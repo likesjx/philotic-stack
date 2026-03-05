@@ -47,3 +47,19 @@ format:
 # Run tests
 test:
     cargo test --workspace
+
+# Show configured Ansible inventory for deployment targets
+ansible-inventory:
+    cd ansible && ansible-inventory --list
+
+# Verify Ansible can reach configured mesh nodes
+ansible-ping:
+    cd ansible && ansible mesh_nodes -m ping
+
+# Preview deployment changes without applying them
+ansible-check:
+    cd ansible && ansible-playbook deploy_mesh_node.yml --check --diff
+
+# Deploy the mesh node playbook to configured hosts
+ansible-deploy:
+    cd ansible && ansible-playbook deploy_mesh_node.yml

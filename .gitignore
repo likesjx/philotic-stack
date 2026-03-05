@@ -1,0 +1,41 @@
+/target/
+**/target/
+
+# Runtime state and local databases
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+
+# Local runtime configuration and secrets
+.env
+.env.local
+.env.*.local
+mesh-config.json
+*.key
+*.pem
+*.p12
+*.pfx
+credentials.json
+secrets*.json
+
+# Logs and local process output
+*.log
+logs/
+
+# Python cache / virtualenvs
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editor / OS noise
+.DS_Store
+._*
+.idea/
+.vscode/
+.zed/
+*.code-workspace
+
+# Misc local build results
+result
