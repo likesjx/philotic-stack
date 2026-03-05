@@ -1,0 +1,100 @@
+# Ansible Mesh Architecture Separation Task List
+
+- [x] Inspect the `openclaw-plugin-ansible` repository and identify the rust port branch.
+- [x] Understand the current architecture of the ansible mesh.
+- [x] Design the separation of the stack into independently addressable units:
+  - [x] chat/communication (including telegram)
+  - [x] agent loop + context + session
+  - [x] memory
+  - [x] models
+  - [x] mcp/tools
+  - [x] context graph
+- [x] Review code for communication and split points.
+- [x] Create an implementation plan for the new services architecture.
+
+## MVP 1: Single-Node Mesh & Basic Tools
+
+- [x] Scaffold the `ansible-mesh-core` crate.
+- [x] Define the UDP `BeaconMessage` transport envelope.
+- [x] Implement the beacon daemon listener.
+- [x] Implement the `AgentBundle` struct and a basic `AgentRuntime`.
+- [x] Build a simple `ToolInvoker` with local mock tools.
+- [x] Set up a hard-coded `node_capabilities.json` for testing.
+
+## MVP 2: Multi-Node Mesh + Model Manager + Ansible
+
+- [x] Implement `node_capabilities` sync and simple health/heartbeat.
+- [x] Build the initial Component Model Manager node exposing `model.manager.list` and `model.manager.route`.
+- [x] Integrate the Rust Ansible port as `ansible.mesh.*` tools on a designated node.
+- [x] Update the Zeroclaw orchestrator adapter to call remote tools (e.g., `mesh.tool_call("ansible.mesh.broadcast")`).
+
+## MVP 3: Context Graph & Edge Client
+
+- [x] Scaffold the memory primitives (`MemoryApartment` struct and queries) inside `crates/ansible-mesh-core/src/graph.rs`.
+- [x] Expose `memory.read@1`, `memory.write@1` over the ToolInvoker interface.
+- [x] Define `ios_capabilities.json` outlining HealthKit, iOS Contacts, and a localized on-device Swift LLM `ModelRef`.
+- [x] Refactor the existing ZeroClaw `src/memory/mod.rs` to query the `MeshAdapter` for episodic persistence.
+
+## MVP 4: Infrastructure Provisioning (Red Hat Ansible)
+
+- [x] Initialize `ansible/` directory structure (inventory, playbooks, roles).
+- [x] Create `roles/mesh_node/` to install dependencies (Rust, systemd).
+- [x] Create `deploy_mesh_node.yml` playbook to compile and run ZeroClaw `mesh run` as a service.
+
+## Phase 1: Making it Ours (The Hegemon Workspace)
+
+- [x] Initialize new Rust crates to build the Philotic architecture alongside the legacy code.
+- [x] Formalize the Cargo Workspace (Monorepo) structure:
+  - `crates/ansible` (The Hotel Manager / local UDP/IPC Event Bus).
+  - `crates/hegemon` (The primary CLI and routing logic).
+  - `crates/philotic-ipc` (The IPC client library for child processes).
+- [x] Port the essential `ansible-mesh-core` MVP 3 logic into the new `crates/ansible` bin.
+- [x] Leave the legacy `src/` monolith untouched for reference and gradual migration.
+
+## Phase 2: Universal Materialization (The Hotel, Guests, & Context Graph)
+
+- [x] Implement a concrete, disk-backed `ContextGraph` store (e.g. SQLite/RocksDB/Sled) to hold the entire system configuration, identities, and memory apartments.
+- [x] Scaffold the `PhiloticClient` (IPC) to allow external Guests (MCP Wrappers, Agent Personas) to connect to the local Ansible.
+- [x] Connect the `Hegemon` Telegram poller to the Philotic Web via the new IPC trait.
+- [x] Close the UDP Request/Response loop (Ansible Echoes back `MsgType::Result` to Hegemon).
+- [x] Write a sample Python and Rust MCP wrapper that registers tools dynamically with the local Ansible.
+- [x] Implement Agent Materialization: Refactor the runtime to spawn child OS processes dynamically from graph data.
+
+## Phase 3: The End-to-End Philotic Stack (Telegram -> Agent -> Model)
+
+We will materialize the core ZeroClaw pipeline as three completely independent binaries that communicate exclusively over the Ansible's UDP IPC:
+
+### 1. The Gateway (Telegram Hegemon)
+
+- [x] Port the legacy `TelegramChannel` struct from `src/channels/telegram.rs` into the `crates/hegemon` binary.
+- [x] Connect the `Hegemon` Telegram poller to the Philotic Web via the `UdpPhiloticClient`.
+- [x] Ensure inbound messages over Telegram are translated to `IpcRequest::EmitTask` and routed to the Agent persona.
+- [x] Refactor the long-polling loop to read the `bot_token` via an IPC config pull rather than the static `config.toml`.
+
+### 2. The Persona (Agent Core)
+
+- [x] Create a new `crates/agent-core` binary in the workspace.
+- [x] Implement the core agent loop (receiving a prompt, building context) checking in as a Guest.
+- [x] When the agent receives a task from Telegram, it queries the Model capabilities via an IPC `EmitTask`.
+
+### 3. The Mind (Model Router)
+
+- [x] Create a new `crates/model-router` binary in the workspace.
+- [x] Implement the Gemini API payload constructor for text generation.
+- [x] Subscribe to Model invocation tasks over IPC, trigger inference, and pass the text back to Hegemon.uter receives an inference task from the Agent, it calls the Gemini API and routes the text response back via IPC.
+
+## Phase 4: The Philotic Split & Metaphor Visualization
+
+Now that the End-to-End Philotic architecture is complete, we need to separate it from the legacy monolith and create visual documentation.
+
+### 1. Repository Separation
+
+- [x] Create a new repository for the Philotic architecture.
+- [x] Migrate the `ansible`, `hegemon`, `agent-core`, `model-router`, `philotic-ipc`, and `ansible-mesh-core` crates to the new repository.
+- [x] Ensure the legacy ZeroClaw/OpenClaw code remains accessible in the original repository as a reference for migrating future capabilities (tools, MCPs).
+
+### 2. Veo3 Metaphor Video
+
+- [x] Brainstorm the visual concepts for the Veo3 video explaining the system metaphors in motion.
+- [x] Draft a storyboard artifact documenting the scenes (The Universal Materialization, The Hotel, The Ansible, The Guests).
+- [x] Refine prompts for Veo3 video generation based on the storyboard.
