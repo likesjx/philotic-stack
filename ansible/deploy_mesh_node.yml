@@ -1,0 +1,7 @@
+---
+- name: Deploy ZeroClaw Mesh Node
+  hosts: mesh_nodes
+  become: yes
+
+  roles:
+    - role: mesh_node

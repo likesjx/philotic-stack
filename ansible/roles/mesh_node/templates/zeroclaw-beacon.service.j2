@@ -1,0 +1,17 @@
+[Unit]
+Description=ZeroClaw Mesh Beacon Payload
+After=network-online.target tailscaled.service wg-quick.service
+
+[Service]
+Type=simple
+User=root
+# Workaround: ZeroClaw defaults to ~/.zeroclaw. We run as root for hardware binding.
+Environment="ZEROCLAW_CONFIG_DIR={{ zeroclaw_install_dir }}/.zeroclaw"
+Environment="RUST_LOG=info"
+WorkingDirectory={{ zeroclaw_install_dir }}
+ExecStart={{ zeroclaw_install_dir }}/target/release/zeroclaw mesh run
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

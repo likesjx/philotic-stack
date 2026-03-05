@@ -1,0 +1,59 @@
+---
+- name: Install system dependencies
+  apt:
+    name:
+      - build-essential
+      - libssl-dev
+      - pkg-config
+      - git
+      - curl
+    state: present
+    update_cache: yes
+  when: ansible_os_family == 'Debian'
+
+- name: Install Rust toolchain
+  shell: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+  args:
+    creates: /root/.cargo/bin/rustc
+
+- name: Ensure target install directory exists
+  file:
+    path: "{{ zeroclaw_install_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Clone ZeroClaw repository
+  git:
+    repo: "{{ zeroclaw_repo_url }}"
+    dest: "{{ zeroclaw_install_dir }}"
+    version: "{{ zeroclaw_branch }}"
+    update: yes
+
+- name: Build the ZeroClaw CLI payload
+  shell: /root/.cargo/bin/cargo build --bin zeroclaw --release
+  args:
+    chdir: "{{ zeroclaw_install_dir }}"
+    creates: "{{ zeroclaw_install_dir }}/target/release/zeroclaw"
+  environment:
+    PATH: "/root/.cargo/bin:{{ ansible_env.PATH }}"
+
+- name: Deploy ZeroClaw node capabilities JSON
+  copy:
+    src: ../../../crates/ansible-mesh-core/node_capabilities.json
+    dest: "{{ zeroclaw_install_dir }}/node_capabilities.json"
+    mode: "0644"
+  ignore_errors: yes # Gracefully fallback if file doesn't exist locally
+
+- name: Generate systemd service for ZeroClaw Mesh Beacon
+  template:
+    src: zeroclaw-beacon.service.j2
+    dest: /etc/systemd/system/zeroclaw-beacon.service
+  notify:
+    - Reload systemd
+    - Restart ZeroClaw
+
+- name: Enable and start ZeroClaw Mesh Beacon
+  systemd:
+    name: zeroclaw-beacon
+    enabled: yes
+    state: started
