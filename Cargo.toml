@@ -1,0 +1,10 @@
+[workspace]
+members = [
+    "crates/ansible",
+    "crates/hegemon",
+    "crates/agent-core",
+    "crates/model-router",
+    "crates/philotic-ipc",
+    "crates/ansible-mesh-core",
+]
+resolver = "2"

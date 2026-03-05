@@ -1,0 +1,20 @@
+{
+  "node_id": "jared-iphone-15-pro",
+  "roles": ["ClientNode", "ModelNode"],
+  "models": [
+    "llm.mlx.llama-3-8b-instruct@1",
+    "stt.whisper.coreml-tiny-en@1"
+  ],
+  "tools": [
+    "os.ios.healthkit.read@1",
+    "os.ios.contacts.search@1",
+    "os.ios.shortcuts.run@1",
+    "os.ios.notifications.push@1",
+    "os.ios.location.get_current@1"
+  ],
+  "constraints": {
+    "max_concurrent_tasks": 2,
+    "requires_auth": true,
+    "battery_minimum_percent": 20
+  }
+}

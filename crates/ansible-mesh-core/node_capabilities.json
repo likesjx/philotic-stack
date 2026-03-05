@@ -1,0 +1,14 @@
+{
+  "node_id": "mock-local-beacon-01",
+  "roles": ["model-node", "mcp-node"],
+  "models": [],
+  "tools": [
+    "mcp.echo@1",
+    "mcp.health.query@1"
+  ],
+  "constraints": {
+    "max_concurrent_jobs": 4,
+    "latency_hint_ms": 1,
+    "trust_level": "personal-lan"
+  }
+}
