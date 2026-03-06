@@ -28,6 +28,8 @@ Define exactly what must be ported from the current OpenClaw Ansible plugin mode
 6. Retention and compaction logic.
 7. Auth admission, invite exchange, ticket validation, replay guards.
 8. Capability lifecycle gate executor internals.
+9. Large Payload blob store and TCP/HTTP chunked file distribution.
+10. WebRTC Media Transceiver signaling (SDP bridging).
 
 ### 3.2 Control-plane domains (Rust-owned)
 
@@ -73,7 +75,9 @@ The port is not complete until these capabilities exist in Rust and pass parity 
 3. `ansible-mesh-core::cursor` for per-source acked sequence tracking.
 4. `ansible-mesh-core::lifecycle` for task/message transition machines.
 5. `ansible-mesh-core::authz` for invite/ticket/nonce validation.
-6. `ansible::service` for IPC + admin HTTP surfaces.
+6. `ansible-mesh-core::blob` for TCP/HTTP chunked file distribution and reference hashing.
+7. `ansible-mesh-core::webrtc` for SDP signaling bridging and media transceiver guests.
+8. `ansible::service` for IPC + admin HTTP surfaces.
 
 ## 6. IPC Contract (Intra-hotel)
 
@@ -257,8 +261,10 @@ Minimum SLO targets (initial):
 4. `PORT-BP-004`: implement task lifecycle engine with invariant tests.
 5. `PORT-BP-005`: implement mesh ACK/processed semantics.
 6. `PORT-BP-006`: implement invite exchange with replay guard.
-7. `PORT-BP-007`: shadow-mode parity harness.
-8. `PORT-BP-008`: phased cutover flags and rollback drills.
+7. `PORT-BP-007`: implement large payload blob extraction + TCP/HTTP chunked fetching index.
+8. `PORT-BP-008`: implement WebRTC Ephemeral Transceiver capabilities and SDP mesh signaling.
+9. `PORT-BP-009`: shadow-mode parity harness.
+10. `PORT-BP-010`: phased cutover flags and rollback drills.
 
 ## 14. Definition of Done
 

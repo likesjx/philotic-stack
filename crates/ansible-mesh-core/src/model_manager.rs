@@ -89,7 +89,7 @@ impl ModelManagerInvoker {
 // or run this in a blocking thread. We'll stub it sync for the trait.
 impl ToolInvoker for ModelManagerInvoker {
     fn call_tool(&self, tool: ToolRef, args: Value) -> Result<Value> {
-        let registry_clone = self.registry.clone();
+        let _registry_clone = self.registry.clone();
         
         // Blocking bridge since the trait is sync in MVP 1
         tokio::task::block_in_place(|| {

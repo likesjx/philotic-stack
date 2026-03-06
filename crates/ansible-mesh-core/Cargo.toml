@@ -5,6 +5,7 @@ edition = "2021"
 description = "Core mesh beacon types and transport"
 
 [dependencies]
+async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 uuid = { version = "1.11", features = ["v4", "serde"] }
@@ -15,3 +16,8 @@ hmac = "0.12"
 sha2 = "0.10"
 log = "0.4"
 tracing = "0.1"
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+[dev-dependencies]
+philotic-client = { path = "../philotic-client" }
+rusqlite = { version = "0.37", features = ["bundled"] }

@@ -28,6 +28,7 @@ pub async fn emit_heartbeat(
         msg_type: MsgType::Heartbeat,
         seq: 0,
         total: 1,
+        timestamp: 0, // MVP 1/2 ignores signature
         payload: serde_json::to_vec(&payload)?,
         hmac: vec![], // MVP 1/2 ignores signature
     };

@@ -3,7 +3,7 @@ use crate::runtime::ToolInvoker;
 use crate::graph::{MemoryApartment, MemoryEntry};
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
-use tracing::{info, debug};
+use tracing::info;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;

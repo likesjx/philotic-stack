@@ -1,6 +1,6 @@
 use crate::{AgentId, BeaconMessage, MsgType, NodeId, ToolRef};
 use crate::runtime::AgentInput;
-use anyhow::{bail, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::net::SocketAddr;
@@ -44,6 +44,7 @@ impl MeshAdapter {
             msg_type,
             seq: 0,
             total: 1,
+            timestamp: 0,
             payload: serde_json::to_vec(&payload)?,
             hmac: vec![],
         };

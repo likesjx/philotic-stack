@@ -1,0 +1,9 @@
+[coverage]
+exclude-files = [
+    "legacy-zeroclaw/*",
+    "legacy-zeroclaw/**",
+]
+# Ignore the entire legacy directory
+ignore-dirs = [
+    "legacy-zeroclaw",
+]

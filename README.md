@@ -1,21 +1,63 @@
 # The Philotic Stack
 
-A Service-Oriented Architecture (SOA) implementation mapping to the "Ansible" & "Philotic Web" metaphors from Speaker for the Dead.
+A distributed AI agent operating system built in Rust — modeled after the "Ansible" and "Philotic Web" metaphors from _Speaker for the Dead_.
 
-## Architecture
+Each hotel is an autonomous, Rust-powered node that materializes AI guest processes, persists state in a local Context Graph, and communicates with peer hotels over a durable UDP mesh.
 
-This mesh connects independently compiled intelligent nodes over UDP/IPC:
-
-- **ansible**: The Host Daemon & Hotel Manager. Materializes capabilities and maintains the Context Graph.
-- **hegemon**: The Gateway. Listens to Telegram/edge protocols and translates to Philotic tasks.
-- **agent-core**: The Persona. Materialized agent intelligence running a REPL loop.
-- **model-router**: The Mind. Processes and routes context to cloud APIs (Gemini).
-
-## Getting Started
-
-1. Copy `mesh-config.example.json` to `mesh-config.json` and provide your API keys.
-2. Run the Ansible daemon:
+## Quick Start
 
 ```bash
+# 1. Copy and configure
+cp mesh-config.example.json mesh-config.json
+# Edit mesh-config.json with your API keys and node identity
+
+# 2. Start the hotel daemon (materializes all guests automatically)
 cargo run -p ansible -- --load-config mesh-config.json
 ```
+
+## Architecture Overview
+
+```
+         ┌──────────────────────────────────────┐
+         │            HOTEL (ansible)            │
+         │                                       │
+         │  ┌──────────┐  IPC  ┌──────────────┐ │
+         │  │ hegemon  │◄─────►│ ContextGraph │ │
+         │  └──────────┘       │ GuestManager │ │
+         │  ┌──────────┐       │ IpcServer    │ │
+         │  │agent-core│◄─────►│ BeaconDaemon │ │
+         │  └──────────┘       │ BlobService  │ │
+         │  ┌────────────┐     └──────────────┘ │
+         │  │model-router│◄───────────────────── │
+         │  └────────────┘                       │
+         └────────────────┬──────────────────────┘
+                          │ UDP Mesh
+         ┌────────────────▼──────────────────────┐
+         │          REMOTE HOTEL                  │
+         └────────────────────────────────────────┘
+```
+
+## Crates
+
+| Crate                                                     | Role                                                       |
+| --------------------------------------------------------- | ---------------------------------------------------------- |
+| [`ansible`](crates/ansible/README.md)                     | Hotel daemon — guest materialization, IPC, mesh routing    |
+| [`ansible-mesh-core`](crates/ansible-mesh-core/README.md) | Core primitives, traits, event types, storage abstractions |
+| [`philotic-client`](crates/philotic-client/README.md)     | Guest SDK — IPC client for hotel communication             |
+| [`hegemon`](crates/hegemon/README.md)                     | Telegram/external protocol gateway guest                   |
+| [`agent-core`](crates/agent-core/README.md)               | Persona/agent cognitive loop guest                         |
+| [`model-router`](crates/model-router/README.md)           | LLM model provider routing guest                           |
+
+## Key Design Principles
+
+- **Hotel = source of truth.** The Context Graph SQLite DB owns all state.
+- **IPC for intra-hotel.** All local communication uses Unix Domain Sockets.
+- **Mesh for inter-hotel.** All cross-machine communication is event-based UDP with durable delivery.
+- **Storage is swappable.** All persistence goes through `Arc<dyn GraphStorage>` — SQLite today, PebbleDB tomorrow.
+- **Guests are crash-safe.** The supervisor loop auto-respawns dead guests every 5s.
+- **Memory is eventually consistent.** Guests write optimistically; the hotel resolves conflicts via Last-Writer-Wins CRDT.
+
+## Documentation
+
+- **[Full Architecture Reference](docs/architecture/ARCHITECTURE.md)** — complete system design, data flows, component reference
+- **[Port Blueprint](docs/architecture/PORT_BLUEPRINT.md)** — migration plan from legacy OpenClaw Ansible plugin model

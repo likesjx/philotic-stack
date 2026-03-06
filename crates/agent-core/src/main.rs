@@ -1,9 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
-use philotic_ipc::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
-use philotic_ipc::udp::UdpPhiloticClient;
+use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
 use serde_json::{json, Value};
-use std::net::SocketAddr;
 use std::time::Duration;
 use tracing::{info, warn, error};
 
@@ -17,23 +15,16 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
-    let args = Args::parse();
+    let _args = Args::parse();
 
     info!("Starting Materialized Persona (Agent Core) Guest Process...");
-
-    let ansible_addr = format!("127.0.0.1:{}", args.ansible_port).parse::<SocketAddr>()?;
-    let mut ipc_client = UdpPhiloticClient::new(ansible_addr).await?;
-
-    ipc_client.connect().await?;
 
     let identity = GuestIdentity {
         guest_id: "agent-jane-01".into(),
         role: "agent".into(),
     };
 
-    info!("Registering as Materialized Guest: {:?}", identity);
-    let resp = ipc_client.send_request(IpcRequest::Register(identity)).await?;
-    info!("Ansible Hotel Response: {:?}", resp);
+    let mut ipc_client = PhiloticClient::connect(identity).await?;
 
     info!("Listening for inbound Persona tasks from the Philotic Web...");
     

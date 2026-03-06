@@ -6,12 +6,20 @@ pub mod runtime;
 pub mod beacon;
 pub mod tools;
 pub mod registry;
+pub mod materializer;
 pub mod heartbeat;
 pub mod model_manager;
 pub mod meshops;
 pub mod adapter;
 pub mod graph;
 pub mod graph_tools;
+pub mod event;
+pub mod ledger;
+pub mod cursor;
+pub mod authz;
+pub mod webrtc;
+pub mod storage;
+pub mod sqlite_storage;
 
 
 
@@ -90,6 +98,8 @@ pub struct BeaconMessage {
     pub total: u32,
     /// Encoded payload (JSON, MsgPack, or CBOR)
     pub payload: Vec<u8>,
+    /// Creation timestamp (Unix epoch secs)
+    pub timestamp: u64,
     /// HMAC signature for integrity and authenticity
     pub hmac: Vec<u8>,
 }
@@ -116,4 +126,10 @@ pub enum MsgType {
     ModelManager,
     /// Reading/writing from the Graph memory apartments
     MemoryOp,
+    /// A batch of EventEnvelopes dispatched over the durable mesh
+    MeshEventBatch,
+    /// An acknowledgment of durably received mesh events
+    MeshEventAck,
+    /// WebRTC Session Description Protocol (SDP) and ICE candidate signaling
+    WebRtcSignal,
 }

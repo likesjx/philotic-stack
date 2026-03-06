@@ -4,7 +4,7 @@ members = [
     "crates/hegemon",
     "crates/agent-core",
     "crates/model-router",
-    "crates/philotic-ipc",
+    "crates/philotic-client",
     "crates/ansible-mesh-core",
 ]
 resolver = "2"
