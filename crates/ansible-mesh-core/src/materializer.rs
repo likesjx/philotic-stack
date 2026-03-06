@@ -15,5 +15,5 @@ pub trait Materializer: Send + Sync {
     async fn reclaim_guest(&mut self, guest_id: &str) -> Result<()>;
     
     /// Check if the materialized Guest identity is currently running and healthy
-    async fn check_status(&self, guest_id: &str, active_id: &str) -> Result<bool>;
+    async fn check_status(&mut self, guest_id: &str, active_id: &str) -> Result<bool>;
 }

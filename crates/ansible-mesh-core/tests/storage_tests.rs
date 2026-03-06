@@ -8,7 +8,7 @@
 
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
 use ansible_mesh_core::sqlite_storage::{SqliteCursorStorage, SqliteEventStorage, SqliteGraphStorage};
-use ansible_mesh_core::storage::{CursorStorage, EventStorage, GraphStorage, GuestRecord};
+use ansible_mesh_core::storage::{CursorStorage, EventStorage, GraphStorage, GuestRecord, HotelRecord};
 use ansible_mesh_core::{NodeCapabilities, NodeRole};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -274,12 +274,66 @@ fn graph_storage_node_capabilities_upsert() {
     assert_eq!(loaded.models, vec!["new-model@1"], "second save must overwrite first");
 }
 
+#[test]
+fn graph_storage_get_config_value_round_trip() {
+    let store = open_graph_storage();
+
+    let caps = NodeCapabilities {
+        node_id: "hotel-config-01".into(),
+        roles: vec![NodeRole::AnsibleNode],
+        models: vec![],
+        tools: vec![],
+        constraints: Default::default(),
+    };
+
+    store.save_node_capabilities(&caps).unwrap();
+
+    let raw_json = store
+        .get_config_value("capabilities")
+        .unwrap()
+        .expect("capabilities should exist");
+
+    let loaded: NodeCapabilities = serde_json::from_str(&raw_json).unwrap();
+    assert_eq!(loaded.node_id, "hotel-config-01");
+}
+
+#[test]
+fn graph_storage_hotel_round_trip_and_pid_update() {
+    let store = open_graph_storage();
+
+    let hotel = HotelRecord {
+        hotel_name: "alpha".into(),
+        capabilities: NodeCapabilities {
+            node_id: "alpha-node".into(),
+            roles: vec![NodeRole::AnsibleNode],
+            models: vec![],
+            tools: vec![],
+            constraints: Default::default(),
+        },
+        mesh_port: 9101,
+        blob_port: 9201,
+        ipc_socket_path: "/tmp/philotic-alpha.sock".into(),
+        active_pid: None,
+    };
+
+    store.upsert_hotel(&hotel).unwrap();
+    store.set_hotel_pid("alpha", Some("2222")).unwrap();
+
+    let loaded = store.get_hotel("alpha").unwrap().expect("hotel should exist");
+    assert_eq!(loaded.capabilities.node_id, "alpha-node");
+    assert_eq!(loaded.mesh_port, 9101);
+    assert_eq!(loaded.blob_port, 9201);
+    assert_eq!(loaded.ipc_socket_path, "/tmp/philotic-alpha.sock");
+    assert_eq!(loaded.active_pid.as_deref(), Some("2222"));
+}
+
 // ═══════════════════════════════════════════════════════════
 // Section 4: SqliteGraphStorage — guest CRUD
 // ═══════════════════════════════════════════════════════════
 
 fn sample_guest(id: &str, active: bool) -> GuestRecord {
     GuestRecord {
+        hotel_name: "test-hotel".into(),
         guest_id: id.into(),
         role: "agent".into(),
         config_json: r#"{"command":"agent-core"}"#.into(),
@@ -293,17 +347,17 @@ fn graph_storage_seed_and_list_guests() {
     let store = open_graph_storage();
 
     store
-        .seed_guests(&[
+        .seed_guests("test-hotel", &[
             sample_guest("g1", true),
             sample_guest("g2", true),
             sample_guest("g3", false),
         ])
         .unwrap();
 
-    let all = store.list_guests(false).unwrap();
+    let all = store.list_guests("test-hotel", false).unwrap();
     assert_eq!(all.len(), 3);
 
-    let active = store.list_guests(true).unwrap();
+    let active = store.list_guests("test-hotel", true).unwrap();
     assert_eq!(active.len(), 2, "only is_active=1 guests returned");
     assert!(active.iter().all(|g| g.is_active));
 }
@@ -311,11 +365,11 @@ fn graph_storage_seed_and_list_guests() {
 #[test]
 fn graph_storage_set_guest_pid() {
     let store = open_graph_storage();
-    store.seed_guests(&[sample_guest("agent-1", true)]).unwrap();
+    store.seed_guests("test-hotel", &[sample_guest("agent-1", true)]).unwrap();
 
     // Assign a PID
-    store.set_guest_pid("agent-1", Some("1234")).unwrap();
-    let guests = store.list_guests(false).unwrap();
+    store.set_guest_pid("test-hotel", "agent-1", Some("1234")).unwrap();
+    let guests = store.list_guests("test-hotel", false).unwrap();
     assert_eq!(
         guests[0].active_pid.as_deref(),
         Some("1234"),
@@ -323,15 +377,15 @@ fn graph_storage_set_guest_pid() {
     );
 
     // Clear the PID
-    store.set_guest_pid("agent-1", None).unwrap();
-    let guests = store.list_guests(false).unwrap();
+    store.set_guest_pid("test-hotel", "agent-1", None).unwrap();
+    let guests = store.list_guests("test-hotel", false).unwrap();
     assert!(guests[0].active_pid.is_none(), "PID should be cleared");
 }
 
 #[test]
 fn graph_storage_list_empty_is_ok() {
     let store = open_graph_storage();
-    let all = store.list_guests(false).unwrap();
+    let all = store.list_guests("test-hotel", false).unwrap();
     assert!(all.is_empty());
 }
 
@@ -340,10 +394,10 @@ fn graph_storage_seed_is_idempotent() {
     let store = open_graph_storage();
     let guest = sample_guest("g-idem", true);
 
-    store.seed_guests(&[guest.clone()]).unwrap();
-    store.seed_guests(&[guest.clone()]).unwrap(); // INSERT OR REPLACE
+    store.seed_guests("test-hotel", &[guest.clone()]).unwrap();
+    store.seed_guests("test-hotel", &[guest.clone()]).unwrap(); // INSERT OR REPLACE
 
-    let all = store.list_guests(false).unwrap();
+    let all = store.list_guests("test-hotel", false).unwrap();
     assert_eq!(all.len(), 1, "idempotent seed must not duplicate");
 }
 

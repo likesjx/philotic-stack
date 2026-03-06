@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use std::net::SocketAddr;
-use tokio::net::UdpSocket;
-use tracing::{info, debug, error};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
+use tracing::{info, debug};
 
 /// Represents the identity of a Guest materializing in the Hotel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,28 +104,28 @@ pub struct IpcPushEvent {
 
 /// The concrete Universal Hotel Client SDK
 pub struct PhiloticClient {
-    socket: UdpSocket,
-    ansible_addr: SocketAddr,
+    stream: UnixStream,
     _identity: GuestIdentity,
 }
 
 impl PhiloticClient {
+    fn socket_path() -> String {
+        std::env::var("PHILOTIC_HOTEL_SOCKET")
+            .unwrap_or_else(|_| "/tmp/philotic-ansible.sock".to_string())
+    }
+
     /// Connect to the local Ansible daemon automatically, driven by environment variables.
-    /// Default Hotel port is 9000 unless PHILOTIC_HOTEL_PORT is specified.
+    /// Default Hotel socket is `/tmp/philotic-ansible.sock` unless `PHILOTIC_HOTEL_SOCKET` is specified.
     pub async fn connect(identity: GuestIdentity) -> Result<Self> {
-        let port_str = std::env::var("PHILOTIC_HOTEL_PORT").unwrap_or_else(|_| "9000".to_string());
-        let port: u16 = port_str.parse().unwrap_or(9000);
-        let ansible_addr: SocketAddr = format!("127.0.0.1:{}", port).parse()?;
-        
-        let socket = UdpSocket::bind("127.0.0.1:0")
+        let socket_path = Self::socket_path();
+        let stream = UnixStream::connect(&socket_path)
             .await
-            .context("Failed to bind ephemeral local UDP socket for PhiloticClient")?;
+            .with_context(|| format!("Failed to connect to hotel IPC socket at {}", socket_path))?;
             
-        debug!("PhiloticClient connecting to local Ansible at {}...", ansible_addr);
+        debug!("PhiloticClient connecting to local Ansible at {}...", socket_path);
         
-        let client = Self {
-            socket,
-            ansible_addr,
+        let mut client = Self {
+            stream,
             _identity: identity.clone(),
         };
         
@@ -150,19 +150,18 @@ impl PhiloticClient {
     }
     
     /// Send an IPC request to the local Ansible
-    pub async fn send_request(&self, req: IpcRequest) -> Result<IpcResponse> {
+    pub async fn send_request(&mut self, req: IpcRequest) -> Result<IpcResponse> {
         let payload = serde_json::to_vec(&req).context("Failed to serialize IpcRequest")?;
-        self.socket
-            .send_to(&payload, &self.ansible_addr)
+        self.stream
+            .write_all(&payload)
             .await
             .context("Failed to send IPC request to Ansible")?;
 
         // Wait for Ack
         let mut buf = vec![0u8; 65535];
-        let (len, src) = self.socket.recv_from(&mut buf).await.context("Failed to receive IPC response")?;
-        
-        if src != self.ansible_addr {
-            error!("Received phantom IPC response from unknown source: {}", src);
+        let len = self.stream.read(&mut buf).await.context("Failed to receive IPC response")?;
+        if len == 0 {
+            anyhow::bail!("Hotel closed the IPC connection");
         }
 
         let resp: IpcResponse = serde_json::from_slice(&buf[..len])
@@ -174,7 +173,10 @@ impl PhiloticClient {
     /// Poll for inbound tasks routed from the Philotic Web
     pub async fn recv_task(&mut self) -> Result<IpcResponse> {
         let mut buf = vec![0u8; 65535];
-        let (len, _src) = self.socket.recv_from(&mut buf).await.context("Failed to receive IPC task/response")?;
+        let len = self.stream.read(&mut buf).await.context("Failed to receive IPC task/response")?;
+        if len == 0 {
+            anyhow::bail!("Hotel closed the IPC connection");
+        }
         
         let resp: IpcResponse = serde_json::from_slice(&buf[..len])
             .context("Failed to decode IpcResponse from Ansible")?;
@@ -183,17 +185,97 @@ impl PhiloticClient {
     }
 
     /// Optimistically write a memory apartment update to the hotel without waiting for a full response
-    pub async fn sync_apartment(&self, agent_id: &str, memory_type: &str, content_json: serde_json::Value) -> Result<()> {
+    pub async fn sync_apartment(&mut self, agent_id: &str, memory_type: &str, content_json: serde_json::Value) -> Result<()> {
         let req = IpcRequest::SyncApartment {
             agent_id: agent_id.to_string(),
             memory_type: memory_type.to_string(),
             content_json,
         };
         let payload = serde_json::to_vec(&req)?;
-        self.socket
-            .send_to(&payload, &self.ansible_addr)
+        self.stream
+            .write_all(&payload)
             .await
             .context("Failed to dispatch SyncApartment")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use tokio::net::UnixListener;
+
+    fn test_socket_path() -> String {
+        format!("/tmp/pc-{}.sock", Uuid::new_v4().simple())
+    }
+
+    #[tokio::test]
+    async fn connect_and_get_config_over_uds() {
+        let socket_path = test_socket_path();
+        let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+
+        let server = tokio::spawn({
+            let socket_path = socket_path.clone();
+            async move {
+                let (mut stream, _) = listener.accept().await.expect("accept client");
+                let mut buf = vec![0u8; 65535];
+
+                let len = stream.read(&mut buf).await.expect("read register");
+                let req: IpcRequest = serde_json::from_slice(&buf[..len]).expect("decode register");
+                match req {
+                    IpcRequest::Register(identity) => assert_eq!(identity.guest_id, "guest-test-1"),
+                    other => panic!("unexpected register request: {other:?}"),
+                }
+                stream
+                    .write_all(&serde_json::to_vec(&IpcResponse::success("reg", None)).unwrap())
+                    .await
+                    .expect("write register response");
+
+                let len = stream.read(&mut buf).await.expect("read get_config");
+                let req: IpcRequest = serde_json::from_slice(&buf[..len]).expect("decode get_config");
+                match req {
+                    IpcRequest::GetConfig { key } => assert_eq!(key, "telegram_bot_token"),
+                    other => panic!("unexpected config request: {other:?}"),
+                }
+                stream
+                    .write_all(&serde_json::to_vec(&IpcResponse::ConfigData {
+                        key: "telegram_bot_token".into(),
+                        value_json: Some("\"secret-token\"".into()),
+                    }).unwrap())
+                    .await
+                    .expect("write config response");
+
+                let _ = std::fs::remove_file(&socket_path);
+            }
+        });
+
+        unsafe { std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path); }
+
+        let identity = GuestIdentity {
+            guest_id: "guest-test-1".into(),
+            role: "test".into(),
+        };
+        let mut client = PhiloticClient::connect(identity).await.expect("connect client");
+        let response = client
+            .send_request(IpcRequest::GetConfig {
+                key: "telegram_bot_token".into(),
+            })
+            .await
+            .expect("send request");
+
+        match response {
+            IpcResponse::ConfigData { key, value_json } => {
+                assert_eq!(key, "telegram_bot_token");
+                assert_eq!(value_json.as_deref(), Some("\"secret-token\""));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        server.await.expect("join server");
+        unsafe { std::env::remove_var("PHILOTIC_HOTEL_SOCKET"); }
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
     }
 }

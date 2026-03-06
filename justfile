@@ -13,8 +13,9 @@ check:
     cargo check --workspace
 
 # Start the Hotel Manager (Ansible Host Daemon)
-start-ansible:
-    cargo run -p ansible -- --load-config mesh-config.json
+start-ansible hotel:
+    cargo build --workspace
+    cargo run -p ansible -- --hotel {{hotel}} --load-config mesh-config.json
 
 # Start the Gateway (Telegram Hegemon)
 start-gateway:

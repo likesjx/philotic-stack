@@ -1,5 +1,5 @@
 use ansible_mesh_core::beacon::BeaconDaemon;
-use ansible_mesh_core::storage::GraphStorage;
+use ansible_mesh_core::storage::{GraphStorage, GuestRecord, HotelRecord};
 use ansible_mesh_core::{NodeCapabilities, NodeRole};
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -30,6 +30,10 @@ pub enum LedgerCommand {
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
+    /// Name of the hotel to boot from the Context Graph
+    #[arg(long)]
+    hotel: String,
+
     /// Optional path to a JSON file containing configuration to load into the Context Graph
     #[arg(long)]
     load_config: Option<String>,
@@ -50,6 +54,112 @@ impl AnsibleCutoverFlags {
             enable_rust_task_lifecycle: std::env::var("PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE").map(|v| v == "true" || v == "1").unwrap_or(false),
         }
     }
+}
+
+fn guest_supervision_enabled() -> bool {
+    std::env::var("PHILOTIC_ENABLE_GUEST_SUPERVISOR")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+}
+
+fn sanitize_hotel_name(hotel_name: &str) -> String {
+    hotel_name
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => ch,
+            _ => '-',
+        })
+        .collect()
+}
+
+fn hotel_base_port(hotel_name: &str) -> u16 {
+    let mut hash: u16 = 0;
+    for byte in hotel_name.bytes() {
+        hash = hash.wrapping_mul(31).wrapping_add(byte as u16);
+    }
+    10_000 + (hash % 20_000)
+}
+
+fn default_hotel_record(hotel_name: &str) -> HotelRecord {
+    let safe_name = sanitize_hotel_name(hotel_name);
+    let base_port = hotel_base_port(&safe_name);
+
+    HotelRecord {
+        hotel_name: hotel_name.to_string(),
+        capabilities: NodeCapabilities {
+            node_id: format!("{safe_name}-ansible-01"),
+            roles: vec![NodeRole::AnsibleNode, NodeRole::Other("hegemon".into())],
+            models: vec![],
+            tools: vec![],
+            constraints: Default::default(),
+        },
+        mesh_port: base_port,
+        blob_port: base_port + 1,
+        ipc_socket_path: format!("/tmp/philotic-{safe_name}.sock"),
+        active_pid: None,
+    }
+}
+
+fn default_guest_seed(hotel_name: &str) -> Vec<GuestRecord> {
+    let socket_path = default_hotel_record(hotel_name).ipc_socket_path;
+    vec![
+        GuestRecord {
+            hotel_name: hotel_name.to_string(),
+            guest_id: format!("{hotel_name}:hegemon-gateway"),
+            role: "hegemon".into(),
+            config_json: serde_json::json!({
+                "command": "target/debug/hegemon",
+                "args": [],
+                "env": {
+                    "PHILOTIC_HOTEL_SOCKET": socket_path.clone()
+                }
+            })
+            .to_string(),
+            is_active: true,
+            active_pid: None,
+        },
+        GuestRecord {
+            hotel_name: hotel_name.to_string(),
+            guest_id: format!("{hotel_name}:agent-core-jane"),
+            role: "agent".into(),
+            config_json: serde_json::json!({
+                "command": "target/debug/agent-core",
+                "args": [],
+                "env": {
+                    "PHILOTIC_HOTEL_SOCKET": socket_path.clone()
+                }
+            })
+            .to_string(),
+            is_active: true,
+            active_pid: None,
+        },
+        GuestRecord {
+            hotel_name: hotel_name.to_string(),
+            guest_id: format!("{hotel_name}:model-router-gemini"),
+            role: "model".into(),
+            config_json: serde_json::json!({
+                "command": "target/debug/model-router",
+                "args": [],
+                "env": {
+                    "PHILOTIC_HOTEL_SOCKET": socket_path
+                }
+            })
+            .to_string(),
+            is_active: true,
+            active_pid: None,
+        },
+    ]
+}
+
+fn pid_exists(pid: u32) -> bool {
+    std::process::Command::new("ps")
+        .arg("-p")
+        .arg(pid.to_string())
+        .arg("-o")
+        .arg("pid=")
+        .output()
+        .map(|output| output.status.success() && !String::from_utf8_lossy(&output.stdout).trim().is_empty())
+        .unwrap_or(false)
 }
 
 
@@ -101,38 +211,46 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Load capabilities from the Graph, or initialize with a master default
-    let caps = match graph_storage.load_node_capabilities()? {
-        Some(c) => c,
+    let hotel_name = args.hotel.clone();
+    let mut hotel = match graph_storage.get_hotel(&hotel_name)? {
+        Some(hotel) => hotel,
         None => {
-            info!("Context Graph is empty. Bootstrapping initial Hegemon configuration.");
-            let default_caps = NodeCapabilities {
-                node_id: "local-ansible-01".into(),
-                roles: vec![NodeRole::AnsibleNode, NodeRole::Other("hegemon".into())],
-                models: vec![],
-                tools: vec![],
-                constraints: Default::default(),
-            };
-            graph_storage.save_node_capabilities(&default_caps)?;
-            
-            // Seed a few demo Guests to be materialized 
-            info!("Seeding End-to-End E2E Guests into Materialization Queue...");
-            let conn = graph_storage.raw_conn().lock().unwrap();
-            conn.execute(
-                "INSERT OR REPLACE INTO materialized_guests (guest_id, role, config_json) VALUES 
-                ('hegemon-gateway', 'hegemon', '{\"command\": \"target/debug/hegemon\", \"args\": []}'),
-                ('agent-core-jane', 'agent', '{\"command\": \"target/debug/agent-core\", \"args\": []}'),
-                ('model-router-gemini', 'model', '{\"command\": \"target/debug/model-router\", \"args\": []}')",
-                [],
-            )?;
-            
-            default_caps
+            info!("Hotel '{}' is missing from the Context Graph. Bootstrapping it now.", hotel_name);
+            let hotel = default_hotel_record(&hotel_name);
+            graph_storage.upsert_hotel(&hotel)?;
+            let guests = default_guest_seed(&hotel_name);
+            graph_storage.seed_guests(&hotel_name, &guests)?;
+            hotel
         }
     };
 
-    let mesh_port = 8999;
+    if let Some(active_pid) = hotel.active_pid.as_deref() {
+        if let Ok(pid) = active_pid.parse::<u32>() {
+            if pid_exists(pid) {
+                anyhow::bail!(
+                    "Hotel '{}' is already running with PID {}. Stop that instance before starting another.",
+                    hotel_name,
+                    pid
+                );
+            }
+        }
+        graph_storage.set_hotel_pid(&hotel_name, None)?;
+        hotel.active_pid = None;
+    }
+
+    let current_pid = std::process::id().to_string();
+    graph_storage.set_hotel_pid(&hotel_name, Some(&current_pid))?;
+    hotel.active_pid = Some(current_pid.clone());
+
+    let caps = hotel.capabilities.clone();
+    let mesh_port = hotel.mesh_port;
     let addr = format!("0.0.0.0:{}", mesh_port);
-    info!("Starting Philotic Ansible Daemon '{}' on {}", caps.node_id, addr);
+    info!(
+        "Starting Philotic Ansible Daemon for hotel '{}' as node '{}' on {}",
+        hotel_name,
+        caps.node_id,
+        addr
+    );
     
     // Channel for inbound mesh UDP payloads bubbled up by the BeaconDaemon
     let (inbox_tx, mut inbox_rx) = mpsc::channel::<ansible_mesh_core::BeaconMessage>(1024);
@@ -140,7 +258,13 @@ async fn main() -> Result<()> {
     // PORT-BP-006: Pre-Shared Key for mesh authentication
     let mesh_psk = std::env::var("PHILOTIC_MESH_PSK").unwrap_or_else(|_| "INSECURE_DEV_DEFAULT_PSK".to_string());
     
-    let daemon = BeaconDaemon::bind(&addr, caps.clone(), inbox_tx, &mesh_psk, db_path.to_str().unwrap_or(""), flags.enable_rust_auth).await?;
+    let daemon = match BeaconDaemon::bind(&addr, caps.clone(), inbox_tx, &mesh_psk, db_path.to_str().unwrap_or(""), flags.enable_rust_auth).await {
+        Ok(daemon) => daemon,
+        Err(e) => {
+            let _ = graph_storage.set_hotel_pid(&hotel_name, None);
+            return Err(e);
+        }
+    };
     
     // Channel for pushing generated SDP Answers back out to the mesh
     let (webrtc_signal_tx, mut webrtc_signal_rx) = mpsc::channel::<ansible_mesh_core::webrtc::WebRtcSignalMessage>(32);
@@ -154,20 +278,24 @@ async fn main() -> Result<()> {
     // Abstracted Universal Materializer with trait-object storage
     let graph_arc: Arc<dyn ansible_mesh_core::storage::GraphStorage> = Arc::new(graph_storage);
     let materializer = Box::new(crate::service::guest_manager::LocalProcessMaterializer::new());
-    let guest_manager = Arc::new(crate::service::guest_manager::GuestManager::new(graph_arc.clone(), materializer));
+    let guest_manager = Arc::new(crate::service::guest_manager::GuestManager::new(hotel_name.clone(), graph_arc.clone(), materializer));
     
     if let Err(e) = guest_manager.materialize_all(shutdown_rx.resubscribe()).await {
         error!("Universal Materialization failed: {}", e);
     }
     
-    let gm_clone = Arc::clone(&guest_manager);
-    let rx_supervise = shutdown_rx.resubscribe();
-    tokio::spawn(async move {
-        gm_clone.supervise_guests(rx_supervise).await;
-    });
+    if guest_supervision_enabled() {
+        let gm_clone = Arc::clone(&guest_manager);
+        let rx_supervise = shutdown_rx.resubscribe();
+        tokio::spawn(async move {
+            gm_clone.supervise_guests(rx_supervise).await;
+        });
+    } else {
+        warn!("Guest supervisor loop is disabled by default until guest heartbeats are implemented.");
+    }
 
     // Spawning the "Hotel Front Desk" local IPC listener for Materialized Guests
-    let socket_path = "/tmp/philotic-ansible.sock";
+    let socket_path = hotel.ipc_socket_path.clone();
     
     // Create the memory channel dispatcher for PORT-BP-003 to pick up
     // In PORT-BP-003, this receiver will hand off to the persistent mesh_events ledger 
@@ -266,7 +394,7 @@ async fn main() -> Result<()> {
     }
 
     // PORT-BP-005: Large Payload Transport via Dedicated HTTP Server
-    let blob_port = 9000;
+    let blob_port = hotel.blob_port;
     let blob_addr = format!("0.0.0.0:{}", blob_port);
     let blob_dir = std::path::Path::new(db_path).parent().unwrap_or(std::path::Path::new(".")).join("blobs");
     let blob_service = BlobService::new(blob_dir);
@@ -336,7 +464,7 @@ async fn main() -> Result<()> {
     });
 
     // PORT-BP-008: WebRTC SDP Signal Dispatcher Loop
-    let local_node_id = "local-ansible-01".to_string(); // In a real app we get this from config
+    let local_node_id = caps.node_id.clone();
     
     let socket_webrtc = daemon.socket().clone();
     let mesh_auth_webrtc = ansible_mesh_core::authz::MeshAuth::new(&mesh_psk);
@@ -455,9 +583,45 @@ async fn main() -> Result<()> {
             let _ = shutdown_tx.send(());
             // Give Guests a tiny breather to exit voluntarily
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            let _ = graph_arc.set_hotel_pid(&hotel_name, None);
             info!("Ansible Daemon shutdown complete.");
         }
     }
+
+    let _ = graph_arc.set_hotel_pid(&hotel_name, None);
     
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{default_guest_seed, default_hotel_record, guest_supervision_enabled, hotel_base_port};
+
+    #[test]
+    fn guest_supervision_defaults_disabled() {
+        unsafe { std::env::remove_var("PHILOTIC_ENABLE_GUEST_SUPERVISOR"); }
+        assert!(!guest_supervision_enabled());
+    }
+
+    #[test]
+    fn default_hotel_record_is_deterministic_and_namespaced() {
+        let hotel = default_hotel_record("alpha-hotel");
+        assert_eq!(hotel.hotel_name, "alpha-hotel");
+        assert_eq!(hotel.capabilities.node_id, "alpha-hotel-ansible-01");
+        assert_eq!(hotel.ipc_socket_path, "/tmp/philotic-alpha-hotel.sock");
+        assert_eq!(hotel.mesh_port, hotel_base_port("alpha-hotel"));
+        assert_eq!(hotel.blob_port, hotel.mesh_port + 1);
+    }
+
+    #[test]
+    fn default_guest_seed_injects_hotel_socket_env() {
+        let guests = default_guest_seed("beta-hotel");
+        assert_eq!(guests.len(), 3);
+        let config: serde_json::Value = serde_json::from_str(&guests[0].config_json).unwrap();
+        assert_eq!(
+            config["env"]["PHILOTIC_HOTEL_SOCKET"].as_str(),
+            Some("/tmp/philotic-beta-hotel.sock")
+        );
+        assert!(guests.iter().all(|guest| guest.hotel_name == "beta-hotel"));
+    }
 }

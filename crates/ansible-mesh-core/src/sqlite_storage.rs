@@ -5,7 +5,7 @@
 //! consume them as `Arc<dyn EventStorage>`, etc.
 
 use crate::event::{EventEnvelope, EventId, EventKind, EventPayload};
-use crate::storage::{CursorStorage, EventStorage, GraphStorage, GuestRecord};
+use crate::storage::{CursorStorage, EventStorage, GraphStorage, GuestRecord, HotelRecord};
 use crate::NodeCapabilities;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
@@ -276,7 +276,18 @@ impl SqliteGraphStorage {
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
 
+            CREATE TABLE IF NOT EXISTS hotels (
+                hotel_name TEXT PRIMARY KEY,
+                capabilities_json TEXT NOT NULL,
+                mesh_port INTEGER NOT NULL,
+                blob_port INTEGER NOT NULL,
+                ipc_socket_path TEXT NOT NULL,
+                active_pid TEXT,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+
             CREATE TABLE IF NOT EXISTS materialized_guests (
+                hotel_name TEXT NOT NULL DEFAULT 'default',
                 guest_id TEXT PRIMARY KEY,
                 role TEXT NOT NULL,
                 config_json TEXT NOT NULL,
@@ -307,6 +318,10 @@ impl SqliteGraphStorage {
         // Migration for legacy databases
         let _ = conn.execute(
             "ALTER TABLE materialized_guests ADD COLUMN active_pid TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE materialized_guests ADD COLUMN hotel_name TEXT NOT NULL DEFAULT 'default'",
             [],
         );
 
@@ -349,44 +364,117 @@ impl GraphStorage for SqliteGraphStorage {
         Ok(())
     }
 
-    fn list_guests(&self, active_only: bool) -> Result<Vec<GuestRecord>> {
+    fn get_config_value(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT value_json FROM node_config WHERE key = ?1")?;
+        let mut rows = stmt.query(params![key])?;
+
+        if let Some(row) = rows.next()? {
+            Ok(Some(row.get(0)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn get_hotel(&self, hotel_name: &str) -> Result<Option<HotelRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT capabilities_json, mesh_port, blob_port, ipc_socket_path, active_pid
+             FROM hotels
+             WHERE hotel_name = ?1",
+        )?;
+        let mut rows = stmt.query(params![hotel_name])?;
+
+        if let Some(row) = rows.next()? {
+            let capabilities_json: String = row.get(0)?;
+            let capabilities: NodeCapabilities = serde_json::from_str(&capabilities_json)?;
+            Ok(Some(HotelRecord {
+                hotel_name: hotel_name.to_string(),
+                capabilities,
+                mesh_port: row.get(1)?,
+                blob_port: row.get(2)?,
+                ipc_socket_path: row.get(3)?,
+                active_pid: row.get(4).unwrap_or(None),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn upsert_hotel(&self, hotel: &HotelRecord) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let capabilities_json = serde_json::to_string(&hotel.capabilities)?;
+        conn.execute(
+            "INSERT INTO hotels (hotel_name, capabilities_json, mesh_port, blob_port, ipc_socket_path, active_pid, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP)
+             ON CONFLICT(hotel_name) DO UPDATE SET
+             capabilities_json = excluded.capabilities_json,
+             mesh_port = excluded.mesh_port,
+             blob_port = excluded.blob_port,
+             ipc_socket_path = excluded.ipc_socket_path,
+             active_pid = excluded.active_pid,
+             updated_at = CURRENT_TIMESTAMP",
+            params![
+                hotel.hotel_name,
+                capabilities_json,
+                hotel.mesh_port,
+                hotel.blob_port,
+                hotel.ipc_socket_path,
+                hotel.active_pid
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn set_hotel_pid(&self, hotel_name: &str, pid: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE hotels SET active_pid = ?1, updated_at = CURRENT_TIMESTAMP WHERE hotel_name = ?2",
+            params![pid, hotel_name],
+        )?;
+        Ok(())
+    }
+
+    fn list_guests(&self, hotel_name: &str, active_only: bool) -> Result<Vec<GuestRecord>> {
         let conn = self.conn.lock().unwrap();
         let sql = if active_only {
-            "SELECT guest_id, role, config_json, is_active, active_pid FROM materialized_guests WHERE is_active = 1"
+            "SELECT hotel_name, guest_id, role, config_json, is_active, active_pid FROM materialized_guests WHERE hotel_name = ?1 AND is_active = 1"
         } else {
-            "SELECT guest_id, role, config_json, is_active, active_pid FROM materialized_guests"
+            "SELECT hotel_name, guest_id, role, config_json, is_active, active_pid FROM materialized_guests WHERE hotel_name = ?1"
         };
         let mut stmt = conn.prepare(sql)?;
-        let mut rows = stmt.query([])?;
+        let mut rows = stmt.query(params![hotel_name])?;
         let mut out = Vec::new();
 
         while let Some(row) = rows.next()? {
             out.push(GuestRecord {
-                guest_id: row.get(0)?,
-                role: row.get(1)?,
-                config_json: row.get(2)?,
-                is_active: row.get(3)?,
-                active_pid: row.get(4).unwrap_or(None),
+                hotel_name: row.get(0)?,
+                guest_id: row.get(1)?,
+                role: row.get(2)?,
+                config_json: row.get(3)?,
+                is_active: row.get(4)?,
+                active_pid: row.get(5).unwrap_or(None),
             });
         }
         Ok(out)
     }
 
-    fn set_guest_pid(&self, guest_id: &str, pid: Option<&str>) -> Result<()> {
+    fn set_guest_pid(&self, hotel_name: &str, guest_id: &str, pid: Option<&str>) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE materialized_guests SET active_pid = ?1 WHERE guest_id = ?2",
-            params![pid, guest_id],
+            "UPDATE materialized_guests SET active_pid = ?1 WHERE hotel_name = ?2 AND guest_id = ?3",
+            params![pid, hotel_name, guest_id],
         )?;
         Ok(())
     }
 
-    fn seed_guests(&self, guests: &[GuestRecord]) -> Result<()> {
+    fn seed_guests(&self, hotel_name: &str, guests: &[GuestRecord]) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         for g in guests {
             conn.execute(
-                "INSERT OR REPLACE INTO materialized_guests (guest_id, role, config_json, is_active) VALUES (?1, ?2, ?3, ?4)",
-                params![g.guest_id, g.role, g.config_json, g.is_active],
+                "INSERT OR REPLACE INTO materialized_guests (hotel_name, guest_id, role, config_json, is_active)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![hotel_name, g.guest_id, g.role, g.config_json, g.is_active],
             )?;
         }
         Ok(())

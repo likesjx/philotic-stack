@@ -52,10 +52,22 @@ pub trait CursorStorage: Send + Sync {
 /// A single guest record as loaded from the storage layer.
 #[derive(Debug, Clone)]
 pub struct GuestRecord {
+    pub hotel_name: String,
     pub guest_id: String,
     pub role: String,
     pub config_json: String,
     pub is_active: bool,
+    pub active_pid: Option<String>,
+}
+
+/// A named hotel runtime record stored in the Context Graph.
+#[derive(Debug, Clone)]
+pub struct HotelRecord {
+    pub hotel_name: String,
+    pub capabilities: NodeCapabilities,
+    pub mesh_port: u16,
+    pub blob_port: u16,
+    pub ipc_socket_path: String,
     pub active_pid: Option<String>,
 }
 
@@ -69,17 +81,29 @@ pub trait GraphStorage: Send + Sync {
     /// Persist (upsert) the node capability manifest.
     fn save_node_capabilities(&self, caps: &NodeCapabilities) -> Result<()>;
 
+    /// Load an arbitrary JSON config value by key.
+    fn get_config_value(&self, key: &str) -> Result<Option<String>>;
+
+    /// Load a named hotel record, or `None` if it has not been bootstrapped yet.
+    fn get_hotel(&self, hotel_name: &str) -> Result<Option<HotelRecord>>;
+
+    /// Persist (upsert) a named hotel record.
+    fn upsert_hotel(&self, hotel: &HotelRecord) -> Result<()>;
+
+    /// Update the running PID lease for a named hotel.
+    fn set_hotel_pid(&self, hotel_name: &str, pid: Option<&str>) -> Result<()>;
+
     // ── Guest materialization manifest ────────────────────────────────
 
     /// Return all guest records matching the filter.
     /// If `active_only` is true, only rows where `is_active = 1`.
-    fn list_guests(&self, active_only: bool) -> Result<Vec<GuestRecord>>;
+    fn list_guests(&self, hotel_name: &str, active_only: bool) -> Result<Vec<GuestRecord>>;
 
     /// Update the `active_pid` column for a guest.
-    fn set_guest_pid(&self, guest_id: &str, pid: Option<&str>) -> Result<()>;
+    fn set_guest_pid(&self, hotel_name: &str, guest_id: &str, pid: Option<&str>) -> Result<()>;
 
     /// Bulk-insert or replace guest rows (used during initial seeding).
-    fn seed_guests(&self, guests: &[GuestRecord]) -> Result<()>;
+    fn seed_guests(&self, hotel_name: &str, guests: &[GuestRecord]) -> Result<()>;
 
     // ── Memory apartments ────────────────────────────────────────────
 
