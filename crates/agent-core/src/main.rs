@@ -27,6 +27,7 @@ async fn main() -> Result<()> {
     let identity = GuestIdentity {
         guest_id: AGENT_ID.into(),
         role: "agent".into(),
+        supported_tools: Vec::new(),
     };
 
     let ipc_client = philotic_client::PhiloticClient::connect(identity).await?;

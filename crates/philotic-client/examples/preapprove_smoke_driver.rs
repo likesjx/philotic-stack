@@ -18,6 +18,7 @@ async fn main() -> Result<()> {
     let mut client = PhiloticClient::connect(GuestIdentity {
         guest_id: "preapprove-smoke-hegemon".into(),
         role: "hegemon".into(),
+        supported_tools: Vec::new(),
     })
     .await
     .with_context(|| format!("failed to connect preapprove smoke driver to {socket_path}"))?;

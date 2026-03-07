@@ -74,6 +74,7 @@ dependencies = [
  "philotic-client",
  "reqwest",
  "rusqlite",
+ "serde",
  "serde_json",
  "sha2",
  "tokio",
@@ -2910,6 +2911,19 @@ dependencies = [
  "futures-sink",
  "pin-project-lite",
  "tokio",
+]
+
+[[package]]
+name = "tool-runner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "philotic-client",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

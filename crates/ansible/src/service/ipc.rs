@@ -18,6 +18,8 @@ type InboxRegistry = Arc<Mutex<HashMap<String, Vec<RoleSubscriber>>>>;
 #[derive(Clone)]
 struct RoleSubscriber {
     conn_id: Uuid,
+    guest_id: String,
+    supported_tools: Vec<String>,
     tx: mpsc::UnboundedSender<IpcResponse>,
 }
 
@@ -32,6 +34,13 @@ struct SessionEnvelope {
     content: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToolRunnerRegistryEntry {
+    guest_id: String,
+    supported_tools: Vec<String>,
+    last_seen_at: u64,
+}
+
 pub struct IpcServer {
     socket_path: String,
     dispatcher_tx: mpsc::Sender<LedgerCommand>,
@@ -40,6 +49,33 @@ pub struct IpcServer {
 }
 
 impl IpcServer {
+    async fn write_frame<W: AsyncWriteExt + Unpin>(
+        writer: &mut W,
+        payload: &[u8],
+    ) -> std::io::Result<()> {
+        let len = u32::try_from(payload.len())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "frame too large"))?;
+        writer.write_all(&len.to_be_bytes()).await?;
+        writer.write_all(payload).await?;
+        Ok(())
+    }
+
+    async fn read_frame<R: AsyncReadExt + Unpin>(
+        reader: &mut R,
+    ) -> std::io::Result<Option<Vec<u8>>> {
+        let mut len_buf = [0u8; 4];
+        match reader.read_exact(&mut len_buf).await {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(err) => return Err(err),
+        }
+
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut buf = vec![0u8; len];
+        reader.read_exact(&mut buf).await?;
+        Ok(Some(buf))
+    }
+
     pub fn new(socket_path: impl Into<String>, dispatcher_tx: mpsc::Sender<LedgerCommand>, graph: Arc<dyn GraphStorage>) -> Self {
         Self {
             socket_path: socket_path.into(),
@@ -91,24 +127,23 @@ impl IpcServer {
                         continue;
                     }
                 };
-                if let Err(e) = writer.write_all(&res_bytes).await {
+                if let Err(e) = Self::write_frame(&mut writer, &res_bytes).await {
                     return Err(e);
                 }
             }
             Ok::<(), std::io::Error>(())
         });
 
-        let mut buf = vec![0u8; 65536];
         let mut subscribed_roles = Vec::new();
         loop {
-            match reader.read(&mut buf).await {
-                Ok(0) => {
+            match Self::read_frame(&mut reader).await {
+                Ok(None) => {
                     Self::remove_subscriptions(&inboxes, conn_id, &subscribed_roles).await;
                     let _ = write_task.await;
                     return Ok(());
                 }
-                Ok(n) => {
-                    match serde_json::from_slice::<IpcRequest>(&buf[..n]) {
+                Ok(Some(frame)) => {
+                    match serde_json::from_slice::<IpcRequest>(&frame) {
                         Ok(req) => {
                             let response = Self::process_request(
                                 req,
@@ -141,6 +176,8 @@ impl IpcServer {
         inboxes: &InboxRegistry,
         role: &str,
         conn_id: Uuid,
+        guest_id: &str,
+        supported_tools: &[String],
         tx: &mpsc::UnboundedSender<IpcResponse>,
         subscribed_roles: &mut Vec<String>,
     ) {
@@ -149,6 +186,8 @@ impl IpcServer {
         if !entry.iter().any(|subscriber| subscriber.conn_id == conn_id) {
             entry.push(RoleSubscriber {
                 conn_id,
+                guest_id: guest_id.to_string(),
+                supported_tools: supported_tools.to_vec(),
                 tx: tx.clone(),
             });
         }
@@ -211,13 +250,27 @@ impl IpcServer {
         match req {
             IpcRequest::Register(identity) => {
                 info!("Guest registered over UDS: [{}] Role: {}", identity.guest_id, identity.role);
-                Self::add_subscription(inboxes, &identity.role, conn_id, outbound_tx, subscribed_roles).await;
+                Self::add_subscription(
+                    inboxes,
+                    &identity.role,
+                    conn_id,
+                    &identity.guest_id,
+                    &identity.supported_tools,
+                    outbound_tx,
+                    subscribed_roles,
+                )
+                .await;
+                if identity.role == "tool" {
+                    if let Err(err) = Self::upsert_tool_runner_registry_entry(graph, &identity) {
+                        error!("Failed to persist tool runner registry entry: {}", err);
+                    }
+                }
                 IpcResponse::success("reg", None)
             }
             IpcRequest::GetConfig { key } => {
                 info!("GetConfig requested: {}", key);
                 if let Some(session_id) = key.strip_prefix("__session_snapshot__:") {
-                    match Self::compose_session_snapshot(graph, session_id) {
+                    match Self::compose_session_snapshot(graph, inboxes, session_id).await {
                         Ok(value) => {
                             return IpcResponse::ConfigData {
                                 key,
@@ -410,7 +463,32 @@ impl IpcServer {
             }
             IpcRequest::SubscribeInbox { role } => {
                 info!("SubscribeInbox for role: {}", role);
-                Self::add_subscription(inboxes, &role, conn_id, outbound_tx, subscribed_roles).await;
+                let guest = {
+                    let guard = inboxes.lock().await;
+                    guard
+                        .values()
+                        .flat_map(|subscribers| subscribers.iter())
+                        .find(|subscriber| subscriber.conn_id == conn_id)
+                        .cloned()
+                };
+                let guest_id = guest
+                    .as_ref()
+                    .map(|subscriber| subscriber.guest_id.as_str())
+                    .unwrap_or("unknown");
+                let supported_tools = guest
+                    .as_ref()
+                    .map(|subscriber| subscriber.supported_tools.as_slice())
+                    .unwrap_or(&[]);
+                Self::add_subscription(
+                    inboxes,
+                    &role,
+                    conn_id,
+                    guest_id,
+                    supported_tools,
+                    outbound_tx,
+                    subscribed_roles,
+                )
+                .await;
                 IpcResponse::success("sub", None)
             }
             IpcRequest::SyncApartment { agent_id, memory_type, content_json } => {
@@ -501,10 +579,15 @@ impl IpcServer {
 
         session.primary_agent_id = Some(agent_id.to_string());
         session.updated_at = now;
-        session.summary_json = serde_json::json!({
+        let mut summary_json = session.summary_json.clone();
+        if !summary_json.is_object() {
+            summary_json = serde_json::json!({});
+        }
+        summary_json["memory_checkpoint"] = serde_json::json!({
             "memory_type": memory_type,
             "checkpoint": content_json,
         });
+        session.summary_json = summary_json;
         let _ = graph.upsert_session(&session);
 
         let _ = graph.append_session_event(&SessionEventRecord {
@@ -565,12 +648,35 @@ impl IpcServer {
         if session.channel_session_key.is_none() {
             session.channel_session_key = envelope.chat_id.clone();
         }
+        if let Some(session_status) = payload.get("session_status").and_then(serde_json::Value::as_str)
+        {
+            session.status = session_status.to_string();
+        }
         if let Some(approval_policy) = payload.get("approval_policy") {
             let mut summary_json = session.summary_json.clone();
             if !summary_json.is_object() {
                 summary_json = serde_json::json!({});
             }
             summary_json["approval_policy"] = approval_policy.clone();
+            session.summary_json = summary_json;
+        }
+        if let Some(bindings) = payload.get("bindings") {
+            let mut summary_json = session.summary_json.clone();
+            if !summary_json.is_object() {
+                summary_json = serde_json::json!({});
+            }
+            summary_json["bindings"] = bindings.clone();
+            if payload.get("tool_assembly").is_none() {
+                summary_json["tool_assembly"] = compose_tool_assembly(bindings, &[], &[]);
+            }
+            session.summary_json = summary_json;
+        }
+        if let Some(tool_assembly) = payload.get("tool_assembly") {
+            let mut summary_json = session.summary_json.clone();
+            if !summary_json.is_object() {
+                summary_json = serde_json::json!({});
+            }
+            summary_json["tool_assembly"] = tool_assembly.clone();
             session.summary_json = summary_json;
         }
         session.updated_at = now;
@@ -646,6 +752,33 @@ impl IpcServer {
         );
     }
 
+    fn upsert_tool_runner_registry_entry(
+        graph: &dyn GraphStorage,
+        identity: &philotic_client::GuestIdentity,
+    ) -> anyhow::Result<()> {
+        let mut registry = load_tool_runner_registry(graph)?;
+        registry.retain(|entry| entry.guest_id != identity.guest_id);
+        registry.push(ToolRunnerRegistryEntry {
+            guest_id: identity.guest_id.clone(),
+            supported_tools: identity.supported_tools.clone(),
+            last_seen_at: unix_ts(),
+        });
+        registry.sort_by(|a, b| a.guest_id.cmp(&b.guest_id));
+        let registry_json = serde_json::Value::Array(
+            registry
+                .iter()
+                .map(|entry| {
+                    serde_json::json!({
+                        "guest_id": entry.guest_id,
+                        "supported_tools": entry.supported_tools,
+                        "last_seen_at": entry.last_seen_at,
+                    })
+                })
+                .collect(),
+        );
+        graph.set_config_value("tool_runner_registry", &registry_json.to_string())
+    }
+
     fn append_explicit_approval_events(
         graph: &dyn GraphStorage,
         session_id: &str,
@@ -697,6 +830,46 @@ impl IpcServer {
                 created_at: now,
             });
         }
+
+        if let Some(session_status) = payload.get("session_status") {
+            let _ = graph.append_session_event(&SessionEventRecord {
+                event_id: Uuid::new_v4().to_string(),
+                session_id: session_id.to_string(),
+                turn_id: turn_id.map(str::to_string),
+                component_id: component_id.to_string(),
+                kind: "session_status_changed".into(),
+                payload_json: session_status.clone(),
+                created_at: now,
+            });
+        }
+
+        if let Some(bindings) = payload.get("bindings") {
+            let _ = graph.append_session_event(&SessionEventRecord {
+                event_id: Uuid::new_v4().to_string(),
+                session_id: session_id.to_string(),
+                turn_id: turn_id.map(str::to_string),
+                component_id: component_id.to_string(),
+                kind: "session_bindings_updated".into(),
+                payload_json: bindings.clone(),
+                created_at: now,
+            });
+        }
+
+        if let Some(tool_assembly) = payload.get("tool_assembly").cloned().or_else(|| {
+            payload
+                .get("bindings")
+                .map(|bindings| compose_tool_assembly(bindings, &[], &[]))
+        }) {
+            let _ = graph.append_session_event(&SessionEventRecord {
+                event_id: Uuid::new_v4().to_string(),
+                session_id: session_id.to_string(),
+                turn_id: turn_id.map(str::to_string),
+                component_id: component_id.to_string(),
+                kind: "tool_assembly_updated".into(),
+                payload_json: tool_assembly,
+                created_at: now,
+            });
+        }
     }
 
     fn extract_session_envelope(payload: &serde_json::Value) -> SessionEnvelope {
@@ -738,8 +911,9 @@ impl IpcServer {
         }
     }
 
-    fn compose_session_snapshot(
+    async fn compose_session_snapshot(
         graph: &dyn GraphStorage,
+        inboxes: &InboxRegistry,
         session_id: &str,
     ) -> anyhow::Result<Option<serde_json::Value>> {
         let Some(session) = graph.get_session(session_id)? else {
@@ -784,6 +958,16 @@ impl IpcServer {
             .cloned()
             .unwrap_or(serde_json::Value::Null);
 
+        let bindings = session
+            .summary_json
+            .get("bindings")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let registered_runners = load_tool_runner_registry(graph)?;
+        let tool_runners = live_tool_runners(inboxes).await;
+        let tool_assembly = compose_tool_assembly(&bindings, &registered_runners, &tool_runners);
+        let tool_runner_registry = merge_tool_runners(&registered_runners, &tool_runners);
+
         Ok(Some(serde_json::json!({
             "session_id": session.session_id,
             "agent_id": session.primary_agent_id,
@@ -795,11 +979,187 @@ impl IpcServer {
                 .get("approval_policy")
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({})),
+            "bindings": bindings,
+            "tool_assembly": tool_assembly,
+            "tool_runners": tool_runner_registry,
             "recent_turns": recent_turns,
             "active_turn": active_turn,
             "session_index": session_index,
         })))
     }
+}
+
+#[derive(Debug, Clone)]
+struct LiveToolRunner {
+    guest_id: String,
+    supported_tools: Vec<String>,
+}
+
+async fn live_tool_runners(inboxes: &InboxRegistry) -> Vec<LiveToolRunner> {
+    let guard = inboxes.lock().await;
+    let mut runners = Vec::new();
+
+    if let Some(subscribers) = guard.get("tool") {
+        for subscriber in subscribers {
+            if !runners
+                .iter()
+                .any(|existing: &LiveToolRunner| existing.guest_id == subscriber.guest_id)
+            {
+                runners.push(LiveToolRunner {
+                    guest_id: subscriber.guest_id.clone(),
+                    supported_tools: subscriber.supported_tools.clone(),
+                });
+            }
+        }
+    }
+
+    runners
+}
+
+fn load_tool_runner_registry(
+    graph: &dyn GraphStorage,
+) -> anyhow::Result<Vec<ToolRunnerRegistryEntry>> {
+    let Some(raw) = graph.get_config_value("tool_runner_registry")? else {
+        return Ok(Vec::new());
+    };
+    let value = serde_json::from_str::<serde_json::Value>(&raw).unwrap_or_else(|_| serde_json::json!([]));
+    let entries = value
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|entry| {
+            Some(ToolRunnerRegistryEntry {
+                guest_id: entry.get("guest_id")?.as_str()?.to_string(),
+                supported_tools: entry
+                    .get("supported_tools")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|tools| {
+                        tools
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
+                last_seen_at: entry
+                    .get("last_seen_at")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(entries)
+}
+
+fn merge_tool_runners(
+    registered_runners: &[ToolRunnerRegistryEntry],
+    live_runners: &[LiveToolRunner],
+) -> serde_json::Value {
+    let merged = registered_runners
+        .iter()
+        .map(|runner| {
+            let is_connected = live_runners
+                .iter()
+                .any(|live| live.guest_id == runner.guest_id);
+            serde_json::json!({
+                "guest_id": runner.guest_id,
+                "supported_tools": runner.supported_tools,
+                "last_seen_at": runner.last_seen_at,
+                "is_connected": is_connected,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::Value::Array(merged)
+}
+
+fn compose_tool_assembly(
+    bindings: &serde_json::Value,
+    registered_runners: &[ToolRunnerRegistryEntry],
+    live_runners: &[LiveToolRunner],
+) -> serde_json::Value {
+    let mut toolset = bindings
+        .get("effective_toolset")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if toolset.is_empty() {
+        toolset.push(serde_json::json!("echo"));
+    }
+
+    let tools_for_model = toolset
+        .iter()
+        .filter_map(|tool| tool.as_str())
+        .filter(|tool_name| {
+            registered_runners.iter().any(|runner| {
+                runner.supported_tools.is_empty()
+                    || runner.supported_tools.iter().any(|supported| supported == *tool_name)
+            })
+        })
+        .map(|tool_name| {
+            serde_json::json!({
+                "tool_name": tool_name,
+                "description": format!("Execute the {} tool.", tool_name),
+                "input_schema": {
+                    "type": "object"
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let execution_routes = toolset
+        .iter()
+        .filter_map(|tool| tool.as_str())
+        .filter_map(|tool_name| {
+            let registered = registered_runners.iter().find(|runner| {
+                runner.supported_tools.is_empty()
+                    || runner.supported_tools.iter().any(|supported| supported == tool_name)
+            })?;
+            let live_runner = live_runners.iter().find(|runner| {
+                runner.supported_tools.is_empty()
+                    || runner.supported_tools.iter().any(|supported| supported == tool_name)
+            });
+            Some((tool_name, registered, live_runner))
+        })
+        .map(|(tool_name, registered, live_runner)| {
+            (
+                tool_name.to_string(),
+                serde_json::json!({
+                    "target_node": "local-ansible-01",
+                    "target_role": format!("tool.{}", tool_name),
+                    "runner_id": live_runner
+                        .map(|runner| runner.guest_id.clone())
+                        .unwrap_or_else(|| registered.guest_id.clone()),
+                    "execution_mode": "ipc",
+                    "availability_state": if live_runner.is_some() {
+                        "live"
+                    } else {
+                        "materialization_required"
+                    }
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+
+    let policy_annotations = toolset
+        .iter()
+        .filter_map(|tool| tool.as_str())
+        .map(|tool_name| {
+            (
+                tool_name.to_string(),
+                serde_json::json!({
+                    "policy_class": format!("tool:{tool_name}"),
+                    "approval_required": false
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+
+    serde_json::json!({
+        "tools_for_model": tools_for_model,
+        "execution_routes": execution_routes,
+        "policy_annotations": policy_annotations,
+    })
 }
 
 fn unix_ts() -> u64 {
@@ -863,9 +1223,15 @@ mod tests {
 
     static IPC_TEST_ENV_LOCK: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
 
+    fn ipc_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        IPC_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
     #[tokio::test]
     async fn emit_task_is_delivered_to_registered_local_role() {
-        let _env_guard = IPC_TEST_ENV_LOCK.lock().expect("ipc env lock");
+        let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
         let (dispatcher_tx, mut dispatcher_rx) = mpsc::channel(8);
         let graph: Arc<dyn GraphStorage> = Arc::new(TestGraphStorage);
@@ -881,10 +1247,12 @@ mod tests {
         let agent_identity = GuestIdentity {
             guest_id: "agent-local".into(),
             role: "agent".into(),
+            supported_tools: Vec::new(),
         };
         let hegemon_identity = GuestIdentity {
             guest_id: "hegemon-local".into(),
             role: "hegemon".into(),
+            supported_tools: Vec::new(),
         };
 
         let mut agent = PhiloticClient::connect(agent_identity).await.expect("agent connect");
@@ -934,7 +1302,7 @@ mod tests {
 
     #[tokio::test]
     async fn emit_task_persists_session_and_turn_metadata() {
-        let _env_guard = IPC_TEST_ENV_LOCK.lock().expect("ipc env lock");
+        let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
@@ -951,6 +1319,7 @@ mod tests {
         let hegemon_identity = GuestIdentity {
             guest_id: "hegemon-local".into(),
             role: "hegemon".into(),
+            supported_tools: Vec::new(),
         };
         let mut hegemon = PhiloticClient::connect(hegemon_identity).await.expect("hegemon connect");
 
@@ -998,7 +1367,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_config_can_return_canonical_session_snapshot() {
-        let _env_guard = IPC_TEST_ENV_LOCK.lock().expect("ipc env lock");
+        let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
@@ -1044,6 +1413,7 @@ mod tests {
         let agent_identity = GuestIdentity {
             guest_id: "agent-local".into(),
             role: "agent".into(),
+            supported_tools: Vec::new(),
         };
         let mut agent = PhiloticClient::connect(agent_identity).await.expect("agent connect");
 
@@ -1079,7 +1449,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_snapshot_includes_approval_policy_from_session_summary() {
-        let _env_guard = IPC_TEST_ENV_LOCK.lock().expect("ipc env lock");
+        let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
@@ -1116,6 +1486,7 @@ mod tests {
         let mut agent = PhiloticClient::connect(GuestIdentity {
             guest_id: "agent-local".into(),
             role: "agent".into(),
+            supported_tools: Vec::new(),
         })
         .await
         .expect("agent connect");
@@ -1148,8 +1519,234 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_snapshot_includes_bindings_and_status_from_session_summary() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
+        let server = IpcServer::new(socket_path.clone(), dispatcher_tx, graph);
+
+        graph_store
+            .upsert_session(&SessionRecord {
+                session_id: "sess-bindings".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("123".into()),
+                status: "paused".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "bindings": {
+                        "effective_toolset": ["echo"],
+                        "effective_skillset": ["planning"],
+                        "effective_workspace_ref": "workspace://main",
+                        "effective_model_controller": "gemini-flash"
+                    }
+                }),
+                created_at: 1,
+                updated_at: 2,
+            })
+            .expect("session should seed");
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe { std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path); }
+
+        let mut agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("agent connect");
+        let mut tool = PhiloticClient::connect(GuestIdentity {
+            guest_id: "tool-runner-local".into(),
+            role: "tool".into(),
+            supported_tools: vec!["echo".into()],
+        })
+        .await
+        .expect("tool connect");
+        tool
+            .send_request(IpcRequest::SubscribeInbox {
+                role: "tool.echo".into(),
+            })
+            .await
+            .expect("tool subscribe");
+
+        let response = agent
+            .send_request(IpcRequest::GetConfig {
+                key: "__session_snapshot__:sess-bindings".into(),
+            })
+            .await
+            .expect("snapshot request should succeed");
+
+        match response {
+            IpcResponse::ConfigData {
+                value_json: Some(value_json),
+                ..
+            } => {
+                let snapshot: serde_json::Value =
+                    serde_json::from_str(&value_json).expect("snapshot should decode");
+                assert_eq!(snapshot["status"], "paused");
+                assert_eq!(snapshot["bindings"]["effective_toolset"][0], "echo");
+                assert_eq!(snapshot["tool_assembly"]["tools_for_model"][0]["tool_name"], "echo");
+                assert_eq!(snapshot["tool_assembly"]["execution_routes"]["echo"]["target_role"], "tool.echo");
+                assert_eq!(snapshot["tool_runners"][0]["guest_id"], "tool-runner-local");
+                assert_eq!(snapshot["tool_runners"][0]["is_connected"], true);
+                assert_eq!(
+                    snapshot["bindings"]["effective_workspace_ref"],
+                    "workspace://main"
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        unsafe { std::env::remove_var("PHILOTIC_HOTEL_SOCKET"); }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_runner_registration_persists_durable_registry() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
+        let server = IpcServer::new(socket_path.clone(), dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe { std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path); }
+
+        let _tool = PhiloticClient::connect(GuestIdentity {
+            guest_id: "tool-runner-local".into(),
+            role: "tool".into(),
+            supported_tools: vec!["echo".into()],
+        })
+        .await
+        .expect("tool connect");
+
+        let raw = graph_store
+            .get_config_value("tool_runner_registry")
+            .expect("registry lookup should work")
+            .expect("registry should exist");
+        let registry: serde_json::Value =
+            serde_json::from_str(&raw).expect("registry should decode");
+        assert_eq!(registry[0]["guest_id"], "tool-runner-local");
+        assert_eq!(registry[0]["supported_tools"][0], "echo");
+
+        unsafe { std::env::remove_var("PHILOTIC_HOTEL_SOCKET"); }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn session_snapshot_marks_registered_but_offline_tools_as_materialization_required() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
+        let server = IpcServer::new(socket_path.clone(), dispatcher_tx, graph);
+
+        graph_store
+            .upsert_session(&SessionRecord {
+                session_id: "sess-dormant-runner".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("123".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "bindings": {
+                        "effective_toolset": ["echo"]
+                    }
+                }),
+                created_at: 1,
+                updated_at: 2,
+            })
+            .expect("session should seed");
+        graph_store
+            .set_config_value(
+                "tool_runner_registry",
+                &serde_json::json!([
+                    {
+                        "guest_id": "tool-runner-local",
+                        "supported_tools": ["echo"],
+                        "last_seen_at": 42
+                    }
+                ])
+                .to_string(),
+            )
+            .expect("registry should seed");
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe { std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path); }
+
+        let mut agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("agent connect");
+
+        let response = agent
+            .send_request(IpcRequest::GetConfig {
+                key: "__session_snapshot__:sess-dormant-runner".into(),
+            })
+            .await
+            .expect("snapshot request should succeed");
+
+        match response {
+            IpcResponse::ConfigData {
+                value_json: Some(value_json),
+                ..
+            } => {
+                let snapshot: serde_json::Value =
+                    serde_json::from_str(&value_json).expect("snapshot should decode");
+                assert_eq!(snapshot["tool_assembly"]["tools_for_model"][0]["tool_name"], "echo");
+                assert_eq!(
+                    snapshot["tool_assembly"]["execution_routes"]["echo"]["availability_state"],
+                    "materialization_required"
+                );
+                assert_eq!(snapshot["tool_runners"][0]["is_connected"], false);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        unsafe { std::env::remove_var("PHILOTIC_HOTEL_SOCKET"); }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
     async fn session_snapshot_uses_per_session_checkpoint_when_agent_has_multiple_sessions() {
-        let _env_guard = IPC_TEST_ENV_LOCK.lock().expect("ipc env lock");
+        let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
@@ -1248,6 +1845,7 @@ mod tests {
         let mut agent = PhiloticClient::connect(GuestIdentity {
             guest_id: "agent-local".into(),
             role: "agent".into(),
+            supported_tools: Vec::new(),
         })
         .await
         .expect("agent connect");
@@ -1284,7 +1882,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_task_with_approval_metadata_writes_explicit_approval_events() {
-        let _env_guard = IPC_TEST_ENV_LOCK.lock().expect("ipc env lock");
+        let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
@@ -1301,6 +1899,7 @@ mod tests {
         let mut agent = PhiloticClient::connect(GuestIdentity {
             guest_id: "agent-local".into(),
             role: "agent".into(),
+            supported_tools: Vec::new(),
         })
         .await
         .expect("agent connect");
@@ -1349,7 +1948,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_task_with_approval_policy_updates_session_summary_and_event_log() {
-        let _env_guard = IPC_TEST_ENV_LOCK.lock().expect("ipc env lock");
+        let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
@@ -1366,6 +1965,7 @@ mod tests {
         let mut agent = PhiloticClient::connect(GuestIdentity {
             guest_id: "agent-local".into(),
             role: "agent".into(),
+            supported_tools: Vec::new(),
         })
         .await
         .expect("agent connect");
@@ -1411,8 +2011,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_task_with_session_status_and_bindings_updates_session_summary_and_event_log() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
+        let server = IpcServer::new(socket_path.clone(), dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe { std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path); }
+
+        let mut agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("agent connect");
+
+        agent
+            .send_request(IpcRequest::UpdateTask {
+                task_id: Uuid::new_v4(),
+                state: "session_status_updated".into(),
+                payload: serde_json::json!({
+                    "session_id": "sess-lifecycle",
+                    "turn_id": "turn-lifecycle-1",
+                    "chat_id": "123",
+                    "session_status": "paused",
+                    "bindings": {
+                        "effective_toolset": ["echo"],
+                        "effective_skillset": ["planning"],
+                        "effective_workspace_ref": "workspace://main",
+                        "effective_model_controller": "gemini-flash"
+                    },
+                    "action": "session_status_update"
+                }),
+            })
+            .await
+            .expect("update task should succeed");
+
+        let session = graph_store
+            .get_session("sess-lifecycle")
+            .expect("session lookup should work")
+            .expect("session should exist");
+        assert_eq!(session.status, "paused");
+        assert_eq!(session.summary_json["bindings"]["effective_toolset"][0], "echo");
+        assert!(session.summary_json["tool_assembly"]["execution_routes"]["echo"].is_null());
+
+        let events = graph_store
+            .list_session_events("sess-lifecycle", 20)
+            .expect("event listing should work");
+        assert!(events.iter().any(|event| event.kind == "session_status_changed"));
+        assert!(events.iter().any(|event| event.kind == "session_bindings_updated"));
+        assert!(events.iter().any(|event| event.kind == "tool_assembly_updated"));
+
+        unsafe { std::env::remove_var("PHILOTIC_HOTEL_SOCKET"); }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
     async fn e2e_session_round_trip_persists_and_delivers_reply() {
-        let _env_guard = IPC_TEST_ENV_LOCK.lock().expect("ipc env lock");
+        let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
         let (dispatcher_tx, mut dispatcher_rx) = mpsc::channel(16);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
@@ -1429,18 +2097,21 @@ mod tests {
         let mut hegemon = PhiloticClient::connect(GuestIdentity {
             guest_id: "hegemon-local".into(),
             role: "hegemon".into(),
+            supported_tools: Vec::new(),
         })
         .await
         .expect("hegemon connect");
         let mut agent = PhiloticClient::connect(GuestIdentity {
             guest_id: "agent-local".into(),
             role: "agent".into(),
+            supported_tools: Vec::new(),
         })
         .await
         .expect("agent connect");
         let mut model = PhiloticClient::connect(GuestIdentity {
             guest_id: "model-local".into(),
             role: "model".into(),
+            supported_tools: Vec::new(),
         })
         .await
         .expect("model connect");
@@ -1657,7 +2328,7 @@ mod tests {
 
     #[tokio::test]
     async fn e2e_structured_tool_call_round_trip_persists_and_delivers_reply() {
-        let _env_guard = IPC_TEST_ENV_LOCK.lock().expect("ipc env lock");
+        let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
         let (dispatcher_tx, mut dispatcher_rx) = mpsc::channel(16);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
@@ -1674,18 +2345,21 @@ mod tests {
         let mut hegemon = PhiloticClient::connect(GuestIdentity {
             guest_id: "hegemon-local".into(),
             role: "hegemon".into(),
+            supported_tools: Vec::new(),
         })
         .await
         .expect("hegemon connect");
         let mut agent = PhiloticClient::connect(GuestIdentity {
             guest_id: "agent-local".into(),
             role: "agent".into(),
+            supported_tools: Vec::new(),
         })
         .await
         .expect("agent connect");
         let mut model = PhiloticClient::connect(GuestIdentity {
             guest_id: "model-local".into(),
             role: "model".into(),
+            supported_tools: Vec::new(),
         })
         .await
         .expect("model connect");

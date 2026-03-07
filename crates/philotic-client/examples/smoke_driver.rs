@@ -20,6 +20,7 @@ async fn main() -> Result<()> {
     let mut client = PhiloticClient::connect(GuestIdentity {
         guest_id: "smoke-driver-hegemon".into(),
         role: "hegemon".into(),
+        supported_tools: Vec::new(),
     })
     .await
     .with_context(|| format!("failed to connect smoke driver to {socket_path}"))?;

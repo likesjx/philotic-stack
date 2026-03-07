@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use uuid::Uuid;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -10,6 +11,8 @@ use tracing::{info, debug};
 pub struct GuestIdentity {
     pub guest_id: String,
     pub role: String,
+    #[serde(default)]
+    pub supported_tools: Vec<String>,
 }
 
 /// Represents the types of operations a Guest can perform locally over IPC to the Ansible Hotel.
@@ -106,9 +109,38 @@ pub struct IpcPushEvent {
 pub struct PhiloticClient {
     stream: UnixStream,
     _identity: GuestIdentity,
+    pending_push: VecDeque<IpcResponse>,
 }
 
 impl PhiloticClient {
+    async fn write_frame(&mut self, payload: &[u8]) -> Result<()> {
+        let len = u32::try_from(payload.len()).context("IPC payload too large")?;
+        self.stream
+            .write_all(&len.to_be_bytes())
+            .await
+            .context("Failed to send IPC frame header to Ansible")?;
+        self.stream
+            .write_all(payload)
+            .await
+            .context("Failed to send IPC frame payload to Ansible")?;
+        Ok(())
+    }
+
+    async fn read_frame(&mut self) -> Result<Vec<u8>> {
+        let mut len_buf = [0u8; 4];
+        self.stream
+            .read_exact(&mut len_buf)
+            .await
+            .context("Failed to receive IPC frame header")?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut buf = vec![0u8; len];
+        self.stream
+            .read_exact(&mut buf)
+            .await
+            .context("Failed to receive IPC frame payload")?;
+        Ok(buf)
+    }
+
     fn socket_path() -> String {
         std::env::var("PHILOTIC_HOTEL_SOCKET")
             .unwrap_or_else(|_| "/tmp/philotic-ansible.sock".to_string())
@@ -127,6 +159,7 @@ impl PhiloticClient {
         let mut client = Self {
             stream,
             _identity: identity.clone(),
+            pending_push: VecDeque::new(),
         };
         
         // Execute the Registration Handshake
@@ -152,36 +185,46 @@ impl PhiloticClient {
     /// Send an IPC request to the local Ansible
     pub async fn send_request(&mut self, req: IpcRequest) -> Result<IpcResponse> {
         let payload = serde_json::to_vec(&req).context("Failed to serialize IpcRequest")?;
-        self.stream
-            .write_all(&payload)
-            .await
-            .context("Failed to send IPC request to Ansible")?;
+        self.write_frame(&payload).await?;
 
-        // Wait for Ack
-        let mut buf = vec![0u8; 65535];
-        let len = self.stream.read(&mut buf).await.context("Failed to receive IPC response")?;
-        if len == 0 {
-            anyhow::bail!("Hotel closed the IPC connection");
+        loop {
+            let resp = self.read_response().await?;
+            if Self::is_push_message(&resp) {
+                self.pending_push.push_back(resp);
+                continue;
+            }
+            return Ok(resp);
         }
+    }
 
-        let resp: IpcResponse = serde_json::from_slice(&buf[..len])
+    async fn read_response(&mut self) -> Result<IpcResponse> {
+        let buf = self.read_frame().await?;
+        let resp: IpcResponse = serde_json::from_slice(&buf)
             .context("Failed to decode IpcResponse from Ansible")?;
-            
+
         Ok(resp)
+    }
+
+    fn is_push_message(response: &IpcResponse) -> bool {
+        matches!(
+            response,
+            IpcResponse::InboundTask { .. } | IpcResponse::ApartmentUpdate { .. }
+        )
     }
     
     /// Poll for inbound tasks routed from the Philotic Web
     pub async fn recv_task(&mut self) -> Result<IpcResponse> {
-        let mut buf = vec![0u8; 65535];
-        let len = self.stream.read(&mut buf).await.context("Failed to receive IPC task/response")?;
-        if len == 0 {
-            anyhow::bail!("Hotel closed the IPC connection");
+        if let Some(pending) = self.pending_push.pop_front() {
+            return Ok(pending);
         }
-        
-        let resp: IpcResponse = serde_json::from_slice(&buf[..len])
-            .context("Failed to decode IpcResponse from Ansible")?;
-            
-        Ok(resp)
+
+        loop {
+            let resp = self.read_response().await?;
+            if Self::is_push_message(&resp) {
+                return Ok(resp);
+            }
+            anyhow::bail!("Unexpected non-push IPC response while waiting for inbound task: {:?}", resp);
+        }
     }
 
     /// Write a memory apartment update to the hotel and consume the response so the IPC stream stays framed.
@@ -209,14 +252,46 @@ impl PhiloticClient {
 mod tests {
     use super::*;
     use std::path::Path;
+    use std::sync::{LazyLock, Mutex as StdMutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixListener;
+
+    static IPC_TEST_ENV_LOCK: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
+
+    fn ipc_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        IPC_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
 
     fn test_socket_path() -> String {
         format!("/tmp/pc-{}.sock", Uuid::new_v4().simple())
     }
 
+    async fn read_frame(stream: &mut tokio::net::UnixStream) -> Vec<u8> {
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await.expect("read frame header");
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut buf = vec![0u8; len];
+        stream.read_exact(&mut buf).await.expect("read frame payload");
+        buf
+    }
+
+    async fn write_frame(stream: &mut tokio::net::UnixStream, payload: &[u8]) {
+        let len = u32::try_from(payload.len()).expect("frame length");
+        stream
+            .write_all(&len.to_be_bytes())
+            .await
+            .expect("write frame header");
+        stream
+            .write_all(payload)
+            .await
+            .expect("write frame payload");
+    }
+
     #[tokio::test]
     async fn connect_and_get_config_over_uds() {
+        let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
         let listener = UnixListener::bind(&socket_path).expect("bind test socket");
 
@@ -224,32 +299,30 @@ mod tests {
             let socket_path = socket_path.clone();
             async move {
                 let (mut stream, _) = listener.accept().await.expect("accept client");
-                let mut buf = vec![0u8; 65535];
 
-                let len = stream.read(&mut buf).await.expect("read register");
-                let req: IpcRequest = serde_json::from_slice(&buf[..len]).expect("decode register");
+                let buf = read_frame(&mut stream).await;
+                let req: IpcRequest = serde_json::from_slice(&buf).expect("decode register");
                 match req {
                     IpcRequest::Register(identity) => assert_eq!(identity.guest_id, "guest-test-1"),
                     other => panic!("unexpected register request: {other:?}"),
                 }
-                stream
-                    .write_all(&serde_json::to_vec(&IpcResponse::success("reg", None)).unwrap())
-                    .await
-                    .expect("write register response");
+                write_frame(
+                    &mut stream,
+                    &serde_json::to_vec(&IpcResponse::success("reg", None)).unwrap(),
+                )
+                .await;
 
-                let len = stream.read(&mut buf).await.expect("read get_config");
-                let req: IpcRequest = serde_json::from_slice(&buf[..len]).expect("decode get_config");
+                let buf = read_frame(&mut stream).await;
+                let req: IpcRequest = serde_json::from_slice(&buf).expect("decode get_config");
                 match req {
                     IpcRequest::GetConfig { key } => assert_eq!(key, "telegram_bot_token"),
                     other => panic!("unexpected config request: {other:?}"),
                 }
-                stream
-                    .write_all(&serde_json::to_vec(&IpcResponse::ConfigData {
+                write_frame(&mut stream, &serde_json::to_vec(&IpcResponse::ConfigData {
                         key: "telegram_bot_token".into(),
                         value_json: Some("\"secret-token\"".into()),
                     }).unwrap())
-                    .await
-                    .expect("write config response");
+                    .await;
 
                 let _ = std::fs::remove_file(&socket_path);
             }
@@ -260,6 +333,7 @@ mod tests {
         let identity = GuestIdentity {
             guest_id: "guest-test-1".into(),
             role: "test".into(),
+            supported_tools: Vec::new(),
         };
         let mut client = PhiloticClient::connect(identity).await.expect("connect client");
         let response = client
@@ -275,6 +349,100 @@ mod tests {
                 assert_eq!(value_json.as_deref(), Some("\"secret-token\""));
             }
             other => panic!("unexpected response: {other:?}"),
+        }
+
+        server.await.expect("join server");
+        unsafe { std::env::remove_var("PHILOTIC_HOTEL_SOCKET"); }
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn send_request_buffers_interleaved_push_messages() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+
+        let server = tokio::spawn({
+            let socket_path = socket_path.clone();
+            async move {
+                let (mut stream, _) = listener.accept().await.expect("accept client");
+                let buf = read_frame(&mut stream).await;
+                let _req: IpcRequest = serde_json::from_slice(&buf).expect("decode register");
+                write_frame(
+                    &mut stream,
+                    &serde_json::to_vec(&IpcResponse::success("reg", None)).unwrap(),
+                )
+                .await;
+
+                let buf = read_frame(&mut stream).await;
+                let req: IpcRequest = serde_json::from_slice(&buf).expect("decode get_config");
+                match req {
+                    IpcRequest::GetConfig { key } => assert_eq!(key, "interleaved"),
+                    other => panic!("unexpected config request: {other:?}"),
+                }
+
+                write_frame(
+                    &mut stream,
+                    &serde_json::to_vec(&IpcResponse::InboundTask {
+                            source_node: "local-ansible-01".into(),
+                            task_id: Uuid::nil(),
+                            task_json: serde_json::json!({
+                                "action": "send_reply",
+                                "content": "pushed first"
+                            })
+                            .to_string(),
+                        })
+                        .unwrap(),
+                )
+                .await;
+
+                write_frame(
+                    &mut stream,
+                    &serde_json::to_vec(&IpcResponse::ConfigData {
+                            key: "interleaved".into(),
+                            value_json: Some("\"ok\"".into()),
+                        })
+                        .unwrap(),
+                )
+                .await;
+
+                let _ = std::fs::remove_file(&socket_path);
+            }
+        });
+
+        unsafe { std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path); }
+
+        let identity = GuestIdentity {
+            guest_id: "guest-test-2".into(),
+            role: "test".into(),
+            supported_tools: Vec::new(),
+        };
+        let mut client = PhiloticClient::connect(identity).await.expect("connect client");
+        let response = client
+            .send_request(IpcRequest::GetConfig {
+                key: "interleaved".into(),
+            })
+            .await
+            .expect("send request");
+
+        match response {
+            IpcResponse::ConfigData { key, value_json } => {
+                assert_eq!(key, "interleaved");
+                assert_eq!(value_json.as_deref(), Some("\"ok\""));
+            }
+            other => panic!("unexpected config response: {other:?}"),
+        }
+
+        let pushed = client.recv_task().await.expect("receive buffered push");
+        match pushed {
+            IpcResponse::InboundTask { task_json, .. } => {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("decode pushed task");
+                assert_eq!(payload["content"], "pushed first");
+            }
+            other => panic!("unexpected pushed response: {other:?}"),
         }
 
         server.await.expect("join server");

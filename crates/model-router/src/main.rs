@@ -22,6 +22,7 @@ async fn main() -> Result<()> {
     let identity = GuestIdentity {
         guest_id: "model-router-gemini-01".into(),
         role: "model".into(),
+        supported_tools: Vec::new(),
     };
 
     let mut ipc_client = PhiloticClient::connect(identity).await?;

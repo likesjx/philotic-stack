@@ -45,13 +45,35 @@
 - [ ] Define approval interrupt/resume semantics.
 - [ ] Define loop event streaming and tracing payloads.
 
+## Next Project: Tool Assembly and Routed Execution
+
+- [ ] Review [TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md).
+- [ ] Review [TOOL_MANAGEMENT_PLANE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TOOL_MANAGEMENT_PLANE_PROPOSAL.md).
+- [ ] Review [RUNNER_ARTIFACT_BUILD_DISTRIBUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RUNNER_ARTIFACT_BUILD_DISTRIBUTION_PROPOSAL.md).
+- [ ] Introduce a first-class `ToolAssembly` model with model-facing tool definitions and runtime-facing execution routes.
+- [ ] Formalize the system tool management plane in the Context Graph:
+  - known tool runners
+  - abstract tools
+  - discovered hotel environments
+  - agent default toolsets
+  - session narrowing/hiding rules
+- [ ] Move real tool execution out of `agent-core` and behind routed tool runners/toolset components.
+- [ ] Add runner readiness/materialization checks during tool assembly.
+- [ ] Add environment-aware runner routing and materialization policy so tools can target non-IPC execution environments when needed.
+- [ ] Keep local config/session mutation commands in `agent-core`, but externalize real tool execution.
+- [ ] Return to skill design after tool assembly and routed execution boundaries are in place.
+
 ## Deferred Design Threads
 
 - [ ] Command Center / architect continuity: define how architecture-impact work should be surfaced to Aria once the new home is ready.
 - [ ] Fresh onboarding flow: design repo/bootstrap onboarding from scratch for a new operator or agent entering Philotic.
 - [ ] `openclaw.json` ingestion: define a migration/import path that can consume legacy agent manifests and materialize Philotic agents.
 - [ ] Context graph deployment model: decide local-first vs cloud-backed vs hybrid graph ownership, sync, and operational model.
+- [ ] Context graph decentralization: decide how much of the graph can be replicated/federated across hotels versus kept locally authoritative.
 - [ ] Approval UX evolution: add `/preapprove`, `/approval status`, `/approval reset`, and richer session policy editing for constrained transports like Telegram.
+- [ ] Tool runner lifecycle policy: define idle retention, sleep/teardown timing, wake-up thresholds, and environment-specific materialization rules for routed tools.
+- [ ] Runner artifact plane: define builder trust, sandboxing, testing, signing, release, and distribution policy for executable tool runners.
+- [ ] Memory consolidation / dreaming: define how short-term session state becomes long-term memory, including sleep/dream cycles, compaction, and candidate memory backends such as `scryper/miniminddb`.
 
 ## MVP 1: Single-Node Mesh & Basic Tools
 

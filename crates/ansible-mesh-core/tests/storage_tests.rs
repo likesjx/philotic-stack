@@ -888,6 +888,7 @@ mod ipc_serde_tests {
         let req = IpcRequest::Register(GuestIdentity {
             guest_id: "agent-01".into(),
             role: "agent".into(),
+            supported_tools: Vec::new(),
         });
         let rt = roundtrip_request(&req);
         match rt {

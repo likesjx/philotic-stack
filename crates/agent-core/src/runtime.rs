@@ -1,7 +1,7 @@
 use crate::commands::{parse_slash_command, SlashCommand};
 use crate::r#loop::{interpret_model_payload, interpret_tool_result, AgentAction, ApprovalRequest, ToolCall, ToolResult, TurnPhase};
-use crate::protocol::{FinalReplyPayload, InboundTaskPayload, ModelRequestPayload};
-use crate::session::{merge_session_index, SessionState, WorkingTurn};
+use crate::protocol::{FinalReplyPayload, InboundTaskPayload, ModelRequestPayload, ToolExecutionPayload};
+use crate::session::{merge_session_index, SessionState, ToolExecutionRoute, WorkingTurn};
 use anyhow::Result;
 use philotic_client::{IpcRequest, IpcResponse, PhiloticClient};
 use std::collections::HashMap;
@@ -44,6 +44,11 @@ impl AgentRuntime {
                                 error!("Failed to handle model response: {}", err);
                             }
                         }
+                        Ok(task) if task.is_tool_result() => {
+                            if let Err(err) = self.handle_tool_result(task).await {
+                                error!("Failed to handle tool result: {}", err);
+                            }
+                        }
                         Ok(task) => {
                             if let Err(err) = self.handle_user_message(task, task_id).await {
                                 error!("Failed to handle user message: {}", err);
@@ -84,6 +89,13 @@ impl AgentRuntime {
         if let Some(command) = parse_slash_command(&content) {
             match command {
                 SlashCommand::Ping => {}
+                SlashCommand::Status | SlashCommand::Pause | SlashCommand::Resume => {}
+                SlashCommand::ToolsAdd { .. }
+                | SlashCommand::ToolsClear
+                | SlashCommand::SkillsAdd { .. }
+                | SlashCommand::SkillsClear
+                | SlashCommand::WorkspaceSet { .. }
+                | SlashCommand::WorkspaceClear => {}
                 SlashCommand::Approve { .. } | SlashCommand::Deny { .. } => {
                     return self
                         .handle_approval_command(
@@ -103,7 +115,7 @@ impl AgentRuntime {
             }
         }
 
-        let (checkpoint_memory_type, checkpoint_json, index_state, model_prompt) = {
+        let (checkpoint_memory_type, checkpoint_json, index_state, model_prompt, tools_for_model) = {
             let state = self
                 .sessions
                 .entry(session_id.clone())
@@ -127,6 +139,7 @@ impl AgentRuntime {
                 state.checkpoint_json(),
                 state.clone(),
                 state.build_prompt(&content),
+                state.tool_assembly.tools_for_model.clone(),
             )
         };
 
@@ -141,14 +154,41 @@ impl AgentRuntime {
                     self.complete_local_command(session_id, turn_id, "pong".into())
                         .await
                 }
+                SlashCommand::Status
+                | SlashCommand::Pause
+                | SlashCommand::Resume
+                | SlashCommand::ToolsAdd { .. }
+                | SlashCommand::ToolsClear
+                | SlashCommand::SkillsAdd { .. }
+                | SlashCommand::SkillsClear
+                | SlashCommand::WorkspaceSet { .. }
+                | SlashCommand::WorkspaceClear => {
+                    self.handle_session_control_command(task_id, session_id, turn_id, chat_id, command)
+                        .await
+                }
                 SlashCommand::PreapproveThisSession
                 | SlashCommand::ApprovalStatus
                 | SlashCommand::ApprovalReset => {
-                    self.handle_session_policy_command(task_id, session_id, turn_id, chat_id, command)
+                    self.handle_session_control_command(task_id, session_id, turn_id, chat_id, command)
                         .await
                 }
                 SlashCommand::Approve { .. } | SlashCommand::Deny { .. } => Ok(()),
             };
+        }
+
+        if self
+            .sessions
+            .get(&session_id)
+            .map(|state| state.status == "paused")
+            .unwrap_or(false)
+        {
+            return self
+                .complete_local_command(
+                    session_id,
+                    turn_id,
+                    "Session is paused. Use /resume to continue.".into(),
+                )
+                .await;
         }
 
         let _ = self
@@ -190,6 +230,7 @@ impl AgentRuntime {
             turn_id,
             prompt: model_prompt,
             user_content: content,
+            tools_for_model,
             chat_id,
             reply_to: LOCAL_NODE.to_string(),
             reply_role: "agent".into(),
@@ -379,7 +420,68 @@ impl AgentRuntime {
             .await?;
         self.sync_session_index(&index_state).await?;
 
-        let tool_result = Self::execute_local_tool(&tool_call)?;
+        let (chat_id, final_reply_to, final_reply_role, route) = {
+            let Some(state) = self.sessions.get(&session_id) else {
+                warn!("Tool execution requested for unknown session {}", session_id);
+                return Ok(());
+            };
+            let route = match Self::execute_bound_tool(state, &tool_call) {
+                Ok(route) => route.clone(),
+                Err(err) => {
+                    return self
+                        .fail_active_turn(session_id, turn_id, err.to_string())
+                        .await;
+                }
+            };
+            let active_turn = state
+                .active_turn
+                .as_ref()
+                .expect("active turn should exist while routing tool call");
+            (
+                active_turn.chat_id.clone(),
+                active_turn.final_reply_to.clone(),
+                active_turn.final_reply_role.clone(),
+                route,
+            )
+        };
+
+        let tool_req = ToolExecutionPayload {
+            action: "execute_tool",
+            session_id,
+            turn_id,
+            chat_id,
+            tool_name: tool_call.tool_name,
+            arguments: tool_call.arguments,
+            reply_to: LOCAL_NODE.to_string(),
+            reply_role: "agent".into(),
+            final_reply_to,
+            final_reply_role,
+        };
+
+        self.ipc_client
+            .send_request(IpcRequest::EmitTask {
+                target_node: route.target_node,
+                target_role: route.target_role,
+                task_json: serde_json::to_string(&tool_req)?,
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    async fn handle_tool_result(&mut self, task: InboundTaskPayload) -> Result<()> {
+        let session_id = match task.session_id.as_deref().filter(|s| !s.is_empty()) {
+            Some(session_id) => session_id.to_string(),
+            None => return Ok(()),
+        };
+        let turn_id = match task.turn_id.as_deref().filter(|s| !s.is_empty()) {
+            Some(turn_id) => turn_id.to_string(),
+            None => return Ok(()),
+        };
+        let tool_result = ToolResult {
+            tool_name: task.tool_name.clone().unwrap_or_else(|| "unknown".into()),
+            content: task.content.clone().unwrap_or_default(),
+        };
 
         let (checkpoint_memory_type, checkpoint_json, index_state) = {
             let Some(state) = self.sessions.get_mut(&session_id) else {
@@ -643,6 +745,15 @@ impl AgentRuntime {
                     }
                 }
                 SlashCommand::Ping
+                | SlashCommand::Status
+                | SlashCommand::Pause
+                | SlashCommand::Resume
+                | SlashCommand::ToolsAdd { .. }
+                | SlashCommand::ToolsClear
+                | SlashCommand::SkillsAdd { .. }
+                | SlashCommand::SkillsClear
+                | SlashCommand::WorkspaceSet { .. }
+                | SlashCommand::WorkspaceClear
                 | SlashCommand::PreapproveThisSession
                 | SlashCommand::ApprovalStatus
                 | SlashCommand::ApprovalReset => {}
@@ -792,6 +903,15 @@ impl AgentRuntime {
                     .await?;
             }
             SlashCommand::Ping
+            | SlashCommand::Status
+            | SlashCommand::Pause
+            | SlashCommand::Resume
+            | SlashCommand::ToolsAdd { .. }
+            | SlashCommand::ToolsClear
+            | SlashCommand::SkillsAdd { .. }
+            | SlashCommand::SkillsClear
+            | SlashCommand::WorkspaceSet { .. }
+            | SlashCommand::WorkspaceClear
             | SlashCommand::PreapproveThisSession
             | SlashCommand::ApprovalStatus
             | SlashCommand::ApprovalReset => {}
@@ -875,12 +995,19 @@ impl AgentRuntime {
             })
             .await?;
 
+        let tools_for_model = self
+            .sessions
+            .get(&session_id)
+            .map(|state| state.tool_assembly.tools_for_model.clone())
+            .unwrap_or_default();
+
         let model_req = ModelRequestPayload {
             action: "generate_text",
             session_id,
             turn_id,
             prompt,
             user_content,
+            tools_for_model,
             chat_id,
             reply_to: LOCAL_NODE.to_string(),
             reply_role: "agent".into(),
@@ -898,7 +1025,7 @@ impl AgentRuntime {
         Ok(())
     }
 
-    async fn handle_session_policy_command(
+    async fn handle_session_control_command(
         &mut self,
         command_task_id: Uuid,
         session_id: String,
@@ -906,32 +1033,222 @@ impl AgentRuntime {
         command_chat_id: String,
         command: SlashCommand,
     ) -> Result<()> {
-        let (reply_content, policy_json, checkpoint_memory_type, checkpoint_json, index_state) = {
+        let (reply_content, update_state, payload, checkpoint_memory_type, checkpoint_json, index_state) = {
             let Some(state) = self.sessions.get_mut(&session_id) else {
                 warn!("Received session policy command for unknown session {}", session_id);
                 return Ok(());
             };
 
-            let reply_content = match command {
+            let (reply_content, update_state, payload) = match command {
+                SlashCommand::Status => (
+                    state.session_status_text(),
+                    "session_status_reported",
+                    serde_json::json!({
+                        "session_id": session_id,
+                        "turn_id": command_turn_id,
+                        "chat_id": command_chat_id,
+                        "session_status": state.status,
+                        "bindings": state.bindings,
+                        "tool_assembly": state.tool_assembly,
+                        "approval_policy": state.approval_policy,
+                    }),
+                ),
+                SlashCommand::Pause => {
+                    state.set_status("paused");
+                    (
+                        "Session paused.".to_string(),
+                        "session_status_updated",
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "turn_id": command_turn_id,
+                            "chat_id": command_chat_id,
+                            "session_status": "paused",
+                            "bindings": state.bindings,
+                            "tool_assembly": state.tool_assembly,
+                            "action": "session_status_update",
+                        }),
+                    )
+                }
+                SlashCommand::Resume => {
+                    state.set_status("active");
+                    (
+                        "Session resumed.".to_string(),
+                        "session_status_updated",
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "turn_id": command_turn_id,
+                            "chat_id": command_chat_id,
+                            "session_status": "active",
+                            "bindings": state.bindings,
+                            "tool_assembly": state.tool_assembly,
+                            "action": "session_status_update",
+                        }),
+                    )
+                }
+                SlashCommand::ToolsAdd { tool } => {
+                    state.add_tool_binding(tool);
+                    (
+                        format!(
+                            "Tool bindings updated: {}.",
+                            if state.bindings.effective_toolset.is_empty() {
+                                "default".to_string()
+                            } else {
+                                state.bindings.effective_toolset.join(", ")
+                            }
+                        ),
+                        "session_bindings_updated",
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "turn_id": command_turn_id,
+                            "chat_id": command_chat_id,
+                            "bindings": state.bindings,
+                            "tool_assembly": state.tool_assembly,
+                            "action": "session_bindings_update",
+                        }),
+                    )
+                }
+                SlashCommand::ToolsClear => {
+                    state.clear_tool_bindings();
+                    (
+                        "Tool bindings reset to default.".to_string(),
+                        "session_bindings_updated",
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "turn_id": command_turn_id,
+                            "chat_id": command_chat_id,
+                            "bindings": state.bindings,
+                            "tool_assembly": state.tool_assembly,
+                            "action": "session_bindings_update",
+                        }),
+                    )
+                }
+                SlashCommand::SkillsAdd { skill } => {
+                    state.add_skill_binding(skill);
+                    (
+                        format!(
+                            "Skill bindings updated: {}.",
+                            if state.bindings.effective_skillset.is_empty() {
+                                "default".to_string()
+                            } else {
+                                state.bindings.effective_skillset.join(", ")
+                            }
+                        ),
+                        "session_bindings_updated",
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "turn_id": command_turn_id,
+                            "chat_id": command_chat_id,
+                            "bindings": state.bindings,
+                            "tool_assembly": state.tool_assembly,
+                            "action": "session_bindings_update",
+                        }),
+                    )
+                }
+                SlashCommand::SkillsClear => {
+                    state.clear_skill_bindings();
+                    (
+                        "Skill bindings reset to default.".to_string(),
+                        "session_bindings_updated",
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "turn_id": command_turn_id,
+                            "chat_id": command_chat_id,
+                            "bindings": state.bindings,
+                            "tool_assembly": state.tool_assembly,
+                            "action": "session_bindings_update",
+                        }),
+                    )
+                }
+                SlashCommand::WorkspaceSet { workspace } => {
+                    state.set_workspace_binding(workspace);
+                    (
+                        format!(
+                            "Workspace binding updated: {}.",
+                            state.bindings.effective_workspace_ref.as_deref().unwrap_or("default")
+                        ),
+                        "session_bindings_updated",
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "turn_id": command_turn_id,
+                            "chat_id": command_chat_id,
+                            "bindings": state.bindings,
+                            "tool_assembly": state.tool_assembly,
+                            "action": "session_bindings_update",
+                        }),
+                    )
+                }
+                SlashCommand::WorkspaceClear => {
+                    state.clear_workspace_binding();
+                    (
+                        "Workspace binding reset to default.".to_string(),
+                        "session_bindings_updated",
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "turn_id": command_turn_id,
+                            "chat_id": command_chat_id,
+                            "bindings": state.bindings,
+                            "tool_assembly": state.tool_assembly,
+                            "action": "session_bindings_update",
+                        }),
+                    )
+                }
                 SlashCommand::PreapproveThisSession => {
                     state.set_preapprove_this_session();
-                    "Approval policy updated: this session is now pre-approved.".to_string()
+                    (
+                        "Approval policy updated: this session is now pre-approved.".to_string(),
+                        "session_policy_updated",
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "turn_id": command_turn_id,
+                            "chat_id": command_chat_id,
+                            "approval_policy": state.approval_policy,
+                            "action": "approval_policy_update",
+                        }),
+                    )
                 }
-                SlashCommand::ApprovalStatus => state.approval_policy_status_text(),
+                SlashCommand::ApprovalStatus => (
+                    state.approval_policy_status_text(),
+                    "session_policy_reported",
+                    serde_json::json!({
+                        "session_id": session_id,
+                        "turn_id": command_turn_id,
+                        "chat_id": command_chat_id,
+                        "approval_policy": state.approval_policy,
+                    }),
+                ),
                 SlashCommand::ApprovalReset => {
                     state.reset_approval_policy();
-                    "Approval policy reset for this session.".to_string()
+                    (
+                        "Approval policy reset for this session.".to_string(),
+                        "session_policy_updated",
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "turn_id": command_turn_id,
+                            "chat_id": command_chat_id,
+                            "approval_policy": state.approval_policy,
+                            "action": "approval_policy_update",
+                        }),
+                    )
                 }
                 SlashCommand::Ping
                 | SlashCommand::Approve { .. }
                 | SlashCommand::Deny { .. } => {
-                    "Unsupported session policy command.".to_string()
+                    (
+                        "Unsupported session control command.".to_string(),
+                        "session_control_unsupported",
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "turn_id": command_turn_id,
+                            "chat_id": command_chat_id,
+                        }),
+                    )
                 }
             };
 
             (
                 reply_content,
-                serde_json::to_value(&state.approval_policy)?,
+                update_state,
+                payload,
                 state.checkpoint_memory_type(),
                 state.checkpoint_json(),
                 state.clone(),
@@ -947,14 +1264,8 @@ impl AgentRuntime {
             .ipc_client
             .send_request(IpcRequest::UpdateTask {
                 task_id: command_task_id,
-                state: "session_policy_updated".into(),
-                payload: serde_json::json!({
-                    "session_id": session_id,
-                    "turn_id": command_turn_id,
-                    "chat_id": command_chat_id,
-                    "approval_policy": policy_json,
-                    "action": "approval_policy_update",
-                }),
+                state: update_state.into(),
+                payload,
             })
             .await?;
 
@@ -962,22 +1273,37 @@ impl AgentRuntime {
             .await
     }
 
-    fn execute_local_tool(tool_call: &ToolCall) -> Result<ToolResult> {
-        match tool_call.tool_name.as_str() {
-            "echo" => Ok(ToolResult {
-                tool_name: tool_call.tool_name.clone(),
-                content: tool_call
-                    .arguments
-                    .get("text")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            }),
-            _ => Ok(ToolResult {
-                tool_name: tool_call.tool_name.clone(),
-                content: "unsupported tool".into(),
-            }),
+    fn execute_bound_tool<'a>(
+        state: &'a SessionState,
+        tool_call: &ToolCall,
+    ) -> Result<&'a ToolExecutionRoute> {
+        if !state.tool_is_enabled(&tool_call.tool_name) {
+            anyhow::bail!(
+                "Tool {} is not enabled for this session",
+                tool_call.tool_name
+            );
         }
+        state
+            .resolve_tool_route(&tool_call.tool_name)
+            .and_then(|route| {
+                if route.availability_state != "live" {
+                    None
+                } else {
+                    Some(route)
+                }
+            })
+            .ok_or_else(|| {
+                if let Some(route) = state.resolve_tool_route(&tool_call.tool_name) {
+                    anyhow::anyhow!(
+                        "Tool {} requires runner materialization (availability: {}, runner: {})",
+                        tool_call.tool_name,
+                        route.availability_state,
+                        route.runner_id.as_deref().unwrap_or("unknown")
+                    )
+                } else {
+                    anyhow::anyhow!("Tool {} has no assembled execution route", tool_call.tool_name)
+                }
+            })
     }
 
     fn normalize_approval_request(mut approval: ApprovalRequest) -> ApprovalRequest {
@@ -1133,6 +1459,7 @@ mod tests {
             turn_id: "turn-1".into(),
             prompt: "hello".into(),
             user_content: "hello".into(),
+            tools_for_model: Vec::new(),
             chat_id: "123".into(),
             reply_to: LOCAL_NODE.into(),
             reply_role: "agent".into(),
@@ -1161,13 +1488,22 @@ mod tests {
     }
 
     #[test]
-    fn local_echo_tool_returns_requested_text() {
-        let result = super::AgentRuntime::execute_local_tool(&ToolCall {
+    fn bound_tool_execution_allows_listed_tools() {
+        let mut state = SessionState::new(
+            "sess-1".into(),
+            "agent-jane-01".into(),
+            "telegram".into(),
+        );
+        state.add_tool_binding("echo");
+        let route = super::AgentRuntime::execute_bound_tool(
+            &state,
+            &ToolCall {
                 tool_name: "echo".into(),
                 arguments: serde_json::json!({ "text": "hello" }),
-            })
-            .expect("echo tool should execute");
-        assert_eq!(result.content, "hello");
+            },
+        )
+        .expect("echo tool should be allowed");
+        assert_eq!(route.target_role, "tool");
     }
 
     #[test]
@@ -1198,5 +1534,48 @@ mod tests {
             reason: "deploy the thing".into(),
             approved_response: "Approved: deploy the thing".into(),
         }));
+    }
+
+    #[test]
+    fn bound_tool_execution_rejects_unlisted_tools() {
+        let mut state = SessionState::new(
+            "sess-1".into(),
+            "agent-jane-01".into(),
+            "telegram".into(),
+        );
+        state.add_tool_binding("echo");
+
+        let err = super::AgentRuntime::execute_bound_tool(
+            &state,
+            &ToolCall {
+                tool_name: "workspace.read".into(),
+                arguments: serde_json::json!({}),
+            },
+        )
+        .expect_err("tool should be blocked");
+        assert!(err.to_string().contains("not enabled"));
+    }
+
+    #[test]
+    fn bound_tool_execution_requires_live_route() {
+        let mut state = SessionState::new(
+            "sess-1".into(),
+            "agent-jane-01".into(),
+            "telegram".into(),
+        );
+        state.add_tool_binding("echo");
+        if let Some(route) = state.tool_assembly.execution_routes.get_mut("echo") {
+            route.availability_state = "materialization_required".into();
+        }
+
+        let err = super::AgentRuntime::execute_bound_tool(
+            &state,
+            &ToolCall {
+                tool_name: "echo".into(),
+                arguments: serde_json::json!({ "text": "hello" }),
+            },
+        )
+        .expect_err("dormant route should not execute");
+        assert!(err.to_string().contains("requires runner materialization"));
     }
 }

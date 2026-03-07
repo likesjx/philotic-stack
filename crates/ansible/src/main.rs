@@ -147,6 +147,21 @@ fn default_guest_seed(hotel_name: &str) -> Vec<GuestRecord> {
                 "command": "target/debug/model-router",
                 "args": [],
                 "env": {
+                    "PHILOTIC_HOTEL_SOCKET": socket_path.clone()
+                }
+            })
+            .to_string(),
+            is_active: true,
+            active_pid: None,
+        },
+        GuestRecord {
+            hotel_name: hotel_name.to_string(),
+            guest_id: format!("{hotel_name}:tool-runner"),
+            role: "tool".into(),
+            config_json: serde_json::json!({
+                "command": "target/debug/tool-runner",
+                "args": [],
+                "env": {
                     "PHILOTIC_HOTEL_SOCKET": socket_path
                 }
             })
@@ -651,12 +666,13 @@ mod tests {
     #[test]
     fn default_guest_seed_injects_hotel_socket_env() {
         let guests = default_guest_seed("beta-hotel");
-        assert_eq!(guests.len(), 3);
+        assert_eq!(guests.len(), 4);
         let config: serde_json::Value = serde_json::from_str(&guests[0].config_json).unwrap();
         assert_eq!(
             config["env"]["PHILOTIC_HOTEL_SOCKET"].as_str(),
             Some("/tmp/philotic-beta-hotel.sock")
         );
         assert!(guests.iter().all(|guest| guest.hotel_name == "beta-hotel"));
+        assert!(guests.iter().any(|guest| guest.role == "tool"));
     }
 }

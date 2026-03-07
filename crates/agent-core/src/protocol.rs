@@ -1,3 +1,4 @@
+use crate::session::ToolDefinition;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -17,6 +18,10 @@ pub struct InboundTaskPayload {
     #[serde(default)]
     pub content: Option<String>,
     #[serde(default)]
+    pub tool_name: Option<String>,
+    #[serde(default)]
+    pub arguments: Option<serde_json::Value>,
+    #[serde(default)]
     pub final_reply_to: Option<String>,
     #[serde(default)]
     pub final_reply_role: Option<String>,
@@ -29,6 +34,7 @@ pub struct ModelRequestPayload {
     pub turn_id: String,
     pub prompt: String,
     pub user_content: String,
+    pub tools_for_model: Vec<ToolDefinition>,
     pub chat_id: String,
     pub reply_to: String,
     pub reply_role: String,
@@ -45,9 +51,27 @@ pub struct FinalReplyPayload {
     pub content: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolExecutionPayload {
+    pub action: &'static str,
+    pub session_id: String,
+    pub turn_id: String,
+    pub chat_id: String,
+    pub tool_name: String,
+    pub arguments: serde_json::Value,
+    pub reply_to: String,
+    pub reply_role: String,
+    pub final_reply_to: String,
+    pub final_reply_role: String,
+}
+
 impl InboundTaskPayload {
     pub fn is_model_response(&self) -> bool {
         self.action.as_deref() == Some("model_response")
+    }
+
+    pub fn is_tool_result(&self) -> bool {
+        self.action.as_deref() == Some("tool_result")
     }
 
     pub fn session_id_or_default(&self, agent_id: &str) -> String {
@@ -75,6 +99,8 @@ mod tests {
             turn_id: None,
             chat_id: Some("1234".into()),
             content: Some("hello".into()),
+            tool_name: None,
+            arguments: None,
             final_reply_to: None,
             final_reply_role: None,
         };
@@ -95,10 +121,31 @@ mod tests {
             turn_id: None,
             chat_id: None,
             content: None,
+            tool_name: None,
+            arguments: None,
             final_reply_to: None,
             final_reply_role: None,
         };
 
         assert!(payload.is_model_response());
+    }
+
+    #[test]
+    fn tool_result_detection_is_action_based() {
+        let payload = InboundTaskPayload {
+            action: Some("tool_result".into()),
+            agent_action: None,
+            source: None,
+            session_id: None,
+            turn_id: None,
+            chat_id: None,
+            content: None,
+            tool_name: Some("echo".into()),
+            arguments: None,
+            final_reply_to: None,
+            final_reply_role: None,
+        };
+
+        assert!(payload.is_tool_result());
     }
 }

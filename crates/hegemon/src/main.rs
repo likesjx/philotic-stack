@@ -23,6 +23,7 @@ async fn main() -> Result<()> {
     let identity = GuestIdentity {
         guest_id: "hegemon-telegram-01".into(),
         role: "hegemon".into(),
+        supported_tools: Vec::new(),
     };
 
     let mut ipc_client = PhiloticClient::connect(identity).await?;

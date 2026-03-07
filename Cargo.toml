@@ -4,6 +4,7 @@ members = [
     "crates/hegemon",
     "crates/agent-core",
     "crates/model-router",
+    "crates/tool-runner",
     "crates/philotic-client",
     "crates/ansible-mesh-core",
 ]

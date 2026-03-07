@@ -1,0 +1,404 @@
+# Philotic Tool Assembly and Execution Proposal
+
+## Goal
+
+Define a tool model where:
+
+- the model sees abstract tools
+- the agent invokes abstract tools
+- the runtime resolves execution routing
+- concrete tool runners perform the work
+
+This keeps implementation details out of the model and out of most of `agent-core`.
+
+The model should not know whether a tool is:
+
+- local
+- remote
+- MCP-backed
+- another guest
+- lazily materialized
+- composed from multiple underlying systems
+
+If it has to know that, we have already leaked the wrong abstraction.
+
+## Core Recommendation
+
+Introduce a first-class `ToolAssembly` layer between session bindings and tool execution.
+
+That layer should:
+
+1. determine which tools are eligible for the session
+2. merge agent defaults and session overrides
+3. resolve execution routes for each eligible tool
+4. verify runner availability
+5. optionally materialize missing runners
+6. produce:
+   - a model-facing abstract tool catalog
+   - a runtime-facing execution routing table
+   - policy annotations for approval/governance
+
+Then:
+
+- `agent-core` plans with the abstract catalog
+- `agent-core` invokes tools through a runtime `ToolExecutor`
+- `ToolExecutor` dispatches to the resolved runner
+- the runner returns a normalized tool result
+
+## Architectural Layers
+
+### 1. Tool Definition Layer
+
+This is the abstract tool contract.
+
+Fields:
+
+- `tool_name`
+- description
+- input schema
+- output schema
+- policy class
+- capability tags
+
+Example:
+
+```json
+{
+  "tool_name": "workspace.read_file",
+  "description": "Read a file from the active workspace",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "path": { "type": "string" }
+    },
+    "required": ["path"]
+  },
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "content": { "type": "string" }
+    }
+  },
+  "policy_class": "workspace-read",
+  "tags": ["workspace", "read-only"]
+}
+```
+
+This is what the model should reason over.
+
+## 2. Tool Assembly Layer
+
+This is the runtime preparation phase that turns desired capability into executable capability.
+
+Inputs:
+
+- agent default tool families
+- session bindings
+- session approval policy
+- current hotel/runtime availability
+- available tool runners and their advertisements
+
+Outputs:
+
+- `tools_for_model`
+- `execution_routes`
+- `policy_annotations`
+- runner environment/materialization requirements
+
+Example:
+
+```json
+{
+  "tools_for_model": [
+    {
+      "tool_name": "workspace.read_file",
+      "description": "Read a file from the active workspace",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" }
+        },
+        "required": ["path"]
+      }
+    }
+  ],
+  "execution_routes": {
+    "workspace.read_file": {
+      "target_node": "local-ansible-01",
+      "target_role": "tool.workspace",
+      "runner_id": "workspace-runner-1",
+      "execution_mode": "ipc",
+      "availability_state": "live"
+    }
+  },
+  "policy_annotations": {
+    "workspace.read_file": {
+      "policy_class": "workspace-read",
+      "approval_required": false
+    }
+  }
+}
+```
+
+Only `tools_for_model` belongs in prompt/model context.
+
+`execution_routes` and runner details are runtime concerns.
+
+`execution_mode` must stay general. A routed tool may execute over:
+
+- local IPC
+- remote hotel IPC
+- mesh transport
+- MCP bridge
+- subprocess or container runtime
+
+Tool assembly therefore also needs to answer:
+
+- which environment the runner must materialize in
+- which transport is required to reach it
+- whether the runner is currently live or only registered/dormant
+
+## 3. Agent Tool Abstraction
+
+`agent-core` should not execute real tools directly.
+
+Instead it should:
+
+- receive an abstract tool call from the model
+- validate that the tool exists in the assembled catalog
+- hand it to a `ToolExecutor`
+- wait for a normalized result
+
+This means the agent should know:
+
+- abstract `tool_name`
+- normalized arguments
+
+It should not know:
+
+- process IDs
+- hotel routing specifics
+- whether the tool is local or remote
+- how the runner was materialized
+
+## 4. Tool Executor Layer
+
+The `ToolExecutor` is the adapter between abstract tool calls and concrete execution routes.
+
+Responsibilities:
+
+- look up the route for an abstract tool
+- confirm the route is still valid
+- request/ensure runner availability
+- dispatch the call
+- await a normalized result envelope
+
+This can begin as a runtime helper in `agent-core`, but it should conceptually be an execution client to hotel-owned routing metadata, not a pile of local tool implementations.
+
+It also needs enough policy to decide:
+
+- whether to wait for materialization
+- how long to wait
+- whether to retry in another environment
+- when to fail back to the agent with a materialization-needed result
+
+## 5. Tool Runner Layer
+
+A tool runner is a separate component/guest/process that actually performs tool work.
+
+Examples:
+
+- `tool.workspace`
+- `tool.shell`
+- `tool.remote`
+- `tool.ansible`
+- `tool.memory`
+
+Responsibilities:
+
+- advertise supported abstract tools
+- accept structured execution requests
+- execute the real work
+- return structured results/errors
+
+This is where implementation details live.
+
+## Session Relationship
+
+Session bindings define which tool families are intended to be available.
+
+Tool assembly turns those bindings into executable reality.
+
+So:
+
+- session bindings = capability intent
+- tool assembly = executable availability
+
+That distinction matters because a session can ask for a tool family before a runner is online, before routing is known, or before policy/availability checks are satisfied.
+
+## Approval Relationship
+
+Approval should act on abstract tool calls and policy classes, not on runner implementation details.
+
+Example:
+
+- model asks for `workspace.read_file`
+- assembly marks it `policy_class = workspace-read`
+- approval layer decides whether that class requires pause, pre-approval, or denial
+
+The user should approve:
+
+- “read from workspace”
+
+not:
+
+- “send IPC to `tool.workspace` on `local-ansible-01` with runner lease `abc123`”
+
+That would be technically rich and humanly useless.
+
+## Proposed Runtime Flow
+
+### 1. Session snapshot load
+
+`agent-core` loads canonical session snapshot:
+
+- session status
+- approval policy
+- effective bindings
+- recent turns
+
+### 2. Tool assembly
+
+Hotel/runtime assembles the session tool environment:
+
+- resolve tool definitions
+- resolve routes
+- verify runners
+- produce `ToolAssembly`
+
+### 3. Prompt construction
+
+`agent-core` includes only abstract tool definitions in the model-facing context.
+
+### 4. Tool call
+
+Model returns:
+
+```json
+{
+  "kind": "tool_call",
+  "tool_name": "workspace.read_file",
+  "arguments": {
+    "path": "README.md"
+  }
+}
+```
+
+### 5. Runtime resolution
+
+`ToolExecutor` uses `ToolAssembly.execution_routes["workspace.read_file"]`
+
+### 6. Dispatch
+
+Hotel routes to the concrete runner:
+
+- `target_role = tool.workspace`
+- `target_node = local-ansible-01`
+
+### 7. Result normalization
+
+Runner returns:
+
+```json
+{
+  "tool_name": "workspace.read_file",
+  "ok": true,
+  "content": {
+    "text": "..."
+  }
+}
+```
+
+### 8. Loop resume
+
+`agent-core` consumes normalized tool result and continues.
+
+## What Belongs Where
+
+### `agent-core`
+
+- tool planning
+- abstract tool invocation
+- waiting/resume behavior
+- normalized result handling
+
+### `ansible`
+
+- canonical session and binding ownership
+- tool assembly
+- runner discovery / routing
+- optional runner materialization
+- event persistence
+
+### tool runners
+
+- concrete execution
+
+## Skills in This Model
+
+Skills should not be the same thing as tool runners.
+
+Recommended distinction:
+
+- skills
+  - shape planning, strategy, and relevant capability families
+- tools
+  - executable abstract operations
+- runners
+  - concrete implementations of tools
+
+So skills come into play:
+
+1. during tool assembly
+   - deciding which tool families are relevant for the session
+2. during prompt construction
+   - steering how the agent thinks/plans
+3. later during loop policy
+   - e.g. `planner`, `executor`, `analyst`, `operator`
+
+Skills should not decide process routing directly.
+
+## Recommended First Implementation Slice
+
+### Phase 1
+
+- keep the current abstract tool-call contract
+- introduce a `ToolAssembly` struct
+- add hotel-composed `tools_for_model` and `execution_routes`
+- keep one simple externalized tool runner, even if it only wraps `echo`
+
+### Phase 2
+
+- replace local tool execution in `agent-core` with routed execution through `ToolExecutor`
+- persist tool request/result events explicitly
+
+### Phase 3
+
+- add runner discovery/materialization checks
+- add workspace tool family as a real external toolset
+
+## Full Recommendation
+
+- abstract tool use away from execution details
+- add a first-class `ToolAssembly` layer
+- make sessions define intended capability, not concrete implementation
+- make the hotel own route resolution and runner readiness
+- make tool runners separate components/processes
+- keep `agent-core` focused on planning and normalized orchestration
+
+That gives us the separation we actually want:
+
+- the model chooses *what*
+- the agent orchestrates *when and why*
+- the runtime decides *where*
+- the runner decides *how*

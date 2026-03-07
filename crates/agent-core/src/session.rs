@@ -34,23 +34,81 @@ pub struct ApprovalPolicy {
     pub preapproved_classes: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SessionBindings {
+    #[serde(default)]
+    pub effective_toolset: Vec<String>,
+    #[serde(default)]
+    pub effective_skillset: Vec<String>,
+    #[serde(default)]
+    pub effective_workspace_ref: Option<String>,
+    #[serde(default)]
+    pub effective_model_controller: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ToolDefinition {
+    pub tool_name: String,
+    pub description: String,
+    #[serde(default)]
+    pub input_schema: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ToolExecutionRoute {
+    pub target_node: String,
+    pub target_role: String,
+    #[serde(default)]
+    pub runner_id: Option<String>,
+    pub execution_mode: String,
+    #[serde(default = "default_route_availability")]
+    pub availability_state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ToolPolicyAnnotation {
+    pub policy_class: String,
+    pub approval_required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ToolAssembly {
+    #[serde(default)]
+    pub tools_for_model: Vec<ToolDefinition>,
+    #[serde(default)]
+    pub execution_routes: std::collections::BTreeMap<String, ToolExecutionRoute>,
+    #[serde(default)]
+    pub policy_annotations: std::collections::BTreeMap<String, ToolPolicyAnnotation>,
+}
+
+fn default_route_availability() -> String {
+    "live".into()
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionState {
     pub session_id: String,
     pub agent_id: String,
     pub source: String,
+    pub status: String,
     pub approval_policy: ApprovalPolicy,
+    pub bindings: SessionBindings,
+    pub tool_assembly: ToolAssembly,
     pub recent_turns: Vec<TurnRecord>,
     pub active_turn: Option<WorkingTurn>,
 }
 
 impl SessionState {
     pub fn new(session_id: String, agent_id: String, source: String) -> Self {
+        let bindings = SessionBindings::default();
         Self {
             session_id,
             agent_id,
             source,
+            status: "active".into(),
             approval_policy: ApprovalPolicy::default(),
+            tool_assembly: default_tool_assembly_for_bindings(&bindings),
+            bindings,
             recent_turns: Vec::new(),
             active_turn: None,
         }
@@ -122,6 +180,61 @@ impl SessionState {
         self.approval_policy = ApprovalPolicy::default();
     }
 
+    pub fn set_status(&mut self, status: impl Into<String>) {
+        self.status = status.into();
+    }
+
+    pub fn add_tool_binding(&mut self, tool: impl Into<String>) {
+        let tool = tool.into();
+        if !self.bindings.effective_toolset.iter().any(|existing| existing == &tool) {
+            self.bindings.effective_toolset.push(tool);
+            self.bindings.effective_toolset.sort();
+            self.rebuild_default_tool_assembly();
+        }
+    }
+
+    pub fn clear_tool_bindings(&mut self) {
+        self.bindings.effective_toolset.clear();
+        self.rebuild_default_tool_assembly();
+    }
+
+    pub fn add_skill_binding(&mut self, skill: impl Into<String>) {
+        let skill = skill.into();
+        if !self.bindings.effective_skillset.iter().any(|existing| existing == &skill) {
+            self.bindings.effective_skillset.push(skill);
+            self.bindings.effective_skillset.sort();
+        }
+    }
+
+    pub fn clear_skill_bindings(&mut self) {
+        self.bindings.effective_skillset.clear();
+    }
+
+    pub fn set_workspace_binding(&mut self, workspace: impl Into<String>) {
+        self.bindings.effective_workspace_ref = Some(workspace.into());
+    }
+
+    pub fn clear_workspace_binding(&mut self) {
+        self.bindings.effective_workspace_ref = None;
+    }
+
+    pub fn tool_is_enabled(&self, tool_name: &str) -> bool {
+        self.bindings.effective_toolset.is_empty()
+            || self
+                .bindings
+                .effective_toolset
+                .iter()
+                .any(|allowed| allowed == tool_name)
+    }
+
+    pub fn resolve_tool_route(&self, tool_name: &str) -> Option<&ToolExecutionRoute> {
+        self.tool_assembly.execution_routes.get(tool_name)
+    }
+
+    pub fn rebuild_default_tool_assembly(&mut self) {
+        self.tool_assembly = default_tool_assembly_for_bindings(&self.bindings);
+    }
+
     pub fn approval_policy_status_text(&self) -> String {
         if self.approval_policy.auto_approve_all {
             return "Approval policy: pre-approved for this session.".into();
@@ -146,6 +259,39 @@ impl SessionState {
         } else {
             format!("Approval policy: {}.", parts.join(" | "))
         }
+    }
+
+    pub fn session_status_text(&self) -> String {
+        let active_turn = self
+            .active_turn
+            .as_ref()
+            .map(|turn| format!("active turn {} ({})", turn.turn_id, turn.phase.as_str()))
+            .unwrap_or_else(|| "no active turn".into());
+        let toolset = if self.bindings.effective_toolset.is_empty() {
+            "default".into()
+        } else {
+            self.bindings.effective_toolset.join(", ")
+        };
+        let skillset = if self.bindings.effective_skillset.is_empty() {
+            "default".into()
+        } else {
+            self.bindings.effective_skillset.join(", ")
+        };
+        let workspace = self
+            .bindings
+            .effective_workspace_ref
+            .clone()
+            .unwrap_or_else(|| "default".into());
+        let controller = self
+            .bindings
+            .effective_model_controller
+            .clone()
+            .unwrap_or_else(|| "default".into());
+
+        format!(
+            "Session status: {}. {}. Toolset: {}. Skillset: {}. Workspace: {}. Model controller: {}.",
+            self.status, active_turn, toolset, skillset, workspace, controller
+        )
     }
 
     pub fn build_prompt(&self, user_content: &str) -> String {
@@ -190,6 +336,37 @@ impl SessionState {
             );
         }
 
+        prompt.push_str("\n[Session envelope]\n");
+        prompt.push_str(&format!("Session status: {}.\n", self.status));
+        if !self.bindings.effective_toolset.is_empty() {
+            prompt.push_str(&format!(
+                "Effective tools: {}.\n",
+                self.bindings.effective_toolset.join(", ")
+            ));
+        }
+        if !self.tool_assembly.tools_for_model.is_empty() {
+            let abstract_tools = self
+                .tool_assembly
+                .tools_for_model
+                .iter()
+                .map(|tool| tool.tool_name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            prompt.push_str(&format!("Abstract tools available: {}.\n", abstract_tools));
+        }
+        if !self.bindings.effective_skillset.is_empty() {
+            prompt.push_str(&format!(
+                "Effective skills: {}.\n",
+                self.bindings.effective_skillset.join(", ")
+            ));
+        }
+        if let Some(workspace) = &self.bindings.effective_workspace_ref {
+            prompt.push_str(&format!("Workspace: {}.\n", workspace));
+        }
+        if let Some(controller) = &self.bindings.effective_model_controller {
+            prompt.push_str(&format!("Model controller: {}.\n", controller));
+        }
+
         prompt.push_str("\n[Current user message]\n");
         prompt.push_str(user_content);
         prompt
@@ -215,7 +392,10 @@ impl SessionState {
             "session_id": self.session_id,
             "agent_id": self.agent_id,
             "source": self.source,
+            "status": self.status,
             "approval_policy": self.approval_policy,
+            "bindings": self.bindings,
+            "tool_assembly": self.tool_assembly,
             "active_turn": active_turn,
             "recent_turns": self.recent_turns.iter().map(|turn| {
                 json!({
@@ -266,11 +446,26 @@ impl SessionState {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("unknown")
             .to_string();
+        let status = checkpoint
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("active")
+            .to_string();
         let approval_policy = checkpoint
             .get("approval_policy")
             .cloned()
             .and_then(|value| serde_json::from_value::<ApprovalPolicy>(value).ok())
             .unwrap_or_default();
+        let bindings = checkpoint
+            .get("bindings")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<SessionBindings>(value).ok())
+            .unwrap_or_default();
+        let tool_assembly = checkpoint
+            .get("tool_assembly")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<ToolAssembly>(value).ok())
+            .unwrap_or_else(|| default_tool_assembly_for_bindings(&bindings));
 
         let recent_turns = checkpoint
             .get("recent_turns")
@@ -350,7 +545,10 @@ impl SessionState {
             session_id,
             agent_id,
             source,
+            status,
             approval_policy,
+            bindings,
+            tool_assembly,
             recent_turns,
             active_turn,
         })
@@ -390,6 +588,60 @@ pub fn merge_session_index(
     })
 }
 
+pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAssembly {
+    let toolset = if bindings.effective_toolset.is_empty() {
+        vec!["echo".to_string()]
+    } else {
+        bindings.effective_toolset.clone()
+    };
+
+    let tools_for_model = toolset
+        .iter()
+        .map(|tool_name| ToolDefinition {
+            tool_name: tool_name.clone(),
+            description: format!("Execute the {} tool.", tool_name),
+            input_schema: json!({
+                "type": "object"
+            }),
+        })
+        .collect::<Vec<_>>();
+
+    let execution_routes = toolset
+        .iter()
+        .map(|tool_name| {
+            (
+                tool_name.clone(),
+                ToolExecutionRoute {
+                    target_node: "local-ansible-01".into(),
+                    target_role: "tool".into(),
+                    runner_id: Some("tool-runner-01".into()),
+                    execution_mode: "ipc".into(),
+                    availability_state: "live".into(),
+                },
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    let policy_annotations = toolset
+        .iter()
+        .map(|tool_name| {
+            (
+                tool_name.clone(),
+                ToolPolicyAnnotation {
+                    policy_class: format!("tool:{tool_name}"),
+                    approval_required: false,
+                },
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    ToolAssembly {
+        tools_for_model,
+        execution_routes,
+        policy_annotations,
+    }
+}
+
 fn current_unix_ts() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -400,8 +652,8 @@ fn current_unix_ts() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        merge_session_index, session_checkpoint_memory_type, ApprovalPolicy, SessionState,
-        WorkingTurn,
+        merge_session_index, session_checkpoint_memory_type, ApprovalPolicy, SessionBindings,
+        SessionState, WorkingTurn,
     };
     use crate::r#loop::{ApprovalRequest, ToolCall, TurnPhase};
     use uuid::Uuid;
@@ -430,6 +682,7 @@ mod tests {
         assert_eq!(checkpoint["session_id"], "sess-1");
         assert_eq!(checkpoint["active_turn"]["turn_id"], "turn-1");
         assert_eq!(checkpoint["active_turn"]["phase"], "queued");
+        assert!(checkpoint["tool_assembly"].is_object());
     }
 
     #[test]
@@ -464,8 +717,15 @@ mod tests {
             "session_id": "sess-1",
             "agent_id": "agent-jane-01",
             "source": "telegram",
+            "status": "paused",
             "approval_policy": {
                 "auto_approve_all": true
+            },
+            "bindings": {
+                "effective_toolset": ["echo", "workspace.read"],
+                "effective_skillset": ["planning"],
+                "effective_workspace_ref": "workspace://main",
+                "effective_model_controller": "gemini-flash"
             },
             "active_turn": {
                 "turn_id": "turn-2",
@@ -495,12 +755,22 @@ mod tests {
 
         let state = SessionState::from_checkpoint(&checkpoint).expect("rehydrate state");
         assert_eq!(state.session_id, "sess-1");
+        assert_eq!(state.status, "paused");
         assert_eq!(
             state.approval_policy,
             ApprovalPolicy {
                 auto_approve_all: true,
                 preapproved_tools: Vec::new(),
                 preapproved_classes: Vec::new(),
+            }
+        );
+        assert_eq!(
+            state.bindings,
+            SessionBindings {
+                effective_toolset: vec!["echo".into(), "workspace.read".into()],
+                effective_skillset: vec!["planning".into()],
+                effective_workspace_ref: Some("workspace://main".into()),
+                effective_model_controller: Some("gemini-flash".into()),
             }
         );
         assert_eq!(state.recent_turns.len(), 1);
@@ -520,6 +790,18 @@ mod tests {
                 reason: "Need confirmation".into(),
                 approved_response: "Confirmed".into(),
             })
+        );
+        assert_eq!(
+            state.tool_assembly.tools_for_model[0].tool_name,
+            "echo"
+        );
+        assert_eq!(
+            state
+                .tool_assembly
+                .execution_routes
+                .get("echo")
+                .and_then(|route| route.runner_id.as_deref()),
+            Some("tool-runner-01")
         );
     }
 
@@ -557,6 +839,27 @@ mod tests {
     }
 
     #[test]
+    fn prompt_reflects_session_bindings_and_status() {
+        let mut state = SessionState::new(
+            "sess-1".into(),
+            "agent-jane-01".into(),
+            "telegram".into(),
+        );
+        state.status = "paused".into();
+        state.bindings = SessionBindings {
+            effective_toolset: vec!["echo".into()],
+            effective_skillset: vec!["planning".into()],
+            effective_workspace_ref: Some("workspace://main".into()),
+            effective_model_controller: Some("gemini-flash".into()),
+        };
+
+        let prompt = state.build_prompt("status");
+        assert!(prompt.contains("Session status: paused."));
+        assert!(prompt.contains("Effective tools: echo."));
+        assert!(prompt.contains("Workspace: workspace://main."));
+    }
+
+    #[test]
     fn status_text_reports_when_no_preapproval_exists() {
         let state = SessionState::new(
             "sess-1".into(),
@@ -567,6 +870,72 @@ mod tests {
             state.approval_policy_status_text(),
             "Approval policy: no pre-approvals configured."
         );
+    }
+
+    #[test]
+    fn session_status_text_reports_bindings() {
+        let mut state = SessionState::new(
+            "sess-1".into(),
+            "agent-jane-01".into(),
+            "telegram".into(),
+        );
+        state.status = "paused".into();
+        state.bindings.effective_toolset = vec!["echo".into()];
+        state.bindings.effective_skillset = vec!["planning".into()];
+        state.bindings.effective_workspace_ref = Some("workspace://main".into());
+        state.bindings.effective_model_controller = Some("gemini-flash".into());
+
+        let text = state.session_status_text();
+        assert!(text.contains("Session status: paused."));
+        assert!(text.contains("Toolset: echo."));
+        assert!(text.contains("Workspace: workspace://main."));
+    }
+
+    #[test]
+    fn tool_binding_gates_enabled_tools() {
+        let mut state = SessionState::new(
+            "sess-1".into(),
+            "agent-jane-01".into(),
+            "telegram".into(),
+        );
+        assert!(state.tool_is_enabled("echo"));
+        assert_eq!(
+            state
+                .resolve_tool_route("echo")
+                .map(|route| route.target_role.as_str()),
+            Some("tool")
+        );
+
+        state.add_tool_binding("echo");
+        assert!(state.tool_is_enabled("echo"));
+        assert!(!state.tool_is_enabled("workspace.read"));
+        assert_eq!(
+            state
+                .resolve_tool_route("echo")
+                .map(|route| route.target_role.as_str()),
+            Some("tool")
+        );
+    }
+
+    #[test]
+    fn skill_and_workspace_bindings_can_be_mutated() {
+        let mut state = SessionState::new(
+            "sess-1".into(),
+            "agent-jane-01".into(),
+            "telegram".into(),
+        );
+        state.add_skill_binding("planning");
+        state.set_workspace_binding("workspace://main");
+        assert_eq!(state.bindings.effective_skillset, vec!["planning"]);
+        assert_eq!(
+            state.bindings.effective_workspace_ref.as_deref(),
+            Some("workspace://main")
+        );
+
+        state.clear_skill_bindings();
+        state.clear_workspace_binding();
+        assert!(state.bindings.effective_skillset.is_empty());
+        assert!(state.bindings.effective_workspace_ref.is_none());
     }
 
     #[test]

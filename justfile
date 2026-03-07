@@ -29,6 +29,10 @@ start-agent:
 start-model:
     cargo run -p model-router
 
+# Start the Tool Runner
+start-tool:
+    cargo run -p tool-runner
+
 # Start the full stack in background (requires tmux or similar)
 start:
     @echo "Starting the Philotic Stack..."
@@ -53,6 +57,10 @@ test:
 smoke-binaries:
     ./scripts/smoke-binary-roundtrip.sh
 
+# Run the routed tool binary smoke test
+smoke-routed-tool:
+    ./scripts/smoke-routed-tool-roundtrip.sh
+
 # Run the approval interrupt binary smoke test
 smoke-approval:
     ./scripts/smoke-approval-roundtrip.sh
@@ -72,6 +80,14 @@ smoke-deny-redirect:
 # Run the preapproved session binary smoke test
 smoke-preapprove:
     ./scripts/smoke-preapprove-roundtrip.sh
+
+# Run the session lifecycle/control binary smoke test
+smoke-session-control:
+    ./scripts/smoke-session-control-roundtrip.sh
+
+# Run the session bindings binary smoke test
+smoke-session-bindings:
+    ./scripts/smoke-session-bindings-roundtrip.sh
 
 # Show configured Ansible inventory for deployment targets
 ansible-inventory:
