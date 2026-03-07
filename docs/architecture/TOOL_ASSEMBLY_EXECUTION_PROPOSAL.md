@@ -111,6 +111,7 @@ This is the runtime preparation phase that turns desired capability into executa
 Inputs:
 
 - agent default tool families
+- allowed runner incarnations
 - session bindings
 - session approval policy
 - current hotel/runtime availability
@@ -207,11 +208,20 @@ Responsibilities:
 
 - look up the route for an abstract tool
 - confirm the route is still valid
+- resolve the chosen incarnation, not just the abstract runner artifact
 - request/ensure runner availability
 - dispatch the call
 - await a normalized result envelope
 
 This can begin as a runtime helper in `agent-core`, but it should conceptually be an execution client to hotel-owned routing metadata, not a pile of local tool implementations.
+
+The longer-term routing model should distinguish:
+
+- runner artifact
+- runner incarnation
+- environment
+
+so execution can target the correct runnable instance instead of pretending every offered tool maps directly to one generic runner.
 
 It also needs enough policy to decide:
 

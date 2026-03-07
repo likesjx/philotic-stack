@@ -53,6 +53,7 @@
 - [ ] Introduce a first-class `ToolAssembly` model with model-facing tool definitions and runtime-facing execution routes.
 - [ ] Formalize the system tool management plane in the Context Graph:
   - known tool runners
+  - runner incarnations
   - abstract tools
   - discovered hotel environments
   - agent default toolsets

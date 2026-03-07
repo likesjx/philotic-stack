@@ -23,17 +23,19 @@ Track the remaining work in [task.md](/Users/jaredlikes/code/philotic-stack/docs
 
 ## Core Recommendation
 
-Introduce a canonical tool management plane in the Context Graph with three layers:
+Introduce a canonical tool management plane in the Context Graph with four layers:
 
-1. system tool plane
-2. agent default tool plane
-3. session effective tool plane
+1. system runner plane
+2. incarnation and environment plane
+3. agent default capability plane
+4. session effective tool plane
 
 The hierarchy should be:
 
-- system defines what exists
-- agent defines what it can generally use
-- session defines what is visible and executable right now
+- the system defines which runner artifacts exist
+- incarnations define which runnable or materializable instances exist in which environments
+- agents map to the incarnations and tools they may generally use
+- sessions define what is visible and executable right now
 
 ## Why This Layer Exists
 
@@ -43,9 +45,9 @@ Without a system plane, the session has to answer questions that should already 
 
 - which tool runners exist at all
 - which abstract tools each runner offers
-- which runner implementations are known artifacts
+- which incarnations are actually runnable or materializable
 - which environments are available on which hotels
-- which agents should generally be allowed to use which tools
+- which agents should generally be allowed to use which incarnations and tools
 
 That is asking the session layer to do ontology, discovery, and routing preparation all at once. It can do that, but only in the same way a backpack can technically be a filing cabinet if you stop caring about access patterns.
 
@@ -73,7 +75,28 @@ Properties:
 
 This is the thing we can know ahead of time.
 
-### 2. Tool
+### 2. Tool Runner Incarnation
+
+An incarnation is a fully defined running or materializable instance of a tool runner.
+
+Properties:
+
+- `incarnation_id`
+- `runner_id`
+- `hotel_id`
+- `environment_id`
+- `status`
+  - `live`
+  - `dormant`
+  - `materializable`
+  - `unavailable`
+- `transport_modes`
+- `endpoint_ref`
+- `policy_overrides`
+
+This is the thing an agent can actually route to.
+
+### 3. Tool
 
 A `tool` is the abstract callable capability.
 
@@ -88,7 +111,7 @@ Properties:
 
 This is what the model and agent should reason over.
 
-### 3. Environment
+### 4. Environment
 
 An `environment` is a discovered execution substrate associated with a hotel/runtime.
 
@@ -110,22 +133,29 @@ Properties:
 
 This is not fully knowable ahead of time in the same way runners are.
 
-### 4. Agent Default Toolset
+### 5. Agent Default Toolset
 
 An agent should have a durable default tool universe.
 
 Properties:
 
 - `agent_id`
+- `allowed_incarnations`
 - `default_tools`
 - `default_tool_families`
 - `default_environment_preferences`
-- `default_runner_preferences`
+- `default_incarnation_preferences`
 - `default_policy_overrides`
 
 This is the baseline used before any session exists.
 
-### 5. Session Effective Toolset
+The important distinction is:
+
+- runners define what can exist
+- incarnations define what can run
+- agents define what they may generally use
+
+### 6. Session Effective Toolset
 
 A session should generally narrow or hide tools relative to the agent default.
 
@@ -136,7 +166,7 @@ Properties:
 - `hidden_tools`
 - `tool_filters`
 - `environment_override`
-- `runner_override`
+- `incarnation_override`
 
 This exists for:
 
@@ -151,6 +181,7 @@ This exists for:
 Recommended graph entities:
 
 - `tool_runner`
+- `tool_runner_incarnation`
 - `tool`
 - `environment`
 - `hotel`
@@ -161,11 +192,14 @@ Recommended edges:
 
 - `tool_runner --OFFERS--> tool`
 - `tool_runner --REQUIRES_ENV--> environment_trait`
+- `tool_runner --CAN_MATERIALIZE_AS--> tool_runner_incarnation`
+- `tool_runner_incarnation --RUNS_IN--> environment`
 - `hotel --HAS_ENV--> environment`
 - `hotel --CAN_MATERIALIZE--> tool_runner`
+- `agent --CAN_USE_INCARNATION--> tool_runner_incarnation`
 - `agent --DEFAULT_TOOL--> tool`
 - `agent --PREFERS_ENV--> environment_trait`
-- `agent --PREFERS_RUNNER--> tool_runner`
+- `agent --PREFERS_INCARNATION--> tool_runner_incarnation`
 - `session --USES_TOOL--> tool`
 - `session --HIDES_TOOL--> tool`
 
@@ -176,6 +210,7 @@ Recommended edges:
 Defines the superset of available capabilities:
 
 - known runners
+- possible runner incarnations
 - known tools
 - known implementation artifacts
 - discovered environments per hotel
@@ -184,9 +219,10 @@ Defines the superset of available capabilities:
 
 Defines the default working tool universe:
 
-- what this agent generally has access to
+- what incarnations this agent generally has access to
+- what tools those incarnations expose
 - preferred environments
-- preferred runner classes
+- preferred incarnations or incarnation classes
 
 This should be computed before a session starts.
 
@@ -207,6 +243,7 @@ The session should not usually be choosing from the whole system universe direct
 Inputs should become:
 
 - system tool plane
+- runner incarnations
 - discovered hotel environments
 - agent default toolset
 - session filters/overrides
@@ -222,6 +259,17 @@ So:
 
 - tool management plane = canonical capability topology
 - tool assembly = per-session executable projection
+
+## Skill Relationship
+
+Skills should not collapse this hierarchy.
+
+Current recommendation:
+
+- skills may influence which tool families or incarnations are relevant
+- but skills are not themselves the routing substrate
+
+It is plausible that some incarnations may advertise runner-local skills later, but that should remain a capability annotation layered on top of runner/incarnation/environment modeling.
 
 ## Environment and Transport Rules
 

@@ -51,6 +51,7 @@ cargo run -p ansible -- --load-config mesh-config.json
 ## Key Design Principles
 
 - **Hotel = source of truth.** The Context Graph SQLite DB owns all state.
+- **Security first, especially at the perimeter.** External communication surfaces should default to minimal trust, narrow authority, and explicit policy.
 - **IPC for intra-hotel.** All local communication uses Unix Domain Sockets.
 - **Mesh for inter-hotel.** All cross-machine communication is event-based UDP with durable delivery.
 - **Storage is swappable.** All persistence goes through `Arc<dyn GraphStorage>` — SQLite today, PebbleDB tomorrow.
