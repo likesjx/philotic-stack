@@ -13,6 +13,17 @@ Define how tool runners and similar executable components can be:
 
 without collapsing build, execution, and deployment into one blurry subsystem.
 
+## Disposition
+
+Proposed and deferred.
+
+This plane is intentionally not implemented in the current runtime slices.
+
+Track future work in [task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md) under:
+
+- `Next Project: Tool Assembly and Routed Execution`
+- `Deferred Design Threads` -> `Runner artifact plane`
+
 ## Core Recommendation
 
 Treat artifact build and distribution as a separate control plane from tool execution.

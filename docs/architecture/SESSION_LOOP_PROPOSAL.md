@@ -13,6 +13,18 @@ The key architectural decision is:
 
 This keeps Philotic aligned with the hotel/guest model already described in [CLAUDE.md](/Users/jaredlikes/code/philotic-stack/CLAUDE.md) and [PHILOTIC-ARCHITECTURE.md](/Users/jaredlikes/code/philotic-stack/docs/PHILOTIC-ARCHITECTURE.md).
 
+## Disposition
+
+Implemented for the current session/checkpoint/approval slice.
+
+Canonical session ownership, snapshot recovery, approval events, and session-envelope behavior are in place.
+
+Remaining related work lives in [task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md) under:
+
+- `WI 1: Session Management`
+- `WI 2: Agent Logic`
+- `Deferred Design Threads`
+
 ## What ZeroClaw Actually Gives Us
 
 The useful legacy pieces are not the old process topology. They are the turn semantics:

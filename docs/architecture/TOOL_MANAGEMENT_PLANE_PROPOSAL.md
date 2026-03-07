@@ -13,6 +13,14 @@ This proposal assumes:
 
 That lets us keep building the current agent/runtime flow without prematurely building the entire management plane in code.
 
+## Disposition
+
+Proposed and accepted as the assumed future model.
+
+This plane is not fully implemented yet. Current code only contains an initial runner registry and session-time tool assembly projection.
+
+Track the remaining work in [task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md) under `Next Project: Tool Assembly and Routed Execution` and `Deferred Design Threads`.
+
 ## Core Recommendation
 
 Introduce a canonical tool management plane in the Context Graph with three layers:

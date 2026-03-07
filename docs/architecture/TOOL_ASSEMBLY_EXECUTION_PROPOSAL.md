@@ -22,6 +22,24 @@ The model should not know whether a tool is:
 
 If it has to know that, we have already leaked the wrong abstraction.
 
+## Disposition
+
+Accepted for the current slice and partially implemented.
+
+Implemented so far:
+
+- first-class `ToolAssembly`
+- model-facing tool definitions
+- runtime-facing execution routes
+- externalized routed tool execution via `tool-runner`
+- live vs materialization-required route signaling
+
+Still pending in [task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md):
+
+- materialization policy
+- environment-aware routing preferences
+- richer runner selection and fallback
+
 ## Core Recommendation
 
 Introduce a first-class `ToolAssembly` layer between session bindings and tool execution.

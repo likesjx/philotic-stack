@@ -12,6 +12,23 @@ This loop should be:
 - tool-capable
 - checkpointed at meaningful boundaries
 
+## Disposition
+
+Accepted for the current slice and partially implemented.
+
+The loop now has:
+
+- explicit turn phases
+- structured `respond` / `tool_call` / `request_approval` actions
+- approval interrupts and resume behavior
+- routed tool execution
+
+Still pending in [task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md):
+
+- bounded multi-iteration loop completion
+- richer context building and compaction policy
+- provider boundary refinement
+
 ## Why This Is A Separate Project
 
 We have completed the foundational runtime work:
