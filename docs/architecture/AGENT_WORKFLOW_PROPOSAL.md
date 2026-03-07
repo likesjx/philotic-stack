@@ -18,6 +18,13 @@ Adopt a layered agent workflow with five explicit phases:
 
 The point is to keep momentum without letting "it seems fine" become the main testing framework.
 
+Each slice should also leave behind a small but durable paper trail:
+
+- a proposal or spec disposition update
+- a commit and push
+- assumption-vs-reality learnings
+- a quick skill/rules optimization check
+
 ## Working Principles
 
 ### 1. One Canonical Owner Per State Type
@@ -108,6 +115,16 @@ When a durable architectural or process decision is made, the agent should updat
 
 This should happen during the work, not as an aspirational future chore.
 
+Every active proposal should carry a short `Disposition` section that is updated per slice.
+
+Recommended statuses:
+
+- `proposed`
+- `accepted for current slice`
+- `implemented`
+- `superseded`
+- `deferred`
+
 ### 5. Close the Slice
 
 Before moving on, the agent should state:
@@ -117,6 +134,23 @@ Before moving on, the agent should state:
 - what the next highest-value seam is
 
 That makes the next step a choice instead of a scavenger hunt.
+
+The close-out should also capture:
+
+- assumption/reality gaps exposed during the slice
+- whether any standing instructions, skills, or rules now need tuning
+
+## Slice Contract
+
+Each implementation slice should aim to produce:
+
+1. a succinct proposal update or disposition change
+2. the smallest coherent code change
+3. relevant tests and smoke coverage
+4. one descriptive commit and push
+5. a short note about reality gaps and next seam
+
+If a slice cannot satisfy all five, the agent should say which part is intentionally missing and why.
 
 ## Testing Policy
 
@@ -180,6 +214,8 @@ Commit messages should:
 - explain the architectural reason in the body
 - mention important verification or operational consequences when relevant
 
+The default should be one commit/push per coherent slice.
+
 Large feature runs should prefer multiple meaningful commits over one vague "progress" commit.
 
 ## Deployment and Live Validation
@@ -207,6 +243,9 @@ The agent should:
 - explain assumptions after doing the work
 - prefer doing the next reasonable step over asking broad questions
 - pause only when a decision has real architectural consequences
+- push back on design choices when there is a materially better option or a hidden cost
+
+Agreement is not the goal. Honest engineering partnership is.
 
 The agent should also keep a running distinction between:
 
@@ -222,6 +261,10 @@ The repo instructions for Codex should explicitly add:
 
 - a verification ladder rule: tests -> integration -> smoke -> watched run
 - a rule to capture architecture/process decisions in `docs/architecture` and `docs/task.md`
+- a rule that each slice should disposition the relevant proposal as succinctly as possible
+- a rule to commit/push per coherent slice with a specific commit body
+- a rule to record assumption-vs-reality gaps when validation exposes them
+- a rule to perform a quick skills/rules optimization check at the end of meaningful slices
 - a rule that bidirectional or push-capable IPC must use framing/correlation assumptions by default
 - a rule to treat state ownership boundaries as first-class design work
 - a rule to label transitional implementations as transitional
@@ -237,8 +280,37 @@ The following collaboration patterns worked especially well:
 - pairing architectural proposals with immediate implementation slices
 - proving each slice with real smokes instead of only code-level confidence
 - using live observation to catch bugs hidden by green tests
+- collecting reality-gap learnings from watched runs instead of treating them as embarrassing side quests
 - splitting large design spaces into focused proposals instead of forcing one giant master spec
 - carrying forward the "next seam" after every slice
+
+## Proposal Lifecycle
+
+Proposal docs should stay light, but they should not stay frozen.
+
+Recommended shape:
+
+- `Goal`
+- `Core Recommendation`
+- `Disposition`
+- `Current Slice`
+- `Links to active work items/tasks`
+- optional supporting sections
+
+Proposal docs should link directly to the relevant work tracking when that work exists.
+
+This avoids the classic irony where the architecture doc explains the future beautifully while the task board is off in another room pretending not to know it.
+
+## Skill and Rules Optimization Loop
+
+At the end of a meaningful slice, the agent should do a brief check for:
+
+- instruction gaps in repo guidance
+- reusable behaviors that deserve a skill
+- skills that are too broad, too vague, or not getting triggered when they should
+- recurring assumption/reality gaps that should become explicit rules
+
+This should stay lightweight unless a real pattern has emerged. The process should improve continuously, not become its own primary workload.
 
 ## Near-Term Process Follow-Ups
 
@@ -253,6 +325,7 @@ The following collaboration patterns worked especially well:
    - proven working
    - working with caveats
    - intentionally incomplete
+6. Add proposal `Disposition` sections and task links to the active architecture docs.
 
 ## Recommendation
 
