@@ -62,6 +62,12 @@
 - [ ] Add environment-aware runner routing and materialization policy so tools can target non-IPC execution environments when needed.
 - [ ] Keep local config/session mutation commands in `agent-core`, but externalize real tool execution.
 - [ ] Return to skill design after tool assembly and routed execution boundaries are in place.
+- [ ] Add agent-specific runner routing:
+  - preferred environment
+  - preferred hotel/node
+  - preferred runner
+  - fallback policy
+  - route selection reason in `tool_assembly`
 
 ## Deferred Design Threads
 
@@ -75,6 +81,11 @@
 - [ ] Context graph deployment model: decide local-first vs cloud-backed vs hybrid graph ownership, sync, and operational model.
 - [ ] Context graph decentralization: decide how much of the graph can be replicated/federated across hotels versus kept locally authoritative.
 - [ ] Approval UX evolution: add `/preapprove`, `/approval status`, `/approval reset`, and richer session policy editing for constrained transports like Telegram.
+- [ ] Review [TELEGRAM_INTEGRATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_INTEGRATION_PROPOSAL.md).
+- [ ] Review [VOICE_MACHINE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/VOICE_MACHINE_PROPOSAL.md).
+- [ ] Telegram slash-command elevation: raise deterministic `/commands` into `hegemon` before the normal agent loop so Telegram-side testing and operational control become faster and cleaner.
+- [ ] Telegram streaming and media UX: define partial delivery, edits vs follow-up messages, and interruption behavior for Telegram replies.
+- [ ] Voice machine design: define STT, TTS, speech-to-speech, transcript generation, and media artifact/session handling.
 - [ ] Tool runner lifecycle policy: define idle retention, sleep/teardown timing, wake-up thresholds, and environment-specific materialization rules for routed tools.
 - [ ] Runner artifact plane: define builder trust, sandboxing, testing, signing, release, and distribution policy for executable tool runners.
 - [ ] Memory consolidation / dreaming: define how short-term session state becomes long-term memory, including sleep/dream cycles, compaction, and candidate memory backends such as `scryper/miniminddb`.
