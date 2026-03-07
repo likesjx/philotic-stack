@@ -89,6 +89,36 @@ smoke-session-control:
 smoke-session-bindings:
     ./scripts/smoke-session-bindings-roundtrip.sh
 
+# Run the trusted vertical-slice verification suite
+verify-vertical-slice:
+    cargo test -p philotic-client -- --nocapture
+    cargo test -p agent-core -- --nocapture
+    cargo test -p ansible -- --nocapture
+    ./scripts/smoke-routed-tool-roundtrip.sh
+    ./scripts/smoke-approval-roundtrip.sh
+    ./scripts/smoke-session-control-roundtrip.sh
+    ./scripts/smoke-session-bindings-roundtrip.sh
+
+# Print the operator checklist for the current trusted vertical slice
+operator-checklist:
+    @echo "Philotic Vertical Slice Operator Checklist"
+    @echo ""
+    @echo "1. Run: just verify-vertical-slice"
+    @echo "2. If you need extra approval-path confidence, also run:"
+    @echo "   - just smoke-deny"
+    @echo "   - just smoke-approve-steer"
+    @echo "   - just smoke-deny-redirect"
+    @echo "   - just smoke-preapprove"
+    @echo "3. For watched-live confidence, start a hotel and verify:"
+    @echo "   - guest processes are alive"
+    @echo "   - guests actually register/subscribe"
+    @echo "   - routed tool flow succeeds"
+    @echo "4. Record the highest honest confidence level:"
+    @echo "   - test-green"
+    @echo "   - smoke-green"
+    @echo "   - watched-live-green"
+    @echo "5. Note any assumption-vs-reality gaps before closing the slice"
+
 # Show configured Ansible inventory for deployment targets
 ansible-inventory:
     cd ansible && ansible-inventory --list

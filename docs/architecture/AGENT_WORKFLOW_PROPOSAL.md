@@ -15,12 +15,15 @@ Implemented so far:
 - repo-root [AGENTS.md](/Users/jaredlikes/code/philotic-stack/AGENTS.md)
 - per-slice commit/push discipline during recent work
 - proposal/task tracking updates
+- executable workflow commands in [justfile](/Users/jaredlikes/code/philotic-stack/justfile):
+  - `verify-vertical-slice`
+  - `operator-checklist`
 
 Still pending in [task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md):
 
 - proposal disposition rollout across remaining active docs
 - lightweight skill/rules optimization loop
-- trusted vertical-slice verification command/checklist
+- subagent delegation guidance in the workflow docs
 
 ## Core Recommendation
 
