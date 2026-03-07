@@ -8,7 +8,10 @@
 
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
 use ansible_mesh_core::sqlite_storage::{SqliteCursorStorage, SqliteEventStorage, SqliteGraphStorage};
-use ansible_mesh_core::storage::{CursorStorage, EventStorage, GraphStorage, GuestRecord, HotelRecord};
+use ansible_mesh_core::storage::{
+    CursorStorage, EventStorage, GraphStorage, GuestRecord, HotelRecord, SessionEventRecord,
+    SessionParticipantRecord, SessionRecord, SessionTurnRecord,
+};
 use ansible_mesh_core::{NodeCapabilities, NodeRole};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -53,6 +56,22 @@ fn open_cursor_storage() -> SqliteCursorStorage {
 
 fn open_graph_storage() -> SqliteGraphStorage {
     SqliteGraphStorage::open(":memory:").expect("open SqliteGraphStorage")
+}
+
+fn sample_session() -> SessionRecord {
+    SessionRecord {
+        session_id: "sess-1".into(),
+        session_kind: "conversation".into(),
+        primary_agent_id: Some("agent-jane".into()),
+        channel_kind: Some("telegram".into()),
+        channel_session_key: Some("telegram:123".into()),
+        status: "active".into(),
+        lease_owner_component_id: Some("agent-core-jane".into()),
+        lease_expires_at: Some(now_ms() + 30_000),
+        summary_json: serde_json::json!({"summary": "user wants concise replies"}),
+        created_at: now_ms(),
+        updated_at: now_ms(),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -298,6 +317,27 @@ fn graph_storage_get_config_value_round_trip() {
 }
 
 #[test]
+fn graph_storage_set_config_value_populates_graph_node() {
+    let store = open_graph_storage();
+
+    store
+        .set_config_value("telegram_bot_token", "\"secret-token\"")
+        .unwrap();
+
+    let conn = store.raw_conn().lock().unwrap();
+    let graph_json: String = conn
+        .query_row(
+            "SELECT data_json FROM graph_nodes WHERE node_key = 'config:telegram_bot_token'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&graph_json).unwrap();
+    assert_eq!(parsed["key"], "telegram_bot_token");
+    assert_eq!(parsed["value_json"], "\"secret-token\"");
+}
+
+#[test]
 fn graph_storage_hotel_round_trip_and_pid_update() {
     let store = open_graph_storage();
 
@@ -401,6 +441,33 @@ fn graph_storage_seed_is_idempotent() {
     assert_eq!(all.len(), 1, "idempotent seed must not duplicate");
 }
 
+#[test]
+fn graph_storage_seed_guest_creates_graph_node_and_edge() {
+    let store = open_graph_storage();
+    let guest = sample_guest("g-graph", true);
+
+    store.seed_guests("test-hotel", &[guest]).unwrap();
+
+    let conn = store.raw_conn().lock().unwrap();
+    let node_count: u64 = conn
+        .query_row(
+            "SELECT count(*) FROM graph_nodes WHERE kind = 'guest'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let edge_count: u64 = conn
+        .query_row(
+            "SELECT count(*) FROM graph_edges WHERE edge_kind = 'HAS_GUEST'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert_eq!(node_count, 1);
+    assert_eq!(edge_count, 1);
+}
+
 // ═══════════════════════════════════════════════════════════
 // Section 5: SqliteGraphStorage — memory apartments (state sync)
 // ═══════════════════════════════════════════════════════════
@@ -501,6 +568,297 @@ fn graph_storage_sync_apartment_independent_agents() {
         .unwrap();
 
     assert_eq!(count_apartments(&store), 2, "different agents own separate apartments");
+}
+
+#[test]
+fn graph_storage_sync_apartment_creates_graph_node_and_edge() {
+    let store = open_graph_storage();
+    seed_agent_identity(&store, "agent-jane");
+
+    store
+        .sync_apartment("agent-jane", "short", &serde_json::json!({"recent": "hello"}))
+        .unwrap();
+
+    let conn = store.raw_conn().lock().unwrap();
+    let apartment_json: String = conn
+        .query_row(
+            "SELECT data_json FROM graph_nodes WHERE node_key = 'agent:agent-jane:apartment:short'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let apartment: serde_json::Value = serde_json::from_str(&apartment_json).unwrap();
+    let edge_count: u64 = conn
+        .query_row(
+            "SELECT count(*) FROM graph_edges WHERE edge_key = 'edge:agent:agent-jane:owns_apartment:short'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert_eq!(apartment["agent_id"], "agent-jane");
+    assert_eq!(apartment["memory_type"], "short");
+    assert_eq!(apartment["content_json"]["recent"], "hello");
+    assert_eq!(edge_count, 1);
+}
+
+#[test]
+fn graph_storage_get_apartment_returns_latest_checkpoint() {
+    let store = open_graph_storage();
+    seed_agent_identity(&store, "agent-jane");
+
+    store
+        .sync_apartment("agent-jane", "short", &serde_json::json!({"session_id": "sess-1"}))
+        .unwrap();
+
+    let checkpoint = store
+        .get_apartment("agent-jane", "short")
+        .unwrap()
+        .expect("checkpoint should exist");
+    assert_eq!(checkpoint["session_id"], "sess-1");
+}
+
+// ═══════════════════════════════════════════════════════════
+// Section 5b: Generalized sessions
+// ═══════════════════════════════════════════════════════════
+
+#[test]
+fn graph_storage_session_round_trip() {
+    let store = open_graph_storage();
+    let session = sample_session();
+
+    store.upsert_session(&session).unwrap();
+
+    let loaded = store
+        .get_session("sess-1")
+        .unwrap()
+        .expect("session should exist");
+    assert_eq!(loaded.session_kind, "conversation");
+    assert_eq!(loaded.primary_agent_id.as_deref(), Some("agent-jane"));
+    assert_eq!(loaded.summary_json["summary"], "user wants concise replies");
+}
+
+#[test]
+fn graph_storage_session_participants_round_trip() {
+    let store = open_graph_storage();
+    store.upsert_session(&sample_session()).unwrap();
+
+    store
+        .upsert_session_participant(&SessionParticipantRecord {
+            session_id: "sess-1".into(),
+            component_id: "hegemon-telegram".into(),
+            role: "gateway".into(),
+            joined_at: now_ms(),
+            last_seen_at: now_ms(),
+        })
+        .unwrap();
+    store
+        .upsert_session_participant(&SessionParticipantRecord {
+            session_id: "sess-1".into(),
+            component_id: "agent-core-jane".into(),
+            role: "owner".into(),
+            joined_at: now_ms(),
+            last_seen_at: now_ms(),
+        })
+        .unwrap();
+
+    let participants = store.list_session_participants("sess-1").unwrap();
+    assert_eq!(participants.len(), 2);
+    assert!(participants.iter().any(|p| p.role == "gateway"));
+    assert!(participants.iter().any(|p| p.role == "owner"));
+}
+
+#[test]
+fn graph_storage_session_turns_round_trip() {
+    let store = open_graph_storage();
+    store.upsert_session(&sample_session()).unwrap();
+
+    store
+        .upsert_session_turn(&SessionTurnRecord {
+            turn_id: "turn-1".into(),
+            session_id: "sess-1".into(),
+            request_event_id: Some("req-1".into()),
+            user_message_json: serde_json::json!({"content": "hello"}),
+            status: "completed".into(),
+            response_json: Some(serde_json::json!({"content": "hi"})),
+            error_json: None,
+            started_at: Some(100),
+            completed_at: Some(200),
+        })
+        .unwrap();
+    store
+        .upsert_session_turn(&SessionTurnRecord {
+            turn_id: "turn-2".into(),
+            session_id: "sess-1".into(),
+            request_event_id: Some("req-2".into()),
+            user_message_json: serde_json::json!({"content": "status?"}),
+            status: "running".into(),
+            response_json: None,
+            error_json: None,
+            started_at: Some(300),
+            completed_at: None,
+        })
+        .unwrap();
+
+    let turns = store.list_session_turns("sess-1", 10).unwrap();
+    assert_eq!(turns.len(), 2);
+    assert_eq!(turns[0].turn_id, "turn-1");
+    assert_eq!(turns[1].turn_id, "turn-2");
+
+    let turn = store
+        .get_session_turn("sess-1", "turn-2")
+        .unwrap()
+        .expect("turn should exist");
+    assert_eq!(turn.status, "running");
+}
+
+#[test]
+fn graph_storage_session_events_round_trip() {
+    let store = open_graph_storage();
+    store.upsert_session(&sample_session()).unwrap();
+    store
+        .upsert_session_turn(&SessionTurnRecord {
+            turn_id: "turn-1".into(),
+            session_id: "sess-1".into(),
+            request_event_id: None,
+            user_message_json: serde_json::json!({"content": "hello"}),
+            status: "running".into(),
+            response_json: None,
+            error_json: None,
+            started_at: Some(100),
+            completed_at: None,
+        })
+        .unwrap();
+
+    store
+        .append_session_event(&SessionEventRecord {
+            event_id: "evt-1".into(),
+            session_id: "sess-1".into(),
+            turn_id: Some("turn-1".into()),
+            component_id: "agent-core-jane".into(),
+            kind: "assistant_delta".into(),
+            payload_json: serde_json::json!({"text": "Thinking..."}),
+            created_at: 101,
+        })
+        .unwrap();
+    store
+        .append_session_event(&SessionEventRecord {
+            event_id: "evt-2".into(),
+            session_id: "sess-1".into(),
+            turn_id: Some("turn-1".into()),
+            component_id: "agent-core-jane".into(),
+            kind: "tool_call".into(),
+            payload_json: serde_json::json!({"tool": "shell"}),
+            created_at: 102,
+        })
+        .unwrap();
+
+    let events = store.list_session_events("sess-1", 10).unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].event_id, "evt-1");
+    assert_eq!(events[1].event_id, "evt-2");
+    assert_eq!(events[1].payload_json["tool"], "shell");
+}
+
+#[test]
+fn graph_storage_session_checkpoint_flow_e2e() {
+    let store = open_graph_storage();
+    seed_agent_identity(&store, "agent-jane");
+
+    store.upsert_session(&sample_session()).unwrap();
+    store
+        .upsert_session_participant(&SessionParticipantRecord {
+            session_id: "sess-1".into(),
+            component_id: "hegemon-telegram".into(),
+            role: "gateway".into(),
+            joined_at: 100,
+            last_seen_at: 100,
+        })
+        .unwrap();
+    store
+        .upsert_session_participant(&SessionParticipantRecord {
+            session_id: "sess-1".into(),
+            component_id: "agent-core-jane".into(),
+            role: "owner".into(),
+            joined_at: 101,
+            last_seen_at: 101,
+        })
+        .unwrap();
+
+    store
+        .upsert_session_turn(&SessionTurnRecord {
+            turn_id: "turn-1".into(),
+            session_id: "sess-1".into(),
+            request_event_id: Some("req-1".into()),
+            user_message_json: serde_json::json!({"content": "Summarize my CPU usage"}),
+            status: "completed".into(),
+            response_json: Some(serde_json::json!({"content": "CPU is at 45%"})),
+            error_json: None,
+            started_at: Some(110),
+            completed_at: Some(140),
+        })
+        .unwrap();
+
+    store
+        .append_session_event(&SessionEventRecord {
+            event_id: "evt-1".into(),
+            session_id: "sess-1".into(),
+            turn_id: Some("turn-1".into()),
+            component_id: "agent-core-jane".into(),
+            kind: "assistant_delta".into(),
+            payload_json: serde_json::json!({"text": "Checking system status..."}),
+            created_at: 120,
+        })
+        .unwrap();
+    store
+        .append_session_event(&SessionEventRecord {
+            event_id: "evt-2".into(),
+            session_id: "sess-1".into(),
+            turn_id: Some("turn-1".into()),
+            component_id: "agent-core-jane".into(),
+            kind: "tool_call".into(),
+            payload_json: serde_json::json!({"tool": "shell", "command": "uptime"}),
+            created_at: 125,
+        })
+        .unwrap();
+
+    store
+        .sync_apartment(
+            "agent-jane",
+            "short",
+            &serde_json::json!({
+                "session_id": "sess-1",
+                "summary": "User asked for CPU usage; answered with current utilization.",
+                "recent_turn_ids": ["turn-1"]
+            }),
+        )
+        .unwrap();
+
+    let session = store
+        .get_session("sess-1")
+        .unwrap()
+        .expect("session should exist");
+    let participants = store.list_session_participants("sess-1").unwrap();
+    let turns = store.list_session_turns("sess-1", 10).unwrap();
+    let events = store.list_session_events("sess-1", 10).unwrap();
+
+    assert_eq!(session.status, "active");
+    assert_eq!(participants.len(), 2);
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].response_json.as_ref().unwrap()["content"], "CPU is at 45%");
+    assert_eq!(events.len(), 2);
+
+    let conn = store.raw_conn().lock().unwrap();
+    let apartment_content: String = conn
+        .query_row(
+            "SELECT content FROM memory_apartments WHERE agent_id = 'agent-jane' AND memory_type = 'short'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let apartment: serde_json::Value = serde_json::from_str(&apartment_content).unwrap();
+    assert_eq!(apartment["session_id"], "sess-1");
+    assert_eq!(apartment["recent_turn_ids"][0], "turn-1");
 }
 
 // ═══════════════════════════════════════════════════════════

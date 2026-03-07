@@ -1,5 +1,28 @@
-use crate::{AgentId};
+use crate::AgentId;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// Generic graph node stored by the adapter layer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GraphNode {
+    pub node_key: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub data: Value,
+}
+
+/// Generic graph edge stored by the adapter layer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GraphEdge {
+    pub edge_key: String,
+    pub src_node_key: String,
+    pub edge_kind: String,
+    pub dst_node_key: String,
+    #[serde(default)]
+    pub data: Value,
+}
 
 /// Represents an Agent identity within the Context Graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -87,6 +87,8 @@ async fn main() -> Result<()> {
                                         if let Some(message) = update.get("message") {
                                             if let Some(text) = message.get("text").and_then(|t| t.as_str()) {
                                                 let chat_id = message.get("chat").and_then(|c| c.get("id")).map(|id| id.to_string()).unwrap_or_default();
+                                                let turn_id = format!("telegram-update-{}", update_id);
+                                                let session_id = format!("telegram:{}:agent-jane-01", chat_id);
                                                 
                                                 info!("Received Telegram Message from Chat [{}]: {}", chat_id, text);
                                                 
@@ -96,8 +98,12 @@ async fn main() -> Result<()> {
                                                     target_role: "agent".into(),
                                                     task_json: json!({
                                                         "source": "telegram",
+                                                        "session_id": session_id,
+                                                        "turn_id": turn_id,
                                                         "chat_id": chat_id,
-                                                        "content": text
+                                                        "content": text,
+                                                        "final_reply_to": "local-ansible-01",
+                                                        "final_reply_role": "hegemon"
                                                     }).to_string(),
                                                 };
                                                 

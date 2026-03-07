@@ -5,7 +5,11 @@
 //! consume them as `Arc<dyn EventStorage>`, etc.
 
 use crate::event::{EventEnvelope, EventId, EventKind, EventPayload};
-use crate::storage::{CursorStorage, EventStorage, GraphStorage, GuestRecord, HotelRecord};
+use crate::graph::{GraphEdge, GraphNode};
+use crate::storage::{
+    CursorStorage, EventStorage, GraphAdapter, GraphStorage, GuestRecord, HotelRecord,
+    SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,
+};
 use crate::NodeCapabilities;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
@@ -250,16 +254,222 @@ impl CursorStorage for SqliteCursorStorage {
 // ══════════════════════════════════════════════════════════════════════
 
 #[derive(Clone)]
+pub struct SqliteGraphAdapter {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl SqliteGraphAdapter {
+    fn new(conn: Arc<Mutex<Connection>>) -> Self {
+        Self { conn }
+    }
+
+    fn init_schema(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch(
+            "
+            BEGIN;
+            CREATE TABLE IF NOT EXISTS graph_nodes (
+                node_key TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                label TEXT,
+                data_json TEXT NOT NULL,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS graph_edges (
+                edge_key TEXT PRIMARY KEY,
+                src_node_key TEXT NOT NULL,
+                edge_kind TEXT NOT NULL,
+                dst_node_key TEXT NOT NULL,
+                data_json TEXT NOT NULL,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_graph_nodes_kind
+                ON graph_nodes(kind);
+            CREATE INDEX IF NOT EXISTS idx_graph_edges_src_kind
+                ON graph_edges(src_node_key, edge_kind);
+            CREATE INDEX IF NOT EXISTS idx_graph_edges_dst
+                ON graph_edges(dst_node_key);
+            COMMIT;
+            ",
+        )?;
+        Ok(())
+    }
+}
+
+impl GraphAdapter for SqliteGraphAdapter {
+    fn upsert_node(&self, node: &GraphNode) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO graph_nodes (node_key, kind, label, data_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP)
+             ON CONFLICT(node_key) DO UPDATE SET
+             kind = excluded.kind,
+             label = excluded.label,
+             data_json = excluded.data_json,
+             updated_at = CURRENT_TIMESTAMP",
+            params![
+                node.node_key,
+                node.kind,
+                node.label,
+                serde_json::to_string(&node.data)?
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn get_node(&self, node_key: &str) -> Result<Option<GraphNode>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT node_key, kind, label, data_json
+             FROM graph_nodes
+             WHERE node_key = ?1",
+        )?;
+        let mut rows = stmt.query(params![node_key])?;
+
+        if let Some(row) = rows.next()? {
+            let data_json: String = row.get(3)?;
+            Ok(Some(GraphNode {
+                node_key: row.get(0)?,
+                kind: row.get(1)?,
+                label: row.get(2)?,
+                data: serde_json::from_str(&data_json)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn delete_node(&self, node_key: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM graph_nodes WHERE node_key = ?1", params![node_key])?;
+        conn.execute(
+            "DELETE FROM graph_edges WHERE src_node_key = ?1 OR dst_node_key = ?1",
+            params![node_key],
+        )?;
+        Ok(())
+    }
+
+    fn list_nodes_by_kind(&self, kind: &str) -> Result<Vec<GraphNode>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT node_key, kind, label, data_json
+             FROM graph_nodes
+             WHERE kind = ?1
+             ORDER BY node_key ASC",
+        )?;
+        let rows = stmt.query_map(params![kind], |row| {
+            let data_json: String = row.get(3)?;
+            Ok(GraphNode {
+                node_key: row.get(0)?,
+                kind: row.get(1)?,
+                label: row.get(2)?,
+                data: serde_json::from_str(&data_json).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    fn upsert_edge(&self, edge: &GraphEdge) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO graph_edges (edge_key, src_node_key, edge_kind, dst_node_key, data_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, CURRENT_TIMESTAMP)
+             ON CONFLICT(edge_key) DO UPDATE SET
+             src_node_key = excluded.src_node_key,
+             edge_kind = excluded.edge_kind,
+             dst_node_key = excluded.dst_node_key,
+             data_json = excluded.data_json,
+             updated_at = CURRENT_TIMESTAMP",
+            params![
+                edge.edge_key,
+                edge.src_node_key,
+                edge.edge_kind,
+                edge.dst_node_key,
+                serde_json::to_string(&edge.data)?
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn delete_edge(&self, edge_key: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM graph_edges WHERE edge_key = ?1", params![edge_key])?;
+        Ok(())
+    }
+
+    fn list_edges_from(&self, src_node_key: &str, edge_kind: Option<&str>) -> Result<Vec<GraphEdge>> {
+        let conn = self.conn.lock().unwrap();
+        let decode_row = |row: &rusqlite::Row<'_>| {
+            let data_json: String = row.get(4)?;
+            Ok(GraphEdge {
+                edge_key: row.get(0)?,
+                src_node_key: row.get(1)?,
+                edge_kind: row.get(2)?,
+                dst_node_key: row.get(3)?,
+                data: serde_json::from_str(&data_json).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?,
+            })
+        };
+
+        let mut out = Vec::new();
+        if let Some(kind) = edge_kind {
+            let mut stmt = conn.prepare(
+                "SELECT edge_key, src_node_key, edge_kind, dst_node_key, data_json
+                 FROM graph_edges
+                 WHERE src_node_key = ?1 AND edge_kind = ?2
+                 ORDER BY edge_key ASC",
+            )?;
+            let rows = stmt.query_map(params![src_node_key, kind], decode_row)?;
+            for row in rows {
+                out.push(row?);
+            }
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT edge_key, src_node_key, edge_kind, dst_node_key, data_json
+                 FROM graph_edges
+                 WHERE src_node_key = ?1
+                 ORDER BY edge_key ASC",
+            )?;
+            let rows = stmt.query_map(params![src_node_key], decode_row)?;
+            for row in rows {
+                out.push(row?);
+            }
+        }
+
+        Ok(out)
+    }
+}
+
+#[derive(Clone)]
 pub struct SqliteGraphStorage {
     conn: Arc<Mutex<Connection>>,
+    adapter: SqliteGraphAdapter,
 }
 
 impl SqliteGraphStorage {
     pub fn open(db_path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(db_path).context("Failed to open GraphStorage SQLite DB")?;
-        let s = Self {
-            conn: Arc::new(Mutex::new(conn)),
-        };
+        let conn = Arc::new(Mutex::new(conn));
+        let adapter = SqliteGraphAdapter::new(conn.clone());
+        let s = Self { conn, adapter };
         s.init_schema()?;
         Ok(s)
     }
@@ -324,6 +534,8 @@ impl SqliteGraphStorage {
             "ALTER TABLE materialized_guests ADD COLUMN hotel_name TEXT NOT NULL DEFAULT 'default'",
             [],
         );
+        drop(conn);
+        self.adapter.init_schema()?;
 
         info!("GraphStorage schema initialized successfully.");
         Ok(())
@@ -334,37 +546,87 @@ impl SqliteGraphStorage {
     pub fn raw_conn(&self) -> &Arc<Mutex<Connection>> {
         &self.conn
     }
+
+    fn config_node_key(key: &str) -> String {
+        format!("config:{key}")
+    }
+
+    fn hotel_node_key(hotel_name: &str) -> String {
+        format!("hotel:{hotel_name}")
+    }
+
+    fn guest_node_key(hotel_name: &str, guest_id: &str) -> String {
+        format!("hotel:{hotel_name}:guest:{guest_id}")
+    }
+
+    fn hotel_guest_edge_key(hotel_name: &str, guest_id: &str) -> String {
+        format!("edge:hotel:{hotel_name}:has_guest:{guest_id}")
+    }
+
+    fn agent_node_key(agent_id: &str) -> String {
+        format!("agent:{agent_id}")
+    }
+
+    fn apartment_node_key(agent_id: &str, memory_type: &str) -> String {
+        format!("agent:{agent_id}:apartment:{memory_type}")
+    }
+
+    fn agent_apartment_edge_key(agent_id: &str, memory_type: &str) -> String {
+        format!("edge:agent:{agent_id}:owns_apartment:{memory_type}")
+    }
+
+    fn session_node_key(session_id: &str) -> String {
+        format!("session:{session_id}")
+    }
+
+    fn session_participant_node_key(session_id: &str, component_id: &str) -> String {
+        format!("session:{session_id}:participant:{component_id}")
+    }
+
+    fn session_turn_node_key(session_id: &str, turn_id: &str) -> String {
+        format!("session:{session_id}:turn:{turn_id}")
+    }
+
+    fn session_event_node_key(session_id: &str, event_id: &str) -> String {
+        format!("session:{session_id}:event:{event_id}")
+    }
+
+    fn session_participant_edge_key(session_id: &str, component_id: &str) -> String {
+        format!("edge:session:{session_id}:has_participant:{component_id}")
+    }
+
+    fn session_turn_edge_key(session_id: &str, turn_id: &str) -> String {
+        format!("edge:session:{session_id}:has_turn:{turn_id}")
+    }
+
+    fn session_event_edge_key(session_id: &str, event_id: &str) -> String {
+        format!("edge:session:{session_id}:has_event:{event_id}")
+    }
+
+    fn turn_event_edge_key(session_id: &str, turn_id: &str, event_id: &str) -> String {
+        format!("edge:session:{session_id}:turn:{turn_id}:has_event:{event_id}")
+    }
 }
 
 impl GraphStorage for SqliteGraphStorage {
     fn load_node_capabilities(&self) -> Result<Option<NodeCapabilities>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT value_json FROM node_config WHERE key = 'capabilities'")?;
-        let mut rows = stmt.query([])?;
-
-        if let Some(row) = rows.next()? {
-            let json: String = row.get(0)?;
-            let caps: NodeCapabilities = serde_json::from_str(&json)?;
-            Ok(Some(caps))
-        } else {
-            Ok(None)
+        match self.get_config_value("capabilities")? {
+            Some(json) => Ok(Some(serde_json::from_str(&json)?)),
+            None => Ok(None),
         }
     }
 
     fn save_node_capabilities(&self, caps: &NodeCapabilities) -> Result<()> {
-        let json = serde_json::to_string(caps)?;
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO node_config (key, value_json, updated_at)
-             VALUES ('capabilities', ?1, CURRENT_TIMESTAMP)
-             ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=CURRENT_TIMESTAMP",
-            [&json],
-        )?;
-        Ok(())
+        self.set_config_value("capabilities", &serde_json::to_string(caps)?)
     }
 
     fn get_config_value(&self, key: &str) -> Result<Option<String>> {
+        if let Some(node) = self.adapter.get_node(&Self::config_node_key(key))? {
+            if let Some(value) = node.data.get("value_json").and_then(|v| v.as_str()) {
+                return Ok(Some(value.to_string()));
+            }
+        }
+
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT value_json FROM node_config WHERE key = ?1")?;
         let mut rows = stmt.query(params![key])?;
@@ -376,7 +638,32 @@ impl GraphStorage for SqliteGraphStorage {
         }
     }
 
+    fn set_config_value(&self, key: &str, value_json: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO node_config (key, value_json, updated_at)
+             VALUES (?1, ?2, CURRENT_TIMESTAMP)
+             ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=CURRENT_TIMESTAMP",
+            params![key, value_json],
+        )?;
+        drop(conn);
+
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::config_node_key(key),
+            kind: "config".into(),
+            label: Some(key.to_string()),
+            data: serde_json::json!({
+                "key": key,
+                "value_json": value_json,
+            }),
+        })
+    }
+
     fn get_hotel(&self, hotel_name: &str) -> Result<Option<HotelRecord>> {
+        if let Some(node) = self.adapter.get_node(&Self::hotel_node_key(hotel_name))? {
+            return Ok(Some(serde_json::from_value(node.data)?));
+        }
+
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT capabilities_json, mesh_port, blob_port, ipc_socket_path, active_pid
@@ -423,7 +710,14 @@ impl GraphStorage for SqliteGraphStorage {
                 hotel.active_pid
             ],
         )?;
-        Ok(())
+        drop(conn);
+
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::hotel_node_key(&hotel.hotel_name),
+            kind: "hotel".into(),
+            label: Some(hotel.hotel_name.clone()),
+            data: serde_json::to_value(hotel)?,
+        })
     }
 
     fn set_hotel_pid(&self, hotel_name: &str, pid: Option<&str>) -> Result<()> {
@@ -432,10 +726,38 @@ impl GraphStorage for SqliteGraphStorage {
             "UPDATE hotels SET active_pid = ?1, updated_at = CURRENT_TIMESTAMP WHERE hotel_name = ?2",
             params![pid, hotel_name],
         )?;
+        drop(conn);
+
+        if let Some(mut hotel) = self.get_hotel(hotel_name)? {
+            hotel.active_pid = pid.map(str::to_string);
+            self.adapter.upsert_node(&GraphNode {
+                node_key: Self::hotel_node_key(hotel_name),
+                kind: "hotel".into(),
+                label: Some(hotel_name.to_string()),
+                data: serde_json::to_value(hotel)?,
+            })?;
+        }
         Ok(())
     }
 
     fn list_guests(&self, hotel_name: &str, active_only: bool) -> Result<Vec<GuestRecord>> {
+        let edges = self
+            .adapter
+            .list_edges_from(&Self::hotel_node_key(hotel_name), Some("HAS_GUEST"))?;
+        if !edges.is_empty() {
+            let mut out = Vec::new();
+            for edge in edges {
+                if let Some(node) = self.adapter.get_node(&edge.dst_node_key)? {
+                    let guest: GuestRecord = serde_json::from_value(node.data)?;
+                    if !active_only || guest.is_active {
+                        out.push(guest);
+                    }
+                }
+            }
+            out.sort_by(|a, b| a.guest_id.cmp(&b.guest_id));
+            return Ok(out);
+        }
+
         let conn = self.conn.lock().unwrap();
         let sql = if active_only {
             "SELECT hotel_name, guest_id, role, config_json, is_active, active_pid FROM materialized_guests WHERE hotel_name = ?1 AND is_active = 1"
@@ -465,6 +787,19 @@ impl GraphStorage for SqliteGraphStorage {
             "UPDATE materialized_guests SET active_pid = ?1 WHERE hotel_name = ?2 AND guest_id = ?3",
             params![pid, hotel_name, guest_id],
         )?;
+        drop(conn);
+
+        let guest_key = Self::guest_node_key(hotel_name, guest_id);
+        if let Some(node) = self.adapter.get_node(&guest_key)? {
+            let mut guest: GuestRecord = serde_json::from_value(node.data)?;
+            guest.active_pid = pid.map(str::to_string);
+            self.adapter.upsert_node(&GraphNode {
+                node_key: guest_key,
+                kind: "guest".into(),
+                label: Some(guest.guest_id.clone()),
+                data: serde_json::to_value(guest)?,
+            })?;
+        }
         Ok(())
     }
 
@@ -476,6 +811,28 @@ impl GraphStorage for SqliteGraphStorage {
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![hotel_name, g.guest_id, g.role, g.config_json, g.is_active],
             )?;
+        }
+        drop(conn);
+
+        for g in guests {
+            let guest = GuestRecord {
+                hotel_name: hotel_name.to_string(),
+                ..g.clone()
+            };
+            let guest_key = Self::guest_node_key(hotel_name, &guest.guest_id);
+            self.adapter.upsert_node(&GraphNode {
+                node_key: guest_key.clone(),
+                kind: "guest".into(),
+                label: Some(guest.guest_id.clone()),
+                data: serde_json::to_value(&guest)?,
+            })?;
+            self.adapter.upsert_edge(&GraphEdge {
+                edge_key: Self::hotel_guest_edge_key(hotel_name, &guest.guest_id),
+                src_node_key: Self::hotel_node_key(hotel_name),
+                edge_kind: "HAS_GUEST".into(),
+                dst_node_key: guest_key,
+                data: serde_json::json!({}),
+            })?;
         }
         Ok(())
     }
@@ -498,11 +855,228 @@ impl GraphStorage for SqliteGraphStorage {
             "INSERT INTO memory_apartments (agent_id, memory_type, content) VALUES (?1, ?2, ?3)",
             [agent_id, memory_type, &content_str],
         )?;
+        drop(conn);
+
+        let agent_key = Self::agent_node_key(agent_id);
+        self.adapter.upsert_node(&GraphNode {
+            node_key: agent_key.clone(),
+            kind: "agent".into(),
+            label: Some(agent_id.to_string()),
+            data: serde_json::json!({
+                "agent_id": agent_id,
+            }),
+        })?;
+        let apartment_key = Self::apartment_node_key(agent_id, memory_type);
+        self.adapter.upsert_node(&GraphNode {
+            node_key: apartment_key.clone(),
+            kind: "memory_apartment".into(),
+            label: Some(format!("{agent_id}:{memory_type}")),
+            data: serde_json::json!({
+                "agent_id": agent_id,
+                "memory_type": memory_type,
+                "content_json": content_json,
+            }),
+        })?;
+        self.adapter.upsert_edge(&GraphEdge {
+            edge_key: Self::agent_apartment_edge_key(agent_id, memory_type),
+            src_node_key: agent_key,
+            edge_kind: "OWNS_APARTMENT".into(),
+            dst_node_key: apartment_key,
+            data: serde_json::json!({}),
+        })?;
 
         debug!(
             "Synchronized Memory Apartment for {} ({})",
             agent_id, memory_type
         );
         Ok(())
+    }
+
+    fn get_apartment(&self, agent_id: &str, memory_type: &str) -> Result<Option<serde_json::Value>> {
+        if let Some(node) = self
+            .adapter
+            .get_node(&Self::apartment_node_key(agent_id, memory_type))?
+        {
+            if let Some(content) = node.data.get("content_json") {
+                return Ok(Some(content.clone()));
+            }
+        }
+
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT content FROM memory_apartments
+             WHERE agent_id = ?1 AND memory_type = ?2
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![agent_id, memory_type])?;
+        if let Some(row) = rows.next()? {
+            let content: String = row.get(0)?;
+            Ok(Some(serde_json::from_str(&content)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn upsert_session(&self, session: &SessionRecord) -> Result<()> {
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::session_node_key(&session.session_id),
+            kind: "session".into(),
+            label: Some(session.session_id.clone()),
+            data: serde_json::to_value(session)?,
+        })
+    }
+
+    fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>> {
+        match self.adapter.get_node(&Self::session_node_key(session_id))? {
+            Some(node) => Ok(Some(serde_json::from_value(node.data)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn upsert_session_participant(&self, participant: &SessionParticipantRecord) -> Result<()> {
+        let participant_key =
+            Self::session_participant_node_key(&participant.session_id, &participant.component_id);
+        self.adapter.upsert_node(&GraphNode {
+            node_key: participant_key.clone(),
+            kind: "session_participant".into(),
+            label: Some(participant.component_id.clone()),
+            data: serde_json::to_value(participant)?,
+        })?;
+        self.adapter.upsert_edge(&GraphEdge {
+            edge_key: Self::session_participant_edge_key(
+                &participant.session_id,
+                &participant.component_id,
+            ),
+            src_node_key: Self::session_node_key(&participant.session_id),
+            edge_kind: "HAS_PARTICIPANT".into(),
+            dst_node_key: participant_key,
+            data: serde_json::json!({
+                "role": participant.role,
+            }),
+        })
+    }
+
+    fn list_session_participants(&self, session_id: &str) -> Result<Vec<SessionParticipantRecord>> {
+        let mut out: Vec<SessionParticipantRecord> = Vec::new();
+        for edge in self
+            .adapter
+            .list_edges_from(&Self::session_node_key(session_id), Some("HAS_PARTICIPANT"))?
+        {
+            if let Some(node) = self.adapter.get_node(&edge.dst_node_key)? {
+                out.push(serde_json::from_value(node.data)?);
+            }
+        }
+        out.sort_by(|a, b| a.component_id.cmp(&b.component_id));
+        Ok(out)
+    }
+
+    fn upsert_session_turn(&self, turn: &SessionTurnRecord) -> Result<()> {
+        let turn_key = Self::session_turn_node_key(&turn.session_id, &turn.turn_id);
+        self.adapter.upsert_node(&GraphNode {
+            node_key: turn_key.clone(),
+            kind: "session_turn".into(),
+            label: Some(turn.turn_id.clone()),
+            data: serde_json::to_value(turn)?,
+        })?;
+        self.adapter.upsert_edge(&GraphEdge {
+            edge_key: Self::session_turn_edge_key(&turn.session_id, &turn.turn_id),
+            src_node_key: Self::session_node_key(&turn.session_id),
+            edge_kind: "HAS_TURN".into(),
+            dst_node_key: turn_key,
+            data: serde_json::json!({
+                "status": turn.status,
+            }),
+        })
+    }
+
+    fn get_session_turn(&self, session_id: &str, turn_id: &str) -> Result<Option<SessionTurnRecord>> {
+        match self
+            .adapter
+            .get_node(&Self::session_turn_node_key(session_id, turn_id))?
+        {
+            Some(node) => Ok(Some(serde_json::from_value(node.data)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn list_session_turns(&self, session_id: &str, limit: usize) -> Result<Vec<SessionTurnRecord>> {
+        let mut out: Vec<SessionTurnRecord> = Vec::new();
+        for edge in self
+            .adapter
+            .list_edges_from(&Self::session_node_key(session_id), Some("HAS_TURN"))?
+        {
+            if let Some(node) = self.adapter.get_node(&edge.dst_node_key)? {
+                out.push(serde_json::from_value(node.data)?);
+            }
+        }
+        out.sort_by(|a: &SessionTurnRecord, b: &SessionTurnRecord| {
+            a.started_at
+                .unwrap_or(0)
+                .cmp(&b.started_at.unwrap_or(0))
+                .then_with(|| a.turn_id.cmp(&b.turn_id))
+        });
+        if out.len() > limit {
+            let drain = out.len() - limit;
+            out.drain(0..drain);
+        }
+        Ok(out)
+    }
+
+    fn append_session_event(&self, event: &SessionEventRecord) -> Result<()> {
+        let event_key = Self::session_event_node_key(&event.session_id, &event.event_id);
+        self.adapter.upsert_node(&GraphNode {
+            node_key: event_key.clone(),
+            kind: "session_event".into(),
+            label: Some(event.event_id.clone()),
+            data: serde_json::to_value(event)?,
+        })?;
+        self.adapter.upsert_edge(&GraphEdge {
+            edge_key: Self::session_event_edge_key(&event.session_id, &event.event_id),
+            src_node_key: Self::session_node_key(&event.session_id),
+            edge_kind: "HAS_EVENT".into(),
+            dst_node_key: event_key.clone(),
+            data: serde_json::json!({
+                "kind": event.kind,
+                "created_at": event.created_at,
+            }),
+        })?;
+
+        if let Some(turn_id) = event.turn_id.as_deref() {
+            self.adapter.upsert_edge(&GraphEdge {
+                edge_key: Self::turn_event_edge_key(&event.session_id, turn_id, &event.event_id),
+                src_node_key: Self::session_turn_node_key(&event.session_id, turn_id),
+                edge_kind: "HAS_EVENT".into(),
+                dst_node_key: event_key,
+                data: serde_json::json!({
+                    "kind": event.kind,
+                    "created_at": event.created_at,
+                }),
+            })?;
+        }
+
+        Ok(())
+    }
+
+    fn list_session_events(&self, session_id: &str, limit: usize) -> Result<Vec<SessionEventRecord>> {
+        let mut out: Vec<SessionEventRecord> = Vec::new();
+        for edge in self
+            .adapter
+            .list_edges_from(&Self::session_node_key(session_id), Some("HAS_EVENT"))?
+        {
+            if let Some(node) = self.adapter.get_node(&edge.dst_node_key)? {
+                out.push(serde_json::from_value(node.data)?);
+            }
+        }
+        out.sort_by(|a: &SessionEventRecord, b: &SessionEventRecord| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.event_id.cmp(&b.event_id))
+        });
+        if out.len() > limit {
+            let drain = out.len() - limit;
+            out.drain(0..drain);
+        }
+        Ok(out)
     }
 }

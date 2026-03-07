@@ -44,10 +44,12 @@ dependencies = [
  "anyhow",
  "clap",
  "philotic-client",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

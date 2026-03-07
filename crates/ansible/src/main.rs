@@ -62,6 +62,12 @@ fn guest_supervision_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn smoke_mode_enabled() -> bool {
+    std::env::var("PHILOTIC_SMOKE_MODE")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+}
+
 fn sanitize_hotel_name(hotel_name: &str) -> String {
     hotel_name
         .chars()
@@ -198,11 +204,7 @@ async fn main() -> Result<()> {
                     value.to_string()
                 };
                 
-                let conn = graph_storage.raw_conn().lock().unwrap();
-                conn.execute(
-                    "INSERT OR REPLACE INTO node_config (key, value_json) VALUES (?, ?)",
-                    [key, &val_str],
-                )?;
+                graph_storage.set_config_value(key, &val_str)?;
                 count += 1;
             }
             info!("Successfully injected {} configuration keys into Context Graph.", count);
@@ -224,6 +226,16 @@ async fn main() -> Result<()> {
         }
     };
 
+    graph_storage
+        .raw_conn()
+        .lock()
+        .expect("sqlite lock")
+        .execute(
+            "INSERT OR IGNORE INTO agent_identities (agent_id, persona_name, bundle_json) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["agent-jane-01", "Jane", "{}"],
+        )
+        .context("Failed to seed default agent identity")?;
+
     if let Some(active_pid) = hotel.active_pid.as_deref() {
         if let Ok(pid) = active_pid.parse::<u32>() {
             if pid_exists(pid) {
@@ -241,6 +253,7 @@ async fn main() -> Result<()> {
     let current_pid = std::process::id().to_string();
     graph_storage.set_hotel_pid(&hotel_name, Some(&current_pid))?;
     hotel.active_pid = Some(current_pid.clone());
+    let smoke_mode = smoke_mode_enabled();
 
     let caps = hotel.capabilities.clone();
     let mesh_port = hotel.mesh_port;
@@ -251,6 +264,29 @@ async fn main() -> Result<()> {
         caps.node_id,
         addr
     );
+
+    let graph_arc: Arc<dyn ansible_mesh_core::storage::GraphStorage> = Arc::new(graph_storage);
+
+    if smoke_mode {
+        warn!("PHILOTIC_SMOKE_MODE enabled: starting local-only IPC runtime without mesh or guest materialization.");
+
+        let (dispatcher_tx, mut dispatcher_rx) = mpsc::channel::<LedgerCommand>(1024);
+        std::thread::spawn(move || {
+            while let Some(_) = dispatcher_rx.blocking_recv() {}
+        });
+
+        let ipc_server = IpcServer::new(hotel.ipc_socket_path.clone(), dispatcher_tx, graph_arc.clone());
+        tokio::spawn(async move {
+            if let Err(e) = ipc_server.run().await {
+                error!("Hotel Front Desk (UDS) failed: {}", e);
+            }
+        });
+
+        tokio::signal::ctrl_c().await?;
+        let _ = graph_arc.set_hotel_pid(&hotel_name, None);
+        info!("Ansible smoke-mode shutdown complete.");
+        return Ok(());
+    }
     
     // Channel for inbound mesh UDP payloads bubbled up by the BeaconDaemon
     let (inbox_tx, mut inbox_rx) = mpsc::channel::<ansible_mesh_core::BeaconMessage>(1024);
@@ -261,7 +297,7 @@ async fn main() -> Result<()> {
     let daemon = match BeaconDaemon::bind(&addr, caps.clone(), inbox_tx, &mesh_psk, db_path.to_str().unwrap_or(""), flags.enable_rust_auth).await {
         Ok(daemon) => daemon,
         Err(e) => {
-            let _ = graph_storage.set_hotel_pid(&hotel_name, None);
+            let _ = graph_arc.set_hotel_pid(&hotel_name, None);
             return Err(e);
         }
     };
@@ -276,7 +312,6 @@ async fn main() -> Result<()> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(16);
     
     // Abstracted Universal Materializer with trait-object storage
-    let graph_arc: Arc<dyn ansible_mesh_core::storage::GraphStorage> = Arc::new(graph_storage);
     let materializer = Box::new(crate::service::guest_manager::LocalProcessMaterializer::new());
     let guest_manager = Arc::new(crate::service::guest_manager::GuestManager::new(hotel_name.clone(), graph_arc.clone(), materializer));
     

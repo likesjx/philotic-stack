@@ -12,6 +12,47 @@
 - [x] Review code for communication and split points.
 - [x] Create an implementation plan for the new services architecture.
 
+## Current Work Item Split
+
+### WI 1: Session Management
+
+- [x] Decide that session state has one canonical home in the Context Graph; apartment checkpoints are derived recovery projections, not a second source of truth.
+- [x] Generalize session as a cross-component coordination envelope rather than an agent-only transcript.
+- [x] Add graph-modeled session entities for session lifecycle, participants, and turns.
+- [x] Bind transport identities in `hegemon` to stable `session_id` values.
+- [ ] Add session leases / ownership semantics for active work.
+- [x] Persist session timeline/progress events while keeping the IPC plane general.
+- [x] Support recovery flows at the session layer.
+- [x] Support approval flows at the session layer.
+
+### WI 2: Agent Logic
+
+- [ ] Implement the bounded ZeroClaw-style loop in `agent-core`.
+- [ ] Build context from session snapshot plus memory apartments.
+- [ ] Execute tools with approval-aware flow control.
+- [x] Keep local working turn state in the agent during execution.
+- [x] Use `SyncApartment` as periodic derived snapshot/checkpoint sync back to the Context Graph, not as canonical session ownership.
+- [ ] Add compaction/checkpoint policy so apartment sync stays structured and reasonably small.
+- [x] Add slash-command short-circuiting for deterministic agent/system commands before the normal model loop.
+- [x] Add approval interrupts with explicit history and a pre-approval runtime path.
+
+## New Project: Philotic Agent Loop
+
+- [ ] Write a dedicated proposal for the Philotic loop architecture using Pi as the core turn-engine reference.
+- [ ] Write an implementation spec for loop state, events, checkpoints, tools, and approval interrupts.
+- [ ] Define the provider boundary (`transformContext`, `convertToLlm`, tool/result records, structured outputs).
+- [ ] Define the bounded execution loop and checkpoint boundaries.
+- [ ] Define approval interrupt/resume semantics.
+- [ ] Define loop event streaming and tracing payloads.
+
+## Deferred Design Threads
+
+- [ ] Command Center / architect continuity: define how architecture-impact work should be surfaced to Aria once the new home is ready.
+- [ ] Fresh onboarding flow: design repo/bootstrap onboarding from scratch for a new operator or agent entering Philotic.
+- [ ] `openclaw.json` ingestion: define a migration/import path that can consume legacy agent manifests and materialize Philotic agents.
+- [ ] Context graph deployment model: decide local-first vs cloud-backed vs hybrid graph ownership, sync, and operational model.
+- [ ] Approval UX evolution: add `/preapprove`, `/approval status`, `/approval reset`, and richer session policy editing for constrained transports like Telegram.
+
 ## MVP 1: Single-Node Mesh & Basic Tools
 
 - [x] Scaffold the `ansible-mesh-core` crate.

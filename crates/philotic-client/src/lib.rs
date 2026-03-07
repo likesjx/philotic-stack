@@ -184,18 +184,23 @@ impl PhiloticClient {
         Ok(resp)
     }
 
-    /// Optimistically write a memory apartment update to the hotel without waiting for a full response
+    /// Write a memory apartment update to the hotel and consume the response so the IPC stream stays framed.
     pub async fn sync_apartment(&mut self, agent_id: &str, memory_type: &str, content_json: serde_json::Value) -> Result<()> {
         let req = IpcRequest::SyncApartment {
             agent_id: agent_id.to_string(),
             memory_type: memory_type.to_string(),
             content_json,
         };
-        let payload = serde_json::to_vec(&req)?;
-        self.stream
-            .write_all(&payload)
-            .await
-            .context("Failed to dispatch SyncApartment")?;
+        let response = self.send_request(req).await?;
+        match response {
+            IpcResponse::Standard { ok: true, .. } => {}
+            IpcResponse::Standard { message, .. } => {
+                anyhow::bail!("SyncApartment failed: {}", message);
+            }
+            other => {
+                anyhow::bail!("Unexpected SyncApartment response: {:?}", other);
+            }
+        }
         Ok(())
     }
 }

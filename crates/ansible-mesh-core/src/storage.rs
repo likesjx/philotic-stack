@@ -6,8 +6,10 @@
 //! pluggable deployment-time decision.
 
 use crate::event::EventEnvelope;
+use crate::graph::{GraphEdge, GraphNode};
 use crate::NodeCapabilities;
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
 // ──────────────────────────────────────────────────────────────────────
 // EventStorage – manages the durable mesh_events log
@@ -50,7 +52,7 @@ pub trait CursorStorage: Send + Sync {
 // ──────────────────────────────────────────────────────────────────────
 
 /// A single guest record as loaded from the storage layer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuestRecord {
     pub hotel_name: String,
     pub guest_id: String,
@@ -61,7 +63,7 @@ pub struct GuestRecord {
 }
 
 /// A named hotel runtime record stored in the Context Graph.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HotelRecord {
     pub hotel_name: String,
     pub capabilities: NodeCapabilities,
@@ -69,6 +71,61 @@ pub struct HotelRecord {
     pub blob_port: u16,
     pub ipc_socket_path: String,
     pub active_pid: Option<String>,
+}
+
+/// A generalized cross-component session record stored in the Context Graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionRecord {
+    pub session_id: String,
+    pub session_kind: String,
+    pub primary_agent_id: Option<String>,
+    pub channel_kind: Option<String>,
+    pub channel_session_key: Option<String>,
+    pub status: String,
+    pub lease_owner_component_id: Option<String>,
+    pub lease_expires_at: Option<u64>,
+    #[serde(default)]
+    pub summary_json: serde_json::Value,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+/// A component participating in a session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionParticipantRecord {
+    pub session_id: String,
+    pub component_id: String,
+    pub role: String,
+    pub joined_at: u64,
+    pub last_seen_at: u64,
+}
+
+/// A turn within a session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionTurnRecord {
+    pub turn_id: String,
+    pub session_id: String,
+    pub request_event_id: Option<String>,
+    #[serde(default)]
+    pub user_message_json: serde_json::Value,
+    pub status: String,
+    pub response_json: Option<serde_json::Value>,
+    pub error_json: Option<serde_json::Value>,
+    pub started_at: Option<u64>,
+    pub completed_at: Option<u64>,
+}
+
+/// A lightweight session event, useful for deltas/progress outside of apartment snapshots.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionEventRecord {
+    pub event_id: String,
+    pub session_id: String,
+    pub turn_id: Option<String>,
+    pub component_id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub payload_json: serde_json::Value,
+    pub created_at: u64,
 }
 
 /// Abstraction over the local Context Graph database.
@@ -83,6 +140,9 @@ pub trait GraphStorage: Send + Sync {
 
     /// Load an arbitrary JSON config value by key.
     fn get_config_value(&self, key: &str) -> Result<Option<String>>;
+
+    /// Persist (upsert) an arbitrary JSON config value by key.
+    fn set_config_value(&self, key: &str, value_json: &str) -> Result<()>;
 
     /// Load a named hotel record, or `None` if it has not been bootstrapped yet.
     fn get_hotel(&self, hotel_name: &str) -> Result<Option<HotelRecord>>;
@@ -114,4 +174,31 @@ pub trait GraphStorage: Send + Sync {
         memory_type: &str,
         content_json: &serde_json::Value,
     ) -> Result<()>;
+    fn get_apartment(&self, agent_id: &str, memory_type: &str) -> Result<Option<serde_json::Value>>;
+
+    // ── Generalized sessions ─────────────────────────────────────────
+
+    fn upsert_session(&self, session: &SessionRecord) -> Result<()>;
+    fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>>;
+    fn upsert_session_participant(&self, participant: &SessionParticipantRecord) -> Result<()>;
+    fn list_session_participants(&self, session_id: &str) -> Result<Vec<SessionParticipantRecord>>;
+    fn upsert_session_turn(&self, turn: &SessionTurnRecord) -> Result<()>;
+    fn get_session_turn(&self, session_id: &str, turn_id: &str) -> Result<Option<SessionTurnRecord>>;
+    fn list_session_turns(&self, session_id: &str, limit: usize) -> Result<Vec<SessionTurnRecord>>;
+    fn append_session_event(&self, event: &SessionEventRecord) -> Result<()>;
+    fn list_session_events(&self, session_id: &str, limit: usize) -> Result<Vec<SessionEventRecord>>;
+}
+
+/// Generic graph persistence contract.
+///
+/// Backends can model nodes/edges however they want, but consumers should see
+/// a graph-shaped API instead of leaking table-oriented assumptions upward.
+pub trait GraphAdapter: Send + Sync {
+    fn upsert_node(&self, node: &GraphNode) -> Result<()>;
+    fn get_node(&self, node_key: &str) -> Result<Option<GraphNode>>;
+    fn delete_node(&self, node_key: &str) -> Result<()>;
+    fn list_nodes_by_kind(&self, kind: &str) -> Result<Vec<GraphNode>>;
+    fn upsert_edge(&self, edge: &GraphEdge) -> Result<()>;
+    fn delete_edge(&self, edge_key: &str) -> Result<()>;
+    fn list_edges_from(&self, src_node_key: &str, edge_kind: Option<&str>) -> Result<Vec<GraphEdge>>;
 }

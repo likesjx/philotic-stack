@@ -55,6 +55,7 @@ async fn main() -> Result<()> {
 
     let http_client = reqwest::Client::builder().timeout(Duration::from_secs(60)).build()?;
     let gemini_url = format!("https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={}", api_key);
+    let stub_response = std::env::var("PHILOTIC_MODEL_ROUTER_STUB_RESPONSE").ok();
 
     info!("Listening for inbound Inference tasks from the Philotic Web...");
     
@@ -65,10 +66,151 @@ async fn main() -> Result<()> {
                 
                 if let Ok(task) = serde_json::from_str::<Value>(&task_json) {
                     if let Some(prompt) = task.get("prompt").and_then(|c| c.as_str()) {
+                        let user_content = task
+                            .get("user_content")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or_default()
+                            .to_string();
                         let reply_to = task.get("reply_to").and_then(|r| r.as_str()).unwrap_or("hegemon").to_string();
+                        let reply_role = task.get("reply_role").and_then(|r| r.as_str()).unwrap_or("hegemon").to_string();
+                        let final_reply_to = task.get("final_reply_to").and_then(|r| r.as_str()).unwrap_or("local-ansible-01").to_string();
+                        let final_reply_role = task.get("final_reply_role").and_then(|r| r.as_str()).unwrap_or("hegemon").to_string();
+                        let session_id = task.get("session_id").and_then(|s| s.as_str()).unwrap_or_default().to_string();
+                        let turn_id = task.get("turn_id").and_then(|s| s.as_str()).unwrap_or_default().to_string();
                         let chat_id = task.get("chat_id").and_then(|id| id.as_str()).unwrap_or_default().to_string();
+
+                        if let Some(stub_text) = stub_response.as_ref() {
+                            let reply_req = IpcRequest::EmitTask {
+                                target_node: reply_to.clone(),
+                                target_role: reply_role.clone(),
+                                task_json: json!({
+                                    "action": "model_response",
+                                    "agent_action": {
+                                        "kind": "respond",
+                                        "content": stub_text
+                                    },
+                                    "session_id": session_id,
+                                    "turn_id": turn_id,
+                                    "chat_id": chat_id,
+                                    "content": stub_text,
+                                    "final_reply_to": final_reply_to,
+                                    "final_reply_role": final_reply_role
+                                }).to_string(),
+                            };
+
+                            info!("Model Router stub mode returning deterministic response.");
+                            let _ = ipc_client.send_request(reply_req).await;
+                            continue;
+                        }
                         
                         info!("Model Router executing inference for prompt snippet: {}...", &prompt.chars().take(50).collect::<String>());
+
+                        if let Some(echo_text) = user_content.strip_prefix("use echo ") {
+                            let reply_req = IpcRequest::EmitTask {
+                                target_node: reply_to.clone(),
+                                target_role: reply_role.clone(),
+                                task_json: json!({
+                                    "action": "model_response",
+                                    "agent_action": {
+                                        "kind": "tool_call",
+                                        "tool_name": "echo",
+                                        "arguments": {
+                                            "text": echo_text.trim()
+                                        }
+                                    },
+                                    "session_id": session_id,
+                                    "turn_id": turn_id,
+                                    "chat_id": chat_id,
+                                    "content": format!("tool_call: echo {}", echo_text.trim()),
+                                    "final_reply_to": final_reply_to,
+                                    "final_reply_role": final_reply_role
+                                }).to_string(),
+                            };
+
+                            info!("Routing structured tool call back to agent.");
+                            let _ = ipc_client.send_request(reply_req).await;
+                            continue;
+                        }
+
+                        if let Some(steering_note) =
+                            user_content.split("[User approval steering]\n").nth(1)
+                        {
+                            let steering_note = steering_note.trim();
+                            let reply_req = IpcRequest::EmitTask {
+                                target_node: reply_to.clone(),
+                                target_role: reply_role.clone(),
+                                task_json: json!({
+                                    "action": "model_response",
+                                    "agent_action": {
+                                        "kind": "respond",
+                                        "content": format!("Steered approval acknowledged: {}", steering_note)
+                                    },
+                                    "session_id": session_id,
+                                    "turn_id": turn_id,
+                                    "chat_id": chat_id,
+                                    "content": format!("Steered approval acknowledged: {}", steering_note),
+                                    "final_reply_to": final_reply_to,
+                                    "final_reply_role": final_reply_role
+                                }).to_string(),
+                            };
+
+                            info!("Routing steered approval follow-up back to agent.");
+                            let _ = ipc_client.send_request(reply_req).await;
+                            continue;
+                        }
+
+                        if let Some(redirect_note) = user_content
+                            .split("[User denied the proposed action. Do this instead]\n")
+                            .nth(1)
+                        {
+                            let redirect_note = redirect_note.trim();
+                            let reply_req = IpcRequest::EmitTask {
+                                target_node: reply_to.clone(),
+                                target_role: reply_role.clone(),
+                                task_json: json!({
+                                    "action": "model_response",
+                                    "agent_action": {
+                                        "kind": "respond",
+                                        "content": format!("Redirected: {}", redirect_note)
+                                    },
+                                    "session_id": session_id,
+                                    "turn_id": turn_id,
+                                    "chat_id": chat_id,
+                                    "content": format!("Redirected: {}", redirect_note),
+                                    "final_reply_to": final_reply_to,
+                                    "final_reply_role": final_reply_role
+                                }).to_string(),
+                            };
+
+                            info!("Routing denied-turn redirect follow-up back to agent.");
+                            let _ = ipc_client.send_request(reply_req).await;
+                            continue;
+                        }
+
+                        if let Some(approval_reason) = user_content.strip_prefix("need approval ") {
+                            let reply_req = IpcRequest::EmitTask {
+                                target_node: reply_to.clone(),
+                                target_role: reply_role.clone(),
+                                task_json: json!({
+                                    "action": "model_response",
+                                    "agent_action": {
+                                        "kind": "request_approval",
+                                        "reason": approval_reason.trim(),
+                                        "approved_response": format!("Approved: {}", approval_reason.trim())
+                                    },
+                                    "session_id": session_id,
+                                    "turn_id": turn_id,
+                                    "chat_id": chat_id,
+                                    "content": format!("approval required: {}", approval_reason.trim()),
+                                    "final_reply_to": final_reply_to,
+                                    "final_reply_role": final_reply_role
+                                }).to_string(),
+                            };
+
+                            info!("Routing structured approval request back to agent.");
+                            let _ = ipc_client.send_request(reply_req).await;
+                            continue;
+                        }
                         
                         // Fake making the HTTP request to start (can build real one next)
                         let payload = json!({
@@ -105,18 +247,26 @@ async fn main() -> Result<()> {
                                         }
                                     }
                                     
-                                    // 5. Route the final answer back to Hegemon over IPC!
+                                    // Route the inference answer back to the requested role.
                                     let reply_req = IpcRequest::EmitTask {
                                         target_node: reply_to.clone(),
-                                        target_role: "hegemon".into(),
+                                        target_role: reply_role.clone(),
                                         task_json: json!({
-                                            "action": "send_reply",
+                                            "action": "model_response",
+                                            "agent_action": {
+                                                "kind": "respond",
+                                                "content": response_text
+                                            },
+                                            "session_id": session_id,
+                                            "turn_id": turn_id,
                                             "chat_id": chat_id,
-                                            "content": response_text
+                                            "content": response_text,
+                                            "final_reply_to": final_reply_to,
+                                            "final_reply_role": final_reply_role
                                         }).to_string(),
                                     };
                                     
-                                    info!("Routing inference answer back to Gateway [{}]", reply_to);
+                                    info!("Routing inference answer back to role [{}] via [{}]", reply_role, reply_to);
                                     let _ = ipc_client.send_request(reply_req).await;
                                 }
                             }

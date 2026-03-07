@@ -270,7 +270,10 @@ impl GuestManager {
 mod tests {
     use super::*;
     use anyhow::Result;
-    use ansible_mesh_core::storage::GuestRecord;
+    use ansible_mesh_core::storage::{
+        GuestRecord, SessionEventRecord, SessionParticipantRecord, SessionRecord,
+        SessionTurnRecord,
+    };
     use ansible_mesh_core::NodeCapabilities;
     use serde_json::json;
     use std::collections::HashMap;
@@ -301,6 +304,10 @@ mod tests {
 
         fn get_config_value(&self, _key: &str) -> Result<Option<String>> {
             Ok(None)
+        }
+
+        fn set_config_value(&self, _key: &str, _value_json: &str) -> Result<()> {
+            Ok(())
         }
 
         fn get_hotel(&self, _hotel_name: &str) -> Result<Option<ansible_mesh_core::storage::HotelRecord>> {
@@ -355,6 +362,46 @@ mod tests {
             _content_json: &serde_json::Value,
         ) -> Result<()> {
             Ok(())
+        }
+
+        fn get_apartment(&self, _agent_id: &str, _memory_type: &str) -> Result<Option<serde_json::Value>> {
+            Ok(None)
+        }
+
+        fn upsert_session(&self, _session: &SessionRecord) -> Result<()> {
+            Ok(())
+        }
+
+        fn get_session(&self, _session_id: &str) -> Result<Option<SessionRecord>> {
+            Ok(None)
+        }
+
+        fn upsert_session_participant(&self, _participant: &SessionParticipantRecord) -> Result<()> {
+            Ok(())
+        }
+
+        fn list_session_participants(&self, _session_id: &str) -> Result<Vec<SessionParticipantRecord>> {
+            Ok(vec![])
+        }
+
+        fn upsert_session_turn(&self, _turn: &SessionTurnRecord) -> Result<()> {
+            Ok(())
+        }
+
+        fn get_session_turn(&self, _session_id: &str, _turn_id: &str) -> Result<Option<SessionTurnRecord>> {
+            Ok(None)
+        }
+
+        fn list_session_turns(&self, _session_id: &str, _limit: usize) -> Result<Vec<SessionTurnRecord>> {
+            Ok(vec![])
+        }
+
+        fn append_session_event(&self, _event: &SessionEventRecord) -> Result<()> {
+            Ok(())
+        }
+
+        fn list_session_events(&self, _session_id: &str, _limit: usize) -> Result<Vec<SessionEventRecord>> {
+            Ok(vec![])
         }
     }
 

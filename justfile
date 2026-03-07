@@ -49,6 +49,30 @@ format:
 test:
     cargo test --workspace
 
+# Run the heavier binary-level smoke test
+smoke-binaries:
+    ./scripts/smoke-binary-roundtrip.sh
+
+# Run the approval interrupt binary smoke test
+smoke-approval:
+    ./scripts/smoke-approval-roundtrip.sh
+
+# Run the approval denial binary smoke test
+smoke-deny:
+    ./scripts/smoke-deny-roundtrip.sh
+
+# Run the approval steering binary smoke test
+smoke-approve-steer:
+    ./scripts/smoke-approve-steer-roundtrip.sh
+
+# Run the deny redirect binary smoke test
+smoke-deny-redirect:
+    ./scripts/smoke-deny-redirect-roundtrip.sh
+
+# Run the preapproved session binary smoke test
+smoke-preapprove:
+    ./scripts/smoke-preapprove-roundtrip.sh
+
 # Show configured Ansible inventory for deployment targets
 ansible-inventory:
     cd ansible && ansible-inventory --list
