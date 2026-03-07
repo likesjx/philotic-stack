@@ -75,6 +75,35 @@
   - fallback policy
   - route selection reason in `tool_assembly`
 
+## Next Project: Personality and Context
+
+- [ ] Review [PERSONALITY_AND_CONTEXT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PERSONALITY_AND_CONTEXT_PROPOSAL.md).
+- [ ] Refactor `agent-core` prompt assembly into explicit layers:
+  - soul
+  - identity
+  - user context
+  - memory context
+  - session context
+- [ ] Add initial agent-level personality fields for:
+  - `soul_text`
+  - `identity_text`
+  - `user_context_text`
+  - `memory_summary`
+- [ ] Define the import path from `openclaw.json`.
+- [ ] Import legacy workspace bootstrap files when present:
+  - `SOUL.md`
+  - `IDENTITY.md`
+  - `USER.md`
+  - `MEMORY.md`
+- [ ] Define how user continuity should follow an identified person across sessions.
+- [ ] Define memory retrieval layers for:
+  - context graph
+  - knowledge graph
+  - hippocampal / episodic memory
+  - heuristic memory backends
+  - tool-runner local indexes
+- [ ] Keep the first implementation slice personality-first; do not try to solve the full memory backend story in the same change.
+
 ## Deferred Design Threads
 
 - [ ] Agent workflow formalization: adopt a standing Codex process for context gathering, slice sizing, verification ladders, watched live runs, proposal disposition updates, per-slice commit/push discipline, and assumption-vs-reality capture.
@@ -90,6 +119,7 @@
 - [ ] Review [TELEGRAM_INTEGRATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_INTEGRATION_PROPOSAL.md).
 - [ ] Review [VOICE_MACHINE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/VOICE_MACHINE_PROPOSAL.md).
 - [ ] Telegram slash-command elevation: raise deterministic `/commands` into `hegemon` before the normal agent loop so Telegram-side testing and operational control become faster and cleaner.
+- [ ] Telegram approval card UX: include request IDs, tool/action names, args summaries, and resolution messages in a more native Telegram approval experience.
 - [ ] Telegram streaming and media UX: define partial delivery, edits vs follow-up messages, and interruption behavior for Telegram replies.
 - [ ] Voice machine design: define STT, TTS, speech-to-speech, transcript generation, and media artifact/session handling.
 - [ ] Tool runner lifecycle policy: define idle retention, sleep/teardown timing, wake-up thresholds, and environment-specific materialization rules for routed tools.

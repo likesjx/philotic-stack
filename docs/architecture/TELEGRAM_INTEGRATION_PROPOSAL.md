@@ -81,6 +81,45 @@ Flow:
 - `/approval status`
 - `/approval reset`
 
+## Approval UX in Telegram
+
+Telegram should present approval flow as a transport-native operator interaction, not just a generic agent reply.
+
+Near-term recommendation:
+
+- approval request messages should include:
+  - approval ID
+  - tool or action name
+  - argument summary
+  - short reason/policy context
+- approval resolution messages should include:
+  - approval ID
+  - decision (`approved` / `denied`)
+  - whether execution resumed, redirected, or stopped
+
+Target message shape:
+
+- `Approval required for tool \`glob_search\``
+- `Request ID: \`apr-123\``
+- `Args: \`{\"pattern\":\"**/*.json\"}\``
+
+and then:
+
+- `Approved pending request \`apr-123\` for this invocation of \`glob_search\`.`
+
+This should later grow into inline Telegram buttons when appropriate:
+
+- `Approve`
+- `Deny`
+- possibly `Approve + note`
+
+Fallback command path should still exist:
+
+- `/approve <request_id> [note]`
+- `/deny <request_id> [redirect]`
+
+This makes approval flows auditable, legible, and much less dependent on the user remembering invisible internal state.
+
 ## Streaming and Delivery UX
 
 Telegram integration should eventually support more than final-message delivery.
