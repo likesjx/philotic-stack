@@ -20,6 +20,7 @@ pub struct InboundTaskPayload {
     #[serde(default)]
     pub tool_name: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub arguments: Option<serde_json::Value>,
     #[serde(default)]
     pub final_reply_to: Option<String>,
@@ -59,6 +60,17 @@ pub struct ToolExecutionPayload {
     pub chat_id: String,
     pub tool_name: String,
     pub arguments: serde_json::Value,
+    pub execution_mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runner_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incarnation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hotel_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection_reason: Option<String>,
     pub reply_to: String,
     pub reply_role: String,
     pub final_reply_to: String,

@@ -33,6 +33,13 @@ Implemented so far:
 - runtime-facing execution routes
 - externalized routed tool execution via `tool-runner`
 - live vs materialization-required route signaling
+- execution-mode taxonomy in the runtime:
+  - `local_agent`
+  - `capability`
+  - `pinned`
+- incarnation-aware execution metadata in assembled routes
+- session `allowed_tool_runner_incarnations` can now define visible tools and preferred execution routes
+- `agent-core` now translates abstract tool calls into preassembled route envelopes instead of rediscovering routing at call time
 
 Still pending in [task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md):
 
@@ -124,6 +131,8 @@ Outputs:
 - `policy_annotations`
 - runner environment/materialization requirements
 
+When a session has an explicit allowed-incarnation set, `ToolAssembly` should derive visible tools from those incarnations first and only use `effective_toolset` as a narrowing/hiding layer. That keeps capability visibility aligned with actual routable execution rather than treating the tool list as magical truth.
+
 Example:
 
 ```json
@@ -162,6 +171,12 @@ Example:
 Only `tools_for_model` belongs in prompt/model context.
 
 `execution_routes` and runner details are runtime concerns.
+
+Current Philotic implementation note:
+
+- route envelopes now carry runner/incarnation/hotel/environment metadata plus a `selection_reason`
+- `agent-core` uses that prepared envelope when dispatching external tool calls
+- `local_agent` tools are resolved entirely within the loop runtime and are intentionally limited to simple logic or self/session configuration behavior
 
 `execution_mode` must stay general. A routed tool may execute over:
 

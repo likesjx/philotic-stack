@@ -17,7 +17,12 @@ That lets us keep building the current agent/runtime flow without prematurely bu
 
 Proposed and accepted as the assumed future model.
 
-This plane is not fully implemented yet. Current code only contains an initial runner registry and session-time tool assembly projection.
+This plane is not fully implemented yet. Current code now contains:
+
+- an initial runner registry
+- session-time tool assembly projection
+- session-scoped allowed-incarnation bindings that can derive visible tools and execution routes
+- initial execution taxonomy in the runtime (`local_agent`, `capability`, `pinned`)
 
 Track the remaining work in [task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md) under `Next Project: Tool Assembly and Routed Execution` and `Deferred Design Threads`.
 
@@ -154,6 +159,12 @@ The important distinction is:
 - runners define what can exist
 - incarnations define what can run
 - agents define what they may generally use
+
+Current transitional implementation note:
+
+- sessions can already carry `allowed_tool_runner_incarnations`
+- that set now acts as the executable boundary for visible tools when present
+- the long-term management plane should move that default capability mapping up to the agent/system layer before session start
 
 ### 6. Session Effective Toolset
 

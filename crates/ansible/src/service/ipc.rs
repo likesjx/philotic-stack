@@ -41,6 +41,20 @@ struct ToolRunnerRegistryEntry {
     last_seen_at: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AllowedIncarnation {
+    incarnation_id: String,
+    runner_id: Option<String>,
+    hotel_id: Option<String>,
+    environment_id: Option<String>,
+    target_node: Option<String>,
+    target_role: Option<String>,
+    supported_tools: Vec<String>,
+    execution_mode: String,
+    availability_state: String,
+    selection_hint: Option<String>,
+}
+
 pub struct IpcServer {
     socket_path: String,
     dispatcher_tx: mpsc::Sender<LedgerCommand>,
@@ -1078,24 +1092,15 @@ fn compose_tool_assembly(
     registered_runners: &[ToolRunnerRegistryEntry],
     live_runners: &[LiveToolRunner],
 ) -> serde_json::Value {
-    let mut toolset = bindings
-        .get("effective_toolset")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    if toolset.is_empty() {
-        toolset.push(serde_json::json!("echo"));
+    let allowed_incarnations = parse_allowed_incarnations(bindings, registered_runners, live_runners);
+    if !allowed_incarnations.is_empty() {
+        return compose_tool_assembly_from_incarnations(bindings, &allowed_incarnations);
     }
+
+    let toolset = default_visible_toolset(bindings);
 
     let tools_for_model = toolset
         .iter()
-        .filter_map(|tool| tool.as_str())
-        .filter(|tool_name| {
-            registered_runners.iter().any(|runner| {
-                runner.supported_tools.is_empty()
-                    || runner.supported_tools.iter().any(|supported| supported == *tool_name)
-            })
-        })
         .map(|tool_name| {
             serde_json::json!({
                 "tool_name": tool_name,
@@ -1109,8 +1114,23 @@ fn compose_tool_assembly(
 
     let execution_routes = toolset
         .iter()
-        .filter_map(|tool| tool.as_str())
-        .filter_map(|tool_name| {
+        .map(|tool_name| {
+            if is_local_agent_tool(tool_name) {
+                return Some((
+                    tool_name.to_string(),
+                    serde_json::json!({
+                        "target_node": "agent-jane-01",
+                        "target_role": "agent",
+                        "runner_id": serde_json::Value::Null,
+                        "incarnation_id": serde_json::Value::Null,
+                        "hotel_id": serde_json::Value::Null,
+                        "environment_id": serde_json::Value::Null,
+                        "execution_mode": "local_agent",
+                        "availability_state": "live",
+                        "selection_reason": "agent_local_tool",
+                    }),
+                ));
+            }
             let registered = registered_runners.iter().find(|runner| {
                 runner.supported_tools.is_empty()
                     || runner.supported_tools.iter().any(|supported| supported == tool_name)
@@ -1119,10 +1139,7 @@ fn compose_tool_assembly(
                 runner.supported_tools.is_empty()
                     || runner.supported_tools.iter().any(|supported| supported == tool_name)
             });
-            Some((tool_name, registered, live_runner))
-        })
-        .map(|(tool_name, registered, live_runner)| {
-            (
+            Some((
                 tool_name.to_string(),
                 serde_json::json!({
                     "target_node": "local-ansible-01",
@@ -1130,20 +1147,30 @@ fn compose_tool_assembly(
                     "runner_id": live_runner
                         .map(|runner| runner.guest_id.clone())
                         .unwrap_or_else(|| registered.guest_id.clone()),
-                    "execution_mode": "ipc",
+                    "incarnation_id": live_runner
+                        .map(|runner| runner.guest_id.clone())
+                        .unwrap_or_else(|| registered.guest_id.clone()),
+                    "hotel_id": "local-ansible-01",
+                    "environment_id": serde_json::Value::Null,
+                    "execution_mode": "capability",
                     "availability_state": if live_runner.is_some() {
                         "live"
                     } else {
                         "materialization_required"
-                    }
+                    },
+                    "selection_reason": if live_runner.is_some() {
+                        "live_capability_runner"
+                    } else {
+                        "registered_capability_runner_requires_materialization"
+                    },
                 }),
-            )
+            ))
         })
+        .flatten()
         .collect::<serde_json::Map<_, _>>();
 
     let policy_annotations = toolset
         .iter()
-        .filter_map(|tool| tool.as_str())
         .map(|tool_name| {
             (
                 tool_name.to_string(),
@@ -1160,6 +1187,215 @@ fn compose_tool_assembly(
         "execution_routes": execution_routes,
         "policy_annotations": policy_annotations,
     })
+}
+
+fn default_visible_toolset(bindings: &serde_json::Value) -> Vec<String> {
+    let mut toolset = bindings
+        .get("effective_toolset")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if toolset.is_empty() {
+        toolset.push("echo".into());
+    }
+    toolset
+}
+
+fn is_local_agent_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "session.status")
+}
+
+fn parse_allowed_incarnations(
+    bindings: &serde_json::Value,
+    registered_runners: &[ToolRunnerRegistryEntry],
+    live_runners: &[LiveToolRunner],
+) -> Vec<AllowedIncarnation> {
+    bindings
+        .get("allowed_tool_runner_incarnations")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|entry| {
+            let incarnation_id = entry.get("incarnation_id")?.as_str()?.to_string();
+            let runner_id = entry
+                .get("runner_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let target_node = entry
+                .get("target_node")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let target_role = entry
+                .get("target_role")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let supported_tools = entry
+                .get("supported_tools")
+                .and_then(serde_json::Value::as_array)
+                .map(|tools| {
+                    tools
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let is_live = live_runners.iter().any(|runner| {
+                runner.guest_id == incarnation_id
+                    || runner_id.as_deref() == Some(runner.guest_id.as_str())
+            });
+            let is_registered = registered_runners.iter().any(|runner| {
+                runner.guest_id == incarnation_id
+                    || runner_id.as_deref() == Some(runner.guest_id.as_str())
+            });
+            Some(AllowedIncarnation {
+                incarnation_id,
+                runner_id,
+                hotel_id: entry
+                    .get("hotel_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                environment_id: entry
+                    .get("environment_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                target_node,
+                target_role,
+                supported_tools,
+                execution_mode: entry
+                    .get("execution_mode")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("capability")
+                    .to_string(),
+                availability_state: if is_live {
+                    "live".into()
+                } else if is_registered {
+                    "materialization_required".into()
+                } else {
+                    entry.get("availability_state")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("materialization_required")
+                        .to_string()
+                },
+                selection_hint: entry
+                    .get("selection_hint")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            })
+        })
+        .collect()
+}
+
+fn compose_tool_assembly_from_incarnations(
+    bindings: &serde_json::Value,
+    incarnations: &[AllowedIncarnation],
+) -> serde_json::Value {
+    let toolset = {
+        let filtered = default_visible_toolset(bindings);
+        if bindings
+            .get("effective_toolset")
+            .and_then(serde_json::Value::as_array)
+            .is_some()
+        {
+            filtered
+        } else {
+            incarnations
+                .iter()
+                .flat_map(|incarnation| incarnation.supported_tools.iter().cloned())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        }
+    };
+
+    let tools_for_model = toolset
+        .iter()
+        .map(|tool_name| {
+            serde_json::json!({
+                "tool_name": tool_name,
+                "description": format!("Execute the {} tool.", tool_name),
+                "input_schema": {
+                    "type": "object"
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let execution_routes = toolset
+        .iter()
+        .filter_map(|tool_name| {
+            select_allowed_incarnation(incarnations, tool_name).map(|incarnation| {
+                (
+                    tool_name.to_string(),
+                    serde_json::json!({
+                        "target_node": incarnation.target_node.clone().or_else(|| incarnation.hotel_id.clone()).unwrap_or_else(|| "local-ansible-01".into()),
+                        "target_role": incarnation.target_role.clone().unwrap_or_else(|| format!("tool.{tool_name}")),
+                        "runner_id": incarnation.runner_id.clone().unwrap_or_else(|| incarnation.incarnation_id.clone()),
+                        "incarnation_id": incarnation.incarnation_id,
+                        "hotel_id": incarnation.hotel_id,
+                        "environment_id": incarnation.environment_id,
+                        "execution_mode": incarnation.execution_mode,
+                        "availability_state": incarnation.availability_state,
+                        "selection_reason": incarnation.selection_hint.clone().unwrap_or_else(|| "allowed_incarnation_route".into()),
+                    }),
+                )
+            })
+        })
+        .collect::<serde_json::Map<_, _>>();
+
+    let policy_annotations = toolset
+        .iter()
+        .map(|tool_name| {
+            (
+                tool_name.to_string(),
+                serde_json::json!({
+                    "policy_class": format!("tool:{tool_name}"),
+                    "approval_required": false
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+
+    serde_json::json!({
+        "tools_for_model": tools_for_model,
+        "execution_routes": execution_routes,
+        "policy_annotations": policy_annotations,
+    })
+}
+
+fn select_allowed_incarnation<'a>(
+    incarnations: &'a [AllowedIncarnation],
+    tool_name: &str,
+) -> Option<&'a AllowedIncarnation> {
+    let mut candidates = incarnations
+        .iter()
+        .filter(|incarnation| {
+            incarnation
+                .supported_tools
+                .iter()
+                .any(|supported| supported == tool_name)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        let left_live = left.availability_state == "live";
+        let right_live = right.availability_state == "live";
+        right_live
+            .cmp(&left_live)
+            .then_with(|| {
+                let left_local = left.hotel_id.as_deref() == Some("local-ansible-01");
+                let right_local = right.hotel_id.as_deref() == Some("local-ansible-01");
+                right_local.cmp(&left_local)
+            })
+            .then_with(|| left.incarnation_id.cmp(&right.incarnation_id))
+    });
+    candidates.into_iter().next()
 }
 
 fn unix_ts() -> u64 {
@@ -1601,6 +1837,143 @@ mod tests {
                 assert_eq!(
                     snapshot["bindings"]["effective_workspace_ref"],
                     "workspace://main"
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        unsafe { std::env::remove_var("PHILOTIC_HOTEL_SOCKET"); }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn session_snapshot_derives_visible_tools_from_allowed_incarnations() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
+        let server = IpcServer::new(socket_path.clone(), dispatcher_tx, graph);
+
+        graph_store
+            .upsert_session(&SessionRecord {
+                session_id: "sess-incarnations".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("123".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "bindings": {
+                        "allowed_tool_runner_incarnations": [
+                            {
+                                "incarnation_id": "tool-runner-remote",
+                                "runner_id": "tool-runner-remote",
+                                "hotel_id": "remote-hotel",
+                                "environment_id": "env://remote",
+                                "target_node": "remote-hotel",
+                                "target_role": "tool.echo",
+                                "supported_tools": ["echo"],
+                                "execution_mode": "capability",
+                                "selection_hint": "remote_fallback"
+                            },
+                            {
+                                "incarnation_id": "tool-runner-local",
+                                "runner_id": "tool-runner-local",
+                                "hotel_id": "local-ansible-01",
+                                "environment_id": "env://local",
+                                "target_node": "local-ansible-01",
+                                "target_role": "tool.echo",
+                                "supported_tools": ["echo"],
+                                "execution_mode": "capability",
+                                "selection_hint": "local_live_preferred"
+                            }
+                        ]
+                    }
+                }),
+                created_at: 1,
+                updated_at: 2,
+            })
+            .expect("session should seed");
+        graph_store
+            .set_config_value(
+                "tool_runner_registry",
+                &serde_json::json!([
+                    {
+                        "guest_id": "tool-runner-remote",
+                        "supported_tools": ["echo"],
+                        "last_seen_at": 41
+                    },
+                    {
+                        "guest_id": "tool-runner-local",
+                        "supported_tools": ["echo"],
+                        "last_seen_at": 42
+                    }
+                ])
+                .to_string(),
+            )
+            .expect("registry should seed");
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe { std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path); }
+
+        let mut agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("agent connect");
+        let mut local_tool = PhiloticClient::connect(GuestIdentity {
+            guest_id: "tool-runner-local".into(),
+            role: "tool".into(),
+            supported_tools: vec!["echo".into()],
+        })
+        .await
+        .expect("local tool connect");
+        local_tool
+            .send_request(IpcRequest::SubscribeInbox {
+                role: "tool.echo".into(),
+            })
+            .await
+            .expect("local tool subscribe");
+
+        let response = agent
+            .send_request(IpcRequest::GetConfig {
+                key: "__session_snapshot__:sess-incarnations".into(),
+            })
+            .await
+            .expect("snapshot request should succeed");
+
+        match response {
+            IpcResponse::ConfigData {
+                value_json: Some(value_json),
+                ..
+            } => {
+                let snapshot: serde_json::Value =
+                    serde_json::from_str(&value_json).expect("snapshot should decode");
+                assert_eq!(snapshot["tool_assembly"]["tools_for_model"][0]["tool_name"], "echo");
+                assert_eq!(
+                    snapshot["tool_assembly"]["execution_routes"]["echo"]["incarnation_id"],
+                    "tool-runner-local"
+                );
+                assert_eq!(
+                    snapshot["tool_assembly"]["execution_routes"]["echo"]["selection_reason"],
+                    "local_live_preferred"
+                );
+                assert_eq!(
+                    snapshot["tool_assembly"]["execution_routes"]["echo"]["availability_state"],
+                    "live"
                 );
             }
             other => panic!("unexpected response: {other:?}"),

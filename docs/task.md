@@ -50,7 +50,7 @@
 - [ ] Review [TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md).
 - [ ] Review [TOOL_MANAGEMENT_PLANE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TOOL_MANAGEMENT_PLANE_PROPOSAL.md).
 - [ ] Review [RUNNER_ARTIFACT_BUILD_DISTRIBUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RUNNER_ARTIFACT_BUILD_DISTRIBUTION_PROPOSAL.md).
-- [ ] Introduce a first-class `ToolAssembly` model with model-facing tool definitions and runtime-facing execution routes.
+- [x] Introduce a first-class `ToolAssembly` model with model-facing tool definitions and runtime-facing execution routes.
 - [ ] Formalize the system tool management plane in the Context Graph:
   - known tool runners
   - runner incarnations
@@ -58,10 +58,15 @@
   - discovered hotel environments
   - agent default toolsets
   - session narrowing/hiding rules
-- [ ] Move real tool execution out of `agent-core` and behind routed tool runners/toolset components.
+- [x] Move real tool execution out of `agent-core` and behind routed tool runners/toolset components.
 - [ ] Add runner readiness/materialization checks during tool assembly.
 - [ ] Add environment-aware runner routing and materialization policy so tools can target non-IPC execution environments when needed.
-- [ ] Keep local config/session mutation commands in `agent-core`, but externalize real tool execution.
+- [x] Keep local config/session mutation commands in `agent-core`, but externalize real tool execution.
+- [x] Let session-scoped allowed runner incarnations derive visible tools and preassembled execution routes.
+- [x] Add execution taxonomy for routed tools:
+  - `local_agent`
+  - `capability`
+  - `pinned`
 - [ ] Return to skill design after tool assembly and routed execution boundaries are in place.
 - [ ] Add agent-specific runner routing:
   - preferred environment

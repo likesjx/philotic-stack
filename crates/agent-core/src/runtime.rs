@@ -452,11 +452,21 @@ impl AgentRuntime {
             chat_id,
             tool_name: tool_call.tool_name,
             arguments: tool_call.arguments,
+            execution_mode: route.execution_mode.clone(),
+            runner_id: route.runner_id.clone(),
+            incarnation_id: route.incarnation_id.clone(),
+            hotel_id: route.hotel_id.clone(),
+            environment_id: route.environment_id.clone(),
+            selection_reason: route.selection_reason.clone(),
             reply_to: LOCAL_NODE.to_string(),
             reply_role: "agent".into(),
             final_reply_to,
             final_reply_role,
         };
+
+        if route.execution_mode == "local_agent" {
+            return self.execute_local_agent_tool(tool_req).await;
+        }
 
         self.ipc_client
             .send_request(IpcRequest::EmitTask {
@@ -1286,7 +1296,7 @@ impl AgentRuntime {
         state
             .resolve_tool_route(&tool_call.tool_name)
             .and_then(|route| {
-                if route.availability_state != "live" {
+                if route.execution_mode != "local_agent" && route.availability_state != "live" {
                     None
                 } else {
                     Some(route)
@@ -1311,6 +1321,40 @@ impl AgentRuntime {
             approval.approval_id = Some(Uuid::new_v4().to_string());
         }
         approval
+    }
+
+    async fn execute_local_agent_tool(&mut self, payload: ToolExecutionPayload) -> Result<()> {
+        match payload.tool_name.as_str() {
+            "session.status" => {
+                let content = self
+                    .sessions
+                    .get(&payload.session_id)
+                    .map(SessionState::session_status_text)
+                    .unwrap_or_else(|| "Session status unavailable.".into());
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    tool_name: Some(payload.tool_name),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                })
+                .await
+            }
+            other => self
+                .fail_active_turn(
+                    payload.session_id,
+                    payload.turn_id,
+                    format!("Agent-local tool {} is not implemented", other),
+                )
+                .await,
+        }
     }
 
     async fn complete_local_command(
@@ -1503,7 +1547,7 @@ mod tests {
             },
         )
         .expect("echo tool should be allowed");
-        assert_eq!(route.target_role, "tool");
+        assert_eq!(route.target_role, "tool.echo");
     }
 
     #[test]
@@ -1577,5 +1621,26 @@ mod tests {
         )
         .expect_err("dormant route should not execute");
         assert!(err.to_string().contains("requires runner materialization"));
+    }
+
+    #[test]
+    fn local_agent_route_executes_without_external_runner_liveness() {
+        let mut state = SessionState::new(
+            "sess-1".into(),
+            "agent-jane-01".into(),
+            "telegram".into(),
+        );
+        state.clear_tool_bindings();
+        state.add_tool_binding("session.status");
+
+        let route = super::AgentRuntime::execute_bound_tool(
+            &state,
+            &ToolCall {
+                tool_name: "session.status".into(),
+                arguments: serde_json::json!({}),
+            },
+        )
+        .expect("local agent tools should not require an external runner");
+        assert_eq!(route.execution_mode, "local_agent");
     }
 }

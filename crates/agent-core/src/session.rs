@@ -44,6 +44,8 @@ pub struct SessionBindings {
     pub effective_workspace_ref: Option<String>,
     #[serde(default)]
     pub effective_model_controller: Option<String>,
+    #[serde(default)]
+    pub allowed_tool_runner_incarnations: Vec<ToolRunnerIncarnationBinding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -60,9 +62,40 @@ pub struct ToolExecutionRoute {
     pub target_role: String,
     #[serde(default)]
     pub runner_id: Option<String>,
+    #[serde(default)]
+    pub incarnation_id: Option<String>,
+    #[serde(default)]
+    pub hotel_id: Option<String>,
+    #[serde(default)]
+    pub environment_id: Option<String>,
     pub execution_mode: String,
     #[serde(default = "default_route_availability")]
     pub availability_state: String,
+    #[serde(default)]
+    pub selection_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ToolRunnerIncarnationBinding {
+    pub incarnation_id: String,
+    #[serde(default)]
+    pub runner_id: Option<String>,
+    #[serde(default)]
+    pub hotel_id: Option<String>,
+    #[serde(default)]
+    pub environment_id: Option<String>,
+    #[serde(default)]
+    pub target_node: Option<String>,
+    #[serde(default)]
+    pub target_role: Option<String>,
+    #[serde(default)]
+    pub supported_tools: Vec<String>,
+    #[serde(default = "default_capability_execution_mode")]
+    pub execution_mode: String,
+    #[serde(default = "default_route_availability")]
+    pub availability_state: String,
+    #[serde(default)]
+    pub selection_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -83,6 +116,10 @@ pub struct ToolAssembly {
 
 fn default_route_availability() -> String {
     "live".into()
+}
+
+fn default_capability_execution_mode() -> String {
+    "capability".into()
 }
 
 #[derive(Debug, Clone)]
@@ -219,6 +256,19 @@ impl SessionState {
     }
 
     pub fn tool_is_enabled(&self, tool_name: &str) -> bool {
+        if self
+            .tool_assembly
+            .tools_for_model
+            .iter()
+            .any(|tool| tool.tool_name == tool_name)
+        {
+            return true;
+        }
+
+        if self.tool_assembly.execution_routes.contains_key(tool_name) {
+            return true;
+        }
+
         self.bindings.effective_toolset.is_empty()
             || self
                 .bindings
@@ -589,11 +639,11 @@ pub fn merge_session_index(
 }
 
 pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAssembly {
-    let toolset = if bindings.effective_toolset.is_empty() {
-        vec!["echo".to_string()]
-    } else {
-        bindings.effective_toolset.clone()
-    };
+    if !bindings.allowed_tool_runner_incarnations.is_empty() {
+        return tool_assembly_from_allowed_incarnations(bindings);
+    }
+
+    let toolset = default_visible_toolset(bindings);
 
     let tools_for_model = toolset
         .iter()
@@ -609,14 +659,43 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
     let execution_routes = toolset
         .iter()
         .map(|tool_name| {
+            let execution_mode = if is_local_agent_tool(tool_name) {
+                "local_agent"
+            } else {
+                "capability"
+            };
             (
                 tool_name.clone(),
                 ToolExecutionRoute {
-                    target_node: "local-ansible-01".into(),
-                    target_role: "tool".into(),
-                    runner_id: Some("tool-runner-01".into()),
-                    execution_mode: "ipc".into(),
+                    target_node: if execution_mode == "local_agent" {
+                        "agent-jane-01".into()
+                    } else {
+                        "local-ansible-01".into()
+                    },
+                    target_role: if execution_mode == "local_agent" {
+                        "agent".into()
+                    } else {
+                        format!("tool.{tool_name}")
+                    },
+                    runner_id: if execution_mode == "local_agent" {
+                        None
+                    } else {
+                        Some("tool-runner-01".into())
+                    },
+                    incarnation_id: None,
+                    hotel_id: if execution_mode == "local_agent" {
+                        None
+                    } else {
+                        Some("local-ansible-01".into())
+                    },
+                    environment_id: None,
+                    execution_mode: execution_mode.into(),
                     availability_state: "live".into(),
+                    selection_reason: Some(if execution_mode == "local_agent" {
+                        "agent_local_tool".into()
+                    } else {
+                        "default_capability_route".into()
+                    }),
                 },
             )
         })
@@ -642,6 +721,132 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
     }
 }
 
+fn default_visible_toolset(bindings: &SessionBindings) -> Vec<String> {
+    if bindings.effective_toolset.is_empty() {
+        vec!["echo".to_string()]
+    } else {
+        bindings.effective_toolset.clone()
+    }
+}
+
+fn is_local_agent_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "session.status")
+}
+
+fn tool_assembly_from_allowed_incarnations(bindings: &SessionBindings) -> ToolAssembly {
+    let visible_tools = if bindings.effective_toolset.is_empty() {
+        bindings
+            .allowed_tool_runner_incarnations
+            .iter()
+            .flat_map(|incarnation| incarnation.supported_tools.iter().cloned())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+    } else {
+        bindings.effective_toolset.clone()
+    };
+
+    let tools_for_model = visible_tools
+        .iter()
+        .map(|tool_name| ToolDefinition {
+            tool_name: tool_name.clone(),
+            description: format!("Execute the {} tool.", tool_name),
+            input_schema: json!({
+                "type": "object"
+            }),
+        })
+        .collect::<Vec<_>>();
+
+    let execution_routes = visible_tools
+        .iter()
+        .filter_map(|tool_name| {
+            select_incarnation_route(bindings, tool_name).map(|route| (tool_name.clone(), route))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    let policy_annotations = visible_tools
+        .iter()
+        .map(|tool_name| {
+            (
+                tool_name.clone(),
+                ToolPolicyAnnotation {
+                    policy_class: format!("tool:{tool_name}"),
+                    approval_required: false,
+                },
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    ToolAssembly {
+        tools_for_model,
+        execution_routes,
+        policy_annotations,
+    }
+}
+
+fn select_incarnation_route(
+    bindings: &SessionBindings,
+    tool_name: &str,
+) -> Option<ToolExecutionRoute> {
+    let mut candidates = bindings
+        .allowed_tool_runner_incarnations
+        .iter()
+        .filter(|incarnation| incarnation.supported_tools.iter().any(|tool| tool == tool_name))
+        .collect::<Vec<_>>();
+
+    candidates.sort_by(|a, b| compare_incarnation_bindings(a, b));
+    let selected = candidates.first()?;
+    let selection_reason = if selected.availability_state == "live" {
+        selected
+            .selection_hint
+            .clone()
+            .unwrap_or_else(|| "live_allowed_incarnation".into())
+    } else {
+        selected
+            .selection_hint
+            .clone()
+            .unwrap_or_else(|| "allowed_incarnation_requires_materialization".into())
+    };
+
+    Some(ToolExecutionRoute {
+        target_node: selected
+            .target_node
+            .clone()
+            .or_else(|| selected.hotel_id.clone())
+            .unwrap_or_else(|| "local-ansible-01".into()),
+        target_role: selected
+            .target_role
+            .clone()
+            .unwrap_or_else(|| format!("tool.{tool_name}")),
+        runner_id: selected
+            .runner_id
+            .clone()
+            .or_else(|| Some(selected.incarnation_id.clone())),
+        incarnation_id: Some(selected.incarnation_id.clone()),
+        hotel_id: selected.hotel_id.clone(),
+        environment_id: selected.environment_id.clone(),
+        execution_mode: selected.execution_mode.clone(),
+        availability_state: selected.availability_state.clone(),
+        selection_reason: Some(selection_reason),
+    })
+}
+
+fn compare_incarnation_bindings(
+    left: &ToolRunnerIncarnationBinding,
+    right: &ToolRunnerIncarnationBinding,
+) -> std::cmp::Ordering {
+    let left_live = left.availability_state == "live";
+    let right_live = right.availability_state == "live";
+    right_live
+        .cmp(&left_live)
+        .then_with(|| {
+            let left_local = left.hotel_id.as_deref() == Some("local-ansible-01");
+            let right_local = right.hotel_id.as_deref() == Some("local-ansible-01");
+            right_local.cmp(&left_local)
+        })
+        .then_with(|| left.incarnation_id.cmp(&right.incarnation_id))
+}
+
 fn current_unix_ts() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -653,7 +858,7 @@ fn current_unix_ts() -> u64 {
 mod tests {
     use super::{
         merge_session_index, session_checkpoint_memory_type, ApprovalPolicy, SessionBindings,
-        SessionState, WorkingTurn,
+        SessionState, ToolRunnerIncarnationBinding, WorkingTurn,
     };
     use crate::r#loop::{ApprovalRequest, ToolCall, TurnPhase};
     use uuid::Uuid;
@@ -771,6 +976,7 @@ mod tests {
                 effective_skillset: vec!["planning".into()],
                 effective_workspace_ref: Some("workspace://main".into()),
                 effective_model_controller: Some("gemini-flash".into()),
+                allowed_tool_runner_incarnations: Vec::new(),
             }
         );
         assert_eq!(state.recent_turns.len(), 1);
@@ -851,6 +1057,7 @@ mod tests {
             effective_skillset: vec!["planning".into()],
             effective_workspace_ref: Some("workspace://main".into()),
             effective_model_controller: Some("gemini-flash".into()),
+            allowed_tool_runner_incarnations: Vec::new(),
         };
 
         let prompt = state.build_prompt("status");
@@ -903,7 +1110,7 @@ mod tests {
             state
                 .resolve_tool_route("echo")
                 .map(|route| route.target_role.as_str()),
-            Some("tool")
+            Some("tool.echo")
         );
 
         state.add_tool_binding("echo");
@@ -913,8 +1120,69 @@ mod tests {
             state
                 .resolve_tool_route("echo")
                 .map(|route| route.target_role.as_str()),
-            Some("tool")
+            Some("tool.echo")
         );
+    }
+
+    #[test]
+    fn allowed_incarnations_define_visible_tools_and_routes() {
+        let mut state = SessionState::new(
+            "sess-1".into(),
+            "agent-jane-01".into(),
+            "telegram".into(),
+        );
+        state.bindings.allowed_tool_runner_incarnations = vec![
+            ToolRunnerIncarnationBinding {
+                incarnation_id: "tool-echo-remote".into(),
+                runner_id: Some("tool-runner-remote".into()),
+                hotel_id: Some("remote-hotel".into()),
+                environment_id: Some("env://remote".into()),
+                target_node: Some("remote-hotel".into()),
+                target_role: Some("tool.echo".into()),
+                supported_tools: vec!["echo".into()],
+                execution_mode: "capability".into(),
+                availability_state: "materialization_required".into(),
+                selection_hint: Some("remote_fallback".into()),
+            },
+            ToolRunnerIncarnationBinding {
+                incarnation_id: "tool-echo-local".into(),
+                runner_id: Some("tool-runner-local".into()),
+                hotel_id: Some("local-ansible-01".into()),
+                environment_id: Some("env://local".into()),
+                target_node: Some("local-ansible-01".into()),
+                target_role: Some("tool.echo".into()),
+                supported_tools: vec!["echo".into()],
+                execution_mode: "capability".into(),
+                availability_state: "live".into(),
+                selection_hint: Some("local_live_preferred".into()),
+            },
+        ];
+        state.rebuild_default_tool_assembly();
+
+        assert!(state.tool_is_enabled("echo"));
+        let route = state
+            .resolve_tool_route("echo")
+            .expect("echo route should be assembled");
+        assert_eq!(route.incarnation_id.as_deref(), Some("tool-echo-local"));
+        assert_eq!(route.hotel_id.as_deref(), Some("local-ansible-01"));
+        assert_eq!(route.selection_reason.as_deref(), Some("local_live_preferred"));
+    }
+
+    #[test]
+    fn local_agent_tools_get_local_execution_routes() {
+        let mut state = SessionState::new(
+            "sess-1".into(),
+            "agent-jane-01".into(),
+            "telegram".into(),
+        );
+        state.clear_tool_bindings();
+        state.add_tool_binding("session.status");
+
+        let route = state
+            .resolve_tool_route("session.status")
+            .expect("local agent tool should have a route");
+        assert_eq!(route.execution_mode, "local_agent");
+        assert_eq!(route.target_role, "agent");
     }
 
     #[test]
