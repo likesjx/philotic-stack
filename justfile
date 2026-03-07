@@ -19,7 +19,6 @@ start-ansible hotel:
 
 # Start the local UAT stack. Ansible will materialize the gateway, agent, model, and tool guests.
 start-ansible-uat:
-    cargo build --workspace
     @echo "Starting UAT stack on hotel 'local-telegram' using mesh-config.json..."
     @echo "If you are testing Telegram, make sure only one Telegram poller is running for this bot token."
     cargo run -p ansible -- --hotel local-telegram --load-config mesh-config.json
