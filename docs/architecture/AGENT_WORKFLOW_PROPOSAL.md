@@ -23,7 +23,7 @@ Still pending in [task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md):
 
 - proposal disposition rollout across remaining active docs
 - lightweight skill/rules optimization loop
-- subagent delegation guidance in the workflow docs
+- watched-live recipe for supervised guest/runtime validation
 
 ## Core Recommendation
 
@@ -331,6 +331,45 @@ At the end of a meaningful slice, the agent should do a brief check for:
 
 This should stay lightweight unless a real pattern has emerged. The process should improve continuously, not become its own primary workload.
 
+## Subagent Delegation
+
+Subagents are useful when they reduce effort without spreading confusion.
+
+Recommended rules:
+
+- delegate a narrow seam, not a whole initiative
+- assign an explicit truth level:
+  - `inspect`
+  - `implement`
+  - `verify`
+  - `explore`
+- pass only the context needed for that seam
+- keep final architectural judgment and synthesis in the main thread
+
+Good subagent use cases:
+
+- focused codepath inspection
+- targeted test writing
+- isolated implementation of a bounded slice
+- runtime/log triage
+- comparison of a few concrete alternatives
+
+Bad subagent use cases:
+
+- open-ended architecture ownership
+- ambiguous product direction
+- tasks that require the same large context package across many helpers
+- final arbitration between competing truths
+
+The context budget should stay intentionally small:
+
+- a few directly relevant files
+- one explicit objective
+- one explicit success condition
+- one proposal/task excerpt only if needed
+
+If multiple subagents require the same giant context dump to be competent, the seam was not split cleanly enough.
+
 ## Near-Term Process Follow-Ups
 
 1. Formalize this workflow in the repo's standing instructions.
@@ -345,6 +384,7 @@ This should stay lightweight unless a real pattern has emerged. The process shou
    - working with caveats
    - intentionally incomplete
 6. Add proposal `Disposition` sections and task links to the active architecture docs.
+7. Add a watched-live recipe for supervised guest registration/runtime validation.
 
 ## Recommendation
 
