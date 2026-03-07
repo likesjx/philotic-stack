@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use ansible_mesh_core::materializer::Materializer;
 use ansible_mesh_core::storage::GraphStorage;
+use rusqlite::types::ValueRef;
 use std::collections::HashMap;
 use std::process::{Command as ProcessCommand, Stdio};
 use tokio::process::Command as TokioCommand;
@@ -46,6 +47,14 @@ impl LocalProcessMaterializer {
             .status()
             .map(|status| status.success())
             .unwrap_or(false)
+    }
+
+    fn parse_pid_value(value: ValueRef<'_>) -> Option<u32> {
+        match value {
+            ValueRef::Integer(pid) => u32::try_from(pid).ok(),
+            ValueRef::Text(text) => std::str::from_utf8(text).ok()?.parse::<u32>().ok(),
+            _ => None,
+        }
     }
 }
 
@@ -98,14 +107,12 @@ impl Materializer for LocalProcessMaterializer {
             let mut stmt = conn.prepare("SELECT active_pid FROM materialized_guests WHERE guest_id = ?")?;
             let mut rows = stmt.query(rusqlite::params![guest_id])?;
             if let Some(row) = rows.next()? {
-                if let Some(pid_str) = row.get::<_, Option<String>>(0)? {
-                    if let Ok(pid) = pid_str.parse::<u32>() {
-                        if Self::pid_exists(pid) {
-                            if Self::terminate_pid(pid) {
-                                info!("Forcefully retired OS Process PID {} for Guest [{}].", pid, guest_id);
-                            } else {
-                                warn!("Failed to forcefully retire OS Process PID {} for Guest [{}].", pid, guest_id);
-                            }
+                if let Some(pid) = Self::parse_pid_value(row.get_ref(0)?) {
+                    if Self::pid_exists(pid) {
+                        if Self::terminate_pid(pid) {
+                            info!("Forcefully retired OS Process PID {} for Guest [{}].", pid, guest_id);
+                        } else {
+                            warn!("Failed to forcefully retire OS Process PID {} for Guest [{}].", pid, guest_id);
                         }
                     }
                 }
@@ -473,6 +480,19 @@ mod tests {
                 .await
                 .expect("status after reclaim should succeed")
         );
+    }
+
+    #[test]
+    fn parse_pid_value_accepts_integer_and_text_sqlite_cells() {
+        assert_eq!(
+            LocalProcessMaterializer::parse_pid_value(ValueRef::Integer(1234)),
+            Some(1234)
+        );
+        assert_eq!(
+            LocalProcessMaterializer::parse_pid_value(ValueRef::Text(b"5678")),
+            Some(5678)
+        );
+        assert_eq!(LocalProcessMaterializer::parse_pid_value(ValueRef::Null), None);
     }
 
     #[tokio::test]

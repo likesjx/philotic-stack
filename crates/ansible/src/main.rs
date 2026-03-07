@@ -320,29 +320,8 @@ async fn main() -> Result<()> {
     // Channel for pushing generated SDP Answers back out to the mesh
     let (webrtc_signal_tx, mut webrtc_signal_rx) = mpsc::channel::<ansible_mesh_core::webrtc::WebRtcSignalMessage>(32);
     
-    // MATERIALIZATION LOOP: Spin up all guests defined in the DB as child processes
-    info!("--- BEGIN UNIVERSAL MATERIALIZATION ---");
-    
     // Broadcast channel to tell tasks to kill their child process on shutdown
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(16);
-    
-    // Abstracted Universal Materializer with trait-object storage
-    let materializer = Box::new(crate::service::guest_manager::LocalProcessMaterializer::new());
-    let guest_manager = Arc::new(crate::service::guest_manager::GuestManager::new(hotel_name.clone(), graph_arc.clone(), materializer));
-    
-    if let Err(e) = guest_manager.materialize_all(shutdown_rx.resubscribe()).await {
-        error!("Universal Materialization failed: {}", e);
-    }
-    
-    if guest_supervision_enabled() {
-        let gm_clone = Arc::clone(&guest_manager);
-        let rx_supervise = shutdown_rx.resubscribe();
-        tokio::spawn(async move {
-            gm_clone.supervise_guests(rx_supervise).await;
-        });
-    } else {
-        warn!("Guest supervisor loop is disabled by default until guest heartbeats are implemented.");
-    }
 
     // Spawning the "Hotel Front Desk" local IPC listener for Materialized Guests
     let socket_path = hotel.ipc_socket_path.clone();
@@ -421,6 +400,30 @@ async fn main() -> Result<()> {
             error!("Hotel Front Desk (UDS) failed: {}", e);
         }
     });
+
+    // MATERIALIZATION LOOP: Spin up all guests defined in the DB as child processes
+    info!("--- BEGIN UNIVERSAL MATERIALIZATION ---");
+
+    // Give the front desk a moment to bind the UDS path before guests attempt to register.
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    // Abstracted Universal Materializer with trait-object storage
+    let materializer = Box::new(crate::service::guest_manager::LocalProcessMaterializer::new());
+    let guest_manager = Arc::new(crate::service::guest_manager::GuestManager::new(hotel_name.clone(), graph_arc.clone(), materializer));
+
+    if let Err(e) = guest_manager.materialize_all(shutdown_rx.resubscribe()).await {
+        error!("Universal Materialization failed: {}", e);
+    }
+
+    if guest_supervision_enabled() {
+        let gm_clone = Arc::clone(&guest_manager);
+        let rx_supervise = shutdown_rx.resubscribe();
+        tokio::spawn(async move {
+            gm_clone.supervise_guests(rx_supervise).await;
+        });
+    } else {
+        warn!("Guest supervisor loop is disabled by default until guest heartbeats are implemented.");
+    }
 
     // PORT-BP-003: Mesh Outbound Dispatcher (Periodic Queuing Loop)
     if flags.enable_rust_dispatcher {
