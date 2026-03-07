@@ -17,6 +17,13 @@ start-ansible hotel:
     cargo build --workspace
     cargo run -p ansible -- --hotel {{hotel}} --load-config mesh-config.json
 
+# Start a local Telegram UAT stack. Ansible will materialize the gateway, agent, model, and tool guests.
+telegram-uat:
+    cargo build --workspace
+    @echo "Starting Telegram UAT stack on hotel 'local-telegram' using mesh-config.json..."
+    @echo "Make sure only one Telegram poller is running for this bot token."
+    cargo run -p ansible -- --hotel local-telegram --load-config mesh-config.json
+
 # Start the Gateway (Telegram Hegemon)
 start-gateway:
     cargo run -p hegemon
