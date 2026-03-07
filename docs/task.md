@@ -65,6 +65,7 @@
 
 ## Deferred Design Threads
 
+- [ ] Agent workflow formalization: adopt a standing Codex process for context gathering, slice sizing, verification ladders, watched live runs, and decision capture.
 - [ ] Command Center / architect continuity: define how architecture-impact work should be surfaced to Aria once the new home is ready.
 - [ ] Fresh onboarding flow: design repo/bootstrap onboarding from scratch for a new operator or agent entering Philotic.
 - [ ] `openclaw.json` ingestion: define a migration/import path that can consume legacy agent manifests and materialize Philotic agents.
