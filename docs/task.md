@@ -78,6 +78,7 @@
 ## Next Project: Personality and Context
 
 - [ ] Review [PERSONALITY_AND_CONTEXT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PERSONALITY_AND_CONTEXT_PROPOSAL.md).
+- [ ] Review [ZEROCLAW_TO_PHILOTIC_BRIDGE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ZEROCLAW_TO_PHILOTIC_BRIDGE_PROPOSAL.md).
 - [ ] Refactor `agent-core` prompt assembly into explicit layers:
   - soul
   - identity
@@ -103,6 +104,12 @@
   - heuristic memory backends
   - tool-runner local indexes
 - [ ] Keep the first implementation slice personality-first; do not try to solve the full memory backend story in the same change.
+- [ ] Build the first ZeroClaw/OpenClaw bridge slice:
+  - import one agent from `openclaw.json`
+  - ingest `SOUL.md`, `IDENTITY.md`, `USER.md`, and `MEMORY.md`
+  - store them as Philotic compatibility inputs
+  - materialize the imported agent in the Philotic web
+  - verify recognizable identity continuity
 
 ## Deferred Design Threads
 
