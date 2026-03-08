@@ -126,6 +126,18 @@
   - [ ] materialize the imported agent in the Philotic web
   - [ ] verify recognizable identity continuity
 
+## Next Work Item: Muninn Heuristic Memory Experiment
+
+- [ ] Review [MUNINN_MEMORY_PROTOCOL_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MUNINN_MEMORY_PROTOCOL_PROPOSAL.md).
+- [ ] Review [MUNINN_CLIENT_MEMORY_PROTOCOL.md](/Users/jaredlikes/code/philotic-stack/docs/reference/MUNINN_CLIENT_MEMORY_PROTOCOL.md).
+- [x] Validate the local Muninn MCP handshake and core tool calls.
+- [x] Establish a default Muninn retrieval/write-back habit for Codex.
+- [x] Create a shared helper script for Muninn MCP transport and tool invocation.
+- [x] Create a shareable client skill/instruction package for adopting the helper-backed Muninn protocol.
+- [ ] Wire the helper into at least one additional cognitive client beyond Codex.
+- [ ] Measure whether Muninn materially improves continuity, personalization, and decision recall over repeated sessions.
+- [ ] Decide whether Muninn remains an external heuristic memory service or should inform a future Philotic-native memory layer.
+
 ## Deferred Design Threads
 
 - [ ] Agent workflow formalization: adopt a standing Codex process for context gathering, slice sizing, verification ladders, watched live runs, proposal disposition updates, per-slice commit/push discipline, and assumption-vs-reality capture.
