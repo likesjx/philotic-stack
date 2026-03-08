@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use uuid::Uuid;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tracing::{info, debug};
+use tracing::{debug, info};
+use uuid::Uuid;
 
 /// Represents the identity of a Guest materializing in the Hotel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,17 +23,44 @@ pub enum IpcRequest {
     /// Connect and register as an active materialized guest
     Register(GuestIdentity),
     /// Ask the Hotel for configuration data from the local Context Graph
-    GetConfig { key: String },
+    GetConfig {
+        key: String,
+    },
     /// Section 6 Blueprint Operations
-    PublishMessage { target_role: String, payload: serde_json::Value },
-    CreateTask { target_role: String, payload: serde_json::Value },
-    AckEvent { event_id: Uuid },
-    UpdateTask { task_id: Uuid, state: String, payload: serde_json::Value },
-    CompleteTask { task_id: Uuid, result: serde_json::Value },
-    FailTask { task_id: Uuid, error_code: String, reason: String },
-    SubscribeInbox { role: String },
-    QueryStatus { task_id: Uuid },
-    QueryTimeline { task_id: Uuid },
+    PublishMessage {
+        target_role: String,
+        payload: serde_json::Value,
+    },
+    CreateTask {
+        target_role: String,
+        payload: serde_json::Value,
+    },
+    AckEvent {
+        event_id: Uuid,
+    },
+    UpdateTask {
+        task_id: Uuid,
+        state: String,
+        payload: serde_json::Value,
+    },
+    CompleteTask {
+        task_id: Uuid,
+        result: serde_json::Value,
+    },
+    FailTask {
+        task_id: Uuid,
+        error_code: String,
+        reason: String,
+    },
+    SubscribeInbox {
+        role: String,
+    },
+    QueryStatus {
+        task_id: Uuid,
+    },
+    QueryTimeline {
+        task_id: Uuid,
+    },
     /// Drop a task onto the Philotic Web (Legacy)
     EmitTask {
         target_node: String,
@@ -52,8 +79,13 @@ pub enum IpcRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum IpcResponse {
-    Ack { req_id: String },
-    ConfigData { key: String, value_json: Option<String> },
+    Ack {
+        req_id: String,
+    },
+    ConfigData {
+        key: String,
+        value_json: Option<String>,
+    },
     InboundTask {
         source_node: String,
         task_id: Uuid,
@@ -85,8 +117,12 @@ impl IpcResponse {
             data,
         }
     }
-    
-    pub fn error(corr_id: impl Into<String>, code: impl Into<String>, message: impl Into<String>) -> Self {
+
+    pub fn error(
+        corr_id: impl Into<String>,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
         Self::Standard {
             ok: false,
             code: code.into(),
@@ -153,20 +189,23 @@ impl PhiloticClient {
         let stream = UnixStream::connect(&socket_path)
             .await
             .with_context(|| format!("Failed to connect to hotel IPC socket at {}", socket_path))?;
-            
-        debug!("PhiloticClient connecting to local Ansible at {}...", socket_path);
-        
+
+        debug!(
+            "PhiloticClient connecting to local Ansible at {}...",
+            socket_path
+        );
+
         let mut client = Self {
             stream,
             _identity: identity.clone(),
             pending_push: VecDeque::new(),
         };
-        
+
         // Execute the Registration Handshake
         info!("Registering as Materialized Guest: {:?}", identity);
         let resp = client.send_request(IpcRequest::Register(identity)).await?;
         info!("Ansible Hotel Registration Response: {:?}", resp);
-        
+
         match resp {
             IpcResponse::Standard { ok, message, .. } if !ok => {
                 anyhow::bail!("Hotel rejected registration: {}", message);
@@ -178,10 +217,10 @@ impl PhiloticClient {
                 // Success
             }
         }
-        
+
         Ok(client)
     }
-    
+
     /// Send an IPC request to the local Ansible
     pub async fn send_request(&mut self, req: IpcRequest) -> Result<IpcResponse> {
         let payload = serde_json::to_vec(&req).context("Failed to serialize IpcRequest")?;
@@ -199,8 +238,8 @@ impl PhiloticClient {
 
     async fn read_response(&mut self) -> Result<IpcResponse> {
         let buf = self.read_frame().await?;
-        let resp: IpcResponse = serde_json::from_slice(&buf)
-            .context("Failed to decode IpcResponse from Ansible")?;
+        let resp: IpcResponse =
+            serde_json::from_slice(&buf).context("Failed to decode IpcResponse from Ansible")?;
 
         Ok(resp)
     }
@@ -211,7 +250,7 @@ impl PhiloticClient {
             IpcResponse::InboundTask { .. } | IpcResponse::ApartmentUpdate { .. }
         )
     }
-    
+
     /// Poll for inbound tasks routed from the Philotic Web
     pub async fn recv_task(&mut self) -> Result<IpcResponse> {
         if let Some(pending) = self.pending_push.pop_front() {
@@ -223,12 +262,20 @@ impl PhiloticClient {
             if Self::is_push_message(&resp) {
                 return Ok(resp);
             }
-            anyhow::bail!("Unexpected non-push IPC response while waiting for inbound task: {:?}", resp);
+            anyhow::bail!(
+                "Unexpected non-push IPC response while waiting for inbound task: {:?}",
+                resp
+            );
         }
     }
 
     /// Write a memory apartment update to the hotel and consume the response so the IPC stream stays framed.
-    pub async fn sync_apartment(&mut self, agent_id: &str, memory_type: &str, content_json: serde_json::Value) -> Result<()> {
+    pub async fn sync_apartment(
+        &mut self,
+        agent_id: &str,
+        memory_type: &str,
+        content_json: serde_json::Value,
+    ) -> Result<()> {
         let req = IpcRequest::SyncApartment {
             agent_id: agent_id.to_string(),
             memory_type: memory_type.to_string(),
@@ -270,10 +317,16 @@ mod tests {
 
     async fn read_frame(stream: &mut tokio::net::UnixStream) -> Vec<u8> {
         let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await.expect("read frame header");
+        stream
+            .read_exact(&mut len_buf)
+            .await
+            .expect("read frame header");
         let len = u32::from_be_bytes(len_buf) as usize;
         let mut buf = vec![0u8; len];
-        stream.read_exact(&mut buf).await.expect("read frame payload");
+        stream
+            .read_exact(&mut buf)
+            .await
+            .expect("read frame payload");
         buf
     }
 
@@ -318,24 +371,32 @@ mod tests {
                     IpcRequest::GetConfig { key } => assert_eq!(key, "telegram_bot_token"),
                     other => panic!("unexpected config request: {other:?}"),
                 }
-                write_frame(&mut stream, &serde_json::to_vec(&IpcResponse::ConfigData {
+                write_frame(
+                    &mut stream,
+                    &serde_json::to_vec(&IpcResponse::ConfigData {
                         key: "telegram_bot_token".into(),
                         value_json: Some("\"secret-token\"".into()),
-                    }).unwrap())
-                    .await;
+                    })
+                    .unwrap(),
+                )
+                .await;
 
                 let _ = std::fs::remove_file(&socket_path);
             }
         });
 
-        unsafe { std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path); }
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
 
         let identity = GuestIdentity {
             guest_id: "guest-test-1".into(),
             role: "test".into(),
             supported_tools: Vec::new(),
         };
-        let mut client = PhiloticClient::connect(identity).await.expect("connect client");
+        let mut client = PhiloticClient::connect(identity)
+            .await
+            .expect("connect client");
         let response = client
             .send_request(IpcRequest::GetConfig {
                 key: "telegram_bot_token".into(),
@@ -352,7 +413,9 @@ mod tests {
         }
 
         server.await.expect("join server");
-        unsafe { std::env::remove_var("PHILOTIC_HOTEL_SOCKET"); }
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
         if Path::new(&socket_path).exists() {
             let _ = std::fs::remove_file(&socket_path);
         }
@@ -386,25 +449,25 @@ mod tests {
                 write_frame(
                     &mut stream,
                     &serde_json::to_vec(&IpcResponse::InboundTask {
-                            source_node: "local-ansible-01".into(),
-                            task_id: Uuid::nil(),
-                            task_json: serde_json::json!({
-                                "action": "send_reply",
-                                "content": "pushed first"
-                            })
-                            .to_string(),
+                        source_node: "local-ansible-01".into(),
+                        task_id: Uuid::nil(),
+                        task_json: serde_json::json!({
+                            "action": "send_reply",
+                            "content": "pushed first"
                         })
-                        .unwrap(),
+                        .to_string(),
+                    })
+                    .unwrap(),
                 )
                 .await;
 
                 write_frame(
                     &mut stream,
                     &serde_json::to_vec(&IpcResponse::ConfigData {
-                            key: "interleaved".into(),
-                            value_json: Some("\"ok\"".into()),
-                        })
-                        .unwrap(),
+                        key: "interleaved".into(),
+                        value_json: Some("\"ok\"".into()),
+                    })
+                    .unwrap(),
                 )
                 .await;
 
@@ -412,14 +475,18 @@ mod tests {
             }
         });
 
-        unsafe { std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path); }
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
 
         let identity = GuestIdentity {
             guest_id: "guest-test-2".into(),
             role: "test".into(),
             supported_tools: Vec::new(),
         };
-        let mut client = PhiloticClient::connect(identity).await.expect("connect client");
+        let mut client = PhiloticClient::connect(identity)
+            .await
+            .expect("connect client");
         let response = client
             .send_request(IpcRequest::GetConfig {
                 key: "interleaved".into(),
@@ -446,7 +513,9 @@ mod tests {
         }
 
         server.await.expect("join server");
-        unsafe { std::env::remove_var("PHILOTIC_HOTEL_SOCKET"); }
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
         if Path::new(&socket_path).exists() {
             let _ = std::fs::remove_file(&socket_path);
         }

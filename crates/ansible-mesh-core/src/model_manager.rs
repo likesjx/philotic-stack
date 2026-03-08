@@ -1,6 +1,6 @@
-use crate::{ModelRef, NodeId, ToolRef};
-use crate::runtime::ToolInvoker;
 use crate::registry::NodeRegistry;
+use crate::runtime::ToolInvoker;
+use crate::{ModelRef, NodeId, ToolRef};
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -45,7 +45,12 @@ impl ModelManagerInvoker {
         let mut available_models = vec![];
 
         for node in registry.active_nodes() {
-            if node.capabilities.roles.contains(&crate::NodeRole::ModelNode) || !node.capabilities.models.is_empty() {
+            if node
+                .capabilities
+                .roles
+                .contains(&crate::NodeRole::ModelNode)
+                || !node.capabilities.models.is_empty()
+            {
                 for model in &node.capabilities.models {
                     available_models.push(json!({
                         "model_ref": model,
@@ -85,12 +90,12 @@ impl ModelManagerInvoker {
 }
 
 // In a real async trait, we'd use async_trait, but since ToolInvoker is currently sync,
-// we block or bridge it. For MVP 2 we will change ToolInvoker to be async if needed, 
+// we block or bridge it. For MVP 2 we will change ToolInvoker to be async if needed,
 // or run this in a blocking thread. We'll stub it sync for the trait.
 impl ToolInvoker for ModelManagerInvoker {
     fn call_tool(&self, tool: ToolRef, args: Value) -> Result<Value> {
         let _registry_clone = self.registry.clone();
-        
+
         // Blocking bridge since the trait is sync in MVP 1
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {

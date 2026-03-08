@@ -1,6 +1,6 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 async fn emit_and_expect(
     client: &mut PhiloticClient,

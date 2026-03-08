@@ -13,7 +13,9 @@ pub struct EventLedger {
 impl EventLedger {
     pub fn open(db_path: impl AsRef<Path>) -> SqlResult<Self> {
         let conn = Connection::open(db_path)?;
-        let ledger = Self { conn: Arc::new(Mutex::new(conn)) };
+        let ledger = Self {
+            conn: Arc::new(Mutex::new(conn)),
+        };
         ledger.init_schema()?;
         Ok(ledger)
     }
@@ -64,7 +66,7 @@ impl EventLedger {
                 env.source_node_id,
                 env.source_agent_id,
                 env.target_agent_id,
-                serde_json::to_string(&env.kind).unwrap().trim_matches('"'), 
+                serde_json::to_string(&env.kind).unwrap().trim_matches('"'),
                 env.corr_id,
                 env.attempt,
                 env.created_at,
@@ -72,12 +74,12 @@ impl EventLedger {
                 payload_type,
                 payload_json,
                 trace_json
-            ]
+            ],
         )?;
 
         let seq = conn.last_insert_rowid() as u64;
         env.seq = seq;
-        
+
         // info!("Committed Event {} at SEQ {}", env.event_id, seq);
         Ok(seq)
     }
@@ -85,11 +87,19 @@ impl EventLedger {
     /// Discard an event definitively (upon processing completion).
     pub fn delete_event(&self, event_id: &crate::event::EventId) -> SqlResult<usize> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM mesh_events WHERE event_id = ?1", params![event_id.to_string()])
+        conn.execute(
+            "DELETE FROM mesh_events WHERE event_id = ?1",
+            params![event_id.to_string()],
+        )
     }
 
     /// Fetch events that have a sequence number greater than the provided cursor.
-    pub fn query_unacked_events(&self, _target_node_id: &str, cursor_seq: u64, limit: u32) -> SqlResult<Vec<crate::event::EventEnvelope>> {
+    pub fn query_unacked_events(
+        &self,
+        _target_node_id: &str,
+        cursor_seq: u64,
+        limit: u32,
+    ) -> SqlResult<Vec<crate::event::EventEnvelope>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT 
@@ -99,12 +109,12 @@ impl EventLedger {
              FROM mesh_events 
              WHERE seq > ?1 
              ORDER BY seq ASC 
-             LIMIT ?2"
+             LIMIT ?2",
         )?;
 
         // Note: For now we ignore the target_node_id filter and assume a simplistic broadcast or single network route
         // A true implementation would filter by routing destination if events are explicitly addressed per node.
-        
+
         let mut rows = stmt.query(params![cursor_seq, limit])?;
         let mut events = Vec::new();
 
@@ -115,7 +125,8 @@ impl EventLedger {
             let payload0 = match payload_type.as_str() {
                 "inline" => crate::event::EventPayload::Inline { data: payload_json },
                 "attachment" => {
-                    let v: serde_json::Value = serde_json::from_str(&payload_json).unwrap_or(serde_json::json!({}));
+                    let v: serde_json::Value =
+                        serde_json::from_str(&payload_json).unwrap_or(serde_json::json!({}));
                     crate::event::EventPayload::BlobRef {
                         blob_id: v["blob_id"].as_str().unwrap_or("").to_string(),
                         size: v["size"].as_u64().unwrap_or(0),
@@ -128,12 +139,12 @@ impl EventLedger {
 
             let trace_json: String = row.get(12)?;
             let trace0: Vec<String> = serde_json::from_str(&trace_json).unwrap_or_else(|_| vec![]);
-            
+
             let kind_str: String = row.get(5)?;
             // Add quotes to make it a valid JSON string for Enum deserialization
             let kind_json = format!("\"{}\"", kind_str);
-            let kind0: crate::event::EventKind = serde_json::from_str(&kind_json)
-                .unwrap_or(crate::event::EventKind::TaskInvoke);
+            let kind0: crate::event::EventKind =
+                serde_json::from_str(&kind_json).unwrap_or(crate::event::EventKind::TaskInvoke);
 
             events.push(crate::event::EventEnvelope {
                 seq: row.get(0)?,

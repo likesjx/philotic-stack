@@ -1,6 +1,6 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -8,16 +8,17 @@ async fn main() -> Result<()> {
         .context("PHILOTIC_HOTEL_SOCKET must be set for approval_smoke_driver")?;
     let session_id = std::env::var("PHILOTIC_SMOKE_SESSION_ID")
         .unwrap_or_else(|_| "smoke:approval:agent-jane-01".to_string());
-    let chat_id =
-        std::env::var("PHILOTIC_SMOKE_CHAT_ID").unwrap_or_else(|_| "smoke-approval-chat".to_string());
+    let chat_id = std::env::var("PHILOTIC_SMOKE_CHAT_ID")
+        .unwrap_or_else(|_| "smoke-approval-chat".to_string());
     let approval_request = std::env::var("PHILOTIC_SMOKE_APPROVAL_REQUEST")
         .unwrap_or_else(|_| "need approval deploy the thing".to_string());
-    let expected_wait = std::env::var("PHILOTIC_SMOKE_EXPECTED_WAIT")
-        .unwrap_or_else(|_| "Approval required: deploy the thing. Reply /approve or /deny.".to_string());
+    let expected_wait = std::env::var("PHILOTIC_SMOKE_EXPECTED_WAIT").unwrap_or_else(|_| {
+        "Approval required: deploy the thing. Reply /approve or /deny.".to_string()
+    });
     let expected_final = std::env::var("PHILOTIC_SMOKE_EXPECTED_FINAL")
         .unwrap_or_else(|_| "Approved: deploy the thing".to_string());
-    let approval_command = std::env::var("PHILOTIC_SMOKE_APPROVAL_COMMAND")
-        .unwrap_or_else(|_| "/approve".to_string());
+    let approval_command =
+        std::env::var("PHILOTIC_SMOKE_APPROVAL_COMMAND").unwrap_or_else(|_| "/approve".to_string());
 
     let mut client = PhiloticClient::connect(GuestIdentity {
         guest_id: "approval-smoke-hegemon".into(),
@@ -63,7 +64,11 @@ async fn main() -> Result<()> {
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
     if wait_content != expected_wait {
-        bail!("expected approval prompt {:?}, got {:?}", expected_wait, wait_content);
+        bail!(
+            "expected approval prompt {:?}, got {:?}",
+            expected_wait,
+            wait_content
+        );
     }
 
     let second_turn_id = "approval-turn-2";
@@ -102,7 +107,11 @@ async fn main() -> Result<()> {
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
     if final_content != expected_final {
-        bail!("expected final approved reply {:?}, got {:?}", expected_final, final_content);
+        bail!(
+            "expected final approved reply {:?}, got {:?}",
+            expected_final,
+            final_content
+        );
     }
 
     println!(

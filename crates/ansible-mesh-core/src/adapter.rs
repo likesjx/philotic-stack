@@ -1,5 +1,5 @@
-use crate::{AgentId, BeaconMessage, MsgType, NodeId, ToolRef};
 use crate::runtime::AgentInput;
+use crate::{AgentId, BeaconMessage, MsgType, NodeId, ToolRef};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -14,7 +14,7 @@ pub struct ToolCallPayload {
     pub context: Value,
 }
 
-/// A client adapter that ZeroClaw (or any orchestrator) uses to bridge 
+/// A client adapter that ZeroClaw (or any orchestrator) uses to bridge
 /// local intents to the remote mesh network.
 pub struct MeshAdapter {
     local_socket: UdpSocket,
@@ -65,7 +65,7 @@ impl MeshAdapter {
         })?;
 
         let _msg_id = self.send_message(MsgType::ToolCall, payload).await?;
-        
+
         // For MVP 2, we simulate async wait/response routing
         // In a real implementation we would wait on the UDP socket for the `Result` msg_type matching `msg_id`
         Ok(serde_json::json!({

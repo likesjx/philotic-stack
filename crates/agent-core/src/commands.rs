@@ -83,16 +83,12 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
 
 fn join_command_note(parts: &[&str]) -> Option<String> {
     let note = parts.join(" ").trim().to_string();
-    if note.is_empty() {
-        None
-    } else {
-        Some(note)
-    }
+    if note.is_empty() { None } else { Some(note) }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_slash_command, SlashCommand};
+    use super::{SlashCommand, parse_slash_command};
 
     #[test]
     fn parses_ping_command() {
@@ -107,14 +103,20 @@ mod tests {
                 tool: "echo".into()
             })
         );
-        assert_eq!(parse_slash_command("/tools clear"), Some(SlashCommand::ToolsClear));
+        assert_eq!(
+            parse_slash_command("/tools clear"),
+            Some(SlashCommand::ToolsClear)
+        );
         assert_eq!(
             parse_slash_command("/skills add planning"),
             Some(SlashCommand::SkillsAdd {
                 skill: "planning".into()
             })
         );
-        assert_eq!(parse_slash_command("/skills clear"), Some(SlashCommand::SkillsClear));
+        assert_eq!(
+            parse_slash_command("/skills clear"),
+            Some(SlashCommand::SkillsClear)
+        );
         assert_eq!(
             parse_slash_command("/workspace set workspace://main"),
             Some(SlashCommand::WorkspaceSet {

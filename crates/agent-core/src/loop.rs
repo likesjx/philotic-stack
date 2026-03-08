@@ -69,10 +69,7 @@ pub struct ToolResult {
     pub content: String,
 }
 
-pub fn interpret_model_payload(
-    agent_action: Option<&Value>,
-    content: Option<&str>,
-) -> AgentAction {
+pub fn interpret_model_payload(agent_action: Option<&Value>, content: Option<&str>) -> AgentAction {
     if let Some(agent_action) = agent_action {
         if let Some(kind) = agent_action.get("kind").and_then(Value::as_str) {
             match kind {
@@ -84,9 +81,7 @@ pub fn interpret_model_payload(
                     }
                 }
                 "tool_call" => {
-                    if let Some(tool_name) =
-                        agent_action.get("tool_name").and_then(Value::as_str)
-                    {
+                    if let Some(tool_name) = agent_action.get("tool_name").and_then(Value::as_str) {
                         return AgentAction::ToolCall(ToolCall {
                             tool_name: tool_name.to_string(),
                             arguments: agent_action
@@ -162,8 +157,8 @@ pub fn interpret_tool_result(result: &ToolResult) -> AgentAction {
 #[cfg(test)]
 mod tests {
     use super::{
-        interpret_model_output, interpret_model_payload, interpret_tool_result, AgentAction,
-        ApprovalRequest, ToolCall, ToolResult, TurnPhase,
+        AgentAction, ApprovalRequest, ToolCall, ToolResult, TurnPhase, interpret_model_output,
+        interpret_model_payload, interpret_tool_result,
     };
 
     #[test]

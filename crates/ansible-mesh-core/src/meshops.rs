@@ -1,5 +1,5 @@
-use crate::ToolRef;
 use crate::runtime::ToolInvoker;
+use crate::ToolRef;
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
 use tracing::info;
@@ -26,7 +26,10 @@ impl MeshopsNodeInvoker {
 
     fn locate_agent(&self, args: Value) -> Result<Value> {
         info!("Executing ansible.mesh.locate_agent with args: {}", args);
-        let target_agent = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let target_agent = args
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
         Ok(json!({
             "status": "found",
             "agent_id": target_agent,

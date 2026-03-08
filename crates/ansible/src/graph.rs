@@ -15,10 +15,12 @@ pub struct ContextGraph {
 impl ContextGraph {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let conn = Connection::open(path).context("Failed to open ContextGraph SQLite DB")?;
-        
-        let graph = Self { conn: Arc::new(Mutex::new(conn)) };
+
+        let graph = Self {
+            conn: Arc::new(Mutex::new(conn)),
+        };
         graph.init_schema()?;
-        
+
         Ok(graph)
     }
 
@@ -63,12 +65,16 @@ impl ContextGraph {
                 FOREIGN KEY(agent_id) REFERENCES agent_identities(agent_id)
             );
             COMMIT;
-            "
-        ).context("Failed to initialize Context Graph schema")?;
-        
+            ",
+        )
+        .context("Failed to initialize Context Graph schema")?;
+
         // Attempt to run migration for existing databases. Ignore failure if the column already exists.
-        let _ = conn.execute("ALTER TABLE materialized_guests ADD COLUMN active_pid TEXT", []);
-        
+        let _ = conn.execute(
+            "ALTER TABLE materialized_guests ADD COLUMN active_pid TEXT",
+            [],
+        );
+
         info!("Context Graph schema initialized successfully.");
         Ok(())
     }

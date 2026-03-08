@@ -45,16 +45,22 @@ impl NodeRegistry {
     }
 
     /// Find nodes matching a specific tool.
-    pub fn find_nodes_with_tool<'a>(&'a self, tool: &'a str) -> impl Iterator<Item = &'a NodeStatus> {
-        self.nodes.values().filter(move |status| {
-            status.capabilities.tools.iter().any(|t| t == tool)
-        })
+    pub fn find_nodes_with_tool<'a>(
+        &'a self,
+        tool: &'a str,
+    ) -> impl Iterator<Item = &'a NodeStatus> {
+        self.nodes
+            .values()
+            .filter(move |status| status.capabilities.tools.iter().any(|t| t == tool))
     }
 
     /// Find nodes matching a specific role.
-    pub fn find_nodes_with_role<'a>(&'a self, role: &'a crate::NodeRole) -> impl Iterator<Item = &'a NodeStatus> {
-        self.nodes.values().filter(move |status| {
-            status.capabilities.roles.contains(role)
-        })
+    pub fn find_nodes_with_role<'a>(
+        &'a self,
+        role: &'a crate::NodeRole,
+    ) -> impl Iterator<Item = &'a NodeStatus> {
+        self.nodes
+            .values()
+            .filter(move |status| status.capabilities.roles.contains(role))
     }
 }

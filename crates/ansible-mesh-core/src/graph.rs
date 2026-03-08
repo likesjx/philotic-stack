@@ -63,7 +63,7 @@ pub struct MemoryApartment {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryEntry {
-    pub id: String, // e.g., "mem:2026-03-04T15:00Z"
+    pub id: String,   // e.g., "mem:2026-03-04T15:00Z"
     pub kind: String, // e.g., "conversation", "semantic", "episodic"
     pub summary: String,
     pub embedding_ref: Option<String>,

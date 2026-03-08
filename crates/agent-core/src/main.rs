@@ -7,7 +7,7 @@ mod session;
 use anyhow::Result;
 use clap::Parser;
 use philotic_client::GuestIdentity;
-use runtime::{AgentRuntime, AGENT_ID};
+use runtime::{AGENT_ID, AgentRuntime};
 use tracing::info;
 
 #[derive(Parser, Debug)]

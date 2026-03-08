@@ -1,9 +1,9 @@
 use anyhow::Result;
 use clap::Parser;
 use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::Duration;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -30,8 +30,10 @@ async fn main() -> Result<()> {
 
     // Pull configuration from the Hotel Graph dynamically
     info!("Requesting Telegram Configuration from Ansible Context Graph...");
-    let config_req = IpcRequest::GetConfig { key: "telegram_bot_token".into() };
-    
+    let config_req = IpcRequest::GetConfig {
+        key: "telegram_bot_token".into(),
+    };
+
     let bot_token = match ipc_client.send_request(config_req).await? {
         IpcResponse::ConfigData { key: _, value_json } => {
             if let Some(json_str) = value_json {
@@ -41,7 +43,9 @@ async fn main() -> Result<()> {
                     json_str // fallback if it was stored as raw string
                 }
             } else {
-                warn!("Telegram Bot Token key found, but value was empty in Context Graph. Using Dummy Token.");
+                warn!(
+                    "Telegram Bot Token key found, but value was empty in Context Graph. Using Dummy Token."
+                );
                 "dummy_token".to_string()
             }
         }
@@ -50,7 +54,7 @@ async fn main() -> Result<()> {
             "dummy_token".to_string()
         }
     };
-    
+
     if bot_token.is_empty() || bot_token == "dummy_token" {
         warn!("No valid Telegram Bot Token found. Polling will fail until configured.");
     }
@@ -59,12 +63,12 @@ async fn main() -> Result<()> {
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
         .build()?;
-        
+
     let tg_base = format!("https://api.telegram.org/bot{}/", bot_token);
     let mut offset: i64 = 0;
 
     info!("Starting Telegram long-polling loop...");
-    
+
     // Main Long-Polling Loop
     loop {
         let url = format!("{}getUpdates", tg_base);
@@ -73,7 +77,7 @@ async fn main() -> Result<()> {
             ("timeout", "30".to_string()),
             ("allowed_updates", "[\"message\"]".to_string()),
         ];
-        
+
         tokio::select! {
             // Branch 1: Wait for Telegram Updates (Long Polling)
             http_result = http_client.get(&url).query(&params).send() => {
@@ -84,15 +88,15 @@ async fn main() -> Result<()> {
                                 for update in result {
                                     if let Some(update_id) = update.get("update_id").and_then(|id| id.as_i64()) {
                                         offset = update_id + 1; // Ack the message
-                                        
+
                                         if let Some(message) = update.get("message") {
                                             if let Some(text) = message.get("text").and_then(|t| t.as_str()) {
                                                 let chat_id = message.get("chat").and_then(|c| c.get("id")).map(|id| id.to_string()).unwrap_or_default();
                                                 let turn_id = format!("telegram-update-{}", update_id);
                                                 let session_id = format!("telegram:{}:agent-jane-01", chat_id);
-                                                
+
                                                 info!("Received Telegram Message from Chat [{}]: {}", chat_id, text);
-                                                
+
                                                 // 3. Route inbound message over Philotic Web IPC
                                                 let task_req = IpcRequest::EmitTask {
                                                     target_node: "local-ansible-01".into(),
@@ -107,7 +111,7 @@ async fn main() -> Result<()> {
                                                         "final_reply_role": "hegemon"
                                                     }).to_string(),
                                                 };
-                                                
+
                                                 match ipc_client.send_request(task_req).await {
                                                     Ok(_) => info!("Routed message to Ansible successfully."),
                                                     Err(e) => error!("Failed to route message to Ansible: {}", e),
@@ -127,27 +131,27 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            
+
             // Branch 2: Wait for outbound IPC tasks (LLM Responses)
             ipc_result = ipc_client.recv_task() => {
                 match ipc_result {
                     Ok(IpcResponse::InboundTask { source_node, task_id, task_json }) => {
                         info!("Hegemon received final response [{}] from Mesh Node [{}]", task_id, source_node);
-                        
+
                         if let Ok(task) = serde_json::from_str::<Value>(&task_json) {
                             if let Some(content) = task.get("content").and_then(|c| c.as_str()) {
                                 let chat_id = task.get("chat_id").and_then(|id| id.as_str()).unwrap_or_default();
-                                
+
                                 if !chat_id.is_empty() {
                                     let send_url = format!("{}sendMessage", tg_base);
                                     let payload = json!({
                                         "chat_id": chat_id,
                                         "text": content
                                     });
-                                    
+
                                     info!("Sending final response back to Telegram Chat [{}]...", chat_id);
                                     let http_client_clone = http_client.clone();
-                                    
+
                                     tokio::spawn(async move {
                                         match http_client_clone.post(&send_url).json(&payload).send().await {
                                             Ok(_) => info!("Telegram Response Sent Successfully!"),

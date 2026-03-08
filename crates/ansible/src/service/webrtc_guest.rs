@@ -1,13 +1,13 @@
-use ansible_mesh_core::webrtc::{WebRtcSignalMessage, SignalPayload};
+use ansible_mesh_core::webrtc::{SignalPayload, WebRtcSignalMessage};
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
+use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
-use webrtc::api::APIBuilder;
-use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::RTCDataChannel;
+use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration;
@@ -22,15 +22,26 @@ pub struct WebRtcGuest {
 }
 
 impl WebRtcGuest {
-    pub fn new(session_id: String, target_node: String, signal_tx: mpsc::Sender<WebRtcSignalMessage>) -> Self {
-        Self { session_id, _target_node: target_node, signal_tx }
+    pub fn new(
+        session_id: String,
+        target_node: String,
+        signal_tx: mpsc::Sender<WebRtcSignalMessage>,
+    ) -> Self {
+        Self {
+            session_id,
+            _target_node: target_node,
+            signal_tx,
+        }
     }
 
     /// Run the transceiver loop. In a real environment, this handles SDP offers,
     /// answers, and ICE routing for Live API DataChannels.
     pub async fn run_answering(self, offer_sdp: String) -> Result<()> {
-        info!("Spinning up WebRTC Transceiver Guest for session {}", self.session_id);
-        
+        info!(
+            "Spinning up WebRTC Transceiver Guest for session {}",
+            self.session_id
+        );
+
         let mut m = MediaEngine::default();
         m.register_default_codecs()?;
 
@@ -66,7 +77,8 @@ impl WebRtcGuest {
             info!("New DataChannel {} {}", d_label, d_id);
 
             d.on_message(Box::new(move |msg: DataChannelMessage| {
-                let msg_str = String::from_utf8(msg.data.to_vec()).unwrap_or_else(|_| "[Binary Data]".to_string());
+                let msg_str = String::from_utf8(msg.data.to_vec())
+                    .unwrap_or_else(|_| "[Binary Data]".to_string());
                 info!("P2P Message from DataChannel '{}': '{}'", d_label, msg_str);
                 Box::pin(async {})
             }));
@@ -91,11 +103,14 @@ impl WebRtcGuest {
             let signal = WebRtcSignalMessage {
                 session_id: self.session_id.clone(),
                 target_guest_id: "remote-requester".to_string(), // In reality we map this back to the requesting agent id
-                sender_node: "local-ansible-01".to_string(), // In reality map from node caps
+                sender_node: "local-ansible-01".to_string(),     // In reality map from node caps
                 signal: SignalPayload::Answer(local_desc.sdp),
             };
             let _ = self.signal_tx.send(signal).await;
-            info!("Generated SDP Answer and dispatched to Mesh Control Plane for session {}", self.session_id);
+            info!(
+                "Generated SDP Answer and dispatched to Mesh Control Plane for session {}",
+                self.session_id
+            );
         }
 
         // Keep the task alive until the connection dies
@@ -103,7 +118,7 @@ impl WebRtcGuest {
             info!("WebRTC Transceiver State: {}", s);
             Box::pin(async {})
         }));
-        
+
         // This is a minimal stub. In the live implementation we bound this loop to the `pc` lifecycle
         // or a manual termination signal.
         tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;

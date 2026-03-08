@@ -161,13 +161,11 @@ impl EventStorage for SqliteEventStorage {
             };
 
             let trace_json: String = row.get(12)?;
-            let trace: Vec<String> =
-                serde_json::from_str(&trace_json).unwrap_or_else(|_| vec![]);
+            let trace: Vec<String> = serde_json::from_str(&trace_json).unwrap_or_else(|_| vec![]);
 
             let kind_str: String = row.get(5)?;
             let kind_json = format!("\"{}\"", kind_str);
-            let kind: EventKind =
-                serde_json::from_str(&kind_json).unwrap_or(EventKind::TaskInvoke);
+            let kind: EventKind = serde_json::from_str(&kind_json).unwrap_or(EventKind::TaskInvoke);
 
             events.push(EventEnvelope {
                 seq: row.get(0)?,
@@ -343,7 +341,10 @@ impl GraphAdapter for SqliteGraphAdapter {
 
     fn delete_node(&self, node_key: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM graph_nodes WHERE node_key = ?1", params![node_key])?;
+        conn.execute(
+            "DELETE FROM graph_nodes WHERE node_key = ?1",
+            params![node_key],
+        )?;
         conn.execute(
             "DELETE FROM graph_edges WHERE src_node_key = ?1 OR dst_node_key = ?1",
             params![node_key],
@@ -406,11 +407,18 @@ impl GraphAdapter for SqliteGraphAdapter {
 
     fn delete_edge(&self, edge_key: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM graph_edges WHERE edge_key = ?1", params![edge_key])?;
+        conn.execute(
+            "DELETE FROM graph_edges WHERE edge_key = ?1",
+            params![edge_key],
+        )?;
         Ok(())
     }
 
-    fn list_edges_from(&self, src_node_key: &str, edge_kind: Option<&str>) -> Result<Vec<GraphEdge>> {
+    fn list_edges_from(
+        &self,
+        src_node_key: &str,
+        edge_kind: Option<&str>,
+    ) -> Result<Vec<GraphEdge>> {
         let conn = self.conn.lock().unwrap();
         let decode_row = |row: &rusqlite::Row<'_>| {
             let data_json: String = row.get(4)?;
@@ -882,8 +890,14 @@ impl GraphStorage for SqliteGraphStorage {
         Ok(())
     }
 
-    fn get_agent_identity(&self, agent_id: &str) -> Result<Option<crate::storage::AgentIdentityRecord>> {
-        if let Some(node) = self.adapter.get_node(&Self::agent_identity_node_key(agent_id))? {
+    fn get_agent_identity(
+        &self,
+        agent_id: &str,
+    ) -> Result<Option<crate::storage::AgentIdentityRecord>> {
+        if let Some(node) = self
+            .adapter
+            .get_node(&Self::agent_identity_node_key(agent_id))?
+        {
             return Ok(Some(serde_json::from_value(node.data)?));
         }
 
@@ -960,7 +974,11 @@ impl GraphStorage for SqliteGraphStorage {
         Ok(())
     }
 
-    fn get_apartment(&self, agent_id: &str, memory_type: &str) -> Result<Option<serde_json::Value>> {
+    fn get_apartment(
+        &self,
+        agent_id: &str,
+        memory_type: &str,
+    ) -> Result<Option<serde_json::Value>> {
         if let Some(node) = self
             .adapter
             .get_node(&Self::apartment_node_key(agent_id, memory_type))?
@@ -1058,7 +1076,11 @@ impl GraphStorage for SqliteGraphStorage {
         })
     }
 
-    fn get_session_turn(&self, session_id: &str, turn_id: &str) -> Result<Option<SessionTurnRecord>> {
+    fn get_session_turn(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<SessionTurnRecord>> {
         match self
             .adapter
             .get_node(&Self::session_turn_node_key(session_id, turn_id))?
@@ -1126,7 +1148,11 @@ impl GraphStorage for SqliteGraphStorage {
         Ok(())
     }
 
-    fn list_session_events(&self, session_id: &str, limit: usize) -> Result<Vec<SessionEventRecord>> {
+    fn list_session_events(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionEventRecord>> {
         let mut out: Vec<SessionEventRecord> = Vec::new();
         for edge in self
             .adapter

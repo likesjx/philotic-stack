@@ -188,7 +188,8 @@ pub trait GraphStorage: Send + Sync {
         memory_type: &str,
         content_json: &serde_json::Value,
     ) -> Result<()>;
-    fn get_apartment(&self, agent_id: &str, memory_type: &str) -> Result<Option<serde_json::Value>>;
+    fn get_apartment(&self, agent_id: &str, memory_type: &str)
+        -> Result<Option<serde_json::Value>>;
 
     // ── Generalized sessions ─────────────────────────────────────────
 
@@ -197,10 +198,18 @@ pub trait GraphStorage: Send + Sync {
     fn upsert_session_participant(&self, participant: &SessionParticipantRecord) -> Result<()>;
     fn list_session_participants(&self, session_id: &str) -> Result<Vec<SessionParticipantRecord>>;
     fn upsert_session_turn(&self, turn: &SessionTurnRecord) -> Result<()>;
-    fn get_session_turn(&self, session_id: &str, turn_id: &str) -> Result<Option<SessionTurnRecord>>;
+    fn get_session_turn(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<SessionTurnRecord>>;
     fn list_session_turns(&self, session_id: &str, limit: usize) -> Result<Vec<SessionTurnRecord>>;
     fn append_session_event(&self, event: &SessionEventRecord) -> Result<()>;
-    fn list_session_events(&self, session_id: &str, limit: usize) -> Result<Vec<SessionEventRecord>>;
+    fn list_session_events(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionEventRecord>>;
 }
 
 /// Generic graph persistence contract.
@@ -214,5 +223,9 @@ pub trait GraphAdapter: Send + Sync {
     fn list_nodes_by_kind(&self, kind: &str) -> Result<Vec<GraphNode>>;
     fn upsert_edge(&self, edge: &GraphEdge) -> Result<()>;
     fn delete_edge(&self, edge_key: &str) -> Result<()>;
-    fn list_edges_from(&self, src_node_key: &str, edge_kind: Option<&str>) -> Result<Vec<GraphEdge>>;
+    fn list_edges_from(
+        &self,
+        src_node_key: &str,
+        edge_kind: Option<&str>,
+    ) -> Result<Vec<GraphEdge>>;
 }

@@ -1,35 +1,25 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub mod agent;
-pub mod runtime;
-pub mod beacon;
-pub mod tools;
-pub mod registry;
-pub mod materializer;
-pub mod heartbeat;
-pub mod model_manager;
-pub mod meshops;
 pub mod adapter;
+pub mod agent;
+pub mod authz;
+pub mod beacon;
+pub mod cursor;
+pub mod event;
 pub mod graph;
 pub mod graph_tools;
-pub mod event;
+pub mod heartbeat;
 pub mod ledger;
-pub mod cursor;
-pub mod authz;
-pub mod webrtc;
-pub mod storage;
+pub mod materializer;
+pub mod meshops;
+pub mod model_manager;
+pub mod registry;
+pub mod runtime;
 pub mod sqlite_storage;
-
-
-
-
-
-
-
-
-
-
+pub mod storage;
+pub mod tools;
+pub mod webrtc;
 
 /// Represents a unique identifier for a node in the mesh network.
 pub type NodeId = String;

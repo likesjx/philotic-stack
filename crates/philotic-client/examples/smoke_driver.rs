@@ -1,13 +1,13 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let socket_path = std::env::var("PHILOTIC_HOTEL_SOCKET")
         .context("PHILOTIC_HOTEL_SOCKET must be set for smoke_driver")?;
-    let expected = std::env::var("PHILOTIC_SMOKE_EXPECTED_REPLY")
-        .unwrap_or_else(|_| "pong".to_string());
+    let expected =
+        std::env::var("PHILOTIC_SMOKE_EXPECTED_REPLY").unwrap_or_else(|_| "pong".to_string());
     let session_id = std::env::var("PHILOTIC_SMOKE_SESSION_ID")
         .unwrap_or_else(|_| "smoke:chat-1:agent-jane-01".to_string());
     let turn_id =
@@ -67,7 +67,11 @@ async fn main() -> Result<()> {
         bail!("unexpected final reply action: {:?}", action);
     }
     if reply_content != expected {
-        bail!("expected final reply {:?}, got {:?}", expected, reply_content);
+        bail!(
+            "expected final reply {:?}, got {:?}",
+            expected,
+            reply_content
+        );
     }
 
     println!("smoke ok: received final reply {:?}", reply_content);

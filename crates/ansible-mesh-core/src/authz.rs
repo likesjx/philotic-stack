@@ -19,8 +19,8 @@ impl MeshAuth {
 
     /// Generates an HMAC-SHA256 signature for the given payload and msg_id.
     pub fn sign(&self, msg_id: &uuid::Uuid, seq: u64, payload: &[u8], timestamp: u64) -> Vec<u8> {
-        let mut mac = HmacSha256::new_from_slice(self.psk.as_bytes())
-            .expect("HMAC can take key of any size");
+        let mut mac =
+            HmacSha256::new_from_slice(self.psk.as_bytes()).expect("HMAC can take key of any size");
         mac.update(msg_id.as_bytes());
         mac.update(&seq.to_be_bytes());
         mac.update(&timestamp.to_be_bytes());
@@ -47,18 +47,21 @@ impl MeshAuth {
             return Err(anyhow!("Packet timestamp is in the future"));
         }
         if now.saturating_sub(timestamp) > REPLAY_WINDOW_SECS {
-            return Err(anyhow!("Packet timestamp is outside the 5-minute replay window"));
+            return Err(anyhow!(
+                "Packet timestamp is outside the 5-minute replay window"
+            ));
         }
 
         // 2. Cryptographic Validation
-        let mut mac = HmacSha256::new_from_slice(self.psk.as_bytes())
-            .expect("HMAC can take key of any size");
+        let mut mac =
+            HmacSha256::new_from_slice(self.psk.as_bytes()).expect("HMAC can take key of any size");
         mac.update(msg_id.as_bytes());
         mac.update(&seq.to_be_bytes());
         mac.update(&timestamp.to_be_bytes());
         mac.update(payload);
-        
-        mac.verify_slice(provided_hmac).map_err(|_| anyhow!("HMAC signature verification failed"))
+
+        mac.verify_slice(provided_hmac)
+            .map_err(|_| anyhow!("HMAC signature verification failed"))
     }
 }
 
@@ -93,8 +96,13 @@ impl NonceTracker {
             (&nonce_str, now),
         ) {
             Ok(_) => Ok(()), // Successfully recorded new nonce
-            Err(rusqlite::Error::SqliteFailure(err, _)) if err.code == rusqlite::ffi::ErrorCode::ConstraintViolation => {
-                Err(anyhow!("Replay detected: Blocked duplicate packet msg_id {}", nonce_str))
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ffi::ErrorCode::ConstraintViolation =>
+            {
+                Err(anyhow!(
+                    "Replay detected: Blocked duplicate packet msg_id {}",
+                    nonce_str
+                ))
             }
             Err(e) => Err(anyhow!("Database error during nonce tracking: {}", e)),
         }
@@ -106,13 +114,11 @@ impl NonceTracker {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        
+
         let threshold = now.saturating_sub(REPLAY_WINDOW_SECS);
 
-        self.conn.execute(
-            "DELETE FROM mesh_nonces WHERE seen_at < ?1",
-            [threshold],
-        )?;
+        self.conn
+            .execute("DELETE FROM mesh_nonces WHERE seen_at < ?1", [threshold])?;
         Ok(())
     }
 }

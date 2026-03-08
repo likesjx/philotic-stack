@@ -12,7 +12,9 @@ pub struct CursorTracker {
 impl CursorTracker {
     pub fn open(db_path: impl AsRef<Path>) -> SqlResult<Self> {
         let conn = Connection::open(db_path)?;
-        let tracker = Self { conn: Arc::new(Mutex::new(conn)) };
+        let tracker = Self {
+            conn: Arc::new(Mutex::new(conn)),
+        };
         tracker.init_schema()?;
         Ok(tracker)
     }
@@ -32,11 +34,13 @@ impl CursorTracker {
 
     pub fn get_cursor(&self, consumer_node_id: &str) -> SqlResult<u64> {
         let conn = self.conn.lock().unwrap();
-        let seq = conn.query_row(
-            "SELECT last_acked_seq FROM mesh_cursors WHERE consumer_node_id = ?1",
-            params![consumer_node_id],
-            |row| row.get(0),
-        ).unwrap_or(0);
+        let seq = conn
+            .query_row(
+                "SELECT last_acked_seq FROM mesh_cursors WHERE consumer_node_id = ?1",
+                params![consumer_node_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
         Ok(seq)
     }
 
@@ -48,7 +52,7 @@ impl CursorTracker {
              ON CONFLICT(consumer_node_id) DO UPDATE SET 
              last_acked_seq = MAX(last_acked_seq, excluded.last_acked_seq),
              updated_at = excluded.updated_at",
-            params![consumer_node_id, acked_seq, ts]
+            params![consumer_node_id, acked_seq, ts],
         )?;
         Ok(())
     }

@@ -1,13 +1,13 @@
-use crate::{BeaconMessage, MsgType, NodeCapabilities};
+use crate::authz::{MeshAuth, NonceTracker};
 use crate::heartbeat::HeartbeatPayload;
 use crate::registry::NodeRegistry;
-use crate::authz::{MeshAuth, NonceTracker};
+use crate::{BeaconMessage, MsgType, NodeCapabilities};
 use anyhow::{Context, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::{RwLock, mpsc};
-use tracing::{error, info, debug, warn};
+use tokio::sync::{mpsc, RwLock};
+use tracing::{debug, error, info, warn};
 
 /// A lightweight beacon daemon that binds to a UDP port and listens
 /// for incoming mesh control messages.
@@ -24,8 +24,8 @@ pub struct BeaconDaemon {
 impl BeaconDaemon {
     /// Bind the daemon to a specific UDP address (e.g., "0.0.0.0:1234" or a WireGuard IP).
     pub async fn bind(
-        addr: &str, 
-        local_capabilities: NodeCapabilities, 
+        addr: &str,
+        local_capabilities: NodeCapabilities,
         inbox_tx: mpsc::Sender<BeaconMessage>,
         psk: &str,
         db_path: &str,
@@ -34,12 +34,12 @@ impl BeaconDaemon {
         let socket = UdpSocket::bind(addr)
             .await
             .context(format!("Failed to bind UDP socket to {}", addr))?;
-        
+
         let auth = Arc::new(MeshAuth::new(psk));
         let nonce_tracker = Arc::new(NonceTracker::open(db_path)?);
 
         info!("Beacon daemon listening on {}", socket.local_addr()?);
-        Ok(Self { 
+        Ok(Self {
             socket: Arc::new(socket),
             registry: Arc::new(RwLock::new(NodeRegistry::new())),
             local_capabilities,
@@ -76,12 +76,24 @@ impl BeaconDaemon {
         // For MVP 1, we will use JSON for simplicity and debuggability.
         match serde_json::from_slice::<BeaconMessage>(data) {
             Ok(msg) => {
-                debug!("Received message {} from {} type {:?}", msg.msg_id, src, msg.msg_type);
-                
+                debug!(
+                    "Received message {} from {} type {:?}",
+                    msg.msg_id, src, msg.msg_type
+                );
+
                 // 1. Time-Window & HMAC Cryptographic Validation
                 if self.enable_rust_auth {
-                    if let Err(e) = self.auth.validate(&msg.msg_id, msg.seq as u64, &msg.payload, msg.timestamp, &msg.hmac) {
-                        warn!("Packet dropped: Auth validation failed for {} from {}: {}", msg.msg_id, src, e);
+                    if let Err(e) = self.auth.validate(
+                        &msg.msg_id,
+                        msg.seq as u64,
+                        &msg.payload,
+                        msg.timestamp,
+                        &msg.hmac,
+                    ) {
+                        warn!(
+                            "Packet dropped: Auth validation failed for {} from {}: {}",
+                            msg.msg_id, src, e
+                        );
                         return;
                     }
 
@@ -91,9 +103,12 @@ impl BeaconDaemon {
                         return;
                     }
                 } else {
-                    debug!("Rust Auth is disabled. Bypassing HMAC and Replay Guard for [{}]", msg.msg_id);
+                    debug!(
+                        "Rust Auth is disabled. Bypassing HMAC and Replay Guard for [{}]",
+                        msg.msg_id
+                    );
                 }
-                
+
                 // Discard messages from ourselves
                 if msg.src_node == self.local_capabilities.node_id {
                     return;
@@ -111,7 +126,10 @@ impl BeaconDaemon {
         match msg.msg_type {
             MsgType::Heartbeat => {
                 if let Ok(payload) = serde_json::from_slice::<HeartbeatPayload>(&msg.payload) {
-                    info!("Received heartbeat from node: {} (roles: {:?})", payload.capabilities.node_id, payload.capabilities.roles);
+                    info!(
+                        "Received heartbeat from node: {} (roles: {:?})",
+                        payload.capabilities.node_id, payload.capabilities.roles
+                    );
                     let mut registry = self.registry.write().await;
                     registry.update_node(payload.capabilities);
                 }

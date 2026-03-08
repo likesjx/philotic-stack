@@ -1,17 +1,17 @@
+use anyhow::Result;
 use axum::{
+    Router,
     extract::{DefaultBodyLimit, Multipart},
     http::StatusCode,
     response::{IntoResponse, Json},
     routing::post,
-    Router,
 };
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::path::{PathBuf};
+use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
 use tower_http::services::ServeDir;
 use tracing::{error, info};
-use anyhow::Result;
 
 #[derive(Clone)]
 pub struct BlobService {
@@ -22,7 +22,10 @@ impl BlobService {
     pub fn new(storage_dir: impl Into<PathBuf>) -> Self {
         let storage_dir = storage_dir.into();
         fs::create_dir_all(&storage_dir).unwrap_or_else(|e| {
-            error!("Failed to create blob storage directory {:?}: {}", storage_dir, e);
+            error!(
+                "Failed to create blob storage directory {:?}: {}",
+                storage_dir, e
+            );
         });
         Self { storage_dir }
     }
@@ -52,14 +55,21 @@ pub async fn upload_blob(
 ) -> Result<impl IntoResponse, StatusCode> {
     let mut uploaded_blobs = Vec::new();
     let storage_dir = state.storage_dir.clone();
-    
-    while let Some(mut field) = multipart.next_field().await.map_err(|_| StatusCode::BAD_REQUEST)? {
+
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?
+    {
         let _file_name = field.file_name().unwrap_or("unknown").to_string();
-        let _content_type = field.content_type().unwrap_or("application/octet-stream").to_string();
-        
+        let _content_type = field
+            .content_type()
+            .unwrap_or("application/octet-stream")
+            .to_string();
+
         let mut hasher = Sha256::new();
         let temp_path = storage_dir.join(format!("temp_{}", uuid::Uuid::new_v4()));
-        
+
         let mut file = tokio::fs::File::create(&temp_path)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -73,9 +83,9 @@ pub async fn upload_blob(
 
         let hash_result = hasher.finalize();
         let blob_id = format!("sha256-{}", hex::encode(hash_result));
-        
+
         let final_path = storage_dir.join(&blob_id);
-        
+
         if final_path.exists() {
             // Already exists, just remove temp
             let _ = tokio::fs::remove_file(temp_path).await;

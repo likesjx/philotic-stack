@@ -7,7 +7,9 @@
 //! - `IpcRequest` / `IpcResponse` serialization round-trips
 
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
-use ansible_mesh_core::sqlite_storage::{SqliteCursorStorage, SqliteEventStorage, SqliteGraphStorage};
+use ansible_mesh_core::sqlite_storage::{
+    SqliteCursorStorage, SqliteEventStorage, SqliteGraphStorage,
+};
 use ansible_mesh_core::storage::{
     CursorStorage, EventStorage, GraphStorage, GuestRecord, HotelRecord, SessionEventRecord,
     SessionParticipantRecord, SessionRecord, SessionTurnRecord,
@@ -266,7 +268,10 @@ fn graph_storage_node_capabilities_round_trip() {
 
     store.save_node_capabilities(&caps).unwrap();
 
-    let loaded = store.load_node_capabilities().unwrap().expect("should exist");
+    let loaded = store
+        .load_node_capabilities()
+        .unwrap()
+        .expect("should exist");
     assert_eq!(loaded.node_id, "hotel-test-01");
     assert_eq!(loaded.roles, vec![NodeRole::AnsibleNode]);
     assert_eq!(loaded.models, vec!["gemini-2.0-flash@2026.1"]);
@@ -290,7 +295,11 @@ fn graph_storage_node_capabilities_upsert() {
     store.save_node_capabilities(&caps_v2).unwrap(); // upsert
 
     let loaded = store.load_node_capabilities().unwrap().unwrap();
-    assert_eq!(loaded.models, vec!["new-model@1"], "second save must overwrite first");
+    assert_eq!(
+        loaded.models,
+        vec!["new-model@1"],
+        "second save must overwrite first"
+    );
 }
 
 #[test]
@@ -359,7 +368,10 @@ fn graph_storage_hotel_round_trip_and_pid_update() {
     store.upsert_hotel(&hotel).unwrap();
     store.set_hotel_pid("alpha", Some("2222")).unwrap();
 
-    let loaded = store.get_hotel("alpha").unwrap().expect("hotel should exist");
+    let loaded = store
+        .get_hotel("alpha")
+        .unwrap()
+        .expect("hotel should exist");
     assert_eq!(loaded.capabilities.node_id, "alpha-node");
     assert_eq!(loaded.mesh_port, 9101);
     assert_eq!(loaded.blob_port, 9201);
@@ -387,11 +399,14 @@ fn graph_storage_seed_and_list_guests() {
     let store = open_graph_storage();
 
     store
-        .seed_guests("test-hotel", &[
-            sample_guest("g1", true),
-            sample_guest("g2", true),
-            sample_guest("g3", false),
-        ])
+        .seed_guests(
+            "test-hotel",
+            &[
+                sample_guest("g1", true),
+                sample_guest("g2", true),
+                sample_guest("g3", false),
+            ],
+        )
         .unwrap();
 
     let all = store.list_guests("test-hotel", false).unwrap();
@@ -405,10 +420,14 @@ fn graph_storage_seed_and_list_guests() {
 #[test]
 fn graph_storage_set_guest_pid() {
     let store = open_graph_storage();
-    store.seed_guests("test-hotel", &[sample_guest("agent-1", true)]).unwrap();
+    store
+        .seed_guests("test-hotel", &[sample_guest("agent-1", true)])
+        .unwrap();
 
     // Assign a PID
-    store.set_guest_pid("test-hotel", "agent-1", Some("1234")).unwrap();
+    store
+        .set_guest_pid("test-hotel", "agent-1", Some("1234"))
+        .unwrap();
     let guests = store.list_guests("test-hotel", false).unwrap();
     assert_eq!(
         guests[0].active_pid.as_deref(),
@@ -567,7 +586,11 @@ fn graph_storage_sync_apartment_independent_agents() {
         .sync_apartment("agent-bob", "short", &serde_json::json!({"b": 1}))
         .unwrap();
 
-    assert_eq!(count_apartments(&store), 2, "different agents own separate apartments");
+    assert_eq!(
+        count_apartments(&store),
+        2,
+        "different agents own separate apartments"
+    );
 }
 
 #[test]
@@ -576,7 +599,11 @@ fn graph_storage_sync_apartment_creates_graph_node_and_edge() {
     seed_agent_identity(&store, "agent-jane");
 
     store
-        .sync_apartment("agent-jane", "short", &serde_json::json!({"recent": "hello"}))
+        .sync_apartment(
+            "agent-jane",
+            "short",
+            &serde_json::json!({"recent": "hello"}),
+        )
         .unwrap();
 
     let conn = store.raw_conn().lock().unwrap();
@@ -608,7 +635,11 @@ fn graph_storage_get_apartment_returns_latest_checkpoint() {
     seed_agent_identity(&store, "agent-jane");
 
     store
-        .sync_apartment("agent-jane", "short", &serde_json::json!({"session_id": "sess-1"}))
+        .sync_apartment(
+            "agent-jane",
+            "short",
+            &serde_json::json!({"session_id": "sess-1"}),
+        )
         .unwrap();
 
     let checkpoint = store
@@ -845,7 +876,10 @@ fn graph_storage_session_checkpoint_flow_e2e() {
     assert_eq!(session.status, "active");
     assert_eq!(participants.len(), 2);
     assert_eq!(turns.len(), 1);
-    assert_eq!(turns[0].response_json.as_ref().unwrap()["content"], "CPU is at 45%");
+    assert_eq!(
+        turns[0].response_json.as_ref().unwrap()["content"],
+        "CPU is at 45%"
+    );
     assert_eq!(events.len(), 2);
 
     let conn = store.raw_conn().lock().unwrap();
