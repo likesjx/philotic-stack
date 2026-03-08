@@ -55,6 +55,14 @@ struct AllowedIncarnation {
     selection_hint: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct RoutingPreferences {
+    preferred_tool_runner_incarnation: Option<String>,
+    preferred_tool_runner: Option<String>,
+    preferred_hotel_id: Option<String>,
+    preferred_environment_id: Option<String>,
+}
+
 pub struct IpcServer {
     socket_path: String,
     dispatcher_tx: mpsc::Sender<LedgerCommand>,
@@ -1391,10 +1399,32 @@ fn parse_allowed_incarnations(
         .collect()
 }
 
+fn parse_routing_preferences(bindings: &serde_json::Value) -> RoutingPreferences {
+    RoutingPreferences {
+        preferred_tool_runner_incarnation: bindings
+            .get("preferred_tool_runner_incarnation")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        preferred_tool_runner: bindings
+            .get("preferred_tool_runner")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        preferred_hotel_id: bindings
+            .get("preferred_hotel_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        preferred_environment_id: bindings
+            .get("preferred_environment_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+    }
+}
+
 fn compose_tool_assembly_from_incarnations(
     bindings: &serde_json::Value,
     incarnations: &[AllowedIncarnation],
 ) -> serde_json::Value {
+    let preferences = parse_routing_preferences(bindings);
     let toolset = {
         let filtered = default_visible_toolset(bindings);
         if bindings
@@ -1429,7 +1459,7 @@ fn compose_tool_assembly_from_incarnations(
     let execution_routes = toolset
         .iter()
         .filter_map(|tool_name| {
-            select_allowed_incarnation(incarnations, tool_name).map(|incarnation| {
+            select_allowed_incarnation(incarnations, tool_name, &preferences).map(|incarnation| {
                 (
                     tool_name.to_string(),
                     serde_json::json!({
@@ -1441,7 +1471,7 @@ fn compose_tool_assembly_from_incarnations(
                         "environment_id": incarnation.environment_id,
                         "execution_mode": incarnation.execution_mode,
                         "availability_state": incarnation.availability_state,
-                        "selection_reason": incarnation.selection_hint.clone().unwrap_or_else(|| "allowed_incarnation_route".into()),
+                        "selection_reason": selection_reason_for_incarnation(incarnation, &preferences),
                     }),
                 )
             })
@@ -1471,6 +1501,7 @@ fn compose_tool_assembly_from_incarnations(
 fn select_allowed_incarnation<'a>(
     incarnations: &'a [AllowedIncarnation],
     tool_name: &str,
+    preferences: &RoutingPreferences,
 ) -> Option<&'a AllowedIncarnation> {
     let mut candidates = incarnations
         .iter()
@@ -1482,10 +1513,13 @@ fn select_allowed_incarnation<'a>(
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
-        let left_live = left.availability_state == "live";
-        let right_live = right.availability_state == "live";
-        right_live
-            .cmp(&left_live)
+        incarnation_preference_rank(preferences, right)
+            .cmp(&incarnation_preference_rank(preferences, left))
+            .then_with(|| {
+                let left_live = left.availability_state == "live";
+                let right_live = right.availability_state == "live";
+                right_live.cmp(&left_live)
+            })
             .then_with(|| {
                 let left_local = left.hotel_id.as_deref() == Some("local-ansible-01");
                 let right_local = right.hotel_id.as_deref() == Some("local-ansible-01");
@@ -1494,6 +1528,67 @@ fn select_allowed_incarnation<'a>(
             .then_with(|| left.incarnation_id.cmp(&right.incarnation_id))
     });
     candidates.into_iter().next()
+}
+
+fn incarnation_preference_rank(
+    preferences: &RoutingPreferences,
+    incarnation: &AllowedIncarnation,
+) -> u8 {
+    if preferences.preferred_tool_runner_incarnation.as_deref()
+        == Some(incarnation.incarnation_id.as_str())
+    {
+        return 4;
+    }
+    if preferences.preferred_tool_runner.as_deref() == incarnation.runner_id.as_deref() {
+        return 3;
+    }
+    if preferences.preferred_environment_id.as_deref() == incarnation.environment_id.as_deref() {
+        return 2;
+    }
+    if preferences.preferred_hotel_id.as_deref() == incarnation.hotel_id.as_deref() {
+        return 1;
+    }
+    0
+}
+
+fn selection_reason_for_incarnation(
+    incarnation: &AllowedIncarnation,
+    preferences: &RoutingPreferences,
+) -> String {
+    let suffix = if incarnation.availability_state == "live" {
+        "live"
+    } else {
+        "requires_materialization"
+    };
+
+    let computed = if preferences.preferred_tool_runner_incarnation.as_deref()
+        == Some(incarnation.incarnation_id.as_str())
+    {
+        format!("preferred_incarnation_{suffix}")
+    } else if preferences.preferred_tool_runner.as_deref() == incarnation.runner_id.as_deref() {
+        format!("preferred_runner_{suffix}")
+    } else if preferences.preferred_environment_id.as_deref()
+        == incarnation.environment_id.as_deref()
+    {
+        format!("preferred_environment_{suffix}")
+    } else if preferences.preferred_hotel_id.as_deref() == incarnation.hotel_id.as_deref() {
+        format!("preferred_hotel_{suffix}")
+    } else if incarnation.availability_state == "live"
+        && incarnation.hotel_id.as_deref() == Some("local-ansible-01")
+    {
+        "live_local_fallback".into()
+    } else if incarnation.availability_state == "live" {
+        "live_allowed_incarnation".into()
+    } else {
+        "allowed_incarnation_requires_materialization".into()
+    };
+
+    let used_preference = incarnation_preference_rank(preferences, incarnation) > 0;
+    if used_preference {
+        computed
+    } else {
+        incarnation.selection_hint.clone().unwrap_or(computed)
+    }
 }
 
 fn unix_ts() -> u64 {
@@ -2221,6 +2316,147 @@ mod tests {
                 assert_eq!(
                     snapshot["tool_assembly"]["execution_routes"]["echo"]["availability_state"],
                     "live"
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn session_snapshot_prefers_requested_environment_even_when_local_is_live() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
+        let server = IpcServer::new(socket_path.clone(), dispatcher_tx, graph);
+
+        graph_store
+            .upsert_session(&SessionRecord {
+                session_id: "sess-pref-env".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("123".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "bindings": {
+                        "preferred_environment_id": "env://remote",
+                        "allowed_tool_runner_incarnations": [
+                            {
+                                "incarnation_id": "tool-runner-local",
+                                "runner_id": "tool-runner-local",
+                                "hotel_id": "local-ansible-01",
+                                "environment_id": "env://local",
+                                "target_node": "local-ansible-01",
+                                "target_role": "tool.echo",
+                                "supported_tools": ["echo"],
+                                "execution_mode": "capability",
+                                "selection_hint": "local_live_preferred"
+                            },
+                            {
+                                "incarnation_id": "tool-runner-remote",
+                                "runner_id": "tool-runner-remote",
+                                "hotel_id": "remote-hotel",
+                                "environment_id": "env://remote",
+                                "target_node": "remote-hotel",
+                                "target_role": "tool.echo",
+                                "supported_tools": ["echo"],
+                                "execution_mode": "capability",
+                                "selection_hint": "remote_fallback"
+                            }
+                        ]
+                    }
+                }),
+                created_at: 1,
+                updated_at: 2,
+            })
+            .expect("session should seed");
+        graph_store
+            .set_config_value(
+                "tool_runner_registry",
+                &serde_json::json!([
+                    {
+                        "guest_id": "tool-runner-remote",
+                        "supported_tools": ["echo"],
+                        "last_seen_at": 41
+                    },
+                    {
+                        "guest_id": "tool-runner-local",
+                        "supported_tools": ["echo"],
+                        "last_seen_at": 42
+                    }
+                ])
+                .to_string(),
+            )
+            .expect("registry should seed");
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("agent connect");
+        let mut local_tool = PhiloticClient::connect(GuestIdentity {
+            guest_id: "tool-runner-local".into(),
+            role: "tool".into(),
+            supported_tools: vec!["echo".into()],
+        })
+        .await
+        .expect("local tool connect");
+        local_tool
+            .send_request(IpcRequest::SubscribeInbox {
+                role: "tool.echo".into(),
+            })
+            .await
+            .expect("local tool subscribe");
+
+        let response = agent
+            .send_request(IpcRequest::GetConfig {
+                key: "__session_snapshot__:sess-pref-env".into(),
+            })
+            .await
+            .expect("snapshot request should succeed");
+
+        match response {
+            IpcResponse::ConfigData {
+                value_json: Some(value_json),
+                ..
+            } => {
+                let snapshot: serde_json::Value =
+                    serde_json::from_str(&value_json).expect("snapshot should decode");
+                assert_eq!(
+                    snapshot["tool_assembly"]["execution_routes"]["echo"]["incarnation_id"],
+                    "tool-runner-remote"
+                );
+                assert_eq!(
+                    snapshot["tool_assembly"]["execution_routes"]["echo"]["selection_reason"],
+                    "preferred_environment_requires_materialization"
+                );
+                assert_eq!(
+                    snapshot["tool_assembly"]["execution_routes"]["echo"]["availability_state"],
+                    "materialization_required"
                 );
             }
             other => panic!("unexpected response: {other:?}"),

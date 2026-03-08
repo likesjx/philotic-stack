@@ -43,12 +43,17 @@ Implemented so far:
   - `workspace.list` and `workspace.read` are now treated as `pinned`
 - incarnation-aware execution metadata in assembled routes
 - session `allowed_tool_runner_incarnations` can now define visible tools and preferred execution routes
+- preference-aware route ranking for:
+  - preferred incarnation
+  - preferred runner
+  - preferred hotel
+  - preferred environment
+- explicit route `selection_reason` values now reflect when a preferred route wins even if it requires materialization
 - `agent-core` now translates abstract tool calls into preassembled route envelopes instead of rediscovering routing at call time
 
 Still pending in [task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md):
 
 - materialization policy
-- environment-aware routing preferences
 - richer runner selection and fallback
 
 ## Core Recommendation

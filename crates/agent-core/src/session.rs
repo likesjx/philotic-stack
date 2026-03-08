@@ -61,6 +61,14 @@ pub struct SessionBindings {
     #[serde(default)]
     pub effective_model_controller: Option<String>,
     #[serde(default)]
+    pub preferred_tool_runner_incarnation: Option<String>,
+    #[serde(default)]
+    pub preferred_tool_runner: Option<String>,
+    #[serde(default)]
+    pub preferred_hotel_id: Option<String>,
+    #[serde(default)]
+    pub preferred_environment_id: Option<String>,
+    #[serde(default)]
     pub allowed_tool_runner_incarnations: Vec<ToolRunnerIncarnationBinding>,
 }
 
@@ -1038,19 +1046,9 @@ fn select_incarnation_route(
         })
         .collect::<Vec<_>>();
 
-    candidates.sort_by(|a, b| compare_incarnation_bindings(a, b));
+    candidates.sort_by(|a, b| compare_incarnation_bindings(bindings, a, b));
     let selected = candidates.first()?;
-    let selection_reason = if selected.availability_state == "live" {
-        selected
-            .selection_hint
-            .clone()
-            .unwrap_or_else(|| "live_allowed_incarnation".into())
-    } else {
-        selected
-            .selection_hint
-            .clone()
-            .unwrap_or_else(|| "allowed_incarnation_requires_materialization".into())
-    };
+    let selection_reason = selection_reason_for_binding(bindings, selected);
 
     Some(ToolExecutionRoute {
         target_node: selected
@@ -1076,19 +1074,86 @@ fn select_incarnation_route(
 }
 
 fn compare_incarnation_bindings(
+    bindings: &SessionBindings,
     left: &ToolRunnerIncarnationBinding,
     right: &ToolRunnerIncarnationBinding,
 ) -> std::cmp::Ordering {
-    let left_live = left.availability_state == "live";
-    let right_live = right.availability_state == "live";
-    right_live
-        .cmp(&left_live)
+    binding_preference_rank(bindings, right)
+        .cmp(&binding_preference_rank(bindings, left))
+        .then_with(|| {
+            let left_live = left.availability_state == "live";
+            let right_live = right.availability_state == "live";
+            right_live.cmp(&left_live)
+        })
         .then_with(|| {
             let left_local = left.hotel_id.as_deref() == Some("local-ansible-01");
             let right_local = right.hotel_id.as_deref() == Some("local-ansible-01");
             right_local.cmp(&left_local)
         })
         .then_with(|| left.incarnation_id.cmp(&right.incarnation_id))
+}
+
+fn binding_preference_rank(
+    bindings: &SessionBindings,
+    binding: &ToolRunnerIncarnationBinding,
+) -> u8 {
+    if bindings
+        .preferred_tool_runner_incarnation
+        .as_deref()
+        == Some(binding.incarnation_id.as_str())
+    {
+        return 4;
+    }
+    if bindings.preferred_tool_runner.as_deref() == binding.runner_id.as_deref() {
+        return 3;
+    }
+    if bindings.preferred_environment_id.as_deref() == binding.environment_id.as_deref() {
+        return 2;
+    }
+    if bindings.preferred_hotel_id.as_deref() == binding.hotel_id.as_deref() {
+        return 1;
+    }
+    0
+}
+
+fn selection_reason_for_binding(
+    bindings: &SessionBindings,
+    binding: &ToolRunnerIncarnationBinding,
+) -> String {
+    let suffix = if binding.availability_state == "live" {
+        "live"
+    } else {
+        "requires_materialization"
+    };
+
+    let computed = if bindings
+        .preferred_tool_runner_incarnation
+        .as_deref()
+        == Some(binding.incarnation_id.as_str())
+    {
+        format!("preferred_incarnation_{suffix}")
+    } else if bindings.preferred_tool_runner.as_deref() == binding.runner_id.as_deref() {
+        format!("preferred_runner_{suffix}")
+    } else if bindings.preferred_environment_id.as_deref() == binding.environment_id.as_deref() {
+        format!("preferred_environment_{suffix}")
+    } else if bindings.preferred_hotel_id.as_deref() == binding.hotel_id.as_deref() {
+        format!("preferred_hotel_{suffix}")
+    } else if binding.availability_state == "live"
+        && binding.hotel_id.as_deref() == Some("local-ansible-01")
+    {
+        "live_local_fallback".into()
+    } else if binding.availability_state == "live" {
+        "live_allowed_incarnation".into()
+    } else {
+        "allowed_incarnation_requires_materialization".into()
+    };
+
+    let used_preference = binding_preference_rank(bindings, binding) > 0;
+    if used_preference {
+        computed
+    } else {
+        binding.selection_hint.clone().unwrap_or(computed)
+    }
 }
 
 fn current_unix_ts() -> u64 {
@@ -1214,6 +1279,10 @@ mod tests {
                 effective_skillset: vec!["planning".into()],
                 effective_workspace_ref: Some("workspace://main".into()),
                 effective_model_controller: Some("gemini-flash".into()),
+                preferred_tool_runner_incarnation: None,
+                preferred_tool_runner: None,
+                preferred_hotel_id: None,
+                preferred_environment_id: None,
                 allowed_tool_runner_incarnations: Vec::new(),
             }
         );
@@ -1286,6 +1355,10 @@ mod tests {
             effective_skillset: vec!["planning".into()],
             effective_workspace_ref: Some("workspace://main".into()),
             effective_model_controller: Some("gemini-flash".into()),
+            preferred_tool_runner_incarnation: None,
+            preferred_tool_runner: None,
+            preferred_hotel_id: None,
+            preferred_environment_id: None,
             allowed_tool_runner_incarnations: Vec::new(),
         };
 
@@ -1402,6 +1475,50 @@ mod tests {
         assert_eq!(
             route.selection_reason.as_deref(),
             Some("local_live_preferred")
+        );
+    }
+
+    #[test]
+    fn preferred_environment_overrides_live_local_fallback() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.bindings.preferred_environment_id = Some("env://remote".into());
+        state.bindings.allowed_tool_runner_incarnations = vec![
+            ToolRunnerIncarnationBinding {
+                incarnation_id: "tool-echo-local".into(),
+                runner_id: Some("tool-runner-local".into()),
+                hotel_id: Some("local-ansible-01".into()),
+                environment_id: Some("env://local".into()),
+                target_node: Some("local-ansible-01".into()),
+                target_role: Some("tool.echo".into()),
+                supported_tools: vec!["echo".into()],
+                execution_mode: "capability".into(),
+                availability_state: "live".into(),
+                selection_hint: Some("local_live_preferred".into()),
+            },
+            ToolRunnerIncarnationBinding {
+                incarnation_id: "tool-echo-remote".into(),
+                runner_id: Some("tool-runner-remote".into()),
+                hotel_id: Some("remote-hotel".into()),
+                environment_id: Some("env://remote".into()),
+                target_node: Some("remote-hotel".into()),
+                target_role: Some("tool.echo".into()),
+                supported_tools: vec!["echo".into()],
+                execution_mode: "capability".into(),
+                availability_state: "materialization_required".into(),
+                selection_hint: Some("remote_fallback".into()),
+            },
+        ];
+        state.rebuild_default_tool_assembly();
+
+        let route = state
+            .resolve_tool_route("echo")
+            .expect("echo route should be assembled");
+        assert_eq!(route.incarnation_id.as_deref(), Some("tool-echo-remote"));
+        assert_eq!(route.environment_id.as_deref(), Some("env://remote"));
+        assert_eq!(
+            route.selection_reason.as_deref(),
+            Some("preferred_environment_requires_materialization")
         );
     }
 

@@ -72,12 +72,12 @@
   - `echo` as `capability`
   - `workspace.list` and `workspace.read` as `pinned`
 - [ ] Return to skill design after tool assembly and routed execution boundaries are in place.
-- [ ] Add agent-specific runner routing:
+- [x] Add agent-specific runner routing:
   - preferred environment
   - preferred hotel/node
   - preferred runner
-  - fallback policy
   - route selection reason in `tool_assembly`
+- [ ] Add runner fallback policy and smarter reroute behavior when the preferred route cannot materialize or should be bypassed.
 
 ## Next Project: Personality and Context
 
