@@ -71,6 +71,8 @@ pub struct ToolExecutionPayload {
     pub environment_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selection_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_ref: Option<String>,
     pub reply_to: String,
     pub reply_role: String,
     pub final_reply_to: String,

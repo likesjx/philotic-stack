@@ -67,6 +67,10 @@
   - `local_agent`
   - `capability`
   - `pinned`
+- [x] Land the first basic tool-family split:
+  - `session.status` as `local_agent`
+  - `echo` as `capability`
+  - `workspace.list` and `workspace.read` as `pinned`
 - [ ] Return to skill design after tool assembly and routed execution boundaries are in place.
 - [ ] Add agent-specific runner routing:
   - preferred environment

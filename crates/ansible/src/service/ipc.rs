@@ -1,17 +1,17 @@
+use crate::LedgerCommand;
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
 use ansible_mesh_core::storage::{
     GraphStorage, SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,
 };
 use philotic_client::{IpcRequest, IpcResponse};
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tracing::{error, info, warn};
 use uuid::Uuid;
-use crate::LedgerCommand;
-use std::collections::HashMap;
-use std::sync::Arc;
 
 type InboxRegistry = Arc<Mutex<HashMap<String, Vec<RoleSubscriber>>>>;
 
@@ -90,7 +90,11 @@ impl IpcServer {
         Ok(Some(buf))
     }
 
-    pub fn new(socket_path: impl Into<String>, dispatcher_tx: mpsc::Sender<LedgerCommand>, graph: Arc<dyn GraphStorage>) -> Self {
+    pub fn new(
+        socket_path: impl Into<String>,
+        dispatcher_tx: mpsc::Sender<LedgerCommand>,
+        graph: Arc<dyn GraphStorage>,
+    ) -> Self {
         Self {
             socket_path: socket_path.into(),
             dispatcher_tx,
@@ -101,7 +105,7 @@ impl IpcServer {
 
     pub async fn run(&self) -> anyhow::Result<()> {
         let path = Path::new(&self.socket_path);
-        
+
         if path.exists() {
             std::fs::remove_file(path)?;
         }
@@ -116,7 +120,9 @@ impl IpcServer {
                     let graph = self.graph.clone();
                     let inboxes = self.inboxes.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = Self::handle_client(stream, dispatcher, graph, inboxes).await {
+                        if let Err(e) =
+                            Self::handle_client(stream, dispatcher, graph, inboxes).await
+                        {
                             error!("IPC client connection error: {}", e);
                         }
                     });
@@ -128,7 +134,12 @@ impl IpcServer {
         }
     }
 
-    async fn handle_client(stream: UnixStream, dispatcher_tx: mpsc::Sender<LedgerCommand>, graph: Arc<dyn GraphStorage>, inboxes: InboxRegistry) -> anyhow::Result<()> {
+    async fn handle_client(
+        stream: UnixStream,
+        dispatcher_tx: mpsc::Sender<LedgerCommand>,
+        graph: Arc<dyn GraphStorage>,
+        inboxes: InboxRegistry,
+    ) -> anyhow::Result<()> {
         let conn_id = Uuid::new_v4();
         let (mut reader, mut writer) = stream.into_split();
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<IpcResponse>();
@@ -156,27 +167,29 @@ impl IpcServer {
                     let _ = write_task.await;
                     return Ok(());
                 }
-                Ok(Some(frame)) => {
-                    match serde_json::from_slice::<IpcRequest>(&frame) {
-                        Ok(req) => {
-                            let response = Self::process_request(
-                                req,
-                                &dispatcher_tx,
-                                graph.as_ref(),
-                                &inboxes,
-                                conn_id,
-                                &outbound_tx,
-                                &mut subscribed_roles,
-                            )
-                            .await;
-                            let _ = outbound_tx.send(response);
-                        }
-                        Err(e) => {
-                            warn!("Malformed IPC request payload: {}", e);
-                            let _ = outbound_tx.send(IpcResponse::error("unknown", "MALFORMED_PAYLOAD", e.to_string()));
-                        }
+                Ok(Some(frame)) => match serde_json::from_slice::<IpcRequest>(&frame) {
+                    Ok(req) => {
+                        let response = Self::process_request(
+                            req,
+                            &dispatcher_tx,
+                            graph.as_ref(),
+                            &inboxes,
+                            conn_id,
+                            &outbound_tx,
+                            &mut subscribed_roles,
+                        )
+                        .await;
+                        let _ = outbound_tx.send(response);
                     }
-                }
+                    Err(e) => {
+                        warn!("Malformed IPC request payload: {}", e);
+                        let _ = outbound_tx.send(IpcResponse::error(
+                            "unknown",
+                            "MALFORMED_PAYLOAD",
+                            e.to_string(),
+                        ));
+                    }
+                },
                 Err(e) => {
                     Self::remove_subscriptions(&inboxes, conn_id, &subscribed_roles).await;
                     let _ = write_task.await;
@@ -210,7 +223,11 @@ impl IpcServer {
         }
     }
 
-    async fn remove_subscriptions(inboxes: &InboxRegistry, conn_id: Uuid, subscribed_roles: &[String]) {
+    async fn remove_subscriptions(
+        inboxes: &InboxRegistry,
+        conn_id: Uuid,
+        subscribed_roles: &[String],
+    ) {
         let mut guard = inboxes.lock().await;
         for role in subscribed_roles {
             if let Some(subscribers) = guard.get_mut(role) {
@@ -220,14 +237,22 @@ impl IpcServer {
         guard.retain(|_, subscribers| !subscribers.is_empty());
     }
 
-    async fn deliver_inbound_task(inboxes: &InboxRegistry, target_role: &str, task_id: Uuid, task_json: String) {
+    async fn deliver_inbound_task(
+        inboxes: &InboxRegistry,
+        target_role: &str,
+        task_id: Uuid,
+        task_json: String,
+    ) {
         let subscribers = {
             let guard = inboxes.lock().await;
             guard.get(target_role).cloned().unwrap_or_default()
         };
 
         if subscribers.is_empty() {
-            warn!("No local inbox subscribers for role '{}'; task {} stays ledger-only for now.", target_role, task_id);
+            warn!(
+                "No local inbox subscribers for role '{}'; task {} stays ledger-only for now.",
+                target_role, task_id
+            );
             return;
         }
 
@@ -263,7 +288,10 @@ impl IpcServer {
     ) -> IpcResponse {
         match req {
             IpcRequest::Register(identity) => {
-                info!("Guest registered over UDS: [{}] Role: {}", identity.guest_id, identity.role);
+                info!(
+                    "Guest registered over UDS: [{}] Role: {}",
+                    identity.guest_id, identity.role
+                );
                 Self::add_subscription(
                     inboxes,
                     &identity.role,
@@ -322,7 +350,10 @@ impl IpcServer {
                     }
                 }
             }
-            IpcRequest::PublishMessage { target_role, payload } => {
+            IpcRequest::PublishMessage {
+                target_role,
+                payload,
+            } => {
                 info!("PublishMessage for role: {}", target_role);
                 let task_id = Uuid::new_v4();
                 let payload_json = payload.to_string();
@@ -345,14 +376,19 @@ impl IpcServer {
                     attempt: 0,
                     created_at: 0,
                     expires_at: None,
-                    payload: EventPayload::Inline { data: payload_json.clone() },
+                    payload: EventPayload::Inline {
+                        data: payload_json.clone(),
+                    },
                     trace: vec![],
                 };
                 let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(env)).await;
                 Self::deliver_inbound_task(inboxes, &target_role, task_id, payload_json).await;
                 IpcResponse::success("pub", None)
             }
-            IpcRequest::CreateTask { target_role, payload } => {
+            IpcRequest::CreateTask {
+                target_role,
+                payload,
+            } => {
                 info!("CreateTask for role: {}", target_role);
                 let task_id = Uuid::new_v4();
                 let payload_json = payload.to_string();
@@ -375,18 +411,27 @@ impl IpcServer {
                     attempt: 0,
                     created_at: 0,
                     expires_at: None,
-                    payload: EventPayload::Inline { data: payload_json.clone() },
+                    payload: EventPayload::Inline {
+                        data: payload_json.clone(),
+                    },
                     trace: vec![],
                 };
                 let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(env)).await;
                 Self::deliver_inbound_task(inboxes, &target_role, task_id, payload_json).await;
-                IpcResponse::success("create", Some(serde_json::json!({ "task_id": task_id.to_string() })))
+                IpcResponse::success(
+                    "create",
+                    Some(serde_json::json!({ "task_id": task_id.to_string() })),
+                )
             }
             IpcRequest::AckEvent { event_id } => {
                 info!("AckEvent for: {}", event_id);
                 IpcResponse::success("ack", None)
             }
-            IpcRequest::UpdateTask { task_id, state, payload } => {
+            IpcRequest::UpdateTask {
+                task_id,
+                state,
+                payload,
+            } => {
                 info!("UpdateTask for: {} to state: {}", task_id, state);
                 Self::record_session_activity_from_value(
                     graph,
@@ -407,7 +452,9 @@ impl IpcServer {
                     attempt: 0,
                     created_at: 0,
                     expires_at: None,
-                    payload: EventPayload::Inline { data: payload.to_string() },
+                    payload: EventPayload::Inline {
+                        data: payload.to_string(),
+                    },
                     trace: vec![],
                 };
                 let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(env)).await;
@@ -434,13 +481,19 @@ impl IpcServer {
                     attempt: 0,
                     created_at: 0,
                     expires_at: None,
-                    payload: EventPayload::Inline { data: result.to_string() },
+                    payload: EventPayload::Inline {
+                        data: result.to_string(),
+                    },
                     trace: vec![],
                 };
                 let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(env)).await;
                 IpcResponse::success("complete", None)
             }
-            IpcRequest::FailTask { task_id, error_code, reason } => {
+            IpcRequest::FailTask {
+                task_id,
+                error_code,
+                reason,
+            } => {
                 info!("FailTask for: {} ({}): {}", task_id, error_code, reason);
                 Self::record_session_activity_from_value(
                     graph,
@@ -459,16 +512,17 @@ impl IpcServer {
                     source_node_id: "local-ansible-01".into(),
                     source_agent_id: "unknown".into(),
                     target_agent_id: None,
-                    kind: EventKind::TaskResult, 
+                    kind: EventKind::TaskResult,
                     corr_id: task_id.to_string(),
                     attempt: 0,
                     created_at: 0,
                     expires_at: None,
-                    payload: EventPayload::Inline { 
+                    payload: EventPayload::Inline {
                         data: serde_json::json!({
                             "error": error_code,
                             "reason": reason
-                        }).to_string() 
+                        })
+                        .to_string(),
                     },
                     trace: vec![],
                 };
@@ -505,7 +559,11 @@ impl IpcServer {
                 .await;
                 IpcResponse::success("sub", None)
             }
-            IpcRequest::SyncApartment { agent_id, memory_type, content_json } => {
+            IpcRequest::SyncApartment {
+                agent_id,
+                memory_type,
+                content_json,
+            } => {
                 info!("SyncApartment for: {} ({})", agent_id, memory_type);
                 if let Err(e) = graph.sync_apartment(&agent_id, &memory_type, &content_json) {
                     error!("Failed to sync memory apartment: {}", e);
@@ -514,14 +572,17 @@ impl IpcServer {
                 Self::record_apartment_checkpoint(graph, &agent_id, &memory_type, &content_json);
                 IpcResponse::success("sync", None)
             }
-            IpcRequest::QueryStatus { task_id: _ } => {
-                IpcResponse::success("query", None)
-            }
-            IpcRequest::QueryTimeline { task_id: _ } => {
-                IpcResponse::success("timeline", None)
-            }
-            IpcRequest::EmitTask { target_node, target_role, task_json } => {
-                info!("EmitTask mapped to TaskInvoke for {}/{}", target_node, target_role);
+            IpcRequest::QueryStatus { task_id: _ } => IpcResponse::success("query", None),
+            IpcRequest::QueryTimeline { task_id: _ } => IpcResponse::success("timeline", None),
+            IpcRequest::EmitTask {
+                target_node,
+                target_role,
+                task_json,
+            } => {
+                info!(
+                    "EmitTask mapped to TaskInvoke for {}/{}",
+                    target_node, target_role
+                );
                 let task_id = Uuid::new_v4();
                 if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&task_json) {
                     Self::record_session_activity_from_value(
@@ -544,7 +605,9 @@ impl IpcServer {
                     attempt: 0,
                     created_at: 0,
                     expires_at: None,
-                    payload: EventPayload::Inline { data: task_json.clone() },
+                    payload: EventPayload::Inline {
+                        data: task_json.clone(),
+                    },
                     trace: vec![],
                 };
                 let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(env)).await;
@@ -662,7 +725,9 @@ impl IpcServer {
         if session.channel_session_key.is_none() {
             session.channel_session_key = envelope.chat_id.clone();
         }
-        if let Some(session_status) = payload.get("session_status").and_then(serde_json::Value::as_str)
+        if let Some(session_status) = payload
+            .get("session_status")
+            .and_then(serde_json::Value::as_str)
         {
             session.status = session_status.to_string();
         }
@@ -935,13 +1000,10 @@ impl IpcServer {
         };
 
         let turns = graph.list_session_turns(session_id, 8)?;
-        let apartment_checkpoint = session
-            .primary_agent_id
-            .as_deref()
-            .and_then(|agent_id| {
-                let memory_type = format!("short_session:{session_id}");
-                graph.get_apartment(agent_id, &memory_type).ok().flatten()
-            });
+        let apartment_checkpoint = session.primary_agent_id.as_deref().and_then(|agent_id| {
+            let memory_type = format!("short_session:{session_id}");
+            graph.get_apartment(agent_id, &memory_type).ok().flatten()
+        });
 
         let session_index = session
             .primary_agent_id
@@ -1043,7 +1105,8 @@ fn load_tool_runner_registry(
     let Some(raw) = graph.get_config_value("tool_runner_registry")? else {
         return Ok(Vec::new());
     };
-    let value = serde_json::from_str::<serde_json::Value>(&raw).unwrap_or_else(|_| serde_json::json!([]));
+    let value =
+        serde_json::from_str::<serde_json::Value>(&raw).unwrap_or_else(|_| serde_json::json!([]));
     let entries = value
         .as_array()
         .cloned()
@@ -1099,7 +1162,8 @@ fn compose_tool_assembly(
     registered_runners: &[ToolRunnerRegistryEntry],
     live_runners: &[LiveToolRunner],
 ) -> serde_json::Value {
-    let allowed_incarnations = parse_allowed_incarnations(bindings, registered_runners, live_runners);
+    let allowed_incarnations =
+        parse_allowed_incarnations(bindings, registered_runners, live_runners);
     if !allowed_incarnations.is_empty() {
         return compose_tool_assembly_from_incarnations(bindings, &allowed_incarnations);
     }
@@ -1138,13 +1202,24 @@ fn compose_tool_assembly(
                     }),
                 ));
             }
+            let execution_mode = if is_pinned_tool(tool_name) {
+                "pinned"
+            } else {
+                "capability"
+            };
             let registered = registered_runners.iter().find(|runner| {
                 runner.supported_tools.is_empty()
-                    || runner.supported_tools.iter().any(|supported| supported == tool_name)
+                    || runner
+                        .supported_tools
+                        .iter()
+                        .any(|supported| supported == tool_name)
             })?;
             let live_runner = live_runners.iter().find(|runner| {
                 runner.supported_tools.is_empty()
-                    || runner.supported_tools.iter().any(|supported| supported == tool_name)
+                    || runner
+                        .supported_tools
+                        .iter()
+                        .any(|supported| supported == tool_name)
             });
             Some((
                 tool_name.to_string(),
@@ -1159,16 +1234,24 @@ fn compose_tool_assembly(
                         .unwrap_or_else(|| registered.guest_id.clone()),
                     "hotel_id": "local-ansible-01",
                     "environment_id": serde_json::Value::Null,
-                    "execution_mode": "capability",
+                    "execution_mode": execution_mode,
                     "availability_state": if live_runner.is_some() {
                         "live"
                     } else {
                         "materialization_required"
                     },
                     "selection_reason": if live_runner.is_some() {
-                        "live_capability_runner"
+                        if execution_mode == "pinned" {
+                            "live_pinned_runner"
+                        } else {
+                            "live_capability_runner"
+                        }
                     } else {
-                        "registered_capability_runner_requires_materialization"
+                        if execution_mode == "pinned" {
+                            "registered_pinned_runner_requires_materialization"
+                        } else {
+                            "registered_capability_runner_requires_materialization"
+                        }
                     },
                 }),
             ))
@@ -1216,6 +1299,13 @@ fn default_visible_toolset(bindings: &serde_json::Value) -> Vec<String> {
 
 fn is_local_agent_tool(tool_name: &str) -> bool {
     matches!(tool_name, "session.status")
+}
+
+fn is_pinned_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "workspace.list" | "workspace.read" | "workspace.write"
+    )
 }
 
 fn parse_allowed_incarnations(
@@ -1286,7 +1376,8 @@ fn parse_allowed_incarnations(
                 } else if is_registered {
                     "materialization_required".into()
                 } else {
-                    entry.get("availability_state")
+                    entry
+                        .get("availability_state")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("materialization_required")
                         .to_string()
@@ -1423,12 +1514,12 @@ fn merge_turn_status(current: &str, incoming: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ansible_mesh_core::NodeCapabilities;
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
     use ansible_mesh_core::storage::{
-        AgentIdentityRecord, GuestRecord, HotelRecord, SessionEventRecord, SessionParticipantRecord, SessionRecord,
-        SessionTurnRecord,
+        AgentIdentityRecord, GuestRecord, HotelRecord, SessionEventRecord,
+        SessionParticipantRecord, SessionRecord, SessionTurnRecord,
     };
-    use ansible_mesh_core::NodeCapabilities;
     use philotic_client::{GuestIdentity, PhiloticClient};
     use std::path::Path;
     use std::sync::{LazyLock, Mutex as StdMutex};
@@ -1437,29 +1528,114 @@ mod tests {
     struct TestGraphStorage;
 
     impl GraphStorage for TestGraphStorage {
-        fn load_node_capabilities(&self) -> anyhow::Result<Option<NodeCapabilities>> { Ok(None) }
-        fn save_node_capabilities(&self, _caps: &NodeCapabilities) -> anyhow::Result<()> { Ok(()) }
-        fn get_config_value(&self, _key: &str) -> anyhow::Result<Option<String>> { Ok(None) }
-        fn set_config_value(&self, _key: &str, _value_json: &str) -> anyhow::Result<()> { Ok(()) }
-        fn get_hotel(&self, _hotel_name: &str) -> anyhow::Result<Option<HotelRecord>> { Ok(None) }
-        fn upsert_hotel(&self, _hotel: &HotelRecord) -> anyhow::Result<()> { Ok(()) }
-        fn set_hotel_pid(&self, _hotel_name: &str, _pid: Option<&str>) -> anyhow::Result<()> { Ok(()) }
-        fn list_guests(&self, _hotel_name: &str, _active_only: bool) -> anyhow::Result<Vec<GuestRecord>> { Ok(vec![]) }
-        fn set_guest_pid(&self, _hotel_name: &str, _guest_id: &str, _pid: Option<&str>) -> anyhow::Result<()> { Ok(()) }
-        fn seed_guests(&self, _hotel_name: &str, _guests: &[GuestRecord]) -> anyhow::Result<()> { Ok(()) }
-        fn upsert_agent_identity(&self, _identity: &AgentIdentityRecord) -> anyhow::Result<()> { Ok(()) }
-        fn get_agent_identity(&self, _agent_id: &str) -> anyhow::Result<Option<AgentIdentityRecord>> { Ok(None) }
-        fn sync_apartment(&self, _agent_id: &str, _memory_type: &str, _content_json: &serde_json::Value) -> anyhow::Result<()> { Ok(()) }
-        fn get_apartment(&self, _agent_id: &str, _memory_type: &str) -> anyhow::Result<Option<serde_json::Value>> { Ok(None) }
-        fn upsert_session(&self, _session: &SessionRecord) -> anyhow::Result<()> { Ok(()) }
-        fn get_session(&self, _session_id: &str) -> anyhow::Result<Option<SessionRecord>> { Ok(None) }
-        fn upsert_session_participant(&self, _participant: &SessionParticipantRecord) -> anyhow::Result<()> { Ok(()) }
-        fn list_session_participants(&self, _session_id: &str) -> anyhow::Result<Vec<SessionParticipantRecord>> { Ok(vec![]) }
-        fn upsert_session_turn(&self, _turn: &SessionTurnRecord) -> anyhow::Result<()> { Ok(()) }
-        fn get_session_turn(&self, _session_id: &str, _turn_id: &str) -> anyhow::Result<Option<SessionTurnRecord>> { Ok(None) }
-        fn list_session_turns(&self, _session_id: &str, _limit: usize) -> anyhow::Result<Vec<SessionTurnRecord>> { Ok(vec![]) }
-        fn append_session_event(&self, _event: &SessionEventRecord) -> anyhow::Result<()> { Ok(()) }
-        fn list_session_events(&self, _session_id: &str, _limit: usize) -> anyhow::Result<Vec<SessionEventRecord>> { Ok(vec![]) }
+        fn load_node_capabilities(&self) -> anyhow::Result<Option<NodeCapabilities>> {
+            Ok(None)
+        }
+        fn save_node_capabilities(&self, _caps: &NodeCapabilities) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn get_config_value(&self, _key: &str) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        fn set_config_value(&self, _key: &str, _value_json: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn get_hotel(&self, _hotel_name: &str) -> anyhow::Result<Option<HotelRecord>> {
+            Ok(None)
+        }
+        fn upsert_hotel(&self, _hotel: &HotelRecord) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn set_hotel_pid(&self, _hotel_name: &str, _pid: Option<&str>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn list_guests(
+            &self,
+            _hotel_name: &str,
+            _active_only: bool,
+        ) -> anyhow::Result<Vec<GuestRecord>> {
+            Ok(vec![])
+        }
+        fn set_guest_pid(
+            &self,
+            _hotel_name: &str,
+            _guest_id: &str,
+            _pid: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn seed_guests(&self, _hotel_name: &str, _guests: &[GuestRecord]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn upsert_agent_identity(&self, _identity: &AgentIdentityRecord) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn get_agent_identity(
+            &self,
+            _agent_id: &str,
+        ) -> anyhow::Result<Option<AgentIdentityRecord>> {
+            Ok(None)
+        }
+        fn sync_apartment(
+            &self,
+            _agent_id: &str,
+            _memory_type: &str,
+            _content_json: &serde_json::Value,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn get_apartment(
+            &self,
+            _agent_id: &str,
+            _memory_type: &str,
+        ) -> anyhow::Result<Option<serde_json::Value>> {
+            Ok(None)
+        }
+        fn upsert_session(&self, _session: &SessionRecord) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn get_session(&self, _session_id: &str) -> anyhow::Result<Option<SessionRecord>> {
+            Ok(None)
+        }
+        fn upsert_session_participant(
+            &self,
+            _participant: &SessionParticipantRecord,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn list_session_participants(
+            &self,
+            _session_id: &str,
+        ) -> anyhow::Result<Vec<SessionParticipantRecord>> {
+            Ok(vec![])
+        }
+        fn upsert_session_turn(&self, _turn: &SessionTurnRecord) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn get_session_turn(
+            &self,
+            _session_id: &str,
+            _turn_id: &str,
+        ) -> anyhow::Result<Option<SessionTurnRecord>> {
+            Ok(None)
+        }
+        fn list_session_turns(
+            &self,
+            _session_id: &str,
+            _limit: usize,
+        ) -> anyhow::Result<Vec<SessionTurnRecord>> {
+            Ok(vec![])
+        }
+        fn append_session_event(&self, _event: &SessionEventRecord) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn list_session_events(
+            &self,
+            _session_id: &str,
+            _limit: usize,
+        ) -> anyhow::Result<Vec<SessionEventRecord>> {
+            Ok(vec![])
+        }
     }
 
     fn test_socket_path() -> String {
@@ -1487,7 +1663,9 @@ mod tests {
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        unsafe { std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path); }
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
 
         let agent_identity = GuestIdentity {
             guest_id: "agent-local".into(),
@@ -1500,8 +1678,12 @@ mod tests {
             supported_tools: Vec::new(),
         };
 
-        let mut agent = PhiloticClient::connect(agent_identity).await.expect("agent connect");
-        let mut hegemon = PhiloticClient::connect(hegemon_identity).await.expect("hegemon connect");
+        let mut agent = PhiloticClient::connect(agent_identity)
+            .await
+            .expect("agent connect");
+        let mut hegemon = PhiloticClient::connect(hegemon_identity)
+            .await
+            .expect("hegemon connect");
 
         let task_payload = serde_json::json!({
             "source": "telegram",
@@ -1521,23 +1703,33 @@ mod tests {
 
         assert!(matches!(response, IpcResponse::Standard { ok: true, .. }));
 
-        let delivered = tokio::time::timeout(tokio::time::Duration::from_secs(1), agent.recv_task())
-            .await
-            .expect("agent should receive task before timeout")
-            .expect("agent recv should succeed");
+        let delivered =
+            tokio::time::timeout(tokio::time::Duration::from_secs(1), agent.recv_task())
+                .await
+                .expect("agent should receive task before timeout")
+                .expect("agent recv should succeed");
 
         match delivered {
-            IpcResponse::InboundTask { source_node, task_json, .. } => {
+            IpcResponse::InboundTask {
+                source_node,
+                task_json,
+                ..
+            } => {
                 assert_eq!(source_node, "local-ansible-01");
                 assert_eq!(task_json, task_payload);
             }
             other => panic!("unexpected inbound response: {other:?}"),
         }
 
-        let ledger_msg = dispatcher_rx.recv().await.expect("ledger command should be emitted");
+        let ledger_msg = dispatcher_rx
+            .recv()
+            .await
+            .expect("ledger command should be emitted");
         assert!(matches!(ledger_msg, LedgerCommand::AppendLocal(_)));
 
-        unsafe { std::env::remove_var("PHILOTIC_HOTEL_SOCKET"); }
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
         server_task.abort();
         let _ = server_task.await;
         if Path::new(&socket_path).exists() {
@@ -1559,14 +1751,18 @@ mod tests {
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        unsafe { std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path); }
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
 
         let hegemon_identity = GuestIdentity {
             guest_id: "hegemon-local".into(),
             role: "hegemon".into(),
             supported_tools: Vec::new(),
         };
-        let mut hegemon = PhiloticClient::connect(hegemon_identity).await.expect("hegemon connect");
+        let mut hegemon = PhiloticClient::connect(hegemon_identity)
+            .await
+            .expect("hegemon connect");
 
         hegemon
             .send_request(IpcRequest::EmitTask {
@@ -1602,7 +1798,9 @@ mod tests {
             .expect("event listing should work");
         assert!(!events.is_empty(), "session events should be recorded");
 
-        unsafe { std::env::remove_var("PHILOTIC_HOTEL_SOCKET"); }
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
         server_task.abort();
         let _ = server_task.await;
         if Path::new(&socket_path).exists() {
@@ -1664,14 +1862,18 @@ mod tests {
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        unsafe { std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path); }
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
 
         let agent_identity = GuestIdentity {
             guest_id: "agent-local".into(),
             role: "agent".into(),
             supported_tools: Vec::new(),
         };
-        let mut agent = PhiloticClient::connect(agent_identity).await.expect("agent connect");
+        let mut agent = PhiloticClient::connect(agent_identity)
+            .await
+            .expect("agent connect");
 
         let response = agent
             .send_request(IpcRequest::GetConfig {
@@ -1690,14 +1892,19 @@ mod tests {
                 assert_eq!(snapshot["session_id"], "sess-1");
                 assert_eq!(snapshot["source"], "telegram");
                 assert_eq!(snapshot["agent_profile"]["soul_text"], "Soul anchor");
-                assert_eq!(snapshot["agent_profile"]["identity_text"], "Identity anchor");
+                assert_eq!(
+                    snapshot["agent_profile"]["identity_text"],
+                    "Identity anchor"
+                );
                 assert_eq!(snapshot["recent_turns"][0]["user_content"], "hello");
                 assert_eq!(snapshot["recent_turns"][0]["assistant_content"], "hi");
             }
             other => panic!("unexpected response: {other:?}"),
         }
 
-        unsafe { std::env::remove_var("PHILOTIC_HOTEL_SOCKET"); }
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
         server_task.abort();
         let _ = server_task.await;
         if Path::new(&socket_path).exists() {
@@ -1739,7 +1946,9 @@ mod tests {
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        unsafe { std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path); }
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
 
         let mut agent = PhiloticClient::connect(GuestIdentity {
             guest_id: "agent-local".into(),
@@ -1768,7 +1977,9 @@ mod tests {
             other => panic!("unexpected response: {other:?}"),
         }
 
-        unsafe { std::env::remove_var("PHILOTIC_HOTEL_SOCKET"); }
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
         server_task.abort();
         let _ = server_task.await;
         if Path::new(&socket_path).exists() {
@@ -1813,7 +2024,9 @@ mod tests {
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        unsafe { std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path); }
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
 
         let mut agent = PhiloticClient::connect(GuestIdentity {
             guest_id: "agent-local".into(),
@@ -1829,12 +2042,11 @@ mod tests {
         })
         .await
         .expect("tool connect");
-        tool
-            .send_request(IpcRequest::SubscribeInbox {
-                role: "tool.echo".into(),
-            })
-            .await
-            .expect("tool subscribe");
+        tool.send_request(IpcRequest::SubscribeInbox {
+            role: "tool.echo".into(),
+        })
+        .await
+        .expect("tool subscribe");
 
         let response = agent
             .send_request(IpcRequest::GetConfig {
@@ -1852,8 +2064,14 @@ mod tests {
                     serde_json::from_str(&value_json).expect("snapshot should decode");
                 assert_eq!(snapshot["status"], "paused");
                 assert_eq!(snapshot["bindings"]["effective_toolset"][0], "echo");
-                assert_eq!(snapshot["tool_assembly"]["tools_for_model"][0]["tool_name"], "echo");
-                assert_eq!(snapshot["tool_assembly"]["execution_routes"]["echo"]["target_role"], "tool.echo");
+                assert_eq!(
+                    snapshot["tool_assembly"]["tools_for_model"][0]["tool_name"],
+                    "echo"
+                );
+                assert_eq!(
+                    snapshot["tool_assembly"]["execution_routes"]["echo"]["target_role"],
+                    "tool.echo"
+                );
                 assert_eq!(snapshot["tool_runners"][0]["guest_id"], "tool-runner-local");
                 assert_eq!(snapshot["tool_runners"][0]["is_connected"], true);
                 assert_eq!(
@@ -1864,7 +2082,9 @@ mod tests {
             other => panic!("unexpected response: {other:?}"),
         }
 
-        unsafe { std::env::remove_var("PHILOTIC_HOTEL_SOCKET"); }
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
         server_task.abort();
         let _ = server_task.await;
         if Path::new(&socket_path).exists() {
@@ -1947,7 +2167,9 @@ mod tests {
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        unsafe { std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path); }
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
 
         let mut agent = PhiloticClient::connect(GuestIdentity {
             guest_id: "agent-local".into(),
@@ -1984,7 +2206,10 @@ mod tests {
             } => {
                 let snapshot: serde_json::Value =
                     serde_json::from_str(&value_json).expect("snapshot should decode");
-                assert_eq!(snapshot["tool_assembly"]["tools_for_model"][0]["tool_name"], "echo");
+                assert_eq!(
+                    snapshot["tool_assembly"]["tools_for_model"][0]["tool_name"],
+                    "echo"
+                );
                 assert_eq!(
                     snapshot["tool_assembly"]["execution_routes"]["echo"]["incarnation_id"],
                     "tool-runner-local"
@@ -2001,7 +2226,9 @@ mod tests {
             other => panic!("unexpected response: {other:?}"),
         }
 
-        unsafe { std::env::remove_var("PHILOTIC_HOTEL_SOCKET"); }
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
         server_task.abort();
         let _ = server_task.await;
         if Path::new(&socket_path).exists() {
@@ -2023,7 +2250,9 @@ mod tests {
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        unsafe { std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path); }
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
 
         let _tool = PhiloticClient::connect(GuestIdentity {
             guest_id: "tool-runner-local".into(),
@@ -2042,7 +2271,9 @@ mod tests {
         assert_eq!(registry[0]["guest_id"], "tool-runner-local");
         assert_eq!(registry[0]["supported_tools"][0], "echo");
 
-        unsafe { std::env::remove_var("PHILOTIC_HOTEL_SOCKET"); }
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
         server_task.abort();
         let _ = server_task.await;
         if Path::new(&socket_path).exists() {
@@ -2097,7 +2328,9 @@ mod tests {
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        unsafe { std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path); }
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
 
         let mut agent = PhiloticClient::connect(GuestIdentity {
             guest_id: "agent-local".into(),
@@ -2121,7 +2354,10 @@ mod tests {
             } => {
                 let snapshot: serde_json::Value =
                     serde_json::from_str(&value_json).expect("snapshot should decode");
-                assert_eq!(snapshot["tool_assembly"]["tools_for_model"][0]["tool_name"], "echo");
+                assert_eq!(
+                    snapshot["tool_assembly"]["tools_for_model"][0]["tool_name"],
+                    "echo"
+                );
                 assert_eq!(
                     snapshot["tool_assembly"]["execution_routes"]["echo"]["availability_state"],
                     "materialization_required"
@@ -2131,7 +2367,9 @@ mod tests {
             other => panic!("unexpected response: {other:?}"),
         }
 
-        unsafe { std::env::remove_var("PHILOTIC_HOTEL_SOCKET"); }
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
         server_task.abort();
         let _ = server_task.await;
         if Path::new(&socket_path).exists() {
@@ -2235,7 +2473,9 @@ mod tests {
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        unsafe { std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path); }
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
 
         let mut agent = PhiloticClient::connect(GuestIdentity {
             guest_id: "agent-local".into(),
@@ -2262,12 +2502,20 @@ mod tests {
                 assert_eq!(snapshot["session_id"], "sess-1");
                 assert_eq!(snapshot["active_turn"]["turn_id"], "turn-1a");
                 assert_eq!(snapshot["recent_turns"][0]["user_content"], "older sess-1");
-                assert_eq!(snapshot["session_index"]["active_sessions"].as_array().unwrap().len(), 2);
+                assert_eq!(
+                    snapshot["session_index"]["active_sessions"]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    2
+                );
             }
             other => panic!("unexpected response: {other:?}"),
         }
 
-        unsafe { std::env::remove_var("PHILOTIC_HOTEL_SOCKET"); }
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
         server_task.abort();
         let _ = server_task.await;
         if Path::new(&socket_path).exists() {
@@ -2289,7 +2537,9 @@ mod tests {
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        unsafe { std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path); }
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
 
         let mut agent = PhiloticClient::connect(GuestIdentity {
             guest_id: "agent-local".into(),
@@ -2326,14 +2576,20 @@ mod tests {
         let events = graph_store
             .list_session_events("sess-approval-events", 20)
             .expect("event listing should work");
-        assert!(events.iter().any(|event| event.kind == "approval_requested"));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "approval_requested")
+        );
         assert!(events.iter().any(|event| event.kind == "approval_resolved"));
         assert!(events.iter().any(|event| {
             event.kind == "approval_resolved"
                 && event.payload_json["resolution_mode"] == "preapproved"
         }));
 
-        unsafe { std::env::remove_var("PHILOTIC_HOTEL_SOCKET"); }
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
         server_task.abort();
         let _ = server_task.await;
         if Path::new(&socket_path).exists() {
@@ -2355,7 +2611,9 @@ mod tests {
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        unsafe { std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path); }
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
 
         let mut agent = PhiloticClient::connect(GuestIdentity {
             guest_id: "agent-local".into(),
@@ -2388,16 +2646,23 @@ mod tests {
             .get_session("sess-policy-events")
             .expect("session lookup should work")
             .expect("session should exist");
-        assert_eq!(session.summary_json["approval_policy"]["auto_approve_all"], true);
+        assert_eq!(
+            session.summary_json["approval_policy"]["auto_approve_all"],
+            true
+        );
 
         let events = graph_store
             .list_session_events("sess-policy-events", 20)
             .expect("event listing should work");
-        assert!(events
-            .iter()
-            .any(|event| event.kind == "approval_policy_changed"));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "approval_policy_changed")
+        );
 
-        unsafe { std::env::remove_var("PHILOTIC_HOTEL_SOCKET"); }
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
         server_task.abort();
         let _ = server_task.await;
         if Path::new(&socket_path).exists() {
@@ -2419,7 +2684,9 @@ mod tests {
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        unsafe { std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path); }
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
 
         let mut agent = PhiloticClient::connect(GuestIdentity {
             guest_id: "agent-local".into(),
@@ -2455,17 +2722,34 @@ mod tests {
             .expect("session lookup should work")
             .expect("session should exist");
         assert_eq!(session.status, "paused");
-        assert_eq!(session.summary_json["bindings"]["effective_toolset"][0], "echo");
+        assert_eq!(
+            session.summary_json["bindings"]["effective_toolset"][0],
+            "echo"
+        );
         assert!(session.summary_json["tool_assembly"]["execution_routes"]["echo"].is_null());
 
         let events = graph_store
             .list_session_events("sess-lifecycle", 20)
             .expect("event listing should work");
-        assert!(events.iter().any(|event| event.kind == "session_status_changed"));
-        assert!(events.iter().any(|event| event.kind == "session_bindings_updated"));
-        assert!(events.iter().any(|event| event.kind == "tool_assembly_updated"));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "session_status_changed")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "session_bindings_updated")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "tool_assembly_updated")
+        );
 
-        unsafe { std::env::remove_var("PHILOTIC_HOTEL_SOCKET"); }
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
         server_task.abort();
         let _ = server_task.await;
         if Path::new(&socket_path).exists() {
@@ -2487,7 +2771,9 @@ mod tests {
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        unsafe { std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path); }
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
 
         let mut hegemon = PhiloticClient::connect(GuestIdentity {
             guest_id: "hegemon-local".into(),
@@ -2532,16 +2818,16 @@ mod tests {
             .await
             .expect("emit user task");
 
-        let inbound_to_agent = tokio::time::timeout(
-            tokio::time::Duration::from_secs(1),
-            agent.recv_task(),
-        )
-        .await
-        .expect("agent should receive task")
-        .expect("agent recv should succeed");
+        let inbound_to_agent =
+            tokio::time::timeout(tokio::time::Duration::from_secs(1), agent.recv_task())
+                .await
+                .expect("agent should receive task")
+                .expect("agent recv should succeed");
 
         let task_id = match inbound_to_agent {
-            IpcResponse::InboundTask { task_id, task_json, .. } => {
+            IpcResponse::InboundTask {
+                task_id, task_json, ..
+            } => {
                 let payload: serde_json::Value =
                     serde_json::from_str(&task_json).expect("payload should decode");
                 assert_eq!(payload["session_id"], session_id);
@@ -2584,13 +2870,11 @@ mod tests {
             .await
             .expect("emit model request");
 
-        let inbound_to_model = tokio::time::timeout(
-            tokio::time::Duration::from_secs(1),
-            model.recv_task(),
-        )
-        .await
-        .expect("model should receive task")
-        .expect("model recv should succeed");
+        let inbound_to_model =
+            tokio::time::timeout(tokio::time::Duration::from_secs(1), model.recv_task())
+                .await
+                .expect("model should receive task")
+                .expect("model recv should succeed");
 
         match inbound_to_model {
             IpcResponse::InboundTask { task_json, .. } => {
@@ -2619,13 +2903,11 @@ mod tests {
             .await
             .expect("emit model response");
 
-        let inbound_model_response = tokio::time::timeout(
-            tokio::time::Duration::from_secs(1),
-            agent.recv_task(),
-        )
-        .await
-        .expect("agent should receive model response")
-        .expect("agent recv should succeed");
+        let inbound_model_response =
+            tokio::time::timeout(tokio::time::Duration::from_secs(1), agent.recv_task())
+                .await
+                .expect("agent should receive model response")
+                .expect("agent recv should succeed");
 
         match inbound_model_response {
             IpcResponse::InboundTask { task_json, .. } => {
@@ -2665,13 +2947,11 @@ mod tests {
             .await
             .expect("emit final reply");
 
-        let final_reply = tokio::time::timeout(
-            tokio::time::Duration::from_secs(1),
-            hegemon.recv_task(),
-        )
-        .await
-        .expect("hegemon should receive final reply")
-        .expect("hegemon recv should succeed");
+        let final_reply =
+            tokio::time::timeout(tokio::time::Duration::from_secs(1), hegemon.recv_task())
+                .await
+                .expect("hegemon should receive final reply")
+                .expect("hegemon recv should succeed");
 
         match final_reply {
             IpcResponse::InboundTask { task_json, .. } => {
@@ -2697,23 +2977,25 @@ mod tests {
         );
 
         let mut ledger_count = 0usize;
-        while tokio::time::timeout(
-            tokio::time::Duration::from_millis(10),
-            dispatcher_rx.recv(),
-        )
-        .await
-        .ok()
-        .flatten()
-        .is_some()
+        while tokio::time::timeout(tokio::time::Duration::from_millis(10), dispatcher_rx.recv())
+            .await
+            .ok()
+            .flatten()
+            .is_some()
         {
             ledger_count += 1;
             if ledger_count > 10 {
                 break;
             }
         }
-        assert!(ledger_count >= 4, "expected multiple ledger writes, got {ledger_count}");
+        assert!(
+            ledger_count >= 4,
+            "expected multiple ledger writes, got {ledger_count}"
+        );
 
-        unsafe { std::env::remove_var("PHILOTIC_HOTEL_SOCKET"); }
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
         server_task.abort();
         let _ = server_task.await;
         if Path::new(&socket_path).exists() {
@@ -2735,7 +3017,9 @@ mod tests {
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        unsafe { std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path); }
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
 
         let mut hegemon = PhiloticClient::connect(GuestIdentity {
             guest_id: "hegemon-local".into(),
@@ -2780,16 +3064,16 @@ mod tests {
             .await
             .expect("emit user task");
 
-        let inbound_to_agent = tokio::time::timeout(
-            tokio::time::Duration::from_secs(1),
-            agent.recv_task(),
-        )
-        .await
-        .expect("agent should receive task")
-        .expect("agent recv should succeed");
+        let inbound_to_agent =
+            tokio::time::timeout(tokio::time::Duration::from_secs(1), agent.recv_task())
+                .await
+                .expect("agent should receive task")
+                .expect("agent recv should succeed");
 
         let task_id = match inbound_to_agent {
-            IpcResponse::InboundTask { task_id, task_json, .. } => {
+            IpcResponse::InboundTask {
+                task_id, task_json, ..
+            } => {
                 let payload: serde_json::Value =
                     serde_json::from_str(&task_json).expect("payload should decode");
                 assert_eq!(payload["session_id"], session_id);
@@ -2833,13 +3117,11 @@ mod tests {
             .await
             .expect("emit model request");
 
-        let inbound_to_model = tokio::time::timeout(
-            tokio::time::Duration::from_secs(1),
-            model.recv_task(),
-        )
-        .await
-        .expect("model should receive task")
-        .expect("model recv should succeed");
+        let inbound_to_model =
+            tokio::time::timeout(tokio::time::Duration::from_secs(1), model.recv_task())
+                .await
+                .expect("model should receive task")
+                .expect("model recv should succeed");
 
         match inbound_to_model {
             IpcResponse::InboundTask { task_json, .. } => {
@@ -2875,13 +3157,11 @@ mod tests {
             .await
             .expect("emit model tool call response");
 
-        let inbound_tool_response = tokio::time::timeout(
-            tokio::time::Duration::from_secs(1),
-            agent.recv_task(),
-        )
-        .await
-        .expect("agent should receive model response")
-        .expect("agent recv should succeed");
+        let inbound_tool_response =
+            tokio::time::timeout(tokio::time::Duration::from_secs(1), agent.recv_task())
+                .await
+                .expect("agent should receive model response")
+                .expect("agent recv should succeed");
 
         match inbound_tool_response {
             IpcResponse::InboundTask { task_json, .. } => {
@@ -2921,13 +3201,11 @@ mod tests {
             .await
             .expect("emit final reply");
 
-        let final_reply = tokio::time::timeout(
-            tokio::time::Duration::from_secs(1),
-            hegemon.recv_task(),
-        )
-        .await
-        .expect("hegemon should receive final reply")
-        .expect("hegemon recv should succeed");
+        let final_reply =
+            tokio::time::timeout(tokio::time::Duration::from_secs(1), hegemon.recv_task())
+                .await
+                .expect("hegemon should receive final reply")
+                .expect("hegemon recv should succeed");
 
         match final_reply {
             IpcResponse::InboundTask { task_json, .. } => {
@@ -2956,28 +3234,32 @@ mod tests {
             .list_session_events(session_id, 20)
             .expect("event listing should work");
         assert!(
-            events.iter().any(|event| event.payload_json.get("agent_action").is_some()),
+            events
+                .iter()
+                .any(|event| event.payload_json.get("agent_action").is_some()),
             "expected structured agent action to be captured in session events"
         );
 
         let mut ledger_count = 0usize;
-        while tokio::time::timeout(
-            tokio::time::Duration::from_millis(10),
-            dispatcher_rx.recv(),
-        )
-        .await
-        .ok()
-        .flatten()
-        .is_some()
+        while tokio::time::timeout(tokio::time::Duration::from_millis(10), dispatcher_rx.recv())
+            .await
+            .ok()
+            .flatten()
+            .is_some()
         {
             ledger_count += 1;
             if ledger_count > 10 {
                 break;
             }
         }
-        assert!(ledger_count >= 4, "expected multiple ledger writes, got {ledger_count}");
+        assert!(
+            ledger_count >= 4,
+            "expected multiple ledger writes, got {ledger_count}"
+        );
 
-        unsafe { std::env::remove_var("PHILOTIC_HOTEL_SOCKET"); }
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
         server_task.abort();
         let _ = server_task.await;
         if Path::new(&socket_path).exists() {

@@ -1,9 +1,9 @@
 use anyhow::Result;
 use clap::Parser;
 use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::Duration;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -29,8 +29,10 @@ async fn main() -> Result<()> {
 
     // Pull configuration from the Hotel Graph dynamically
     info!("Requesting Gemini API Key from Ansible Context Graph...");
-    let config_req = IpcRequest::GetConfig { key: "gemini_api_key".into() };
-    
+    let config_req = IpcRequest::GetConfig {
+        key: "gemini_api_key".into(),
+    };
+
     let api_key = match ipc_client.send_request(config_req).await? {
         IpcResponse::ConfigData { key: _, value_json } => {
             if let Some(json_str) = value_json {
@@ -49,22 +51,34 @@ async fn main() -> Result<()> {
             "dummy_key".to_string()
         }
     };
-    
+
     if api_key.is_empty() || api_key == "dummy_key" {
         warn!("No valid Gemini API Key found. Inference will fail.");
     }
 
-    let http_client = reqwest::Client::builder().timeout(Duration::from_secs(60)).build()?;
-    let gemini_url = format!("https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={}", api_key);
+    let http_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()?;
+    let gemini_url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={}",
+        api_key
+    );
     let stub_response = std::env::var("PHILOTIC_MODEL_ROUTER_STUB_RESPONSE").ok();
 
     info!("Listening for inbound Inference tasks from the Philotic Web...");
-    
+
     loop {
         match tokio::time::timeout(Duration::from_secs(5), ipc_client.recv_task()).await {
-            Ok(Ok(IpcResponse::InboundTask { source_node, task_id, task_json })) => {
-                info!("Model Router received task [{}] from [{}]", task_id, source_node);
-                
+            Ok(Ok(IpcResponse::InboundTask {
+                source_node,
+                task_id,
+                task_json,
+            })) => {
+                info!(
+                    "Model Router received task [{}] from [{}]",
+                    task_id, source_node
+                );
+
                 if let Ok(task) = serde_json::from_str::<Value>(&task_json) {
                     if let Some(prompt) = task.get("prompt").and_then(|c| c.as_str()) {
                         let user_content = task
@@ -72,13 +86,41 @@ async fn main() -> Result<()> {
                             .and_then(|c| c.as_str())
                             .unwrap_or_default()
                             .to_string();
-                        let reply_to = task.get("reply_to").and_then(|r| r.as_str()).unwrap_or("hegemon").to_string();
-                        let reply_role = task.get("reply_role").and_then(|r| r.as_str()).unwrap_or("hegemon").to_string();
-                        let final_reply_to = task.get("final_reply_to").and_then(|r| r.as_str()).unwrap_or("local-ansible-01").to_string();
-                        let final_reply_role = task.get("final_reply_role").and_then(|r| r.as_str()).unwrap_or("hegemon").to_string();
-                        let session_id = task.get("session_id").and_then(|s| s.as_str()).unwrap_or_default().to_string();
-                        let turn_id = task.get("turn_id").and_then(|s| s.as_str()).unwrap_or_default().to_string();
-                        let chat_id = task.get("chat_id").and_then(|id| id.as_str()).unwrap_or_default().to_string();
+                        let reply_to = task
+                            .get("reply_to")
+                            .and_then(|r| r.as_str())
+                            .unwrap_or("hegemon")
+                            .to_string();
+                        let reply_role = task
+                            .get("reply_role")
+                            .and_then(|r| r.as_str())
+                            .unwrap_or("hegemon")
+                            .to_string();
+                        let final_reply_to = task
+                            .get("final_reply_to")
+                            .and_then(|r| r.as_str())
+                            .unwrap_or("local-ansible-01")
+                            .to_string();
+                        let final_reply_role = task
+                            .get("final_reply_role")
+                            .and_then(|r| r.as_str())
+                            .unwrap_or("hegemon")
+                            .to_string();
+                        let session_id = task
+                            .get("session_id")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        let turn_id = task
+                            .get("turn_id")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        let chat_id = task
+                            .get("chat_id")
+                            .and_then(|id| id.as_str())
+                            .unwrap_or_default()
+                            .to_string();
 
                         if let Some(stub_text) = stub_response.as_ref() {
                             let reply_req = IpcRequest::EmitTask {
@@ -96,15 +138,19 @@ async fn main() -> Result<()> {
                                     "content": stub_text,
                                     "final_reply_to": final_reply_to,
                                     "final_reply_role": final_reply_role
-                                }).to_string(),
+                                })
+                                .to_string(),
                             };
 
                             info!("Model Router stub mode returning deterministic response.");
                             let _ = ipc_client.send_request(reply_req).await;
                             continue;
                         }
-                        
-                        info!("Model Router executing inference for prompt snippet: {}...", &prompt.chars().take(50).collect::<String>());
+
+                        info!(
+                            "Model Router executing inference for prompt snippet: {}...",
+                            &prompt.chars().take(50).collect::<String>()
+                        );
 
                         if let Some(echo_text) = user_content.strip_prefix("use echo ") {
                             let reply_req = IpcRequest::EmitTask {
@@ -125,10 +171,95 @@ async fn main() -> Result<()> {
                                     "content": format!("tool_call: echo {}", echo_text.trim()),
                                     "final_reply_to": final_reply_to,
                                     "final_reply_role": final_reply_role
-                                }).to_string(),
+                                })
+                                .to_string(),
                             };
 
                             info!("Routing structured tool call back to agent.");
+                            let _ = ipc_client.send_request(reply_req).await;
+                            continue;
+                        }
+
+                        if let Some(path) = user_content.strip_prefix("use workspace.list ") {
+                            let reply_req = IpcRequest::EmitTask {
+                                target_node: reply_to.clone(),
+                                target_role: reply_role.clone(),
+                                task_json: json!({
+                                    "action": "model_response",
+                                    "agent_action": {
+                                        "kind": "tool_call",
+                                        "tool_name": "workspace.list",
+                                        "arguments": {
+                                            "path": path.trim()
+                                        }
+                                    },
+                                    "session_id": session_id,
+                                    "turn_id": turn_id,
+                                    "chat_id": chat_id,
+                                    "content": format!("tool_call: workspace.list {}", path.trim()),
+                                    "final_reply_to": final_reply_to,
+                                    "final_reply_role": final_reply_role
+                                })
+                                .to_string(),
+                            };
+
+                            info!("Routing structured workspace.list tool call back to agent.");
+                            let _ = ipc_client.send_request(reply_req).await;
+                            continue;
+                        }
+
+                        if user_content.trim() == "use workspace.list" {
+                            let reply_req = IpcRequest::EmitTask {
+                                target_node: reply_to.clone(),
+                                target_role: reply_role.clone(),
+                                task_json: json!({
+                                    "action": "model_response",
+                                    "agent_action": {
+                                        "kind": "tool_call",
+                                        "tool_name": "workspace.list",
+                                        "arguments": {
+                                            "path": "."
+                                        }
+                                    },
+                                    "session_id": session_id,
+                                    "turn_id": turn_id,
+                                    "chat_id": chat_id,
+                                    "content": "tool_call: workspace.list .",
+                                    "final_reply_to": final_reply_to,
+                                    "final_reply_role": final_reply_role
+                                })
+                                .to_string(),
+                            };
+
+                            info!("Routing structured workspace.list tool call back to agent.");
+                            let _ = ipc_client.send_request(reply_req).await;
+                            continue;
+                        }
+
+                        if let Some(path) = user_content.strip_prefix("use workspace.read ") {
+                            let reply_req = IpcRequest::EmitTask {
+                                target_node: reply_to.clone(),
+                                target_role: reply_role.clone(),
+                                task_json: json!({
+                                    "action": "model_response",
+                                    "agent_action": {
+                                        "kind": "tool_call",
+                                        "tool_name": "workspace.read",
+                                        "arguments": {
+                                            "path": path.trim()
+                                        }
+                                    },
+                                    "session_id": session_id,
+                                    "turn_id": turn_id,
+                                    "chat_id": chat_id,
+                                    "content": format!("tool_call: workspace.read {}", path.trim()),
+                                    "final_reply_to": final_reply_to,
+                                    "final_reply_role": final_reply_role
+                                })
+                                .to_string(),
+                            };
+
+                            info!("Routing structured workspace.read tool call back to agent.");
                             let _ = ipc_client.send_request(reply_req).await;
                             continue;
                         }
@@ -180,7 +311,8 @@ async fn main() -> Result<()> {
                                     "content": format!("Redirected: {}", redirect_note),
                                     "final_reply_to": final_reply_to,
                                     "final_reply_role": final_reply_role
-                                }).to_string(),
+                                })
+                                .to_string(),
                             };
 
                             info!("Routing denied-turn redirect follow-up back to agent.");
@@ -212,34 +344,56 @@ async fn main() -> Result<()> {
                             let _ = ipc_client.send_request(reply_req).await;
                             continue;
                         }
-                        
+
                         // Fake making the HTTP request to start (can build real one next)
                         let payload = json!({
                             "contents": [{"parts":[{"text": prompt}]}]
                         });
-                        
+
                         match http_client.post(&gemini_url).json(&payload).send().await {
                             Ok(res) => {
                                 let status = res.status();
                                 if let Ok(json_res) = res.json::<Value>().await {
-                                    let mut response_text = "I am Jane, the Materialized AI. This is a stub response.".to_string();
-                                    
+                                    let mut response_text =
+                                        "I am Jane, the Materialized AI. This is a stub response."
+                                            .to_string();
+
                                     if !status.is_success() {
-                                        response_text = format!("Gemini API Error: HTTP {}", status.as_u16());
+                                        response_text =
+                                            format!("Gemini API Error: HTTP {}", status.as_u16());
                                         if let Some(error_obj) = json_res.get("error") {
-                                            if let Some(msg) = error_obj.get("message").and_then(|m| m.as_str()) {
-                                                response_text = format!("Gemini API Error ({}): {}", status.as_u16(), msg);
+                                            if let Some(msg) =
+                                                error_obj.get("message").and_then(|m| m.as_str())
+                                            {
+                                                response_text = format!(
+                                                    "Gemini API Error ({}): {}",
+                                                    status.as_u16(),
+                                                    msg
+                                                );
                                             }
                                         } else {
-                                            response_text = format!("Gemini API Error ({}): {:?}", status.as_u16(), json_res);
+                                            response_text = format!(
+                                                "Gemini API Error ({}): {:?}",
+                                                status.as_u16(),
+                                                json_res
+                                            );
                                         }
                                         error!("{}", response_text);
                                     } else {
-                                        if let Some(candidates) = json_res.get("candidates").and_then(|c| c.as_array()) {
+                                        if let Some(candidates) =
+                                            json_res.get("candidates").and_then(|c| c.as_array())
+                                        {
                                             if let Some(first) = candidates.first() {
-                                                if let Some(content) = first.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
+                                                if let Some(content) = first
+                                                    .get("content")
+                                                    .and_then(|c| c.get("parts"))
+                                                    .and_then(|p| p.as_array())
+                                                {
                                                     if let Some(part) = content.first() {
-                                                        if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                                        if let Some(text) = part
+                                                            .get("text")
+                                                            .and_then(|t| t.as_str())
+                                                        {
                                                             response_text = text.to_string();
                                                         }
                                                     }
@@ -247,7 +401,7 @@ async fn main() -> Result<()> {
                                             }
                                         }
                                     }
-                                    
+
                                     // Route the inference answer back to the requested role.
                                     let reply_req = IpcRequest::EmitTask {
                                         target_node: reply_to.clone(),
@@ -264,10 +418,14 @@ async fn main() -> Result<()> {
                                             "content": response_text,
                                             "final_reply_to": final_reply_to,
                                             "final_reply_role": final_reply_role
-                                        }).to_string(),
+                                        })
+                                        .to_string(),
                                     };
-                                    
-                                    info!("Routing inference answer back to role [{}] via [{}]", reply_role, reply_to);
+
+                                    info!(
+                                        "Routing inference answer back to role [{}] via [{}]",
+                                        reply_role, reply_to
+                                    );
                                     let _ = ipc_client.send_request(reply_req).await;
                                 }
                             }

@@ -241,7 +241,12 @@ impl SessionState {
 
     pub fn add_tool_binding(&mut self, tool: impl Into<String>) {
         let tool = tool.into();
-        if !self.bindings.effective_toolset.iter().any(|existing| existing == &tool) {
+        if !self
+            .bindings
+            .effective_toolset
+            .iter()
+            .any(|existing| existing == &tool)
+        {
             self.bindings.effective_toolset.push(tool);
             self.bindings.effective_toolset.sort();
             self.rebuild_default_tool_assembly();
@@ -255,7 +260,12 @@ impl SessionState {
 
     pub fn add_skill_binding(&mut self, skill: impl Into<String>) {
         let skill = skill.into();
-        if !self.bindings.effective_skillset.iter().any(|existing| existing == &skill) {
+        if !self
+            .bindings
+            .effective_skillset
+            .iter()
+            .any(|existing| existing == &skill)
+        {
             self.bindings.effective_skillset.push(skill);
             self.bindings.effective_skillset.sort();
         }
@@ -799,8 +809,18 @@ impl SessionState {
 fn looks_like_conversational_goal(normalized: &str) -> bool {
     normalized.contains('?')
         || [
-            "what", "why", "how", "who", "when", "tell me", "explain", "help me understand",
-            "i think", "i am thinking", "let's think", "can we talk",
+            "what",
+            "why",
+            "how",
+            "who",
+            "when",
+            "tell me",
+            "explain",
+            "help me understand",
+            "i think",
+            "i am thinking",
+            "let's think",
+            "can we talk",
         ]
         .iter()
         .any(|prefix| normalized.starts_with(prefix))
@@ -833,14 +853,19 @@ pub fn merge_session_index(
         .unwrap_or_default();
 
     sessions.retain(|entry| {
-        entry.get("session_id")
-            .and_then(serde_json::Value::as_str)
+        entry.get("session_id").and_then(serde_json::Value::as_str)
             != Some(state.session_id.as_str())
     });
     sessions.push(state.checkpoint_index_entry());
     sessions.sort_by(|a, b| {
-        let a_ts = a.get("updated_at").and_then(serde_json::Value::as_u64).unwrap_or(0);
-        let b_ts = b.get("updated_at").and_then(serde_json::Value::as_u64).unwrap_or(0);
+        let a_ts = a
+            .get("updated_at")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let b_ts = b
+            .get("updated_at")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
         b_ts.cmp(&a_ts)
     });
     sessions.truncate(32);
@@ -874,6 +899,8 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
         .map(|tool_name| {
             let execution_mode = if is_local_agent_tool(tool_name) {
                 "local_agent"
+            } else if is_pinned_tool(tool_name) {
+                "pinned"
             } else {
                 "capability"
             };
@@ -906,6 +933,8 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
                     availability_state: "live".into(),
                     selection_reason: Some(if execution_mode == "local_agent" {
                         "agent_local_tool".into()
+                    } else if execution_mode == "pinned" {
+                        "default_pinned_route".into()
                     } else {
                         "default_capability_route".into()
                     }),
@@ -944,6 +973,13 @@ fn default_visible_toolset(bindings: &SessionBindings) -> Vec<String> {
 
 fn is_local_agent_tool(tool_name: &str) -> bool {
     matches!(tool_name, "session.status")
+}
+
+fn is_pinned_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "workspace.list" | "workspace.read" | "workspace.write"
+    )
 }
 
 fn tool_assembly_from_allowed_incarnations(bindings: &SessionBindings) -> ToolAssembly {
@@ -1004,7 +1040,12 @@ fn select_incarnation_route(
     let mut candidates = bindings
         .allowed_tool_runner_incarnations
         .iter()
-        .filter(|incarnation| incarnation.supported_tools.iter().any(|tool| tool == tool_name))
+        .filter(|incarnation| {
+            incarnation
+                .supported_tools
+                .iter()
+                .any(|tool| tool == tool_name)
+        })
         .collect::<Vec<_>>();
 
     candidates.sort_by(|a, b| compare_incarnation_bindings(a, b));
@@ -1070,19 +1111,16 @@ fn current_unix_ts() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        merge_session_index, session_checkpoint_memory_type, ApprovalPolicy, SessionBindings,
-        SessionState, ToolRunnerIncarnationBinding, WorkingTurn,
+        ApprovalPolicy, SessionBindings, SessionState, ToolRunnerIncarnationBinding, WorkingTurn,
+        merge_session_index, session_checkpoint_memory_type,
     };
     use crate::r#loop::{ApprovalRequest, ToolCall, TurnPhase};
     use uuid::Uuid;
 
     #[test]
     fn checkpoint_contains_active_turn_and_history() {
-        let mut state = SessionState::new(
-            "sess-1".into(),
-            "agent-jane-01".into(),
-            "telegram".into(),
-        );
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.start_turn(WorkingTurn {
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
@@ -1105,11 +1143,8 @@ mod tests {
 
     #[test]
     fn completing_turn_rolls_into_recent_history() {
-        let mut state = SessionState::new(
-            "sess-1".into(),
-            "agent-jane-01".into(),
-            "telegram".into(),
-        );
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.start_turn(WorkingTurn {
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
@@ -1194,7 +1229,10 @@ mod tests {
         );
         assert_eq!(state.recent_turns.len(), 1);
         assert_eq!(state.active_turn.as_ref().unwrap().turn_id, "turn-2");
-        assert_eq!(state.active_turn.as_ref().unwrap().phase, TurnPhase::WaitingModel);
+        assert_eq!(
+            state.active_turn.as_ref().unwrap().phase,
+            TurnPhase::WaitingModel
+        );
         assert_eq!(
             state.active_turn.as_ref().unwrap().pending_tool_call,
             Some(ToolCall {
@@ -1210,10 +1248,7 @@ mod tests {
                 approved_response: "Confirmed".into(),
             })
         );
-        assert_eq!(
-            state.tool_assembly.tools_for_model[0].tool_name,
-            "echo"
-        );
+        assert_eq!(state.tool_assembly.tools_for_model[0].tool_name, "echo");
         assert_eq!(
             state
                 .tool_assembly
@@ -1226,11 +1261,8 @@ mod tests {
 
     #[test]
     fn approval_policy_can_auto_approve_session_requests() {
-        let mut state = SessionState::new(
-            "sess-1".into(),
-            "agent-jane-01".into(),
-            "telegram".into(),
-        );
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.approval_policy = ApprovalPolicy {
             auto_approve_all: true,
             preapproved_tools: Vec::new(),
@@ -1246,11 +1278,8 @@ mod tests {
 
     #[test]
     fn prompt_reflects_session_preapproval() {
-        let mut state = SessionState::new(
-            "sess-1".into(),
-            "agent-jane-01".into(),
-            "telegram".into(),
-        );
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.set_preapprove_this_session();
 
         let prompt = state.build_prompt("deploy the thing");
@@ -1259,11 +1288,8 @@ mod tests {
 
     #[test]
     fn prompt_reflects_session_bindings_and_status() {
-        let mut state = SessionState::new(
-            "sess-1".into(),
-            "agent-jane-01".into(),
-            "telegram".into(),
-        );
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.status = "paused".into();
         state.bindings = SessionBindings {
             effective_toolset: vec!["echo".into()],
@@ -1281,14 +1307,12 @@ mod tests {
 
     #[test]
     fn prompt_uses_agent_profile_sources_when_present() {
-        let mut state = SessionState::new(
-            "sess-1".into(),
-            "agent-jane-01".into(),
-            "telegram".into(),
-        );
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.agent_profile.identity_text = Some("Identity anchor: Jane".into());
         state.agent_profile.soul_text = Some("Soul anchor: sharp, warm, witty.".into());
-        state.agent_profile.user_context_text = Some("User anchor: Jared prefers direct collaboration.".into());
+        state.agent_profile.user_context_text =
+            Some("User anchor: Jared prefers direct collaboration.".into());
         state.agent_profile.agents_text = Some("Workspace rule: read the soul first.".into());
         state.agent_profile.memory_summary = Some("Memory seed: architecture matters.".into());
 
@@ -1302,11 +1326,7 @@ mod tests {
 
     #[test]
     fn status_text_reports_when_no_preapproval_exists() {
-        let state = SessionState::new(
-            "sess-1".into(),
-            "agent-jane-01".into(),
-            "telegram".into(),
-        );
+        let state = SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         assert_eq!(
             state.approval_policy_status_text(),
             "Approval policy: no pre-approvals configured."
@@ -1315,11 +1335,8 @@ mod tests {
 
     #[test]
     fn session_status_text_reports_bindings() {
-        let mut state = SessionState::new(
-            "sess-1".into(),
-            "agent-jane-01".into(),
-            "telegram".into(),
-        );
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.status = "paused".into();
         state.bindings.effective_toolset = vec!["echo".into()];
         state.bindings.effective_skillset = vec!["planning".into()];
@@ -1334,11 +1351,8 @@ mod tests {
 
     #[test]
     fn tool_binding_gates_enabled_tools() {
-        let mut state = SessionState::new(
-            "sess-1".into(),
-            "agent-jane-01".into(),
-            "telegram".into(),
-        );
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         assert!(state.tool_is_enabled("echo"));
         assert_eq!(
             state
@@ -1360,11 +1374,8 @@ mod tests {
 
     #[test]
     fn allowed_incarnations_define_visible_tools_and_routes() {
-        let mut state = SessionState::new(
-            "sess-1".into(),
-            "agent-jane-01".into(),
-            "telegram".into(),
-        );
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.bindings.allowed_tool_runner_incarnations = vec![
             ToolRunnerIncarnationBinding {
                 incarnation_id: "tool-echo-remote".into(),
@@ -1399,16 +1410,16 @@ mod tests {
             .expect("echo route should be assembled");
         assert_eq!(route.incarnation_id.as_deref(), Some("tool-echo-local"));
         assert_eq!(route.hotel_id.as_deref(), Some("local-ansible-01"));
-        assert_eq!(route.selection_reason.as_deref(), Some("local_live_preferred"));
+        assert_eq!(
+            route.selection_reason.as_deref(),
+            Some("local_live_preferred")
+        );
     }
 
     #[test]
     fn local_agent_tools_get_local_execution_routes() {
-        let mut state = SessionState::new(
-            "sess-1".into(),
-            "agent-jane-01".into(),
-            "telegram".into(),
-        );
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.clear_tool_bindings();
         state.add_tool_binding("session.status");
 
@@ -1420,12 +1431,30 @@ mod tests {
     }
 
     #[test]
+    fn workspace_tools_get_pinned_execution_routes() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("workspace.read");
+        state.add_tool_binding("workspace.list");
+
+        let read_route = state
+            .resolve_tool_route("workspace.read")
+            .expect("workspace.read route should exist");
+        let list_route = state
+            .resolve_tool_route("workspace.list")
+            .expect("workspace.list route should exist");
+
+        assert_eq!(read_route.execution_mode, "pinned");
+        assert_eq!(list_route.execution_mode, "pinned");
+        assert_eq!(read_route.target_role, "tool.workspace.read");
+        assert_eq!(list_route.target_role, "tool.workspace.list");
+    }
+
+    #[test]
     fn conversational_turns_project_no_tools_by_default() {
-        let mut state = SessionState::new(
-            "sess-1".into(),
-            "agent-jane-01".into(),
-            "telegram".into(),
-        );
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.add_tool_binding("echo");
 
         let projected = state.project_tools_for_turn("What do you think about this architecture?");
@@ -1434,11 +1463,8 @@ mod tests {
 
     #[test]
     fn explicit_tool_mentions_project_matching_tools() {
-        let mut state = SessionState::new(
-            "sess-1".into(),
-            "agent-jane-01".into(),
-            "telegram".into(),
-        );
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.clear_tool_bindings();
         state.add_tool_binding("echo");
         state.add_tool_binding("session.status");
@@ -1450,11 +1476,8 @@ mod tests {
 
     #[test]
     fn skill_and_workspace_bindings_can_be_mutated() {
-        let mut state = SessionState::new(
-            "sess-1".into(),
-            "agent-jane-01".into(),
-            "telegram".into(),
-        );
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.add_skill_binding("planning");
         state.set_workspace_binding("workspace://main");
         assert_eq!(state.bindings.effective_skillset, vec!["planning"]);
@@ -1479,11 +1502,8 @@ mod tests {
 
     #[test]
     fn session_index_tracks_multiple_sessions_without_duplicates() {
-        let mut first = SessionState::new(
-            "sess-1".into(),
-            "agent-jane-01".into(),
-            "telegram".into(),
-        );
+        let mut first =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         first.start_turn(WorkingTurn {
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
@@ -1499,11 +1519,7 @@ mod tests {
         let index = merge_session_index(None, &first);
         assert_eq!(index["active_sessions"].as_array().unwrap().len(), 1);
 
-        let second = SessionState::new(
-            "sess-2".into(),
-            "agent-jane-01".into(),
-            "telegram".into(),
-        );
+        let second = SessionState::new("sess-2".into(), "agent-jane-01".into(), "telegram".into());
         let index = merge_session_index(Some(&index), &second);
         assert_eq!(index["active_sessions"].as_array().unwrap().len(), 2);
 

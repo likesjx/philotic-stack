@@ -37,6 +37,10 @@ Implemented so far:
   - `local_agent`
   - `capability`
   - `pinned`
+- first basic tool-family split:
+  - `session.status` stays `local_agent`
+  - `echo` stays `capability`
+  - `workspace.list` and `workspace.read` are now treated as `pinned`
 - incarnation-aware execution metadata in assembled routes
 - session `allowed_tool_runner_incarnations` can now define visible tools and preferred execution routes
 - `agent-core` now translates abstract tool calls into preassembled route envelopes instead of rediscovering routing at call time

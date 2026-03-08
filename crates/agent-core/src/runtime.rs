@@ -1,7 +1,12 @@
-use crate::commands::{parse_slash_command, SlashCommand};
-use crate::r#loop::{interpret_model_payload, interpret_tool_result, AgentAction, ApprovalRequest, ToolCall, ToolResult, TurnPhase};
-use crate::protocol::{FinalReplyPayload, InboundTaskPayload, ModelRequestPayload, ToolExecutionPayload};
-use crate::session::{merge_session_index, SessionState, ToolExecutionRoute, WorkingTurn};
+use crate::commands::{SlashCommand, parse_slash_command};
+use crate::r#loop::{
+    AgentAction, ApprovalRequest, ToolCall, ToolResult, TurnPhase, interpret_model_payload,
+    interpret_tool_result,
+};
+use crate::protocol::{
+    FinalReplyPayload, InboundTaskPayload, ModelRequestPayload, ToolExecutionPayload,
+};
+use crate::session::{SessionState, ToolExecutionRoute, WorkingTurn, merge_session_index};
 use anyhow::Result;
 use philotic_client::{IpcRequest, IpcResponse, PhiloticClient};
 use std::collections::HashMap;
@@ -67,7 +72,12 @@ impl AgentRuntime {
     }
 
     async fn handle_user_message(&mut self, task: InboundTaskPayload, task_id: Uuid) -> Result<()> {
-        let content = match task.content.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let content = match task
+            .content
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             Some(content) => content.to_string(),
             None => return Ok(()),
         };
@@ -164,14 +174,18 @@ impl AgentRuntime {
                 | SlashCommand::SkillsClear
                 | SlashCommand::WorkspaceSet { .. }
                 | SlashCommand::WorkspaceClear => {
-                    self.handle_session_control_command(task_id, session_id, turn_id, chat_id, command)
-                        .await
+                    self.handle_session_control_command(
+                        task_id, session_id, turn_id, chat_id, command,
+                    )
+                    .await
                 }
                 SlashCommand::PreapproveThisSession
                 | SlashCommand::ApprovalStatus
                 | SlashCommand::ApprovalReset => {
-                    self.handle_session_control_command(task_id, session_id, turn_id, chat_id, command)
-                        .await
+                    self.handle_session_control_command(
+                        task_id, session_id, turn_id, chat_id, command,
+                    )
+                    .await
                 }
                 SlashCommand::Approve { .. } | SlashCommand::Deny { .. } => Ok(()),
             };
@@ -198,13 +212,13 @@ impl AgentRuntime {
                 task_id,
                 state: "waiting_model".into(),
                 payload: serde_json::json!({
-                "session_id": index_state.session_id,
-                "turn_id": turn_id,
-                "chat_id": chat_id,
-                "content": content,
-            }),
-        })
-        .await?;
+                    "session_id": index_state.session_id,
+                    "turn_id": turn_id,
+                    "chat_id": chat_id,
+                    "content": content,
+                }),
+            })
+            .await?;
 
         let (checkpoint_memory_type, checkpoint_json, index_state) = {
             let state = self
@@ -268,15 +282,19 @@ impl AgentRuntime {
         let action = interpret_model_payload(task.agent_action.as_ref(), task.content.as_deref());
         match action {
             AgentAction::Respond { content } => {
-                self.complete_agent_response(session_id, turn_id, content).await
+                self.complete_agent_response(session_id, turn_id, content)
+                    .await
             }
             AgentAction::ToolCall(tool_call) => {
                 self.handle_tool_call(session_id, turn_id, tool_call).await
             }
             AgentAction::RequestApproval(approval) => {
-                self.handle_approval_request(session_id, turn_id, approval).await
+                self.handle_approval_request(session_id, turn_id, approval)
+                    .await
             }
-            AgentAction::Fail { message } => self.fail_active_turn(session_id, turn_id, message).await,
+            AgentAction::Fail { message } => {
+                self.fail_active_turn(session_id, turn_id, message).await
+            }
         }
     }
 
@@ -293,13 +311,27 @@ impl AgentRuntime {
             .map(|state| state.approval_policy_allows(&approval))
             .unwrap_or(false);
 
-        let (task_id, chat_id, final_reply_to, final_reply_role, checkpoint_memory_type, checkpoint_json, index_state) = {
+        let (
+            task_id,
+            chat_id,
+            final_reply_to,
+            final_reply_role,
+            checkpoint_memory_type,
+            checkpoint_json,
+            index_state,
+        ) = {
             let Some(state) = self.sessions.get_mut(&session_id) else {
-                warn!("Received approval request for unknown session {}", session_id);
+                warn!(
+                    "Received approval request for unknown session {}",
+                    session_id
+                );
                 return Ok(());
             };
             let Some(active_turn) = state.active_turn.as_ref() else {
-                warn!("Received approval request for session {} with no active turn", session_id);
+                warn!(
+                    "Received approval request for session {} with no active turn",
+                    session_id
+                );
                 return Ok(());
             };
             let task_id = active_turn.task_id;
@@ -382,7 +414,10 @@ impl AgentRuntime {
             session_id,
             turn_id,
             chat_id,
-            content: format!("Approval required: {}. Reply /approve or /deny.", approval.reason),
+            content: format!(
+                "Approval required: {}. Reply /approve or /deny.",
+                approval.reason
+            ),
         };
 
         self.ipc_client
@@ -421,9 +456,12 @@ impl AgentRuntime {
             .await?;
         self.sync_session_index(&index_state).await?;
 
-        let (chat_id, final_reply_to, final_reply_role, route) = {
+        let (chat_id, final_reply_to, final_reply_role, workspace_ref, route) = {
             let Some(state) = self.sessions.get(&session_id) else {
-                warn!("Tool execution requested for unknown session {}", session_id);
+                warn!(
+                    "Tool execution requested for unknown session {}",
+                    session_id
+                );
                 return Ok(());
             };
             let route = match Self::execute_bound_tool(state, &tool_call) {
@@ -442,6 +480,7 @@ impl AgentRuntime {
                 active_turn.chat_id.clone(),
                 active_turn.final_reply_to.clone(),
                 active_turn.final_reply_role.clone(),
+                state.bindings.effective_workspace_ref.clone(),
                 route,
             )
         };
@@ -459,6 +498,7 @@ impl AgentRuntime {
             hotel_id: route.hotel_id.clone(),
             environment_id: route.environment_id.clone(),
             selection_reason: route.selection_reason.clone(),
+            workspace_ref,
             reply_to: LOCAL_NODE.to_string(),
             reply_role: "agent".into(),
             final_reply_to,
@@ -515,21 +555,28 @@ impl AgentRuntime {
 
         match interpret_tool_result(&tool_result) {
             AgentAction::Respond { content } => {
-                self.complete_agent_response(session_id, turn_id, content).await
+                self.complete_agent_response(session_id, turn_id, content)
+                    .await
             }
-            AgentAction::ToolCall(_) => self.fail_active_turn(
-                session_id,
-                turn_id,
-                "Nested tool calls are not supported yet".into(),
-            )
-            .await,
-            AgentAction::RequestApproval(_) => self.fail_active_turn(
-                session_id,
-                turn_id,
-                "Approval after tool execution is not supported yet".into(),
-            )
-            .await,
-            AgentAction::Fail { message } => self.fail_active_turn(session_id, turn_id, message).await,
+            AgentAction::ToolCall(_) => {
+                self.fail_active_turn(
+                    session_id,
+                    turn_id,
+                    "Nested tool calls are not supported yet".into(),
+                )
+                .await
+            }
+            AgentAction::RequestApproval(_) => {
+                self.fail_active_turn(
+                    session_id,
+                    turn_id,
+                    "Approval after tool execution is not supported yet".into(),
+                )
+                .await
+            }
+            AgentAction::Fail { message } => {
+                self.fail_active_turn(session_id, turn_id, message).await
+            }
         }
     }
 
@@ -612,13 +659,24 @@ impl AgentRuntime {
         turn_id: String,
         message: String,
     ) -> Result<()> {
-        let (task_id, checkpoint_memory_type, checkpoint_json, index_state, chat_id, final_reply_to, final_reply_role) = {
+        let (
+            task_id,
+            checkpoint_memory_type,
+            checkpoint_json,
+            index_state,
+            chat_id,
+            final_reply_to,
+            final_reply_role,
+        ) = {
             let Some(state) = self.sessions.get_mut(&session_id) else {
                 warn!("Received fail action for unknown session {}", session_id);
                 return Ok(());
             };
             let Some(active_turn) = state.active_turn.as_ref() else {
-                warn!("Received fail action for session {} with no active turn", session_id);
+                warn!(
+                    "Received fail action for session {} with no active turn",
+                    session_id
+                );
                 return Ok(());
             };
             let task_id = active_turn.task_id;
@@ -785,14 +843,14 @@ impl AgentRuntime {
             .ipc_client
             .send_request(IpcRequest::CompleteTask {
                 task_id: command_task_id,
-                    result: serde_json::json!({
-                        "session_id": session_id,
-                        "turn_id": command_turn_id,
-                        "chat_id": command_chat_id,
-                        "content": command.reply_text().unwrap_or("ok"),
-                    }),
-                })
-                .await?;
+                result: serde_json::json!({
+                    "session_id": session_id,
+                    "turn_id": command_turn_id,
+                    "chat_id": command_chat_id,
+                    "content": command.reply_text().unwrap_or("ok"),
+                }),
+            })
+            .await?;
 
         match command {
             SlashCommand::Approve { note } => {
@@ -951,7 +1009,10 @@ impl AgentRuntime {
             user_content,
         ) = {
             let Some(state) = self.sessions.get_mut(&session_id) else {
-                warn!("Tried to resume steered turn for unknown session {}", session_id);
+                warn!(
+                    "Tried to resume steered turn for unknown session {}",
+                    session_id
+                );
                 return Ok(());
             };
             let user_content = {
@@ -1044,9 +1105,19 @@ impl AgentRuntime {
         command_chat_id: String,
         command: SlashCommand,
     ) -> Result<()> {
-        let (reply_content, update_state, payload, checkpoint_memory_type, checkpoint_json, index_state) = {
+        let (
+            reply_content,
+            update_state,
+            payload,
+            checkpoint_memory_type,
+            checkpoint_json,
+            index_state,
+        ) = {
             let Some(state) = self.sessions.get_mut(&session_id) else {
-                warn!("Received session policy command for unknown session {}", session_id);
+                warn!(
+                    "Received session policy command for unknown session {}",
+                    session_id
+                );
                 return Ok(());
             };
 
@@ -1175,7 +1246,11 @@ impl AgentRuntime {
                     (
                         format!(
                             "Workspace binding updated: {}.",
-                            state.bindings.effective_workspace_ref.as_deref().unwrap_or("default")
+                            state
+                                .bindings
+                                .effective_workspace_ref
+                                .as_deref()
+                                .unwrap_or("default")
                         ),
                         "session_bindings_updated",
                         serde_json::json!({
@@ -1241,19 +1316,15 @@ impl AgentRuntime {
                         }),
                     )
                 }
-                SlashCommand::Ping
-                | SlashCommand::Approve { .. }
-                | SlashCommand::Deny { .. } => {
-                    (
-                        "Unsupported session control command.".to_string(),
-                        "session_control_unsupported",
-                        serde_json::json!({
-                            "session_id": session_id,
-                            "turn_id": command_turn_id,
-                            "chat_id": command_chat_id,
-                        }),
-                    )
-                }
+                SlashCommand::Ping | SlashCommand::Approve { .. } | SlashCommand::Deny { .. } => (
+                    "Unsupported session control command.".to_string(),
+                    "session_control_unsupported",
+                    serde_json::json!({
+                        "session_id": session_id,
+                        "turn_id": command_turn_id,
+                        "chat_id": command_chat_id,
+                    }),
+                ),
             };
 
             (
@@ -1312,13 +1383,21 @@ impl AgentRuntime {
                         route.runner_id.as_deref().unwrap_or("unknown")
                     )
                 } else {
-                    anyhow::anyhow!("Tool {} has no assembled execution route", tool_call.tool_name)
+                    anyhow::anyhow!(
+                        "Tool {} has no assembled execution route",
+                        tool_call.tool_name
+                    )
                 }
             })
     }
 
     fn normalize_approval_request(mut approval: ApprovalRequest) -> ApprovalRequest {
-        if approval.approval_id.as_deref().unwrap_or_default().is_empty() {
+        if approval
+            .approval_id
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty()
+        {
             approval.approval_id = Some(Uuid::new_v4().to_string());
         }
         approval
@@ -1348,13 +1427,14 @@ impl AgentRuntime {
                 })
                 .await
             }
-            other => self
-                .fail_active_turn(
+            other => {
+                self.fail_active_turn(
                     payload.session_id,
                     payload.turn_id,
                     format!("Agent-local tool {} is not implemented", other),
                 )
-                .await,
+                .await
+            }
         }
     }
 
@@ -1366,7 +1446,10 @@ impl AgentRuntime {
     ) -> Result<()> {
         let (completed_turn, checkpoint_memory_type, checkpoint_json, index_state) = {
             let Some(state) = self.sessions.get_mut(&session_id) else {
-                warn!("Received local command completion for unknown session {}", session_id);
+                warn!(
+                    "Received local command completion for unknown session {}",
+                    session_id
+                );
                 return Ok(());
             };
 
@@ -1460,7 +1543,11 @@ impl AgentRuntime {
 
         self.sessions.insert(
             session_id.to_string(),
-            SessionState::new(session_id.to_string(), AGENT_ID.into(), fallback_source.into()),
+            SessionState::new(
+                session_id.to_string(),
+                AGENT_ID.into(),
+                fallback_source.into(),
+            ),
         );
         Ok(())
     }
@@ -1492,8 +1579,8 @@ impl AgentRuntime {
 #[cfg(test)]
 mod tests {
     use super::LOCAL_NODE;
-    use crate::protocol::{FinalReplyPayload, ModelRequestPayload};
     use crate::r#loop::{ApprovalRequest, ToolCall};
+    use crate::protocol::{FinalReplyPayload, ModelRequestPayload};
     use crate::session::{ApprovalPolicy, SessionState};
 
     #[test]
@@ -1534,11 +1621,8 @@ mod tests {
 
     #[test]
     fn bound_tool_execution_allows_listed_tools() {
-        let mut state = SessionState::new(
-            "sess-1".into(),
-            "agent-jane-01".into(),
-            "telegram".into(),
-        );
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.add_tool_binding("echo");
         let route = super::AgentRuntime::execute_bound_tool(
             &state,
@@ -1563,11 +1647,8 @@ mod tests {
 
     #[test]
     fn auto_approval_uses_session_policy() {
-        let mut state = SessionState::new(
-            "sess-1".into(),
-            "agent-jane-01".into(),
-            "telegram".into(),
-        );
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.approval_policy = ApprovalPolicy {
             auto_approve_all: true,
             preapproved_tools: Vec::new(),
@@ -1583,11 +1664,8 @@ mod tests {
 
     #[test]
     fn bound_tool_execution_rejects_unlisted_tools() {
-        let mut state = SessionState::new(
-            "sess-1".into(),
-            "agent-jane-01".into(),
-            "telegram".into(),
-        );
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.add_tool_binding("echo");
 
         let err = super::AgentRuntime::execute_bound_tool(
@@ -1603,11 +1681,8 @@ mod tests {
 
     #[test]
     fn bound_tool_execution_requires_live_route() {
-        let mut state = SessionState::new(
-            "sess-1".into(),
-            "agent-jane-01".into(),
-            "telegram".into(),
-        );
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.add_tool_binding("echo");
         if let Some(route) = state.tool_assembly.execution_routes.get_mut("echo") {
             route.availability_state = "materialization_required".into();
@@ -1626,11 +1701,8 @@ mod tests {
 
     #[test]
     fn local_agent_route_executes_without_external_runner_liveness() {
-        let mut state = SessionState::new(
-            "sess-1".into(),
-            "agent-jane-01".into(),
-            "telegram".into(),
-        );
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.clear_tool_bindings();
         state.add_tool_binding("session.status");
 
