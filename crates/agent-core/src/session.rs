@@ -35,6 +35,22 @@ pub struct ApprovalPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AgentProfile {
+    #[serde(default)]
+    pub persona_name: Option<String>,
+    #[serde(default)]
+    pub soul_text: Option<String>,
+    #[serde(default)]
+    pub identity_text: Option<String>,
+    #[serde(default)]
+    pub user_context_text: Option<String>,
+    #[serde(default)]
+    pub agents_text: Option<String>,
+    #[serde(default)]
+    pub memory_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SessionBindings {
     #[serde(default)]
     pub effective_toolset: Vec<String>,
@@ -127,6 +143,7 @@ pub struct SessionState {
     pub session_id: String,
     pub agent_id: String,
     pub source: String,
+    pub agent_profile: AgentProfile,
     pub status: String,
     pub approval_policy: ApprovalPolicy,
     pub bindings: SessionBindings,
@@ -142,6 +159,7 @@ impl SessionState {
             session_id,
             agent_id,
             source,
+            agent_profile: AgentProfile::default(),
             status: "active".into(),
             approval_policy: ApprovalPolicy::default(),
             tool_assembly: default_tool_assembly_for_bindings(&bindings),
@@ -413,11 +431,34 @@ impl SessionState {
     }
 
     pub fn project_agent_self(&self) -> String {
-        let mut lines = vec![
-            "You are Jane, a hyper-intelligent Hegemon AI.".to_string(),
-            "Be concise, helpful, context-aware, and willing to push back when it improves the work."
-                .to_string(),
-        ];
+        let mut lines = Vec::new();
+
+        if let Some(identity) = self
+            .agent_profile
+            .identity_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            lines.push(identity.to_string());
+        } else {
+            lines.push("You are Jane, a hyper-intelligent Hegemon AI.".to_string());
+        }
+
+        if let Some(soul) = self
+            .agent_profile
+            .soul_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            lines.push(soul.to_string());
+        } else {
+            lines.push(
+                "Be concise, helpful, context-aware, and willing to push back when it improves the work."
+                    .to_string(),
+            );
+        }
 
         if !self.bindings.effective_skillset.is_empty() {
             lines.push(format!(
@@ -430,10 +471,22 @@ impl SessionState {
     }
 
     pub fn project_user(&self, _user_content: &str) -> String {
-        let mut lines = vec![format!(
-            "You are speaking with a collaborator over {}.",
-            self.source
-        )];
+        let mut lines = Vec::new();
+
+        if let Some(user_context) = self
+            .agent_profile
+            .user_context_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            lines.push(user_context.to_string());
+        } else {
+            lines.push(format!(
+                "You are speaking with a collaborator over {}.",
+                self.source
+            ));
+        }
 
         if self.source == "telegram" {
             lines.push(
@@ -530,6 +583,26 @@ impl SessionState {
         }
         sections.push(envelope.trim_end().to_string());
 
+        if let Some(agents_text) = self
+            .agent_profile
+            .agents_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            sections.push(format!("[Workspace guidance]\n{agents_text}"));
+        }
+
+        if let Some(memory_summary) = self
+            .agent_profile
+            .memory_summary
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            sections.push(format!("[Memory seed]\n{memory_summary}"));
+        }
+
         sections.join("\n\n")
     }
 
@@ -553,6 +626,7 @@ impl SessionState {
             "session_id": self.session_id,
             "agent_id": self.agent_id,
             "source": self.source,
+            "agent_profile": self.agent_profile,
             "status": self.status,
             "approval_policy": self.approval_policy,
             "bindings": self.bindings,
@@ -607,6 +681,11 @@ impl SessionState {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("unknown")
             .to_string();
+        let agent_profile = checkpoint
+            .get("agent_profile")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<AgentProfile>(value).ok())
+            .unwrap_or_default();
         let status = checkpoint
             .get("status")
             .and_then(serde_json::Value::as_str)
@@ -706,6 +785,7 @@ impl SessionState {
             session_id,
             agent_id,
             source,
+            agent_profile,
             status,
             approval_policy,
             bindings,
@@ -1197,6 +1277,27 @@ mod tests {
         assert!(prompt.contains("Session status: paused."));
         assert!(prompt.contains("Effective tools: echo."));
         assert!(prompt.contains("Workspace: workspace://main."));
+    }
+
+    #[test]
+    fn prompt_uses_agent_profile_sources_when_present() {
+        let mut state = SessionState::new(
+            "sess-1".into(),
+            "agent-jane-01".into(),
+            "telegram".into(),
+        );
+        state.agent_profile.identity_text = Some("Identity anchor: Jane".into());
+        state.agent_profile.soul_text = Some("Soul anchor: sharp, warm, witty.".into());
+        state.agent_profile.user_context_text = Some("User anchor: Jared prefers direct collaboration.".into());
+        state.agent_profile.agents_text = Some("Workspace rule: read the soul first.".into());
+        state.agent_profile.memory_summary = Some("Memory seed: architecture matters.".into());
+
+        let prompt = state.build_prompt("status");
+        assert!(prompt.contains("Identity anchor: Jane"));
+        assert!(prompt.contains("Soul anchor: sharp, warm, witty."));
+        assert!(prompt.contains("User anchor: Jared prefers direct collaboration."));
+        assert!(prompt.contains("Workspace rule: read the soul first."));
+        assert!(prompt.contains("Memory seed: architecture matters."));
     }
 
     #[test]

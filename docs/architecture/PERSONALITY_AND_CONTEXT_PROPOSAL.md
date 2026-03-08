@@ -16,7 +16,7 @@ This proposal focuses on:
 
 ## Disposition
 
-Accepted for the current slice. Initial turn-time projection scaffolding is now implemented in `agent-core`, but it is still fed by simple in-process state rather than imported legacy inputs or richer memory projection.
+Accepted for the current slice. Initial turn-time projection scaffolding is implemented in `agent-core`, and the canonical session snapshot now carries a graph-backed imported Jane profile seeded from the legacy `vps-jane` workspace. The runtime is still using compatibility text inputs rather than richer heuristic memory projection.
 
 Research basis:
 
@@ -27,17 +27,19 @@ Track follow-on work in [task.md](/Users/jaredlikes/code/philotic-stack/docs/tas
 
 ## Current Slice
 
-Land the first honest projection boundary in `agent-core`:
+Land the first honest projection boundary in `agent-core` and feed it with one imported Jane profile:
 
 - refactor prompt assembly around:
   - `project_agent_self`
   - `project_user`
   - `project_knowledge`
-- keep the first implementation simple and local
+- seed `agent-jane-01` from the legacy `workspace-vps-jane` bootstrap files
+- expose that imported profile in the canonical session snapshot
+- keep the first implementation compatibility-first and text-driven
 - preserve existing runtime behavior while creating a clean seam for later:
-  - legacy input import
   - user-specific profile projection
   - Muninn or other memory-backed knowledge projection
+  - fuller `openclaw.json` import
 
 ## Core Recommendation
 

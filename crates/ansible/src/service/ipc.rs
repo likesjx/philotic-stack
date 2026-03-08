@@ -947,6 +947,12 @@ impl IpcServer {
             .primary_agent_id
             .as_deref()
             .and_then(|agent_id| graph.get_apartment(agent_id, "short").ok().flatten());
+        let agent_profile = session
+            .primary_agent_id
+            .as_deref()
+            .and_then(|agent_id| graph.get_agent_identity(agent_id).ok().flatten())
+            .map(|identity| identity.bundle_json)
+            .unwrap_or_else(|| serde_json::json!({}));
 
         let recent_turns = if let Some(checkpoint_turns) = apartment_checkpoint
             .as_ref()
@@ -986,6 +992,7 @@ impl IpcServer {
             "session_id": session.session_id,
             "agent_id": session.primary_agent_id,
             "source": session.channel_kind,
+            "agent_profile": agent_profile,
             "status": session.status,
             "summary": session.summary_json,
             "approval_policy": session
@@ -1418,7 +1425,7 @@ mod tests {
     use super::*;
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
     use ansible_mesh_core::storage::{
-        GuestRecord, HotelRecord, SessionEventRecord, SessionParticipantRecord, SessionRecord,
+        AgentIdentityRecord, GuestRecord, HotelRecord, SessionEventRecord, SessionParticipantRecord, SessionRecord,
         SessionTurnRecord,
     };
     use ansible_mesh_core::NodeCapabilities;
@@ -1440,6 +1447,8 @@ mod tests {
         fn list_guests(&self, _hotel_name: &str, _active_only: bool) -> anyhow::Result<Vec<GuestRecord>> { Ok(vec![]) }
         fn set_guest_pid(&self, _hotel_name: &str, _guest_id: &str, _pid: Option<&str>) -> anyhow::Result<()> { Ok(()) }
         fn seed_guests(&self, _hotel_name: &str, _guests: &[GuestRecord]) -> anyhow::Result<()> { Ok(()) }
+        fn upsert_agent_identity(&self, _identity: &AgentIdentityRecord) -> anyhow::Result<()> { Ok(()) }
+        fn get_agent_identity(&self, _agent_id: &str) -> anyhow::Result<Option<AgentIdentityRecord>> { Ok(None) }
         fn sync_apartment(&self, _agent_id: &str, _memory_type: &str, _content_json: &serde_json::Value) -> anyhow::Result<()> { Ok(()) }
         fn get_apartment(&self, _agent_id: &str, _memory_type: &str) -> anyhow::Result<Option<serde_json::Value>> { Ok(None) }
         fn upsert_session(&self, _session: &SessionRecord) -> anyhow::Result<()> { Ok(()) }
@@ -1611,6 +1620,17 @@ mod tests {
         let server = IpcServer::new(socket_path.clone(), dispatcher_tx, graph);
 
         graph_store
+            .upsert_agent_identity(&AgentIdentityRecord {
+                agent_id: "agent-jane-01".into(),
+                persona_name: "Jane".into(),
+                bundle_json: serde_json::json!({
+                    "soul_text": "Soul anchor",
+                    "identity_text": "Identity anchor",
+                    "user_context_text": "User anchor"
+                }),
+            })
+            .expect("agent identity should seed");
+        graph_store
             .upsert_session(&SessionRecord {
                 session_id: "sess-1".into(),
                 session_kind: "conversation".into(),
@@ -1669,6 +1689,8 @@ mod tests {
                     serde_json::from_str(&value_json).expect("snapshot should decode");
                 assert_eq!(snapshot["session_id"], "sess-1");
                 assert_eq!(snapshot["source"], "telegram");
+                assert_eq!(snapshot["agent_profile"]["soul_text"], "Soul anchor");
+                assert_eq!(snapshot["agent_profile"]["identity_text"], "Identity anchor");
                 assert_eq!(snapshot["recent_turns"][0]["user_content"], "hello");
                 assert_eq!(snapshot["recent_turns"][0]["assistant_content"], "hi");
             }

@@ -91,7 +91,7 @@
   - user context
   - memory context
   - session context
-- [ ] Add initial agent-level personality fields for:
+- [x] Add initial agent-level personality fields for:
   - `soul_text`
   - `identity_text`
   - `user_context_text`
@@ -115,11 +115,12 @@
   - subagents
 - [ ] Keep the first implementation slice personality-first; do not try to solve the full memory backend story in the same change.
 - [ ] Build the first ZeroClaw/OpenClaw bridge slice:
-  - import one agent from `openclaw.json`
-  - ingest `SOUL.md`, `IDENTITY.md`, `USER.md`, and `MEMORY.md`
-  - store them as Philotic compatibility inputs
-  - materialize the imported agent in the Philotic web
-  - verify recognizable identity continuity
+  - [ ] import one agent from `openclaw.json`
+  - [x] ingest `SOUL.md`, `IDENTITY.md`, `USER.md`, and `MEMORY.md`
+  - [x] store them as Philotic compatibility inputs
+  - [x] expose the imported Jane profile through the canonical session snapshot
+  - [ ] materialize the imported agent in the Philotic web
+  - [ ] verify recognizable identity continuity
 
 ## Deferred Design Threads
 

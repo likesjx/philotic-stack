@@ -567,6 +567,10 @@ impl SqliteGraphStorage {
         format!("agent:{agent_id}")
     }
 
+    fn agent_identity_node_key(agent_id: &str) -> String {
+        format!("agent:{agent_id}:identity")
+    }
+
     fn apartment_node_key(agent_id: &str, memory_type: &str) -> String {
         format!("agent:{agent_id}:apartment:{memory_type}")
     }
@@ -835,6 +839,70 @@ impl GraphStorage for SqliteGraphStorage {
             })?;
         }
         Ok(())
+    }
+
+    fn upsert_agent_identity(&self, identity: &crate::storage::AgentIdentityRecord) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let bundle_json = serde_json::to_string(&identity.bundle_json)?;
+        conn.execute(
+            "INSERT INTO agent_identities (agent_id, persona_name, bundle_json)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(agent_id) DO UPDATE SET
+             persona_name = excluded.persona_name,
+             bundle_json = excluded.bundle_json",
+            params![identity.agent_id, identity.persona_name, bundle_json],
+        )?;
+        drop(conn);
+
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::agent_identity_node_key(&identity.agent_id),
+            kind: "agent_identity".into(),
+            label: Some(identity.persona_name.clone()),
+            data: serde_json::to_value(identity)?,
+        })?;
+
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::agent_node_key(&identity.agent_id),
+            kind: "agent".into(),
+            label: Some(identity.agent_id.clone()),
+            data: serde_json::json!({
+                "agent_id": identity.agent_id,
+                "persona_name": identity.persona_name,
+            }),
+        })?;
+
+        self.adapter.upsert_edge(&GraphEdge {
+            edge_key: format!("edge:agent:{}:has_identity", identity.agent_id),
+            src_node_key: Self::agent_node_key(&identity.agent_id),
+            edge_kind: "HAS_IDENTITY".into(),
+            dst_node_key: Self::agent_identity_node_key(&identity.agent_id),
+            data: serde_json::json!({}),
+        })?;
+
+        Ok(())
+    }
+
+    fn get_agent_identity(&self, agent_id: &str) -> Result<Option<crate::storage::AgentIdentityRecord>> {
+        if let Some(node) = self.adapter.get_node(&Self::agent_identity_node_key(agent_id))? {
+            return Ok(Some(serde_json::from_value(node.data)?));
+        }
+
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT agent_id, persona_name, bundle_json FROM agent_identities WHERE agent_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![agent_id])?;
+        if let Some(row) = rows.next()? {
+            let bundle_json: String = row.get(2)?;
+            Ok(Some(crate::storage::AgentIdentityRecord {
+                agent_id: row.get(0)?,
+                persona_name: row.get(1)?,
+                bundle_json: serde_json::from_str(&bundle_json)
+                    .unwrap_or_else(|_| serde_json::json!({})),
+            }))
+        } else {
+            Ok(None)
+        }
     }
 
     fn sync_apartment(

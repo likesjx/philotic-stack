@@ -362,6 +362,14 @@ mod tests {
             Ok(())
         }
 
+        fn upsert_agent_identity(&self, _identity: &ansible_mesh_core::storage::AgentIdentityRecord) -> Result<()> {
+            Ok(())
+        }
+
+        fn get_agent_identity(&self, _agent_id: &str) -> Result<Option<ansible_mesh_core::storage::AgentIdentityRecord>> {
+            Ok(None)
+        }
+
         fn sync_apartment(
             &self,
             _agent_id: &str,

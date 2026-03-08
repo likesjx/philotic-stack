@@ -1,5 +1,5 @@
 use ansible_mesh_core::beacon::BeaconDaemon;
-use ansible_mesh_core::storage::{GraphStorage, GuestRecord, HotelRecord};
+use ansible_mesh_core::storage::{AgentIdentityRecord, GraphStorage, GuestRecord, HotelRecord};
 use ansible_mesh_core::{NodeCapabilities, NodeRole};
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -172,6 +172,31 @@ fn default_guest_seed(hotel_name: &str) -> Vec<GuestRecord> {
     ]
 }
 
+fn maybe_load_text(path: &Path) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+}
+
+fn vps_jane_identity_bundle() -> serde_json::Value {
+    let Some(home) = std::env::var_os("HOME") else {
+        return serde_json::json!({});
+    };
+    let workspace = Path::new(&home).join(".openclaw/workspace-vps-jane");
+
+    serde_json::json!({
+        "source_kind": "openclaw_workspace",
+        "source_agent": "vps-jane",
+        "workspace_path": workspace,
+        "soul_text": maybe_load_text(&workspace.join("SOUL.md")),
+        "identity_text": maybe_load_text(&workspace.join("IDENTITY.md")),
+        "user_context_text": maybe_load_text(&workspace.join("USER.md")),
+        "agents_text": maybe_load_text(&workspace.join("AGENTS.md")),
+        "memory_summary": maybe_load_text(&workspace.join("MEMORY.md")),
+    })
+}
+
 fn pid_exists(pid: u32) -> bool {
     std::process::Command::new("ps")
         .arg("-p")
@@ -242,14 +267,12 @@ async fn main() -> Result<()> {
     };
 
     graph_storage
-        .raw_conn()
-        .lock()
-        .expect("sqlite lock")
-        .execute(
-            "INSERT OR IGNORE INTO agent_identities (agent_id, persona_name, bundle_json) VALUES (?1, ?2, ?3)",
-            rusqlite::params!["agent-jane-01", "Jane", "{}"],
-        )
-        .context("Failed to seed default agent identity")?;
+        .upsert_agent_identity(&AgentIdentityRecord {
+            agent_id: "agent-jane-01".into(),
+            persona_name: "Jane".into(),
+            bundle_json: vps_jane_identity_bundle(),
+        })
+        .context("Failed to seed default agent identity bundle")?;
 
     if let Some(active_pid) = hotel.active_pid.as_deref() {
         if let Ok(pid) = active_pid.parse::<u32>() {

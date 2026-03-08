@@ -73,6 +73,15 @@ pub struct HotelRecord {
     pub active_pid: Option<String>,
 }
 
+/// A durable agent identity/profile bundle stored in the Context Graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentIdentityRecord {
+    pub agent_id: String,
+    pub persona_name: String,
+    #[serde(default)]
+    pub bundle_json: serde_json::Value,
+}
+
 /// A generalized cross-component session record stored in the Context Graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
@@ -164,6 +173,11 @@ pub trait GraphStorage: Send + Sync {
 
     /// Bulk-insert or replace guest rows (used during initial seeding).
     fn seed_guests(&self, hotel_name: &str, guests: &[GuestRecord]) -> Result<()>;
+
+    // ── Agent identity bundles ───────────────────────────────────────
+
+    fn upsert_agent_identity(&self, identity: &AgentIdentityRecord) -> Result<()>;
+    fn get_agent_identity(&self, agent_id: &str) -> Result<Option<AgentIdentityRecord>>;
 
     // ── Memory apartments ────────────────────────────────────────────
 
