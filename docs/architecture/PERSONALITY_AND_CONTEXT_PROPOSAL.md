@@ -10,6 +10,8 @@ This proposal focuses on:
 - OpenClaw/ZeroClaw compatibility for existing agents
 - per-user continuity
 - memory and context layering
+- turn-time projection functions instead of static prompt blobs
+- different projection profiles for conversational agents, workers, and subagents
 - making the agent feel like someone, not just a routing success story
 
 ## Disposition
@@ -25,7 +27,27 @@ Track follow-on work in [task.md](/Users/jaredlikes/code/philotic-stack/docs/tas
 
 ## Core Recommendation
 
-Split Philotic prompt/context assembly into five intentional layers:
+Philotic should evaluate personality, user, and memory as turn-time projection functions.
+
+The minimal triad is:
+
+1. who am I
+2. who am I talking to
+3. what do I know that matters right now
+
+In implementation terms, that becomes:
+
+- `project_agent_self(turn_context)`
+- `project_user(turn_context)`
+- `project_knowledge(turn_context)`
+
+Those projections should then be composed with current session/runtime state.
+
+For now, the simplest implementation can still be fed by imported or authored text anchors. But the abstraction must be dynamic from day one.
+
+## Projection Layers
+
+The practical projection layers for the first implementation should be:
 
 1. soul
 2. identity
@@ -43,6 +65,34 @@ The key rule is:
 - session context defines what is happening right now
 
 If those layers are merged carelessly, personality becomes generic, memory becomes noisy, and the session prompt becomes a sentimental landfill.
+
+## Source, Model, Projection
+
+Philotic should explicitly distinguish:
+
+### 1. Source
+
+Imported or authored input.
+
+Examples:
+
+- `SOUL.md`
+- `IDENTITY.md`
+- `USER.md`
+- `MEMORY.md`
+- Philotic-authored records
+
+### 2. Model
+
+The internal representation.
+
+Initially this can be very light, but it should be separate from raw source text.
+
+### 3. Projection
+
+The evaluated turn-time output used for the current context window.
+
+This distinction matters because legacy files should be input only, not the final runtime ontology.
 
 ## Legacy Reference
 
@@ -173,6 +223,47 @@ It should include:
 
 This is the layer most similar to the current `SessionState::build_prompt()` behavior, but it should sit under the deeper personality layers.
 
+## Agent Modes
+
+Philotic should not assume every agent projection is socially identical.
+
+The same underlying substrate should support at least three broad projection profiles:
+
+### 1. Conversational Agent
+
+This is the agent you talk with and build continuity with.
+
+Projection emphasis:
+
+- strong selfhood
+- relationship continuity
+- adaptive style
+- richer personality expression
+
+### 2. Worker
+
+This is the agent you expect precision and dependable output from.
+
+Projection emphasis:
+
+- clarity
+- discipline
+- narrower personality expression
+- high legibility
+
+### 3. Subagent
+
+This is the bounded agent you want to complete a job.
+
+Projection emphasis:
+
+- task scope
+- low social overhead
+- minimal relationship projection
+- bounded context
+
+These should be treated as projection profiles, not entirely different species of mind.
+
 ## OpenClaw Compatibility
 
 Philotic should support importing existing agents from `openclaw.json` and related workspace files.
@@ -241,6 +332,24 @@ The assembly rule should be:
 
 - inject only what is relevant to the moment
 - prefer ranked retrieval and summaries over raw accumulation
+
+## Heuristic Direction
+
+Long-term, Philotic should move toward a heuristic mind model rather than a fixed schema of personality fields.
+
+That likely means:
+
+- stable anchors
+- memory-backed user fit
+- salience-driven knowledge projection
+- later:
+  - goals
+  - fears
+  - needs and wants
+  - relationships
+  - associations and jumps of logic
+
+But the first implementation should stay small and observable.
 
 ## Personality Guidance
 

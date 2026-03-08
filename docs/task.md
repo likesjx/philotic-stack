@@ -79,7 +79,12 @@
 
 - [ ] Review [PERSONALITY_AND_CONTEXT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PERSONALITY_AND_CONTEXT_PROPOSAL.md).
 - [ ] Review [ZEROCLAW_TO_PHILOTIC_BRIDGE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ZEROCLAW_TO_PHILOTIC_BRIDGE_PROPOSAL.md).
-- [ ] Refactor `agent-core` prompt assembly into explicit layers:
+- [ ] Review [HEURISTIC_MIND_AND_CONTEXT_PAPER.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/HEURISTIC_MIND_AND_CONTEXT_PAPER.md).
+- [ ] Refactor `agent-core` prompt assembly into turn-time projection functions:
+  - `project_agent_self`
+  - `project_user`
+  - `project_knowledge`
+- [ ] Compose those projections with explicit context layers:
   - soul
   - identity
   - user context
@@ -103,6 +108,10 @@
   - hippocampal / episodic memory
   - heuristic memory backends
   - tool-runner local indexes
+- [ ] Define projection profiles for:
+  - conversational agents
+  - workers
+  - subagents
 - [ ] Keep the first implementation slice personality-first; do not try to solve the full memory backend story in the same change.
 - [ ] Build the first ZeroClaw/OpenClaw bridge slice:
   - import one agent from `openclaw.json`
