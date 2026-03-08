@@ -976,7 +976,7 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
 fn is_pinned_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "workspace.list" | "workspace.read" | "workspace.write"
+        "workspace.list" | "workspace.read" | "workspace.search" | "workspace.write"
     )
 }
 
@@ -1097,9 +1097,7 @@ fn binding_preference_rank(
     bindings: &SessionBindings,
     binding: &ToolRunnerIncarnationBinding,
 ) -> u8 {
-    if bindings
-        .preferred_tool_runner_incarnation
-        .as_deref()
+    if bindings.preferred_tool_runner_incarnation.as_deref()
         == Some(binding.incarnation_id.as_str())
     {
         return 4;
@@ -1126,9 +1124,7 @@ fn selection_reason_for_binding(
         "requires_materialization"
     };
 
-    let computed = if bindings
-        .preferred_tool_runner_incarnation
-        .as_deref()
+    let computed = if bindings.preferred_tool_runner_incarnation.as_deref()
         == Some(binding.incarnation_id.as_str())
     {
         format!("preferred_incarnation_{suffix}")
@@ -1543,6 +1539,7 @@ mod tests {
         state.clear_tool_bindings();
         state.add_tool_binding("workspace.read");
         state.add_tool_binding("workspace.list");
+        state.add_tool_binding("workspace.search");
 
         let read_route = state
             .resolve_tool_route("workspace.read")
@@ -1550,11 +1547,16 @@ mod tests {
         let list_route = state
             .resolve_tool_route("workspace.list")
             .expect("workspace.list route should exist");
+        let search_route = state
+            .resolve_tool_route("workspace.search")
+            .expect("workspace.search route should exist");
 
         assert_eq!(read_route.execution_mode, "pinned");
         assert_eq!(list_route.execution_mode, "pinned");
+        assert_eq!(search_route.execution_mode, "pinned");
         assert_eq!(read_route.target_role, "tool.workspace.read");
         assert_eq!(list_route.target_role, "tool.workspace.list");
+        assert_eq!(search_route.target_role, "tool.workspace.search");
     }
 
     #[test]

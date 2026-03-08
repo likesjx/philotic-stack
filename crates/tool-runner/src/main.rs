@@ -3,6 +3,7 @@ use clap::Parser;
 use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
 use serde_json::json;
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 use tracing::{info, warn};
@@ -103,8 +104,111 @@ fn execute_tool(
                 Err(err) => format!("workspace.read error: {err}"),
             }
         }
+        "workspace.search" => {
+            let root = resolve_workspace_root(workspace_ref);
+            let query = arguments
+                .get("query")
+                .or_else(|| arguments.get("pattern"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let Some(query) = query else {
+                return "workspace.search error: missing `query`".into();
+            };
+            let requested = arguments
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(".");
+            let path = match resolve_workspace_path(&root, requested) {
+                Ok(path) => path,
+                Err(err) => return format!("workspace.search error: {err}"),
+            };
+            match search_workspace(&path, query) {
+                Ok(results) if results.is_empty() => {
+                    format!("workspace.search: no matches for `{query}`")
+                }
+                Ok(results) => results.join("\n"),
+                Err(err) => format!("workspace.search error: {err}"),
+            }
+        }
         _ => "unsupported tool".into(),
     }
+}
+
+fn search_workspace(root: &Path, query: &str) -> Result<Vec<String>, String> {
+    const MAX_RESULTS: usize = 50;
+    const MAX_FILE_BYTES: usize = 256 * 1024;
+
+    fn visit(
+        path: &Path,
+        root: &Path,
+        query: &str,
+        results: &mut Vec<String>,
+    ) -> Result<(), String> {
+        if results.len() >= MAX_RESULTS {
+            return Ok(());
+        }
+
+        let metadata = fs::metadata(path).map_err(|err| err.to_string())?;
+        if metadata.is_dir() {
+            let mut entries = fs::read_dir(path)
+                .map_err(|err| err.to_string())?
+                .filter_map(|entry| entry.ok())
+                .collect::<Vec<_>>();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                visit(&entry.path(), root, query, results)?;
+                if results.len() >= MAX_RESULTS {
+                    break;
+                }
+            }
+            return Ok(());
+        }
+
+        if !metadata.is_file() || metadata.len() as usize > MAX_FILE_BYTES {
+            return Ok(());
+        }
+
+        let relative = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string();
+
+        let file_name_matches = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.contains(query))
+            .unwrap_or(false);
+        if file_name_matches {
+            results.push(format!("{relative}: [filename match]"));
+            if results.len() >= MAX_RESULTS {
+                return Ok(());
+            }
+        }
+
+        let mut file = fs::File::open(path).map_err(|err| err.to_string())?;
+        let mut contents = String::new();
+        if file.read_to_string(&mut contents).is_err() {
+            return Ok(());
+        }
+
+        for (idx, line) in contents.lines().enumerate() {
+            if !line.contains(query) {
+                continue;
+            }
+            results.push(format!("{relative}:{}: {}", idx + 1, line.trim()));
+            if results.len() >= MAX_RESULTS {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    let mut results = Vec::new();
+    visit(root, root, query, &mut results)?;
+    Ok(results)
 }
 
 #[tokio::main]
@@ -119,6 +223,7 @@ async fn main() -> Result<()> {
             "echo".into(),
             "workspace.list".into(),
             "workspace.read".into(),
+            "workspace.search".into(),
         ],
     };
     let mut ipc_client = PhiloticClient::connect(identity).await?;
@@ -135,6 +240,11 @@ async fn main() -> Result<()> {
     let _ = ipc_client
         .send_request(IpcRequest::SubscribeInbox {
             role: "tool.workspace.read".into(),
+        })
+        .await?;
+    let _ = ipc_client
+        .send_request(IpcRequest::SubscribeInbox {
+            role: "tool.workspace.search".into(),
         })
         .await?;
 
@@ -268,5 +378,33 @@ mod tests {
             temp.path().to_str(),
         );
         assert!(output.contains("path traversal"));
+    }
+
+    #[test]
+    fn workspace_search_returns_matching_lines() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        fs::write(
+            temp.path().join("note.txt"),
+            "alpha\nremember this line\nomega\n",
+        )
+        .expect("write file");
+
+        let output = execute_tool(
+            "workspace.search",
+            &json!({ "path": ".", "query": "remember" }),
+            temp.path().to_str(),
+        );
+        assert!(output.contains("note.txt:2: remember this line"));
+    }
+
+    #[test]
+    fn workspace_search_requires_query() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let output = execute_tool(
+            "workspace.search",
+            &json!({ "path": "." }),
+            temp.path().to_str(),
+        );
+        assert!(output.contains("missing `query`"));
     }
 }

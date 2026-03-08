@@ -1312,7 +1312,7 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
 fn is_pinned_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "workspace.list" | "workspace.read" | "workspace.write"
+        "workspace.list" | "workspace.read" | "workspace.search" | "workspace.write"
     )
 }
 
