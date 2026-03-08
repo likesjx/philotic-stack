@@ -134,12 +134,13 @@ impl AgentRuntime {
             });
             state.set_active_turn_phase(TurnPhase::LoadingContext);
 
+            let tools_for_model = state.project_tools_for_turn(&content);
             (
                 state.checkpoint_memory_type(),
                 state.checkpoint_json(),
                 state.clone(),
-                state.build_prompt(&content),
-                state.tool_assembly.tools_for_model.clone(),
+                state.build_prompt_with_tools(&content, &tools_for_model),
+                tools_for_model,
             )
         };
 

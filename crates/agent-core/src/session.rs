@@ -344,7 +344,59 @@ impl SessionState {
         )
     }
 
+    pub fn project_tools_for_turn(&self, user_content: &str) -> Vec<ToolDefinition> {
+        let all_tools = self.tool_assembly.tools_for_model.clone();
+        if all_tools.is_empty() {
+            return all_tools;
+        }
+
+        let normalized = user_content.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            return all_tools;
+        }
+
+        if normalized.starts_with("/status")
+            || normalized.starts_with("/pause")
+            || normalized.starts_with("/resume")
+        {
+            let projected = all_tools
+                .iter()
+                .filter(|tool| tool.tool_name == "session.status")
+                .cloned()
+                .collect::<Vec<_>>();
+            return if projected.is_empty() {
+                all_tools
+            } else {
+                projected
+            };
+        }
+
+        let explicitly_named = all_tools
+            .iter()
+            .filter(|tool| tool_name_matches_goal(&tool.tool_name, &normalized))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !explicitly_named.is_empty() {
+            return explicitly_named;
+        }
+
+        if looks_like_conversational_goal(&normalized) {
+            return Vec::new();
+        }
+
+        all_tools
+    }
+
     pub fn build_prompt(&self, user_content: &str) -> String {
+        let projected_tools = self.project_tools_for_turn(user_content);
+        self.build_prompt_with_tools(user_content, &projected_tools)
+    }
+
+    pub fn build_prompt_with_tools(
+        &self,
+        user_content: &str,
+        projected_tools: &[ToolDefinition],
+    ) -> String {
         let mut prompt = String::from(
             "You are Jane, a hyper-intelligent Hegemon AI. Be concise, helpful, and context-aware.\n",
         );
@@ -394,10 +446,8 @@ impl SessionState {
                 self.bindings.effective_toolset.join(", ")
             ));
         }
-        if !self.tool_assembly.tools_for_model.is_empty() {
-            let abstract_tools = self
-                .tool_assembly
-                .tools_for_model
+        if !projected_tools.is_empty() {
+            let abstract_tools = projected_tools
                 .iter()
                 .map(|tool| tool.tool_name.as_str())
                 .collect::<Vec<_>>()
@@ -603,6 +653,28 @@ impl SessionState {
             active_turn,
         })
     }
+}
+
+fn looks_like_conversational_goal(normalized: &str) -> bool {
+    normalized.contains('?')
+        || [
+            "what", "why", "how", "who", "when", "tell me", "explain", "help me understand",
+            "i think", "i am thinking", "let's think", "can we talk",
+        ]
+        .iter()
+        .any(|prefix| normalized.starts_with(prefix))
+}
+
+fn tool_name_matches_goal(tool_name: &str, normalized: &str) -> bool {
+    let tool_name = tool_name.to_ascii_lowercase();
+    if normalized.contains(&tool_name) {
+        return true;
+    }
+
+    tool_name
+        .split(['.', '_', '-'])
+        .filter(|part| !part.is_empty())
+        .any(|part| normalized.contains(part))
 }
 
 pub fn session_checkpoint_memory_type(session_id: &str) -> String {
@@ -1183,6 +1255,35 @@ mod tests {
             .expect("local agent tool should have a route");
         assert_eq!(route.execution_mode, "local_agent");
         assert_eq!(route.target_role, "agent");
+    }
+
+    #[test]
+    fn conversational_turns_project_no_tools_by_default() {
+        let mut state = SessionState::new(
+            "sess-1".into(),
+            "agent-jane-01".into(),
+            "telegram".into(),
+        );
+        state.add_tool_binding("echo");
+
+        let projected = state.project_tools_for_turn("What do you think about this architecture?");
+        assert!(projected.is_empty());
+    }
+
+    #[test]
+    fn explicit_tool_mentions_project_matching_tools() {
+        let mut state = SessionState::new(
+            "sess-1".into(),
+            "agent-jane-01".into(),
+            "telegram".into(),
+        );
+        state.clear_tool_bindings();
+        state.add_tool_binding("echo");
+        state.add_tool_binding("session.status");
+
+        let projected = state.project_tools_for_turn("use echo hello there");
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].tool_name, "echo");
     }
 
     #[test]

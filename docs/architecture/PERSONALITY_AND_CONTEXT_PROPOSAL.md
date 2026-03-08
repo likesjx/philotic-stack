@@ -45,6 +45,14 @@ Those projections should then be composed with current session/runtime state.
 
 For now, the simplest implementation can still be fed by imported or authored text anchors. But the abstraction must be dynamic from day one.
 
+The same principle should apply to skills and tools:
+
+- full capability inventory is runtime truth
+- turn-local capability exposure should be projection-driven
+- if the current goal does not make a tool or skill relevant, it should usually stay out of the prompt/context window
+
+That keeps token usage lower and reduces the model’s temptation to fondle irrelevant machinery.
+
 ## Projection Layers
 
 The practical projection layers for the first implementation should be:
