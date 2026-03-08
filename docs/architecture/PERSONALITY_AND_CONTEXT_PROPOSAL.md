@@ -140,6 +140,14 @@ That separation is worth preserving:
 - curated durable memory
 - dynamic retrieval
 
+For Philotic, these legacy files should not all be projected equally into ordinary conversation.
+
+- `SOUL.md`, `IDENTITY.md`, and `USER.md` are valid source inputs for turn-time projection
+- `MEMORY.md` is a seed/retrieval source, not a wholesale prompt dump
+- `AGENTS.md` should be treated as operational/bootstrap guidance, not default conversational personality context
+
+If `AGENTS.md` is projected directly into ordinary chat turns, operational instructions and shell habits bleed into the agent voice, which is informative in exactly the wrong way.
+
 ## Proposed Personality Model
 
 ### 1. Soul

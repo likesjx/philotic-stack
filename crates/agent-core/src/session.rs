@@ -593,16 +593,6 @@ impl SessionState {
         }
         sections.push(envelope.trim_end().to_string());
 
-        if let Some(agents_text) = self
-            .agent_profile
-            .agents_text
-            .as_deref()
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-        {
-            sections.push(format!("[Workspace guidance]\n{agents_text}"));
-        }
-
         if let Some(memory_summary) = self
             .agent_profile
             .memory_summary
@@ -1320,7 +1310,6 @@ mod tests {
         assert!(prompt.contains("Identity anchor: Jane"));
         assert!(prompt.contains("Soul anchor: sharp, warm, witty."));
         assert!(prompt.contains("User anchor: Jared prefers direct collaboration."));
-        assert!(prompt.contains("Workspace rule: read the soul first."));
         assert!(prompt.contains("Memory seed: architecture matters."));
     }
 

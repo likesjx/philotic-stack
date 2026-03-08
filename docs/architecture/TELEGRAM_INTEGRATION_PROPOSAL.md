@@ -154,6 +154,28 @@ and then route them into either:
 - voice machine flow
 - hybrid text+voice flow
 
+## Future Communication Plane Thread: Nostr
+
+Nostr is worth keeping in the active design set as a possible communication-plane component.
+
+Why it is interesting:
+
+- decentralized relay model
+- key-based identity instead of platform accounts
+- naturally event-oriented transport
+- could support agent-to-agent or bot-to-bot communication without central platform dependency
+
+Why it is not an immediate implementation target:
+
+- public-by-default posture is awkward for internal coordination
+- encrypted DM ergonomics are still rough
+- relay trust, spam, and private topology questions need a security-first answer
+
+Current recommendation:
+
+- keep Nostr pinned as a research/design thread
+- revisit it as a possible external or decentralized communication-plane transport after the Telegram and core session/tooling paths are more mature
+
 ## Recommendation
 
 - raise slash commands to `hegemon` soon

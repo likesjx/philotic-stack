@@ -144,6 +144,7 @@
 - [ ] Telegram approval card UX: include request IDs, tool/action names, args summaries, and resolution messages in a more native Telegram approval experience.
 - [ ] Telegram streaming and media UX: define partial delivery, edits vs follow-up messages, and interruption behavior for Telegram replies.
 - [ ] Voice machine design: define STT, TTS, speech-to-speech, transcript generation, and media artifact/session handling.
+- [ ] Nostr communication-plane investigation: evaluate Nostr as a decentralized/event-native transport, with security and privacy-first scrutiny before any implementation.
 - [ ] Tool runner lifecycle policy: define idle retention, sleep/teardown timing, wake-up thresholds, and environment-specific materialization rules for routed tools.
 - [ ] Runner artifact plane: define builder trust, sandboxing, testing, signing, release, and distribution policy for executable tool runners.
 - [ ] Memory consolidation / dreaming: define how short-term session state becomes long-term memory, including sleep/dream cycles, compaction, and candidate memory backends such as `scryper/miniminddb`.
