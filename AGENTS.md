@@ -233,7 +233,23 @@ While working:
 - prefer the next reasonable action over broad exploratory questioning
 - pause when a decision has non-obvious architectural consequences
 
-## 9. Skills and Rules Optimization Loop
+## 9. Parallel Workstreams
+
+When multiple conversations or workstreams are active in parallel:
+
+- keep each conversation on one coherent slice or seam
+- state the workstream name, current goal, and explicit out-of-scope items near the start
+- avoid overlapping file ownership when possible, especially in:
+  - [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md)
+  - active architecture proposals
+  - hot runtime files
+- commit as soon as a slice becomes coherent so other threads can build on a stable checkpoint
+- let one thread own architectural boundary changes while other threads implement within those boundaries
+- capture assumption-vs-reality gaps quickly, because drift accelerates when work is parallel
+
+If two threads need the same files and the same architectural decisions at the same time, that is usually a seam problem, not a coordination failure.
+
+## 10. Skills and Rules Optimization Loop
 
 At the end of a meaningful slice, perform a brief check for:
 
@@ -244,7 +260,7 @@ At the end of a meaningful slice, perform a brief check for:
 
 Keep this lightweight. The process should improve continuously without becoming its own bureaucracy engine.
 
-## 10. Repository-Specific Notes
+## 11. Repository-Specific Notes
 
 - `legacy-zeroclaw/` is reference material, not active implementation. Do not modify it unless explicitly asked.
 - Prefer `rg` for file and text search.
@@ -252,7 +268,7 @@ Keep this lightweight. The process should improve continuously without becoming 
 - Keep architecture docs and task tracking current when decisions shift.
 - When changing runtime boundaries, prefer proving them with code and smokes before broadening the design story.
 
-## 11. Key References
+## 12. Key References
 
 - [CLAUDE.md](/Users/jaredlikes/code/philotic-stack/CLAUDE.md)
 - [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md)
