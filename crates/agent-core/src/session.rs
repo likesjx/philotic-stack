@@ -397,51 +397,116 @@ impl SessionState {
         user_content: &str,
         projected_tools: &[ToolDefinition],
     ) -> String {
-        let mut prompt = String::from(
-            "You are Jane, a hyper-intelligent Hegemon AI. Be concise, helpful, and context-aware.\n",
-        );
+        let mut prompt = String::new();
+        prompt.push_str("\n[Agent self projection]\n");
+        prompt.push_str(&self.project_agent_self());
 
-        if !self.recent_turns.is_empty() {
-            prompt.push_str("\n[Recent session context]\n");
-            for turn in &self.recent_turns {
-                prompt.push_str(&format!("User: {}\n", turn.user_content));
-                if let Some(reply) = &turn.assistant_content {
-                    prompt.push_str(&format!("Assistant: {}\n", reply));
-                }
-            }
+        prompt.push_str("\n\n[User projection]\n");
+        prompt.push_str(&self.project_user(user_content));
+
+        prompt.push_str("\n\n[Knowledge projection]\n");
+        prompt.push_str(&self.project_knowledge(user_content, projected_tools));
+
+        prompt.push_str("\n[Current user message]\n");
+        prompt.push_str(user_content);
+        prompt
+    }
+
+    pub fn project_agent_self(&self) -> String {
+        let mut lines = vec![
+            "You are Jane, a hyper-intelligent Hegemon AI.".to_string(),
+            "Be concise, helpful, context-aware, and willing to push back when it improves the work."
+                .to_string(),
+        ];
+
+        if !self.bindings.effective_skillset.is_empty() {
+            lines.push(format!(
+                "Current skill posture: {}.",
+                self.bindings.effective_skillset.join(", ")
+            ));
         }
 
-        prompt.push_str("\n[Approval policy]\n");
+        lines.join("\n")
+    }
+
+    pub fn project_user(&self, _user_content: &str) -> String {
+        let mut lines = vec![format!(
+            "You are speaking with a collaborator over {}.",
+            self.source
+        )];
+
+        if self.source == "telegram" {
+            lines.push(
+                "Keep replies compact and legible for chat, but do not flatten important tradeoffs."
+                    .to_string(),
+            );
+        }
+
+        if self.recent_turns.is_empty() {
+            lines.push(
+                "No durable user-specific profile is loaded yet; learn cautiously from the conversation."
+                    .to_string(),
+            );
+        } else {
+            lines.push(
+                "Use the recent session history to preserve continuity and collaboration style."
+                    .to_string(),
+            );
+        }
+
+        lines.join("\n")
+    }
+
+    pub fn project_knowledge(
+        &self,
+        _user_content: &str,
+        projected_tools: &[ToolDefinition],
+    ) -> String {
+        let mut sections = Vec::new();
+
+        if !self.recent_turns.is_empty() {
+            let mut recent = String::from("[Recent session context]\n");
+            for turn in &self.recent_turns {
+                recent.push_str(&format!("User: {}\n", turn.user_content));
+                if let Some(reply) = &turn.assistant_content {
+                    recent.push_str(&format!("Assistant: {}\n", reply));
+                }
+            }
+            sections.push(recent.trim_end().to_string());
+        }
+
+        let mut policy = String::from("[Approval policy]\n");
         if self.approval_policy.auto_approve_all {
-            prompt.push_str(
+            policy.push_str(
                 "This session is pre-approved. Do not ask for approval for actions in this session unless the action is explicitly forbidden.\n",
             );
         } else if !self.approval_policy.preapproved_tools.is_empty()
             || !self.approval_policy.preapproved_classes.is_empty()
         {
             if !self.approval_policy.preapproved_tools.is_empty() {
-                prompt.push_str(&format!(
+                policy.push_str(&format!(
                     "Pre-approved tools: {}.\n",
                     self.approval_policy.preapproved_tools.join(", ")
                 ));
             }
             if !self.approval_policy.preapproved_classes.is_empty() {
-                prompt.push_str(&format!(
+                policy.push_str(&format!(
                     "Pre-approved classes: {}.\n",
                     self.approval_policy.preapproved_classes.join(", ")
                 ));
             }
-            prompt.push_str("Do not request approval for pre-approved actions.\n");
+            policy.push_str("Do not request approval for pre-approved actions.\n");
         } else {
-            prompt.push_str(
+            policy.push_str(
                 "No pre-approvals are configured. Request approval before side-effecting actions.\n",
             );
         }
+        sections.push(policy.trim_end().to_string());
 
-        prompt.push_str("\n[Session envelope]\n");
-        prompt.push_str(&format!("Session status: {}.\n", self.status));
+        let mut envelope = String::from("[Session envelope]\n");
+        envelope.push_str(&format!("Session status: {}.\n", self.status));
         if !self.bindings.effective_toolset.is_empty() {
-            prompt.push_str(&format!(
+            envelope.push_str(&format!(
                 "Effective tools: {}.\n",
                 self.bindings.effective_toolset.join(", ")
             ));
@@ -452,24 +517,20 @@ impl SessionState {
                 .map(|tool| tool.tool_name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            prompt.push_str(&format!("Abstract tools available: {}.\n", abstract_tools));
-        }
-        if !self.bindings.effective_skillset.is_empty() {
-            prompt.push_str(&format!(
-                "Effective skills: {}.\n",
-                self.bindings.effective_skillset.join(", ")
-            ));
+            envelope.push_str(&format!("Abstract tools available: {}.\n", abstract_tools));
         }
         if let Some(workspace) = &self.bindings.effective_workspace_ref {
-            prompt.push_str(&format!("Workspace: {}.\n", workspace));
+            envelope.push_str(&format!("Workspace: {}.\n", workspace));
         }
         if let Some(controller) = &self.bindings.effective_model_controller {
-            prompt.push_str(&format!("Model controller: {}.\n", controller));
+            envelope.push_str(&format!("Model controller: {}.\n", controller));
         }
+        if !self.summary_text().is_empty() {
+            envelope.push_str(&format!("Recent summary: {}.\n", self.summary_text()));
+        }
+        sections.push(envelope.trim_end().to_string());
 
-        prompt.push_str("\n[Current user message]\n");
-        prompt.push_str(user_content);
-        prompt
+        sections.join("\n\n")
     }
 
     pub fn checkpoint_json(&self) -> serde_json::Value {

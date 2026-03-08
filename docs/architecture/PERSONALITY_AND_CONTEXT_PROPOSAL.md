@@ -16,7 +16,7 @@ This proposal focuses on:
 
 ## Disposition
 
-Proposed and pinned for the next personality-focused slice.
+Accepted for the current slice. Initial turn-time projection scaffolding is now implemented in `agent-core`, but it is still fed by simple in-process state rather than imported legacy inputs or richer memory projection.
 
 Research basis:
 
@@ -24,6 +24,20 @@ Research basis:
 - ZeroClaw also keeps a separate dynamic memory-loader seam for retrieved context instead of dumping all memory into the bootstrap prompt
 
 Track follow-on work in [task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md).
+
+## Current Slice
+
+Land the first honest projection boundary in `agent-core`:
+
+- refactor prompt assembly around:
+  - `project_agent_self`
+  - `project_user`
+  - `project_knowledge`
+- keep the first implementation simple and local
+- preserve existing runtime behavior while creating a clean seam for later:
+  - legacy input import
+  - user-specific profile projection
+  - Muninn or other memory-backed knowledge projection
 
 ## Core Recommendation
 
