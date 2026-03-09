@@ -8,7 +8,7 @@ use crate::event::{EventEnvelope, EventId, EventKind, EventPayload};
 use crate::graph::{GraphEdge, GraphNode};
 use crate::storage::{
     CursorStorage, EventStorage, GraphAdapter, GraphStorage, GuestRecord, HotelRecord,
-    SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,
+    SecretRecord, SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,
 };
 use crate::NodeCapabilities;
 use anyhow::{Context, Result};
@@ -494,6 +494,18 @@ impl SqliteGraphStorage {
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
 
+            CREATE TABLE IF NOT EXISTS vault_secrets (
+                secret_ref TEXT PRIMARY KEY,
+                secret_kind TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                allowed_roles_json TEXT NOT NULL,
+                allowed_guests_json TEXT NOT NULL,
+                ciphertext_b64 TEXT NOT NULL,
+                nonce_b64 TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS hotels (
                 hotel_name TEXT PRIMARY KEY,
                 capabilities_json TEXT NOT NULL,
@@ -669,6 +681,66 @@ impl GraphStorage for SqliteGraphStorage {
                 "value_json": value_json,
             }),
         })
+    }
+
+    fn upsert_secret(&self, secret: &SecretRecord) -> Result<()> {
+        let allowed_roles_json = serde_json::to_string(&secret.allowed_roles)?;
+        let allowed_guests_json = serde_json::to_string(&secret.allowed_guests)?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO vault_secrets (
+                secret_ref, secret_kind, scope, allowed_roles_json, allowed_guests_json,
+                ciphertext_b64, nonce_b64, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ON CONFLICT(secret_ref) DO UPDATE SET
+                secret_kind = excluded.secret_kind,
+                scope = excluded.scope,
+                allowed_roles_json = excluded.allowed_roles_json,
+                allowed_guests_json = excluded.allowed_guests_json,
+                ciphertext_b64 = excluded.ciphertext_b64,
+                nonce_b64 = excluded.nonce_b64,
+                updated_at = excluded.updated_at",
+            params![
+                secret.secret_ref,
+                secret.secret_kind,
+                secret.scope,
+                allowed_roles_json,
+                allowed_guests_json,
+                secret.ciphertext_b64,
+                secret.nonce_b64,
+                secret.created_at,
+                secret.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn get_secret(&self, secret_ref: &str) -> Result<Option<SecretRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT
+                secret_kind, scope, allowed_roles_json, allowed_guests_json,
+                ciphertext_b64, nonce_b64, created_at, updated_at
+             FROM vault_secrets
+             WHERE secret_ref = ?1",
+        )?;
+        let mut rows = stmt.query(params![secret_ref])?;
+
+        if let Some(row) = rows.next()? {
+            Ok(Some(SecretRecord {
+                secret_ref: secret_ref.to_string(),
+                secret_kind: row.get(0)?,
+                scope: row.get(1)?,
+                allowed_roles: serde_json::from_str::<Vec<String>>(&row.get::<_, String>(2)?)?,
+                allowed_guests: serde_json::from_str::<Vec<String>>(&row.get::<_, String>(3)?)?,
+                ciphertext_b64: row.get(4)?,
+                nonce_b64: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+            }))
+        } else {
+            Ok(None)
+        }
     }
 
     fn get_hotel(&self, hotel_name: &str) -> Result<Option<HotelRecord>> {

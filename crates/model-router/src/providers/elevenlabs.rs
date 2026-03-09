@@ -27,11 +27,12 @@ impl ElevenLabsProvider {
     }
 
     fn resolve_voice_id<'a>(&'a self, task: &'a ControllerTask) -> Result<&'a str> {
-        task.voice_id
-            .as_deref()
+        task.requested_voice()
             .or(self.default_voice_id.as_deref())
+            .or(task.provider_option_str("voice"))
+            .or(task.provider_option_str("voice_id"))
             .context(
-                "ElevenLabs voice.synthesize task is missing voice_id and no default is configured",
+                "ElevenLabs voice.synthesize task is missing voice override and no default is configured",
             )
     }
 
@@ -49,12 +50,29 @@ impl ElevenLabsProvider {
             body["language_code"] = Value::String(language_code.to_string());
         }
 
+        if let Some(seed) = task.provider_options.get("seed").cloned() {
+            body["seed"] = seed;
+        }
+
+        if let Some(previous_text) = task.provider_option_str("previous_text") {
+            body["previous_text"] = Value::String(previous_text.to_string());
+        }
+
+        if let Some(next_text) = task.provider_option_str("next_text") {
+            body["next_text"] = Value::String(next_text.to_string());
+        }
+
+        if let Some(voice_settings) = task.provider_options.get("voice_settings").cloned() {
+            body["voice_settings"] = voice_settings;
+        }
+
         Ok(body)
     }
 
     fn output_format<'a>(&'a self, task: &'a ControllerTask) -> &'a str {
         task.output_format
             .as_deref()
+            .or(task.provider_option_str("output_format"))
             .unwrap_or(&self.default_output_format)
     }
 }
@@ -131,30 +149,42 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn request_body_uses_text_and_model() {
+    fn request_body_prefers_spoken_text_and_includes_provider_options() {
         let provider = ElevenLabsProvider::new(reqwest::Client::new(), None, None);
         let task = ControllerTask::from_value(&json!({
             "kind": "voice.synthesize",
-            "text": "hello",
-            "model": "eleven_flash_v2_5"
+            "text": "display",
+            "spoken_text": "perform this expressively",
+            "model": "eleven_v3",
+            "provider_options": {
+                "previous_text": "before",
+                "next_text": "after",
+                "voice_settings": {
+                    "stability": 0.4
+                }
+            }
         }))
         .unwrap();
 
         let body = provider.request_body(&task).unwrap();
-        assert_eq!(body["text"], "hello");
-        assert_eq!(body["model_id"], "eleven_flash_v2_5");
+        assert_eq!(body["text"], "perform this expressively");
+        assert_eq!(body["model_id"], "eleven_v3");
+        assert_eq!(body["previous_text"], "before");
+        assert_eq!(body["next_text"], "after");
+        assert_eq!(body["voice_settings"]["stability"], 0.4);
     }
 
     #[test]
-    fn resolves_default_voice_when_task_is_missing_one() {
+    fn resolves_request_voice_before_default_voice() {
         let provider =
             ElevenLabsProvider::new(reqwest::Client::new(), None, Some("default-voice".into()));
         let task = ControllerTask::from_value(&json!({
             "kind": "voice.synthesize",
-            "text": "hello"
+            "text": "hello",
+            "voice": "override-voice"
         }))
         .unwrap();
 
-        assert_eq!(provider.resolve_voice_id(&task).unwrap(), "default-voice");
+        assert_eq!(provider.resolve_voice_id(&task).unwrap(), "override-voice");
     }
 }

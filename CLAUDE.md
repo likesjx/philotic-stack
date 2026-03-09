@@ -20,9 +20,38 @@ just start-ansible          # build + start hotel daemon (requires mesh-config.j
 just start-gateway          # cargo run -p hegemon
 just start-agent            # cargo run -p agent-core
 just start-model            # cargo run -p model-router
+
+# Parallel workstreams
+just workstream-start <slug>    # create the sibling worktree and print the checklist
+just workstream-status <slug>   # show git status + changed files + hot-file overlap
+just workstream-overlap <slug>  # show only risky overlap vs origin/main
 ```
 
 The hotel daemon requires `mesh-config.json` in the project root — copy from `mesh-config.example.json` and fill in credentials before running.
+
+## Parallel Workstreams
+
+Treat a worktree as the unit of an implementation conversation.
+
+- one active implementation thread -> one `codex/<slug>` branch
+- one `codex/<slug>` branch -> one sibling worktree
+- do not continue multiple active implementation conversations in the same checkout
+
+Before touching hot runtime files in a worktree:
+
+```bash
+just workstream-status <slug>
+```
+
+Before opening a PR from a worktree:
+
+```bash
+just workstream-overlap <slug>
+```
+
+Hot files include `crates/ansible/src/main.rs`, `crates/ansible/src/service/ipc.rs`, `crates/agent-core/src/runtime.rs`, `crates/hegemon/src/main.rs`, `crates/model-router/*`, `crates/philotic-client/src/lib.rs`, `crates/ansible/README.md`, `docs/task.md`, and `docs/architecture/MODEL_CONTROLLER_PROPOSAL.md`.
+
+See [docs/operations/parallel-worktree-runbook.md](docs/operations/parallel-worktree-runbook.md).
 
 ## Architecture
 

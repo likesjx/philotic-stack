@@ -47,25 +47,113 @@
 
 ## New Project: Model Controller
 
-- [x] Define the controller seam so mesh routing (`model.manager.*`) and provider invocation have separate owners.
-- [x] Treat `model-router` as shared SDK/runtime infrastructure instead of the single materialized model guest.
-- [x] Add a provider abstraction in `crates/model-router` and move Gemini invocation behind it.
-- [x] Add separate materialized controller guests for Gemini (`model.gemini`) and ElevenLabs (`model.elevenlabs`).
-- [x] Point the current text-generation path at the Gemini-specific controller role so multiple model guests do not all receive the same task.
-- [x] Add a hotel-startup self-test path for routed ElevenLabs voice synthesis via `ansible --test voice-sample`.
-- [x] Add a hotel-startup self-test path for text model-controller round-trips via `ansible --test text-roundtrip`.
+- [ ] Review [MODEL_CONTROLLER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack-model-controller-abstraction/docs/architecture/MODEL_CONTROLLER_PROPOSAL.md).
+- [x] Land the first `voice.synthesize` request envelope with `display_text`, `spoken_text`, `voice`, `model`, and `provider_options`.
+- [x] Add an upstream producer example that emits the richer `voice.synthesize` envelope through the hotel.
+- [ ] Define the canonical capability envelope for:
+  - `text.generate`
+  - `voice.synthesize`
+  - `voice.dialogue`
+  - `sound.generate`
+  - `music.generate`
+  - `response.generate`
+- [x] Propose the first structured model request envelope split:
+  - `response_contract`
+  - `context`
+  - `affordances`
+  - `routing_hints`
+  - `provider_options`
+- [x] Implement the first compatibility-first structured model envelope seam in `model-router`.
+- [x] Propose the first structured model response envelope split:
+  - `result`
+  - `artifacts`
+  - `trace`
+  - `provider_output`
+- [x] Define optimization-oriented response channels:
+  - `display_text`
+  - `spoken_text`
+  - `working_memory_delta`
+  - `follow_up_questions`
+  - `intent_summary`
+  - `state_updates`
+  - `delivery_hints`
+- [x] Define canonical context layers for model requests:
+  - `instructions`
+  - `identity`
+  - `memory`
+  - `dialogue_window`
+  - `active_turn`
+  - `attachments`
+- [x] Decide that tools and skills should project separately from semantic context under `affordances`.
+- [x] Implement the first compatibility-first structured model response seam in `model-router`.
+- [x] Preserve a first-class minimal prompt-response path with the structured envelope fields remaining mostly optional.
+- [x] Add initial `response_contract.channels` handling for text-generation requests.
+- [x] Add first structured response fields for:
+  - `display_text`
+  - `spoken_text`
+  - `working_memory_delta`
+  - `follow_up_questions`
+- [ ] Add `spoken_text` / expressive speech projection alongside user-visible text.
+- [ ] Define ElevenLabs default-voice pinning plus upstream voice override behavior.
+- [ ] Add Eleven v3 model selection and expressive-tag support without pretending it is the same as the low-latency conversational path.
+- [ ] Define how native-audio multimodal models emit text plus audio without being forced through TTS.
+- [ ] Define Gemini auth modes:
+  - hotel-managed OAuth
+  - API key fallback
+  - possible ADC path
+- [x] Add the first Gemini guest auth abstraction that prefers OAuth bearer config over API key fallback.
+- [x] Add `ansible --test` startup harness support for:
+  - `text-roundtrip`
+  - `gemini-oauth-roundtrip`
+  - `telegram-roundtrip`
+  - `voice-sample`
+- [x] Add a startup-driven model-controller smoke script for the text round-trip path.
+- [x] Add a startup-driven Gemini OAuth smoke through the materialized model-controller guest.
 - [x] Add a hotel-startup Telegram controller smoke via `ansible --test telegram-roundtrip` using a local fake Telegram API.
 - [x] Extend the startup Telegram smoke so it simulates text, photo, and voice-note ingress and exercises fake-Gemini multimodal requests on top of blob-backed media transport.
-- [ ] Define the canonical model task envelope for text, voice, structured output, and future multimodal requests.
-- [ ] Add first-class audio artifact delivery from model controller through agent/hegemon or the future voice machine.
-- [ ] Define the agent/model outbound rich-text contract so `agent-core` is not forced to emit transport-specific Markdown quirks for Telegram, WhatsApp, or future hegemon transports.
-- [ ] Decide whether ElevenLabs stays in the model controller long-term or moves wholly behind the dedicated voice machine.
+- [ ] Define hotel CLI OAuth UX:
+  - browser launch
+  - temporary localhost callback listener
+  - token exchange
+  - token storage/refresh
+  - guest handoff
+- [x] Add a transitional `ansible auth google start --provider gemini` flow with browser launch, localhost callback, token exchange, and access-token persistence.
+- [x] Add a hotel-side Gemini OAuth validation command that performs a real model call with the stored auth path.
+- [x] Refresh model-controller provider config per task so updated Gemini auth takes effect without a guest restart.
+- [ ] Run a Keychain-backed Gemini OAuth smoke with `PHILOTIC_VAULT_MASTER_KEY` unset.
+- [x] Run a full guest-path Gemini OAuth smoke through the materialized model-controller, not just hotel-side validation.
+- [ ] Wire refresh-token persistence and refresh lifecycle behind the hotel vault.
+- [ ] Deliver an honest ElevenLabs end-to-end voice path beyond inline-audio/testing mode.
+
+## New Project: Key Vault
+
+- [ ] Review [KEY_VAULT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack-model-controller-abstraction/docs/architecture/KEY_VAULT_PROPOSAL.md).
+- [x] Define the first vault record schema and context-graph secret references.
+- [x] Begin removing new OAuth access-token storage from plain `node_config` by storing secret refs instead.
+- [x] Define and implement the first hotel-local secret fetch API for guests.
+- [x] Define and implement the first envelope-encryption and root-key strategy:
+  - OS keychain / TPM / Secure Enclave preferred
+  - cloud KMS/HSM for hosted hotels
+  - operator master key only as fallback
+- [ ] Replace the current local root-key bootstrap with stronger platform-native backing beyond basic macOS Keychain item storage.
+- [ ] Define secret lifecycle:
+  - create
+  - stage
+  - rotate
+  - revoke
+  - rollback
+- [ ] Move Gemini OAuth refresh tokens behind vault references.
+- [x] Move Gemini OAuth access tokens behind vault references for model-controller consumption.
+- [ ] Define Telegram-safe secret onboarding:
+  - control-plane command in chat
+  - Mini App or secure browser handoff
+  - no plaintext secret entry in normal chat messages
+- [ ] Define Telegram-safe rotation UX and operator approvals.
 
 ## Next Project: Tool Assembly and Routed Execution
 
 - [ ] Review [TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md).
 - [ ] Review [TOOL_MANAGEMENT_PLANE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TOOL_MANAGEMENT_PLANE_PROPOSAL.md).
-- [ ] Review [TASK_RUNNER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TASK_RUNNER_PROPOSAL.md).
 - [ ] Review [RUNNER_ARTIFACT_BUILD_DISTRIBUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RUNNER_ARTIFACT_BUILD_DISTRIBUTION_PROPOSAL.md).
 - [x] Introduce a first-class `ToolAssembly` model with model-facing tool definitions and runtime-facing execution routes.
 - [ ] Formalize the system tool management plane in the Context Graph:
@@ -78,11 +166,6 @@
 - [x] Move real tool execution out of `agent-core` and behind routed tool runners/toolset components.
 - [ ] Add runner readiness/materialization checks during tool assembly.
 - [ ] Add environment-aware runner routing and materialization policy so tools can target non-IPC execution environments when needed.
-- [ ] Define task-runner specialization for environment-bound execution:
-  - workspace runners
-  - shell runners
-  - runner base config + agent/session overlays
-  - unreachable-incarnation handling in routing/materialization policy rather than inside the runner
 - [x] Keep local config/session mutation commands in `agent-core`, but externalize real tool execution.
 - [x] Let session-scoped allowed runner incarnations derive visible tools and preassembled execution routes.
 - [x] Add execution taxonomy for routed tools:
@@ -100,48 +183,6 @@
   - preferred runner
   - route selection reason in `tool_assembly`
 - [ ] Add runner fallback policy and smarter reroute behavior when the preferred route cannot materialize or should be bypassed.
-
-## New Work Item: Telegram Controller
-
-- [x] Research current Telegram Bot API capabilities and identify the transport boundary opportunity.
-- [x] Review webhook ingress with a security-first lens before treating it as a default inbound mode.
-- [x] Accept [TELEGRAM_INTEGRATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_INTEGRATION_PROPOSAL.md) for the current slice:
-  - polling remains the default ingress
-  - webhook support is deferred behind an explicit security contract
-- [x] Review [HEGEMON_COMPONENT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/HEGEMON_COMPONENT_PROPOSAL.md).
-- [x] Define `hegemon` as a component type with transport-specific implementations rather than a single Telegram-named implementation.
-- [x] Mark the generic `final_reply_role = "hegemon"` routing path as transitional and define the first replacement step:
-  - optional guest-specific local delivery via `target_guest_id`
-  - optional turn-level `final_reply_guest_id` preserved through agent/model/hegemon flow
-- [x] Define how session bindings identify the owning hegemon component/incarnation for outbound delivery.
-- [x] Define the normalized Telegram ingress envelope and prove it on the current text polling path.
-- [x] Expand `hegemon` polling ingestion beyond `message.text` while keeping one canonical transport-normalization path.
-- [x] Add an initial Telegram media transport step on top of normalized attachment metadata:
-  - resolve Telegram `file_id` values via `getFile`
-  - download attachment bytes
-  - upload them into the hotel blob service and attach blob refs to the envelope
-- [ ] Extend Telegram media transport:
-  - watched live validation against real Telegram media
-  - specialized downstream transcription/vision routing on top of the initial blob-backed media-analysis path
-- [x] Add an initial downstream media-analysis path on top of blob-backed Telegram attachments:
-  - route supported blob-backed attachments through `agent-core` as `media.analyze`
-  - let the Gemini model-controller consume blob-backed media bytes for first-pass analysis
-  - keep specialized voice transcription and richer vision workflows as follow-on work
-- [x] Add an initial Telegram outbound formatting projector in `hegemon`:
-  - translate a supported Markdown subset into Telegram-safe HTML `parse_mode`
-  - apply it to outbound `sendMessage` replies
-- [ ] Extend Telegram outbound formatting projection:
-  - move from HTML-only projection toward explicit `entities` where it improves reliability
-  - account for Telegram text and caption length limits with chunking or fallback behavior
-- [ ] Elevate deterministic Telegram slash commands into `hegemon` before the normal agent loop.
-- [ ] Add Telegram delivery primitives for typing state, partial streaming, and final message commit.
-- [ ] Specify webhook config shape and verification behavior:
-  - Telegram secret-token enforcement
-  - request size/time limits
-  - update dedupe/idempotency
-  - tunnel/proxy deployment guidance
-- [ ] Add targeted tests for Telegram normalization and webhook security gates.
-- [ ] Run a Telegram smoke pass for command routing and partial/final delivery before broadening the transport story.
 
 ## Next Project: Personality and Context
 
@@ -216,13 +257,13 @@
 - [ ] Approval UX evolution: add `/preapprove`, `/approval status`, `/approval reset`, and richer session policy editing for constrained transports like Telegram.
 - [ ] Review [TELEGRAM_INTEGRATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_INTEGRATION_PROPOSAL.md).
 - [ ] Review [VOICE_MACHINE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/VOICE_MACHINE_PROPOSAL.md).
+- [ ] Telegram slash-command elevation: raise deterministic `/commands` into `hegemon` before the normal agent loop so Telegram-side testing and operational control become faster and cleaner.
 - [ ] Telegram approval card UX: include request IDs, tool/action names, args summaries, and resolution messages in a more native Telegram approval experience.
+- [ ] Telegram streaming and media UX: define partial delivery, edits vs follow-up messages, and interruption behavior for Telegram replies.
 - [ ] Voice machine design: define STT, TTS, speech-to-speech, transcript generation, and media artifact/session handling.
 - [ ] Nostr communication-plane investigation: evaluate Nostr as a decentralized/event-native transport, with security and privacy-first scrutiny before any implementation.
-- [ ] Loop incarnations and delegation model: explore whether different agent loops should materialize as specialized agent incarnations, and define how delegation, subagents, and loop-specialized workers relate to the primary conversational agent.
 - [ ] Tool runner lifecycle policy: define idle retention, sleep/teardown timing, wake-up thresholds, and environment-specific materialization rules for routed tools.
 - [ ] Runner artifact plane: define builder trust, sandboxing, testing, signing, release, and distribution policy for executable tool runners.
-- [ ] Review [RUST_FORGE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RUST_FORGE_PROPOSAL.md) and decide whether a sandboxed `forge` runner family should eventually scaffold, build, publish, and propose mesh integration for Rust-based components.
 - [ ] Memory consolidation / dreaming: define how short-term session state becomes long-term memory, including sleep/dream cycles, compaction, and candidate memory backends such as `scryper/miniminddb`.
 
 ## MVP 1: Single-Node Mesh & Basic Tools

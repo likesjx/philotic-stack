@@ -27,6 +27,10 @@ pub enum IpcRequest {
     GetConfig {
         key: String,
     },
+    /// Ask the Hotel vault for a decrypted secret value by secret ref
+    GetSecret {
+        secret_ref: String,
+    },
     /// Section 6 Blueprint Operations
     PublishMessage {
         target_role: String,
@@ -87,6 +91,10 @@ pub enum IpcResponse {
     },
     ConfigData {
         key: String,
+        value_json: Option<String>,
+    },
+    SecretData {
+        secret_ref: String,
         value_json: Option<String>,
     },
     InboundTask {
@@ -203,6 +211,8 @@ impl PhiloticClient {
             .unwrap_or_else(|_| "/tmp/philotic-ansible.sock".to_string())
     }
 
+    /// Connect to the local Ansible daemon automatically, driven by environment variables.
+    /// Default Hotel socket is `/tmp/philotic-ansible.sock` unless `PHILOTIC_HOTEL_SOCKET` is specified.
     pub async fn connect_at(socket_path: impl AsRef<str>, identity: GuestIdentity) -> Result<Self> {
         let socket_path = socket_path.as_ref().to_string();
         let stream = UnixStream::connect(&socket_path)
