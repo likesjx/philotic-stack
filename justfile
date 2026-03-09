@@ -66,6 +66,38 @@ status:
 format:
     cargo fmt --all
 
+# Create a dedicated Codex worktree for an active thread.
+worktree-create slug base="main":
+    ./scripts/codex-worktree.sh create {{slug}} {{base}}
+
+# Bootstrap an implementation workstream with a dedicated sibling worktree and checklist.
+workstream-start slug base="main":
+    ./scripts/codex-workstream.sh start {{slug}} {{base}}
+
+# Show git status plus hot-file overlap for an active workstream.
+workstream-status slug compare_ref="origin/main":
+    ./scripts/codex-workstream.sh status {{slug}} {{compare_ref}}
+
+# Show only hot-file overlap for an active workstream.
+workstream-overlap slug compare_ref="origin/main":
+    ./scripts/codex-workstream.sh overlap {{slug}} {{compare_ref}}
+
+# List registered git worktrees for this repo.
+worktree-list:
+    ./scripts/codex-worktree.sh list
+
+# Print the sibling-path convention for a worktree slug.
+worktree-path slug:
+    ./scripts/codex-worktree.sh path {{slug}}
+
+# Remove a dedicated Codex worktree when the thread is done.
+worktree-remove slug delete_branch="":
+    ./scripts/codex-worktree.sh remove {{slug}} {{delete_branch}}
+
+# Prune stale git worktree metadata.
+worktree-prune:
+    ./scripts/codex-worktree.sh prune
+
 # Run tests
 test:
     cargo test --workspace

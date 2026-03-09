@@ -1,5 +1,10 @@
 {
-  "local_node": "local-ansible-01",
-  "bot_token": "YOUR_TELEGRAM_BOT_TOKEN_HERE",
-  "gemini_api_key": "YOUR_GEMINI_API_KEY_HERE"
+  "context_graph": {
+    "telegram_bot_token": "YOUR_TELEGRAM_BOT_TOKEN_HERE",
+    "gemini_api_key": "YOUR_GEMINI_API_KEY_HERE",
+    "elevenlabs_api_key": "YOUR_ELEVENLABS_API_KEY_HERE",
+    "elevenlabs_voice_id": "YOUR_DEFAULT_ELEVENLABS_VOICE_ID_HERE",
+    "telegram_allowed_users": ["JaneHegemonBot"],
+    "default_model": "gemini-pro"
+  }
 }

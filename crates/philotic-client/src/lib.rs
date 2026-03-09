@@ -230,7 +230,6 @@ impl PhiloticClient {
             pending_push: VecDeque::new(),
         };
 
-        // Execute the Registration Handshake
         info!("Registering as Materialized Guest: {:?}", identity);
         let resp = client.send_request(IpcRequest::Register(identity)).await?;
         info!("Ansible Hotel Registration Response: {:?}", resp);
@@ -242,9 +241,7 @@ impl PhiloticClient {
             IpcResponse::Error(msg) => {
                 anyhow::bail!("Hotel rejected registration: {}", msg);
             }
-            _ => {
-                // Success
-            }
+            _ => {}
         }
 
         Ok(client)
@@ -333,6 +330,7 @@ impl PhiloticClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::ErrorKind;
     use std::path::Path;
     use std::sync::{LazyLock, Mutex as StdMutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -554,5 +552,11 @@ mod tests {
         if Path::new(&socket_path).exists() {
             let _ = std::fs::remove_file(&socket_path);
         }
+    }
+
+    #[test]
+    fn disconnect_detection_matches_unexpected_eof() {
+        let err = anyhow::Error::new(std::io::Error::from(ErrorKind::UnexpectedEof));
+        assert!(is_ipc_disconnect(&err));
     }
 }

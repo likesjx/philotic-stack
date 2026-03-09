@@ -237,6 +237,7 @@ While working:
 
 When multiple conversations or workstreams are active in parallel:
 
+- use one dedicated git worktree per active implementation thread; do not share one filesystem checkout across multiple active slices
 - keep each conversation on one coherent slice or seam
 - state the workstream name, current goal, and explicit out-of-scope items near the start
 - avoid overlapping file ownership when possible, especially in:
@@ -246,6 +247,12 @@ When multiple conversations or workstreams are active in parallel:
 - commit as soon as a slice becomes coherent so other threads can build on a stable checkpoint
 - let one thread own architectural boundary changes while other threads implement within those boundaries
 - capture assumption-vs-reality gaps quickly, because drift accelerates when work is parallel
+
+Use the repo-local worktree workflow in [parallel-worktree-runbook.md](/Users/jaredlikes/code/philotic-stack/docs/operations/parallel-worktree-runbook.md), and prefer:
+
+- `just workstream-start <slug>`
+- `just workstream-status <slug>`
+- `just workstream-overlap <slug>`
 
 If two threads need the same files and the same architectural decisions at the same time, that is usually a seam problem, not a coordination failure.
 

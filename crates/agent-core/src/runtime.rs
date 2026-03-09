@@ -4,11 +4,12 @@ use crate::r#loop::{
     interpret_tool_result,
 };
 use crate::protocol::{
-    FinalReplyPayload, InboundTaskPayload, ModelRequestPayload, ToolExecutionPayload,
+    FinalReplyPayload, InboundTaskPayload, ModelRequestPayload, TaskRunnerOverlay,
+    ToolExecutionPayload, TransportAttachment,
 };
 use crate::session::{SessionState, ToolExecutionRoute, WorkingTurn, merge_session_index};
 use anyhow::Result;
-use philotic_client::{IpcRequest, IpcResponse, PhiloticClient};
+use philotic_client::{IpcRequest, IpcResponse, PhiloticClient, is_ipc_disconnect};
 use std::collections::HashMap;
 use std::time::Duration;
 use tracing::{error, info, warn};
@@ -17,6 +18,109 @@ use uuid::Uuid;
 pub const AGENT_ID: &str = "agent-jane-01";
 const DEFAULT_REPLY_ROLE: &str = "hegemon";
 const LOCAL_NODE: &str = "local-ansible-01";
+const DEFAULT_TEXT_MODEL_ROLE: &str = "model.gemini";
+
+fn implementation_to_model_role(implementation: &str) -> String {
+    let normalized = implementation
+        .split(['.', '-', '@', '/'])
+        .find(|segment| !segment.is_empty())
+        .unwrap_or("gemini");
+    format!("model.{normalized}")
+}
+
+fn normalized_user_content(task: &InboundTaskPayload) -> Option<String> {
+    if let Some(content) = task
+        .content
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(content.to_string());
+    }
+
+    if let Some(callback_data) = task
+        .callback_data
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(format!("Callback action: {callback_data}"));
+    }
+
+    if !task.attachments.is_empty() {
+        let summaries = task
+            .attachments
+            .iter()
+            .map(describe_transport_attachment)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let message_kind = task.message_kind.as_deref().unwrap_or("attachment");
+        return Some(format!(
+            "User sent a {message_kind} message with attachments: {summaries}."
+        ));
+    }
+
+    task.message_kind
+        .as_deref()
+        .map(|message_kind| format!("User sent a {message_kind} message."))
+}
+
+fn describe_transport_attachment(attachment: &TransportAttachment) -> String {
+    let mut parts = vec![attachment.kind.clone()];
+    if let Some(file_name) = attachment
+        .file_name
+        .as_deref()
+        .filter(|name| !name.is_empty())
+    {
+        parts.push(file_name.to_string());
+    }
+    if let Some(mime_type) = attachment
+        .mime_type
+        .as_deref()
+        .filter(|mime| !mime.is_empty())
+    {
+        parts.push(mime_type.to_string());
+    }
+    if !attachment.file_id.is_empty() {
+        parts.push(format!("file_id={}", attachment.file_id));
+    }
+    parts.join(" ")
+}
+
+fn media_analysis_attachments(task: &InboundTaskPayload) -> Vec<TransportAttachment> {
+    task.attachments
+        .iter()
+        .filter(|attachment| {
+            attachment
+                .blob_download_url
+                .as_deref()
+                .map(|url| !url.is_empty())
+                .unwrap_or(false)
+                && attachment
+                    .transport_error
+                    .as_deref()
+                    .map(|error| error.is_empty())
+                    .unwrap_or(true)
+                && matches!(
+                    attachment.kind.as_str(),
+                    "photo" | "image" | "voice" | "audio" | "document"
+                )
+        })
+        .cloned()
+        .collect()
+}
+
+fn media_analysis_prompt(content: &str, attachments: &[TransportAttachment]) -> String {
+    let kinds = attachments
+        .iter()
+        .map(|attachment| attachment.kind.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Analyze the attached media and respond helpfully to the user. User message/context: {}. Attachment kinds: {}.",
+        content, kinds
+    )
+}
 
 pub struct AgentRuntime {
     ipc_client: PhiloticClient,
@@ -65,36 +169,64 @@ impl AgentRuntime {
                 Ok(Ok(other)) => {
                     info!("Jane received non-task IPC message: {:?}", other);
                 }
-                Ok(Err(err)) => warn!("IPC Recv error: {}", err),
+                Ok(Err(err)) => {
+                    if is_ipc_disconnect(&err) {
+                        info!("Hotel IPC disconnected; agent-core exiting.");
+                        return Ok(());
+                    }
+                    warn!("IPC Recv error: {}", err);
+                }
                 Err(_) => {}
             }
         }
     }
 
     async fn handle_user_message(&mut self, task: InboundTaskPayload, task_id: Uuid) -> Result<()> {
-        let content = match task
-            .content
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
+        let content = match normalized_user_content(&task) {
             Some(content) => content.to_string(),
             None => return Ok(()),
         };
-        let source = task.source.clone().unwrap_or_else(|| "unknown".into());
+        let source = task
+            .transport
+            .clone()
+            .or(task.source.clone())
+            .unwrap_or_else(|| "unknown".into());
         let session_id = task.session_id_or_default(AGENT_ID);
         let turn_id = task.turn_id.clone().unwrap_or_else(|| task_id.to_string());
         let chat_id = task.chat_id.clone().unwrap_or_default();
-        let final_reply_to = task
+        let inbound_final_reply_to = task
             .final_reply_to
             .clone()
             .unwrap_or_else(|| LOCAL_NODE.to_string());
-        let final_reply_role = task
+        let inbound_final_reply_role = task
             .final_reply_role
             .clone()
             .unwrap_or_else(|| DEFAULT_REPLY_ROLE.to_string());
+        let inbound_final_reply_guest_id = task.final_reply_guest_id.clone();
 
         self.ensure_session_loaded(&session_id, &source).await?;
+
+        let (final_reply_to, final_reply_role, final_reply_guest_id) = {
+            let state = self
+                .sessions
+                .entry(session_id.clone())
+                .or_insert_with(|| SessionState::new(session_id.clone(), AGENT_ID.into(), source));
+            state.set_transport_reply_target(
+                inbound_final_reply_to,
+                inbound_final_reply_role,
+                inbound_final_reply_guest_id,
+            );
+            let target = state.resolved_transport_reply_target(
+                LOCAL_NODE.to_string(),
+                DEFAULT_REPLY_ROLE.to_string(),
+                None,
+            );
+            (
+                target.target_node,
+                target.target_role,
+                target.target_guest_id,
+            )
+        };
 
         if let Some(command) = parse_slash_command(&content) {
             match command {
@@ -115,6 +247,7 @@ impl AgentRuntime {
                             chat_id,
                             final_reply_to,
                             final_reply_role,
+                            final_reply_guest_id,
                             command,
                         )
                         .await;
@@ -128,8 +261,8 @@ impl AgentRuntime {
         let (checkpoint_memory_type, checkpoint_json, index_state, model_prompt, tools_for_model) = {
             let state = self
                 .sessions
-                .entry(session_id.clone())
-                .or_insert_with(|| SessionState::new(session_id.clone(), AGENT_ID.into(), source));
+                .get_mut(&session_id)
+                .expect("session should exist after ensuring and binding transport target");
             state.start_turn(WorkingTurn {
                 task_id,
                 turn_id: turn_id.clone(),
@@ -137,6 +270,7 @@ impl AgentRuntime {
                 user_content: content.clone(),
                 final_reply_to: final_reply_to.clone(),
                 final_reply_role: final_reply_role.clone(),
+                final_reply_guest_id: final_reply_guest_id.clone(),
                 phase: TurnPhase::Queued,
                 iteration: 0,
                 pending_tool_call: None,
@@ -239,25 +373,55 @@ impl AgentRuntime {
             .await?;
         self.sync_session_index(&index_state).await?;
 
+        let media_attachments = media_analysis_attachments(&task);
+        let (action, prompt, attachments, tools_for_model, target_role) =
+            if media_attachments.is_empty() {
+                (
+                    "generate_text",
+                    model_prompt,
+                    Vec::new(),
+                    tools_for_model,
+                    self.sessions
+                        .get(&session_id)
+                        .and_then(|state| state.preferred_component_implementation("text.generate"))
+                        .map(implementation_to_model_role)
+                        .unwrap_or_else(|| DEFAULT_TEXT_MODEL_ROLE.into()),
+                )
+            } else {
+                (
+                    "analyze_media",
+                    media_analysis_prompt(&content, &media_attachments),
+                    media_attachments,
+                    Vec::new(),
+                    self.sessions
+                        .get(&session_id)
+                        .and_then(|state| state.preferred_component_implementation("media.analyze"))
+                        .map(implementation_to_model_role)
+                        .unwrap_or_else(|| DEFAULT_TEXT_MODEL_ROLE.into()),
+                )
+            };
+
         let model_req = ModelRequestPayload {
-            action: "generate_text",
-            session_id,
+            action,
+            session_id: session_id.clone(),
             turn_id,
-            prompt: model_prompt,
+            prompt,
             user_content: content,
+            attachments,
             tools_for_model,
             chat_id,
             reply_to: LOCAL_NODE.to_string(),
             reply_role: "agent".into(),
             final_reply_to,
             final_reply_role,
+            final_reply_guest_id,
         };
 
-        info!("Asking the Hotel to route inference to the Model Router...");
+        info!("Asking the Hotel to route inference to the model controller...");
         self.ipc_client
             .send_request(IpcRequest::EmitTask {
                 target_node: LOCAL_NODE.into(),
-                target_role: "model".into(),
+                target_role,
                 target_guest_id: None,
                 task_json: serde_json::to_string(&model_req)?,
             })
@@ -317,6 +481,7 @@ impl AgentRuntime {
             chat_id,
             final_reply_to,
             final_reply_role,
+            final_reply_guest_id,
             checkpoint_memory_type,
             checkpoint_json,
             index_state,
@@ -339,6 +504,7 @@ impl AgentRuntime {
             let chat_id = active_turn.chat_id.clone();
             let final_reply_to = active_turn.final_reply_to.clone();
             let final_reply_role = active_turn.final_reply_role.clone();
+            let final_reply_guest_id = active_turn.final_reply_guest_id.clone();
             if preapproved {
                 state.clear_pending_approval();
                 state.set_active_turn_phase(TurnPhase::Thinking);
@@ -351,6 +517,7 @@ impl AgentRuntime {
                 chat_id,
                 final_reply_to,
                 final_reply_role,
+                final_reply_guest_id,
                 state.checkpoint_memory_type(),
                 state.checkpoint_json(),
                 state.clone(),
@@ -425,7 +592,7 @@ impl AgentRuntime {
             .send_request(IpcRequest::EmitTask {
                 target_node: final_reply_to,
                 target_role: final_reply_role,
-                target_guest_id: None,
+                target_guest_id: final_reply_guest_id,
                 task_json: serde_json::to_string(&reply_payload)?,
             })
             .await?;
@@ -458,7 +625,7 @@ impl AgentRuntime {
             .await?;
         self.sync_session_index(&index_state).await?;
 
-        let (chat_id, final_reply_to, final_reply_role, workspace_ref, route) = {
+        let (chat_id, final_reply_to, final_reply_role, final_reply_guest_id, workspace_ref, route) = {
             let Some(state) = self.sessions.get(&session_id) else {
                 warn!(
                     "Tool execution requested for unknown session {}",
@@ -482,6 +649,7 @@ impl AgentRuntime {
                 active_turn.chat_id.clone(),
                 active_turn.final_reply_to.clone(),
                 active_turn.final_reply_role.clone(),
+                active_turn.final_reply_guest_id.clone(),
                 state.bindings.effective_workspace_ref.clone(),
                 route,
             )
@@ -499,12 +667,28 @@ impl AgentRuntime {
             incarnation_id: route.incarnation_id.clone(),
             hotel_id: route.hotel_id.clone(),
             environment_id: route.environment_id.clone(),
+            task_runner_kind: route.task_runner_kind.clone(),
+            task_runner_config: route.task_runner_config.clone(),
             selection_reason: route.selection_reason.clone(),
-            workspace_ref,
+            workspace_ref: workspace_ref.clone(),
+            task_runner_overlay: route
+                .task_runner_kind
+                .as_deref()
+                .map(|kind| TaskRunnerOverlay {
+                    workspace_ref: if kind == "workspace" {
+                        workspace_ref
+                    } else {
+                        None
+                    },
+                    allowed_tools: None,
+                    max_read_bytes: None,
+                    max_search_results: None,
+                }),
             reply_to: LOCAL_NODE.to_string(),
             reply_role: "agent".into(),
             final_reply_to,
             final_reply_role,
+            final_reply_guest_id,
         };
 
         if route.execution_mode == "local_agent" {
@@ -515,7 +699,7 @@ impl AgentRuntime {
             .send_request(IpcRequest::EmitTask {
                 target_node: route.target_node,
                 target_role: route.target_role,
-                target_guest_id: None,
+                target_guest_id: route.incarnation_id.clone(),
                 task_json: serde_json::to_string(&tool_req)?,
             })
             .await?;
@@ -649,7 +833,7 @@ impl AgentRuntime {
             .send_request(IpcRequest::EmitTask {
                 target_node: completed_turn.final_reply_to,
                 target_role: completed_turn.final_reply_role,
-                target_guest_id: None,
+                target_guest_id: completed_turn.final_reply_guest_id,
                 task_json: serde_json::to_string(&reply_payload)?,
             })
             .await?;
@@ -671,6 +855,7 @@ impl AgentRuntime {
             chat_id,
             final_reply_to,
             final_reply_role,
+            final_reply_guest_id,
         ) = {
             let Some(state) = self.sessions.get_mut(&session_id) else {
                 warn!("Received fail action for unknown session {}", session_id);
@@ -687,6 +872,7 @@ impl AgentRuntime {
             let chat_id = active_turn.chat_id.clone();
             let final_reply_to = active_turn.final_reply_to.clone();
             let final_reply_role = active_turn.final_reply_role.clone();
+            let final_reply_guest_id = active_turn.final_reply_guest_id.clone();
             state.set_active_turn_phase(TurnPhase::Failed);
             (
                 task_id,
@@ -696,6 +882,7 @@ impl AgentRuntime {
                 chat_id,
                 final_reply_to,
                 final_reply_role,
+                final_reply_guest_id,
             )
         };
 
@@ -725,7 +912,7 @@ impl AgentRuntime {
             .send_request(IpcRequest::EmitTask {
                 target_node: final_reply_to,
                 target_role: final_reply_role,
-                target_guest_id: None,
+                target_guest_id: final_reply_guest_id,
                 task_json: serde_json::to_string(&reply_payload)?,
             })
             .await?;
@@ -741,6 +928,7 @@ impl AgentRuntime {
         command_chat_id: String,
         command_reply_to: String,
         command_reply_role: String,
+        command_reply_guest_id: Option<String>,
         command: SlashCommand,
     ) -> Result<()> {
         let pending = self
@@ -756,6 +944,7 @@ impl AgentRuntime {
                             turn.chat_id.clone(),
                             turn.final_reply_to.clone(),
                             turn.final_reply_role.clone(),
+                            turn.final_reply_guest_id.clone(),
                             approval,
                         )
                     })
@@ -770,6 +959,7 @@ impl AgentRuntime {
             original_chat_id,
             original_reply_to,
             original_reply_role,
+            original_reply_guest_id,
             approval,
         )) = pending
         else {
@@ -796,7 +986,7 @@ impl AgentRuntime {
                 .send_request(IpcRequest::EmitTask {
                     target_node: command_reply_to,
                     target_role: command_reply_role,
-                    target_guest_id: None,
+                    target_guest_id: command_reply_guest_id,
                     task_json: serde_json::to_string(&reply_payload)?,
                 })
                 .await?;
@@ -916,7 +1106,7 @@ impl AgentRuntime {
                     .send_request(IpcRequest::EmitTask {
                         target_node: original_reply_to,
                         target_role: original_reply_role,
-                        target_guest_id: None,
+                        target_guest_id: original_reply_guest_id.clone(),
                         task_json: serde_json::to_string(&reply_payload)?,
                     })
                     .await?;
@@ -974,7 +1164,7 @@ impl AgentRuntime {
                     .send_request(IpcRequest::EmitTask {
                         target_node: original_reply_to,
                         target_role: original_reply_role,
-                        target_guest_id: None,
+                        target_guest_id: original_reply_guest_id,
                         task_json: serde_json::to_string(&reply_payload)?,
                     })
                     .await?;
@@ -1010,6 +1200,7 @@ impl AgentRuntime {
             task_id,
             final_reply_to,
             final_reply_role,
+            final_reply_guest_id,
             prompt,
             checkpoint_memory_type,
             checkpoint_json,
@@ -1048,6 +1239,7 @@ impl AgentRuntime {
                 active_turn.task_id,
                 active_turn.final_reply_to.clone(),
                 active_turn.final_reply_role.clone(),
+                active_turn.final_reply_guest_id.clone(),
                 prompt,
                 state.checkpoint_memory_type(),
                 state.checkpoint_json(),
@@ -1083,22 +1275,31 @@ impl AgentRuntime {
 
         let model_req = ModelRequestPayload {
             action: "generate_text",
-            session_id,
+            session_id: session_id.clone(),
             turn_id,
             prompt,
             user_content,
+            attachments: Vec::new(),
             tools_for_model,
             chat_id,
             reply_to: LOCAL_NODE.to_string(),
             reply_role: "agent".into(),
             final_reply_to,
             final_reply_role,
+            final_reply_guest_id,
         };
+
+        let target_role = self
+            .sessions
+            .get(&session_id)
+            .and_then(|state| state.preferred_component_implementation("text.generate"))
+            .map(implementation_to_model_role)
+            .unwrap_or_else(|| DEFAULT_TEXT_MODEL_ROLE.into());
 
         self.ipc_client
             .send_request(IpcRequest::EmitTask {
                 target_node: LOCAL_NODE.into(),
-                target_role: "model".into(),
+                target_role,
                 target_guest_id: None,
                 task_json: serde_json::to_string(&model_req)?,
             })
@@ -1427,12 +1628,22 @@ impl AgentRuntime {
                     source: Some("agent".into()),
                     session_id: Some(payload.session_id),
                     turn_id: Some(payload.turn_id),
+                    transport: None,
                     chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
                     content: Some(content),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
                     tool_name: Some(payload.tool_name),
                     arguments: None,
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
                 })
                 .await
             }
@@ -1508,7 +1719,7 @@ impl AgentRuntime {
             .send_request(IpcRequest::EmitTask {
                 target_node: completed_turn.final_reply_to,
                 target_role: completed_turn.final_reply_role,
-                target_guest_id: None,
+                target_guest_id: completed_turn.final_reply_guest_id,
                 task_json: serde_json::to_string(&reply_payload)?,
             })
             .await?;
@@ -1588,10 +1799,14 @@ impl AgentRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::LOCAL_NODE;
+    use super::{
+        DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE, media_analysis_attachments, normalized_user_content,
+    };
     use crate::r#loop::{ApprovalRequest, ToolCall};
-    use crate::protocol::{FinalReplyPayload, ModelRequestPayload};
-    use crate::session::{ApprovalPolicy, SessionState};
+    use crate::protocol::{
+        FinalReplyPayload, InboundTaskPayload, ModelRequestPayload, TransportAttachment,
+    };
+    use crate::session::{ApprovalPolicy, ComponentRouteBinding, SessionState};
 
     #[test]
     fn model_request_targets_agent_for_reply() {
@@ -1601,17 +1816,60 @@ mod tests {
             turn_id: "turn-1".into(),
             prompt: "hello".into(),
             user_content: "hello".into(),
+            attachments: Vec::new(),
             tools_for_model: Vec::new(),
             chat_id: "123".into(),
             reply_to: LOCAL_NODE.into(),
             reply_role: "agent".into(),
             final_reply_to: LOCAL_NODE.into(),
             final_reply_role: "hegemon".into(),
+            final_reply_guest_id: None,
         };
 
         let json = serde_json::to_value(&request).expect("serialize request");
         assert_eq!(json["reply_role"], "agent");
         assert_eq!(json["final_reply_role"], "hegemon");
+    }
+
+    #[test]
+    fn default_text_model_role_targets_gemini_controller() {
+        assert_eq!(DEFAULT_TEXT_MODEL_ROLE, "model.gemini");
+    }
+
+    #[test]
+    fn implementation_names_map_to_model_roles() {
+        assert_eq!(
+            super::implementation_to_model_role("gemini"),
+            "model.gemini"
+        );
+        assert_eq!(
+            super::implementation_to_model_role("gemini-flash"),
+            "model.gemini"
+        );
+        assert_eq!(
+            super::implementation_to_model_role("elevenlabs-v1"),
+            "model.elevenlabs"
+        );
+    }
+
+    #[test]
+    fn session_component_route_can_override_text_model_implementation() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.bindings.component_routes.push(ComponentRouteBinding {
+            capability: "text.generate".into(),
+            selection_mode: "preferred".into(),
+            implementation: Some("elevenlabs".into()),
+            incarnation: None,
+            preferred_hotel_id: None,
+            preferred_environment_id: None,
+        });
+
+        let target_role = state
+            .preferred_component_implementation("text.generate")
+            .map(super::implementation_to_model_role);
+
+        assert_eq!(target_role.as_deref(), Some("model.elevenlabs"));
     }
 
     #[test]
@@ -1725,5 +1983,186 @@ mod tests {
         )
         .expect("local agent tools should not require an external runner");
         assert_eq!(route.execution_mode, "local_agent");
+    }
+
+    #[test]
+    fn normalized_user_content_prefers_explicit_text() {
+        let task = InboundTaskPayload {
+            action: None,
+            agent_action: None,
+            source: Some("telegram".into()),
+            session_id: None,
+            turn_id: None,
+            transport: Some("telegram".into()),
+            chat_id: Some("123".into()),
+            thread_id: None,
+            sender_id: None,
+            sender_username: None,
+            message_kind: Some("photo".into()),
+            content: Some("caption text".into()),
+            attachments: vec![TransportAttachment {
+                kind: "photo".into(),
+                file_id: "photo-1".into(),
+                mime_type: None,
+                file_name: None,
+                file_size: None,
+                telegram_file_path: None,
+                blob_id: None,
+                blob_download_url: None,
+                transport_error: None,
+            }],
+            command: None,
+            callback_data: None,
+            raw_transport_event: None,
+            tool_name: None,
+            arguments: None,
+            final_reply_to: None,
+            final_reply_role: None,
+            final_reply_guest_id: None,
+        };
+
+        assert_eq!(normalized_user_content(&task), Some("caption text".into()));
+    }
+
+    #[test]
+    fn normalized_user_content_summarizes_attachment_only_turns() {
+        let task = InboundTaskPayload {
+            action: None,
+            agent_action: None,
+            source: Some("telegram".into()),
+            session_id: None,
+            turn_id: None,
+            transport: Some("telegram".into()),
+            chat_id: Some("123".into()),
+            thread_id: None,
+            sender_id: None,
+            sender_username: None,
+            message_kind: Some("voice".into()),
+            content: None,
+            attachments: vec![TransportAttachment {
+                kind: "voice".into(),
+                file_id: "voice-1".into(),
+                mime_type: Some("audio/ogg".into()),
+                file_name: None,
+                file_size: None,
+                telegram_file_path: None,
+                blob_id: None,
+                blob_download_url: None,
+                transport_error: None,
+            }],
+            command: None,
+            callback_data: None,
+            raw_transport_event: None,
+            tool_name: None,
+            arguments: None,
+            final_reply_to: None,
+            final_reply_role: None,
+            final_reply_guest_id: None,
+        };
+
+        assert_eq!(
+            normalized_user_content(&task),
+            Some(
+                "User sent a voice message with attachments: voice audio/ogg file_id=voice-1."
+                    .into()
+            )
+        );
+    }
+
+    #[test]
+    fn normalized_user_content_uses_callback_data_when_present() {
+        let task = InboundTaskPayload {
+            action: None,
+            agent_action: None,
+            source: Some("telegram".into()),
+            session_id: None,
+            turn_id: None,
+            transport: Some("telegram".into()),
+            chat_id: Some("123".into()),
+            thread_id: None,
+            sender_id: None,
+            sender_username: None,
+            message_kind: Some("callback".into()),
+            content: None,
+            attachments: Vec::new(),
+            command: None,
+            callback_data: Some("approve:turn-1".into()),
+            raw_transport_event: None,
+            tool_name: None,
+            arguments: None,
+            final_reply_to: None,
+            final_reply_role: None,
+            final_reply_guest_id: None,
+        };
+
+        assert_eq!(
+            normalized_user_content(&task),
+            Some("Callback action: approve:turn-1".into())
+        );
+    }
+
+    #[test]
+    fn media_analysis_attachments_only_include_blob_backed_supported_kinds() {
+        let task = InboundTaskPayload {
+            action: None,
+            agent_action: None,
+            source: Some("telegram".into()),
+            session_id: None,
+            turn_id: None,
+            transport: Some("telegram".into()),
+            chat_id: Some("123".into()),
+            thread_id: None,
+            sender_id: None,
+            sender_username: None,
+            message_kind: Some("photo".into()),
+            content: Some("what is this?".into()),
+            attachments: vec![
+                TransportAttachment {
+                    kind: "photo".into(),
+                    file_id: "photo-1".into(),
+                    mime_type: Some("image/jpeg".into()),
+                    file_name: None,
+                    file_size: None,
+                    telegram_file_path: None,
+                    blob_id: Some("sha256-1".into()),
+                    blob_download_url: Some("http://127.0.0.1:9001/download/sha256-1".into()),
+                    transport_error: None,
+                },
+                TransportAttachment {
+                    kind: "sticker".into(),
+                    file_id: "sticker-1".into(),
+                    mime_type: Some("image/webp".into()),
+                    file_name: None,
+                    file_size: None,
+                    telegram_file_path: None,
+                    blob_id: Some("sha256-2".into()),
+                    blob_download_url: Some("http://127.0.0.1:9001/download/sha256-2".into()),
+                    transport_error: None,
+                },
+                TransportAttachment {
+                    kind: "voice".into(),
+                    file_id: "voice-1".into(),
+                    mime_type: Some("audio/ogg".into()),
+                    file_name: None,
+                    file_size: None,
+                    telegram_file_path: None,
+                    blob_id: Some("sha256-3".into()),
+                    blob_download_url: None,
+                    transport_error: None,
+                },
+            ],
+            command: None,
+            callback_data: None,
+            raw_transport_event: None,
+            tool_name: None,
+            arguments: None,
+            final_reply_to: None,
+            final_reply_role: None,
+            final_reply_guest_id: None,
+        };
+
+        let attachments = media_analysis_attachments(&task);
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].kind, "photo");
     }
 }

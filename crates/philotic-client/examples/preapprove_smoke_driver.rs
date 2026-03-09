@@ -37,7 +37,8 @@ async fn main() -> Result<()> {
                 "chat_id": chat_id,
                 "content": "/preapprove this-session",
                 "final_reply_to": "local-ansible-01",
-                "final_reply_role": "hegemon"
+                "final_reply_role": "hegemon",
+                "final_reply_guest_id": "preapprove-smoke-hegemon"
             })
             .to_string(),
         })
@@ -75,7 +76,8 @@ async fn main() -> Result<()> {
                 "chat_id": chat_id,
                 "content": "need approval deploy the thing",
                 "final_reply_to": "local-ansible-01",
-                "final_reply_role": "hegemon"
+                "final_reply_role": "hegemon",
+                "final_reply_guest_id": "preapprove-smoke-hegemon"
             })
             .to_string(),
         })
