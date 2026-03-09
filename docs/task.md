@@ -57,6 +57,20 @@
   - `sound.generate`
   - `music.generate`
   - `response.generate`
+- [x] Propose the first structured model request envelope split:
+  - `response_contract`
+  - `context`
+  - `affordances`
+  - `routing_hints`
+  - `provider_options`
+- [x] Define canonical context layers for model requests:
+  - `instructions`
+  - `identity`
+  - `memory`
+  - `dialogue_window`
+  - `active_turn`
+  - `attachments`
+- [x] Decide that tools and skills should project separately from semantic context under `affordances`.
 - [ ] Add `spoken_text` / expressive speech projection alongside user-visible text.
 - [ ] Define ElevenLabs default-voice pinning plus upstream voice override behavior.
 - [ ] Add Eleven v3 model selection and expressive-tag support without pretending it is the same as the low-latency conversational path.

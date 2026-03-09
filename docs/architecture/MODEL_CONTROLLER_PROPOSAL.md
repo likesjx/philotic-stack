@@ -38,6 +38,7 @@ Pin and prove the first design contract for:
 - an upstream producer path for `voice.synthesize`
 - a guest-side Gemini auth abstraction that prefers OAuth bearer material over API key fallback
 - a hotel-side Gemini OAuth validation path that proves stored auth can call a real Gemini model
+- a structured model request envelope that separates context layers from routing hints and provider options
 
 Linked task surface: [docs/task.md](/Users/jaredlikes/code/philotic-stack-model-controller-abstraction/docs/task.md)
 
@@ -54,6 +55,136 @@ The model-controller API should be structured around capabilities such as:
 - `response.generate`
 
 `response.generate` is the important escape hatch for multimodal models that can emit text and audio directly. It should not be forced through the `voice.synthesize` path, because that would collapse native model audio into a fake TTS abstraction.
+
+## Structured Request Envelope
+
+Model-controller requests should move toward one canonical envelope with separate concerns for:
+
+- `capability`
+- `response_contract`
+- `context`
+- `routing_hints`
+- `provider_options`
+
+Recommended shape:
+
+```json
+{
+  "capability": "text.generate",
+  "response_contract": {
+    "modalities": ["text"],
+    "style": "assistant_reply"
+  },
+  "context": {
+    "instructions": [],
+    "identity": [],
+    "memory": [],
+    "dialogue_window": [],
+    "active_turn": {
+      "role": "user",
+      "parts": [{ "type": "text", "text": "..." }]
+    },
+    "attachments": []
+  },
+  "affordances": {
+    "skills": [],
+    "tools": []
+  },
+  "routing_hints": {
+    "implementation": "gemini"
+  },
+  "provider_options": {}
+}
+```
+
+This gives the system a stable capability-facing request while preserving structured seams for:
+
+- prompt projection
+- context trimming
+- cache reuse
+- provider-specific rendering
+- routing decisions
+
+If everything becomes one giant prompt string, Philotic loses the ability to reason about what can be cached, dropped, summarized, or projected differently per model.
+
+## Context Layer Recommendation
+
+The canonical `context` object should be layered as:
+
+1. `instructions`
+2. `identity`
+3. `memory`
+4. `dialogue_window`
+5. `active_turn`
+6. `attachments`
+
+Why this split:
+
+- `instructions` are policy, task framing, and other higher-priority behavior constraints
+- `identity` is who the agent is
+- `memory` is recalled relevant knowledge, not full transcript continuity
+- `dialogue_window` is recent conversational context
+- `active_turn` is the thing being answered right now
+- `attachments` are non-text inputs that may need provider-native rendering
+
+Important pushback:
+
+- do not collapse `memory` and `dialogue_window` into one history blob
+- do not treat `active_turn` as just “the last message”
+- do not let routing hints or provider flags leak into the semantic context object
+
+Those categories want different projection and trimming policies. If they are fused, optimization becomes mostly ceremonial.
+
+## Tools And Skills Recommendation
+
+Yes, tools and skills should be separated out, but not as peer context layers.
+
+They should live in a distinct `affordances` section because they are neither identity nor memory nor dialogue.
+
+Recommended split:
+
+- `skills`
+  - procedural or instructional overlays that shape how the model should approach the task
+- `tools`
+  - executable affordances the runtime can actually satisfy
+
+Why:
+
+- skills are interpretive guidance
+- tools are actionable capabilities
+- both affect model behavior
+- neither should be confused with recalled semantic context
+
+So the recommendation is:
+
+- `context` answers: who am I, what matters, what is happening now
+- `affordances.skills` answers: what approach patterns should I follow
+- `affordances.tools` answers: what can I actually invoke
+
+This also keeps future optimization cleaner:
+
+- skills can be projected sparsely or omitted when irrelevant
+- tools can be narrowed to the active tool assembly instead of dumping full inventory
+- both can be rendered differently per provider without corrupting the semantic context model
+
+Guardrail:
+
+- do not treat `AGENTS.md`-style operational guidance as ordinary conversational context
+- do not dump every tool and skill into every request just because they exist
+- expose them through turn-time projection only when relevant to the current goal
+
+## Projection Metadata Recommendation
+
+Each projected context or affordance item should eventually carry metadata such as:
+
+- `source_ref`
+- `projection_kind`
+- `priority`
+- `token_estimate`
+- `cache_key`
+- `truncation_policy`
+
+That metadata is what will let Philotic optimize model usage honestly instead of pretending string concatenation is architecture.
 
 ## ElevenLabs Recommendation
 
