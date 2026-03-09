@@ -60,10 +60,12 @@ What is implemented in this slice:
 - provider selection for text vs voice synthesis tasks
 - provider-specific request building and response parsing
 - separate guest roles so Gemini and ElevenLabs can scale independently on the mesh
+- an initial `media.analyze` task path so the Gemini model-controller can consume blob-backed transport media for first-pass interpretation
 
 What is not implemented in this slice:
 
 - canonical media artifact storage
+- specialized transcription routing or a dedicated multimodal media pipeline
 - audio delivery through `agent-core` and `hegemon`
 - interruption/barge-in behavior
 - transcript-first voice session handling

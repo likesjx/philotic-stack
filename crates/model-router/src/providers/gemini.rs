@@ -1,6 +1,8 @@
-use crate::controller::{ControllerTask, ModelProvider, ProviderOutput, TaskKind};
+use crate::controller::{ControllerTask, MediaAttachment, ModelProvider, ProviderOutput, TaskKind};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde_json::{Value, json};
 
 pub struct GeminiProvider {
@@ -32,10 +34,44 @@ impl GeminiProvider {
         ))
     }
 
-    fn request_payload(prompt: &str) -> Value {
+    fn text_request_payload(prompt: &str) -> Value {
         json!({
             "contents": [{"parts": [{"text": prompt}]}]
         })
+    }
+
+    async fn media_request_payload(&self, task: &ControllerTask) -> Result<Value> {
+        let prompt = task
+            .media_prompt()
+            .context("Gemini media task missing prompt")?;
+        let mut parts = vec![json!({ "text": prompt })];
+
+        for attachment in task.attachments.iter().filter(|attachment| {
+            attachment
+                .blob_download_url
+                .as_deref()
+                .map(|url| !url.is_empty())
+                .unwrap_or(false)
+        }) {
+            let mime_type = attachment_mime_type(attachment)
+                .with_context(|| format!("attachment [{}] missing mime type", attachment.kind))?;
+            let blob_url = attachment
+                .blob_download_url
+                .as_deref()
+                .context("attachment missing blob download url")?;
+            let response = self.http_client.get(blob_url).send().await?;
+            let bytes = response.bytes().await?;
+            parts.push(json!({
+                "inline_data": {
+                    "mime_type": mime_type,
+                    "data": BASE64_STANDARD.encode(bytes)
+                }
+            }));
+        }
+
+        Ok(json!({
+            "contents": [{"parts": parts}]
+        }))
     }
 
     fn parse_response_text(status: reqwest::StatusCode, body: Value) -> String {
@@ -72,17 +108,22 @@ impl ModelProvider for GeminiProvider {
     }
 
     fn supports(&self, task: &ControllerTask) -> bool {
-        task.kind == TaskKind::TextGenerate
+        matches!(task.kind, TaskKind::TextGenerate | TaskKind::MediaAnalyze)
     }
 
     async fn invoke(&self, task: &ControllerTask) -> Result<ProviderOutput> {
-        let prompt = task
-            .prompt_text()
-            .context("Gemini text task missing prompt")?;
+        let payload = match task.kind {
+            TaskKind::TextGenerate => Self::text_request_payload(
+                task.prompt_text()
+                    .context("Gemini text task missing prompt")?,
+            ),
+            TaskKind::MediaAnalyze => self.media_request_payload(task).await?,
+            TaskKind::VoiceSynthesize => bail!("Gemini does not support voice synthesis"),
+        };
         let response = self
             .http_client
             .post(self.endpoint_url(task.model.as_deref())?)
-            .json(&Self::request_payload(prompt))
+            .json(&payload)
             .send()
             .await?;
         let status = response.status();
@@ -100,11 +141,12 @@ impl ModelProvider for GeminiProvider {
 #[cfg(test)]
 mod tests {
     use super::GeminiProvider;
+    use crate::controller::{ControllerTask, MediaAttachment, TaskKind};
     use serde_json::json;
 
     #[test]
     fn request_payload_wraps_prompt_in_contents() {
-        let payload = GeminiProvider::request_payload("hello");
+        let payload = GeminiProvider::text_request_payload("hello");
         assert_eq!(payload["contents"][0]["parts"][0]["text"], "hello");
     }
 
@@ -139,4 +181,60 @@ mod tests {
 
         assert_eq!(text, "Gemini API Error (400): bad prompt");
     }
+
+    #[test]
+    fn image_attachments_default_to_jpeg() {
+        let attachment = MediaAttachment {
+            kind: "photo".into(),
+            file_id: "file-1".into(),
+            mime_type: None,
+            file_name: None,
+            file_size: None,
+            telegram_file_path: None,
+            blob_id: None,
+            blob_download_url: Some("http://127.0.0.1:9001/download/sha256-1".into()),
+            transport_error: None,
+        };
+
+        assert_eq!(super::attachment_mime_type(&attachment), Some("image/jpeg"));
+    }
+
+    #[test]
+    fn gemini_supports_media_analysis_tasks() {
+        let provider = GeminiProvider::new(reqwest::Client::new(), Some("key".into()));
+        let task = ControllerTask {
+            kind: TaskKind::MediaAnalyze,
+            provider: None,
+            model: None,
+            prompt: Some("Describe this image".into()),
+            text: None,
+            attachments: vec![MediaAttachment {
+                kind: "photo".into(),
+                file_id: "file-1".into(),
+                mime_type: Some("image/jpeg".into()),
+                file_name: None,
+                file_size: None,
+                telegram_file_path: None,
+                blob_id: Some("sha256-1".into()),
+                blob_download_url: Some("http://127.0.0.1:9001/download/sha256-1".into()),
+                transport_error: None,
+            }],
+            voice_id: None,
+            output_format: None,
+            language_code: None,
+        };
+
+        assert!(crate::controller::ModelProvider::supports(&provider, &task));
+    }
+}
+
+fn attachment_mime_type(attachment: &MediaAttachment) -> Option<&str> {
+    attachment
+        .mime_type
+        .as_deref()
+        .or(match attachment.kind.as_str() {
+            "photo" => Some("image/jpeg"),
+            "sticker" => Some("image/webp"),
+            _ => None,
+        })
 }

@@ -3,12 +3,14 @@ use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use philotic_client::{IpcRequest, IpcResponse, PhiloticClient};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskKind {
     TextGenerate,
+    MediaAnalyze,
     VoiceSynthesize,
 }
 
@@ -16,9 +18,30 @@ impl TaskKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::TextGenerate => "text.generate",
+            Self::MediaAnalyze => "media.analyze",
             Self::VoiceSynthesize => "voice.synthesize",
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct MediaAttachment {
+    pub kind: String,
+    pub file_id: String,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub file_name: Option<String>,
+    #[serde(default)]
+    pub file_size: Option<u64>,
+    #[serde(default)]
+    pub telegram_file_path: Option<String>,
+    #[serde(default)]
+    pub blob_id: Option<String>,
+    #[serde(default)]
+    pub blob_download_url: Option<String>,
+    #[serde(default)]
+    pub transport_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +51,7 @@ pub struct ControllerTask {
     pub model: Option<String>,
     pub prompt: Option<String>,
     pub text: Option<String>,
+    pub attachments: Vec<MediaAttachment>,
     pub voice_id: Option<String>,
     pub output_format: Option<String>,
     pub language_code: Option<String>,
@@ -35,10 +59,27 @@ pub struct ControllerTask {
 
 impl ControllerTask {
     pub fn from_value(task: &Value) -> Result<Self> {
-        let kind = match task.get("kind").and_then(Value::as_str) {
-            Some("text.generate") | Some("text_generate") => TaskKind::TextGenerate,
+        let kind = match task
+            .get("kind")
+            .or_else(|| task.get("action"))
+            .and_then(Value::as_str)
+        {
+            Some("generate_text") | Some("text.generate") | Some("text_generate") => {
+                TaskKind::TextGenerate
+            }
+            Some("analyze_media") | Some("media.analyze") | Some("media_analyze") => {
+                TaskKind::MediaAnalyze
+            }
             Some("voice.synthesize") | Some("voice_synthesize") => TaskKind::VoiceSynthesize,
             Some(other) => bail!("unsupported task kind [{}]", other),
+            None if task
+                .get("attachments")
+                .and_then(Value::as_array)
+                .map(|attachments| !attachments.is_empty())
+                .unwrap_or(false) =>
+            {
+                TaskKind::MediaAnalyze
+            }
             None if task.get("prompt").and_then(Value::as_str).is_some() => TaskKind::TextGenerate,
             None if task.get("text").and_then(Value::as_str).is_some() => TaskKind::VoiceSynthesize,
             None => bail!("task is missing a recognized kind/prompt/text payload"),
@@ -59,6 +100,12 @@ impl ControllerTask {
                 .and_then(Value::as_str)
                 .map(str::to_string),
             text: task.get("text").and_then(Value::as_str).map(str::to_string),
+            attachments: task
+                .get("attachments")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()?
+                .unwrap_or_default(),
             voice_id: task
                 .get("voice_id")
                 .and_then(Value::as_str)
@@ -89,6 +136,10 @@ impl ControllerTask {
         self.text.as_deref()
     }
 
+    pub fn media_prompt(&self) -> Option<&str> {
+        self.prompt.as_deref().or(self.text.as_deref())
+    }
+
     fn validate(&self) -> Result<()> {
         match self.kind {
             TaskKind::TextGenerate => {
@@ -97,6 +148,24 @@ impl ControllerTask {
                     .context("text.generate task missing prompt")?;
                 if prompt.trim().is_empty() {
                     bail!("text.generate task prompt cannot be empty");
+                }
+            }
+            TaskKind::MediaAnalyze => {
+                let prompt = self
+                    .media_prompt()
+                    .context("media.analyze task missing prompt")?;
+                if prompt.trim().is_empty() {
+                    bail!("media.analyze task prompt cannot be empty");
+                }
+                if self.attachments.is_empty() {
+                    bail!("media.analyze task requires at least one attachment");
+                }
+                if !self
+                    .attachments
+                    .iter()
+                    .any(|attachment| attachment.blob_download_url.is_some())
+                {
+                    bail!("media.analyze task requires blob-backed attachments");
                 }
             }
             TaskKind::VoiceSynthesize => {
@@ -278,6 +347,28 @@ mod tests {
         assert_eq!(task.kind, TaskKind::VoiceSynthesize);
         assert_eq!(task.voice_text(), Some("Speak now"));
         assert_eq!(task.provider_hint(), Some("elevenlabs"));
+    }
+
+    #[test]
+    fn infers_media_analysis_from_blob_backed_attachments() {
+        let task = ControllerTask::from_value(&json!({
+            "action": "analyze_media",
+            "prompt": "Describe this image",
+            "attachments": [{
+                "kind": "photo",
+                "file_id": "photo-1",
+                "mime_type": "image/jpeg",
+                "blob_download_url": "http://127.0.0.1:9001/download/sha256-1"
+            }]
+        }))
+        .expect("task should parse");
+
+        assert_eq!(task.kind, TaskKind::MediaAnalyze);
+        assert_eq!(task.attachments.len(), 1);
+        assert_eq!(
+            task.attachments[0].blob_download_url.as_deref(),
+            Some("http://127.0.0.1:9001/download/sha256-1")
+        );
     }
 
     #[test]

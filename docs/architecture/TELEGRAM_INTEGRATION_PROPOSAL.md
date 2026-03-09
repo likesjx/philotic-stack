@@ -79,7 +79,9 @@ Current repo truth:
 That is a useful membrane slice, but it is not yet a richer Telegram controller:
 
 - slash commands still execute in `agent-core`
-- attachment handling now resolves `file_id` values through Telegram `getFile`, downloads bytes, and uploads them into the hotel blob service, but downstream media analysis/transcription/vision are not implemented yet
+- attachment handling now resolves `file_id` values through Telegram `getFile`, downloads bytes, and uploads them into the hotel blob service
+- blob-backed Telegram attachments now have an initial downstream path through `agent-core` and `model-router` as `media.analyze`, so supported photos, audio/voice notes, and documents can reach Gemini for first-pass interpretation
+- specialized voice transcription, richer vision workflows, and watched live validation of the blob-backed media path are still follow-on work
 - polling still does not cover the full Telegram update surface beyond `message` and `callback_query`
 
 ## Current Reality

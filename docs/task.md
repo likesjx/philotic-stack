@@ -121,7 +121,11 @@
   - upload them into the hotel blob service and attach blob refs to the envelope
 - [ ] Extend Telegram media transport:
   - watched live validation against real Telegram media
-  - downstream media-analysis/transcription routing on top of blob-backed attachments
+  - specialized downstream transcription/vision routing on top of the initial blob-backed media-analysis path
+- [x] Add an initial downstream media-analysis path on top of blob-backed Telegram attachments:
+  - route supported blob-backed attachments through `agent-core` as `media.analyze`
+  - let the Gemini model-controller consume blob-backed media bytes for first-pass analysis
+  - keep specialized voice transcription and richer vision workflows as follow-on work
 - [x] Add an initial Telegram outbound formatting projector in `hegemon`:
   - translate a supported Markdown subset into Telegram-safe HTML `parse_mode`
   - apply it to outbound `sendMessage` replies

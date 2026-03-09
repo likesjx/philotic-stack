@@ -374,33 +374,32 @@ impl AgentRuntime {
         self.sync_session_index(&index_state).await?;
 
         let media_attachments = media_analysis_attachments(&task);
-        let (action, prompt, attachments, tools_for_model, target_role) = if media_attachments
-            .is_empty()
-        {
-            (
-                "generate_text",
-                model_prompt,
-                Vec::new(),
-                tools_for_model,
-                self.sessions
-                    .get(&session_id)
-                    .and_then(|state| state.preferred_component_implementation("text.generate"))
-                    .map(implementation_to_model_role)
-                    .unwrap_or_else(|| DEFAULT_TEXT_MODEL_ROLE.into()),
-            )
-        } else {
-            (
-                "analyze_media",
-                media_analysis_prompt(&content, &media_attachments),
-                media_attachments,
-                Vec::new(),
-                self.sessions
-                    .get(&session_id)
-                    .and_then(|state| state.preferred_component_implementation("media.analyze"))
-                    .map(implementation_to_model_role)
-                    .unwrap_or_else(|| DEFAULT_TEXT_MODEL_ROLE.into()),
-            )
-        };
+        let (action, prompt, attachments, tools_for_model, target_role) =
+            if media_attachments.is_empty() {
+                (
+                    "generate_text",
+                    model_prompt,
+                    Vec::new(),
+                    tools_for_model,
+                    self.sessions
+                        .get(&session_id)
+                        .and_then(|state| state.preferred_component_implementation("text.generate"))
+                        .map(implementation_to_model_role)
+                        .unwrap_or_else(|| DEFAULT_TEXT_MODEL_ROLE.into()),
+                )
+            } else {
+                (
+                    "analyze_media",
+                    media_analysis_prompt(&content, &media_attachments),
+                    media_attachments,
+                    Vec::new(),
+                    self.sessions
+                        .get(&session_id)
+                        .and_then(|state| state.preferred_component_implementation("media.analyze"))
+                        .map(implementation_to_model_role)
+                        .unwrap_or_else(|| DEFAULT_TEXT_MODEL_ROLE.into()),
+                )
+            };
 
         let model_req = ModelRequestPayload {
             action,
