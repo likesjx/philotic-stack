@@ -585,6 +585,7 @@ impl IpcServer {
             IpcRequest::EmitTask {
                 target_node,
                 target_role,
+                target_guest_id: _,
                 task_json,
             } => {
                 info!(
@@ -1791,6 +1792,7 @@ mod tests {
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
                 target_role: "agent".into(),
+                target_guest_id: None,
                 task_json: task_payload.clone(),
             })
             .await
@@ -1863,6 +1865,7 @@ mod tests {
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
                 target_role: "agent".into(),
+                target_guest_id: None,
                 task_json: serde_json::json!({
                     "source": "telegram",
                     "session_id": "telegram:123:agent-jane-01",
@@ -3040,6 +3043,7 @@ mod tests {
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
                 target_role: "agent".into(),
+                target_guest_id: None,
                 task_json: serde_json::json!({
                     "source": "telegram",
                     "session_id": session_id,
@@ -3090,6 +3094,7 @@ mod tests {
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
                 target_role: "model".into(),
+                target_guest_id: None,
                 task_json: serde_json::json!({
                     "action": "generate_text",
                     "session_id": session_id,
@@ -3125,6 +3130,7 @@ mod tests {
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
                 target_role: "agent".into(),
+                target_guest_id: None,
                 task_json: serde_json::json!({
                     "action": "model_response",
                     "session_id": session_id,
@@ -3171,6 +3177,7 @@ mod tests {
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
                 target_role: "hegemon".into(),
+                target_guest_id: None,
                 task_json: serde_json::json!({
                     "action": "send_reply",
                     "session_id": session_id,
@@ -3286,6 +3293,7 @@ mod tests {
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
                 target_role: "agent".into(),
+                target_guest_id: None,
                 task_json: serde_json::json!({
                     "source": "telegram",
                     "session_id": session_id,
@@ -3336,6 +3344,7 @@ mod tests {
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
                 target_role: "model".into(),
+                target_guest_id: None,
                 task_json: serde_json::json!({
                     "action": "generate_text",
                     "session_id": session_id,
@@ -3372,6 +3381,7 @@ mod tests {
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
                 target_role: "agent".into(),
+                target_guest_id: None,
                 task_json: serde_json::json!({
                     "action": "model_response",
                     "agent_action": {
@@ -3425,6 +3435,7 @@ mod tests {
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
                 target_role: "hegemon".into(),
+                target_guest_id: None,
                 task_json: serde_json::json!({
                     "action": "send_reply",
                     "session_id": session_id,

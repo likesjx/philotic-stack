@@ -48,8 +48,6 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
         .build()?;
-    let provider_configs = ProviderConfigs::load(&mut ipc_client).await?;
-    let providers = ProviderRegistry::new((config.providers)(http_client, &provider_configs));
     let stub_response = std::env::var("PHILOTIC_MODEL_ROUTER_STUB_RESPONSE").ok();
 
     info!(
@@ -108,6 +106,26 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                     .await?;
                     continue;
                 }
+
+                let provider_configs = match ProviderConfigs::load(&mut ipc_client).await {
+                    Ok(configs) => configs,
+                    Err(err) => {
+                        emit_failure(
+                            &mut ipc_client,
+                            &reply,
+                            format!(
+                                "Model controller failed to refresh provider config: {}",
+                                err
+                            ),
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
+                let providers = ProviderRegistry::new((config.providers)(
+                    http_client.clone(),
+                    &provider_configs,
+                ));
 
                 let provider = match providers.resolve(&controller_task) {
                     Ok(provider) => provider,

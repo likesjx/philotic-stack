@@ -188,6 +188,8 @@ Current implementation slice:
 - optional `gemini_oauth_project_id` is forwarded as `x-goog-user-project`
 - if OAuth material is absent, the guest falls back to `gemini_api_key`
 - refreshable credentials still belong to the future hotel/vault flow, not the guest
+- hotel CLI now has a transitional `auth google start --provider gemini` loopback flow
+- access-token updates can take effect on the next model request because provider config is refreshed per task
 
 The hotel should own the user experience for OAuth:
 
@@ -204,6 +206,7 @@ Important boundary:
 - do not make the model-controller guest own the browser login flow
 - do not rely on a one-time bearer token with no refresh story
 - do not make the guest the canonical owner of long-lived OAuth credentials
+- do not quietly persist refresh tokens in plain `node_config` as if that were a security design
 
 The hotel is the better authority because it already owns local runtime coordination and canonical configuration.
 

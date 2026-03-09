@@ -2,12 +2,13 @@ use ansible_mesh_core::beacon::BeaconDaemon;
 use ansible_mesh_core::storage::{AgentIdentityRecord, GraphStorage, GuestRecord, HotelRecord};
 use ansible_mesh_core::{NodeCapabilities, NodeRole};
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::fs;
 use std::path::Path;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+mod auth;
 mod graph;
 
 mod service;
@@ -16,6 +17,7 @@ use service::ipc::IpcServer;
 use std::sync::Arc;
 
 use ansible_mesh_core::event::EventEnvelope;
+use auth::AuthCommand;
 
 /// Instructions for the strictly-serialized DB writer thread
 pub enum LedgerCommand {
@@ -36,13 +38,24 @@ pub enum LedgerCommand {
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Name of the hotel to boot from the Context Graph
     #[arg(long)]
-    hotel: String,
+    hotel: Option<String>,
 
     /// Optional path to a JSON file containing configuration to load into the Context Graph
     #[arg(long)]
     load_config: Option<String>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    Auth {
+        #[command(subcommand)]
+        provider: AuthCommand,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -227,6 +240,10 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
 
+    if let Some(Command::Auth { provider }) = args.command {
+        return auth::run_auth_command(provider).await;
+    }
+
     info!("Starting Philotic Ansible Daemon Boot Sequence...");
 
     let flags = AnsibleCutoverFlags::from_env();
@@ -293,7 +310,10 @@ async fn main() -> Result<()> {
         }
     }
 
-    let hotel_name = args.hotel.clone();
+    let hotel_name = args
+        .hotel
+        .clone()
+        .context("--hotel is required unless using a subcommand such as `auth`")?;
     let mut hotel = match graph_storage.get_hotel(&hotel_name)? {
         Some(hotel) => hotel,
         None => {

@@ -72,6 +72,8 @@
   - token exchange
   - token storage/refresh
   - guest handoff
+- [x] Add a transitional `ansible auth google start --provider gemini` flow with browser launch, localhost callback, token exchange, and access-token persistence.
+- [x] Refresh model-controller provider config per task so updated Gemini auth takes effect without a guest restart.
 
 ## New Project: Key Vault
 
