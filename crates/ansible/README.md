@@ -49,6 +49,12 @@ cargo run -p ansible -- auth google start --provider gemini --client-id YOUR_CLI
 
 # Validate the stored Gemini OAuth path with a real Gemini call
 cargo run -p ansible -- auth google validate --provider gemini
+
+# Run the startup text model-controller smoke through the hotel
+cargo run -p ansible -- --hotel startup-test-hotel --load-config mesh-config.json --test text-roundtrip --test-text "hello model controller"
+
+# Run the startup voice sample through the hotel
+cargo run -p ansible -- --hotel startup-test-hotel --load-config mesh-config.json --test voice-sample --test-output /tmp/ansible-startup-voice-sample.mp3 --test-text "Hello from the startup voice test."
 ```
 
 On macOS, the hotel now uses a Keychain-backed vault root key automatically and creates one on first use if needed. `PHILOTIC_VAULT_MASTER_KEY` remains a bootstrap fallback for non-macOS environments or explicit operator override. `PHILOTIC_VAULT_KEY_ID` can scope the Keychain item label when you want separate local vault roots.

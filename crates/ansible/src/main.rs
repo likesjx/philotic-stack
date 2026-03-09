@@ -2,9 +2,12 @@ use ansible_mesh_core::beacon::BeaconDaemon;
 use ansible_mesh_core::storage::{AgentIdentityRecord, GraphStorage, GuestRecord, HotelRecord};
 use ansible_mesh_core::{NodeCapabilities, NodeRole};
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use clap::{Parser, Subcommand, ValueEnum};
+use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -49,6 +52,18 @@ struct Args {
     /// Optional path to a JSON file containing configuration to load into the Context Graph
     #[arg(long)]
     load_config: Option<String>,
+
+    /// Optional startup validation to run after the hotel materializes its guests
+    #[arg(long, value_enum)]
+    test: Option<StartupTest>,
+
+    /// Output path for startup test artifacts such as voice samples
+    #[arg(long)]
+    test_output: Option<String>,
+
+    /// Text payload for startup tests that synthesize or generate content
+    #[arg(long)]
+    test_text: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -58,6 +73,15 @@ enum Command {
         provider: AuthCommand,
     },
 }
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum StartupTest {
+    #[value(name = "text-roundtrip", alias = "text-round-trip")]
+    TextRoundTrip,
+    VoiceSample,
+}
+
+const STARTUP_TEST_TEXT_REPLY: &str = "startup text smoke ok";
 
 #[derive(Debug, Clone)]
 pub struct AnsibleCutoverFlags {
@@ -205,6 +229,317 @@ fn maybe_load_text(path: &Path) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
+fn extract_context_graph_entries(
+    config_json: &serde_json::Value,
+) -> Vec<(String, serde_json::Value)> {
+    let Some(obj) = config_json.as_object() else {
+        return Vec::new();
+    };
+
+    if let Some(context_graph) = obj
+        .get("context_graph")
+        .and_then(serde_json::Value::as_object)
+    {
+        return context_graph
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+    }
+
+    obj.iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+fn enable_guest_test_overrides(
+    graph: &dyn GraphStorage,
+    hotel_name: &str,
+    test: StartupTest,
+) -> Result<()> {
+    let mut guests = graph.list_guests(hotel_name, false)?;
+    if guests.is_empty() {
+        return Ok(());
+    }
+
+    match test {
+        StartupTest::TextRoundTrip => {
+            for guest in &mut guests {
+                if guest.role != "model" {
+                    continue;
+                }
+
+                let mut config: serde_json::Value =
+                    serde_json::from_str(&guest.config_json).unwrap_or_default();
+                let env = config
+                    .as_object_mut()
+                    .and_then(|obj| obj.get_mut("env"))
+                    .and_then(serde_json::Value::as_object_mut)
+                    .context("guest config missing env object")?;
+                env.insert(
+                    "PHILOTIC_MODEL_ROUTER_STUB_RESPONSE".into(),
+                    serde_json::Value::String(STARTUP_TEST_TEXT_REPLY.into()),
+                );
+                guest.config_json = config.to_string();
+            }
+        }
+        StartupTest::VoiceSample => {
+            for guest in &mut guests {
+                if guest.role != "model" {
+                    continue;
+                }
+
+                let mut config: serde_json::Value =
+                    serde_json::from_str(&guest.config_json).unwrap_or_default();
+                let env = config
+                    .as_object_mut()
+                    .and_then(|obj| obj.get_mut("env"))
+                    .and_then(serde_json::Value::as_object_mut)
+                    .context("guest config missing env object")?;
+                env.insert(
+                    "PHILOTIC_MODEL_CONTROLLER_INLINE_AUDIO".into(),
+                    serde_json::Value::String("1".into()),
+                );
+                guest.config_json = config.to_string();
+            }
+        }
+    }
+
+    graph.seed_guests(hotel_name, &guests)?;
+    Ok(())
+}
+
+fn prepare_startup_test_binaries(_test: StartupTest) -> Result<()> {
+    let status = std::process::Command::new("cargo")
+        .args([
+            "build",
+            "-p",
+            "hegemon",
+            "-p",
+            "agent-core",
+            "-p",
+            "tool-runner",
+            "-p",
+            "model-router",
+            "--bins",
+        ])
+        .status()
+        .context("failed to launch cargo build for startup test binaries")?;
+
+    if !status.success() {
+        anyhow::bail!("startup test binary build failed with status {}", status);
+    }
+
+    Ok(())
+}
+
+async fn run_startup_test(
+    test: StartupTest,
+    socket_path: &str,
+    output: Option<&str>,
+    text: Option<&str>,
+) -> Result<()> {
+    match test {
+        StartupTest::TextRoundTrip => {
+            let text = text
+                .unwrap_or("hello from the Philotic startup text test")
+                .to_string();
+
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+            let mut client = PhiloticClient::connect_at(
+                socket_path,
+                GuestIdentity {
+                    guest_id: "ansible-startup-test-client".into(),
+                    role: "ansible-startup-test".into(),
+                    supported_tools: Vec::new(),
+                },
+            )
+            .await?;
+
+            let mut last_error = None;
+            for attempt in 1..=5 {
+                let response = client
+                    .send_request(IpcRequest::EmitTask {
+                        target_node: "local-ansible-01".into(),
+                        target_role: "agent".into(),
+                        target_guest_id: None,
+                        task_json: serde_json::json!({
+                            "source": "startup-test",
+                            "session_id": "startup-test:text-roundtrip",
+                            "turn_id": format!("startup-test-turn-{attempt}"),
+                            "chat_id": "startup-test-chat",
+                            "content": text,
+                            "final_reply_to": "local-ansible-01",
+                            "final_reply_role": "ansible-startup-test",
+                            "final_reply_guest_id": "ansible-startup-test-client"
+                        })
+                        .to_string(),
+                    })
+                    .await?;
+
+                match response {
+                    IpcResponse::Standard { ok: true, .. } => {}
+                    other => anyhow::bail!("unexpected startup test emit response: {other:?}"),
+                }
+
+                match tokio::time::timeout(tokio::time::Duration::from_secs(10), client.recv_task())
+                    .await
+                {
+                    Ok(Ok(IpcResponse::InboundTask { task_json, .. })) => {
+                        let payload: serde_json::Value = serde_json::from_str(&task_json)
+                            .context("failed to decode startup text reply")?;
+                        let action = payload
+                            .get("action")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default();
+                        let content = payload
+                            .get("content")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default();
+
+                        if action != "send_reply" {
+                            anyhow::bail!("unexpected startup text action: {action}");
+                        }
+                        if content != STARTUP_TEST_TEXT_REPLY {
+                            anyhow::bail!(
+                                "unexpected startup text reply: expected {:?}, got {:?}",
+                                STARTUP_TEST_TEXT_REPLY,
+                                content
+                            );
+                        }
+
+                        info!(
+                            "Startup text round-trip received {:?} on attempt {}",
+                            content, attempt
+                        );
+                        return Ok(());
+                    }
+                    Ok(Ok(other)) => anyhow::bail!("unexpected startup text envelope: {other:?}"),
+                    Ok(Err(err)) => {
+                        return Err(err.context("failed waiting for startup text reply"));
+                    }
+                    Err(err) => {
+                        warn!(
+                            "Startup text round-trip attempt {} timed out waiting for reply; retrying.",
+                            attempt
+                        );
+                        last_error = Some(err);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    }
+                }
+            }
+
+            let err = last_error.context("startup text retry loop did not record a timeout")?;
+            anyhow::bail!(
+                "timed out waiting for startup text reply after retries: {}",
+                err
+            );
+        }
+        StartupTest::VoiceSample => {
+            let output_path = output
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("tmp/voice-samples/ansible-startup-sample.mp3"));
+            let text = text
+                .unwrap_or("Hello from Philotic. This is an ansible startup voice test.")
+                .to_string();
+
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+            let mut client = PhiloticClient::connect_at(
+                socket_path,
+                GuestIdentity {
+                    guest_id: "ansible-startup-test-client".into(),
+                    role: "ansible-startup-test".into(),
+                    supported_tools: Vec::new(),
+                },
+            )
+            .await?;
+
+            let response = client
+                .send_request(IpcRequest::EmitTask {
+                    target_node: "local-ansible-01".into(),
+                    target_role: "model".into(),
+                    target_guest_id: None,
+                    task_json: serde_json::json!({
+                        "kind": "voice.synthesize",
+                        "session_id": "startup-test:voice-sample",
+                        "turn_id": "startup-test-turn-1",
+                        "chat_id": "startup-test-chat",
+                        "text": text,
+                        "reply_to": "local-ansible-01",
+                        "reply_role": "ansible-startup-test",
+                        "final_reply_to": "local-ansible-01",
+                        "final_reply_role": "ansible-startup-test"
+                    })
+                    .to_string(),
+                })
+                .await?;
+
+            match response {
+                IpcResponse::Standard { ok: true, .. } => {}
+                other => anyhow::bail!("unexpected startup test emit response: {other:?}"),
+            }
+
+            let reply =
+                tokio::time::timeout(tokio::time::Duration::from_secs(30), client.recv_task())
+                    .await
+                    .context("timed out waiting for startup test reply")??;
+            let IpcResponse::InboundTask { task_json, .. } = reply else {
+                anyhow::bail!("unexpected startup test envelope: {reply:?}");
+            };
+
+            let payload: serde_json::Value =
+                serde_json::from_str(&task_json).context("failed to decode startup test reply")?;
+            if let Some(message) = payload
+                .get("agent_action")
+                .and_then(|value| value.get("message"))
+                .and_then(serde_json::Value::as_str)
+            {
+                anyhow::bail!("startup voice sample failed: {message}");
+            }
+
+            let content = payload
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .context("startup test reply missing content")?;
+            let artifact: serde_json::Value = serde_json::from_str(content)
+                .context("startup test content was not audio artifact json")?;
+            let audio_base64 = artifact
+                .get("audio_base64")
+                .and_then(serde_json::Value::as_str)
+                .context("audio artifact missing audio_base64")?;
+            let audio_bytes = BASE64_STANDARD
+                .decode(audio_base64)
+                .context("failed to decode startup sample base64")?;
+
+            if let Some(parent) = output_path.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!(
+                        "failed to create startup test output dir {}",
+                        parent.display()
+                    )
+                })?;
+            }
+            fs::write(&output_path, audio_bytes).with_context(|| {
+                format!(
+                    "failed to write startup voice sample to {}",
+                    output_path.display()
+                )
+            })?;
+
+            info!(
+                "Startup voice sample wrote {} using voice {}",
+                output_path.display(),
+                artifact
+                    .get("voice_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+            );
+            Ok(())
+        }
+    }
+}
+
 fn vps_jane_identity_bundle() -> serde_json::Value {
     let Some(home) = std::env::var_os("HOME") else {
         return serde_json::json!({});
@@ -289,17 +624,19 @@ async fn main() -> Result<()> {
         let config_json: serde_json::Value =
             serde_json::from_str(&config_data).context("Invalid JSON config file")?;
 
-        if let Some(obj) = config_json.as_object() {
+        let entries = extract_context_graph_entries(&config_json);
+
+        if !entries.is_empty() {
             let mut count = 0;
-            for (key, value) in obj {
+            for (key, value) in entries {
                 let val_str = if value.is_string() {
                     // Store strings as-is (with quotes, so they remain valid JSON strings in the db)
-                    serde_json::to_string(value)?
+                    serde_json::to_string(&value)?
                 } else {
                     value.to_string()
                 };
 
-                graph_storage.set_config_value(key, &val_str)?;
+                graph_storage.set_config_value(&key, &val_str)?;
                 count += 1;
             }
             info!(
@@ -307,7 +644,7 @@ async fn main() -> Result<()> {
                 count
             );
         } else {
-            warn!("Config file must be a JSON object mapping string keys to values.");
+            warn!("Config file must be a JSON object or contain a top-level context_graph object.");
         }
     }
 
@@ -329,6 +666,11 @@ async fn main() -> Result<()> {
             hotel
         }
     };
+
+    if let Some(test) = args.test {
+        prepare_startup_test_binaries(test)?;
+        enable_guest_test_overrides(&graph_storage, &hotel_name, test)?;
+    }
 
     graph_storage
         .upsert_agent_identity(&AgentIdentityRecord {
@@ -561,6 +903,20 @@ async fn main() -> Result<()> {
         warn!(
             "Guest supervisor loop is disabled by default until guest heartbeats are implemented."
         );
+    }
+
+    if let Some(test) = args.test {
+        let test_result = run_startup_test(
+            test,
+            &hotel.ipc_socket_path,
+            args.test_output.as_deref(),
+            args.test_text.as_deref(),
+        )
+        .await;
+        let _ = shutdown_tx.send(());
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        let _ = graph_arc.set_hotel_pid(&hotel_name, None);
+        return test_result;
     }
 
     // PORT-BP-003: Mesh Outbound Dispatcher (Periodic Queuing Loop)
@@ -812,8 +1168,11 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_guest_seed, default_hotel_record, guest_supervision_enabled, hotel_base_port,
+        StartupTest, default_guest_seed, default_hotel_record, enable_guest_test_overrides,
+        extract_context_graph_entries, guest_supervision_enabled, hotel_base_port,
     };
+    use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
+    use ansible_mesh_core::storage::GraphStorage;
 
     #[test]
     fn guest_supervision_defaults_disabled() {
@@ -844,5 +1203,49 @@ mod tests {
         );
         assert!(guests.iter().all(|guest| guest.hotel_name == "beta-hotel"));
         assert!(guests.iter().any(|guest| guest.role == "tool"));
+    }
+
+    #[test]
+    fn context_graph_entries_support_nested_section() {
+        let entries = extract_context_graph_entries(&serde_json::json!({
+            "context_graph": {
+                "telegram_bot_token": "token",
+                "elevenlabs_api_key": "key"
+            },
+            "ignored": {
+                "not": "imported"
+            }
+        }));
+
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|(key, _)| key == "telegram_bot_token"));
+        assert!(entries.iter().any(|(key, _)| key == "elevenlabs_api_key"));
+    }
+
+    #[test]
+    fn text_startup_test_injects_stub_response_into_model_guest() {
+        let graph = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let guests = default_guest_seed("startup-test-hotel");
+        graph
+            .seed_guests("startup-test-hotel", &guests)
+            .expect("seed guests");
+
+        enable_guest_test_overrides(&graph, "startup-test-hotel", StartupTest::TextRoundTrip)
+            .expect("apply startup overrides");
+
+        let stored = graph
+            .list_guests("startup-test-hotel", false)
+            .expect("list guests");
+        let model = stored
+            .into_iter()
+            .find(|guest| guest.role == "model")
+            .expect("model guest should exist");
+        let config: serde_json::Value =
+            serde_json::from_str(&model.config_json).expect("config should decode");
+
+        assert_eq!(
+            config["env"]["PHILOTIC_MODEL_ROUTER_STUB_RESPONSE"].as_str(),
+            Some("startup text smoke ok")
+        );
     }
 }

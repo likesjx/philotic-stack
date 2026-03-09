@@ -86,7 +86,7 @@
   - `attachments`
 - [x] Decide that tools and skills should project separately from semantic context under `affordances`.
 - [x] Implement the first compatibility-first structured model response seam in `model-router`.
-- [ ] Preserve a first-class minimal prompt-response path with the structured envelope fields remaining mostly optional.
+- [x] Preserve a first-class minimal prompt-response path with the structured envelope fields remaining mostly optional.
 - [x] Add initial `response_contract.channels` handling for text-generation requests.
 - [x] Add first structured response fields for:
   - `display_text`
@@ -102,6 +102,10 @@
   - API key fallback
   - possible ADC path
 - [x] Add the first Gemini guest auth abstraction that prefers OAuth bearer config over API key fallback.
+- [x] Add `ansible --test` startup harness support for:
+  - `text-roundtrip`
+  - `voice-sample`
+- [x] Add a startup-driven model-controller smoke script for the text round-trip path.
 - [ ] Define hotel CLI OAuth UX:
   - browser launch
   - temporary localhost callback listener
