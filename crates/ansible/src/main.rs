@@ -2,10 +2,17 @@ use ansible_mesh_core::beacon::BeaconDaemon;
 use ansible_mesh_core::storage::{AgentIdentityRecord, GraphStorage, GuestRecord, HotelRecord};
 use ansible_mesh_core::{NodeCapabilities, NodeRole};
 use anyhow::{Context, Result};
+use axum::{
+    Json, Router,
+    extract::{Path as AxumPath, Query, State},
+    response::IntoResponse,
+    routing::{get, post},
+};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use clap::{Parser, ValueEnum};
 use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
+use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
@@ -65,9 +72,32 @@ enum StartupTest {
     #[value(name = "text-roundtrip", alias = "text-round-trip")]
     TextRoundTrip,
     VoiceSample,
+    #[value(name = "telegram-roundtrip", alias = "telegram-round-trip")]
+    TelegramRoundTrip,
 }
 
 const STARTUP_TEST_TEXT_REPLY: &str = "startup text smoke ok";
+const STARTUP_TEST_TELEGRAM_TOKEN: &str = "startup-test-telegram-token";
+const STARTUP_TEST_TELEGRAM_REPLY: &str = "startup telegram smoke ok";
+
+#[derive(Debug, Default)]
+struct FakeTelegramState {
+    updates: std::sync::Mutex<VecDeque<serde_json::Value>>,
+    sent_messages: std::sync::Mutex<Vec<serde_json::Value>>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TelegramGetUpdatesQuery {
+    offset: Option<i64>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TelegramSendMessageRequest {
+    chat_id: serde_json::Value,
+    text: String,
+    #[allow(dead_code)]
+    parse_mode: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct AnsibleCutoverFlags {
@@ -120,6 +150,17 @@ fn hotel_base_port(hotel_name: &str) -> u16 {
         hash = hash.wrapping_mul(31).wrapping_add(byte as u16);
     }
     10_000 + (hash % 20_000)
+}
+
+fn startup_test_telegram_port(hotel_name: &str) -> u16 {
+    hotel_base_port(hotel_name) + 20
+}
+
+fn startup_test_telegram_api_base_url(hotel_name: &str) -> String {
+    format!(
+        "http://127.0.0.1:{}",
+        startup_test_telegram_port(hotel_name)
+    )
 }
 
 fn default_hotel_record(hotel_name: &str) -> HotelRecord {
@@ -303,6 +344,50 @@ fn enable_guest_test_overrides(
                 guest.config_json = config.to_string();
             }
         }
+        StartupTest::TelegramRoundTrip => {
+            graph.set_config_value(
+                "telegram_bot_token",
+                &serde_json::Value::String(STARTUP_TEST_TELEGRAM_TOKEN.into()).to_string(),
+            )?;
+
+            let telegram_api_base_url = startup_test_telegram_api_base_url(hotel_name);
+
+            for guest in &mut guests {
+                if guest.role == "model.gemini" {
+                    let mut config: serde_json::Value =
+                        serde_json::from_str(&guest.config_json).unwrap_or_default();
+                    let env = config
+                        .as_object_mut()
+                        .and_then(|obj| obj.get_mut("env"))
+                        .and_then(serde_json::Value::as_object_mut)
+                        .context("guest config missing env object")?;
+                    env.insert(
+                        "PHILOTIC_MODEL_ROUTER_STUB_RESPONSE".into(),
+                        serde_json::Value::String(STARTUP_TEST_TELEGRAM_REPLY.into()),
+                    );
+                    guest.config_json = config.to_string();
+                }
+
+                if guest.role == "hegemon" {
+                    let mut config: serde_json::Value =
+                        serde_json::from_str(&guest.config_json).unwrap_or_default();
+                    let env = config
+                        .as_object_mut()
+                        .and_then(|obj| obj.get_mut("env"))
+                        .and_then(serde_json::Value::as_object_mut)
+                        .context("guest config missing env object")?;
+                    env.insert(
+                        "PHILOTIC_TELEGRAM_API_BASE_URL".into(),
+                        serde_json::Value::String(telegram_api_base_url.clone()),
+                    );
+                    env.insert(
+                        "PHILOTIC_TELEGRAM_FILE_API_BASE_URL".into(),
+                        serde_json::Value::String(telegram_api_base_url.clone()),
+                    );
+                    guest.config_json = config.to_string();
+                }
+            }
+        }
     }
 
     graph.seed_guests(hotel_name, &guests)?;
@@ -341,6 +426,21 @@ fn prepare_startup_test_binaries(test: StartupTest) -> Result<()> {
             ])
             .status()
             .context("failed to launch cargo build for startup test binaries")?,
+        StartupTest::TelegramRoundTrip => std::process::Command::new("cargo")
+            .args([
+                "build",
+                "-p",
+                "hegemon",
+                "-p",
+                "agent-core",
+                "-p",
+                "tool-runner",
+                "-p",
+                "model-router",
+                "--bins",
+            ])
+            .status()
+            .context("failed to launch cargo build for startup test binaries")?,
     };
 
     if !status.success() {
@@ -350,8 +450,66 @@ fn prepare_startup_test_binaries(test: StartupTest) -> Result<()> {
     Ok(())
 }
 
+fn fake_telegram_router(state: Arc<FakeTelegramState>) -> Router {
+    Router::new()
+        .route("/bot:token/getUpdates", get(fake_telegram_get_updates))
+        .route("/bot:token/sendMessage", post(fake_telegram_send_message))
+        .with_state(state)
+}
+
+async fn fake_telegram_get_updates(
+    AxumPath(_token): AxumPath<String>,
+    Query(query): Query<TelegramGetUpdatesQuery>,
+    State(state): State<Arc<FakeTelegramState>>,
+) -> impl IntoResponse {
+    let offset = query.offset.unwrap_or(0);
+    let mut updates = state.updates.lock().expect("updates lock");
+    let mut result = Vec::new();
+    while let Some(update) = updates.front() {
+        let update_id = update
+            .get("update_id")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or_default();
+        if update_id < offset {
+            updates.pop_front();
+            continue;
+        }
+        result.push(update.clone());
+        updates.pop_front();
+    }
+
+    Json(serde_json::json!({
+        "ok": true,
+        "result": result
+    }))
+}
+
+async fn fake_telegram_send_message(
+    AxumPath(_token): AxumPath<String>,
+    State(state): State<Arc<FakeTelegramState>>,
+    Json(payload): Json<TelegramSendMessageRequest>,
+) -> impl IntoResponse {
+    state
+        .sent_messages
+        .lock()
+        .expect("sent messages lock")
+        .push(serde_json::json!({
+            "chat_id": payload.chat_id,
+            "text": payload.text,
+            "parse_mode": payload.parse_mode,
+        }));
+
+    Json(serde_json::json!({
+        "ok": true,
+        "result": {
+            "message_id": 1
+        }
+    }))
+}
+
 async fn run_startup_test(
     test: StartupTest,
+    hotel_name: &str,
     socket_path: &str,
     output: Option<&str>,
     text: Option<&str>,
@@ -554,6 +712,92 @@ async fn run_startup_test(
                     .get("voice_id")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("unknown")
+            );
+        }
+        StartupTest::TelegramRoundTrip => {
+            let telegram_api_base_url = startup_test_telegram_api_base_url(hotel_name);
+            let telegram_addr = format!("127.0.0.1:{}", startup_test_telegram_port(hotel_name));
+            let telegram_state = Arc::new(FakeTelegramState::default());
+            telegram_state
+                .updates
+                .lock()
+                .expect("updates lock")
+                .push_back(serde_json::json!({
+                    "update_id": 1,
+                    "message": {
+                        "message_id": 1,
+                        "text": text.unwrap_or("hello from telegram startup test"),
+                        "chat": { "id": 777000 },
+                        "from": { "id": 42, "username": "startup_test" }
+                    }
+                }));
+
+            let listener = tokio::net::TcpListener::bind(&telegram_addr)
+                .await
+                .with_context(|| format!("failed to bind fake telegram api on {telegram_addr}"))?;
+            let telegram_server = tokio::spawn({
+                let state = Arc::clone(&telegram_state);
+                async move {
+                    axum::serve(listener, fake_telegram_router(state))
+                        .await
+                        .expect("fake telegram api should serve");
+                }
+            });
+
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+            for attempt in 1..=10 {
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                let maybe_message = telegram_state
+                    .sent_messages
+                    .lock()
+                    .expect("sent messages lock")
+                    .last()
+                    .cloned();
+                if let Some(message) = maybe_message {
+                    let text = message
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    let parse_mode = message
+                        .get("parse_mode")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    if text != STARTUP_TEST_TELEGRAM_REPLY {
+                        telegram_server.abort();
+                        let _ = telegram_server.await;
+                        anyhow::bail!(
+                            "unexpected telegram startup reply on attempt {}: expected {:?}, got {:?}",
+                            attempt,
+                            STARTUP_TEST_TELEGRAM_REPLY,
+                            text
+                        );
+                    }
+                    if parse_mode != "HTML" {
+                        telegram_server.abort();
+                        let _ = telegram_server.await;
+                        anyhow::bail!(
+                            "unexpected telegram parse_mode on attempt {}: expected HTML, got {:?}",
+                            attempt,
+                            parse_mode
+                        );
+                    }
+
+                    info!(
+                        "Startup telegram round-trip delivered {:?} through fake Telegram API on attempt {} via {}",
+                        text, attempt, telegram_api_base_url
+                    );
+                    telegram_server.abort();
+                    let _ = telegram_server.await;
+                    return Ok(());
+                }
+            }
+
+            telegram_server.abort();
+            let _ = telegram_server.await;
+            anyhow::bail!(
+                "timed out waiting for fake Telegram sendMessage at {}",
+                telegram_api_base_url
             );
         }
     }
@@ -921,6 +1165,7 @@ async fn main() -> Result<()> {
     if let Some(test) = args.test {
         let test_result = run_startup_test(
             test,
+            &hotel_name,
             &hotel.ipc_socket_path,
             args.test_output.as_deref(),
             args.test_text.as_deref(),
@@ -1181,9 +1426,10 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        STARTUP_TEST_TEXT_REPLY, StartupTest, default_guest_seed, default_hotel_record,
-        enable_guest_test_overrides, extract_context_graph_entries, guest_supervision_enabled,
-        hotel_base_port, run_startup_test,
+        STARTUP_TEST_TELEGRAM_REPLY, STARTUP_TEST_TELEGRAM_TOKEN, STARTUP_TEST_TEXT_REPLY,
+        StartupTest, default_guest_seed, default_hotel_record, enable_guest_test_overrides,
+        extract_context_graph_entries, guest_supervision_enabled, hotel_base_port,
+        run_startup_test, startup_test_telegram_api_base_url,
     };
     use crate::service::ipc::IpcServer;
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
@@ -1281,6 +1527,51 @@ mod tests {
         assert_eq!(
             config["env"]["PHILOTIC_MODEL_ROUTER_STUB_RESPONSE"].as_str(),
             Some(STARTUP_TEST_TEXT_REPLY)
+        );
+    }
+
+    #[test]
+    fn telegram_startup_test_injects_fake_api_and_stub_reply() {
+        let graph = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let guests = default_guest_seed("startup-test-hotel");
+        graph
+            .seed_guests("startup-test-hotel", &guests)
+            .expect("seed guests");
+
+        enable_guest_test_overrides(&graph, "startup-test-hotel", StartupTest::TelegramRoundTrip)
+            .expect("apply startup overrides");
+
+        let token = graph
+            .get_config_value("telegram_bot_token")
+            .expect("read telegram token");
+        let expected_token =
+            serde_json::Value::String(STARTUP_TEST_TELEGRAM_TOKEN.into()).to_string();
+        assert_eq!(token.as_deref(), Some(expected_token.as_str()));
+
+        let stored = graph
+            .list_guests("startup-test-hotel", false)
+            .expect("list guests");
+
+        let hegemon = stored
+            .iter()
+            .find(|guest| guest.role == "hegemon")
+            .expect("hegemon guest should exist");
+        let hegemon_config: serde_json::Value =
+            serde_json::from_str(&hegemon.config_json).expect("config should decode");
+        assert_eq!(
+            hegemon_config["env"]["PHILOTIC_TELEGRAM_API_BASE_URL"].as_str(),
+            Some(startup_test_telegram_api_base_url("startup-test-hotel").as_str())
+        );
+
+        let gemini = stored
+            .iter()
+            .find(|guest| guest.role == "model.gemini")
+            .expect("gemini guest should exist");
+        let gemini_config: serde_json::Value =
+            serde_json::from_str(&gemini.config_json).expect("config should decode");
+        assert_eq!(
+            gemini_config["env"]["PHILOTIC_MODEL_ROUTER_STUB_RESPONSE"].as_str(),
+            Some(STARTUP_TEST_TELEGRAM_REPLY)
         );
     }
 
@@ -1382,6 +1673,7 @@ mod tests {
 
         run_startup_test(
             StartupTest::TextRoundTrip,
+            "startup-test-hotel",
             &socket_path,
             None,
             Some("hello startup test"),

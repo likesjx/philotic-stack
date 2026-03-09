@@ -66,15 +66,28 @@ cargo run -p ansible -- \
   --test-text "hello model controller"
 ```
 
+### Startup Smoke: Telegram Controller Round-Trip
+
+```bash
+cargo run -p ansible -- \
+  --hotel startup-test-hotel \
+  --load-config mesh-config.json \
+  --test telegram-roundtrip \
+  --test-text "hello telegram controller"
+```
+
 `--load-config` accepts either a flat JSON object for backward compatibility or a
 top-level `context_graph` object whose keys are injected into `node_config`. The
 structured form is preferred for secrets like `telegram_bot_token`,
 `gemini_api_key`, `elevenlabs_api_key`, and `elevenlabs_voice_id`.
 
-`--test text-roundtrip` and `--test voice-sample` are startup self-tests. They
-build the required guest binaries, boot the hotel, route a task through the hotel
-IPC plane, verify the reply, and then shut the hotel down. The voice test also
-forces inline audio for the `model.elevenlabs` guest and writes the returned MP3.
+`--test text-roundtrip`, `--test telegram-roundtrip`, and `--test voice-sample`
+are startup self-tests. They build the required guest binaries, boot the hotel,
+route a task through the hotel IPC plane, verify the reply, and then shut the
+hotel down. The Telegram smoke points `hegemon` at a local fake Telegram API and
+asserts that the controller sends the expected `sendMessage` reply. The voice
+test also forces inline audio for the `model.elevenlabs` guest and writes the
+returned MP3.
 
 ## Architecture Reference
 

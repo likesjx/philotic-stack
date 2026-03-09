@@ -926,8 +926,16 @@ async fn main() -> Result<()> {
         .timeout(Duration::from_secs(60))
         .build()?;
 
-    let tg_base = format!("https://api.telegram.org/bot{}/", bot_token);
-    let tg_file_base = format!("https://api.telegram.org/file/bot{}/", bot_token);
+    let telegram_api_base = std::env::var("PHILOTIC_TELEGRAM_API_BASE_URL")
+        .unwrap_or_else(|_| "https://api.telegram.org".to_string())
+        .trim_end_matches('/')
+        .to_string();
+    let telegram_file_api_base = std::env::var("PHILOTIC_TELEGRAM_FILE_API_BASE_URL")
+        .unwrap_or_else(|_| telegram_api_base.clone())
+        .trim_end_matches('/')
+        .to_string();
+    let tg_base = format!("{telegram_api_base}/bot{}/", bot_token);
+    let tg_file_base = format!("{telegram_file_api_base}/file/bot{}/", bot_token);
     let blob_base = format!("http://127.0.0.1:{}", args.ansible_port + 1);
     let mut offset: i64 = 0;
 
