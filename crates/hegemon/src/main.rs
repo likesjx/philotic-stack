@@ -951,6 +951,22 @@ fn value_to_id_string(value: &Value) -> Option<String> {
     }
 }
 
+fn configured_target_agent_id() -> String {
+    std::env::var("PHILOTIC_TARGET_AGENT_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "agent-jane-01".to_string())
+}
+
+fn configured_telegram_token_key() -> String {
+    std::env::var("PHILOTIC_TELEGRAM_BOT_TOKEN_KEY")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "telegram_bot_token".to_string())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -965,31 +981,45 @@ async fn main() -> Result<()> {
     };
 
     let mut ipc_client = PhiloticClient::connect(identity).await?;
+    let target_agent_id = configured_target_agent_id();
+    let telegram_token_key = configured_telegram_token_key();
 
     // Pull configuration from the Hotel Graph dynamically
     info!("Requesting Telegram Configuration from Ansible Context Graph...");
-    let config_req = IpcRequest::GetConfig {
-        key: "telegram_bot_token".into(),
-    };
+    let bot_token = if let Some(env_token) = std::env::var("PHILOTIC_TELEGRAM_BOT_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        env_token
+    } else {
+        let config_req = IpcRequest::GetConfig {
+            key: telegram_token_key.clone(),
+        };
 
-    let bot_token = match ipc_client.send_request(config_req).await? {
-        IpcResponse::ConfigData { key: _, value_json } => {
-            if let Some(json_str) = value_json {
-                if let Ok(val) = serde_json::from_str::<Value>(&json_str) {
-                    val.as_str().unwrap_or("").to_string()
+        match ipc_client.send_request(config_req).await? {
+            IpcResponse::ConfigData { key: _, value_json } => {
+                if let Some(json_str) = value_json {
+                    if let Ok(val) = serde_json::from_str::<Value>(&json_str) {
+                        val.as_str().unwrap_or("").to_string()
+                    } else {
+                        json_str
+                    }
                 } else {
-                    json_str // fallback if it was stored as raw string
+                    warn!(
+                        "Telegram Bot Token key [{}] found, but value was empty in Context Graph. Using Dummy Token.",
+                        telegram_token_key
+                    );
+                    "dummy_token".to_string()
                 }
-            } else {
+            }
+            _ => {
                 warn!(
-                    "Telegram Bot Token key found, but value was empty in Context Graph. Using Dummy Token."
+                    "Failed to retrieve Telegram Bot Token from Context Graph key [{}]. Using Dummy Token.",
+                    telegram_token_key
                 );
                 "dummy_token".to_string()
             }
-        }
-        _ => {
-            warn!("Failed to retrieve Telegram Bot Token from Context Graph. Using Dummy Token.");
-            "dummy_token".to_string()
         }
     };
 
@@ -1043,7 +1073,7 @@ async fn main() -> Result<()> {
                                     if let Some(update_id) = update.get("update_id").and_then(|id| id.as_i64()) {
                                         offset = update_id + 1; // Ack the message
 
-                                        if let Some(mut envelope) = telegram_inbound_envelope(update, update_id, "agent-jane-01") {
+                                        if let Some(mut envelope) = telegram_inbound_envelope(update, update_id, &target_agent_id) {
                                             if !envelope.attachments.is_empty() {
                                                 envelope.attachments = hydrate_telegram_attachments(
                                                     &http_client,

@@ -15,7 +15,7 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-pub const AGENT_ID: &str = "agent-jane-01";
+pub const DEFAULT_AGENT_ID: &str = "agent-jane-01";
 const DEFAULT_REPLY_ROLE: &str = "hegemon";
 const LOCAL_NODE: &str = "local-ansible-01";
 const DEFAULT_TEXT_MODEL_ROLE: &str = "model.gemini";
@@ -124,13 +124,15 @@ fn media_analysis_prompt(content: &str, attachments: &[TransportAttachment]) -> 
 
 pub struct AgentRuntime {
     ipc_client: PhiloticClient,
+    agent_id: String,
     sessions: HashMap<String, SessionState>,
 }
 
 impl AgentRuntime {
-    pub fn new(ipc_client: PhiloticClient) -> Self {
+    pub fn new(ipc_client: PhiloticClient, agent_id: impl Into<String>) -> Self {
         Self {
             ipc_client,
+            agent_id: agent_id.into(),
             sessions: HashMap::new(),
         }
     }
@@ -191,7 +193,7 @@ impl AgentRuntime {
             .clone()
             .or(task.source.clone())
             .unwrap_or_else(|| "unknown".into());
-        let session_id = task.session_id_or_default(AGENT_ID);
+        let session_id = task.session_id_or_default(&self.agent_id);
         let turn_id = task.turn_id.clone().unwrap_or_else(|| task_id.to_string());
         let chat_id = task.chat_id.clone().unwrap_or_default();
         let inbound_final_reply_to = task
@@ -207,10 +209,9 @@ impl AgentRuntime {
         self.ensure_session_loaded(&session_id, &source).await?;
 
         let (final_reply_to, final_reply_role, final_reply_guest_id) = {
-            let state = self
-                .sessions
-                .entry(session_id.clone())
-                .or_insert_with(|| SessionState::new(session_id.clone(), AGENT_ID.into(), source));
+            let state = self.sessions.entry(session_id.clone()).or_insert_with(|| {
+                SessionState::new(session_id.clone(), self.agent_id.clone(), source)
+            });
             state.set_transport_reply_target(
                 inbound_final_reply_to,
                 inbound_final_reply_role,
@@ -289,7 +290,7 @@ impl AgentRuntime {
         };
 
         self.ipc_client
-            .sync_apartment(AGENT_ID, &checkpoint_memory_type, checkpoint_json)
+            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
             .await?;
         self.sync_session_index(&index_state).await?;
 
@@ -369,7 +370,7 @@ impl AgentRuntime {
         };
 
         self.ipc_client
-            .sync_apartment(AGENT_ID, &checkpoint_memory_type, checkpoint_json)
+            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
             .await?;
         self.sync_session_index(&index_state).await?;
 
@@ -554,7 +555,7 @@ impl AgentRuntime {
         };
 
         self.ipc_client
-            .sync_apartment(AGENT_ID, &checkpoint_memory_type, checkpoint_json)
+            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
             .await?;
         self.sync_session_index(&index_state).await?;
 
@@ -650,7 +651,7 @@ impl AgentRuntime {
         };
 
         self.ipc_client
-            .sync_apartment(AGENT_ID, &checkpoint_memory_type, checkpoint_json)
+            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
             .await?;
         self.sync_session_index(&index_state).await?;
 
@@ -765,7 +766,7 @@ impl AgentRuntime {
         };
 
         self.ipc_client
-            .sync_apartment(AGENT_ID, &checkpoint_memory_type, checkpoint_json)
+            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
             .await?;
         self.sync_session_index(&index_state).await?;
 
@@ -833,7 +834,7 @@ impl AgentRuntime {
         };
 
         self.ipc_client
-            .sync_apartment(AGENT_ID, &checkpoint_memory_type, checkpoint_json)
+            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
             .await?;
         self.sync_session_index(&index_state).await?;
 
@@ -916,7 +917,7 @@ impl AgentRuntime {
         };
 
         self.ipc_client
-            .sync_apartment(AGENT_ID, &checkpoint_memory_type, checkpoint_json)
+            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
             .await?;
         self.sync_session_index(&index_state).await?;
 
@@ -1060,7 +1061,7 @@ impl AgentRuntime {
         };
 
         self.ipc_client
-            .sync_apartment(AGENT_ID, &checkpoint_memory_type, checkpoint_json)
+            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
             .await?;
         self.sync_session_index(&index_state).await?;
 
@@ -1278,7 +1279,7 @@ impl AgentRuntime {
         };
 
         self.ipc_client
-            .sync_apartment(AGENT_ID, &checkpoint_memory_type, checkpoint_json)
+            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
             .await?;
         self.sync_session_index(&index_state).await?;
 
@@ -1577,7 +1578,7 @@ impl AgentRuntime {
         };
 
         self.ipc_client
-            .sync_apartment(AGENT_ID, &checkpoint_memory_type, checkpoint_json)
+            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
             .await?;
         self.sync_session_index(&index_state).await?;
 
@@ -1719,7 +1720,7 @@ impl AgentRuntime {
         };
 
         self.ipc_client
-            .sync_apartment(AGENT_ID, &checkpoint_memory_type, checkpoint_json)
+            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
             .await?;
         self.sync_session_index(&index_state).await?;
 
@@ -1795,7 +1796,7 @@ impl AgentRuntime {
             session_id.to_string(),
             SessionState::new(
                 session_id.to_string(),
-                AGENT_ID.into(),
+                self.agent_id.clone(),
                 fallback_source.into(),
             ),
         );
@@ -1806,7 +1807,7 @@ impl AgentRuntime {
         let response = self
             .ipc_client
             .send_request(IpcRequest::GetConfig {
-                key: format!("__apartment__:{AGENT_ID}:short"),
+                key: format!("__apartment__:{}:short", self.agent_id),
             })
             .await?;
 
@@ -1820,7 +1821,7 @@ impl AgentRuntime {
 
         let merged_index = merge_session_index(existing_index.as_ref(), state);
         self.ipc_client
-            .sync_apartment(AGENT_ID, "short", merged_index)
+            .sync_apartment(&self.agent_id, "short", merged_index)
             .await?;
         Ok(())
     }
