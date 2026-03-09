@@ -28,6 +28,28 @@ fn implementation_to_model_role(implementation: &str) -> String {
     format!("model.{normalized}")
 }
 
+fn resolve_model_execution_target(
+    state: Option<&SessionState>,
+    capability: &str,
+    fallback_role: &str,
+) -> (String, String, Option<String>) {
+    if let Some(route) = state.and_then(|state| state.resolve_component_execution_route(capability))
+    {
+        return (
+            route.target_node.clone(),
+            route.target_role.clone(),
+            route.incarnation_id.clone(),
+        );
+    }
+
+    let target_role = state
+        .and_then(|state| state.preferred_component_implementation(capability))
+        .map(implementation_to_model_role)
+        .unwrap_or_else(|| fallback_role.into());
+
+    (LOCAL_NODE.into(), target_role, None)
+}
+
 fn normalized_user_content(task: &InboundTaskPayload) -> Option<String> {
     if let Some(content) = task
         .content
@@ -375,18 +397,14 @@ impl AgentRuntime {
         self.sync_session_index(&index_state).await?;
 
         let media_attachments = media_analysis_attachments(&task);
-        let (action, prompt, attachments, tools_for_model, target_role) =
+        let (action, prompt, attachments, tools_for_model, capability) =
             if media_attachments.is_empty() {
                 (
                     "generate_text",
                     model_prompt,
                     Vec::new(),
                     tools_for_model,
-                    self.sessions
-                        .get(&session_id)
-                        .and_then(|state| state.preferred_component_implementation("text.generate"))
-                        .map(implementation_to_model_role)
-                        .unwrap_or_else(|| DEFAULT_TEXT_MODEL_ROLE.into()),
+                    "text.generate",
                 )
             } else {
                 (
@@ -394,13 +412,14 @@ impl AgentRuntime {
                     media_analysis_prompt(&content, &media_attachments),
                     media_attachments,
                     Vec::new(),
-                    self.sessions
-                        .get(&session_id)
-                        .and_then(|state| state.preferred_component_implementation("media.analyze"))
-                        .map(implementation_to_model_role)
-                        .unwrap_or_else(|| DEFAULT_TEXT_MODEL_ROLE.into()),
+                    "media.analyze",
                 )
             };
+        let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
+            self.sessions.get(&session_id),
+            capability,
+            DEFAULT_TEXT_MODEL_ROLE,
+        );
 
         let attachment_kinds: Vec<&str> = attachments
             .iter()
@@ -450,9 +469,9 @@ impl AgentRuntime {
         info!("Asking the Hotel to route inference to the model controller...");
         self.ipc_client
             .send_request(IpcRequest::EmitTask {
-                target_node: LOCAL_NODE.into(),
+                target_node,
                 target_role,
-                target_guest_id: None,
+                target_guest_id,
                 task_json: serde_json::to_string(&model_req)?,
             })
             .await?;
@@ -1319,18 +1338,17 @@ impl AgentRuntime {
             final_reply_guest_id,
         };
 
-        let target_role = self
-            .sessions
-            .get(&session_id)
-            .and_then(|state| state.preferred_component_implementation("text.generate"))
-            .map(implementation_to_model_role)
-            .unwrap_or_else(|| DEFAULT_TEXT_MODEL_ROLE.into());
+        let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
+            self.sessions.get(&session_id),
+            "text.generate",
+            DEFAULT_TEXT_MODEL_ROLE,
+        );
 
         self.ipc_client
             .send_request(IpcRequest::EmitTask {
-                target_node: LOCAL_NODE.into(),
+                target_node,
                 target_role,
-                target_guest_id: None,
+                target_guest_id,
                 task_json: serde_json::to_string(&model_req)?,
             })
             .await?;
@@ -1831,12 +1849,16 @@ impl AgentRuntime {
 mod tests {
     use super::{
         DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE, media_analysis_attachments, normalized_user_content,
+        resolve_model_execution_target,
     };
     use crate::r#loop::{ApprovalRequest, ToolCall};
     use crate::protocol::{
         FinalReplyPayload, InboundTaskPayload, ModelRequestPayload, TransportAttachment,
     };
-    use crate::session::{ApprovalPolicy, ComponentRouteBinding, SessionState};
+    use crate::session::{
+        ApprovalPolicy, ComponentExecutionRoute, ComponentRouteAssembly, ComponentRouteBinding,
+        SessionState,
+    };
 
     #[test]
     fn model_request_targets_agent_for_reply() {
@@ -1900,6 +1922,36 @@ mod tests {
             .map(super::implementation_to_model_role);
 
         assert_eq!(target_role.as_deref(), Some("model.elevenlabs"));
+    }
+
+    #[test]
+    fn resolved_component_route_can_drive_remote_model_target() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.component_route_assembly = ComponentRouteAssembly {
+            execution_routes: std::collections::BTreeMap::from([(
+                "media.analyze".into(),
+                ComponentExecutionRoute {
+                    target_node: "aria-node".into(),
+                    target_role: "model.gemini".into(),
+                    incarnation_id: Some("aria-architect-hotel:model-controller-gemini".into()),
+                    hotel_id: Some("aria-architect-hotel".into()),
+                    environment_id: None,
+                    execution_mode: "capability".into(),
+                    availability_state: "live".into(),
+                    selection_reason: Some("remote_latency_capacity".into()),
+                },
+            )]),
+        };
+
+        let target =
+            resolve_model_execution_target(Some(&state), "media.analyze", DEFAULT_TEXT_MODEL_ROLE);
+        assert_eq!(target.0, "aria-node");
+        assert_eq!(target.1, "model.gemini");
+        assert_eq!(
+            target.2.as_deref(),
+            Some("aria-architect-hotel:model-controller-gemini")
+        );
     }
 
     #[test]

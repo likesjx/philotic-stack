@@ -393,6 +393,10 @@ mod tests {
             Ok(None)
         }
 
+        fn list_hotels(&self) -> Result<Vec<ansible_mesh_core::storage::HotelRecord>> {
+            Ok(vec![])
+        }
+
         fn upsert_hotel(&self, _hotel: &ansible_mesh_core::storage::HotelRecord) -> Result<()> {
             Ok(())
         }

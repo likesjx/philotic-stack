@@ -176,6 +176,9 @@ pub trait GraphStorage: Send + Sync {
     /// Load a named hotel record, or `None` if it has not been bootstrapped yet.
     fn get_hotel(&self, hotel_name: &str) -> Result<Option<HotelRecord>>;
 
+    /// List all known hotel records.
+    fn list_hotels(&self) -> Result<Vec<HotelRecord>>;
+
     /// Persist (upsert) a named hotel record.
     fn upsert_hotel(&self, hotel: &HotelRecord) -> Result<()>;
 

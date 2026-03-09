@@ -34,6 +34,7 @@ fn make_event(kind: EventKind) -> EventEnvelope {
         event_id: Uuid::new_v4(),
         seq: 0, // assigned by storage
         source_node_id: "hotel-a".into(),
+        target_node_id: Some("hotel-b".into()),
         source_agent_id: "agent-jane".into(),
         target_agent_id: Some("agent-bob".into()),
         kind,
@@ -133,6 +134,33 @@ fn event_storage_query_respects_limit() {
 }
 
 #[test]
+fn event_storage_query_filters_by_target_node() {
+    let store = open_event_storage();
+
+    let mut hotel_b = make_event(EventKind::TaskInvoke);
+    let mut hotel_c = make_event(EventKind::TaskInvoke);
+    hotel_c.target_node_id = Some("hotel-c".into());
+    let mut broadcast = make_event(EventKind::TaskInvoke);
+    broadcast.target_node_id = None;
+
+    store.append_event(&mut hotel_b).unwrap();
+    store.append_event(&mut hotel_c).unwrap();
+    store.append_event(&mut broadcast).unwrap();
+
+    let hotel_b_events = store.query_unacked_events("hotel-b", 0, 10).unwrap();
+    assert_eq!(hotel_b_events.len(), 2);
+    assert!(hotel_b_events.iter().all(|event| {
+        event.target_node_id.is_none() || event.target_node_id.as_deref() == Some("hotel-b")
+    }));
+
+    let hotel_c_events = store.query_unacked_events("hotel-c", 0, 10).unwrap();
+    assert_eq!(hotel_c_events.len(), 2);
+    assert!(hotel_c_events.iter().all(|event| {
+        event.target_node_id.is_none() || event.target_node_id.as_deref() == Some("hotel-c")
+    }));
+}
+
+#[test]
 fn event_storage_delete_removes_event() {
     let store = open_event_storage();
 
@@ -173,6 +201,7 @@ fn event_storage_blob_ref_payload_round_trips() {
         event_id: Uuid::new_v4(),
         seq: 0,
         source_node_id: "hotel-a".into(),
+        target_node_id: Some("hotel-b".into()),
         source_agent_id: "agent-jane".into(),
         target_agent_id: None,
         kind: EventKind::TaskInvoke,
@@ -401,6 +430,50 @@ fn graph_storage_hotel_round_trip_and_pid_update() {
     assert_eq!(loaded.blob_port, 9201);
     assert_eq!(loaded.ipc_socket_path, "/tmp/philotic-alpha.sock");
     assert_eq!(loaded.active_pid.as_deref(), Some("2222"));
+}
+
+#[test]
+fn graph_storage_lists_hotels() {
+    let store = open_graph_storage();
+
+    let alpha = HotelRecord {
+        hotel_name: "alpha".into(),
+        capabilities: NodeCapabilities {
+            node_id: "alpha-node".into(),
+            roles: vec![NodeRole::AnsibleNode],
+            models: vec![],
+            tools: vec![],
+            constraints: Default::default(),
+        },
+        mesh_port: 9101,
+        blob_port: 9201,
+        ipc_socket_path: "/tmp/philotic-alpha.sock".into(),
+        active_pid: None,
+    };
+    let beta = HotelRecord {
+        hotel_name: "beta".into(),
+        capabilities: NodeCapabilities {
+            node_id: "beta-node".into(),
+            roles: vec![NodeRole::AnsibleNode],
+            models: vec![],
+            tools: vec![],
+            constraints: Default::default(),
+        },
+        mesh_port: 9102,
+        blob_port: 9202,
+        ipc_socket_path: "/tmp/philotic-beta.sock".into(),
+        active_pid: None,
+    };
+
+    store.upsert_hotel(&beta).unwrap();
+    store.upsert_hotel(&alpha).unwrap();
+
+    let listed = store.list_hotels().unwrap();
+    let names: Vec<_> = listed
+        .iter()
+        .map(|hotel| hotel.hotel_name.as_str())
+        .collect();
+    assert_eq!(names, vec!["alpha", "beta"]);
 }
 
 // ═══════════════════════════════════════════════════════════
