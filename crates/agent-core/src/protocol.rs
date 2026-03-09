@@ -1,4 +1,4 @@
-use crate::session::ToolDefinition;
+use crate::session::{TaskRunnerBaseConfig, ToolDefinition};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -75,6 +75,8 @@ pub struct ModelRequestPayload {
     pub turn_id: String,
     pub prompt: String,
     pub user_content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<TransportAttachment>,
     pub tools_for_model: Vec<ToolDefinition>,
     pub chat_id: String,
     pub reply_to: String,
@@ -126,6 +128,8 @@ pub struct ToolExecutionPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_runner_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_runner_config: Option<TaskRunnerBaseConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub selection_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_ref: Option<String>,
@@ -170,6 +174,7 @@ impl InboundTaskPayload {
 #[cfg(test)]
 mod tests {
     use super::{InboundTaskPayload, TaskRunnerOverlay, ToolExecutionPayload, TransportAttachment};
+    use crate::session::TaskRunnerBaseConfig;
 
     #[test]
     fn session_id_defaults_from_source_and_chat() {
@@ -361,6 +366,12 @@ mod tests {
             hotel_id: Some("local-ansible-01".into()),
             environment_id: Some("workspace://main".into()),
             task_runner_kind: Some("workspace".into()),
+            task_runner_config: Some(TaskRunnerBaseConfig {
+                default_workspace_ref: Some("workspace://main".into()),
+                allowed_tools: Some(vec!["workspace.read".into(), "workspace.search".into()]),
+                max_read_bytes: Some(8192),
+                max_search_results: Some(25),
+            }),
             selection_reason: Some("preferred_environment_live".into()),
             workspace_ref: Some("workspace://main".into()),
             task_runner_overlay: Some(TaskRunnerOverlay {
@@ -378,6 +389,11 @@ mod tests {
 
         let json = serde_json::to_value(&payload).expect("serialize payload");
         assert_eq!(json["task_runner_kind"], "workspace");
+        assert_eq!(
+            json["task_runner_config"]["default_workspace_ref"],
+            "workspace://main"
+        );
+        assert_eq!(json["task_runner_config"]["max_read_bytes"], 8192);
         assert_eq!(
             json["task_runner_overlay"]["workspace_ref"],
             "workspace://main"

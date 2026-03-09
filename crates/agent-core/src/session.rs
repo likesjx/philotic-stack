@@ -60,6 +60,8 @@ pub struct SessionBindings {
     #[serde(default)]
     pub effective_workspace_ref: Option<String>,
     #[serde(default)]
+    pub workspace_runner_config: Option<TaskRunnerBaseConfig>,
+    #[serde(default)]
     pub transport_reply_target: Option<TransportReplyTargetBinding>,
     #[serde(default)]
     pub component_routes: Vec<ComponentRouteBinding>,
@@ -75,6 +77,18 @@ pub struct SessionBindings {
     pub preferred_environment_id: Option<String>,
     #[serde(default)]
     pub allowed_tool_runner_incarnations: Vec<ToolRunnerIncarnationBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TaskRunnerBaseConfig {
+    #[serde(default)]
+    pub default_workspace_ref: Option<String>,
+    #[serde(default)]
+    pub allowed_tools: Option<Vec<String>>,
+    #[serde(default)]
+    pub max_read_bytes: Option<usize>,
+    #[serde(default)]
+    pub max_search_results: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -122,6 +136,8 @@ pub struct ToolExecutionRoute {
     pub environment_id: Option<String>,
     #[serde(default)]
     pub task_runner_kind: Option<String>,
+    #[serde(default)]
+    pub task_runner_config: Option<TaskRunnerBaseConfig>,
     pub execution_mode: String,
     #[serde(default = "default_route_availability")]
     pub availability_state: String,
@@ -1075,6 +1091,7 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
                     },
                     environment_id: None,
                     task_runner_kind: task_runner_kind_for_tool(tool_name),
+                    task_runner_config: task_runner_base_config_for_tool(bindings, tool_name),
                     execution_mode: execution_mode.into(),
                     availability_state: "live".into(),
                     selection_reason: Some(if execution_mode == "local_agent" {
@@ -1138,6 +1155,40 @@ fn task_runner_kind_for_tool(tool_name: &str) -> Option<String> {
     }
 
     None
+}
+
+fn task_runner_base_config_for_tool(
+    bindings: &SessionBindings,
+    tool_name: &str,
+) -> Option<TaskRunnerBaseConfig> {
+    if !tool_name.starts_with("workspace.") {
+        return None;
+    }
+
+    let config = bindings.workspace_runner_config.clone().unwrap_or_default();
+    let default_workspace_ref = config
+        .default_workspace_ref
+        .or_else(|| bindings.effective_workspace_ref.clone());
+    let allowed_tools = config.allowed_tools.or_else(|| {
+        let workspace_tools = bindings
+            .effective_toolset
+            .iter()
+            .filter(|tool| tool.starts_with("workspace."))
+            .cloned()
+            .collect::<Vec<_>>();
+        if workspace_tools.is_empty() {
+            None
+        } else {
+            Some(workspace_tools)
+        }
+    });
+
+    Some(TaskRunnerBaseConfig {
+        default_workspace_ref,
+        allowed_tools,
+        max_read_bytes: config.max_read_bytes,
+        max_search_results: config.max_search_results,
+    })
 }
 
 fn tool_assembly_from_allowed_incarnations(bindings: &SessionBindings) -> ToolAssembly {
@@ -1228,6 +1279,7 @@ fn select_incarnation_route(
         hotel_id: selected.hotel_id.clone(),
         environment_id: selected.environment_id.clone(),
         task_runner_kind: task_runner_kind_for_tool(tool_name),
+        task_runner_config: task_runner_base_config_for_tool(bindings, tool_name),
         execution_mode: selected.execution_mode.clone(),
         availability_state: selected.availability_state.clone(),
         selection_reason: Some(selection_reason),
@@ -1323,7 +1375,7 @@ fn current_unix_ts() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApprovalPolicy, ComponentRouteBinding, SessionBindings, SessionState,
+        ApprovalPolicy, ComponentRouteBinding, SessionBindings, SessionState, TaskRunnerBaseConfig,
         ToolRunnerIncarnationBinding, TransportReplyTargetBinding, WorkingTurn,
         merge_session_index, session_checkpoint_memory_type,
     };
@@ -1454,6 +1506,7 @@ mod tests {
                 }),
                 component_routes: Vec::new(),
                 effective_model_controller: Some("gemini-flash".into()),
+                workspace_runner_config: None,
                 preferred_tool_runner_incarnation: None,
                 preferred_tool_runner: None,
                 preferred_hotel_id: None,
@@ -1536,6 +1589,7 @@ mod tests {
             }),
             component_routes: Vec::new(),
             effective_model_controller: Some("gemini-flash".into()),
+            workspace_runner_config: None,
             preferred_tool_runner_incarnation: None,
             preferred_tool_runner: None,
             preferred_hotel_id: None,
@@ -1781,6 +1835,14 @@ mod tests {
         state.add_tool_binding("workspace.read");
         state.add_tool_binding("workspace.list");
         state.add_tool_binding("workspace.search");
+        state.bindings.effective_workspace_ref = Some("workspace://main".into());
+        state.bindings.workspace_runner_config = Some(TaskRunnerBaseConfig {
+            default_workspace_ref: Some("workspace://policy".into()),
+            allowed_tools: Some(vec!["workspace.read".into(), "workspace.search".into()]),
+            max_read_bytes: Some(8192),
+            max_search_results: Some(25),
+        });
+        state.rebuild_default_tool_assembly();
 
         let read_route = state
             .resolve_tool_route("workspace.read")
@@ -1798,6 +1860,20 @@ mod tests {
         assert_eq!(read_route.task_runner_kind.as_deref(), Some("workspace"));
         assert_eq!(list_route.task_runner_kind.as_deref(), Some("workspace"));
         assert_eq!(search_route.task_runner_kind.as_deref(), Some("workspace"));
+        assert_eq!(
+            read_route
+                .task_runner_config
+                .as_ref()
+                .and_then(|config| config.default_workspace_ref.as_deref()),
+            Some("workspace://policy")
+        );
+        assert_eq!(
+            read_route
+                .task_runner_config
+                .as_ref()
+                .and_then(|config| config.max_read_bytes),
+            Some(8192)
+        );
         assert_eq!(read_route.target_role, "tool.workspace.read");
         assert_eq!(list_route.target_role, "tool.workspace.list");
         assert_eq!(search_route.target_role, "tool.workspace.search");

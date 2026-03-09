@@ -21,6 +21,18 @@ struct WorkspaceRunnerConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize)]
+struct WorkspaceRunnerBaseConfig {
+    #[serde(default)]
+    default_workspace_ref: Option<String>,
+    #[serde(default)]
+    allowed_tools: Option<Vec<String>>,
+    #[serde(default)]
+    max_read_bytes: Option<usize>,
+    #[serde(default)]
+    max_search_results: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize)]
 struct WorkspaceRunnerOverlay {
     #[serde(default)]
     workspace_ref: Option<String>,
@@ -113,6 +125,34 @@ impl WorkspaceRunnerConfig {
                 .unwrap_or(self.max_search_results),
         }
     }
+
+    fn apply_base_config(&self, base: WorkspaceRunnerBaseConfig) -> Self {
+        let allowed_tools = base
+            .allowed_tools
+            .map(|tools| {
+                self.allowed_tools
+                    .iter()
+                    .filter(|tool| tools.iter().any(|configured| configured == *tool))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| self.allowed_tools.clone());
+
+        Self {
+            default_workspace_ref: base
+                .default_workspace_ref
+                .or_else(|| self.default_workspace_ref.clone()),
+            allowed_tools,
+            max_read_bytes: base
+                .max_read_bytes
+                .map(|limit| limit.min(self.max_read_bytes))
+                .unwrap_or(self.max_read_bytes),
+            max_search_results: base
+                .max_search_results
+                .map(|limit| limit.min(self.max_search_results))
+                .unwrap_or(self.max_search_results),
+        }
+    }
 }
 
 fn resolve_workspace_root(workspace_ref: Option<&str>) -> PathBuf {
@@ -170,6 +210,13 @@ fn parse_workspace_runner_overlay(task: &serde_json::Value) -> WorkspaceRunnerOv
     }
 
     overlay
+}
+
+fn parse_workspace_runner_base_config(task: &serde_json::Value) -> WorkspaceRunnerBaseConfig {
+    task.get("task_runner_config")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<WorkspaceRunnerBaseConfig>(value).ok())
+        .unwrap_or_default()
 }
 
 fn execute_tool(
@@ -468,8 +515,11 @@ async fn main() -> Result<()> {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("hegemon")
                     .to_string();
+                let runner_base_config = parse_workspace_runner_base_config(&task);
                 let runner_overlay = parse_workspace_runner_overlay(&task);
-                let effective_config = workspace_config.apply_overlay(runner_overlay);
+                let effective_config = workspace_config
+                    .apply_base_config(runner_base_config)
+                    .apply_overlay(runner_overlay);
 
                 let result_content = execute_tool(&effective_config, &tool_name, &arguments);
 
@@ -508,8 +558,9 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        execute_tool, parse_workspace_runner_overlay, search_workspace,
-        EffectiveWorkspaceRunnerConfig, WorkspaceRunnerConfig, WorkspaceRunnerOverlay,
+        execute_tool, parse_workspace_runner_base_config, parse_workspace_runner_overlay,
+        search_workspace, EffectiveWorkspaceRunnerConfig, WorkspaceRunnerConfig,
+        WorkspaceRunnerOverlay,
     };
     use serde_json::json;
     use std::fs;
@@ -614,6 +665,41 @@ mod tests {
                 .as_deref(),
             Some("workspace://overlay")
         );
+    }
+
+    #[test]
+    fn task_runner_base_config_can_narrow_env_defaults() {
+        let env_base = WorkspaceRunnerConfig {
+            default_workspace_ref: Some("workspace://env".into()),
+            allowed_tools: vec![
+                "workspace.list".into(),
+                "workspace.read".into(),
+                "workspace.search".into(),
+            ],
+            max_read_bytes: 4096,
+            max_search_results: 20,
+        };
+        let task = json!({
+            "task_runner_config": {
+                "default_workspace_ref": "workspace://session",
+                "allowed_tools": ["workspace.read", "workspace.search"],
+                "max_read_bytes": 1024,
+                "max_search_results": 5
+            }
+        });
+
+        let effective = env_base.apply_base_config(parse_workspace_runner_base_config(&task));
+
+        assert_eq!(
+            effective.default_workspace_ref.as_deref(),
+            Some("workspace://session")
+        );
+        assert_eq!(
+            effective.allowed_tools,
+            vec!["workspace.read", "workspace.search"]
+        );
+        assert_eq!(effective.max_read_bytes, 1024);
+        assert_eq!(effective.max_search_results, 5);
     }
 
     #[test]

@@ -28,6 +28,10 @@ Current code already points this way:
   - workspace runners now have a real base config surface
   - overlays can narrow allowed tools and execution limits
   - workspace read/search limits are enforced by runner policy instead of only by convention
+- third coding slice landed:
+  - workspace runner base policy now rides in hotel/session-driven route metadata
+  - `tool-runner` treats env vars as fallback defaults instead of primary truth
+  - canonical session snapshots now include workspace runner base config for routed workspace tools
 
 Still pending:
 

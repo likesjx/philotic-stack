@@ -1268,6 +1268,7 @@ fn compose_tool_assembly(
                     "hotel_id": "local-ansible-01",
                     "environment_id": serde_json::Value::Null,
                     "task_runner_kind": task_runner_kind_for_tool(tool_name),
+                    "task_runner_config": task_runner_base_config_for_tool(bindings, tool_name),
                     "execution_mode": execution_mode,
                     "availability_state": if live_runner.is_some() {
                         "live"
@@ -1352,6 +1353,47 @@ fn task_runner_kind_for_tool(tool_name: &str) -> Option<&'static str> {
     }
 
     None
+}
+
+fn task_runner_base_config_for_tool(
+    bindings: &serde_json::Value,
+    tool_name: &str,
+) -> serde_json::Value {
+    if !tool_name.starts_with("workspace.") {
+        return serde_json::Value::Null;
+    }
+
+    let mut config = bindings
+        .get("workspace_runner_config")
+        .cloned()
+        .filter(|value| value.is_object())
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    if config.get("default_workspace_ref").is_none() {
+        if let Some(workspace_ref) = bindings.get("effective_workspace_ref").cloned() {
+            config["default_workspace_ref"] = workspace_ref;
+        }
+    }
+
+    if config.get("allowed_tools").is_none() {
+        let workspace_tools = bindings
+            .get("effective_toolset")
+            .and_then(serde_json::Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .filter(|tool| tool.starts_with("workspace."))
+                    .map(|tool| serde_json::Value::String(tool.to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !workspace_tools.is_empty() {
+            config["allowed_tools"] = serde_json::Value::Array(workspace_tools);
+        }
+    }
+
+    config
 }
 
 fn parse_allowed_incarnations(
@@ -1508,6 +1550,7 @@ fn compose_tool_assembly_from_incarnations(
                         "hotel_id": incarnation.hotel_id,
                         "environment_id": incarnation.environment_id,
                         "task_runner_kind": task_runner_kind_for_tool(tool_name),
+                        "task_runner_config": task_runner_base_config_for_tool(bindings, tool_name),
                         "execution_mode": incarnation.execution_mode,
                         "availability_state": incarnation.availability_state,
                         "selection_reason": selection_reason_for_incarnation(incarnation, &preferences),
@@ -2305,6 +2348,120 @@ mod tests {
                 assert_eq!(
                     snapshot["bindings"]["effective_workspace_ref"],
                     "workspace://main"
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn session_snapshot_includes_workspace_runner_base_config() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
+        let server = IpcServer::new(socket_path.clone(), dispatcher_tx, graph);
+
+        graph_store
+            .upsert_session(&SessionRecord {
+                session_id: "sess-workspace-policy".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("123".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "bindings": {
+                        "effective_toolset": ["workspace.read"],
+                        "effective_workspace_ref": "workspace://main",
+                        "workspace_runner_config": {
+                            "default_workspace_ref": "workspace://policy",
+                            "allowed_tools": ["workspace.read"],
+                            "max_read_bytes": 8192,
+                            "max_search_results": 25
+                        }
+                    }
+                }),
+                created_at: 1,
+                updated_at: 2,
+            })
+            .expect("session should seed");
+        graph_store
+            .set_config_value(
+                "tool_runner_registry",
+                &serde_json::json!([
+                    {
+                        "guest_id": "tool-runner-local",
+                        "supported_tools": ["workspace.read"],
+                        "last_seen_at": 42
+                    }
+                ])
+                .to_string(),
+            )
+            .expect("registry should seed");
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("agent connect");
+        let mut tool = PhiloticClient::connect(GuestIdentity {
+            guest_id: "tool-runner-local".into(),
+            role: "tool".into(),
+            supported_tools: vec!["workspace.read".into()],
+        })
+        .await
+        .expect("tool connect");
+        tool.send_request(IpcRequest::SubscribeInbox {
+            role: "tool.workspace.read".into(),
+        })
+        .await
+        .expect("tool subscribe");
+
+        let response = agent
+            .send_request(IpcRequest::GetConfig {
+                key: "__session_snapshot__:sess-workspace-policy".into(),
+            })
+            .await
+            .expect("snapshot request should succeed");
+
+        match response {
+            IpcResponse::ConfigData {
+                value_json: Some(value_json),
+                ..
+            } => {
+                let snapshot: serde_json::Value =
+                    serde_json::from_str(&value_json).expect("snapshot should decode");
+                assert_eq!(
+                    snapshot["tool_assembly"]["execution_routes"]["workspace.read"]["task_runner_config"]["default_workspace_ref"],
+                    "workspace://policy"
+                );
+                assert_eq!(
+                    snapshot["tool_assembly"]["execution_routes"]["workspace.read"]["task_runner_config"]["max_read_bytes"],
+                    8192
                 );
             }
             other => panic!("unexpected response: {other:?}"),

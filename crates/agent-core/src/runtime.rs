@@ -87,6 +87,41 @@ fn describe_transport_attachment(attachment: &TransportAttachment) -> String {
     parts.join(" ")
 }
 
+fn media_analysis_attachments(task: &InboundTaskPayload) -> Vec<TransportAttachment> {
+    task.attachments
+        .iter()
+        .filter(|attachment| {
+            attachment
+                .blob_download_url
+                .as_deref()
+                .map(|url| !url.is_empty())
+                .unwrap_or(false)
+                && attachment
+                    .transport_error
+                    .as_deref()
+                    .map(|error| error.is_empty())
+                    .unwrap_or(true)
+                && matches!(
+                    attachment.kind.as_str(),
+                    "photo" | "image" | "voice" | "audio" | "document"
+                )
+        })
+        .cloned()
+        .collect()
+}
+
+fn media_analysis_prompt(content: &str, attachments: &[TransportAttachment]) -> String {
+    let kinds = attachments
+        .iter()
+        .map(|attachment| attachment.kind.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Analyze the attached media and respond helpfully to the user. User message/context: {}. Attachment kinds: {}.",
+        content, kinds
+    )
+}
+
 pub struct AgentRuntime {
     ipc_client: PhiloticClient,
     sessions: HashMap<String, SessionState>,
@@ -338,12 +373,42 @@ impl AgentRuntime {
             .await?;
         self.sync_session_index(&index_state).await?;
 
+        let media_attachments = media_analysis_attachments(&task);
+        let (action, prompt, attachments, tools_for_model, target_role) = if media_attachments
+            .is_empty()
+        {
+            (
+                "generate_text",
+                model_prompt,
+                Vec::new(),
+                tools_for_model,
+                self.sessions
+                    .get(&session_id)
+                    .and_then(|state| state.preferred_component_implementation("text.generate"))
+                    .map(implementation_to_model_role)
+                    .unwrap_or_else(|| DEFAULT_TEXT_MODEL_ROLE.into()),
+            )
+        } else {
+            (
+                "analyze_media",
+                media_analysis_prompt(&content, &media_attachments),
+                media_attachments,
+                Vec::new(),
+                self.sessions
+                    .get(&session_id)
+                    .and_then(|state| state.preferred_component_implementation("media.analyze"))
+                    .map(implementation_to_model_role)
+                    .unwrap_or_else(|| DEFAULT_TEXT_MODEL_ROLE.into()),
+            )
+        };
+
         let model_req = ModelRequestPayload {
-            action: "generate_text",
+            action,
             session_id: session_id.clone(),
             turn_id,
-            prompt: model_prompt,
+            prompt,
             user_content: content,
+            attachments,
             tools_for_model,
             chat_id,
             reply_to: LOCAL_NODE.to_string(),
@@ -352,13 +417,6 @@ impl AgentRuntime {
             final_reply_role,
             final_reply_guest_id,
         };
-
-        let target_role = self
-            .sessions
-            .get(&session_id)
-            .and_then(|state| state.preferred_component_implementation("text.generate"))
-            .map(implementation_to_model_role)
-            .unwrap_or_else(|| DEFAULT_TEXT_MODEL_ROLE.into());
 
         info!("Asking the Hotel to route inference to the model controller...");
         self.ipc_client
@@ -611,6 +669,7 @@ impl AgentRuntime {
             hotel_id: route.hotel_id.clone(),
             environment_id: route.environment_id.clone(),
             task_runner_kind: route.task_runner_kind.clone(),
+            task_runner_config: route.task_runner_config.clone(),
             selection_reason: route.selection_reason.clone(),
             workspace_ref: workspace_ref.clone(),
             task_runner_overlay: route
@@ -1221,6 +1280,7 @@ impl AgentRuntime {
             turn_id,
             prompt,
             user_content,
+            attachments: Vec::new(),
             tools_for_model,
             chat_id,
             reply_to: LOCAL_NODE.to_string(),
@@ -1740,7 +1800,9 @@ impl AgentRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE, normalized_user_content};
+    use super::{
+        DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE, media_analysis_attachments, normalized_user_content,
+    };
     use crate::r#loop::{ApprovalRequest, ToolCall};
     use crate::protocol::{
         FinalReplyPayload, InboundTaskPayload, ModelRequestPayload, TransportAttachment,
@@ -1755,6 +1817,7 @@ mod tests {
             turn_id: "turn-1".into(),
             prompt: "hello".into(),
             user_content: "hello".into(),
+            attachments: Vec::new(),
             tools_for_model: Vec::new(),
             chat_id: "123".into(),
             reply_to: LOCAL_NODE.into(),
@@ -2037,5 +2100,70 @@ mod tests {
             normalized_user_content(&task),
             Some("Callback action: approve:turn-1".into())
         );
+    }
+
+    #[test]
+    fn media_analysis_attachments_only_include_blob_backed_supported_kinds() {
+        let task = InboundTaskPayload {
+            action: None,
+            agent_action: None,
+            source: Some("telegram".into()),
+            session_id: None,
+            turn_id: None,
+            transport: Some("telegram".into()),
+            chat_id: Some("123".into()),
+            thread_id: None,
+            sender_id: None,
+            sender_username: None,
+            message_kind: Some("photo".into()),
+            content: Some("what is this?".into()),
+            attachments: vec![
+                TransportAttachment {
+                    kind: "photo".into(),
+                    file_id: "photo-1".into(),
+                    mime_type: Some("image/jpeg".into()),
+                    file_name: None,
+                    file_size: None,
+                    telegram_file_path: None,
+                    blob_id: Some("sha256-1".into()),
+                    blob_download_url: Some("http://127.0.0.1:9001/download/sha256-1".into()),
+                    transport_error: None,
+                },
+                TransportAttachment {
+                    kind: "sticker".into(),
+                    file_id: "sticker-1".into(),
+                    mime_type: Some("image/webp".into()),
+                    file_name: None,
+                    file_size: None,
+                    telegram_file_path: None,
+                    blob_id: Some("sha256-2".into()),
+                    blob_download_url: Some("http://127.0.0.1:9001/download/sha256-2".into()),
+                    transport_error: None,
+                },
+                TransportAttachment {
+                    kind: "voice".into(),
+                    file_id: "voice-1".into(),
+                    mime_type: Some("audio/ogg".into()),
+                    file_name: None,
+                    file_size: None,
+                    telegram_file_path: None,
+                    blob_id: Some("sha256-3".into()),
+                    blob_download_url: None,
+                    transport_error: None,
+                },
+            ],
+            command: None,
+            callback_data: None,
+            raw_transport_event: None,
+            tool_name: None,
+            arguments: None,
+            final_reply_to: None,
+            final_reply_role: None,
+            final_reply_guest_id: None,
+        };
+
+        let attachments = media_analysis_attachments(&task);
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].kind, "photo");
     }
 }
