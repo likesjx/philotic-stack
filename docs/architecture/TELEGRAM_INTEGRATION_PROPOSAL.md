@@ -54,7 +54,11 @@ Accepted here means:
 Current repo truth:
 
 - `crates/hegemon` is a long-polling Telegram guest
-- it currently normalizes only the `message.text` polling path
+- it now normalizes one canonical inbound path for:
+  - `message.text`
+  - captioned media messages
+  - attachment-only media/file messages
+  - `callback_query`
 - it emits a normalized inbound transport envelope into `agent-core` with:
   - `transport`
   - `session_id`
@@ -74,18 +78,17 @@ Current repo truth:
 
 That is a useful membrane slice, but it is not yet a richer Telegram controller:
 
-- callback queries are not normalized yet
-- media/file attachments are not normalized yet
 - slash commands still execute in `agent-core`
-- polling still only requests `message` updates
+- attachment handling is metadata-first; media download/transcription/vision are not implemented yet
+- polling still does not cover the full Telegram update surface beyond `message` and `callback_query`
 
 ## Current Reality
 
 Today the implementation is narrower than some repo docs imply:
 
 - the live code uses `getUpdates`, not webhooks
-- the live code only requests `allowed_updates = ["message"]`
-- the live code only extracts `message.text`
+- the live code currently requests `allowed_updates = ["message", "callback_query"]`
+- the live code normalizes text, captions, callback data, and common media/file metadata, but not full media retrieval
 - there is no Telegram webhook verification path in Philotic yet
 
 This matters because transport docs that describe a webhook path as though it already exists are not harmless color. They increase the odds that we accidentally design around inferred behavior instead of proven behavior.

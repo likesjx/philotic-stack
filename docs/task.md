@@ -112,7 +112,8 @@
   - optional turn-level `final_reply_guest_id` preserved through agent/model/hegemon flow
 - [x] Define how session bindings identify the owning hegemon component/incarnation for outbound delivery.
 - [x] Define the normalized Telegram ingress envelope and prove it on the current text polling path.
-- [ ] Expand `hegemon` polling ingestion beyond `message.text` while keeping one canonical transport-normalization path.
+- [x] Expand `hegemon` polling ingestion beyond `message.text` while keeping one canonical transport-normalization path.
+- [ ] Add Telegram media download/fetch handling on top of normalized attachment metadata.
 - [ ] Elevate deterministic Telegram slash commands into `hegemon` before the normal agent loop.
 - [ ] Add Telegram delivery primitives for typing state, partial streaming, and final message commit.
 - [ ] Specify webhook config shape and verification behavior:

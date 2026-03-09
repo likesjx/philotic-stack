@@ -4,7 +4,9 @@ use crate::r#loop::{
     interpret_tool_result,
 };
 use crate::protocol::{
-    FinalReplyPayload, InboundTaskPayload, ModelRequestPayload, ToolExecutionPayload,
+    FinalReplyPayload, InboundTaskPayload, ModelRequestPayload, TaskRunnerOverlay,
+    ToolExecutionPayload,
+    TransportAttachment,
 };
 use crate::session::{SessionState, ToolExecutionRoute, WorkingTurn, merge_session_index};
 use anyhow::Result;
@@ -25,6 +27,65 @@ fn implementation_to_model_role(implementation: &str) -> String {
         .find(|segment| !segment.is_empty())
         .unwrap_or("gemini");
     format!("model.{normalized}")
+}
+
+fn normalized_user_content(task: &InboundTaskPayload) -> Option<String> {
+    if let Some(content) = task
+        .content
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(content.to_string());
+    }
+
+    if let Some(callback_data) = task
+        .callback_data
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(format!("Callback action: {callback_data}"));
+    }
+
+    if !task.attachments.is_empty() {
+        let summaries = task
+            .attachments
+            .iter()
+            .map(describe_transport_attachment)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let message_kind = task.message_kind.as_deref().unwrap_or("attachment");
+        return Some(format!(
+            "User sent a {message_kind} message with attachments: {summaries}."
+        ));
+    }
+
+    task.message_kind
+        .as_deref()
+        .map(|message_kind| format!("User sent a {message_kind} message."))
+}
+
+fn describe_transport_attachment(attachment: &TransportAttachment) -> String {
+    let mut parts = vec![attachment.kind.clone()];
+    if let Some(file_name) = attachment
+        .file_name
+        .as_deref()
+        .filter(|name| !name.is_empty())
+    {
+        parts.push(file_name.to_string());
+    }
+    if let Some(mime_type) = attachment
+        .mime_type
+        .as_deref()
+        .filter(|mime| !mime.is_empty())
+    {
+        parts.push(mime_type.to_string());
+    }
+    if !attachment.file_id.is_empty() {
+        parts.push(format!("file_id={}", attachment.file_id));
+    }
+    parts.join(" ")
 }
 
 pub struct AgentRuntime {
@@ -87,12 +148,7 @@ impl AgentRuntime {
     }
 
     async fn handle_user_message(&mut self, task: InboundTaskPayload, task_id: Uuid) -> Result<()> {
-        let content = match task
-            .content
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
+        let content = match normalized_user_content(&task) {
             Some(content) => content.to_string(),
             None => return Ok(()),
         };
@@ -555,8 +611,16 @@ impl AgentRuntime {
             incarnation_id: route.incarnation_id.clone(),
             hotel_id: route.hotel_id.clone(),
             environment_id: route.environment_id.clone(),
+            task_runner_kind: route.task_runner_kind.clone(),
             selection_reason: route.selection_reason.clone(),
-            workspace_ref,
+            workspace_ref: workspace_ref.clone(),
+            task_runner_overlay: route.task_runner_kind.as_deref().map(|kind| TaskRunnerOverlay {
+                workspace_ref: if kind == "workspace" {
+                    workspace_ref
+                } else {
+                    None
+                },
+            }),
             reply_to: LOCAL_NODE.to_string(),
             reply_role: "agent".into(),
             final_reply_to,
@@ -1671,9 +1735,11 @@ impl AgentRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE};
+    use super::{DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE, normalized_user_content};
     use crate::r#loop::{ApprovalRequest, ToolCall};
-    use crate::protocol::{FinalReplyPayload, ModelRequestPayload};
+    use crate::protocol::{
+        FinalReplyPayload, InboundTaskPayload, ModelRequestPayload, TransportAttachment,
+    };
     use crate::session::{ApprovalPolicy, ComponentRouteBinding, SessionState};
 
     #[test]
@@ -1850,5 +1916,111 @@ mod tests {
         )
         .expect("local agent tools should not require an external runner");
         assert_eq!(route.execution_mode, "local_agent");
+    }
+
+    #[test]
+    fn normalized_user_content_prefers_explicit_text() {
+        let task = InboundTaskPayload {
+            action: None,
+            agent_action: None,
+            source: Some("telegram".into()),
+            session_id: None,
+            turn_id: None,
+            transport: Some("telegram".into()),
+            chat_id: Some("123".into()),
+            thread_id: None,
+            sender_id: None,
+            sender_username: None,
+            message_kind: Some("photo".into()),
+            content: Some("caption text".into()),
+            attachments: vec![TransportAttachment {
+                kind: "photo".into(),
+                file_id: "photo-1".into(),
+                mime_type: None,
+                file_name: None,
+            }],
+            command: None,
+            callback_data: None,
+            raw_transport_event: None,
+            tool_name: None,
+            arguments: None,
+            final_reply_to: None,
+            final_reply_role: None,
+            final_reply_guest_id: None,
+        };
+
+        assert_eq!(normalized_user_content(&task), Some("caption text".into()));
+    }
+
+    #[test]
+    fn normalized_user_content_summarizes_attachment_only_turns() {
+        let task = InboundTaskPayload {
+            action: None,
+            agent_action: None,
+            source: Some("telegram".into()),
+            session_id: None,
+            turn_id: None,
+            transport: Some("telegram".into()),
+            chat_id: Some("123".into()),
+            thread_id: None,
+            sender_id: None,
+            sender_username: None,
+            message_kind: Some("voice".into()),
+            content: None,
+            attachments: vec![TransportAttachment {
+                kind: "voice".into(),
+                file_id: "voice-1".into(),
+                mime_type: Some("audio/ogg".into()),
+                file_name: None,
+            }],
+            command: None,
+            callback_data: None,
+            raw_transport_event: None,
+            tool_name: None,
+            arguments: None,
+            final_reply_to: None,
+            final_reply_role: None,
+            final_reply_guest_id: None,
+        };
+
+        assert_eq!(
+            normalized_user_content(&task),
+            Some(
+                "User sent a voice message with attachments: voice audio/ogg file_id=voice-1."
+                    .into()
+            )
+        );
+    }
+
+    #[test]
+    fn normalized_user_content_uses_callback_data_when_present() {
+        let task = InboundTaskPayload {
+            action: None,
+            agent_action: None,
+            source: Some("telegram".into()),
+            session_id: None,
+            turn_id: None,
+            transport: Some("telegram".into()),
+            chat_id: Some("123".into()),
+            thread_id: None,
+            sender_id: None,
+            sender_username: None,
+            message_kind: Some("callback".into()),
+            content: None,
+            attachments: Vec::new(),
+            command: None,
+            callback_data: Some("approve:turn-1".into()),
+            raw_transport_event: None,
+            tool_name: None,
+            arguments: None,
+            final_reply_to: None,
+            final_reply_role: None,
+            final_reply_guest_id: None,
+        };
+
+        assert_eq!(
+            normalized_user_content(&task),
+            Some("Callback action: approve:turn-1".into())
+        );
     }
 }

@@ -85,6 +85,12 @@ pub struct FinalReplyPayload {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct TaskRunnerOverlay {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ToolExecutionPayload {
     pub action: &'static str,
     pub session_id: String,
@@ -102,9 +108,13 @@ pub struct ToolExecutionPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub environment_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_runner_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub selection_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_runner_overlay: Option<TaskRunnerOverlay>,
     pub reply_to: String,
     pub reply_role: String,
     pub final_reply_to: String,

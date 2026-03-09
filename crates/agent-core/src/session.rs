@@ -120,6 +120,8 @@ pub struct ToolExecutionRoute {
     pub hotel_id: Option<String>,
     #[serde(default)]
     pub environment_id: Option<String>,
+    #[serde(default)]
+    pub task_runner_kind: Option<String>,
     pub execution_mode: String,
     #[serde(default = "default_route_availability")]
     pub availability_state: String,
@@ -1072,6 +1074,7 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
                         Some("local-ansible-01".into())
                     },
                     environment_id: None,
+                    task_runner_kind: task_runner_kind_for_tool(tool_name),
                     execution_mode: execution_mode.into(),
                     availability_state: "live".into(),
                     selection_reason: Some(if execution_mode == "local_agent" {
@@ -1123,6 +1126,18 @@ fn is_pinned_tool(tool_name: &str) -> bool {
         tool_name,
         "workspace.list" | "workspace.read" | "workspace.search" | "workspace.write"
     )
+}
+
+fn task_runner_kind_for_tool(tool_name: &str) -> Option<String> {
+    if tool_name.starts_with("workspace.") {
+        return Some("workspace".into());
+    }
+
+    if tool_name.starts_with("shell.") {
+        return Some("shell".into());
+    }
+
+    None
 }
 
 fn tool_assembly_from_allowed_incarnations(bindings: &SessionBindings) -> ToolAssembly {
@@ -1212,6 +1227,7 @@ fn select_incarnation_route(
         incarnation_id: Some(selected.incarnation_id.clone()),
         hotel_id: selected.hotel_id.clone(),
         environment_id: selected.environment_id.clone(),
+        task_runner_kind: task_runner_kind_for_tool(tool_name),
         execution_mode: selected.execution_mode.clone(),
         availability_state: selected.availability_state.clone(),
         selection_reason: Some(selection_reason),
@@ -1779,6 +1795,9 @@ mod tests {
         assert_eq!(read_route.execution_mode, "pinned");
         assert_eq!(list_route.execution_mode, "pinned");
         assert_eq!(search_route.execution_mode, "pinned");
+        assert_eq!(read_route.task_runner_kind.as_deref(), Some("workspace"));
+        assert_eq!(list_route.task_runner_kind.as_deref(), Some("workspace"));
+        assert_eq!(search_route.task_runner_kind.as_deref(), Some("workspace"));
         assert_eq!(read_route.target_role, "tool.workspace.read");
         assert_eq!(list_route.target_role, "tool.workspace.list");
         assert_eq!(search_route.target_role, "tool.workspace.search");
