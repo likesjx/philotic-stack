@@ -237,7 +237,9 @@ impl ModelProvider for GeminiProvider {
 #[cfg(test)]
 mod tests {
     use super::{GeminiAuth, GeminiProvider};
-    use crate::controller::{AttachmentInput, ContextEnvelope, ControllerTask, RoutingHints, TaskKind};
+    use crate::controller::{
+        AttachmentInput, ContextEnvelope, ControllerTask, RoutingHints, TaskKind,
+    };
 
     #[test]
     fn prefers_oauth_bearer_over_api_key() {
