@@ -357,12 +357,7 @@ async fn exchange_google_code(
         ("redirect_uri", redirect_uri.to_string()),
     ];
 
-    if let Some(client_secret) = args
-        .client_secret
-        .as_deref()
-        .map(str::trim)
-        .filter(|secret| !secret.is_empty())
-    {
+    if let Some(client_secret) = resolve_client_secret(args) {
         form.push(("client_secret", client_secret.to_string()));
     }
 
@@ -387,6 +382,20 @@ async fn exchange_google_code(
         .json::<GoogleTokenResponse>()
         .await
         .context("failed to decode Google OAuth token response")
+}
+
+fn resolve_client_secret(args: &GoogleStartArgs) -> Option<String> {
+    args.client_secret
+        .as_deref()
+        .map(str::trim)
+        .filter(|secret| !secret.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var("GOOGLE_CLIENT_SECRET")
+                .ok()
+                .map(|secret| secret.trim().to_string())
+                .filter(|secret| !secret.is_empty())
+        })
 }
 
 fn persist_gemini_oauth_config(args: &GoogleStartArgs, token: &GoogleTokenResponse) -> Result<()> {

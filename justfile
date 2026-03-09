@@ -19,6 +19,8 @@ start-ansible hotel:
 
 # Start the transitional Gemini OAuth flow through the hotel CLI
 gemini-oauth-start client_id project_id:
+    @echo "Using GOOGLE_CLIENT_SECRET from env if needed by the OAuth client."
+    @echo "PHILOTIC_VAULT_MASTER_KEY must be set before storing OAuth tokens in the hotel vault."
     cargo run -p ansible -- auth google start --provider gemini --client-id {{client_id}} --project-id {{project_id}}
 
 # Validate that stored Gemini OAuth auth can call a real Gemini model
