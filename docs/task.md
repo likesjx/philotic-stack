@@ -57,6 +57,42 @@
   - `sound.generate`
   - `music.generate`
   - `response.generate`
+- [x] Propose the first structured model request envelope split:
+  - `response_contract`
+  - `context`
+  - `affordances`
+  - `routing_hints`
+  - `provider_options`
+- [x] Implement the first compatibility-first structured model envelope seam in `model-router`.
+- [x] Propose the first structured model response envelope split:
+  - `result`
+  - `artifacts`
+  - `trace`
+  - `provider_output`
+- [x] Define optimization-oriented response channels:
+  - `display_text`
+  - `spoken_text`
+  - `working_memory_delta`
+  - `follow_up_questions`
+  - `intent_summary`
+  - `state_updates`
+  - `delivery_hints`
+- [x] Define canonical context layers for model requests:
+  - `instructions`
+  - `identity`
+  - `memory`
+  - `dialogue_window`
+  - `active_turn`
+  - `attachments`
+- [x] Decide that tools and skills should project separately from semantic context under `affordances`.
+- [x] Implement the first compatibility-first structured model response seam in `model-router`.
+- [x] Preserve a first-class minimal prompt-response path with the structured envelope fields remaining mostly optional.
+- [x] Add initial `response_contract.channels` handling for text-generation requests.
+- [x] Add first structured response fields for:
+  - `display_text`
+  - `spoken_text`
+  - `working_memory_delta`
+  - `follow_up_questions`
 - [ ] Add `spoken_text` / expressive speech projection alongside user-visible text.
 - [ ] Define ElevenLabs default-voice pinning plus upstream voice override behavior.
 - [ ] Add Eleven v3 model selection and expressive-tag support without pretending it is the same as the low-latency conversational path.
@@ -66,6 +102,12 @@
   - API key fallback
   - possible ADC path
 - [x] Add the first Gemini guest auth abstraction that prefers OAuth bearer config over API key fallback.
+- [x] Add `ansible --test` startup harness support for:
+  - `text-roundtrip`
+  - `gemini-oauth-roundtrip`
+  - `voice-sample`
+- [x] Add a startup-driven model-controller smoke script for the text round-trip path.
+- [x] Add a startup-driven Gemini OAuth smoke through the materialized model-controller guest.
 - [ ] Define hotel CLI OAuth UX:
   - browser launch
   - temporary localhost callback listener
@@ -75,6 +117,10 @@
 - [x] Add a transitional `ansible auth google start --provider gemini` flow with browser launch, localhost callback, token exchange, and access-token persistence.
 - [x] Add a hotel-side Gemini OAuth validation command that performs a real model call with the stored auth path.
 - [x] Refresh model-controller provider config per task so updated Gemini auth takes effect without a guest restart.
+- [ ] Run a Keychain-backed Gemini OAuth smoke with `PHILOTIC_VAULT_MASTER_KEY` unset.
+- [x] Run a full guest-path Gemini OAuth smoke through the materialized model-controller, not just hotel-side validation.
+- [ ] Wire refresh-token persistence and refresh lifecycle behind the hotel vault.
+- [ ] Deliver an honest ElevenLabs end-to-end voice path beyond inline-audio/testing mode.
 
 ## New Project: Key Vault
 
@@ -82,10 +128,11 @@
 - [x] Define the first vault record schema and context-graph secret references.
 - [x] Begin removing new OAuth access-token storage from plain `node_config` by storing secret refs instead.
 - [x] Define and implement the first hotel-local secret fetch API for guests.
-- [ ] Define envelope-encryption and root-key strategy:
+- [x] Define and implement the first envelope-encryption and root-key strategy:
   - OS keychain / TPM / Secure Enclave preferred
   - cloud KMS/HSM for hosted hotels
   - operator master key only as fallback
+- [ ] Replace the current local root-key bootstrap with stronger platform-native backing beyond basic macOS Keychain item storage.
 - [ ] Define secret lifecycle:
   - create
   - stage

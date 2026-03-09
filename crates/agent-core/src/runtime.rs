@@ -258,6 +258,7 @@ impl AgentRuntime {
             .send_request(IpcRequest::EmitTask {
                 target_node: LOCAL_NODE.into(),
                 target_role: "model".into(),
+                target_guest_id: None,
                 task_json: serde_json::to_string(&model_req)?,
             })
             .await?;
@@ -424,6 +425,7 @@ impl AgentRuntime {
             .send_request(IpcRequest::EmitTask {
                 target_node: final_reply_to,
                 target_role: final_reply_role,
+                target_guest_id: None,
                 task_json: serde_json::to_string(&reply_payload)?,
             })
             .await?;
@@ -513,6 +515,7 @@ impl AgentRuntime {
             .send_request(IpcRequest::EmitTask {
                 target_node: route.target_node,
                 target_role: route.target_role,
+                target_guest_id: None,
                 task_json: serde_json::to_string(&tool_req)?,
             })
             .await?;
@@ -646,6 +649,7 @@ impl AgentRuntime {
             .send_request(IpcRequest::EmitTask {
                 target_node: completed_turn.final_reply_to,
                 target_role: completed_turn.final_reply_role,
+                target_guest_id: None,
                 task_json: serde_json::to_string(&reply_payload)?,
             })
             .await?;
@@ -721,6 +725,7 @@ impl AgentRuntime {
             .send_request(IpcRequest::EmitTask {
                 target_node: final_reply_to,
                 target_role: final_reply_role,
+                target_guest_id: None,
                 task_json: serde_json::to_string(&reply_payload)?,
             })
             .await?;
@@ -791,6 +796,7 @@ impl AgentRuntime {
                 .send_request(IpcRequest::EmitTask {
                     target_node: command_reply_to,
                     target_role: command_reply_role,
+                    target_guest_id: None,
                     task_json: serde_json::to_string(&reply_payload)?,
                 })
                 .await?;
@@ -910,6 +916,7 @@ impl AgentRuntime {
                     .send_request(IpcRequest::EmitTask {
                         target_node: original_reply_to,
                         target_role: original_reply_role,
+                        target_guest_id: None,
                         task_json: serde_json::to_string(&reply_payload)?,
                     })
                     .await?;
@@ -967,6 +974,7 @@ impl AgentRuntime {
                     .send_request(IpcRequest::EmitTask {
                         target_node: original_reply_to,
                         target_role: original_reply_role,
+                        target_guest_id: None,
                         task_json: serde_json::to_string(&reply_payload)?,
                     })
                     .await?;
@@ -1091,6 +1099,7 @@ impl AgentRuntime {
             .send_request(IpcRequest::EmitTask {
                 target_node: LOCAL_NODE.into(),
                 target_role: "model".into(),
+                target_guest_id: None,
                 task_json: serde_json::to_string(&model_req)?,
             })
             .await?;
@@ -1499,6 +1508,7 @@ impl AgentRuntime {
             .send_request(IpcRequest::EmitTask {
                 target_node: completed_turn.final_reply_to,
                 target_role: completed_turn.final_reply_role,
+                target_guest_id: None,
                 task_json: serde_json::to_string(&reply_payload)?,
             })
             .await?;

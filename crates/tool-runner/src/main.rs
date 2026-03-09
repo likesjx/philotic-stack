@@ -314,6 +314,7 @@ async fn main() -> Result<()> {
                     .send_request(IpcRequest::EmitTask {
                         target_node: reply_to,
                         target_role: reply_role,
+                        target_guest_id: None,
                         task_json: json!({
                             "action": "tool_result",
                             "session_id": session_id,

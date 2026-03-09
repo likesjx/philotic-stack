@@ -43,6 +43,7 @@ Pin and prove the first design contract for:
 - vault-backed model-controller auth
 - Telegram-safe onboarding and rotation paths
 - encrypted secret storage plus role/guest-gated local secret fetch over hotel IPC
+- macOS Keychain-backed vault root key with env fallback only as a bootstrap path
 
 Linked task surface: [docs/task.md](/Users/jaredlikes/code/philotic-stack-model-controller-abstraction/docs/task.md)
 
@@ -59,6 +60,7 @@ The current implementation slice now begins that boundary:
 - guests can request secrets through dedicated hotel IPC instead of generic `GetConfig`
 - Gemini OAuth access tokens now fit that path
 - hotel-side validation can exercise the vaulted Gemini OAuth path directly before guest fallback obscures failures
+- on macOS, the hotel can now load or create its vault root key in Keychain instead of requiring the operator to mint one manually in the shell
 
 The next boundary should continue toward:
 
@@ -120,6 +122,13 @@ Root key priority:
 1. hardware-backed OS secret store or TPM/Secure Enclave
 2. cloud KMS / HSM-backed key for hosted hotels
 3. operator-supplied master key only as a last fallback
+
+Current implementation note:
+
+- the current slice now uses macOS Keychain first for the local hotel root key
+- `PHILOTIC_VAULT_MASTER_KEY` remains as a non-macOS/bootstrap fallback
+- the Keychain record can be scoped locally with `PHILOTIC_VAULT_KEY_ID`
+- hardware-backed attestation is still not proven just because Keychain is in the sentence
 
 Strong recommendation:
 

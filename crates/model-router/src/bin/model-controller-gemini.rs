@@ -16,6 +16,7 @@ async fn main() -> Result<()> {
                     configs.gemini_oauth_project_id.clone(),
                     configs.gemini_api_key.clone(),
                 ),
+                configs.gemini_base_url.clone(),
             ))]
         }),
     })
