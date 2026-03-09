@@ -234,7 +234,9 @@ fn default_hotel_record(hotel_name: &str) -> HotelRecord {
 }
 
 fn default_guest_seed(hotel_name: &str) -> Vec<GuestRecord> {
-    let socket_path = default_hotel_record(hotel_name).ipc_socket_path;
+    let hotel = default_hotel_record(hotel_name);
+    let socket_path = hotel.ipc_socket_path;
+    let blob_base_url = format!("http://127.0.0.1:{}", hotel.blob_port);
     vec![
         GuestRecord {
             hotel_name: hotel_name.to_string(),
@@ -244,7 +246,8 @@ fn default_guest_seed(hotel_name: &str) -> Vec<GuestRecord> {
                 "command": "target/debug/hegemon",
                 "args": [],
                 "env": {
-                    "PHILOTIC_HOTEL_SOCKET": socket_path.clone()
+                    "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
+                    "PHILOTIC_BLOB_BASE_URL": blob_base_url
                 }
             })
             .to_string(),

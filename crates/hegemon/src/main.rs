@@ -332,6 +332,11 @@ async fn hydrate_telegram_attachments(
     blob_base: &str,
     attachments: Vec<Value>,
 ) -> Vec<Value> {
+    info!(
+        "Hydrating {} Telegram attachment(s) using blob base [{}]",
+        attachments.len(),
+        blob_base
+    );
     let mut hydrated = Vec::with_capacity(attachments.len());
     for attachment in attachments {
         hydrated.push(
@@ -363,9 +368,21 @@ async fn hydrate_single_telegram_attachment(
     else {
         return attachment;
     };
+    let kind = attachment
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("attachment");
+    info!(
+        "Starting Telegram attachment hydration for kind [{}] file_id [{}]",
+        kind, file_id
+    );
 
     match fetch_telegram_file_ref(http_client, tg_base, &file_id).await {
         Ok(file_ref) => {
+            info!(
+                "Telegram getFile resolved file_id [{}] to path [{}] size {:?}",
+                file_id, file_ref.file_path, file_ref.file_size
+            );
             let file_url = format!("{tg_file_base}{}", file_ref.file_path);
             match download_telegram_file(http_client, &file_url).await {
                 Ok(bytes) => {
@@ -379,9 +396,21 @@ async fn hydrate_single_telegram_attachment(
                         .and_then(Value::as_str)
                         .filter(|mime| !mime.is_empty())
                         .unwrap_or("application/octet-stream");
+                    info!(
+                        "Downloaded Telegram attachment [{}] as [{}] mime [{}] with {} bytes; uploading to [{}]",
+                        file_id,
+                        file_name,
+                        mime_type,
+                        bytes.len(),
+                        blob_base
+                    );
 
                     match upload_blob(http_client, blob_base, &file_name, mime_type, bytes).await {
                         Ok(blob_id) => {
+                            info!(
+                                "Uploaded Telegram attachment [{}] to blob [{}]",
+                                file_id, blob_id
+                            );
                             return enrich_attachment_with_transport(
                                 attachment,
                                 Some(&file_ref),
@@ -446,7 +475,15 @@ async fn fetch_telegram_file_ref(
         .query(&[("file_id", file_id)])
         .send()
         .await?;
+    let status = response.status();
     let payload: Value = response.json().await?;
+    if !status.is_success() {
+        anyhow::bail!(
+            "Telegram getFile returned HTTP {} with payload {}",
+            status,
+            payload
+        );
+    }
     if payload.get("ok").and_then(Value::as_bool) != Some(true) {
         anyhow::bail!(
             "{}",
@@ -476,6 +513,16 @@ async fn fetch_telegram_file_ref(
 
 async fn download_telegram_file(http_client: &reqwest::Client, file_url: &str) -> Result<Vec<u8>> {
     let response = http_client.get(file_url).send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!(
+            "Telegram file download returned HTTP {} for {} with body {}",
+            status,
+            file_url,
+            body
+        );
+    }
     let bytes = response.bytes().await?;
     Ok(bytes.to_vec())
 }
@@ -496,7 +543,15 @@ async fn upload_blob(
         .multipart(form)
         .send()
         .await?;
+    let status = response.status();
     let payload: Value = response.json().await?;
+    if !status.is_success() {
+        anyhow::bail!(
+            "Blob upload returned HTTP {} with payload {}",
+            status,
+            payload
+        );
+    }
     let blob_id = payload
         .get("blob_ids")
         .and_then(Value::as_array)
@@ -543,6 +598,27 @@ fn enrich_attachment_with_transport(
     if let Some(transport_error) = transport_error.filter(|error| !error.is_empty()) {
         attachment["transport_error"] = Value::String(transport_error.to_string());
     }
+
+    let kind = attachment
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("attachment");
+    let file_id = attachment
+        .get("file_id")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    info!(
+        "Telegram attachment transport result kind [{}] file_id [{}] path {:?} blob {:?} error {:?}",
+        kind,
+        file_id,
+        attachment
+            .get("telegram_file_path")
+            .and_then(|value| value.as_str()),
+        attachment.get("blob_id").and_then(|value| value.as_str()),
+        attachment
+            .get("transport_error")
+            .and_then(|value| value.as_str())
+    );
 
     attachment
 }

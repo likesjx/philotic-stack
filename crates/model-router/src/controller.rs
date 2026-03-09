@@ -9,6 +9,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskKind {
     TextGenerate,
+    MediaAnalyze,
     VoiceSynthesize,
 }
 
@@ -16,6 +17,7 @@ impl TaskKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::TextGenerate => "text.generate",
+            Self::MediaAnalyze => "media.analyze",
             Self::VoiceSynthesize => "voice.synthesize",
         }
     }
@@ -84,9 +86,11 @@ impl TurnInput {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AttachmentInput {
     pub kind: Option<String>,
+    pub file_id: Option<String>,
     pub mime_type: Option<String>,
     pub url: Option<String>,
     pub blob_ref: Option<String>,
+    pub transport_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -142,15 +146,27 @@ pub struct ControllerTask {
 impl ControllerTask {
     pub fn from_value(task: &Value) -> Result<Self> {
         let response_contract = parse_response_contract(task.get("response_contract"));
-        let context = parse_context(task.get("context"));
+        let mut context = parse_context(task.get("context"));
         let affordances = parse_affordances(task.get("affordances"));
         let routing_hints = parse_routing_hints(task.get("routing_hints"));
+        let top_level_attachments = parse_attachments(task.get("attachments"));
+        if !top_level_attachments.is_empty() {
+            context.attachments.extend(top_level_attachments);
+        }
 
-        let kind = match task.get("kind").and_then(Value::as_str) {
+        let kind = match task
+            .get("kind")
+            .or_else(|| task.get("action"))
+            .and_then(Value::as_str)
+        {
             Some("text.generate") | Some("text_generate") => TaskKind::TextGenerate,
+            Some("media.analyze") | Some("media_analyze") | Some("analyze_media") => {
+                TaskKind::MediaAnalyze
+            }
             Some("voice.synthesize") | Some("voice_synthesize") => TaskKind::VoiceSynthesize,
             Some(other) => bail!("unsupported task kind [{}]", other),
             None if task.get("prompt").and_then(Value::as_str).is_some() => TaskKind::TextGenerate,
+            None if !context.attachments.is_empty() => TaskKind::MediaAnalyze,
             None if active_turn_text(task.get("context")).is_some() => TaskKind::TextGenerate,
             None if task.get("text").and_then(Value::as_str).is_some() => TaskKind::VoiceSynthesize,
             None if task.get("spoken_text").and_then(Value::as_str).is_some() => {
@@ -232,6 +248,10 @@ impl ControllerTask {
         self.prompt.as_deref()
     }
 
+    pub fn media_prompt(&self) -> Option<&str> {
+        self.prompt.as_deref()
+    }
+
     pub fn voice_text(&self) -> Option<&str> {
         self.spoken_text
             .as_deref()
@@ -251,6 +271,10 @@ impl ControllerTask {
         self.provider_options.get(key).and_then(Value::as_str)
     }
 
+    pub fn media_attachments(&self) -> &[AttachmentInput] {
+        &self.context.attachments
+    }
+
     pub fn wants_channel(&self, channel: &str) -> bool {
         self.response_contract
             .channels
@@ -266,6 +290,31 @@ impl ControllerTask {
                     .context("text.generate task missing prompt")?;
                 if prompt.trim().is_empty() {
                     bail!("text.generate task prompt cannot be empty");
+                }
+            }
+            TaskKind::MediaAnalyze => {
+                let prompt = self
+                    .media_prompt()
+                    .context("media.analyze task missing prompt")?;
+                if prompt.trim().is_empty() {
+                    bail!("media.analyze task prompt cannot be empty");
+                }
+                if self.context.attachments.is_empty() {
+                    bail!("media.analyze task requires at least one attachment");
+                }
+                if !self.context.attachments.iter().any(|attachment| {
+                    attachment
+                        .url
+                        .as_deref()
+                        .map(|url| !url.trim().is_empty())
+                        .unwrap_or(false)
+                        && attachment
+                            .transport_error
+                            .as_deref()
+                            .map(|error| error.trim().is_empty())
+                            .unwrap_or(true)
+                }) {
+                    bail!("media.analyze task requires at least one blob-backed attachment url");
                 }
             }
             TaskKind::VoiceSynthesize => {
@@ -416,16 +465,26 @@ fn parse_attachments(value: Option<&Value>) -> Vec<AttachmentInput> {
                             .and_then(|obj| obj.get("kind"))
                             .and_then(Value::as_str)
                             .map(str::to_string),
+                        file_id: object
+                            .and_then(|obj| obj.get("file_id"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
                         mime_type: object
                             .and_then(|obj| obj.get("mime_type"))
                             .and_then(Value::as_str)
                             .map(str::to_string),
                         url: object
                             .and_then(|obj| obj.get("url"))
+                            .or_else(|| object.and_then(|obj| obj.get("blob_download_url")))
                             .and_then(Value::as_str)
                             .map(str::to_string),
                         blob_ref: object
                             .and_then(|obj| obj.get("blob_ref"))
+                            .or_else(|| object.and_then(|obj| obj.get("blob_id")))
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        transport_error: object
+                            .and_then(|obj| obj.get("transport_error"))
                             .and_then(Value::as_str)
                             .map(str::to_string),
                     }
@@ -935,6 +994,29 @@ mod tests {
         assert_eq!(task.kind, TaskKind::TextGenerate);
         assert_eq!(task.prompt_text(), Some("Summarize the deployment status."));
         assert_eq!(task.context.identity.len(), 1);
+    }
+
+    #[test]
+    fn infers_media_task_from_flat_blob_backed_attachments() {
+        let task = ControllerTask::from_value(&json!({
+            "action": "analyze_media",
+            "prompt": "Describe the media",
+            "attachments": [{
+                "kind": "photo",
+                "file_id": "photo-1",
+                "mime_type": "image/jpeg",
+                "blob_id": "sha256-1",
+                "blob_download_url": "http://127.0.0.1:9001/download/sha256-1"
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(task.kind, TaskKind::MediaAnalyze);
+        assert_eq!(task.media_attachments().len(), 1);
+        assert_eq!(
+            task.media_attachments()[0].url.as_deref(),
+            Some("http://127.0.0.1:9001/download/sha256-1")
+        );
     }
 
     #[test]

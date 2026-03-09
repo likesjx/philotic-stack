@@ -401,6 +401,35 @@ impl AgentRuntime {
                 )
             };
 
+        let attachment_kinds: Vec<&str> = attachments
+            .iter()
+            .filter_map(|attachment| {
+                if attachment.kind.is_empty() {
+                    None
+                } else {
+                    Some(attachment.kind.as_str())
+                }
+            })
+            .collect();
+        info!(
+            "Session [{}] routing turn {:?} as action [{}] to role [{}] with {} attachment(s) kinds {:?}",
+            session_id,
+            task.turn_id,
+            action,
+            target_role,
+            attachments.len(),
+            attachment_kinds
+        );
+        for attachment in &attachments {
+            info!(
+                "Model-bound attachment kind [{}] file_id [{}] blob {:?} transport_error {:?}",
+                attachment.kind,
+                attachment.file_id,
+                attachment.blob_id.as_deref(),
+                attachment.transport_error.as_deref()
+            );
+        }
+
         let model_req = ModelRequestPayload {
             action,
             session_id: session_id.clone(),

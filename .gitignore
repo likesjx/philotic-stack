@@ -6,6 +6,7 @@
 *.db-*
 *.sqlite
 *.sqlite-*
+blobs/
 
 # Local runtime configuration and secrets
 .env
