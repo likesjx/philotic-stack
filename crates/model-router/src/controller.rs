@@ -159,7 +159,9 @@ impl ControllerTask {
             .or_else(|| task.get("action"))
             .and_then(Value::as_str)
         {
-            Some("text.generate") | Some("text_generate") => TaskKind::TextGenerate,
+            Some("generate_text") | Some("text.generate") | Some("text_generate") => {
+                TaskKind::TextGenerate
+            }
             Some("media.analyze") | Some("media_analyze") | Some("analyze_media") => {
                 TaskKind::MediaAnalyze
             }
