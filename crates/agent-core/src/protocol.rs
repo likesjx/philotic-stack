@@ -9,6 +9,16 @@ pub struct TransportAttachment {
     pub mime_type: Option<String>,
     #[serde(default)]
     pub file_name: Option<String>,
+    #[serde(default)]
+    pub file_size: Option<u64>,
+    #[serde(default)]
+    pub telegram_file_path: Option<String>,
+    #[serde(default)]
+    pub blob_id: Option<String>,
+    #[serde(default)]
+    pub blob_download_url: Option<String>,
+    #[serde(default)]
+    pub transport_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -88,6 +98,12 @@ pub struct FinalReplyPayload {
 pub struct TaskRunnerOverlay {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_read_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_search_results: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -285,6 +301,11 @@ mod tests {
                 file_id: "file-1".into(),
                 mime_type: Some("audio/ogg".into()),
                 file_name: None,
+                file_size: None,
+                telegram_file_path: None,
+                blob_id: None,
+                blob_download_url: None,
+                transport_error: None,
             }]
         );
         assert_eq!(
@@ -344,6 +365,9 @@ mod tests {
             workspace_ref: Some("workspace://main".into()),
             task_runner_overlay: Some(TaskRunnerOverlay {
                 workspace_ref: Some("workspace://main".into()),
+                allowed_tools: Some(vec!["workspace.read".into(), "workspace.search".into()]),
+                max_read_bytes: Some(4096),
+                max_search_results: Some(25),
             }),
             reply_to: "local-ansible-01".into(),
             reply_role: "agent".into(),
@@ -358,5 +382,7 @@ mod tests {
             json["task_runner_overlay"]["workspace_ref"],
             "workspace://main"
         );
+        assert_eq!(json["task_runner_overlay"]["max_read_bytes"], 4096);
+        assert_eq!(json["task_runner_overlay"]["max_search_results"], 25);
     }
 }

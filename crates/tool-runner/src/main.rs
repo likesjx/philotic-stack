@@ -12,6 +12,109 @@ use tracing::{info, warn};
 #[command(author, version, about, long_about = None)]
 struct Args {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkspaceRunnerConfig {
+    default_workspace_ref: Option<String>,
+    allowed_tools: Vec<String>,
+    max_read_bytes: usize,
+    max_search_results: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize)]
+struct WorkspaceRunnerOverlay {
+    #[serde(default)]
+    workspace_ref: Option<String>,
+    #[serde(default)]
+    allowed_tools: Option<Vec<String>>,
+    #[serde(default)]
+    max_read_bytes: Option<usize>,
+    #[serde(default)]
+    max_search_results: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EffectiveWorkspaceRunnerConfig {
+    workspace_ref: Option<String>,
+    allowed_tools: Vec<String>,
+    max_read_bytes: usize,
+    max_search_results: usize,
+}
+
+impl WorkspaceRunnerConfig {
+    fn from_env() -> Self {
+        let default_workspace_ref = std::env::var("PHILOTIC_WORKSPACE_RUNNER_ROOT")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let allowed_tools = std::env::var("PHILOTIC_WORKSPACE_ALLOWED_TOOLS")
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|tool| !tool.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|tools| !tools.is_empty())
+            .unwrap_or_else(|| {
+                vec![
+                    "workspace.list".into(),
+                    "workspace.read".into(),
+                    "workspace.search".into(),
+                ]
+            });
+        let max_read_bytes = std::env::var("PHILOTIC_WORKSPACE_MAX_READ_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(256 * 1024);
+        let max_search_results = std::env::var("PHILOTIC_WORKSPACE_MAX_SEARCH_RESULTS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(50);
+
+        Self {
+            default_workspace_ref,
+            allowed_tools,
+            max_read_bytes,
+            max_search_results,
+        }
+    }
+
+    fn apply_overlay(&self, overlay: WorkspaceRunnerOverlay) -> EffectiveWorkspaceRunnerConfig {
+        let allowed_tools = match overlay.allowed_tools {
+            Some(overlay_tools) => self
+                .allowed_tools
+                .iter()
+                .filter(|tool| {
+                    overlay_tools
+                        .iter()
+                        .any(|overlay_tool| overlay_tool == *tool)
+                })
+                .cloned()
+                .collect::<Vec<_>>(),
+            None => self.allowed_tools.clone(),
+        };
+
+        EffectiveWorkspaceRunnerConfig {
+            workspace_ref: overlay
+                .workspace_ref
+                .or_else(|| self.default_workspace_ref.clone()),
+            allowed_tools,
+            max_read_bytes: overlay
+                .max_read_bytes
+                .map(|limit| limit.min(self.max_read_bytes))
+                .unwrap_or(self.max_read_bytes),
+            max_search_results: overlay
+                .max_search_results
+                .map(|limit| limit.min(self.max_search_results))
+                .unwrap_or(self.max_search_results),
+        }
+    }
+}
+
 fn resolve_workspace_root(workspace_ref: Option<&str>) -> PathBuf {
     let current = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let Some(workspace_ref) = workspace_ref
@@ -52,23 +155,39 @@ fn resolve_workspace_path(root: &Path, requested: &str) -> Result<PathBuf, Strin
     Ok(root.join(requested_path))
 }
 
-fn effective_workspace_ref(task: &serde_json::Value) -> Option<String> {
-    task.get("task_runner_overlay")
-        .and_then(|overlay| overlay.get("workspace_ref"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
-        .or_else(|| {
-            task.get("workspace_ref")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-        })
+fn parse_workspace_runner_overlay(task: &serde_json::Value) -> WorkspaceRunnerOverlay {
+    let mut overlay = task
+        .get("task_runner_overlay")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<WorkspaceRunnerOverlay>(value).ok())
+        .unwrap_or_default();
+
+    if overlay.workspace_ref.is_none() {
+        overlay.workspace_ref = task
+            .get("workspace_ref")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+    }
+
+    overlay
 }
 
 fn execute_tool(
+    config: &EffectiveWorkspaceRunnerConfig,
     tool_name: &str,
     arguments: &serde_json::Value,
-    workspace_ref: Option<&str>,
 ) -> String {
+    if !config
+        .allowed_tools
+        .iter()
+        .any(|allowed| allowed == tool_name)
+    {
+        return format!(
+            "{} error: tool is not allowed by workspace runner policy",
+            tool_name
+        );
+    }
+
     match tool_name {
         "echo" => arguments
             .get("text")
@@ -76,7 +195,7 @@ fn execute_tool(
             .unwrap_or_default()
             .to_string(),
         "workspace.list" => {
-            let root = resolve_workspace_root(workspace_ref);
+            let root = resolve_workspace_root(config.workspace_ref.as_deref());
             let requested = arguments
                 .get("path")
                 .and_then(serde_json::Value::as_str)
@@ -103,7 +222,7 @@ fn execute_tool(
             entries.join("\n")
         }
         "workspace.read" => {
-            let root = resolve_workspace_root(workspace_ref);
+            let root = resolve_workspace_root(config.workspace_ref.as_deref());
             let Some(requested) = arguments.get("path").and_then(serde_json::Value::as_str) else {
                 return "workspace.read error: missing `path`".into();
             };
@@ -111,13 +230,23 @@ fn execute_tool(
                 Ok(path) => path,
                 Err(err) => return format!("workspace.read error: {err}"),
             };
+            let metadata = match fs::metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(err) => return format!("workspace.read error: {err}"),
+            };
+            if metadata.len() as usize > config.max_read_bytes {
+                return format!(
+                    "workspace.read error: file exceeds max_read_bytes ({})",
+                    config.max_read_bytes
+                );
+            }
             match fs::read_to_string(&path) {
                 Ok(contents) => contents,
                 Err(err) => format!("workspace.read error: {err}"),
             }
         }
         "workspace.search" => {
-            let root = resolve_workspace_root(workspace_ref);
+            let root = resolve_workspace_root(config.workspace_ref.as_deref());
             let query = arguments
                 .get("query")
                 .or_else(|| arguments.get("pattern"))
@@ -135,7 +264,12 @@ fn execute_tool(
                 Ok(path) => path,
                 Err(err) => return format!("workspace.search error: {err}"),
             };
-            match search_workspace(&path, query) {
+            match search_workspace(
+                &path,
+                query,
+                config.max_read_bytes,
+                config.max_search_results,
+            ) {
                 Ok(results) if results.is_empty() => {
                     format!("workspace.search: no matches for `{query}`")
                 }
@@ -147,17 +281,21 @@ fn execute_tool(
     }
 }
 
-fn search_workspace(root: &Path, query: &str) -> Result<Vec<String>, String> {
-    const MAX_RESULTS: usize = 50;
-    const MAX_FILE_BYTES: usize = 256 * 1024;
-
+fn search_workspace(
+    root: &Path,
+    query: &str,
+    max_read_bytes: usize,
+    max_search_results: usize,
+) -> Result<Vec<String>, String> {
     fn visit(
         path: &Path,
         root: &Path,
         query: &str,
+        max_read_bytes: usize,
+        max_search_results: usize,
         results: &mut Vec<String>,
     ) -> Result<(), String> {
-        if results.len() >= MAX_RESULTS {
+        if results.len() >= max_search_results {
             return Ok(());
         }
 
@@ -169,15 +307,22 @@ fn search_workspace(root: &Path, query: &str) -> Result<Vec<String>, String> {
                 .collect::<Vec<_>>();
             entries.sort_by_key(|entry| entry.file_name());
             for entry in entries {
-                visit(&entry.path(), root, query, results)?;
-                if results.len() >= MAX_RESULTS {
+                visit(
+                    &entry.path(),
+                    root,
+                    query,
+                    max_read_bytes,
+                    max_search_results,
+                    results,
+                )?;
+                if results.len() >= max_search_results {
                     break;
                 }
             }
             return Ok(());
         }
 
-        if !metadata.is_file() || metadata.len() as usize > MAX_FILE_BYTES {
+        if !metadata.is_file() || metadata.len() as usize > max_read_bytes {
             return Ok(());
         }
 
@@ -194,7 +339,7 @@ fn search_workspace(root: &Path, query: &str) -> Result<Vec<String>, String> {
             .unwrap_or(false);
         if file_name_matches {
             results.push(format!("{relative}: [filename match]"));
-            if results.len() >= MAX_RESULTS {
+            if results.len() >= max_search_results {
                 return Ok(());
             }
         }
@@ -210,7 +355,7 @@ fn search_workspace(root: &Path, query: &str) -> Result<Vec<String>, String> {
                 continue;
             }
             results.push(format!("{relative}:{}: {}", idx + 1, line.trim()));
-            if results.len() >= MAX_RESULTS {
+            if results.len() >= max_search_results {
                 break;
             }
         }
@@ -219,7 +364,14 @@ fn search_workspace(root: &Path, query: &str) -> Result<Vec<String>, String> {
     }
 
     let mut results = Vec::new();
-    visit(root, root, query, &mut results)?;
+    visit(
+        root,
+        root,
+        query,
+        max_read_bytes,
+        max_search_results,
+        &mut results,
+    )?;
     Ok(results)
 }
 
@@ -227,6 +379,7 @@ fn search_workspace(root: &Path, query: &str) -> Result<Vec<String>, String> {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let _args = Args::parse();
+    let workspace_config = WorkspaceRunnerConfig::from_env();
 
     let identity = GuestIdentity {
         guest_id: "tool-runner-01".into(),
@@ -315,9 +468,10 @@ async fn main() -> Result<()> {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("hegemon")
                     .to_string();
-                let workspace_ref = effective_workspace_ref(&task);
+                let runner_overlay = parse_workspace_runner_overlay(&task);
+                let effective_config = workspace_config.apply_overlay(runner_overlay);
 
-                let result_content = execute_tool(&tool_name, &arguments, workspace_ref.as_deref());
+                let result_content = execute_tool(&effective_config, &tool_name, &arguments);
 
                 ipc_client
                     .send_request(IpcRequest::EmitTask {
@@ -353,7 +507,10 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_workspace_ref, execute_tool};
+    use super::{
+        execute_tool, parse_workspace_runner_overlay, search_workspace,
+        EffectiveWorkspaceRunnerConfig, WorkspaceRunnerConfig, WorkspaceRunnerOverlay,
+    };
     use serde_json::json;
     use std::fs;
 
@@ -363,11 +520,13 @@ mod tests {
         fs::write(temp.path().join("alpha.txt"), "hello").expect("write file");
         fs::create_dir(temp.path().join("nested")).expect("mkdir");
 
-        let output = execute_tool(
-            "workspace.list",
-            &json!({ "path": "." }),
-            temp.path().to_str(),
-        );
+        let config = EffectiveWorkspaceRunnerConfig {
+            workspace_ref: temp.path().to_str().map(str::to_string),
+            allowed_tools: vec!["workspace.list".into()],
+            max_read_bytes: 256 * 1024,
+            max_search_results: 50,
+        };
+        let output = execute_tool(&config, "workspace.list", &json!({ "path": "." }));
         assert!(output.contains("alpha.txt"));
         assert!(output.contains("nested/"));
     }
@@ -377,21 +536,29 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         fs::write(temp.path().join("note.txt"), "remember this").expect("write file");
 
-        let output = execute_tool(
-            "workspace.read",
-            &json!({ "path": "note.txt" }),
-            temp.path().to_str(),
-        );
+        let config = EffectiveWorkspaceRunnerConfig {
+            workspace_ref: temp.path().to_str().map(str::to_string),
+            allowed_tools: vec!["workspace.read".into()],
+            max_read_bytes: 256 * 1024,
+            max_search_results: 50,
+        };
+        let output = execute_tool(&config, "workspace.read", &json!({ "path": "note.txt" }));
         assert_eq!(output, "remember this");
     }
 
     #[test]
     fn workspace_tools_reject_parent_traversal() {
         let temp = tempfile::tempdir().expect("temp dir");
+        let config = EffectiveWorkspaceRunnerConfig {
+            workspace_ref: temp.path().to_str().map(str::to_string),
+            allowed_tools: vec!["workspace.read".into()],
+            max_read_bytes: 256 * 1024,
+            max_search_results: 50,
+        };
         let output = execute_tool(
+            &config,
             "workspace.read",
             &json!({ "path": "../secret.txt" }),
-            temp.path().to_str(),
         );
         assert!(output.contains("path traversal"));
     }
@@ -405,10 +572,16 @@ mod tests {
         )
         .expect("write file");
 
+        let config = EffectiveWorkspaceRunnerConfig {
+            workspace_ref: temp.path().to_str().map(str::to_string),
+            allowed_tools: vec!["workspace.search".into()],
+            max_read_bytes: 256 * 1024,
+            max_search_results: 50,
+        };
         let output = execute_tool(
+            &config,
             "workspace.search",
             &json!({ "path": ".", "query": "remember" }),
-            temp.path().to_str(),
         );
         assert!(output.contains("note.txt:2: remember this line"));
     }
@@ -416,11 +589,13 @@ mod tests {
     #[test]
     fn workspace_search_requires_query() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let output = execute_tool(
-            "workspace.search",
-            &json!({ "path": "." }),
-            temp.path().to_str(),
-        );
+        let config = EffectiveWorkspaceRunnerConfig {
+            workspace_ref: temp.path().to_str().map(str::to_string),
+            allowed_tools: vec!["workspace.search".into()],
+            max_read_bytes: 256 * 1024,
+            max_search_results: 50,
+        };
+        let output = execute_tool(&config, "workspace.search", &json!({ "path": "." }));
         assert!(output.contains("missing `query`"));
     }
 
@@ -434,8 +609,76 @@ mod tests {
         });
 
         assert_eq!(
-            effective_workspace_ref(&task).as_deref(),
+            parse_workspace_runner_overlay(&task)
+                .workspace_ref
+                .as_deref(),
             Some("workspace://overlay")
         );
+    }
+
+    #[test]
+    fn workspace_runner_overlay_can_only_narrow_limits() {
+        let base = WorkspaceRunnerConfig {
+            default_workspace_ref: Some("workspace://base".into()),
+            allowed_tools: vec!["workspace.read".into(), "workspace.search".into()],
+            max_read_bytes: 4096,
+            max_search_results: 20,
+        };
+        let effective = base.apply_overlay(WorkspaceRunnerOverlay {
+            workspace_ref: Some("workspace://overlay".into()),
+            allowed_tools: Some(vec!["workspace.search".into()]),
+            max_read_bytes: Some(1024),
+            max_search_results: Some(5),
+        });
+
+        assert_eq!(
+            effective.workspace_ref.as_deref(),
+            Some("workspace://overlay")
+        );
+        assert_eq!(effective.allowed_tools, vec!["workspace.search"]);
+        assert_eq!(effective.max_read_bytes, 1024);
+        assert_eq!(effective.max_search_results, 5);
+    }
+
+    #[test]
+    fn workspace_runner_rejects_tools_outside_overlay_policy() {
+        let config = EffectiveWorkspaceRunnerConfig {
+            workspace_ref: Some("workspace://main".into()),
+            allowed_tools: vec!["workspace.read".into()],
+            max_read_bytes: 256 * 1024,
+            max_search_results: 50,
+        };
+
+        let output = execute_tool(&config, "workspace.search", &json!({ "query": "needle" }));
+        assert!(output.contains("not allowed by workspace runner policy"));
+    }
+
+    #[test]
+    fn workspace_read_respects_max_read_bytes() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        fs::write(temp.path().join("note.txt"), "remember this").expect("write file");
+
+        let config = EffectiveWorkspaceRunnerConfig {
+            workspace_ref: temp.path().to_str().map(str::to_string),
+            allowed_tools: vec!["workspace.read".into()],
+            max_read_bytes: 4,
+            max_search_results: 50,
+        };
+
+        let output = execute_tool(&config, "workspace.read", &json!({ "path": "note.txt" }));
+        assert!(output.contains("exceeds max_read_bytes"));
+    }
+
+    #[test]
+    fn workspace_search_respects_max_search_results() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        fs::write(
+            temp.path().join("note.txt"),
+            "hit one\nhit two\nhit three\n",
+        )
+        .expect("write file");
+
+        let output = search_workspace(temp.path(), "hit", 256 * 1024, 2).expect("search");
+        assert_eq!(output.len(), 2);
     }
 }

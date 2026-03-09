@@ -24,6 +24,10 @@ Current code already points this way:
   - route metadata can now carry `task_runner_kind`
   - execution payloads can now carry a `task_runner_overlay`
   - workspace execution uses that overlay to resolve the effective workspace binding
+- second coding slice landed:
+  - workspace runners now have a real base config surface
+  - overlays can narrow allowed tools and execution limits
+  - workspace read/search limits are enforced by runner policy instead of only by convention
 
 Still pending:
 
