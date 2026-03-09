@@ -16,14 +16,23 @@ pub struct GeminiProvider {
     http_client: reqwest::Client,
     auth: Option<GeminiAuth>,
     default_model: String,
+    base_url: String,
 }
 
 impl GeminiProvider {
-    pub fn new(http_client: reqwest::Client, auth: Option<GeminiAuth>) -> Self {
+    pub fn new(
+        http_client: reqwest::Client,
+        auth: Option<GeminiAuth>,
+        base_url: Option<String>,
+    ) -> Self {
         Self {
             http_client,
             auth,
             default_model: "gemini-flash-latest".into(),
+            base_url: base_url
+                .unwrap_or_else(|| "https://generativelanguage.googleapis.com".into())
+                .trim_end_matches('/')
+                .to_string(),
         }
     }
 
@@ -60,12 +69,12 @@ impl GeminiProvider {
             .context("Gemini auth missing from config; expected OAuth bearer or API key")?
         {
             GeminiAuth::ApiKey(api_key) => Ok(format!(
-                "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-                model, api_key
+                "{}/v1beta/models/{}:generateContent?key={}",
+                self.base_url, model, api_key
             )),
             GeminiAuth::OAuthBearer { .. } => Ok(format!(
-                "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
-                model
+                "{}/v1beta/models/{}:generateContent",
+                self.base_url, model
             )),
         }
     }
@@ -157,7 +166,14 @@ impl ModelProvider for GeminiProvider {
             bail!("Gemini returned an empty response");
         }
 
-        Ok(ProviderOutput::Text { content })
+        Ok(ProviderOutput::Text {
+            display_text: Some(content.clone()),
+            content,
+            spoken_text: None,
+            working_memory_delta: None,
+            follow_up_questions: Vec::new(),
+            intent_summary: None,
+        })
     }
 }
 
@@ -203,6 +219,7 @@ mod tests {
                 access_token: "oauth-token".into(),
                 project_id: Some("proj".into()),
             }),
+            None,
         );
 
         let url = provider.endpoint_url(Some("gemini-2.5-pro")).unwrap();
@@ -220,6 +237,7 @@ mod tests {
                 access_token: "oauth-token".into(),
                 project_id: Some("proj-123".into()),
             }),
+            None,
         );
 
         let request = provider
@@ -243,12 +261,31 @@ mod tests {
         let provider = GeminiProvider::new(
             reqwest::Client::new(),
             Some(GeminiAuth::ApiKey("api-key".into())),
+            None,
         );
 
         let url = provider.endpoint_url(Some("gemini-2.5-flash")).unwrap();
         assert_eq!(
             url,
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=api-key"
+        );
+    }
+
+    #[test]
+    fn base_url_override_changes_endpoint_host() {
+        let provider = GeminiProvider::new(
+            reqwest::Client::new(),
+            Some(GeminiAuth::OAuthBearer {
+                access_token: "oauth-token".into(),
+                project_id: Some("proj".into()),
+            }),
+            Some("http://127.0.0.1:40123".into()),
+        );
+
+        let url = provider.endpoint_url(Some("gemini-2.5-flash")).unwrap();
+        assert_eq!(
+            url,
+            "http://127.0.0.1:40123/v1beta/models/gemini-2.5-flash:generateContent"
         );
     }
 }

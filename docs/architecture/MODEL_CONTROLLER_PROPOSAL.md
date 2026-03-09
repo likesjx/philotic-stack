@@ -38,6 +38,8 @@ Pin and prove the first design contract for:
 - an upstream producer path for `voice.synthesize`
 - a guest-side Gemini auth abstraction that prefers OAuth bearer material over API key fallback
 - a hotel-side Gemini OAuth validation path that proves stored auth can call a real Gemini model
+- a structured model request envelope that separates context layers from routing hints and provider options
+- a structured model response envelope with explicit response channels for optimization-oriented outputs
 
 Linked task surface: [docs/task.md](/Users/jaredlikes/code/philotic-stack-model-controller-abstraction/docs/task.md)
 
@@ -54,6 +56,360 @@ The model-controller API should be structured around capabilities such as:
 - `response.generate`
 
 `response.generate` is the important escape hatch for multimodal models that can emit text and audio directly. It should not be forced through the `voice.synthesize` path, because that would collapse native model audio into a fake TTS abstraction.
+
+## Structured Request Envelope
+
+Model-controller requests should move toward one canonical envelope with separate concerns for:
+
+- `capability`
+- `response_contract`
+- `context`
+- `routing_hints`
+- `provider_options`
+
+Recommended shape:
+
+```json
+{
+  "capability": "text.generate",
+  "response_contract": {
+    "modalities": ["text"],
+    "style": "assistant_reply"
+  },
+  "context": {
+    "instructions": [],
+    "identity": [],
+    "memory": [],
+    "dialogue_window": [],
+    "active_turn": {
+      "role": "user",
+      "parts": [{ "type": "text", "text": "..." }]
+    },
+    "attachments": []
+  },
+  "affordances": {
+    "skills": [],
+    "tools": []
+  },
+  "routing_hints": {
+    "implementation": "gemini"
+  },
+  "provider_options": {}
+}
+```
+
+This gives the system a stable capability-facing request while preserving structured seams for:
+
+- prompt projection
+- context trimming
+- cache reuse
+- provider-specific rendering
+- routing decisions
+
+If everything becomes one giant prompt string, Philotic loses the ability to reason about what can be cached, dropped, summarized, or projected differently per model.
+
+Important invariant:
+
+- structured envelopes must degrade cleanly to a minimal prompt-response path
+
+That means the majority of request fields should remain optional.
+
+The minimum honest request for `text.generate` should be able to look like:
+
+```json
+{
+  "capability": "text.generate",
+  "context": {
+    "active_turn": {
+      "text": "Hello"
+    }
+  }
+}
+```
+
+Everything else should be additive:
+
+- `response_contract` only when extra output channels are desired
+- `identity`, `memory`, and `dialogue_window` only when they are relevant
+- `affordances` only when skills or tools matter for this turn
+- `routing_hints` only when selection needs steering
+- `provider_options` only when provider-specific behavior is actually needed
+
+If a simple prompt-response turn has to impersonate a fully dressed orchestration request, the schema has become more ceremonial than useful.
+
+## Structured Response Envelope
+
+The response side should follow the same philosophy: do not collapse every model result back into a single text field.
+
+Recommended top-level response shape:
+
+- `capability`
+- `result`
+- `artifacts`
+- `trace`
+- `provider_output`
+
+Recommended example:
+
+```json
+{
+  "capability": "text.generate",
+  "result": {
+    "display_text": "...",
+    "spoken_text": null,
+    "working_memory_delta": null,
+    "follow_up_questions": []
+  },
+  "artifacts": [],
+  "trace": {
+    "provider": "gemini",
+    "model": "gemini-2.5-flash"
+  },
+  "provider_output": {}
+}
+```
+
+This should not be a naive mirror of the request envelope just for aesthetic symmetry.
+
+The response envelope exists to separate:
+
+- what the user should see
+- what downstream delivery systems should perform
+- what the runtime should retain for tighter future turns
+- what machine-readable hints the agent or UI can use next
+- what provenance/provider detail should be preserved without polluting the main semantic result
+
+If the request becomes structured but the response falls back into a glorified string return value, Philotic keeps only half of the optimization seam.
+
+The same optionality rule should apply on the response side.
+
+The minimum honest response for `text.generate` should be able to look like:
+
+```json
+{
+  "capability": "text.generate",
+  "result": {
+    "display_text": "Hello"
+  }
+}
+```
+
+Other response fields should remain optional and appear only when:
+
+- they were requested through `response_contract`
+- they are naturally produced by the provider path
+- downstream systems actually have a use for them
+
+So:
+
+- `spoken_text` is optional
+- `working_memory_delta` is optional
+- `follow_up_questions` are optional
+- `artifacts` are optional
+- `trace` should be available for observability, but consumers should not need it to extract the main answer
+
+This keeps the structured response envelope useful for optimization without turning ordinary prompt-response behavior into a schema tax.
+
+## Response Channel Recommendation
+
+The response contract should be able to request explicit result channels such as:
+
+- `display_text`
+- `spoken_text`
+- `working_memory_delta`
+- `follow_up_questions`
+- `intent_summary`
+- `state_updates`
+- `delivery_hints`
+
+These should be requested through `response_contract`, not smuggled in through prompt folklore.
+
+Recommended shape:
+
+```json
+{
+  "response_contract": {
+    "modalities": ["text"],
+    "channels": [
+      "display_text",
+      "spoken_text",
+      "working_memory_delta",
+      "follow_up_questions"
+    ]
+  }
+}
+```
+
+This allows a caller to say:
+
+- ordinary text reply only
+- text plus expressive speech projection
+- text plus session-tightening memory delta
+- text plus suggested next questions
+
+without pretending every turn needs every output.
+
+## Optimization-Oriented Response Channels
+
+### `working_memory_delta`
+
+`working_memory_delta` should be a compact, bounded summary of what should remain active for the next turns.
+
+Why:
+
+- it helps keep a session tight without replaying the whole transcript
+- it can feed session compaction or short-horizon working memory
+- it is more honest than re-scraping the assistant reply later for state
+
+Guardrails:
+
+- it should summarize active state, not rewrite durable memory authority
+- it should be bounded and structured enough to avoid essay sprawl
+- it should be optional per turn
+
+### `spoken_text`
+
+`spoken_text` should be the expressive performable form of the reply.
+
+Why:
+
+- it lets the text model emit delivery-aware speech text directly
+- it gives ElevenLabs and later voice systems a better substrate than raw display prose
+- it keeps performance markup and spoken cadence out of the user-visible text
+
+This channel aligns directly with the earlier ElevenLabs recommendation.
+
+### `follow_up_questions`
+
+`follow_up_questions` should be a list of useful next questions or missing-information prompts.
+
+Why:
+
+- it helps guide future turns
+- it can power UI suggestion chips or agent steering
+- it makes uncertainty and missing inputs explicit
+
+This is a cleaner seam than hoping the model casually remembers to ask smart questions in prose.
+
+### `intent_summary`
+
+`intent_summary` should capture the current user ask in one concise line.
+
+Why:
+
+- useful for routing, labeling, and session summaries
+- can help session management and memory indexing
+- can be easier to trust downstream than scraping the whole response
+
+### `state_updates`
+
+`state_updates` should carry structured facts or decisions that the caller may want to merge into working or session state.
+
+Why:
+
+- this avoids reparsing prose to recover operational state
+- it creates a seam for bounded session updates without making the reply itself do all the jobs
+
+### `delivery_hints`
+
+`delivery_hints` should capture output-shaping metadata such as:
+
+- tone
+- intensity
+- pace
+- style hints
+
+These should stay provider-neutral where possible and only fall into provider-specific formatting at the projection layer.
+
+## Response Boundary Recommendation
+
+Important pushback:
+
+- do not ask the model to emit every structured channel on every turn
+- do not let `working_memory_delta` become a shadow canonical memory store
+- do not force provider-specific audio markup into `display_text`
+- do not treat follow-up suggestions as the same thing as the main answer
+
+The response contract should select only the channels that matter for the current turn, and the runtime should be able to ignore channels it did not ask for.
+
+## Context Layer Recommendation
+
+The canonical `context` object should be layered as:
+
+1. `instructions`
+2. `identity`
+3. `memory`
+4. `dialogue_window`
+5. `active_turn`
+6. `attachments`
+
+Why this split:
+
+- `instructions` are policy, task framing, and other higher-priority behavior constraints
+- `identity` is who the agent is
+- `memory` is recalled relevant knowledge, not full transcript continuity
+- `dialogue_window` is recent conversational context
+- `active_turn` is the thing being answered right now
+- `attachments` are non-text inputs that may need provider-native rendering
+
+Important pushback:
+
+- do not collapse `memory` and `dialogue_window` into one history blob
+- do not treat `active_turn` as just “the last message”
+- do not let routing hints or provider flags leak into the semantic context object
+
+Those categories want different projection and trimming policies. If they are fused, optimization becomes mostly ceremonial.
+
+## Tools And Skills Recommendation
+
+Yes, tools and skills should be separated out, but not as peer context layers.
+
+They should live in a distinct `affordances` section because they are neither identity nor memory nor dialogue.
+
+Recommended split:
+
+- `skills`
+  - procedural or instructional overlays that shape how the model should approach the task
+- `tools`
+  - executable affordances the runtime can actually satisfy
+
+Why:
+
+- skills are interpretive guidance
+- tools are actionable capabilities
+- both affect model behavior
+- neither should be confused with recalled semantic context
+
+So the recommendation is:
+
+- `context` answers: who am I, what matters, what is happening now
+- `affordances.skills` answers: what approach patterns should I follow
+- `affordances.tools` answers: what can I actually invoke
+
+This also keeps future optimization cleaner:
+
+- skills can be projected sparsely or omitted when irrelevant
+- tools can be narrowed to the active tool assembly instead of dumping full inventory
+- both can be rendered differently per provider without corrupting the semantic context model
+
+Guardrail:
+
+- do not treat `AGENTS.md`-style operational guidance as ordinary conversational context
+- do not dump every tool and skill into every request just because they exist
+- expose them through turn-time projection only when relevant to the current goal
+
+## Projection Metadata Recommendation
+
+Each projected context or affordance item should eventually carry metadata such as:
+
+- `source_ref`
+- `projection_kind`
+- `priority`
+- `token_estimate`
+- `cache_key`
+- `truncation_policy`
+
+That metadata is what will let Philotic optimize model usage honestly instead of pretending string concatenation is architecture.
 
 ## ElevenLabs Recommendation
 

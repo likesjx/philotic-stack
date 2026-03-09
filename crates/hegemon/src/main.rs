@@ -101,6 +101,7 @@ async fn main() -> Result<()> {
                                                 let task_req = IpcRequest::EmitTask {
                                                     target_node: "local-ansible-01".into(),
                                                     target_role: "agent".into(),
+                                                    target_guest_id: None,
                                                     task_json: json!({
                                                         "source": "telegram",
                                                         "session_id": session_id,
