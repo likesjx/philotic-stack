@@ -9,6 +9,7 @@ pub struct GeminiProvider {
     http_client: reqwest::Client,
     api_key: Option<String>,
     default_model: String,
+    api_base_url: String,
 }
 
 impl GeminiProvider {
@@ -17,6 +18,26 @@ impl GeminiProvider {
             http_client,
             api_key,
             default_model: "gemini-flash-latest".into(),
+            api_base_url: Self::configured_api_base_url(),
+        }
+    }
+
+    fn configured_api_base_url() -> String {
+        std::env::var("PHILOTIC_GEMINI_API_BASE_URL")
+            .unwrap_or_else(|_| "https://generativelanguage.googleapis.com".into())
+    }
+
+    #[cfg(test)]
+    fn with_api_base_url_for_tests(
+        http_client: reqwest::Client,
+        api_key: Option<String>,
+        api_base_url: &str,
+    ) -> Self {
+        Self {
+            http_client,
+            api_key,
+            default_model: "gemini-flash-latest".into(),
+            api_base_url: api_base_url.to_string(),
         }
     }
 
@@ -29,8 +50,10 @@ impl GeminiProvider {
         let model = model.unwrap_or(&self.default_model);
 
         Ok(format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-            model, api_key
+            "{}/v1beta/models/{}:generateContent?key={}",
+            self.api_base_url.trim_end_matches('/'),
+            model,
+            api_key
         ))
     }
 
@@ -180,6 +203,21 @@ mod tests {
         );
 
         assert_eq!(text, "Gemini API Error (400): bad prompt");
+    }
+
+    #[test]
+    fn endpoint_url_uses_override_base_url() {
+        let provider = GeminiProvider::with_api_base_url_for_tests(
+            reqwest::Client::new(),
+            Some("key".into()),
+            "http://127.0.0.1:9555",
+        );
+        let endpoint = provider.endpoint_url(None).expect("endpoint should build");
+
+        assert_eq!(
+            endpoint,
+            "http://127.0.0.1:9555/v1beta/models/gemini-flash-latest:generateContent?key=key"
+        );
     }
 
     #[test]

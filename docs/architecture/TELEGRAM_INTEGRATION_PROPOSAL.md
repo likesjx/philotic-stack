@@ -75,6 +75,7 @@ Current repo truth:
   - `raw_transport_event`
 - it replies with `sendMessage`
 - it now preserves an optional `final_reply_guest_id` and session-level transport reply target so the owning local hegemon guest survives beyond a single turn without relying only on shared-role fan-out
+- the startup smoke now simulates text, photo, and voice-note Telegram updates against local fake Telegram and fake Gemini APIs, so the blob-backed media path has a real regression harness even though watched live Telegram validation is still pending
 
 That is a useful membrane slice, but it is not yet a richer Telegram controller:
 

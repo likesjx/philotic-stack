@@ -85,9 +85,11 @@ structured form is preferred for secrets like `telegram_bot_token`,
 are startup self-tests. They build the required guest binaries, boot the hotel,
 route a task through the hotel IPC plane, verify the reply, and then shut the
 hotel down. The Telegram smoke points `hegemon` at a local fake Telegram API and
-asserts that the controller sends the expected `sendMessage` reply. The voice
-test also forces inline audio for the `model.elevenlabs` guest and writes the
-returned MP3.
+asserts that the controller sends the expected `sendMessage` replies for text,
+photo, and voice-note inputs. It also points the Gemini controller at a local
+fake Gemini API so the simulated media path exercises real `getFile`, blob
+upload, and multimodal request assembly. The voice test also forces inline
+audio for the `model.elevenlabs` guest and writes the returned MP3.
 
 ## Architecture Reference
 

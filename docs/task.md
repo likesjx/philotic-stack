@@ -55,6 +55,7 @@
 - [x] Add a hotel-startup self-test path for routed ElevenLabs voice synthesis via `ansible --test voice-sample`.
 - [x] Add a hotel-startup self-test path for text model-controller round-trips via `ansible --test text-roundtrip`.
 - [x] Add a hotel-startup Telegram controller smoke via `ansible --test telegram-roundtrip` using a local fake Telegram API.
+- [x] Extend the startup Telegram smoke so it simulates text, photo, and voice-note ingress and exercises fake-Gemini multimodal requests on top of blob-backed media transport.
 - [ ] Define the canonical model task envelope for text, voice, structured output, and future multimodal requests.
 - [ ] Add first-class audio artifact delivery from model controller through agent/hegemon or the future voice machine.
 - [ ] Define the agent/model outbound rich-text contract so `agent-core` is not forced to emit transport-specific Markdown quirks for Telegram, WhatsApp, or future hegemon transports.

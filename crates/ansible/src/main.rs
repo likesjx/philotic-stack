@@ -12,7 +12,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use clap::{Parser, ValueEnum};
 use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
@@ -78,12 +78,27 @@ enum StartupTest {
 
 const STARTUP_TEST_TEXT_REPLY: &str = "startup text smoke ok";
 const STARTUP_TEST_TELEGRAM_TOKEN: &str = "startup-test-telegram-token";
-const STARTUP_TEST_TELEGRAM_REPLY: &str = "startup telegram smoke ok";
+const STARTUP_TEST_GEMINI_API_KEY: &str = "startup-test-gemini-key";
+const STARTUP_TEST_TELEGRAM_TEXT_REPLY: &str = "startup telegram text smoke ok";
+const STARTUP_TEST_TELEGRAM_PHOTO_REPLY: &str = "startup telegram photo smoke ok";
+const STARTUP_TEST_TELEGRAM_VOICE_REPLY: &str = "startup telegram voice smoke ok";
 
 #[derive(Debug, Default)]
 struct FakeTelegramState {
     updates: std::sync::Mutex<VecDeque<serde_json::Value>>,
     sent_messages: std::sync::Mutex<Vec<serde_json::Value>>,
+    files: std::sync::Mutex<HashMap<String, FakeTelegramFile>>,
+}
+
+#[derive(Debug, Clone)]
+struct FakeTelegramFile {
+    file_path: String,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Default)]
+struct FakeGeminiState {
+    requests: std::sync::Mutex<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -161,6 +176,22 @@ fn startup_test_telegram_api_base_url(hotel_name: &str) -> String {
         "http://127.0.0.1:{}",
         startup_test_telegram_port(hotel_name)
     )
+}
+
+fn startup_test_gemini_port(hotel_name: &str) -> u16 {
+    hotel_base_port(hotel_name) + 21
+}
+
+fn startup_test_gemini_api_base_url(hotel_name: &str) -> String {
+    format!("http://127.0.0.1:{}", startup_test_gemini_port(hotel_name))
+}
+
+fn startup_test_blob_port(hotel_name: &str) -> u16 {
+    hotel_base_port(hotel_name) + 22
+}
+
+fn startup_test_blob_base_url(hotel_name: &str) -> String {
+    format!("http://127.0.0.1:{}", startup_test_blob_port(hotel_name))
 }
 
 fn default_hotel_record(hotel_name: &str) -> HotelRecord {
@@ -349,33 +380,33 @@ fn enable_guest_test_overrides(
                 "telegram_bot_token",
                 &serde_json::Value::String(STARTUP_TEST_TELEGRAM_TOKEN.into()).to_string(),
             )?;
+            graph.set_config_value(
+                "gemini_api_key",
+                &serde_json::Value::String(STARTUP_TEST_GEMINI_API_KEY.into()).to_string(),
+            )?;
 
             let telegram_api_base_url = startup_test_telegram_api_base_url(hotel_name);
+            let gemini_api_base_url = startup_test_gemini_api_base_url(hotel_name);
+            let blob_base_url = startup_test_blob_base_url(hotel_name);
 
             for guest in &mut guests {
+                let mut config: serde_json::Value =
+                    serde_json::from_str(&guest.config_json).unwrap_or_default();
+                let env = config
+                    .as_object_mut()
+                    .and_then(|obj| obj.get_mut("env"))
+                    .and_then(serde_json::Value::as_object_mut)
+                    .context("guest config missing env object")?;
+
                 if guest.role == "model.gemini" {
-                    let mut config: serde_json::Value =
-                        serde_json::from_str(&guest.config_json).unwrap_or_default();
-                    let env = config
-                        .as_object_mut()
-                        .and_then(|obj| obj.get_mut("env"))
-                        .and_then(serde_json::Value::as_object_mut)
-                        .context("guest config missing env object")?;
+                    env.remove("PHILOTIC_MODEL_ROUTER_STUB_RESPONSE");
                     env.insert(
-                        "PHILOTIC_MODEL_ROUTER_STUB_RESPONSE".into(),
-                        serde_json::Value::String(STARTUP_TEST_TELEGRAM_REPLY.into()),
+                        "PHILOTIC_GEMINI_API_BASE_URL".into(),
+                        serde_json::Value::String(gemini_api_base_url.clone()),
                     );
-                    guest.config_json = config.to_string();
                 }
 
                 if guest.role == "hegemon" {
-                    let mut config: serde_json::Value =
-                        serde_json::from_str(&guest.config_json).unwrap_or_default();
-                    let env = config
-                        .as_object_mut()
-                        .and_then(|obj| obj.get_mut("env"))
-                        .and_then(serde_json::Value::as_object_mut)
-                        .context("guest config missing env object")?;
                     env.insert(
                         "PHILOTIC_TELEGRAM_API_BASE_URL".into(),
                         serde_json::Value::String(telegram_api_base_url.clone()),
@@ -384,8 +415,13 @@ fn enable_guest_test_overrides(
                         "PHILOTIC_TELEGRAM_FILE_API_BASE_URL".into(),
                         serde_json::Value::String(telegram_api_base_url.clone()),
                     );
-                    guest.config_json = config.to_string();
+                    env.insert(
+                        "PHILOTIC_BLOB_BASE_URL".into(),
+                        serde_json::Value::String(blob_base_url.clone()),
+                    );
                 }
+
+                guest.config_json = config.to_string();
             }
         }
     }
@@ -453,6 +489,8 @@ fn prepare_startup_test_binaries(test: StartupTest) -> Result<()> {
 fn fake_telegram_router(state: Arc<FakeTelegramState>) -> Router {
     Router::new()
         .route("/bot:token/getUpdates", get(fake_telegram_get_updates))
+        .route("/bot:token/getFile", get(fake_telegram_get_file))
+        .route("/file/*rest", get(fake_telegram_download_file))
         .route("/bot:token/sendMessage", post(fake_telegram_send_message))
         .with_state(state)
 }
@@ -484,6 +522,55 @@ async fn fake_telegram_get_updates(
     }))
 }
 
+async fn fake_telegram_get_file(
+    AxumPath(_token): AxumPath<String>,
+    Query(query): Query<HashMap<String, String>>,
+    State(state): State<Arc<FakeTelegramState>>,
+) -> impl IntoResponse {
+    let Some(file_id) = query.get("file_id") else {
+        return Json(serde_json::json!({
+            "ok": false,
+            "description": "file_id is required"
+        }));
+    };
+
+    let files = state.files.lock().expect("files lock");
+    let Some(file) = files.get(file_id) else {
+        return Json(serde_json::json!({
+            "ok": false,
+            "description": "file not found"
+        }));
+    };
+
+    Json(serde_json::json!({
+        "ok": true,
+        "result": {
+            "file_id": file_id,
+            "file_path": file.file_path,
+            "file_size": file.bytes.len()
+        }
+    }))
+}
+
+async fn fake_telegram_download_file(
+    AxumPath(rest): AxumPath<String>,
+    State(state): State<Arc<FakeTelegramState>>,
+) -> impl IntoResponse {
+    let Some((_, file_path)) = rest.split_once('/') else {
+        return axum::http::StatusCode::NOT_FOUND.into_response();
+    };
+    let files = state.files.lock().expect("files lock");
+    let Some(file) = files.values().find(|file| file.file_path == file_path) else {
+        return axum::http::StatusCode::NOT_FOUND.into_response();
+    };
+
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        file.bytes.clone(),
+    )
+        .into_response()
+}
+
 async fn fake_telegram_send_message(
     AxumPath(_token): AxumPath<String>,
     State(state): State<Arc<FakeTelegramState>>,
@@ -505,6 +592,69 @@ async fn fake_telegram_send_message(
             "message_id": 1
         }
     }))
+}
+
+fn fake_gemini_router(state: Arc<FakeGeminiState>) -> Router {
+    Router::new()
+        .route("/v1beta/models/*rest", post(fake_gemini_generate_content))
+        .with_state(state)
+}
+
+async fn fake_gemini_generate_content(
+    AxumPath(_rest): AxumPath<String>,
+    State(state): State<Arc<FakeGeminiState>>,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    state
+        .requests
+        .lock()
+        .expect("fake gemini requests lock")
+        .push(payload.clone());
+
+    let reply_text = fake_gemini_reply_text(&payload);
+    Json(serde_json::json!({
+        "candidates": [{
+            "content": {
+                "parts": [{
+                    "text": reply_text
+                }]
+            }
+        }]
+    }))
+}
+
+fn fake_gemini_reply_text(payload: &serde_json::Value) -> &'static str {
+    let parts = payload
+        .get("contents")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|contents| contents.first())
+        .and_then(|content| content.get("parts"))
+        .and_then(serde_json::Value::as_array);
+
+    let Some(parts) = parts else {
+        return STARTUP_TEST_TELEGRAM_TEXT_REPLY;
+    };
+
+    for part in parts {
+        let inline_data = part
+            .get("inline_data")
+            .and_then(serde_json::Value::as_object);
+        let Some(inline_data) = inline_data else {
+            continue;
+        };
+        let mime_type = inline_data
+            .get("mime_type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if mime_type.starts_with("image/") {
+            return STARTUP_TEST_TELEGRAM_PHOTO_REPLY;
+        }
+        if mime_type.starts_with("audio/") {
+            return STARTUP_TEST_TELEGRAM_VOICE_REPLY;
+        }
+    }
+
+    STARTUP_TEST_TELEGRAM_TEXT_REPLY
 }
 
 async fn run_startup_test(
@@ -717,100 +867,270 @@ async fn run_startup_test(
         StartupTest::TelegramRoundTrip => {
             let telegram_api_base_url = startup_test_telegram_api_base_url(hotel_name);
             let telegram_addr = format!("127.0.0.1:{}", startup_test_telegram_port(hotel_name));
+            let gemini_api_base_url = startup_test_gemini_api_base_url(hotel_name);
+            let gemini_addr = format!("127.0.0.1:{}", startup_test_gemini_port(hotel_name));
+            let blob_port = startup_test_blob_port(hotel_name);
+            let blob_addr = format!("127.0.0.1:{}", blob_port);
             let telegram_state = Arc::new(FakeTelegramState::default());
+            let gemini_state = Arc::new(FakeGeminiState::default());
+            let startup_text = text
+                .unwrap_or("hello from telegram startup test")
+                .to_string();
+            let blob_dir = std::env::temp_dir().join(format!(
+                "philotic-startup-test-blobs-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            let blob_service = BlobService::new(blob_dir);
             {
-                let telegram_state = Arc::clone(&telegram_state);
-                let startup_text = text
-                    .unwrap_or("hello from telegram startup test")
-                    .to_string();
-                tokio::spawn(async move {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
-                    telegram_state
-                        .updates
-                        .lock()
-                        .expect("updates lock")
-                        .push_back(serde_json::json!({
-                            "update_id": 1,
-                            "message": {
-                                "message_id": 1,
-                                "text": startup_text,
-                                "chat": { "id": 777000 },
-                                "from": { "id": 42, "username": "startup_test" }
-                            }
-                        }));
-                });
+                let mut files = telegram_state.files.lock().expect("files lock");
+                files.insert(
+                    "photo-large".into(),
+                    FakeTelegramFile {
+                        file_path: "photos/photo-large.jpg".into(),
+                        bytes: b"startup-photo-bytes".to_vec(),
+                    },
+                );
+                files.insert(
+                    "voice-1".into(),
+                    FakeTelegramFile {
+                        file_path: "voice/voice-1.ogg".into(),
+                        bytes: b"startup-voice-bytes".to_vec(),
+                    },
+                );
             }
 
-            let listener = tokio::net::TcpListener::bind(&telegram_addr)
+            let telegram_listener = tokio::net::TcpListener::bind(&telegram_addr)
                 .await
                 .with_context(|| format!("failed to bind fake telegram api on {telegram_addr}"))?;
             let telegram_server = tokio::spawn({
                 let state = Arc::clone(&telegram_state);
                 async move {
-                    axum::serve(listener, fake_telegram_router(state))
+                    axum::serve(telegram_listener, fake_telegram_router(state))
                         .await
                         .expect("fake telegram api should serve");
                 }
             });
+            let gemini_listener = tokio::net::TcpListener::bind(&gemini_addr)
+                .await
+                .with_context(|| format!("failed to bind fake gemini api on {gemini_addr}"))?;
+            let gemini_server = tokio::spawn({
+                let state = Arc::clone(&gemini_state);
+                async move {
+                    axum::serve(gemini_listener, fake_gemini_router(state))
+                        .await
+                        .expect("fake gemini api should serve");
+                }
+            });
+            let blob_server = tokio::spawn(async move {
+                blob_service
+                    .serve(&blob_addr)
+                    .await
+                    .expect("fake blob service should serve");
+            });
+
+            {
+                let telegram_state = Arc::clone(&telegram_state);
+                tokio::spawn(async move {
+                    let mut blob_ready = false;
+                    for _ in 0..60 {
+                        if tokio::net::TcpStream::connect(("127.0.0.1", blob_port))
+                            .await
+                            .is_ok()
+                        {
+                            blob_ready = true;
+                            break;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+                    }
+                    if !blob_ready {
+                        return;
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    let mut updates = telegram_state.updates.lock().expect("updates lock");
+                    updates.push_back(serde_json::json!({
+                        "update_id": 1,
+                        "message": {
+                            "message_id": 1,
+                            "text": startup_text,
+                            "chat": { "id": 777000 },
+                            "from": { "id": 42, "username": "startup_test" }
+                        }
+                    }));
+                    updates.push_back(serde_json::json!({
+                        "update_id": 2,
+                        "message": {
+                            "message_id": 2,
+                            "caption": "what is in this image?",
+                            "chat": { "id": 777001 },
+                            "from": { "id": 42, "username": "startup_test" },
+                            "photo": [
+                                { "file_id": "photo-small" },
+                                { "file_id": "photo-large" }
+                            ]
+                        }
+                    }));
+                    updates.push_back(serde_json::json!({
+                        "update_id": 3,
+                        "message": {
+                            "message_id": 3,
+                            "chat": { "id": 777002 },
+                            "from": { "id": 42, "username": "startup_test" },
+                            "voice": {
+                                "file_id": "voice-1",
+                                "mime_type": "audio/ogg"
+                            }
+                        }
+                    }));
+                });
+            }
 
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
-            for attempt in 1..=20 {
+            let expected_replies = [
+                STARTUP_TEST_TELEGRAM_TEXT_REPLY,
+                STARTUP_TEST_TELEGRAM_PHOTO_REPLY,
+                STARTUP_TEST_TELEGRAM_VOICE_REPLY,
+            ];
+            for attempt in 1..=30 {
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                let maybe_message = telegram_state
+                let sent_messages = telegram_state
                     .sent_messages
                     .lock()
                     .expect("sent messages lock")
-                    .last()
-                    .cloned();
-                if let Some(message) = maybe_message {
-                    let text = message
-                        .get("text")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default();
-                    let parse_mode = message
-                        .get("parse_mode")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default();
-                    if text != STARTUP_TEST_TELEGRAM_REPLY {
-                        telegram_server.abort();
-                        let _ = telegram_server.await;
-                        anyhow::bail!(
-                            "unexpected telegram startup reply on attempt {}: expected {:?}, got {:?}",
-                            attempt,
-                            STARTUP_TEST_TELEGRAM_REPLY,
-                            text
-                        );
-                    }
-                    if parse_mode != "HTML" {
-                        telegram_server.abort();
-                        let _ = telegram_server.await;
-                        anyhow::bail!(
-                            "unexpected telegram parse_mode on attempt {}: expected HTML, got {:?}",
-                            attempt,
-                            parse_mode
-                        );
+                    .clone();
+                if sent_messages.len() >= expected_replies.len() {
+                    for (index, expected_text) in expected_replies.iter().enumerate() {
+                        let message = &sent_messages[index];
+                        let text = message
+                            .get("text")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default();
+                        let parse_mode = message
+                            .get("parse_mode")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default();
+                        if text != *expected_text {
+                            telegram_server.abort();
+                            gemini_server.abort();
+                            blob_server.abort();
+                            let _ = telegram_server.await;
+                            let _ = gemini_server.await;
+                            let _ = blob_server.await;
+                            anyhow::bail!(
+                                "unexpected telegram startup reply {} on attempt {}: expected {:?}, got {:?}",
+                                index + 1,
+                                attempt,
+                                expected_text,
+                                text
+                            );
+                        }
+                        if parse_mode != "HTML" {
+                            telegram_server.abort();
+                            gemini_server.abort();
+                            blob_server.abort();
+                            let _ = telegram_server.await;
+                            let _ = gemini_server.await;
+                            let _ = blob_server.await;
+                            anyhow::bail!(
+                                "unexpected telegram parse_mode for reply {} on attempt {}: expected HTML, got {:?}",
+                                index + 1,
+                                attempt,
+                                parse_mode
+                            );
+                        }
                     }
 
+                    let gemini_requests = gemini_state
+                        .requests
+                        .lock()
+                        .expect("fake gemini requests lock")
+                        .clone();
+                    if gemini_requests.len() < expected_replies.len() {
+                        telegram_server.abort();
+                        gemini_server.abort();
+                        blob_server.abort();
+                        let _ = telegram_server.await;
+                        let _ = gemini_server.await;
+                        let _ = blob_server.await;
+                        anyhow::bail!(
+                            "expected {} fake Gemini requests, got {}",
+                            expected_replies.len(),
+                            gemini_requests.len()
+                        );
+                    }
+                    assert_fake_gemini_media_request(&gemini_requests[1], "image/jpeg")?;
+                    assert_fake_gemini_media_request(&gemini_requests[2], "audio/ogg")?;
+
                     info!(
-                        "Startup telegram round-trip delivered {:?} through fake Telegram API on attempt {} via {}",
-                        text, attempt, telegram_api_base_url
+                        "Startup telegram round-trip delivered {:?} through fake Telegram API and fake Gemini API on attempt {} via {} and {}",
+                        expected_replies, attempt, telegram_api_base_url, gemini_api_base_url
                     );
                     telegram_server.abort();
+                    gemini_server.abort();
+                    blob_server.abort();
                     let _ = telegram_server.await;
+                    let _ = gemini_server.await;
+                    let _ = blob_server.await;
                     return Ok(());
                 }
             }
 
             telegram_server.abort();
+            gemini_server.abort();
+            blob_server.abort();
             let _ = telegram_server.await;
+            let _ = gemini_server.await;
+            let _ = blob_server.await;
             anyhow::bail!(
-                "timed out waiting for fake Telegram sendMessage at {}",
-                telegram_api_base_url
+                "timed out waiting for fake Telegram media smoke replies at {} via {}",
+                telegram_api_base_url,
+                gemini_api_base_url
             );
         }
     }
 
+    Ok(())
+}
+
+fn assert_fake_gemini_media_request(
+    payload: &serde_json::Value,
+    expected_mime_type: &str,
+) -> Result<()> {
+    let parts = payload
+        .get("contents")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|contents| contents.first())
+        .and_then(|content| content.get("parts"))
+        .and_then(serde_json::Value::as_array)
+        .context("fake Gemini request missing contents.parts")?;
+    let inline_data = parts
+        .iter()
+        .find_map(|part| part.get("inline_data"))
+        .context("fake Gemini request missing inline_data")?;
+    let mime_type = inline_data
+        .get("mime_type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if mime_type != expected_mime_type {
+        anyhow::bail!(
+            "expected fake Gemini inline_data mime type {:?}, got {:?}",
+            expected_mime_type,
+            mime_type
+        );
+    }
+    let data = inline_data
+        .get("data")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if data.is_empty() {
+        anyhow::bail!("fake Gemini inline_data payload was empty");
+    }
+    let decoded = BASE64_STANDARD
+        .decode(data)
+        .context("fake Gemini inline_data was not valid base64")?;
+    if decoded.is_empty() {
+        anyhow::bail!("fake Gemini inline_data decoded to empty bytes");
+    }
     Ok(())
 }
 
@@ -1435,10 +1755,11 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        STARTUP_TEST_TELEGRAM_REPLY, STARTUP_TEST_TELEGRAM_TOKEN, STARTUP_TEST_TEXT_REPLY,
+        STARTUP_TEST_GEMINI_API_KEY, STARTUP_TEST_TELEGRAM_TOKEN, STARTUP_TEST_TEXT_REPLY,
         StartupTest, default_guest_seed, default_hotel_record, enable_guest_test_overrides,
         extract_context_graph_entries, guest_supervision_enabled, hotel_base_port,
-        run_startup_test, startup_test_telegram_api_base_url,
+        run_startup_test, startup_test_blob_base_url, startup_test_gemini_api_base_url,
+        startup_test_telegram_api_base_url,
     };
     use crate::service::ipc::IpcServer;
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
@@ -1540,7 +1861,7 @@ mod tests {
     }
 
     #[test]
-    fn telegram_startup_test_injects_fake_api_and_stub_reply() {
+    fn telegram_startup_test_injects_fake_api_and_fake_gemini_override() {
         let graph = SqliteGraphStorage::open(":memory:").expect("open sqlite");
         let guests = default_guest_seed("startup-test-hotel");
         graph
@@ -1556,6 +1877,15 @@ mod tests {
         let expected_token =
             serde_json::Value::String(STARTUP_TEST_TELEGRAM_TOKEN.into()).to_string();
         assert_eq!(token.as_deref(), Some(expected_token.as_str()));
+        let gemini_api_key = graph
+            .get_config_value("gemini_api_key")
+            .expect("read gemini api key");
+        let expected_gemini_api_key =
+            serde_json::Value::String(STARTUP_TEST_GEMINI_API_KEY.into()).to_string();
+        assert_eq!(
+            gemini_api_key.as_deref(),
+            Some(expected_gemini_api_key.as_str())
+        );
 
         let stored = graph
             .list_guests("startup-test-hotel", false)
@@ -1571,6 +1901,10 @@ mod tests {
             hegemon_config["env"]["PHILOTIC_TELEGRAM_API_BASE_URL"].as_str(),
             Some(startup_test_telegram_api_base_url("startup-test-hotel").as_str())
         );
+        assert_eq!(
+            hegemon_config["env"]["PHILOTIC_BLOB_BASE_URL"].as_str(),
+            Some(startup_test_blob_base_url("startup-test-hotel").as_str())
+        );
 
         let gemini = stored
             .iter()
@@ -1579,8 +1913,8 @@ mod tests {
         let gemini_config: serde_json::Value =
             serde_json::from_str(&gemini.config_json).expect("config should decode");
         assert_eq!(
-            gemini_config["env"]["PHILOTIC_MODEL_ROUTER_STUB_RESPONSE"].as_str(),
-            Some(STARTUP_TEST_TELEGRAM_REPLY)
+            gemini_config["env"]["PHILOTIC_GEMINI_API_BASE_URL"].as_str(),
+            Some(startup_test_gemini_api_base_url("startup-test-hotel").as_str())
         );
     }
 

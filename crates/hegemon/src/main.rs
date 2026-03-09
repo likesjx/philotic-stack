@@ -936,7 +936,10 @@ async fn main() -> Result<()> {
         .to_string();
     let tg_base = format!("{telegram_api_base}/bot{}/", bot_token);
     let tg_file_base = format!("{telegram_file_api_base}/file/bot{}/", bot_token);
-    let blob_base = format!("http://127.0.0.1:{}", args.ansible_port + 1);
+    let blob_base = std::env::var("PHILOTIC_BLOB_BASE_URL")
+        .unwrap_or_else(|_| format!("http://127.0.0.1:{}", args.ansible_port + 1))
+        .trim_end_matches('/')
+        .to_string();
     let mut offset: i64 = 0;
 
     info!("Starting Telegram long-polling loop...");
