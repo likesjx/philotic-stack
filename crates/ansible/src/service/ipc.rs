@@ -2456,11 +2456,13 @@ mod tests {
                 let snapshot: serde_json::Value =
                     serde_json::from_str(&value_json).expect("snapshot should decode");
                 assert_eq!(
-                    snapshot["tool_assembly"]["execution_routes"]["workspace.read"]["task_runner_config"]["default_workspace_ref"],
+                    snapshot["tool_assembly"]["execution_routes"]["workspace.read"]["task_runner_config"]
+                        ["default_workspace_ref"],
                     "workspace://policy"
                 );
                 assert_eq!(
-                    snapshot["tool_assembly"]["execution_routes"]["workspace.read"]["task_runner_config"]["max_read_bytes"],
+                    snapshot["tool_assembly"]["execution_routes"]["workspace.read"]["task_runner_config"]
+                        ["max_read_bytes"],
                     8192
                 );
             }
