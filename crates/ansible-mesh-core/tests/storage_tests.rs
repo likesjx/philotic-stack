@@ -11,8 +11,8 @@ use ansible_mesh_core::sqlite_storage::{
     SqliteCursorStorage, SqliteEventStorage, SqliteGraphStorage,
 };
 use ansible_mesh_core::storage::{
-    CursorStorage, EventStorage, GraphStorage, GuestRecord, HotelRecord, SessionEventRecord,
-    SessionParticipantRecord, SessionRecord, SessionTurnRecord,
+    CursorStorage, EventStorage, GraphStorage, GuestRecord, HotelRecord, SecretRecord,
+    SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,
 };
 use ansible_mesh_core::{NodeCapabilities, NodeRole};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -344,6 +344,30 @@ fn graph_storage_set_config_value_populates_graph_node() {
     let parsed: serde_json::Value = serde_json::from_str(&graph_json).unwrap();
     assert_eq!(parsed["key"], "telegram_bot_token");
     assert_eq!(parsed["value_json"], "\"secret-token\"");
+}
+
+#[test]
+fn graph_storage_secret_round_trips() {
+    let store = open_graph_storage();
+    let secret = SecretRecord {
+        secret_ref: "secret://hotel/default/test/one".into(),
+        secret_kind: "test".into(),
+        scope: "hotel".into(),
+        allowed_roles: vec!["model.gemini".into()],
+        allowed_guests: vec!["guest-1".into()],
+        ciphertext_b64: "ciphertext".into(),
+        nonce_b64: "nonce".into(),
+        created_at: now_ms(),
+        updated_at: now_ms(),
+    };
+
+    store.upsert_secret(&secret).expect("upsert secret");
+    let fetched = store
+        .get_secret(&secret.secret_ref)
+        .expect("get secret")
+        .expect("secret should exist");
+
+    assert_eq!(fetched, secret);
 }
 
 #[test]
@@ -980,6 +1004,20 @@ mod ipc_serde_tests {
     }
 
     #[test]
+    fn ipc_request_get_secret_round_trip() {
+        let req = IpcRequest::GetSecret {
+            secret_ref: "secret://hotel/default/test/one".into(),
+        };
+        let rt = roundtrip_request(&req);
+        match rt {
+            IpcRequest::GetSecret { secret_ref } => {
+                assert_eq!(secret_ref, "secret://hotel/default/test/one");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
     fn ipc_response_apartment_update_round_trip() {
         let res = IpcResponse::ApartmentUpdate {
             agent_id: "agent-jane".into(),
@@ -1022,6 +1060,25 @@ mod ipc_serde_tests {
         match rt {
             IpcResponse::Error(msg) => {
                 assert_eq!(msg, "something went wrong");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn ipc_response_secret_data_round_trip() {
+        let res = IpcResponse::SecretData {
+            secret_ref: "secret://hotel/default/test/one".into(),
+            value_json: Some("\"shh\"".into()),
+        };
+        let rt = roundtrip_response(&res);
+        match rt {
+            IpcResponse::SecretData {
+                secret_ref,
+                value_json,
+            } => {
+                assert_eq!(secret_ref, "secret://hotel/default/test/one");
+                assert_eq!(value_json.as_deref(), Some("\"shh\""));
             }
             _ => panic!("wrong variant"),
         }
