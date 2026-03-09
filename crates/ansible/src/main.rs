@@ -411,6 +411,7 @@ fn extract_context_graph_entries(
     };
 
     let mut merged = serde_json::Map::new();
+    let agent_profile = hotel_name.map(profile_for_hotel);
 
     if let Some(context_graph) = obj
         .get("context_graph")
@@ -421,12 +422,7 @@ fn extract_context_graph_entries(
 
     if let Some(hotels) = obj.get("hotels").and_then(serde_json::Value::as_object) {
         if let Some(default_hotel) = hotels.get("default").and_then(serde_json::Value::as_object) {
-            if let Some(context_graph) = default_hotel
-                .get("context_graph")
-                .and_then(serde_json::Value::as_object)
-            {
-                merged.extend(context_graph.clone());
-            }
+            merge_hotel_config_entries(&mut merged, default_hotel, agent_profile);
         }
 
         if let Some(hotel_name) = hotel_name {
@@ -434,12 +430,7 @@ fn extract_context_graph_entries(
                 .get(hotel_name)
                 .and_then(serde_json::Value::as_object)
             {
-                if let Some(context_graph) = hotel
-                    .get("context_graph")
-                    .and_then(serde_json::Value::as_object)
-                {
-                    merged.extend(context_graph.clone());
-                }
+                merge_hotel_config_entries(&mut merged, hotel, agent_profile);
             }
         }
     }
@@ -451,6 +442,70 @@ fn extract_context_graph_entries(
     obj.iter()
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect()
+}
+
+fn merge_hotel_config_entries(
+    merged: &mut serde_json::Map<String, serde_json::Value>,
+    hotel: &serde_json::Map<String, serde_json::Value>,
+    agent_profile: Option<BuiltInAgentProfile>,
+) {
+    if let Some(context_graph) = hotel
+        .get("context_graph")
+        .and_then(serde_json::Value::as_object)
+    {
+        merged.extend(context_graph.clone());
+    }
+
+    if let Some(telegram) = hotel.get("telegram").and_then(serde_json::Value::as_object) {
+        merge_telegram_entries(merged, telegram);
+    }
+
+    if let Some(agent_profile) = agent_profile {
+        if let Some(agents) = hotel.get("agents").and_then(serde_json::Value::as_object) {
+            let selected_agent = agents
+                .get(agent_profile.slug)
+                .or_else(|| agents.get(agent_profile.agent_id))
+                .or_else(|| agents.get("default"))
+                .and_then(serde_json::Value::as_object);
+            if let Some(agent) = selected_agent {
+                merge_agent_entries(merged, agent);
+            }
+        }
+    }
+}
+
+fn merge_agent_entries(
+    merged: &mut serde_json::Map<String, serde_json::Value>,
+    agent: &serde_json::Map<String, serde_json::Value>,
+) {
+    if let Some(context_graph) = agent
+        .get("context_graph")
+        .and_then(serde_json::Value::as_object)
+    {
+        merged.extend(context_graph.clone());
+    }
+
+    if let Some(telegram) = agent.get("telegram").and_then(serde_json::Value::as_object) {
+        merge_telegram_entries(merged, telegram);
+    }
+
+    if let Some(model) = agent.get("model").and_then(serde_json::Value::as_object) {
+        if let Some(default_model) = model.get("default_model") {
+            merged.insert("default_model".into(), default_model.clone());
+        }
+    }
+}
+
+fn merge_telegram_entries(
+    merged: &mut serde_json::Map<String, serde_json::Value>,
+    telegram: &serde_json::Map<String, serde_json::Value>,
+) {
+    if let Some(bot_token) = telegram.get("bot_token") {
+        merged.insert("telegram_bot_token".into(), bot_token.clone());
+    }
+    if let Some(allowed_users) = telegram.get("allowed_users") {
+        merged.insert("telegram_allowed_users".into(), allowed_users.clone());
+    }
 }
 
 fn enable_guest_test_overrides(
@@ -2311,15 +2366,29 @@ mod tests {
                 },
                 "hotels": {
                     "default": {
-                        "context_graph": {
-                            "telegram_bot_token": "jane-token",
-                            "default_model": "gemini-pro"
+                        "agents": {
+                            "jane": {
+                                "telegram": {
+                                    "bot_token": "jane-token",
+                                    "allowed_users": ["JaneHegemonBot"]
+                                },
+                                "model": {
+                                    "default_model": "gemini-pro"
+                                }
+                            }
                         }
                     },
                     "aria-architect-hotel": {
-                        "context_graph": {
-                            "telegram_bot_token": "aria-token",
-                            "default_model": "gemini-2.5-pro"
+                        "agents": {
+                            "aria": {
+                                "telegram": {
+                                    "bot_token": "aria-token",
+                                    "allowed_users": ["AriaArchitectBot"]
+                                },
+                                "model": {
+                                    "default_model": "gemini-2.5-pro"
+                                }
+                            }
                         }
                     }
                 }
@@ -2336,7 +2405,40 @@ mod tests {
             key == "telegram_bot_token" && value.as_str() == Some("aria-token")
         }));
         assert!(entries.iter().any(|(key, value)| {
+            key == "telegram_allowed_users"
+                && value
+                    .as_array()
+                    .is_some_and(|arr| arr.len() == 1 && arr[0] == "AriaArchitectBot")
+        }));
+        assert!(entries.iter().any(|(key, value)| {
             key == "default_model" && value.as_str() == Some("gemini-2.5-pro")
+        }));
+    }
+
+    #[test]
+    fn context_graph_entries_support_hotel_level_telegram_overlay() {
+        let entries = extract_context_graph_entries(
+            &serde_json::json!({
+                "hotels": {
+                    "default": {
+                        "telegram": {
+                            "bot_token": "fallback-token",
+                            "allowed_users": ["shared-bot"]
+                        }
+                    }
+                }
+            }),
+            Some("beta-hotel"),
+        );
+
+        assert!(entries.iter().any(|(key, value)| {
+            key == "telegram_bot_token" && value.as_str() == Some("fallback-token")
+        }));
+        assert!(entries.iter().any(|(key, value)| {
+            key == "telegram_allowed_users"
+                && value
+                    .as_array()
+                    .is_some_and(|arr| arr.len() == 1 && arr[0] == "shared-bot")
         }));
     }
 
