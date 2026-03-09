@@ -113,7 +113,7 @@
 - [x] Extend the startup Telegram smoke so it simulates text, photo, and voice-note ingress and exercises fake-Gemini multimodal requests on top of blob-backed media transport.
 - [x] Prove watched-live Telegram text/photo/voice/document delivery through hegemon -> agent-core -> Gemini and normalize markdown-ish document MIME for Gemini media analysis.
 - [x] Make materialized Telegram/agent guests configurable enough for separate hotel/persona stacks (for example Jane vs Aria) instead of hardcoding one Jane-shaped membrane.
-- [ ] Seed `telegram_bot_token_aria` and run the first watched-live Aria hotel Telegram poller on its own bot token.
+- [ ] Seed `hotels.aria-architect-hotel.context_graph.telegram_bot_token` in `mesh-config.json` and run the first watched-live Aria hotel Telegram poller on its own bot token.
 - [ ] Make agent-level media routing policy configurable so text/media/voice decisions are owned by the agent/session profile instead of one hardcoded runtime branch.
 - [ ] Investigate splitting voice-note transcription/understanding toward ElevenLabs or another speech-specialized provider while keeping richer text reasoning in the agent/model loop.
 - [ ] Define hotel CLI OAuth UX:
