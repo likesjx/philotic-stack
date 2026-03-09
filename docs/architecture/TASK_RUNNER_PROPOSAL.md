@@ -174,6 +174,25 @@ They should route through a preassembled execution envelope that already identif
 
 Even if one binary implements both, they should be treated as different capability families.
 
+Recommended split:
+
+- first split by execution surface:
+  - `workspace`
+  - `shell`
+- then split by trust/policy profile within each family
+- do not split by agent identity unless hard isolation is actually required
+
+That gives us a sane progression:
+
+1. one workspace family
+2. one shell family
+3. multiple incarnations or policy profiles per family as needed
+
+This avoids two common mistakes:
+
+- one giant runner that does everything badly
+- one runner per agent, which looks tidy until operational life begins
+
 ### Workspace Family
 
 - `workspace.list`
@@ -204,6 +223,63 @@ Policy focus:
 
 This split matters because “list files” and “run shell commands” should not share the same trust posture just because both happen on a laptop.
 
+## Recommended Family Split
+
+### Workspace Runner
+
+Purpose:
+
+- operate on files rooted in a specific workspace or mount
+
+Core tools:
+
+- `workspace.list`
+- `workspace.read`
+- `workspace.search`
+- `workspace.write`
+
+Optional future tools:
+
+- `workspace.stat`
+- `workspace.move`
+- `workspace.delete`
+- `workspace.patch`
+
+Recommended profiles:
+
+- `workspace.readonly`
+- `workspace.edit`
+- `workspace.artifacts`
+
+### Shell Runner
+
+Purpose:
+
+- execute commands in a specific working environment
+
+Core tools:
+
+- `shell.exec`
+
+Optional future tools:
+
+- `shell.background`
+- `shell.stream`
+- `shell.cancel`
+
+Recommended profiles:
+
+- `shell.readonly_inspect`
+- `shell.dev_exec`
+- `shell.privileged`
+
+The important distinction is:
+
+- workspace runners are primarily about files and path-scoped resources
+- shell runners are about process execution and command policy
+
+They may share an implementation binary later, but they should not share a default trust model.
+
 ## Configuration Model
 
 ### Runner Base Config
@@ -223,6 +299,26 @@ Properties:
 - `command_policy`
 - `availability_state`
 
+Recommended v1 additions:
+
+- `family`
+  - `workspace`
+  - `shell`
+- `profile`
+  - `readonly`
+  - `edit`
+  - `dev_exec`
+  - etc.
+- `allowed_tools`
+- `materialization_mode`
+  - `always_on`
+  - `on_demand`
+  - `manual_only`
+- `idle_policy`
+  - `keep_warm`
+  - `sleep_after`
+  - `terminate_after`
+
 ### Agent/Session Overlay
 
 Properties:
@@ -233,6 +329,74 @@ Properties:
 - `preferred_environment_id`
 - `workspace_override`
 - `policy_override`
+
+Recommended v1 additions:
+
+- `allowed_tools`
+- `approval_profile`
+- `max_read_bytes`
+- `max_search_results`
+- `allowed_commands`
+- `denied_commands`
+- `working_directory_override`
+- `environment_variable_whitelist`
+
+The overlay should narrow and tune. It should not silently widen a runner past its base policy.
+
+## Minimal Config Shape (V1)
+
+```toml
+[[task_runners]]
+runner_id = "task-runner-workspace-01"
+incarnation_id = "task-runner-workspace-01"
+family = "workspace"
+profile = "readonly"
+hotel_id = "local-ansible-01"
+environment_id = "workspace://main"
+workspace_root = "/srv/philotic/workspaces/main"
+allowed_tools = ["workspace.list", "workspace.read", "workspace.search"]
+materialization_mode = "on_demand"
+idle_policy = "sleep_after"
+availability_state = "materializable"
+
+[task_runners.filesystem_policy]
+allow_absolute_paths = false
+allow_parent_traversal = false
+max_read_bytes = 262144
+max_search_results = 50
+
+[[task_runner_overlays]]
+agent_id = "agent-jane-01"
+session_id = "telegram:123:agent-jane-01"
+incarnation_id = "task-runner-workspace-01"
+workspace_override = "workspace://main"
+allowed_tools = ["workspace.list", "workspace.read", "workspace.search"]
+approval_profile = "workspace_readonly"
+max_search_results = 25
+```
+
+For shell:
+
+```toml
+[[task_runners]]
+runner_id = "task-runner-shell-dev-01"
+incarnation_id = "task-runner-shell-dev-01"
+family = "shell"
+profile = "dev_exec"
+hotel_id = "local-ansible-01"
+environment_id = "env://devbox"
+workspace_root = "/srv/philotic/workspaces/main"
+allowed_tools = ["shell.exec"]
+materialization_mode = "manual_only"
+idle_policy = "terminate_after"
+availability_state = "dormant"
+
+[task_runners.command_policy]
+allowed_commands = ["ls", "rg", "cat", "git status"]
+denied_commands = ["rm", "sudo", "shutdown"]
+default_timeout_seconds = 15
+max_output_bytes = 65536
+```
 
 ## Unavailable Incarnation / Unreachable Hotel
 
