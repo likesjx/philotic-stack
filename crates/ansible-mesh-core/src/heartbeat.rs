@@ -1,3 +1,4 @@
+use crate::registry::CapabilityAdvertisement;
 use crate::{BeaconMessage, MsgType, NodeCapabilities};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -8,6 +9,8 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatPayload {
     pub capabilities: NodeCapabilities,
+    #[serde(default)]
+    pub advertisements: Vec<CapabilityAdvertisement>,
 }
 
 /// Emits heartbeat messages over the given UDP socket to a target address.
@@ -15,9 +18,11 @@ pub async fn emit_heartbeat(
     socket: &UdpSocket,
     target: SocketAddr,
     capabilities: &NodeCapabilities,
+    advertisements: &[CapabilityAdvertisement],
 ) -> Result<()> {
     let payload = HeartbeatPayload {
         capabilities: capabilities.clone(),
+        advertisements: advertisements.to_vec(),
     };
 
     let msg = BeaconMessage {
@@ -37,4 +42,48 @@ pub async fn emit_heartbeat(
     socket.send_to(&data, target).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{NodeCapabilities, NodeConstraints, NodeRole};
+
+    #[test]
+    fn heartbeat_payload_round_trips_with_advertisements() {
+        let payload = HeartbeatPayload {
+            capabilities: NodeCapabilities {
+                node_id: "aria-node".into(),
+                roles: vec![NodeRole::AnsibleNode],
+                models: vec![],
+                tools: vec![],
+                constraints: NodeConstraints {
+                    max_concurrent_jobs: Some(4),
+                    latency_hint_ms: Some(12),
+                    trust_level: None,
+                },
+            },
+            advertisements: vec![CapabilityAdvertisement {
+                hotel_id: "aria-architect-hotel".into(),
+                node_id: "aria-node".into(),
+                incarnation_id: "aria-architect-hotel:model-controller-gemini".into(),
+                target_role: "model.gemini".into(),
+                availability_state: "live".into(),
+                selection_hint: Some("remote_fallback".into()),
+                latency_hint_ms: Some(12),
+                max_concurrent_jobs: Some(4),
+                active_jobs: 1,
+                queue_depth: 0,
+            }],
+        };
+
+        let encoded = serde_json::to_vec(&payload).expect("payload should encode");
+        let decoded: HeartbeatPayload =
+            serde_json::from_slice(&encoded).expect("payload should decode");
+        assert_eq!(decoded.advertisements.len(), 1);
+        assert_eq!(
+            decoded.advertisements[0].incarnation_id,
+            "aria-architect-hotel:model-controller-gemini"
+        );
+    }
 }

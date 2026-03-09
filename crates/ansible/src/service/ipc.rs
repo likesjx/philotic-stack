@@ -1,6 +1,7 @@
 use crate::LedgerCommand;
 use crate::vault::{SecretAccess, resolve_secret};
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
+use ansible_mesh_core::registry::{CapabilityAdvertisement, NodeRegistry};
 use ansible_mesh_core::storage::{
     GraphStorage, SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,
 };
@@ -10,14 +11,14 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-type InboxRegistry = Arc<Mutex<HashMap<String, Vec<RoleSubscriber>>>>;
+pub(crate) type InboxRegistry = Arc<Mutex<HashMap<String, Vec<RoleSubscriber>>>>;
 
 #[derive(Clone)]
-struct RoleSubscriber {
+pub(crate) struct RoleSubscriber {
     conn_id: Uuid,
     guest_id: String,
     supported_tools: Vec<String>,
@@ -66,9 +67,11 @@ struct RoutingPreferences {
 
 pub struct IpcServer {
     socket_path: String,
+    local_node_id: String,
     dispatcher_tx: mpsc::Sender<LedgerCommand>,
     graph: Arc<dyn GraphStorage>,
     inboxes: InboxRegistry,
+    registry: Arc<RwLock<NodeRegistry>>,
 }
 
 impl IpcServer {
@@ -101,15 +104,27 @@ impl IpcServer {
 
     pub fn new(
         socket_path: impl Into<String>,
+        local_node_id: impl Into<String>,
         dispatcher_tx: mpsc::Sender<LedgerCommand>,
         graph: Arc<dyn GraphStorage>,
     ) -> Self {
         Self {
             socket_path: socket_path.into(),
+            local_node_id: local_node_id.into(),
             dispatcher_tx,
             graph,
             inboxes: Arc::new(Mutex::new(HashMap::new())),
+            registry: Arc::new(RwLock::new(NodeRegistry::new())),
         }
+    }
+
+    pub fn with_registry(mut self, registry: Arc<RwLock<NodeRegistry>>) -> Self {
+        self.registry = registry;
+        self
+    }
+
+    pub(crate) fn inboxes(&self) -> InboxRegistry {
+        self.inboxes.clone()
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
@@ -126,11 +141,20 @@ impl IpcServer {
             match listener.accept().await {
                 Ok((stream, _)) => {
                     let dispatcher = self.dispatcher_tx.clone();
+                    let local_node_id = self.local_node_id.clone();
                     let graph = self.graph.clone();
                     let inboxes = self.inboxes.clone();
+                    let registry = self.registry.clone();
                     tokio::spawn(async move {
-                        if let Err(e) =
-                            Self::handle_client(stream, dispatcher, graph, inboxes).await
+                        if let Err(e) = Self::handle_client(
+                            stream,
+                            local_node_id,
+                            dispatcher,
+                            graph,
+                            inboxes,
+                            registry,
+                        )
+                        .await
                         {
                             error!("IPC client connection error: {}", e);
                         }
@@ -145,9 +169,11 @@ impl IpcServer {
 
     async fn handle_client(
         stream: UnixStream,
+        local_node_id: String,
         dispatcher_tx: mpsc::Sender<LedgerCommand>,
         graph: Arc<dyn GraphStorage>,
         inboxes: InboxRegistry,
+        registry: Arc<RwLock<NodeRegistry>>,
     ) -> anyhow::Result<()> {
         let conn_id = Uuid::new_v4();
         let (mut reader, mut writer) = stream.into_split();
@@ -181,9 +207,11 @@ impl IpcServer {
                     Ok(req) => {
                         let response = Self::process_request(
                             req,
+                            &local_node_id,
                             &dispatcher_tx,
                             graph.as_ref(),
                             &inboxes,
+                            &registry,
                             conn_id,
                             &outbound_tx,
                             &mut subscribed_roles,
@@ -248,8 +276,9 @@ impl IpcServer {
         guard.retain(|_, subscribers| !subscribers.is_empty());
     }
 
-    async fn deliver_inbound_task(
+    pub(crate) async fn deliver_inbound_task(
         inboxes: &InboxRegistry,
+        source_node: &str,
         target_role: &str,
         target_guest_id: Option<&str>,
         task_id: Uuid,
@@ -282,7 +311,7 @@ impl IpcServer {
         }
 
         let response = IpcResponse::InboundTask {
-            source_node: "local-ansible-01".into(),
+            source_node: source_node.to_string(),
             task_id,
             task_json,
         };
@@ -302,11 +331,38 @@ impl IpcServer {
         }
     }
 
+    pub(crate) async fn deliver_event_envelope(
+        inboxes: &InboxRegistry,
+        event: &EventEnvelope,
+    ) -> bool {
+        match (&event.kind, &event.target_agent_id, &event.payload) {
+            (
+                EventKind::TaskInvoke | EventKind::TaskResult,
+                Some(target_role),
+                EventPayload::Inline { data },
+            ) => {
+                Self::deliver_inbound_task(
+                    inboxes,
+                    &event.source_node_id,
+                    target_role,
+                    None,
+                    event.event_id,
+                    data.clone(),
+                )
+                .await;
+                true
+            }
+            _ => false,
+        }
+    }
+
     async fn process_request(
         req: IpcRequest,
+        local_node_id: &str,
         dispatcher_tx: &mpsc::Sender<LedgerCommand>,
         graph: &dyn GraphStorage,
         inboxes: &InboxRegistry,
+        registry: &Arc<RwLock<NodeRegistry>>,
         conn_id: Uuid,
         outbound_tx: &mpsc::UnboundedSender<IpcResponse>,
         subscribed_roles: &mut Vec<String>,
@@ -338,8 +394,23 @@ impl IpcServer {
             }
             IpcRequest::GetConfig { key } => {
                 info!("GetConfig requested: {}", key);
+                if key == "__mesh_registry__" {
+                    let snapshot = Self::compose_mesh_registry_snapshot(registry).await;
+                    return IpcResponse::ConfigData {
+                        key,
+                        value_json: Some(snapshot.to_string()),
+                    };
+                }
                 if let Some(session_id) = key.strip_prefix("__session_snapshot__:") {
-                    match Self::compose_session_snapshot(graph, inboxes, session_id).await {
+                    match Self::compose_session_snapshot(
+                        graph,
+                        inboxes,
+                        registry,
+                        local_node_id,
+                        session_id,
+                    )
+                    .await
+                    {
                         Ok(value) => {
                             return IpcResponse::ConfigData {
                                 key,
@@ -422,7 +493,8 @@ impl IpcServer {
                 let env = EventEnvelope {
                     event_id: task_id,
                     seq: 0, // Set by the sequence manager in PORT-BP-003
-                    source_node_id: "local-ansible-01".into(),
+                    source_node_id: local_node_id.to_string(),
+                    target_node_id: Some(local_node_id.to_string()),
                     source_agent_id: "unknown".into(), // Will be pulled from connection context
                     target_agent_id: Some(target_role.clone()),
                     kind: EventKind::TaskInvoke,
@@ -436,8 +508,15 @@ impl IpcServer {
                     trace: vec![],
                 };
                 let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(env)).await;
-                Self::deliver_inbound_task(inboxes, &target_role, None, task_id, payload_json)
-                    .await;
+                Self::deliver_inbound_task(
+                    inboxes,
+                    local_node_id,
+                    &target_role,
+                    None,
+                    task_id,
+                    payload_json,
+                )
+                .await;
                 IpcResponse::success("pub", None)
             }
             IpcRequest::CreateTask {
@@ -458,7 +537,8 @@ impl IpcServer {
                 let env = EventEnvelope {
                     event_id: task_id,
                     seq: 0,
-                    source_node_id: "local-ansible-01".into(),
+                    source_node_id: local_node_id.to_string(),
+                    target_node_id: Some(local_node_id.to_string()),
                     source_agent_id: "unknown".into(),
                     target_agent_id: Some(target_role.clone()),
                     kind: EventKind::TaskInvoke,
@@ -472,8 +552,15 @@ impl IpcServer {
                     trace: vec![],
                 };
                 let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(env)).await;
-                Self::deliver_inbound_task(inboxes, &target_role, None, task_id, payload_json)
-                    .await;
+                Self::deliver_inbound_task(
+                    inboxes,
+                    local_node_id,
+                    &target_role,
+                    None,
+                    task_id,
+                    payload_json,
+                )
+                .await;
                 IpcResponse::success(
                     "create",
                     Some(serde_json::json!({ "task_id": task_id.to_string() })),
@@ -500,7 +587,8 @@ impl IpcServer {
                 let env = EventEnvelope {
                     event_id: Uuid::new_v4(),
                     seq: 0,
-                    source_node_id: "local-ansible-01".into(),
+                    source_node_id: local_node_id.to_string(),
+                    target_node_id: Some(local_node_id.to_string()),
                     source_agent_id: "unknown".into(),
                     target_agent_id: None,
                     kind: EventKind::TaskInvoke, // Or potentially a new TaskUpdate kind if required
@@ -529,7 +617,8 @@ impl IpcServer {
                 let env = EventEnvelope {
                     event_id: Uuid::new_v4(),
                     seq: 0,
-                    source_node_id: "local-ansible-01".into(),
+                    source_node_id: local_node_id.to_string(),
+                    target_node_id: Some(local_node_id.to_string()),
                     source_agent_id: "unknown".into(),
                     target_agent_id: None,
                     kind: EventKind::TaskResult,
@@ -565,7 +654,8 @@ impl IpcServer {
                 let env = EventEnvelope {
                     event_id: Uuid::new_v4(),
                     seq: 0,
-                    source_node_id: "local-ansible-01".into(),
+                    source_node_id: local_node_id.to_string(),
+                    target_node_id: Some(local_node_id.to_string()),
                     source_agent_id: "unknown".into(),
                     target_agent_id: None,
                     kind: EventKind::TaskResult,
@@ -654,7 +744,8 @@ impl IpcServer {
                 let env = EventEnvelope {
                     event_id: task_id,
                     seq: 0,
-                    source_node_id: "local-ansible-01".into(),
+                    source_node_id: local_node_id.to_string(),
+                    target_node_id: Some(target_node.clone()),
                     source_agent_id: "unknown".into(),
                     target_agent_id: Some(target_role.clone()),
                     kind: EventKind::TaskInvoke,
@@ -668,14 +759,17 @@ impl IpcServer {
                     trace: vec![],
                 };
                 let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(env)).await;
-                Self::deliver_inbound_task(
-                    inboxes,
-                    &target_role,
-                    target_guest_id.as_deref(),
-                    task_id,
-                    task_json,
-                )
-                .await;
+                if target_node == local_node_id {
+                    Self::deliver_inbound_task(
+                        inboxes,
+                        local_node_id,
+                        &target_role,
+                        target_guest_id.as_deref(),
+                        task_id,
+                        task_json,
+                    )
+                    .await;
+                }
                 IpcResponse::success("emit", None)
             }
         }
@@ -810,7 +904,8 @@ impl IpcServer {
             }
             summary_json["bindings"] = bindings.clone();
             if payload.get("tool_assembly").is_none() {
-                summary_json["tool_assembly"] = compose_tool_assembly(bindings, &[], &[]);
+                summary_json["tool_assembly"] =
+                    compose_tool_assembly(bindings, &[], &[], &[], "local-ansible-01");
             }
             session.summary_json = summary_json;
         }
@@ -1001,7 +1096,7 @@ impl IpcServer {
         if let Some(tool_assembly) = payload.get("tool_assembly").cloned().or_else(|| {
             payload
                 .get("bindings")
-                .map(|bindings| compose_tool_assembly(bindings, &[], &[]))
+                .map(|bindings| compose_tool_assembly(bindings, &[], &[], &[], "local-ansible-01"))
         }) {
             let _ = graph.append_session_event(&SessionEventRecord {
                 event_id: Uuid::new_v4().to_string(),
@@ -1057,6 +1152,8 @@ impl IpcServer {
     async fn compose_session_snapshot(
         graph: &dyn GraphStorage,
         inboxes: &InboxRegistry,
+        registry: &Arc<RwLock<NodeRegistry>>,
+        local_node_id: &str,
         session_id: &str,
     ) -> anyhow::Result<Option<serde_json::Value>> {
         let Some(session) = graph.get_session(session_id)? else {
@@ -1111,8 +1208,28 @@ impl IpcServer {
             .unwrap_or_else(|| serde_json::json!({}));
         let registered_runners = load_tool_runner_registry(graph)?;
         let tool_runners = live_tool_runners(inboxes).await;
-        let tool_assembly = compose_tool_assembly(&bindings, &registered_runners, &tool_runners);
+        let live_model_subscribers = live_role_subscribers(inboxes, "model.").await;
+        let (remote_tool_ads, component_route_assembly) = {
+            let guard = registry.read().await;
+            (
+                remote_tool_advertisements(&guard, local_node_id),
+                compose_component_route_assembly(
+                    &bindings,
+                    &live_model_subscribers,
+                    &guard,
+                    local_node_id,
+                ),
+            )
+        };
+        let tool_assembly = compose_tool_assembly(
+            &bindings,
+            &registered_runners,
+            &tool_runners,
+            &remote_tool_ads,
+            local_node_id,
+        );
         let tool_runner_registry = merge_tool_runners(&registered_runners, &tool_runners);
+        let mesh_registry = Self::compose_mesh_registry_snapshot(registry).await;
 
         Ok(Some(serde_json::json!({
             "session_id": session.session_id,
@@ -1127,12 +1244,33 @@ impl IpcServer {
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({})),
             "bindings": bindings,
+            "component_route_assembly": component_route_assembly,
             "tool_assembly": tool_assembly,
             "tool_runners": tool_runner_registry,
+            "mesh_registry": mesh_registry,
             "recent_turns": recent_turns,
             "active_turn": active_turn,
             "session_index": session_index,
         })))
+    }
+
+    async fn compose_mesh_registry_snapshot(
+        registry: &Arc<RwLock<NodeRegistry>>,
+    ) -> serde_json::Value {
+        let guard = registry.read().await;
+        let nodes = guard
+            .active_nodes()
+            .map(|status| {
+                serde_json::json!({
+                    "node_id": status.capabilities.node_id,
+                    "roles": status.capabilities.roles,
+                    "models": status.capabilities.models,
+                    "tools": status.capabilities.tools,
+                    "advertisements": status.advertisements,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({ "nodes": nodes })
     }
 }
 
@@ -1140,6 +1278,12 @@ impl IpcServer {
 struct LiveToolRunner {
     guest_id: String,
     supported_tools: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct LiveRoleSubscriberView {
+    guest_id: String,
+    role: String,
 }
 
 async fn live_tool_runners(inboxes: &InboxRegistry) -> Vec<LiveToolRunner> {
@@ -1161,6 +1305,30 @@ async fn live_tool_runners(inboxes: &InboxRegistry) -> Vec<LiveToolRunner> {
     }
 
     runners
+}
+
+async fn live_role_subscribers(
+    inboxes: &InboxRegistry,
+    role_prefix: &str,
+) -> Vec<LiveRoleSubscriberView> {
+    let guard = inboxes.lock().await;
+    let mut subscribers = guard
+        .iter()
+        .filter(|(role, _)| role.starts_with(role_prefix))
+        .flat_map(|(role, entries)| {
+            entries.iter().map(|entry| LiveRoleSubscriberView {
+                guest_id: entry.guest_id.clone(),
+                role: role.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    subscribers.sort_by(|left, right| {
+        left.role
+            .cmp(&right.role)
+            .then_with(|| left.guest_id.cmp(&right.guest_id))
+    });
+    subscribers.dedup_by(|left, right| left.role == right.role && left.guest_id == right.guest_id);
+    subscribers
 }
 
 fn load_tool_runner_registry(
@@ -1221,10 +1389,245 @@ fn merge_tool_runners(
     serde_json::Value::Array(merged)
 }
 
+fn compose_component_route_assembly(
+    bindings: &serde_json::Value,
+    local_subscribers: &[LiveRoleSubscriberView],
+    registry: &NodeRegistry,
+    local_node_id: &str,
+) -> serde_json::Value {
+    let execution_routes = default_component_capabilities(bindings)
+        .into_iter()
+        .filter_map(|capability| {
+            select_component_route(
+                bindings,
+                &capability,
+                local_subscribers,
+                registry,
+                local_node_id,
+            )
+            .map(|route| (capability, route))
+        })
+        .collect::<serde_json::Map<_, _>>();
+
+    serde_json::json!({
+        "execution_routes": execution_routes,
+    })
+}
+
+fn default_component_capabilities(bindings: &serde_json::Value) -> Vec<String> {
+    let mut capabilities = std::collections::BTreeSet::from([
+        "text.generate".to_string(),
+        "media.analyze".to_string(),
+    ]);
+
+    for route in bindings
+        .get("component_routes")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(capability) = route.get("capability").and_then(serde_json::Value::as_str) {
+            capabilities.insert(capability.to_string());
+        }
+    }
+
+    capabilities.into_iter().collect()
+}
+
+fn select_component_route(
+    bindings: &serde_json::Value,
+    capability: &str,
+    local_subscribers: &[LiveRoleSubscriberView],
+    registry: &NodeRegistry,
+    local_node_id: &str,
+) -> Option<serde_json::Value> {
+    let binding = bindings
+        .get("component_routes")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|routes| {
+            routes.iter().find(|route| {
+                route.get("capability").and_then(serde_json::Value::as_str) == Some(capability)
+            })
+        });
+    let preferred_hotel_id = binding
+        .and_then(|route| route.get("preferred_hotel_id"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            bindings
+                .get("preferred_hotel_id")
+                .and_then(serde_json::Value::as_str)
+        });
+    let preferred_environment_id = binding
+        .and_then(|route| route.get("preferred_environment_id"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            bindings
+                .get("preferred_environment_id")
+                .and_then(serde_json::Value::as_str)
+        });
+    let target_role = binding
+        .and_then(|route| route.get("implementation"))
+        .and_then(serde_json::Value::as_str)
+        .map(component_implementation_to_role)
+        .or_else(|| {
+            if capability == "text.generate" || capability == "media.analyze" {
+                bindings
+                    .get("effective_model_controller")
+                    .and_then(serde_json::Value::as_str)
+                    .map(component_implementation_to_role)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| default_component_role(capability).to_string());
+
+    if let Some(incarnation_id) = binding
+        .and_then(|route| route.get("incarnation"))
+        .and_then(serde_json::Value::as_str)
+    {
+        if let Some(local) = local_subscribers.iter().find(|subscriber| {
+            subscriber.role == target_role && subscriber.guest_id == incarnation_id
+        }) {
+            return Some(serde_json::json!({
+                "target_node": local_node_id,
+                "target_role": local.role,
+                "incarnation_id": local.guest_id,
+                "hotel_id": local_node_id,
+                "environment_id": preferred_environment_id,
+                "execution_mode": "preferred",
+                "availability_state": "live",
+                "selection_reason": "preferred_incarnation_live",
+            }));
+        }
+
+        if let Some(remote) = registry
+            .advertisements_for_role(&target_role)
+            .filter(|advertisement| {
+                advertisement.node_id != local_node_id
+                    && advertisement.availability_state == "live"
+                    && advertisement.incarnation_id == incarnation_id
+            })
+            .next()
+        {
+            return Some(serde_json::json!({
+                "target_node": remote.node_id,
+                "target_role": remote.target_role,
+                "incarnation_id": remote.incarnation_id,
+                "hotel_id": remote.hotel_id,
+                "environment_id": preferred_environment_id,
+                "execution_mode": "preferred",
+                "availability_state": remote.availability_state,
+                "selection_reason": "preferred_incarnation_live",
+            }));
+        }
+    }
+
+    if let Some(local) = local_subscribers
+        .iter()
+        .find(|subscriber| subscriber.role == target_role)
+    {
+        return Some(serde_json::json!({
+            "target_node": local_node_id,
+            "target_role": local.role,
+            "incarnation_id": local.guest_id,
+            "hotel_id": local_node_id,
+            "environment_id": preferred_environment_id,
+            "execution_mode": "capability",
+            "availability_state": "live",
+            "selection_reason": if binding.is_some() {
+                "live_local_capability"
+            } else {
+                "live_local_fallback"
+            },
+        }));
+    }
+
+    if let Some(remote) = select_remote_component_advertisement(
+        registry,
+        &target_role,
+        preferred_hotel_id,
+        local_node_id,
+    ) {
+        return Some(serde_json::json!({
+            "target_node": remote.node_id,
+            "target_role": remote.target_role,
+            "incarnation_id": remote.incarnation_id,
+            "hotel_id": remote.hotel_id,
+            "environment_id": preferred_environment_id,
+            "execution_mode": "capability",
+            "availability_state": remote.availability_state,
+            "selection_reason": remote.selection_hint.unwrap_or_else(|| "remote_latency_capacity".into()),
+        }));
+    }
+
+    Some(serde_json::json!({
+        "target_node": local_node_id,
+        "target_role": target_role,
+        "incarnation_id": serde_json::Value::Null,
+        "hotel_id": local_node_id,
+        "environment_id": preferred_environment_id,
+        "execution_mode": "capability",
+        "availability_state": "materialization_required",
+        "selection_reason": "local_requires_materialization",
+    }))
+}
+
+fn component_implementation_to_role(implementation: &str) -> String {
+    let normalized = implementation.trim().to_ascii_lowercase();
+    if normalized.starts_with("model.") {
+        return normalized;
+    }
+    let prefix = normalized
+        .split(['.', '-', '@', '/'])
+        .find(|segment| !segment.is_empty())
+        .unwrap_or("gemini");
+    format!("model.{prefix}")
+}
+
+fn default_component_role(capability: &str) -> &'static str {
+    match capability {
+        "voice.synthesize" => "model.elevenlabs",
+        _ => "model.gemini",
+    }
+}
+
+fn select_remote_component_advertisement(
+    registry: &NodeRegistry,
+    target_role: &str,
+    preferred_hotel_id: Option<&str>,
+    local_node_id: &str,
+) -> Option<CapabilityAdvertisement> {
+    let mut candidates = registry
+        .advertisements_for_role(target_role)
+        .filter(|advertisement| {
+            advertisement.node_id != local_node_id && advertisement.availability_state == "live"
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    candidates.sort_by(|left, right| {
+        let left_pref = preferred_hotel_id == Some(left.hotel_id.as_str());
+        let right_pref = preferred_hotel_id == Some(right.hotel_id.as_str());
+        right_pref
+            .cmp(&left_pref)
+            .then_with(|| {
+                left.latency_hint_ms
+                    .unwrap_or(u32::MAX)
+                    .cmp(&right.latency_hint_ms.unwrap_or(u32::MAX))
+            })
+            .then_with(|| remote_available_capacity(right).cmp(&remote_available_capacity(left)))
+            .then_with(|| left.incarnation_id.cmp(&right.incarnation_id))
+    });
+
+    candidates.into_iter().next()
+}
+
 fn compose_tool_assembly(
     bindings: &serde_json::Value,
     registered_runners: &[ToolRunnerRegistryEntry],
     live_runners: &[LiveToolRunner],
+    remote_tool_ads: &[CapabilityAdvertisement],
+    local_node_id: &str,
 ) -> serde_json::Value {
     let allowed_incarnations =
         parse_allowed_incarnations(bindings, registered_runners, live_runners);
@@ -1278,7 +1681,7 @@ fn compose_tool_assembly(
                         .supported_tools
                         .iter()
                         .any(|supported| supported == tool_name)
-            })?;
+            });
             let live_runner = live_runners.iter().find(|runner| {
                 runner.supported_tools.is_empty()
                     || runner
@@ -1286,10 +1689,30 @@ fn compose_tool_assembly(
                         .iter()
                         .any(|supported| supported == tool_name)
             });
+            if registered.is_none() && live_runner.is_none() {
+                let remote = select_remote_tool_advertisement(remote_tool_ads, tool_name, bindings)?;
+                return Some((
+                    tool_name.to_string(),
+                    serde_json::json!({
+                        "target_node": remote.node_id,
+                        "target_role": remote.target_role,
+                        "runner_id": remote.incarnation_id,
+                        "incarnation_id": remote.incarnation_id,
+                        "hotel_id": remote.hotel_id,
+                        "environment_id": serde_json::Value::Null,
+                        "task_runner_kind": task_runner_kind_for_tool(tool_name),
+                        "task_runner_config": task_runner_base_config_for_tool(bindings, tool_name),
+                        "execution_mode": "capability",
+                        "availability_state": remote.availability_state,
+                        "selection_reason": remote.selection_hint.unwrap_or_else(|| "remote_latency_capacity".into()),
+                    }),
+                ));
+            }
+            let registered = registered?;
             Some((
                 tool_name.to_string(),
                 serde_json::json!({
-                    "target_node": "local-ansible-01",
+                    "target_node": local_node_id,
                     "target_role": format!("tool.{}", tool_name),
                     "runner_id": live_runner
                         .map(|runner| runner.guest_id.clone())
@@ -1297,7 +1720,7 @@ fn compose_tool_assembly(
                     "incarnation_id": live_runner
                         .map(|runner| runner.guest_id.clone())
                         .unwrap_or_else(|| registered.guest_id.clone()),
-                    "hotel_id": "local-ansible-01",
+                    "hotel_id": local_node_id,
                     "environment_id": serde_json::Value::Null,
                     "task_runner_kind": task_runner_kind_for_tool(tool_name),
                     "task_runner_config": task_runner_base_config_for_tool(bindings, tool_name),
@@ -1362,6 +1785,58 @@ fn default_visible_toolset(bindings: &serde_json::Value) -> Vec<String> {
         toolset.push("echo".into());
     }
     toolset
+}
+
+fn remote_tool_advertisements(
+    registry: &NodeRegistry,
+    local_node_id: &str,
+) -> Vec<CapabilityAdvertisement> {
+    registry
+        .active_nodes()
+        .filter(|status| status.capabilities.node_id != local_node_id)
+        .flat_map(|status| status.advertisements.iter().cloned())
+        .filter(|advertisement| advertisement.target_role.starts_with("tool."))
+        .collect()
+}
+
+fn select_remote_tool_advertisement(
+    remote_tool_ads: &[CapabilityAdvertisement],
+    tool_name: &str,
+    bindings: &serde_json::Value,
+) -> Option<CapabilityAdvertisement> {
+    let target_role = format!("tool.{tool_name}");
+    let preferred_hotel_id = bindings
+        .get("preferred_hotel_id")
+        .and_then(serde_json::Value::as_str);
+    let mut candidates = remote_tool_ads
+        .iter()
+        .filter(|advertisement| {
+            advertisement.target_role == target_role && advertisement.availability_state == "live"
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    candidates.sort_by(|left, right| {
+        let left_pref = preferred_hotel_id == Some(left.hotel_id.as_str());
+        let right_pref = preferred_hotel_id == Some(right.hotel_id.as_str());
+        right_pref
+            .cmp(&left_pref)
+            .then_with(|| {
+                left.latency_hint_ms
+                    .unwrap_or(u32::MAX)
+                    .cmp(&right.latency_hint_ms.unwrap_or(u32::MAX))
+            })
+            .then_with(|| remote_available_capacity(right).cmp(&remote_available_capacity(left)))
+            .then_with(|| left.incarnation_id.cmp(&right.incarnation_id))
+    });
+
+    candidates.into_iter().next()
+}
+
+fn remote_available_capacity(advertisement: &CapabilityAdvertisement) -> i64 {
+    i64::from(advertisement.max_concurrent_jobs.unwrap_or(0))
+        - i64::from(advertisement.active_jobs)
+        - i64::from(advertisement.queue_depth)
 }
 
 fn is_local_agent_tool(tool_name: &str) -> bool {
@@ -1725,6 +2200,7 @@ mod tests {
     use super::*;
     use crate::vault::{SecretInput, store_secret};
     use ansible_mesh_core::NodeCapabilities;
+    use ansible_mesh_core::registry::{CapabilityAdvertisement, NodeRegistry};
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
     use ansible_mesh_core::storage::{
         AgentIdentityRecord, GuestRecord, HotelRecord, SecretRecord, SessionEventRecord,
@@ -1759,6 +2235,9 @@ mod tests {
         }
         fn get_hotel(&self, _hotel_name: &str) -> anyhow::Result<Option<HotelRecord>> {
             Ok(None)
+        }
+        fn list_hotels(&self) -> anyhow::Result<Vec<HotelRecord>> {
+            Ok(vec![])
         }
         fn upsert_hotel(&self, _hotel: &HotelRecord) -> anyhow::Result<()> {
             Ok(())
@@ -1873,7 +2352,12 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, mut dispatcher_rx) = mpsc::channel(8);
         let graph: Arc<dyn GraphStorage> = Arc::new(TestGraphStorage);
-        let server = IpcServer::new(socket_path.clone(), dispatcher_tx, graph);
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-ansible-01",
+            dispatcher_tx,
+            graph,
+        );
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");
@@ -1943,7 +2427,13 @@ mod tests {
             .recv()
             .await
             .expect("ledger command should be emitted");
-        assert!(matches!(ledger_msg, LedgerCommand::AppendLocal(_)));
+        match ledger_msg {
+            LedgerCommand::AppendLocal(env) => {
+                assert_eq!(env.source_node_id, "local-ansible-01");
+                assert_eq!(env.target_node_id.as_deref(), Some("local-ansible-01"));
+            }
+            _ => panic!("unexpected ledger command"),
+        }
 
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
@@ -1961,7 +2451,12 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph: Arc<dyn GraphStorage> = Arc::new(TestGraphStorage);
-        let server = IpcServer::new(socket_path.clone(), dispatcher_tx, graph);
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-ansible-01",
+            dispatcher_tx,
+            graph,
+        );
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");
@@ -2048,13 +2543,179 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn emit_task_for_remote_node_stays_off_local_inbox() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, mut dispatcher_rx) = mpsc::channel(8);
+        let graph: Arc<dyn GraphStorage> = Arc::new(TestGraphStorage);
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-ansible-01",
+            dispatcher_tx,
+            graph,
+        );
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut sender = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("sender connect");
+        let mut local_agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-receiver".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("receiver connect");
+
+        sender
+            .send_request(IpcRequest::EmitTask {
+                target_node: "remote-ansible-02".into(),
+                target_role: "agent".into(),
+                target_guest_id: None,
+                task_json: serde_json::json!({"content":"remote task"}).to_string(),
+            })
+            .await
+            .expect("emit remote task");
+
+        let recv = tokio::time::timeout(
+            tokio::time::Duration::from_millis(200),
+            local_agent.recv_task(),
+        )
+        .await;
+        assert!(
+            recv.is_err(),
+            "remote-targeted task should not be delivered locally"
+        );
+
+        match dispatcher_rx.recv().await.expect("ledger command") {
+            LedgerCommand::AppendLocal(env) => {
+                assert_eq!(env.target_node_id.as_deref(), Some("remote-ansible-02"));
+                assert_eq!(env.target_agent_id.as_deref(), Some("agent"));
+            }
+            _ => panic!("unexpected ledger command"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn get_config_can_return_live_mesh_registry_snapshot() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph: Arc<dyn GraphStorage> = Arc::new(TestGraphStorage);
+        let registry = Arc::new(RwLock::new(NodeRegistry::new()));
+        registry.write().await.update_node(
+            NodeCapabilities {
+                node_id: "aria-node".into(),
+                roles: vec![ansible_mesh_core::NodeRole::AnsibleNode],
+                models: vec![],
+                tools: vec![],
+                constraints: Default::default(),
+            },
+            vec![CapabilityAdvertisement {
+                hotel_id: "aria-architect-hotel".into(),
+                node_id: "aria-node".into(),
+                incarnation_id: "aria-architect-hotel:model-controller-gemini".into(),
+                target_role: "model.gemini".into(),
+                availability_state: "live".into(),
+                selection_hint: Some("remote_fallback".into()),
+                latency_hint_ms: Some(12),
+                max_concurrent_jobs: Some(4),
+                active_jobs: 1,
+                queue_depth: 0,
+            }],
+        );
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-ansible-01",
+            dispatcher_tx,
+            graph,
+        )
+        .with_registry(registry);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("client connect");
+
+        let response = client
+            .send_request(IpcRequest::GetConfig {
+                key: "__mesh_registry__".into(),
+            })
+            .await
+            .expect("mesh registry request");
+
+        match response {
+            IpcResponse::ConfigData {
+                value_json: Some(value_json),
+                ..
+            } => {
+                let snapshot: serde_json::Value =
+                    serde_json::from_str(&value_json).expect("snapshot should decode");
+                assert_eq!(snapshot["nodes"][0]["node_id"], "aria-node");
+                assert_eq!(
+                    snapshot["nodes"][0]["advertisements"][0]["target_role"],
+                    "model.gemini"
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
     async fn get_secret_returns_vault_secret_for_authorized_guest() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
-        let server = IpcServer::new(socket_path.clone(), dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-ansible-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
 
         let vault_key = base64::engine::general_purpose::STANDARD.encode([5u8; 32]);
         unsafe {
@@ -2123,7 +2784,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
-        let server = IpcServer::new(socket_path.clone(), dispatcher_tx, graph);
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-ansible-01",
+            dispatcher_tx,
+            graph,
+        );
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");
@@ -2195,7 +2861,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
-        let server = IpcServer::new(socket_path.clone(), dispatcher_tx, graph);
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-ansible-01",
+            dispatcher_tx,
+            graph,
+        );
 
         graph_store
             .upsert_agent_identity(&AgentIdentityRecord {
@@ -2299,7 +2970,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
-        let server = IpcServer::new(socket_path.clone(), dispatcher_tx, graph);
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-ansible-01",
+            dispatcher_tx,
+            graph,
+        );
 
         graph_store
             .upsert_session(&SessionRecord {
@@ -2374,7 +3050,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
-        let server = IpcServer::new(socket_path.clone(), dispatcher_tx, graph);
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-ansible-01",
+            dispatcher_tx,
+            graph,
+        );
 
         graph_store
             .upsert_session(&SessionRecord {
@@ -2473,13 +3154,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_snapshot_can_route_model_capability_to_remote_advertisement_when_local_model_missing()
+     {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
+        let registry = Arc::new(RwLock::new(NodeRegistry::new()));
+        registry.write().await.update_node(
+            NodeCapabilities {
+                node_id: "aria-node".into(),
+                roles: vec![ansible_mesh_core::NodeRole::AnsibleNode],
+                models: vec!["gemini".into()],
+                tools: vec![],
+                constraints: Default::default(),
+            },
+            vec![CapabilityAdvertisement {
+                hotel_id: "aria-architect-hotel".into(),
+                node_id: "aria-node".into(),
+                incarnation_id: "aria-architect-hotel:model-controller-gemini".into(),
+                target_role: "model.gemini".into(),
+                availability_state: "live".into(),
+                selection_hint: Some("remote_latency_capacity".into()),
+                latency_hint_ms: Some(8),
+                max_concurrent_jobs: Some(8),
+                active_jobs: 1,
+                queue_depth: 0,
+            }],
+        );
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-ansible-01",
+            dispatcher_tx,
+            graph,
+        )
+        .with_registry(registry);
+
+        graph_store
+            .upsert_session(&SessionRecord {
+                session_id: "sess-remote-model".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("123".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "bindings": {
+                        "effective_model_controller": "gemini-flash",
+                        "preferred_hotel_id": "aria-architect-hotel"
+                    }
+                }),
+                created_at: 1,
+                updated_at: 2,
+            })
+            .expect("session should seed");
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("agent connect");
+
+        let response = agent
+            .send_request(IpcRequest::GetConfig {
+                key: "__session_snapshot__:sess-remote-model".into(),
+            })
+            .await
+            .expect("snapshot request should succeed");
+
+        match response {
+            IpcResponse::ConfigData {
+                value_json: Some(value_json),
+                ..
+            } => {
+                let snapshot: serde_json::Value =
+                    serde_json::from_str(&value_json).expect("snapshot should decode");
+                assert_eq!(
+                    snapshot["component_route_assembly"]["execution_routes"]["text.generate"]["target_node"],
+                    "aria-node"
+                );
+                assert_eq!(
+                    snapshot["component_route_assembly"]["execution_routes"]["text.generate"]["target_role"],
+                    "model.gemini"
+                );
+                assert_eq!(
+                    snapshot["component_route_assembly"]["execution_routes"]["text.generate"]["incarnation_id"],
+                    "aria-architect-hotel:model-controller-gemini"
+                );
+                assert_eq!(
+                    snapshot["component_route_assembly"]["execution_routes"]["text.generate"]["selection_reason"],
+                    "remote_latency_capacity"
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
     async fn session_snapshot_includes_workspace_runner_base_config() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
-        let server = IpcServer::new(socket_path.clone(), dispatcher_tx, graph);
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-ansible-01",
+            dispatcher_tx,
+            graph,
+        );
 
         graph_store
             .upsert_session(&SessionRecord {
@@ -2595,7 +3401,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
-        let server = IpcServer::new(socket_path.clone(), dispatcher_tx, graph);
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-ansible-01",
+            dispatcher_tx,
+            graph,
+        );
 
         graph_store
             .upsert_session(&SessionRecord {
@@ -2739,7 +3550,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
-        let server = IpcServer::new(socket_path.clone(), dispatcher_tx, graph);
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-ansible-01",
+            dispatcher_tx,
+            graph,
+        );
 
         graph_store
             .upsert_session(&SessionRecord {
@@ -2874,13 +3690,136 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_snapshot_can_route_tool_to_remote_advertisement_when_local_runner_missing() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
+        let registry = Arc::new(RwLock::new(NodeRegistry::new()));
+        registry.write().await.update_node(
+            NodeCapabilities {
+                node_id: "aria-node".into(),
+                roles: vec![ansible_mesh_core::NodeRole::AnsibleNode],
+                models: vec![],
+                tools: vec![],
+                constraints: ansible_mesh_core::NodeConstraints {
+                    max_concurrent_jobs: Some(8),
+                    latency_hint_ms: Some(10),
+                    trust_level: None,
+                },
+            },
+            vec![CapabilityAdvertisement {
+                hotel_id: "aria-architect-hotel".into(),
+                node_id: "aria-node".into(),
+                incarnation_id: "aria-architect-hotel:tool-runner-echo".into(),
+                target_role: "tool.echo".into(),
+                availability_state: "live".into(),
+                selection_hint: Some("remote_latency_capacity".into()),
+                latency_hint_ms: Some(10),
+                max_concurrent_jobs: Some(8),
+                active_jobs: 1,
+                queue_depth: 0,
+            }],
+        );
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-ansible-01",
+            dispatcher_tx,
+            graph,
+        )
+        .with_registry(registry);
+
+        graph_store
+            .upsert_session(&SessionRecord {
+                session_id: "sess-remote-tool".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("123".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "bindings": {
+                        "effective_toolset": ["echo"]
+                    }
+                }),
+                created_at: 1,
+                updated_at: 2,
+            })
+            .expect("session should seed");
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("agent connect");
+
+        let response = agent
+            .send_request(IpcRequest::GetConfig {
+                key: "__session_snapshot__:sess-remote-tool".into(),
+            })
+            .await
+            .expect("snapshot request should succeed");
+
+        match response {
+            IpcResponse::ConfigData {
+                value_json: Some(value_json),
+                ..
+            } => {
+                let snapshot: serde_json::Value =
+                    serde_json::from_str(&value_json).expect("snapshot should decode");
+                assert_eq!(
+                    snapshot["tool_assembly"]["execution_routes"]["echo"]["target_node"],
+                    "aria-node"
+                );
+                assert_eq!(
+                    snapshot["tool_assembly"]["execution_routes"]["echo"]["incarnation_id"],
+                    "aria-architect-hotel:tool-runner-echo"
+                );
+                assert_eq!(
+                    snapshot["tool_assembly"]["execution_routes"]["echo"]["selection_reason"],
+                    "remote_latency_capacity"
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
     async fn tool_runner_registration_persists_durable_registry() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
-        let server = IpcServer::new(socket_path.clone(), dispatcher_tx, graph);
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-ansible-01",
+            dispatcher_tx,
+            graph,
+        );
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");
@@ -2925,7 +3864,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
-        let server = IpcServer::new(socket_path.clone(), dispatcher_tx, graph);
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-ansible-01",
+            dispatcher_tx,
+            graph,
+        );
 
         graph_store
             .upsert_session(&SessionRecord {
@@ -3021,7 +3965,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
-        let server = IpcServer::new(socket_path.clone(), dispatcher_tx, graph);
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-ansible-01",
+            dispatcher_tx,
+            graph,
+        );
 
         for session_id in ["sess-1", "sess-2"] {
             graph_store
@@ -3167,7 +4116,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
-        let server = IpcServer::new(socket_path.clone(), dispatcher_tx, graph);
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-ansible-01",
+            dispatcher_tx,
+            graph,
+        );
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");
@@ -3241,7 +4195,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
-        let server = IpcServer::new(socket_path.clone(), dispatcher_tx, graph);
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-ansible-01",
+            dispatcher_tx,
+            graph,
+        );
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");
@@ -3314,7 +4273,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
-        let server = IpcServer::new(socket_path.clone(), dispatcher_tx, graph);
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-ansible-01",
+            dispatcher_tx,
+            graph,
+        );
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");
@@ -3401,7 +4365,12 @@ mod tests {
         let (dispatcher_tx, mut dispatcher_rx) = mpsc::channel(16);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
-        let server = IpcServer::new(socket_path.clone(), dispatcher_tx, graph);
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-ansible-01",
+            dispatcher_tx,
+            graph,
+        );
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");
@@ -3651,7 +4620,12 @@ mod tests {
         let (dispatcher_tx, mut dispatcher_rx) = mpsc::channel(16);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
-        let server = IpcServer::new(socket_path.clone(), dispatcher_tx, graph);
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-ansible-01",
+            dispatcher_tx,
+            graph,
+        );
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");

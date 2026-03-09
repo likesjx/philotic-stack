@@ -45,6 +45,38 @@
 - [ ] Define approval interrupt/resume semantics.
 - [ ] Define loop event streaming and tracing payloads.
 
+## New Project: Red Hat Ansible / VPS Deployment Boundary
+
+- [x] Pin the architecture boundary between Red Hat Ansible as the outer deployment orchestrator and Philotic `ansible` as the inner hotel runtime authority.
+- [ ] Define the first Linux/VPS deployment contract:
+  - host prerequisites
+  - filesystem layout
+  - service manager shape
+  - config/secrets inputs
+  - binary/artifact placement
+- [ ] Define the first peer inventory/rendering contract for deployed hotels so cross-host mesh no longer depends on loopback assumptions.
+- [ ] Prove a first VPS deployment smoke for one hotel.
+- [ ] Prove a first multi-host or local-to-VPS two-hotel roundtrip.
+
+## New Project: Inter-Hotel Routing And Placement
+
+- [x] Decide that inter-hotel routing should extend the same route contract already used for intra-hotel execution rather than creating a second remote-only routing abstraction.
+- [x] Decide that hotels must advertise capabilities plus live incarnations and remain authoritative for the incarnations they materialize.
+- [x] Decide that incarnation identity is hotel-scoped and deterministic: `<hotel_name>:<guest_id>`.
+- [x] Decide that unpinned remote routing should resolve by deterministic placement scoring rather than first-match or broadcast behavior.
+- [x] Close the first placement inputs for remote selection:
+  - latency
+  - available capacity / CPU headroom
+  - deterministic tiebreak by canonical incarnation id
+- [x] Define the first capability advertisement payload and hotel-side registry shape for hotel-scoped incarnations.
+- [x] Add heartbeat emission / refresh / TTL rules for the capability advertisement plane.
+- [ ] Extend current session/tool/model/hegemon route records so the shared routing schema carries remote-capable incarnation metadata consistently.
+- [x] Extend placement-based remote selection into model capability routing for `text.generate` and `media.analyze` while keeping hegemon reply delivery session-owned.
+- [x] Build the first live capability registry view across hotels.
+- [x] Implement the first placement-based remote selection for unpinned capability routes on tool fallback when no local runner is available.
+- [ ] Extend placement-based remote selection beyond the first tool/model fallback paths to broader routed component classes without breaking session-owned hegemon reply routing.
+- [ ] Move mesh ACK emission to a strict post-commit boundary.
+
 ## New Project: Model Controller
 
 - [ ] Review [MODEL_CONTROLLER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack-model-controller-abstraction/docs/architecture/MODEL_CONTROLLER_PROPOSAL.md).
@@ -113,7 +145,9 @@
 - [x] Extend the startup Telegram smoke so it simulates text, photo, and voice-note ingress and exercises fake-Gemini multimodal requests on top of blob-backed media transport.
 - [x] Prove watched-live Telegram text/photo/voice/document delivery through hegemon -> agent-core -> Gemini and normalize markdown-ish document MIME for Gemini media analysis.
 - [x] Make materialized Telegram/agent guests configurable enough for separate hotel/persona stacks (for example Jane vs Aria) instead of hardcoding one Jane-shaped membrane.
+- [x] Make inter-hotel mesh dispatch node-aware by carrying `target_node_id`, discovering peer hotels from the Context Graph, and returning real mesh ACK packets for local multi-hotel development.
 - [ ] Seed `hotels.aria-architect-hotel.agents.aria.telegram.bot_token` in local `mesh-config.json` and run the first watched-live Aria hotel Telegram poller on its own bot token.
+- [ ] Tighten inter-hotel mesh reality gaps: preserve target guest specificity across hotels, move ACK emission to a true post-commit boundary, and replace loopback-only peer addressing with explicit host authority.
 - [x] Support `hotels.<hotel>.agents.<agent>.import_workspace` so startup can seed the selected agent identity bundle from a declared workspace path.
 - [ ] Make agent-level media routing policy configurable so text/media/voice decisions are owned by the agent/session profile instead of one hardcoded runtime branch.
 - [ ] Investigate splitting voice-note transcription/understanding toward ElevenLabs or another speech-specialized provider while keeping richer text reasoning in the agent/model loop.

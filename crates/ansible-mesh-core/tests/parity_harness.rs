@@ -12,6 +12,7 @@ fn mock_event(id: uuid::Uuid, seq: u64) -> EventEnvelope {
         event_id: id,
         seq,
         source_node_id: "node-test-1".to_string(),
+        target_node_id: Some("node-test-2".to_string()),
         source_agent_id: "agent-a".to_string(),
         target_agent_id: Some("agent-b".to_string()),
         kind: EventKind::TaskInvoke,

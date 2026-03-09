@@ -1,4 +1,6 @@
 use ansible_mesh_core::beacon::BeaconDaemon;
+use ansible_mesh_core::heartbeat::emit_heartbeat;
+use ansible_mesh_core::registry::CapabilityAdvertisement;
 use ansible_mesh_core::storage::{AgentIdentityRecord, GraphStorage, GuestRecord, HotelRecord};
 use ansible_mesh_core::{NodeCapabilities, NodeRole};
 use anyhow::{Context, Result};
@@ -233,6 +235,108 @@ fn default_hotel_record(hotel_name: &str) -> HotelRecord {
     }
 }
 
+fn mesh_targets_for_graph(
+    graph: &dyn GraphStorage,
+    local_node_id: &str,
+) -> Result<Vec<(String, String)>> {
+    Ok(graph
+        .list_hotels()?
+        .into_iter()
+        .filter(|hotel| hotel.capabilities.node_id != local_node_id)
+        .map(|hotel| {
+            (
+                hotel.capabilities.node_id,
+                format!("127.0.0.1:{}", hotel.mesh_port),
+            )
+        })
+        .collect())
+}
+
+fn mesh_target_addr_for_node(
+    graph: &dyn GraphStorage,
+    target_node_id: &str,
+) -> Result<Option<String>> {
+    Ok(graph
+        .list_hotels()?
+        .into_iter()
+        .find(|hotel| hotel.capabilities.node_id == target_node_id)
+        .map(|hotel| format!("127.0.0.1:{}", hotel.mesh_port)))
+}
+
+fn local_capability_advertisements(
+    graph: &dyn GraphStorage,
+    hotel: &HotelRecord,
+) -> Result<Vec<CapabilityAdvertisement>> {
+    let tool_runner_registry = graph
+        .get_config_value("tool_runner_registry")?
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    let tool_capabilities = tool_runner_registry
+        .into_iter()
+        .filter_map(|entry| {
+            Some((
+                entry.get("guest_id")?.as_str()?.to_string(),
+                entry
+                    .get("supported_tools")?
+                    .as_array()?
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+            ))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+
+    let mut advertisements = Vec::new();
+    for guest in graph.list_guests(&hotel.hotel_name, true)? {
+        let availability_state = if guest.active_pid.is_some() {
+            "live"
+        } else {
+            "materialization_required"
+        };
+        let selection_hint = if guest.active_pid.is_some() {
+            Some("local_live_preferred".into())
+        } else {
+            Some("local_materialization_required".into())
+        };
+
+        if guest.role == "tool" {
+            if let Some(supported_tools) = tool_capabilities.get(&guest.guest_id) {
+                for tool_name in supported_tools {
+                    advertisements.push(CapabilityAdvertisement {
+                        hotel_id: hotel.hotel_name.clone(),
+                        node_id: hotel.capabilities.node_id.clone(),
+                        incarnation_id: guest.guest_id.clone(),
+                        target_role: format!("tool.{tool_name}"),
+                        availability_state: availability_state.into(),
+                        selection_hint: selection_hint.clone(),
+                        latency_hint_ms: hotel.capabilities.constraints.latency_hint_ms,
+                        max_concurrent_jobs: hotel.capabilities.constraints.max_concurrent_jobs,
+                        active_jobs: 0,
+                        queue_depth: 0,
+                    });
+                }
+                continue;
+            }
+        }
+
+        advertisements.push(CapabilityAdvertisement {
+            hotel_id: hotel.hotel_name.clone(),
+            node_id: hotel.capabilities.node_id.clone(),
+            incarnation_id: guest.guest_id,
+            target_role: guest.role,
+            availability_state: availability_state.into(),
+            selection_hint: selection_hint.clone(),
+            latency_hint_ms: hotel.capabilities.constraints.latency_hint_ms,
+            max_concurrent_jobs: hotel.capabilities.constraints.max_concurrent_jobs,
+            active_jobs: 0,
+            queue_depth: 0,
+        });
+    }
+    Ok(advertisements)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BuiltInAgentProfile {
     slug: &'static str,
@@ -371,7 +475,7 @@ fn default_identity_bundle_for_profile(profile: BuiltInAgentProfile) -> serde_js
     };
 
     let workspace = match profile.slug {
-        "jane" => Path::new(&home).join(".openclaw/workspace-vps-jane"),
+        "jane" => Path::new(&home).join(".openClaw/workspace"),
         "aria" => Path::new(&home).join(".openclaw/architect"),
         _ => return serde_json::json!({}),
     };
@@ -1843,6 +1947,7 @@ async fn main() -> Result<()> {
 
         let ipc_server = IpcServer::new(
             hotel.ipc_socket_path.clone(),
+            caps.node_id.clone(),
             dispatcher_tx,
             graph_arc.clone(),
         );
@@ -1988,7 +2093,14 @@ async fn main() -> Result<()> {
         });
     }
 
-    let ipc_server = IpcServer::new(socket_path, dispatcher_tx.clone(), graph_arc.clone());
+    let ipc_server = IpcServer::new(
+        socket_path,
+        caps.node_id.clone(),
+        dispatcher_tx.clone(),
+        graph_arc.clone(),
+    )
+    .with_registry(daemon.registry());
+    let ipc_inboxes = ipc_server.inboxes();
 
     tokio::spawn(async move {
         if let Err(e) = ipc_server.run().await {
@@ -2055,8 +2167,7 @@ async fn main() -> Result<()> {
         let dispatcher_ledger = ledger.clone();
         let dispatcher_tracker = tracker.clone();
         let dispatcher_socket = daemon.socket();
-        // MVP: Hardcode target for now or leave generic for extension
-        let targets = vec![("central-hotel".to_string(), "127.0.0.1:9099".to_string())];
+        let targets = mesh_targets_for_graph(graph_arc.as_ref(), &caps.node_id)?;
 
         let rx_dispatch = shutdown_rx.resubscribe();
         tokio::spawn(crate::service::mesh_dispatcher::outbound_dispatcher(
@@ -2068,6 +2179,48 @@ async fn main() -> Result<()> {
             rx_dispatch,
         ));
     }
+
+    let heartbeat_socket = daemon.socket().clone();
+    let heartbeat_graph = graph_arc.clone();
+    let heartbeat_hotel = hotel.clone();
+    let heartbeat_caps = caps.clone();
+    let mut heartbeat_shutdown = shutdown_rx.resubscribe();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let targets = match mesh_targets_for_graph(heartbeat_graph.as_ref(), &heartbeat_caps.node_id) {
+                        Ok(targets) => targets,
+                        Err(err) => {
+                            warn!("Failed to resolve mesh heartbeat targets: {}", err);
+                            continue;
+                        }
+                    };
+                    if targets.is_empty() {
+                        continue;
+                    }
+                    let advertisements = match local_capability_advertisements(heartbeat_graph.as_ref(), &heartbeat_hotel) {
+                        Ok(advertisements) => advertisements,
+                        Err(err) => {
+                            warn!("Failed to build local capability advertisements: {}", err);
+                            continue;
+                        }
+                    };
+                    for (_target_node_id, target_addr) in targets {
+                        let Ok(target) = target_addr.parse::<SocketAddr>() else {
+                            warn!("Skipping invalid heartbeat target address {}", target_addr);
+                            continue;
+                        };
+                        if let Err(err) = emit_heartbeat(&heartbeat_socket, target, &heartbeat_caps, &advertisements).await {
+                            warn!("Failed to emit heartbeat to {}: {}", target_addr, err);
+                        }
+                    }
+                }
+                _ = heartbeat_shutdown.recv() => break,
+            }
+        }
+    });
 
     // PORT-BP-005: Large Payload Transport via Dedicated HTTP Server
     let blob_port = hotel.blob_port;
@@ -2086,6 +2239,11 @@ async fn main() -> Result<()> {
     // PORT-BP-004: Async Mesh Inbound Router
     // Receives BeaconMessages from the UDP socket and forwards them to the single DB writer thread
     let dispatcher_inbound_tx = dispatcher_tx.clone();
+    let inbound_socket = daemon.socket().clone();
+    let inbound_graph = graph_arc.clone();
+    let inbound_inboxes = ipc_inboxes.clone();
+    let inbound_local_node_id = caps.node_id.clone();
+    let mesh_auth_inbound = ansible_mesh_core::authz::MeshAuth::new(&mesh_psk);
     tokio::spawn(async move {
         while let Some(msg) = inbox_rx.recv().await {
             match msg.msg_type {
@@ -2093,6 +2251,9 @@ async fn main() -> Result<()> {
                     if let Ok(events) = serde_json::from_slice::<Vec<EventEnvelope>>(&msg.payload) {
                         if !events.is_empty() {
                             let max_seq = events.iter().map(|e| e.seq).max().unwrap_or(0);
+                            for event in &events {
+                                IpcServer::deliver_event_envelope(&inbound_inboxes, event).await;
+                            }
                             let _ = dispatcher_inbound_tx
                                 .send(LedgerCommand::CommitInboundBatch {
                                     events,
@@ -2100,11 +2261,56 @@ async fn main() -> Result<()> {
                                 })
                                 .await; // The DB writer pushes this durably to the Inbox
 
-                            // ACK immediately per idempotent design
-                            let _ack_payload =
+                            let ack_payload =
                                 serde_json::json!({ "acked_seq": max_seq }).to_string();
-                            // In a real scenario, this ACK would be enqueued back out to the remote node.
-                            // For MVP, if we had a socket handle here, we'd fire an ACK UDP packet back.
+                            if let Some(target_addr) =
+                                mesh_target_addr_for_node(inbound_graph.as_ref(), &msg.src_node)
+                                    .ok()
+                                    .flatten()
+                            {
+                                let msg_id = uuid::Uuid::new_v4();
+                                let seq = 0;
+                                let timestamp = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                let payload = ack_payload.into_bytes();
+                                let hmac = mesh_auth_inbound
+                                    .sign(&msg_id, seq as u64, &payload, timestamp);
+                                let ack = ansible_mesh_core::BeaconMessage {
+                                    version: 1,
+                                    msg_id,
+                                    src_node: inbound_local_node_id.clone(),
+                                    dest_node: msg.src_node.clone(),
+                                    msg_type: ansible_mesh_core::MsgType::MeshEventAck,
+                                    seq,
+                                    total: 1,
+                                    payload,
+                                    timestamp,
+                                    hmac,
+                                };
+                                match serde_json::to_vec(&ack) {
+                                    Ok(packet) => {
+                                        if let Err(err) =
+                                            inbound_socket.send_to(&packet, &target_addr).await
+                                        {
+                                            warn!(
+                                                "Failed to return mesh ACK to {} at {}: {}",
+                                                msg.src_node, target_addr, err
+                                            );
+                                        }
+                                    }
+                                    Err(err) => warn!(
+                                        "Failed to serialize mesh ACK for {}: {}",
+                                        msg.src_node, err
+                                    ),
+                                }
+                            } else {
+                                warn!(
+                                    "No mesh target address found for ACK destination {}",
+                                    msg.src_node
+                                );
+                            }
                         }
                     }
                 }
@@ -2199,82 +2405,6 @@ async fn main() -> Result<()> {
         }
     });
 
-    // PORT-BP-004: Async Mesh Outbound Dispatcher Loop
-    // Polls unacked events and packages them into UDP batches over the WireGuard interface
-    let db_path_dispatcher = db_path.to_owned();
-    let socket_dispatcher = daemon.socket().clone();
-    let local_node_id_dispatcher = local_node_id.clone();
-    let mesh_auth_dispatcher = ansible_mesh_core::authz::MeshAuth::new(&mesh_psk);
-
-    if flags.enable_rust_dispatcher {
-        tokio::spawn(async move {
-            let ledger = match ansible_mesh_core::ledger::EventLedger::open(&db_path_dispatcher) {
-                Ok(l) => l,
-                Err(_) => return,
-            };
-            let tracker = match ansible_mesh_core::cursor::CursorTracker::open(&db_path_dispatcher)
-            {
-                Ok(t) => t,
-                Err(_) => return,
-            };
-
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
-            loop {
-                interval.tick().await;
-
-                // For MVP: Target node is remote-ansible-02
-                let target_node = "remote-ansible-02";
-                let cursor = tracker.get_cursor(target_node).unwrap_or(0);
-
-                if let Ok(events) = ledger.query_unacked_events(target_node, cursor, 50) {
-                    if !events.is_empty() {
-                        // trace!("Dispatcher pushing {} unacked events to {}", events.len(), target_node);
-
-                        if let Ok(payload_bytes) = serde_json::to_vec(&events) {
-                            let msg_id = uuid::Uuid::new_v4();
-                            let seq = 0;
-                            let timestamp = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
-
-                            let hmac = mesh_auth_dispatcher.sign(
-                                &msg_id,
-                                seq as u64,
-                                &payload_bytes,
-                                timestamp,
-                            );
-
-                            let msg = ansible_mesh_core::BeaconMessage {
-                                version: 1,
-                                msg_id,
-                                src_node: local_node_id_dispatcher.clone(),
-                                dest_node: target_node.to_string(),
-                                msg_type: ansible_mesh_core::MsgType::MeshEventBatch,
-                                seq,
-                                total: 1,
-                                timestamp,
-                                payload: payload_bytes,
-                                hmac,
-                            };
-
-                            // UDP MTU is ~1420 bytes. For MVP, assuming the batch fits.
-                            // For larger payloads, PORT_BLUEPRINT requires attachment by reference TCP.
-                            if let Ok(packet) = serde_json::to_vec(&msg) {
-                                let target_addr = "127.0.0.1:8999";
-                                if let Err(e) =
-                                    socket_dispatcher.send_to(&packet, target_addr).await
-                                {
-                                    tracing::error!("UDP send failed: {}", e);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        });
-    }
-
     tokio::select! {
         res = daemon.run_loop() => {
             if let Err(e) = res {
@@ -2301,7 +2431,7 @@ mod tests {
     use super::{
         StartupTest, default_guest_seed, default_hotel_record, enable_guest_test_overrides,
         extract_context_graph_entries, guest_supervision_enabled, hotel_base_port,
-        startup_test_gemini_base_url,
+        local_capability_advertisements, startup_test_gemini_base_url,
     };
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
     use ansible_mesh_core::storage::GraphStorage;
@@ -2369,6 +2499,28 @@ mod tests {
         );
         assert!(guests[0].guest_id.contains("aria"));
         assert!(guests[1].guest_id.contains("aria"));
+    }
+
+    #[test]
+    fn local_capability_advertisements_include_hotel_scoped_incarnations() {
+        let graph = SqliteGraphStorage::open(":memory:").expect("open sqlite graph");
+        let hotel = default_hotel_record("aria-architect-hotel");
+        let guests = default_guest_seed("aria-architect-hotel");
+        graph
+            .seed_guests("aria-architect-hotel", &guests)
+            .expect("seed guests");
+
+        let ads = local_capability_advertisements(&graph, &hotel).expect("ads should build");
+        assert_eq!(ads.len(), guests.len());
+        assert!(ads.iter().all(|ad| ad.hotel_id == "aria-architect-hotel"));
+        assert!(
+            ads.iter()
+                .all(|ad| ad.incarnation_id.starts_with("aria-architect-hotel:"))
+        );
+        assert!(
+            ads.iter()
+                .all(|ad| ad.selection_hint.as_deref() == Some("local_materialization_required"))
+        );
     }
 
     #[test]

@@ -323,6 +323,10 @@ Tick (every 1s)
 
 Enabled by `PHILOTIC_ENABLE_RUST_DISPATCHER=1`.
 
+Current implementation note:
+- mesh events are now filtered by `target_node_id`, and peer addresses are discovered from known hotel records in the Context Graph
+- the current peer-address assumption is still loopback-only (`127.0.0.1:<mesh_port>`), which is enough for multi-hotel local development but not yet a general cross-machine authority story
+
 ### 8.3 Inbound Dispatch (main inbox loop)
 
 Inbound `BeaconMessage`s arrive and are dispatched in `main.rs`:
@@ -342,6 +346,10 @@ The `EventLedger` is an append-only, durable SQLite log. When a peer hotel
 goes offline, events accumulate in the ledger. When the peer comes back
 online, the outbound dispatcher resumes from the last acknowledged cursor
 position — guaranteeing **at-least-once delivery** with **idempotent processing**.
+
+Current implementation note:
+- inbound `MESH_EVENT_BATCH` payloads are now delivered into the local role inbox and trigger a real `MESH_EVENT_ACK` reply
+- the ACK is emitted from the async inbox loop after enqueueing the inbound batch to the writer thread; that is a transitional approximation of durable receipt, not yet a strictly post-commit acknowledgment boundary
 
 ---
 

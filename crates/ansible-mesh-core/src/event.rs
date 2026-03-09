@@ -23,6 +23,8 @@ pub struct EventEnvelope {
     pub seq: u64,
     /// The originating hotel node.
     pub source_node_id: NodeId,
+    /// The destination hotel node. `None` means local-only or broadcast semantics.
+    pub target_node_id: Option<NodeId>,
     /// The originating guest agent.
     pub source_agent_id: AgentId,
     /// The destination guest agent. (Optional for broadcast).
