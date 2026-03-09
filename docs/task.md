@@ -104,8 +104,10 @@
 - [x] Add the first Gemini guest auth abstraction that prefers OAuth bearer config over API key fallback.
 - [x] Add `ansible --test` startup harness support for:
   - `text-roundtrip`
+  - `gemini-oauth-roundtrip`
   - `voice-sample`
 - [x] Add a startup-driven model-controller smoke script for the text round-trip path.
+- [x] Add a startup-driven Gemini OAuth smoke through the materialized model-controller guest.
 - [ ] Define hotel CLI OAuth UX:
   - browser launch
   - temporary localhost callback listener
@@ -116,7 +118,7 @@
 - [x] Add a hotel-side Gemini OAuth validation command that performs a real model call with the stored auth path.
 - [x] Refresh model-controller provider config per task so updated Gemini auth takes effect without a guest restart.
 - [ ] Run a Keychain-backed Gemini OAuth smoke with `PHILOTIC_VAULT_MASTER_KEY` unset.
-- [ ] Run a full guest-path Gemini OAuth smoke through the materialized model-controller, not just hotel-side validation.
+- [x] Run a full guest-path Gemini OAuth smoke through the materialized model-controller, not just hotel-side validation.
 - [ ] Wire refresh-token persistence and refresh lifecycle behind the hotel vault.
 - [ ] Deliver an honest ElevenLabs end-to-end voice path beyond inline-audio/testing mode.
 

@@ -667,6 +667,7 @@ pub struct ProviderConfigs {
     pub gemini_api_key: Option<String>,
     pub gemini_oauth_access_token: Option<String>,
     pub gemini_oauth_project_id: Option<String>,
+    pub gemini_base_url: Option<String>,
     pub elevenlabs_api_key: Option<String>,
     pub elevenlabs_default_voice_id: Option<String>,
 }
@@ -674,20 +675,25 @@ pub struct ProviderConfigs {
 impl ProviderConfigs {
     pub async fn load(ipc_client: &mut PhiloticClient) -> Result<Self> {
         Ok(Self {
-            gemini_api_key: fetch_config_or_secret_string(
+            gemini_api_key: env_override("PHILOTIC_GEMINI_API_KEY").or(
+                fetch_config_or_secret_string(ipc_client, "gemini_api_key", "gemini_api_key_ref")
+                    .await?,
+            ),
+            gemini_oauth_access_token: load_env_or_config_secret_string(
                 ipc_client,
-                "gemini_api_key",
-                "gemini_api_key_ref",
-            )
-            .await?,
-            gemini_oauth_access_token: fetch_config_or_secret_string(
-                ipc_client,
+                "PHILOTIC_GEMINI_OAUTH_ACCESS_TOKEN",
+                "PHILOTIC_GEMINI_OAUTH_ACCESS_TOKEN_REF",
                 "gemini_oauth_access_token",
                 "gemini_oauth_access_token_ref",
             )
             .await?,
-            gemini_oauth_project_id: fetch_config_string(ipc_client, "gemini_oauth_project_id")
-                .await?,
+            gemini_oauth_project_id: env_override("PHILOTIC_GEMINI_OAUTH_PROJECT_ID")
+                .or(fetch_config_string(ipc_client, "gemini_oauth_project_id").await?),
+            gemini_base_url: env_override("PHILOTIC_GEMINI_BASE_URL").or(fetch_config_string(
+                ipc_client,
+                "gemini_base_url",
+            )
+            .await?),
             elevenlabs_api_key: fetch_config_or_secret_string(
                 ipc_client,
                 "elevenlabs_api_key",
@@ -774,6 +780,31 @@ async fn fetch_config_string(ipc_client: &mut PhiloticClient, key: &str) -> Resu
     };
 
     Ok(value.filter(|value| !value.trim().is_empty()))
+}
+
+fn env_override(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+async fn load_env_or_config_secret_string(
+    ipc_client: &mut PhiloticClient,
+    env_value_key: &str,
+    env_ref_key: &str,
+    value_key: &str,
+    ref_key: &str,
+) -> Result<Option<String>> {
+    if let Some(value) = env_override(env_value_key) {
+        return Ok(Some(value));
+    }
+
+    if let Some(secret_ref) = env_override(env_ref_key) {
+        return fetch_secret_string(ipc_client, &secret_ref).await;
+    }
+
+    fetch_config_or_secret_string(ipc_client, value_key, ref_key).await
 }
 
 async fn fetch_config_or_secret_string(

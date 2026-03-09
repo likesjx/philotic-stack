@@ -2,11 +2,18 @@ use ansible_mesh_core::beacon::BeaconDaemon;
 use ansible_mesh_core::storage::{AgentIdentityRecord, GraphStorage, GuestRecord, HotelRecord};
 use ansible_mesh_core::{NodeCapabilities, NodeRole};
 use anyhow::{Context, Result};
+use axum::body::{Body, to_bytes};
+use axum::extract::{Request, State};
+use axum::http::{Method, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::any;
+use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use clap::{Parser, Subcommand, ValueEnum};
 use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -22,6 +29,7 @@ use std::sync::Arc;
 
 use ansible_mesh_core::event::EventEnvelope;
 use auth::AuthCommand;
+use vault::{SecretInput, store_secret};
 
 /// Instructions for the strictly-serialized DB writer thread
 pub enum LedgerCommand {
@@ -78,10 +86,13 @@ enum Command {
 enum StartupTest {
     #[value(name = "text-roundtrip", alias = "text-round-trip")]
     TextRoundTrip,
+    #[value(name = "gemini-oauth-roundtrip", alias = "gemini-oauth")]
+    GeminiOAuthRoundTrip,
     VoiceSample,
 }
 
 const STARTUP_TEST_TEXT_REPLY: &str = "startup text smoke ok";
+const STARTUP_TEST_GEMINI_OAUTH_REPLY: &str = "oauth-guest-ok";
 
 #[derive(Debug, Clone)]
 pub struct AnsibleCutoverFlags {
@@ -282,6 +293,45 @@ fn enable_guest_test_overrides(
                 guest.config_json = config.to_string();
             }
         }
+        StartupTest::GeminiOAuthRoundTrip => {
+            let startup_secret_ref = store_secret(
+                graph,
+                SecretInput {
+                    secret_kind: "gemini-startup-oauth-token".into(),
+                    scope: "startup-test".into(),
+                    allowed_roles: vec!["model".into()],
+                    allowed_guests: Vec::new(),
+                    plaintext: "startup-test-oauth-bearer".into(),
+                },
+            )?;
+
+            for guest in &mut guests {
+                if guest.role != "model" {
+                    continue;
+                }
+
+                let mut config: serde_json::Value =
+                    serde_json::from_str(&guest.config_json).unwrap_or_default();
+                let env = config
+                    .as_object_mut()
+                    .and_then(|obj| obj.get_mut("env"))
+                    .and_then(serde_json::Value::as_object_mut)
+                    .context("guest config missing env object")?;
+                env.insert(
+                    "PHILOTIC_GEMINI_BASE_URL".into(),
+                    serde_json::Value::String(startup_test_gemini_base_url(hotel_name)),
+                );
+                env.insert(
+                    "PHILOTIC_GEMINI_OAUTH_ACCESS_TOKEN_REF".into(),
+                    serde_json::Value::String(startup_secret_ref.clone()),
+                );
+                env.insert(
+                    "PHILOTIC_GEMINI_OAUTH_PROJECT_ID".into(),
+                    serde_json::Value::String("startup-test-project".into()),
+                );
+                guest.config_json = config.to_string();
+            }
+        }
         StartupTest::VoiceSample => {
             for guest in &mut guests {
                 if guest.role != "model" {
@@ -306,6 +356,163 @@ fn enable_guest_test_overrides(
 
     graph.seed_guests(hotel_name, &guests)?;
     Ok(())
+}
+
+fn startup_test_gemini_base_url(hotel_name: &str) -> String {
+    let port = hotel_base_port(hotel_name).saturating_add(2);
+    format!("http://127.0.0.1:{port}")
+}
+
+#[derive(Clone)]
+struct FakeGeminiState {
+    expected_reply: String,
+}
+
+fn spawn_fake_gemini_server(
+    hotel_name: &str,
+    expected_reply: String,
+) -> tokio::task::JoinHandle<()> {
+    let bind_addr: SocketAddr = format!(
+        "127.0.0.1:{}",
+        hotel_base_port(hotel_name).saturating_add(2)
+    )
+    .parse()
+    .expect("startup fake Gemini socket address should parse");
+
+    let app = Router::new()
+        .fallback(any(fake_gemini_handler))
+        .with_state(FakeGeminiState { expected_reply });
+
+    tokio::spawn(async move {
+        let listener = match tokio::net::TcpListener::bind(bind_addr).await {
+            Ok(listener) => listener,
+            Err(err) => {
+                warn!(
+                    "Failed to bind fake Gemini startup server at {}: {}",
+                    bind_addr, err
+                );
+                return;
+            }
+        };
+
+        if let Err(err) = axum::serve(listener, app).await {
+            warn!("Fake Gemini startup server exited with error: {}", err);
+        }
+    })
+}
+
+async fn fake_gemini_handler(
+    State(state): State<FakeGeminiState>,
+    request: Request<Body>,
+) -> Response {
+    if request.method() != Method::POST {
+        return (
+            StatusCode::METHOD_NOT_ALLOWED,
+            Json(serde_json::json!({
+                "error": { "message": "expected POST" }
+            })),
+        )
+            .into_response();
+    }
+
+    if !request.uri().path().contains(":generateContent") {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": { "message": "unexpected path" }
+            })),
+        )
+            .into_response();
+    }
+
+    if request
+        .uri()
+        .query()
+        .map(|query| query.contains("key="))
+        .unwrap_or(false)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": { "message": "startup oauth smoke requires bearer auth, not api-key query auth" }
+            })),
+        )
+            .into_response();
+    }
+
+    let headers = request.headers();
+    let auth_header = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if !auth_header.starts_with("Bearer ") || auth_header.trim() == "Bearer" {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": { "message": "missing bearer auth" }
+            })),
+        )
+            .into_response();
+    }
+
+    let project_header = headers
+        .get("x-goog-user-project")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if project_header.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": { "message": "missing x-goog-user-project header" }
+            })),
+        )
+            .into_response();
+    }
+
+    let body = match to_bytes(request.into_body(), usize::MAX).await {
+        Ok(body) => body,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": { "message": format!("failed to read request body: {}", err) }
+                })),
+            )
+                .into_response();
+        }
+    };
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+    let prompt = payload
+        .get("contents")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|contents| contents.first())
+        .and_then(|content| content.get("parts"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|parts| parts.first())
+        .and_then(|part| part.get("text"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if !prompt.contains(&state.expected_reply) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": { "message": "prompt did not contain expected startup reply token" }
+            })),
+        )
+            .into_response();
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{ "text": state.expected_reply }]
+                }
+            }]
+        })),
+    )
+        .into_response()
 }
 
 fn prepare_startup_test_binaries(_test: StartupTest) -> Result<()> {
@@ -334,6 +541,7 @@ fn prepare_startup_test_binaries(_test: StartupTest) -> Result<()> {
 
 async fn run_startup_test(
     test: StartupTest,
+    hotel_name: &str,
     socket_path: &str,
     output: Option<&str>,
     text: Option<&str>,
@@ -434,6 +642,111 @@ async fn run_startup_test(
                 "timed out waiting for startup text reply after retries: {}",
                 err
             );
+        }
+        StartupTest::GeminiOAuthRoundTrip => {
+            let expected_reply = text
+                .unwrap_or(STARTUP_TEST_GEMINI_OAUTH_REPLY)
+                .trim()
+                .to_string();
+            let prompt = format!("Reply with exactly: {}", expected_reply);
+
+            let fake_gemini = spawn_fake_gemini_server(hotel_name, expected_reply.clone());
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+            let mut client = PhiloticClient::connect_at(
+                socket_path,
+                GuestIdentity {
+                    guest_id: "ansible-startup-test-client".into(),
+                    role: "ansible-startup-test".into(),
+                    supported_tools: Vec::new(),
+                },
+            )
+            .await?;
+
+            let response = client
+                .send_request(IpcRequest::EmitTask {
+                    target_node: "local-ansible-01".into(),
+                    target_role: "model".into(),
+                    target_guest_id: None,
+                    task_json: serde_json::json!({
+                        "kind": "text.generate",
+                        "provider": "gemini",
+                        "model": "gemini-2.5-flash",
+                        "prompt": prompt,
+                        "response_contract": {
+                            "channels": ["display_text"]
+                        },
+                        "session_id": "startup-test:gemini-oauth-roundtrip",
+                        "turn_id": "startup-test-turn-1",
+                        "chat_id": "startup-test-chat",
+                        "reply_to": "local-ansible-01",
+                        "reply_role": "ansible-startup-test",
+                        "final_reply_to": "local-ansible-01",
+                        "final_reply_role": "ansible-startup-test",
+                        "final_reply_guest_id": "ansible-startup-test-client"
+                    })
+                    .to_string(),
+                })
+                .await?;
+
+            match response {
+                IpcResponse::Standard { ok: true, .. } => {}
+                other => anyhow::bail!("unexpected startup test emit response: {other:?}"),
+            }
+
+            let reply =
+                tokio::time::timeout(tokio::time::Duration::from_secs(30), client.recv_task())
+                    .await
+                    .context("timed out waiting for Gemini OAuth startup reply")??;
+            fake_gemini.abort();
+
+            let IpcResponse::InboundTask { task_json, .. } = reply else {
+                anyhow::bail!("unexpected startup test envelope: {reply:?}");
+            };
+
+            let payload: serde_json::Value =
+                serde_json::from_str(&task_json).context("failed to decode startup test reply")?;
+            if let Some(message) = payload
+                .get("agent_action")
+                .and_then(|value| value.get("message"))
+                .and_then(serde_json::Value::as_str)
+            {
+                anyhow::bail!("startup gemini oauth round-trip failed: {message}");
+            }
+
+            let content = payload
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if content != expected_reply {
+                anyhow::bail!(
+                    "unexpected Gemini OAuth startup reply: expected {:?}, got {:?}",
+                    expected_reply,
+                    content
+                );
+            }
+
+            let trace_provider = payload
+                .get("agent_action")
+                .and_then(|value| value.get("model_result"))
+                .and_then(|value| value.get("trace"))
+                .and_then(|value| value.get("provider"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if trace_provider != "gemini" {
+                anyhow::bail!(
+                    "unexpected Gemini OAuth startup trace provider: {:?}",
+                    trace_provider
+                );
+            }
+
+            info!(
+                "Startup Gemini OAuth round-trip received {:?} through provider {:?}",
+                content, trace_provider
+            );
+            Ok(())
         }
         StartupTest::VoiceSample => {
             let output_path = output
@@ -908,6 +1221,7 @@ async fn main() -> Result<()> {
     if let Some(test) = args.test {
         let test_result = run_startup_test(
             test,
+            &hotel_name,
             &hotel.ipc_socket_path,
             args.test_output.as_deref(),
             args.test_text.as_deref(),
@@ -1170,6 +1484,7 @@ mod tests {
     use super::{
         StartupTest, default_guest_seed, default_hotel_record, enable_guest_test_overrides,
         extract_context_graph_entries, guest_supervision_enabled, hotel_base_port,
+        startup_test_gemini_base_url,
     };
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
     use ansible_mesh_core::storage::GraphStorage;
@@ -1246,6 +1561,38 @@ mod tests {
         assert_eq!(
             config["env"]["PHILOTIC_MODEL_ROUTER_STUB_RESPONSE"].as_str(),
             Some("startup text smoke ok")
+        );
+    }
+
+    #[test]
+    fn gemini_oauth_startup_test_injects_fake_base_url_into_model_guest() {
+        let graph = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let guests = default_guest_seed("startup-test-hotel");
+        graph
+            .seed_guests("startup-test-hotel", &guests)
+            .expect("seed guests");
+
+        enable_guest_test_overrides(
+            &graph,
+            "startup-test-hotel",
+            StartupTest::GeminiOAuthRoundTrip,
+        )
+        .expect("apply startup overrides");
+
+        let stored = graph
+            .list_guests("startup-test-hotel", false)
+            .expect("list guests");
+        let model = stored
+            .into_iter()
+            .find(|guest| guest.role == "model")
+            .expect("model guest should exist");
+        let config: serde_json::Value =
+            serde_json::from_str(&model.config_json).expect("config should decode");
+        let expected_base_url = startup_test_gemini_base_url("startup-test-hotel");
+
+        assert_eq!(
+            config["env"]["PHILOTIC_GEMINI_BASE_URL"].as_str(),
+            Some(expected_base_url.as_str())
         );
     }
 }

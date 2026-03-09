@@ -53,6 +53,11 @@ cargo run -p ansible -- auth google validate --provider gemini
 # Run the startup text model-controller smoke through the hotel
 cargo run -p ansible -- --hotel startup-test-hotel --load-config mesh-config.json --test text-roundtrip --test-text "hello model controller"
 
+# Run the startup Gemini OAuth smoke through the materialized model-controller guest.
+# This harness seeds a temporary vaulted bearer token and talks to a local fake Gemini endpoint,
+# so it proves the guest-path OAuth contract without depending on live Google.
+cargo run -p ansible -- --hotel startup-test-hotel --test gemini-oauth-roundtrip --test-text "oauth-guest-ok"
+
 # Run the startup voice sample through the hotel
 cargo run -p ansible -- --hotel startup-test-hotel --load-config mesh-config.json --test voice-sample --test-output /tmp/ansible-startup-voice-sample.mp3 --test-text "Hello from the startup voice test."
 ```
