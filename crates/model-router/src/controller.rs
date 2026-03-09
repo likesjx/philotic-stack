@@ -21,6 +21,103 @@ impl TaskKind {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ResponseContract {
+    pub modalities: Vec<String>,
+    pub style: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProjectionItem {
+    pub text: Option<String>,
+    pub source_ref: Option<String>,
+    pub projection_kind: Option<String>,
+    pub priority: Option<i64>,
+    pub token_estimate: Option<u64>,
+    pub cache_key: Option<String>,
+    pub truncation_policy: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ContentPart {
+    pub part_type: String,
+    pub text: Option<String>,
+    pub mime_type: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TurnInput {
+    pub role: Option<String>,
+    pub text: Option<String>,
+    pub parts: Vec<ContentPart>,
+}
+
+impl TurnInput {
+    pub fn text_content(&self) -> Option<String> {
+        if let Some(text) = self
+            .text
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            return Some(text.to_string());
+        }
+
+        let texts = self
+            .parts
+            .iter()
+            .filter(|part| part.part_type == "text")
+            .filter_map(|part| part.text.as_deref())
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>();
+
+        if texts.is_empty() {
+            None
+        } else {
+            Some(texts.join("\n"))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AttachmentInput {
+    pub kind: Option<String>,
+    pub mime_type: Option<String>,
+    pub url: Option<String>,
+    pub blob_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ContextEnvelope {
+    pub instructions: Vec<ProjectionItem>,
+    pub identity: Vec<ProjectionItem>,
+    pub memory: Vec<ProjectionItem>,
+    pub dialogue_window: Vec<TurnInput>,
+    pub active_turn: Option<TurnInput>,
+    pub attachments: Vec<AttachmentInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AffordanceItem {
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub text: Option<String>,
+    pub source_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Affordances {
+    pub skills: Vec<AffordanceItem>,
+    pub tools: Vec<AffordanceItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RoutingHints {
+    pub implementation: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControllerTask {
     pub kind: TaskKind,
@@ -34,16 +131,26 @@ pub struct ControllerTask {
     pub voice_id: Option<String>,
     pub output_format: Option<String>,
     pub language_code: Option<String>,
+    pub response_contract: ResponseContract,
+    pub context: ContextEnvelope,
+    pub affordances: Affordances,
+    pub routing_hints: RoutingHints,
     pub provider_options: Map<String, Value>,
 }
 
 impl ControllerTask {
     pub fn from_value(task: &Value) -> Result<Self> {
+        let response_contract = parse_response_contract(task.get("response_contract"));
+        let context = parse_context(task.get("context"));
+        let affordances = parse_affordances(task.get("affordances"));
+        let routing_hints = parse_routing_hints(task.get("routing_hints"));
+
         let kind = match task.get("kind").and_then(Value::as_str) {
             Some("text.generate") | Some("text_generate") => TaskKind::TextGenerate,
             Some("voice.synthesize") | Some("voice_synthesize") => TaskKind::VoiceSynthesize,
             Some(other) => bail!("unsupported task kind [{}]", other),
             None if task.get("prompt").and_then(Value::as_str).is_some() => TaskKind::TextGenerate,
+            None if active_turn_text(task.get("context")).is_some() => TaskKind::TextGenerate,
             None if task.get("text").and_then(Value::as_str).is_some() => TaskKind::VoiceSynthesize,
             None if task.get("spoken_text").and_then(Value::as_str).is_some() => {
                 TaskKind::VoiceSynthesize
@@ -62,7 +169,8 @@ impl ControllerTask {
             provider: task
                 .get("provider")
                 .and_then(Value::as_str)
-                .map(str::to_string),
+                .map(str::to_string)
+                .or_else(|| routing_hints.implementation.clone()),
             model: task
                 .get("model")
                 .and_then(Value::as_str)
@@ -70,7 +178,13 @@ impl ControllerTask {
             prompt: task
                 .get("prompt")
                 .and_then(Value::as_str)
-                .map(str::to_string),
+                .map(str::to_string)
+                .or_else(|| {
+                    context
+                        .active_turn
+                        .as_ref()
+                        .and_then(TurnInput::text_content)
+                }),
             text: task.get("text").and_then(Value::as_str).map(str::to_string),
             spoken_text: task
                 .get("spoken_text")
@@ -96,6 +210,10 @@ impl ControllerTask {
                 .get("language_code")
                 .and_then(Value::as_str)
                 .map(str::to_string),
+            response_contract,
+            context,
+            affordances,
+            routing_hints,
             provider_options,
         };
 
@@ -104,7 +222,9 @@ impl ControllerTask {
     }
 
     pub fn provider_hint(&self) -> Option<&str> {
-        self.provider.as_deref()
+        self.provider
+            .as_deref()
+            .or(self.routing_hints.implementation.as_deref())
     }
 
     pub fn prompt_text(&self) -> Option<&str> {
@@ -152,6 +272,233 @@ impl ControllerTask {
 
         Ok(())
     }
+}
+
+fn parse_response_contract(value: Option<&Value>) -> ResponseContract {
+    let Some(object) = value.and_then(Value::as_object) else {
+        return ResponseContract::default();
+    };
+
+    ResponseContract {
+        modalities: object
+            .get("modalities")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+        style: object
+            .get("style")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    }
+}
+
+fn parse_projection_items(value: Option<&Value>) -> Vec<ProjectionItem> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| items.iter().map(parse_projection_item).collect())
+        .unwrap_or_default()
+}
+
+fn parse_projection_item(value: &Value) -> ProjectionItem {
+    let object = value.as_object();
+    ProjectionItem {
+        text: value.as_str().map(str::to_string).or_else(|| {
+            object
+                .and_then(|obj| obj.get("text"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        }),
+        source_ref: object
+            .and_then(|obj| obj.get("source_ref"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        projection_kind: object
+            .and_then(|obj| obj.get("projection_kind"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        priority: object
+            .and_then(|obj| obj.get("priority"))
+            .and_then(Value::as_i64),
+        token_estimate: object
+            .and_then(|obj| obj.get("token_estimate"))
+            .and_then(Value::as_u64),
+        cache_key: object
+            .and_then(|obj| obj.get("cache_key"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        truncation_policy: object
+            .and_then(|obj| obj.get("truncation_policy"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    }
+}
+
+fn parse_turns(value: Option<&Value>) -> Vec<TurnInput> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| items.iter().map(parse_turn_input).collect())
+        .unwrap_or_default()
+}
+
+fn parse_turn_input(value: &Value) -> TurnInput {
+    let object = value.as_object();
+    TurnInput {
+        role: object
+            .and_then(|obj| obj.get("role"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        text: object
+            .and_then(|obj| obj.get("text"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        parts: object
+            .and_then(|obj| obj.get("parts"))
+            .and_then(Value::as_array)
+            .map(|parts| parts.iter().map(parse_content_part).collect())
+            .unwrap_or_default(),
+    }
+}
+
+fn parse_content_part(value: &Value) -> ContentPart {
+    let object = value.as_object();
+    ContentPart {
+        part_type: object
+            .and_then(|obj| obj.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or("text")
+            .to_string(),
+        text: object
+            .and_then(|obj| obj.get("text"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        mime_type: object
+            .and_then(|obj| obj.get("mime_type"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    }
+}
+
+fn parse_attachments(value: Option<&Value>) -> Vec<AttachmentInput> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| {
+                    let object = item.as_object();
+                    AttachmentInput {
+                        kind: object
+                            .and_then(|obj| obj.get("kind"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        mime_type: object
+                            .and_then(|obj| obj.get("mime_type"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        url: object
+                            .and_then(|obj| obj.get("url"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        blob_ref: object
+                            .and_then(|obj| obj.get("blob_ref"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_context(value: Option<&Value>) -> ContextEnvelope {
+    let Some(object) = value.and_then(Value::as_object) else {
+        return ContextEnvelope::default();
+    };
+
+    ContextEnvelope {
+        instructions: parse_projection_items(object.get("instructions")),
+        identity: parse_projection_items(object.get("identity")),
+        memory: parse_projection_items(object.get("memory")),
+        dialogue_window: parse_turns(object.get("dialogue_window")),
+        active_turn: object.get("active_turn").map(parse_turn_input),
+        attachments: parse_attachments(object.get("attachments")),
+    }
+}
+
+fn parse_affordance_items(value: Option<&Value>) -> Vec<AffordanceItem> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| {
+                    let object = item.as_object();
+                    AffordanceItem {
+                        id: object
+                            .and_then(|obj| obj.get("id"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        name: object
+                            .and_then(|obj| obj.get("name"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        description: object
+                            .and_then(|obj| obj.get("description"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        text: item.as_str().map(str::to_string).or_else(|| {
+                            object
+                                .and_then(|obj| obj.get("text"))
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        }),
+                        source_ref: object
+                            .and_then(|obj| obj.get("source_ref"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_affordances(value: Option<&Value>) -> Affordances {
+    let Some(object) = value.and_then(Value::as_object) else {
+        return Affordances::default();
+    };
+
+    Affordances {
+        skills: parse_affordance_items(object.get("skills")),
+        tools: parse_affordance_items(object.get("tools")),
+    }
+}
+
+fn parse_routing_hints(value: Option<&Value>) -> RoutingHints {
+    let Some(object) = value.and_then(Value::as_object) else {
+        return RoutingHints::default();
+    };
+
+    RoutingHints {
+        implementation: object
+            .get("implementation")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    }
+}
+
+fn active_turn_text(context: Option<&Value>) -> Option<String> {
+    context
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("active_turn"))
+        .map(parse_turn_input)
+        .and_then(|turn| turn.text_content())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -391,6 +738,69 @@ mod tests {
         assert_eq!(task.voice_text(), Some("Speak now"));
         assert_eq!(task.display_text(), Some("Hi there"));
         assert_eq!(task.requested_voice(), Some("voice-123"));
+    }
+
+    #[test]
+    fn infers_text_task_from_structured_active_turn() {
+        let task = ControllerTask::from_value(&json!({
+            "context": {
+                "identity": [{"text": "You are Jane."}],
+                "active_turn": {
+                    "role": "user",
+                    "parts": [
+                        {"type": "text", "text": "Summarize the deployment status."}
+                    ]
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(task.kind, TaskKind::TextGenerate);
+        assert_eq!(task.prompt_text(), Some("Summarize the deployment status."));
+        assert_eq!(task.context.identity.len(), 1);
+    }
+
+    #[test]
+    fn uses_routing_hint_as_provider_hint_when_provider_missing() {
+        let task = ControllerTask::from_value(&json!({
+            "kind": "voice.synthesize",
+            "text": "hello",
+            "routing_hints": {
+                "implementation": "elevenlabs"
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(task.provider_hint(), Some("elevenlabs"));
+    }
+
+    #[test]
+    fn parses_affordances_separately_from_context() {
+        let task = ControllerTask::from_value(&json!({
+            "kind": "text.generate",
+            "context": {
+                "active_turn": {
+                    "role": "user",
+                    "text": "What should we do next?"
+                }
+            },
+            "affordances": {
+                "skills": [{"id": "ops.checklist", "text": "Use the ops checklist."}],
+                "tools": [{"name": "workspace.read", "description": "Read workspace files."}]
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(task.affordances.skills.len(), 1);
+        assert_eq!(task.affordances.tools.len(), 1);
+        assert_eq!(
+            task.affordances.skills[0].id.as_deref(),
+            Some("ops.checklist")
+        );
+        assert_eq!(
+            task.affordances.tools[0].name.as_deref(),
+            Some("workspace.read")
+        );
     }
 
     #[test]
