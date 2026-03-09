@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+aes-gcm = "0.10"
 async-trait = "0.1"
 ansible-mesh-core = { path = "../ansible-mesh-core" }
 anyhow = "1.0"

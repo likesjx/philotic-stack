@@ -185,6 +185,7 @@ Recommended auth modes:
 Current implementation slice:
 
 - model-controller guest can consume `gemini_oauth_access_token`
+- model-controller guest can resolve `gemini_oauth_access_token_ref` through hotel secret IPC
 - optional `gemini_oauth_project_id` is forwarded as `x-goog-user-project`
 - if OAuth material is absent, the guest falls back to `gemini_api_key`
 - refreshable credentials still belong to the future hotel/vault flow, not the guest

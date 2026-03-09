@@ -10,6 +10,7 @@ use tracing::{debug, error, info, warn};
 
 mod auth;
 mod graph;
+mod vault;
 
 mod service;
 use service::blob::BlobService;

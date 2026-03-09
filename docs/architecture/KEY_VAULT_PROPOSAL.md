@@ -33,15 +33,16 @@ That was acceptable for the current bootstrap slice, but it is not an acceptable
 
 ## Disposition
 
-Proposed.
+Accepted for current slice.
 
 ## Current Slice
 
-Pin the first design contract for:
+Pin and prove the first design contract for:
 
 - hotel-owned key vault authority
 - vault-backed model-controller auth
 - Telegram-safe onboarding and rotation paths
+- encrypted secret storage plus role/guest-gated local secret fetch over hotel IPC
 
 Linked task surface: [docs/task.md](/Users/jaredlikes/code/philotic-stack-model-controller-abstraction/docs/task.md)
 
@@ -51,7 +52,14 @@ Current repo truth is that `node_config` stores values directly, including secre
 
 That is convenient for bring-up and bad for long-term security.
 
-The next boundary should be:
+The current implementation slice now begins that boundary:
+
+- encrypted secrets are stored in `vault_secrets`
+- config can store `*_ref` values instead of raw secret values
+- guests can request secrets through dedicated hotel IPC instead of generic `GetConfig`
+- Gemini OAuth access tokens now fit that path
+
+The next boundary should continue toward:
 
 - context graph stores secret references plus metadata
 - vault stores encrypted payloads
@@ -138,6 +146,12 @@ Access rules:
 - local-only delivery by default
 - auditable reads
 - optional operator approval for especially sensitive reads
+
+Current implementation note:
+
+- the first slice uses per-secret allowed roles/guests enforced by the hotel
+- it returns the decrypted payload directly over local IPC after policy check
+- lease handles, access audit records, and approval-gated reads are still deferred
 
 ## Rotation Recommendation
 

@@ -182,12 +182,26 @@ pub struct ProviderConfigs {
 impl ProviderConfigs {
     pub async fn load(ipc_client: &mut PhiloticClient) -> Result<Self> {
         Ok(Self {
-            gemini_api_key: fetch_config_string(ipc_client, "gemini_api_key").await?,
-            gemini_oauth_access_token: fetch_config_string(ipc_client, "gemini_oauth_access_token")
-                .await?,
+            gemini_api_key: fetch_config_or_secret_string(
+                ipc_client,
+                "gemini_api_key",
+                "gemini_api_key_ref",
+            )
+            .await?,
+            gemini_oauth_access_token: fetch_config_or_secret_string(
+                ipc_client,
+                "gemini_oauth_access_token",
+                "gemini_oauth_access_token_ref",
+            )
+            .await?,
             gemini_oauth_project_id: fetch_config_string(ipc_client, "gemini_oauth_project_id")
                 .await?,
-            elevenlabs_api_key: fetch_config_string(ipc_client, "elevenlabs_api_key").await?,
+            elevenlabs_api_key: fetch_config_or_secret_string(
+                ipc_client,
+                "elevenlabs_api_key",
+                "elevenlabs_api_key_ref",
+            )
+            .await?,
             elevenlabs_default_voice_id: fetch_config_string(ipc_client, "elevenlabs_voice_id")
                 .await?,
         })
@@ -265,6 +279,56 @@ async fn fetch_config_string(ipc_client: &mut PhiloticClient, key: &str) -> Resu
             }
         }
         _ => None,
+    };
+
+    Ok(value.filter(|value| !value.trim().is_empty()))
+}
+
+async fn fetch_config_or_secret_string(
+    ipc_client: &mut PhiloticClient,
+    value_key: &str,
+    ref_key: &str,
+) -> Result<Option<String>> {
+    if let Some(value) = fetch_config_string(ipc_client, value_key).await? {
+        return Ok(Some(value));
+    }
+
+    let Some(secret_ref) = fetch_config_string(ipc_client, ref_key).await? else {
+        return Ok(None);
+    };
+
+    fetch_secret_string(ipc_client, &secret_ref).await
+}
+
+async fn fetch_secret_string(
+    ipc_client: &mut PhiloticClient,
+    secret_ref: &str,
+) -> Result<Option<String>> {
+    let response = ipc_client
+        .send_request(IpcRequest::GetSecret {
+            secret_ref: secret_ref.into(),
+        })
+        .await?;
+
+    let value = match response {
+        IpcResponse::SecretData {
+            secret_ref: _,
+            value_json: Some(value_json),
+        } => {
+            if let Ok(val) = serde_json::from_str::<Value>(&value_json) {
+                val.as_str().map(str::to_string).or(Some(value_json))
+            } else {
+                Some(value_json)
+            }
+        }
+        IpcResponse::SecretData {
+            secret_ref: _,
+            value_json: None,
+        } => None,
+        IpcResponse::Standard {
+            ok: false, message, ..
+        } => bail!("secret fetch failed: {}", message),
+        other => bail!("unexpected GetSecret response: {:?}", other),
     };
 
     Ok(value.filter(|value| !value.trim().is_empty()))

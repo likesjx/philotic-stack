@@ -78,9 +78,9 @@
 ## New Project: Key Vault
 
 - [ ] Review [KEY_VAULT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack-model-controller-abstraction/docs/architecture/KEY_VAULT_PROPOSAL.md).
-- [ ] Define vault record schema and context-graph secret references.
-- [ ] Remove long-term raw secret storage from plain `node_config`.
-- [ ] Define hotel-local secret lease/fetch API for guests.
+- [x] Define the first vault record schema and context-graph secret references.
+- [x] Begin removing new OAuth access-token storage from plain `node_config` by storing secret refs instead.
+- [x] Define and implement the first hotel-local secret fetch API for guests.
 - [ ] Define envelope-encryption and root-key strategy:
   - OS keychain / TPM / Secure Enclave preferred
   - cloud KMS/HSM for hosted hotels
@@ -92,6 +92,7 @@
   - revoke
   - rollback
 - [ ] Move Gemini OAuth refresh tokens behind vault references.
+- [x] Move Gemini OAuth access tokens behind vault references for model-controller consumption.
 - [ ] Define Telegram-safe secret onboarding:
   - control-plane command in chat
   - Mini App or secure browser handoff

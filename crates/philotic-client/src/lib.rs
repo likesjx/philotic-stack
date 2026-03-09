@@ -27,6 +27,10 @@ pub enum IpcRequest {
     GetConfig {
         key: String,
     },
+    /// Ask the Hotel vault for a decrypted secret value by secret ref
+    GetSecret {
+        secret_ref: String,
+    },
     /// Section 6 Blueprint Operations
     PublishMessage {
         target_role: String,
@@ -87,6 +91,10 @@ pub enum IpcResponse {
     },
     ConfigData {
         key: String,
+        value_json: Option<String>,
+    },
+    SecretData {
+        secret_ref: String,
         value_json: Option<String>,
     },
     InboundTask {

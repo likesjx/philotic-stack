@@ -17,6 +17,10 @@ start-ansible hotel:
     cargo build --workspace
     cargo run -p ansible -- --hotel {{hotel}} --load-config mesh-config.json
 
+# Start the transitional Gemini OAuth flow through the hotel CLI
+gemini-oauth-start client_id project_id:
+    cargo run -p ansible -- auth google start --provider gemini --client-id {{client_id}} --project-id {{project_id}}
+
 # Start the local UAT stack. Ansible will materialize the gateway, agent, model, and tool guests.
 start-ansible-uat:
     @echo "Starting UAT stack on hotel 'local-telegram' using mesh-config.json..."

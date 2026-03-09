@@ -1,3 +1,4 @@
+use crate::vault::{SecretInput, store_secret};
 use ansible_mesh_core::storage::GraphStorage;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -130,11 +131,11 @@ async fn run_google_auth_start(args: GoogleStartArgs) -> Result<()> {
     println!("Google OAuth succeeded for provider gemini.");
     if args.insecure_store_refresh_token {
         println!(
-            "Refresh token was stored in node_config because --insecure-store-refresh-token was set."
+            "Refresh token was stored in the hotel vault because --insecure-store-refresh-token was set."
         );
     } else {
         println!(
-            "Refresh token was not stored. Current auth is access-token-only until vault-backed refresh storage lands."
+            "Refresh token was not stored. Current auth is access-token-only until refresh lifecycle and policy are wired."
         );
     }
 
@@ -306,9 +307,19 @@ async fn exchange_google_code(
 fn persist_gemini_oauth_config(args: &GoogleStartArgs, token: &GoogleTokenResponse) -> Result<()> {
     let graph = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open("ansible_context.db")?;
 
+    let access_token_ref = store_secret(
+        &graph,
+        SecretInput {
+            secret_kind: "gemini-access-token".into(),
+            scope: "hotel".into(),
+            allowed_roles: vec!["model".into(), "model.gemini".into()],
+            allowed_guests: Vec::new(),
+            plaintext: token.access_token.clone(),
+        },
+    )?;
     graph.set_config_value(
-        "gemini_oauth_access_token",
-        &serde_json::to_string(&token.access_token)?,
+        "gemini_oauth_access_token_ref",
+        &serde_json::to_string(&access_token_ref)?,
     )?;
 
     if let Some(project_id) = args
@@ -347,18 +358,28 @@ fn persist_gemini_oauth_config(args: &GoogleStartArgs, token: &GoogleTokenRespon
 
     if let Some(refresh_token) = token.refresh_token.as_deref() {
         if args.insecure_store_refresh_token {
+            let refresh_token_ref = store_secret(
+                &graph,
+                SecretInput {
+                    secret_kind: "gemini-refresh-token".into(),
+                    scope: "hotel".into(),
+                    allowed_roles: vec!["ansible".into()],
+                    allowed_guests: Vec::new(),
+                    plaintext: refresh_token.to_string(),
+                },
+            )?;
             graph.set_config_value(
-                "gemini_oauth_refresh_token",
-                &serde_json::to_string(refresh_token)?,
+                "gemini_oauth_refresh_token_ref",
+                &serde_json::to_string(&refresh_token_ref)?,
             )?;
         } else {
             warn!(
-                "Received a Google refresh token but did not persist it; vault-backed storage is not implemented yet."
+                "Received a Google refresh token but did not persist it; refresh lifecycle is not wired yet."
             );
         }
     }
 
-    info!("Persisted Gemini OAuth access token config into node_config.");
+    info!("Persisted Gemini OAuth secret refs into the hotel vault/context graph.");
     Ok(())
 }
 
