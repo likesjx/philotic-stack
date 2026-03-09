@@ -216,6 +216,7 @@
 - [ ] Loop incarnations and delegation model: explore whether different agent loops should materialize as specialized agent incarnations, and define how delegation, subagents, and loop-specialized workers relate to the primary conversational agent.
 - [ ] Tool runner lifecycle policy: define idle retention, sleep/teardown timing, wake-up thresholds, and environment-specific materialization rules for routed tools.
 - [ ] Runner artifact plane: define builder trust, sandboxing, testing, signing, release, and distribution policy for executable tool runners.
+- [ ] Review [RUST_FORGE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RUST_FORGE_PROPOSAL.md) and decide whether a sandboxed `forge` runner family should eventually scaffold, build, publish, and propose mesh integration for Rust-based components.
 - [ ] Memory consolidation / dreaming: define how short-term session state becomes long-term memory, including sleep/dream cycles, compaction, and candidate memory backends such as `scryper/miniminddb`.
 
 ## MVP 1: Single-Node Mesh & Basic Tools
