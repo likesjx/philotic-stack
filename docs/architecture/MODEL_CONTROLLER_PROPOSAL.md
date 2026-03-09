@@ -36,6 +36,7 @@ Pin and prove the first design contract for:
 - native-audio multimodal model support
 - hotel-driven Gemini OAuth UX
 - an upstream producer path for `voice.synthesize`
+- a guest-side Gemini auth abstraction that prefers OAuth bearer material over API key fallback
 
 Linked task surface: [docs/task.md](/Users/jaredlikes/code/philotic-stack-model-controller-abstraction/docs/task.md)
 
@@ -180,6 +181,13 @@ Recommended auth modes:
 - `oauth_bearer`
 - `oauth_refreshable`
 - `adc`
+
+Current implementation slice:
+
+- model-controller guest can consume `gemini_oauth_access_token`
+- optional `gemini_oauth_project_id` is forwarded as `x-goog-user-project`
+- if OAuth material is absent, the guest falls back to `gemini_api_key`
+- refreshable credentials still belong to the future hotel/vault flow, not the guest
 
 The hotel should own the user experience for OAuth:
 

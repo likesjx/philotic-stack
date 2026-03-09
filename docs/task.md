@@ -65,6 +65,7 @@
   - hotel-managed OAuth
   - API key fallback
   - possible ADC path
+- [x] Add the first Gemini guest auth abstraction that prefers OAuth bearer config over API key fallback.
 - [ ] Define hotel CLI OAuth UX:
   - browser launch
   - temporary localhost callback listener

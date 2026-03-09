@@ -173,6 +173,8 @@ pub enum ProviderOutput {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProviderConfigs {
     pub gemini_api_key: Option<String>,
+    pub gemini_oauth_access_token: Option<String>,
+    pub gemini_oauth_project_id: Option<String>,
     pub elevenlabs_api_key: Option<String>,
     pub elevenlabs_default_voice_id: Option<String>,
 }
@@ -181,6 +183,10 @@ impl ProviderConfigs {
     pub async fn load(ipc_client: &mut PhiloticClient) -> Result<Self> {
         Ok(Self {
             gemini_api_key: fetch_config_string(ipc_client, "gemini_api_key").await?,
+            gemini_oauth_access_token: fetch_config_string(ipc_client, "gemini_oauth_access_token")
+                .await?,
+            gemini_oauth_project_id: fetch_config_string(ipc_client, "gemini_oauth_project_id")
+                .await?,
             elevenlabs_api_key: fetch_config_string(ipc_client, "elevenlabs_api_key").await?,
             elevenlabs_default_voice_id: fetch_config_string(ipc_client, "elevenlabs_voice_id")
                 .await?,

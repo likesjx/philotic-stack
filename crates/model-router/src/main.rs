@@ -25,7 +25,11 @@ async fn main() -> Result<()> {
             vec![
                 std::sync::Arc::new(GeminiProvider::new(
                     http_client.clone(),
-                    configs.gemini_api_key.clone(),
+                    GeminiProvider::auth_from_config(
+                        configs.gemini_oauth_access_token.clone(),
+                        configs.gemini_oauth_project_id.clone(),
+                        configs.gemini_api_key.clone(),
+                    ),
                 )),
                 std::sync::Arc::new(ElevenLabsProvider::new(
                     http_client,
