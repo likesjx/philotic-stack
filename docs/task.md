@@ -115,10 +115,12 @@
 - [x] Define the normalized Telegram ingress envelope and prove it on the current text polling path.
 - [x] Expand `hegemon` polling ingestion beyond `message.text` while keeping one canonical transport-normalization path.
 - [ ] Add Telegram media download/fetch handling on top of normalized attachment metadata.
-- [ ] Add Telegram outbound formatting projection in `hegemon`:
-  - translate model Markdown/rich text into Telegram-safe formatting
-  - choose between `parse_mode` projection and explicit `entities`
-  - account for Telegram text and caption length limits
+- [x] Add an initial Telegram outbound formatting projector in `hegemon`:
+  - translate a supported Markdown subset into Telegram-safe HTML `parse_mode`
+  - apply it to outbound `sendMessage` replies
+- [ ] Extend Telegram outbound formatting projection:
+  - move from HTML-only projection toward explicit `entities` where it improves reliability
+  - account for Telegram text and caption length limits with chunking or fallback behavior
 - [ ] Elevate deterministic Telegram slash commands into `hegemon` before the normal agent loop.
 - [ ] Add Telegram delivery primitives for typing state, partial streaming, and final message commit.
 - [ ] Specify webhook config shape and verification behavior:

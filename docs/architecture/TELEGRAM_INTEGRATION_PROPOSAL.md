@@ -335,6 +335,12 @@ Recommendation:
   - normal message text length after formatting parse
   - caption length limits for media messages
 
+Current implementation note:
+
+- `hegemon` now projects outbound `sendMessage` replies through a Markdown-subset to Telegram HTML formatter
+- the current supported subset includes headings, bold, italic, strikethrough, inline code, fenced code blocks, links, blockquotes, and simple lists
+- explicit Telegram entities and length-aware chunking/fallback are still follow-on work
+
 ## Slash Commands
 
 ### Recommendation

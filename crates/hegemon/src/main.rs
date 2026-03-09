@@ -1,6 +1,9 @@
 use anyhow::Result;
 use clap::Parser;
 use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, is_ipc_disconnect};
+use pulldown_cmark::{
+    CodeBlockKind, Event, LinkType, Options, Parser as MarkdownParser, Tag, TagEnd,
+};
 use serde_json::{Value, json};
 use std::time::Duration;
 use tracing::{error, info, warn};
@@ -27,6 +30,293 @@ struct TelegramMessageEnvelope {
     command: Option<String>,
     callback_data: Option<String>,
     raw_transport_event: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TelegramFormattedText {
+    text: String,
+    parse_mode: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BlockKind {
+    Paragraph,
+    Heading,
+    BlockQuote,
+    CodeBlock(Option<String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ListKind {
+    Bullet,
+    Ordered(u64),
+}
+
+#[derive(Debug, Default)]
+struct TelegramHtmlRenderer {
+    output: String,
+    block_stack: Vec<BlockKind>,
+    list_stack: Vec<ListKind>,
+    list_item_stack: Vec<usize>,
+    pending_link: Option<String>,
+}
+
+impl TelegramHtmlRenderer {
+    fn render(markdown: &str) -> TelegramFormattedText {
+        let parser = MarkdownParser::new_ext(markdown, Options::all());
+        let mut renderer = Self::default();
+        for event in parser {
+            renderer.push_event(event);
+        }
+        let text = renderer.finish();
+        if text.is_empty() {
+            return TelegramFormattedText {
+                text: String::new(),
+                parse_mode: "HTML",
+            };
+        }
+        TelegramFormattedText {
+            text,
+            parse_mode: "HTML",
+        }
+    }
+
+    fn push_event(&mut self, event: Event<'_>) {
+        match event {
+            Event::Start(tag) => self.start_tag(tag),
+            Event::End(tag) => self.end_tag(tag),
+            Event::Text(text) => self.push_text(&text),
+            Event::Code(text) => {
+                self.output.push_str("<code>");
+                self.output.push_str(&escape_html(&text));
+                self.output.push_str("</code>");
+            }
+            Event::Html(text) | Event::InlineHtml(text) => self.push_text(&text),
+            Event::SoftBreak | Event::HardBreak => {
+                self.output.push('\n');
+                if self.in_blockquote() {
+                    self.output.push_str("&gt; ");
+                }
+            }
+            Event::Rule => {
+                self.ensure_block_spacing();
+                self.output.push_str("----------\n");
+            }
+            Event::FootnoteReference(text) => {
+                self.output.push('[');
+                self.output.push_str(&escape_html(&text));
+                self.output.push(']');
+            }
+            Event::TaskListMarker(checked) => {
+                self.output.push_str(if checked { "[x] " } else { "[ ] " });
+            }
+            Event::InlineMath(text) | Event::DisplayMath(text) => self.push_text(&text),
+        }
+    }
+
+    fn start_tag(&mut self, tag: Tag<'_>) {
+        match tag {
+            Tag::Paragraph => {
+                if !self.in_blockquote() {
+                    self.ensure_block_spacing();
+                }
+                self.block_stack.push(BlockKind::Paragraph);
+            }
+            Tag::Heading { .. } => {
+                self.ensure_block_spacing();
+                self.block_stack.push(BlockKind::Heading);
+                self.output.push_str("<b>");
+            }
+            Tag::BlockQuote(_) => {
+                self.ensure_block_spacing();
+                self.block_stack.push(BlockKind::BlockQuote);
+                self.output.push_str("&gt; ");
+            }
+            Tag::CodeBlock(kind) => {
+                self.ensure_block_spacing();
+                let language = match kind {
+                    CodeBlockKind::Fenced(language) => {
+                        let language = language.trim();
+                        (!language.is_empty()).then(|| language.to_string())
+                    }
+                    CodeBlockKind::Indented => None,
+                };
+                self.block_stack
+                    .push(BlockKind::CodeBlock(language.clone()));
+                self.output.push_str("<pre><code");
+                if let Some(language) = language {
+                    self.output.push_str(" class=\"language-");
+                    self.output.push_str(&escape_html_attribute(&language));
+                    self.output.push('"');
+                }
+                self.output.push('>');
+            }
+            Tag::List(start) => {
+                let kind = match start {
+                    Some(start) => ListKind::Ordered(start),
+                    None => ListKind::Bullet,
+                };
+                self.ensure_block_spacing();
+                self.list_stack.push(kind);
+            }
+            Tag::Item => {
+                self.ensure_line_start();
+                let indent_level = self.list_stack.len().saturating_sub(1);
+                self.output.push_str(&"  ".repeat(indent_level));
+                match self.list_stack.last_mut() {
+                    Some(ListKind::Bullet) => self.output.push_str("- "),
+                    Some(ListKind::Ordered(next)) => {
+                        let current = *next;
+                        *next += 1;
+                        self.output.push_str(&format!("{current}. "));
+                    }
+                    None => self.output.push_str("- "),
+                }
+                self.list_item_stack.push(indent_level);
+            }
+            Tag::Emphasis => self.output.push_str("<i>"),
+            Tag::Strong => self.output.push_str("<b>"),
+            Tag::Strikethrough => self.output.push_str("<s>"),
+            Tag::Link {
+                link_type,
+                dest_url,
+                ..
+            } => {
+                if matches!(
+                    link_type,
+                    LinkType::Inline | LinkType::Autolink | LinkType::Email
+                ) {
+                    self.output.push_str("<a href=\"");
+                    self.output
+                        .push_str(&escape_html_attribute(dest_url.as_ref()));
+                    self.output.push_str("\">");
+                    self.pending_link = Some(dest_url.to_string());
+                }
+            }
+            Tag::Image {
+                dest_url, title, ..
+            } => {
+                let mut label = String::from("image");
+                if !title.is_empty() {
+                    label.push_str(": ");
+                    label.push_str(title.as_ref());
+                }
+                self.output.push_str("<a href=\"");
+                self.output
+                    .push_str(&escape_html_attribute(dest_url.as_ref()));
+                self.output.push_str("\">");
+                self.output.push_str(&escape_html(&label));
+                self.output.push_str("</a>");
+            }
+            _ => {}
+        }
+    }
+
+    fn end_tag(&mut self, tag: TagEnd) {
+        match tag {
+            TagEnd::Paragraph => {
+                self.block_stack.pop();
+                if !self.in_blockquote() {
+                    self.output.push('\n');
+                }
+            }
+            TagEnd::Heading(_) => {
+                self.block_stack.pop();
+                self.output.push_str("</b>\n");
+            }
+            TagEnd::BlockQuote(_) => {
+                self.block_stack.pop();
+                self.output.push('\n');
+            }
+            TagEnd::CodeBlock => {
+                self.block_stack.pop();
+                self.output.push_str("</code></pre>\n");
+            }
+            TagEnd::List(_) => {
+                self.list_stack.pop();
+                self.output.push('\n');
+            }
+            TagEnd::Item => {
+                self.list_item_stack.pop();
+                self.output.push('\n');
+            }
+            TagEnd::Emphasis => self.output.push_str("</i>"),
+            TagEnd::Strong => self.output.push_str("</b>"),
+            TagEnd::Strikethrough => self.output.push_str("</s>"),
+            TagEnd::Link => {
+                self.pending_link = None;
+                self.output.push_str("</a>");
+            }
+            _ => {}
+        }
+    }
+
+    fn push_text(&mut self, text: &str) {
+        if matches!(self.block_stack.last(), Some(BlockKind::BlockQuote)) {
+            let mut first = true;
+            for line in text.lines() {
+                if !first {
+                    self.output.push('\n');
+                    self.output.push_str("&gt; ");
+                }
+                self.output.push_str(&escape_html(line));
+                first = false;
+            }
+            if text.ends_with('\n') {
+                self.output.push('\n');
+                self.output.push_str("&gt; ");
+            }
+            return;
+        }
+        self.output.push_str(&escape_html(text));
+    }
+
+    fn ensure_block_spacing(&mut self) {
+        if !self.output.is_empty() && !self.output.ends_with("\n\n") {
+            if !self.output.ends_with('\n') {
+                self.output.push('\n');
+            }
+            self.output.push('\n');
+        }
+    }
+
+    fn ensure_line_start(&mut self) {
+        if !self.output.is_empty() && !self.output.ends_with('\n') {
+            self.output.push('\n');
+        }
+    }
+
+    fn in_blockquote(&self) -> bool {
+        self.block_stack
+            .iter()
+            .any(|kind| matches!(kind, BlockKind::BlockQuote))
+    }
+
+    fn finish(mut self) -> String {
+        while self.output.ends_with('\n') {
+            self.output.pop();
+        }
+        self.output
+    }
+}
+
+fn telegram_format_text(markdown: &str) -> TelegramFormattedText {
+    TelegramHtmlRenderer::render(markdown)
+}
+
+fn escape_html(text: &str) -> String {
+    text.chars()
+        .map(|ch| match ch {
+            '&' => "&amp;".to_string(),
+            '<' => "&lt;".to_string(),
+            '>' => "&gt;".to_string(),
+            _ => ch.to_string(),
+        })
+        .collect()
+}
+
+fn escape_html_attribute(text: &str) -> String {
+    escape_html(text).replace('"', "&quot;")
 }
 
 fn telegram_inbound_envelope(
@@ -504,10 +794,13 @@ async fn main() -> Result<()> {
                                 let chat_id = task.get("chat_id").and_then(|id| id.as_str()).unwrap_or_default();
 
                                 if !chat_id.is_empty() {
+                                    let formatted = telegram_format_text(content);
                                     let send_url = format!("{}sendMessage", tg_base);
                                     let payload = json!({
                                         "chat_id": chat_id,
-                                        "text": content
+                                        "text": formatted.text,
+                                        "parse_mode": formatted.parse_mode,
+                                        "disable_web_page_preview": true
                                     });
 
                                     info!("Sending final response back to Telegram Chat [{}]...", chat_id);
@@ -541,7 +834,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{telegram_command, telegram_inbound_envelope};
+    use super::{telegram_command, telegram_format_text, telegram_inbound_envelope};
     use serde_json::json;
 
     #[test]
@@ -654,5 +947,35 @@ mod tests {
         assert_eq!(envelope.content, "Telegram callback action: approve:turn-1");
         assert_eq!(envelope.callback_data.as_deref(), Some("approve:turn-1"));
         assert!(envelope.attachments.is_empty());
+    }
+
+    #[test]
+    fn telegram_formatter_projects_basic_markdown_to_html() {
+        let formatted = telegram_format_text(
+            "# Title\n\n**bold** and *italic* with `code`.\n\n- one\n- two\n\n[link](https://example.com)",
+        );
+
+        assert_eq!(formatted.parse_mode, "HTML");
+        assert_eq!(
+            formatted.text,
+            "<b>Title</b>\n\n<b>bold</b> and <i>italic</i> with <code>code</code>.\n\n- one\n- two\n\n<a href=\"https://example.com\">link</a>"
+        );
+    }
+
+    #[test]
+    fn telegram_formatter_escapes_html_and_preserves_code_blocks() {
+        let formatted = telegram_format_text("```rust\nif a < b && c > d {}\n```");
+
+        assert_eq!(
+            formatted.text,
+            "<pre><code class=\"language-rust\">if a &lt; b &amp;&amp; c &gt; d {}\n</code></pre>"
+        );
+    }
+
+    #[test]
+    fn telegram_formatter_projects_blockquotes_without_raw_html() {
+        let formatted = telegram_format_text("> quoted\n> still quoted");
+
+        assert_eq!(formatted.text, "&gt; quoted\n&gt; still quoted");
     }
 }
