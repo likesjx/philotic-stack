@@ -108,6 +108,35 @@ This gives the system a stable capability-facing request while preserving struct
 
 If everything becomes one giant prompt string, Philotic loses the ability to reason about what can be cached, dropped, summarized, or projected differently per model.
 
+Important invariant:
+
+- structured envelopes must degrade cleanly to a minimal prompt-response path
+
+That means the majority of request fields should remain optional.
+
+The minimum honest request for `text.generate` should be able to look like:
+
+```json
+{
+  "capability": "text.generate",
+  "context": {
+    "active_turn": {
+      "text": "Hello"
+    }
+  }
+}
+```
+
+Everything else should be additive:
+
+- `response_contract` only when extra output channels are desired
+- `identity`, `memory`, and `dialogue_window` only when they are relevant
+- `affordances` only when skills or tools matter for this turn
+- `routing_hints` only when selection needs steering
+- `provider_options` only when provider-specific behavior is actually needed
+
+If a simple prompt-response turn has to impersonate a fully dressed orchestration request, the schema has become more ceremonial than useful.
+
 ## Structured Response Envelope
 
 The response side should follow the same philosophy: do not collapse every model result back into a single text field.
@@ -151,6 +180,35 @@ The response envelope exists to separate:
 - what provenance/provider detail should be preserved without polluting the main semantic result
 
 If the request becomes structured but the response falls back into a glorified string return value, Philotic keeps only half of the optimization seam.
+
+The same optionality rule should apply on the response side.
+
+The minimum honest response for `text.generate` should be able to look like:
+
+```json
+{
+  "capability": "text.generate",
+  "result": {
+    "display_text": "Hello"
+  }
+}
+```
+
+Other response fields should remain optional and appear only when:
+
+- they were requested through `response_contract`
+- they are naturally produced by the provider path
+- downstream systems actually have a use for them
+
+So:
+
+- `spoken_text` is optional
+- `working_memory_delta` is optional
+- `follow_up_questions` are optional
+- `artifacts` are optional
+- `trace` should be available for observability, but consumers should not need it to extract the main answer
+
+This keeps the structured response envelope useful for optimization without turning ordinary prompt-response behavior into a schema tax.
 
 ## Response Channel Recommendation
 
