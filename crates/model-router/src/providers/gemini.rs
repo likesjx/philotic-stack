@@ -1,6 +1,8 @@
-use crate::controller::{ControllerTask, ModelProvider, ProviderOutput, TaskKind};
+use crate::controller::{AttachmentInput, ControllerTask, ModelProvider, ProviderOutput, TaskKind};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde_json::{Value, json};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +87,55 @@ impl GeminiProvider {
         })
     }
 
+    async fn media_request_payload(&self, task: &ControllerTask) -> Result<Value> {
+        let prompt = task
+            .media_prompt()
+            .context("Gemini media task missing prompt")?;
+        let mut parts = vec![json!({ "text": prompt })];
+
+        for attachment in task.media_attachments().iter().filter(|attachment| {
+            attachment
+                .url
+                .as_deref()
+                .map(|url| !url.trim().is_empty())
+                .unwrap_or(false)
+                && attachment
+                    .transport_error
+                    .as_deref()
+                    .map(|error| error.trim().is_empty())
+                    .unwrap_or(true)
+        }) {
+            let mime_type = attachment_mime_type(attachment)
+                .with_context(|| format!("attachment {:?} missing mime type", attachment.kind))?;
+            let url = attachment
+                .url
+                .as_deref()
+                .context("media attachment missing download url")?;
+            let response = self.http_client.get(url).send().await?;
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                bail!(
+                    "failed to fetch media attachment from {}: HTTP {} {}",
+                    url,
+                    status,
+                    body
+                );
+            }
+            let bytes = response.bytes().await?;
+            parts.push(json!({
+                "inline_data": {
+                    "mime_type": mime_type,
+                    "data": BASE64_STANDARD.encode(bytes)
+                }
+            }));
+        }
+
+        Ok(json!({
+            "contents": [{"parts": parts}]
+        }))
+    }
+
     fn parse_response_text(status: reqwest::StatusCode, body: Value) -> String {
         if !status.is_success() {
             if let Some(message) = body
@@ -143,19 +194,24 @@ impl ModelProvider for GeminiProvider {
     }
 
     fn supports(&self, task: &ControllerTask) -> bool {
-        task.kind == TaskKind::TextGenerate
+        matches!(task.kind, TaskKind::TextGenerate | TaskKind::MediaAnalyze)
     }
 
     async fn invoke(&self, task: &ControllerTask) -> Result<ProviderOutput> {
-        let prompt = task
-            .prompt_text()
-            .context("Gemini text task missing prompt")?;
+        let payload = match task.kind {
+            TaskKind::TextGenerate => Self::request_payload(
+                task.prompt_text()
+                    .context("Gemini text task missing prompt")?,
+            ),
+            TaskKind::MediaAnalyze => self.media_request_payload(task).await?,
+            TaskKind::VoiceSynthesize => bail!("Gemini does not support voice synthesis"),
+        };
         let response = self
             .apply_auth_headers(
                 self.http_client
                     .post(self.endpoint_url(task.model.as_deref())?),
             )?
-            .json(&Self::request_payload(prompt))
+            .json(&payload)
             .send()
             .await?;
         let status = response.status();
@@ -180,6 +236,7 @@ impl ModelProvider for GeminiProvider {
 #[cfg(test)]
 mod tests {
     use super::{GeminiAuth, GeminiProvider};
+    use crate::controller::{AttachmentInput, ContextEnvelope, ControllerTask, RoutingHints, TaskKind};
 
     #[test]
     fn prefers_oauth_bearer_over_api_key() {
@@ -288,4 +345,69 @@ mod tests {
             "http://127.0.0.1:40123/v1beta/models/gemini-2.5-flash:generateContent"
         );
     }
+
+    #[test]
+    fn image_attachment_defaults_to_jpeg() {
+        let attachment = AttachmentInput {
+            kind: Some("photo".into()),
+            file_id: Some("photo-1".into()),
+            mime_type: None,
+            url: Some("http://127.0.0.1:9001/download/sha256-1".into()),
+            blob_ref: Some("sha256-1".into()),
+            transport_error: None,
+        };
+
+        assert_eq!(super::attachment_mime_type(&attachment), Some("image/jpeg"));
+    }
+
+    #[test]
+    fn gemini_supports_media_analysis_tasks() {
+        let provider = GeminiProvider::new(
+            reqwest::Client::new(),
+            Some(GeminiAuth::ApiKey("api-key".into())),
+            None,
+        );
+        let task = ControllerTask {
+            kind: TaskKind::MediaAnalyze,
+            provider: None,
+            model: None,
+            prompt: Some("Describe this media".into()),
+            text: None,
+            spoken_text: None,
+            display_text: None,
+            voice: None,
+            voice_id: None,
+            output_format: None,
+            language_code: None,
+            response_contract: Default::default(),
+            context: ContextEnvelope {
+                attachments: vec![AttachmentInput {
+                    kind: Some("voice".into()),
+                    file_id: Some("voice-1".into()),
+                    mime_type: Some("audio/ogg".into()),
+                    url: Some("http://127.0.0.1:9001/download/sha256-2".into()),
+                    blob_ref: Some("sha256-2".into()),
+                    transport_error: None,
+                }],
+                ..Default::default()
+            },
+            affordances: Default::default(),
+            routing_hints: RoutingHints::default(),
+            provider_options: Default::default(),
+        };
+
+        assert!(crate::controller::ModelProvider::supports(&provider, &task));
+    }
+}
+
+fn attachment_mime_type(attachment: &AttachmentInput) -> Option<&str> {
+    attachment
+        .mime_type
+        .as_deref()
+        .or(match attachment.kind.as_deref() {
+            Some("photo") | Some("image") => Some("image/jpeg"),
+            Some("voice") => Some("audio/ogg"),
+            Some("sticker") => Some("image/webp"),
+            _ => None,
+        })
 }
