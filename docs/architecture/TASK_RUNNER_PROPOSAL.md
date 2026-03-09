@@ -20,6 +20,10 @@ Current code already points this way:
 - `workspace.*` tools are classified as `pinned`
 - routed execution already carries runner/incarnation/hotel/environment metadata
 - the current `tool-runner` is functioning as an initial external executor
+- first coding slice landed:
+  - route metadata can now carry `task_runner_kind`
+  - execution payloads can now carry a `task_runner_overlay`
+  - workspace execution uses that overlay to resolve the effective workspace binding
 
 Still pending:
 

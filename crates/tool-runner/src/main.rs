@@ -52,6 +52,18 @@ fn resolve_workspace_path(root: &Path, requested: &str) -> Result<PathBuf, Strin
     Ok(root.join(requested_path))
 }
 
+fn effective_workspace_ref(task: &serde_json::Value) -> Option<String> {
+    task.get("task_runner_overlay")
+        .and_then(|overlay| overlay.get("workspace_ref"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            task.get("workspace_ref")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+}
+
 fn execute_tool(
     tool_name: &str,
     arguments: &serde_json::Value,
@@ -303,10 +315,7 @@ async fn main() -> Result<()> {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("hegemon")
                     .to_string();
-                let workspace_ref = task
-                    .get("workspace_ref")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string);
+                let workspace_ref = effective_workspace_ref(&task);
 
                 let result_content = execute_tool(&tool_name, &arguments, workspace_ref.as_deref());
 
@@ -344,7 +353,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::execute_tool;
+    use super::{effective_workspace_ref, execute_tool};
     use serde_json::json;
     use std::fs;
 
@@ -413,5 +422,20 @@ mod tests {
             temp.path().to_str(),
         );
         assert!(output.contains("missing `query`"));
+    }
+
+    #[test]
+    fn task_runner_overlay_workspace_ref_takes_precedence() {
+        let task = json!({
+            "workspace_ref": "workspace://legacy",
+            "task_runner_overlay": {
+                "workspace_ref": "workspace://overlay"
+            }
+        });
+
+        assert_eq!(
+            effective_workspace_ref(&task).as_deref(),
+            Some("workspace://overlay")
+        );
     }
 }

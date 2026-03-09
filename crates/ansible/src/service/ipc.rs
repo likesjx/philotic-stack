@@ -1228,6 +1228,7 @@ fn compose_tool_assembly(
                         "incarnation_id": serde_json::Value::Null,
                         "hotel_id": serde_json::Value::Null,
                         "environment_id": serde_json::Value::Null,
+                        "task_runner_kind": serde_json::Value::Null,
                         "execution_mode": "local_agent",
                         "availability_state": "live",
                         "selection_reason": "agent_local_tool",
@@ -1266,6 +1267,7 @@ fn compose_tool_assembly(
                         .unwrap_or_else(|| registered.guest_id.clone()),
                     "hotel_id": "local-ansible-01",
                     "environment_id": serde_json::Value::Null,
+                    "task_runner_kind": task_runner_kind_for_tool(tool_name),
                     "execution_mode": execution_mode,
                     "availability_state": if live_runner.is_some() {
                         "live"
@@ -1338,6 +1340,18 @@ fn is_pinned_tool(tool_name: &str) -> bool {
         tool_name,
         "workspace.list" | "workspace.read" | "workspace.search" | "workspace.write"
     )
+}
+
+fn task_runner_kind_for_tool(tool_name: &str) -> Option<&'static str> {
+    if tool_name.starts_with("workspace.") {
+        return Some("workspace");
+    }
+
+    if tool_name.starts_with("shell.") {
+        return Some("shell");
+    }
+
+    None
 }
 
 fn parse_allowed_incarnations(
@@ -1493,6 +1507,7 @@ fn compose_tool_assembly_from_incarnations(
                         "incarnation_id": incarnation.incarnation_id,
                         "hotel_id": incarnation.hotel_id,
                         "environment_id": incarnation.environment_id,
+                        "task_runner_kind": task_runner_kind_for_tool(tool_name),
                         "execution_mode": incarnation.execution_mode,
                         "availability_state": incarnation.availability_state,
                         "selection_reason": selection_reason_for_incarnation(incarnation, &preferences),

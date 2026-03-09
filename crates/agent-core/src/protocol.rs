@@ -153,7 +153,7 @@ impl InboundTaskPayload {
 
 #[cfg(test)]
 mod tests {
-    use super::{InboundTaskPayload, TransportAttachment};
+    use super::{InboundTaskPayload, TaskRunnerOverlay, ToolExecutionPayload, TransportAttachment};
 
     #[test]
     fn session_id_defaults_from_source_and_chat() {
@@ -322,6 +322,41 @@ mod tests {
         assert_eq!(
             payload.session_id_or_default("agent-jane-01"),
             "telegram:1234:42:agent-jane-01"
+        );
+    }
+
+    #[test]
+    fn tool_execution_payload_can_carry_task_runner_overlay() {
+        let payload = ToolExecutionPayload {
+            action: "execute_tool",
+            session_id: "sess-1".into(),
+            turn_id: "turn-1".into(),
+            chat_id: "123".into(),
+            tool_name: "workspace.read".into(),
+            arguments: serde_json::json!({ "path": "README.md" }),
+            execution_mode: "pinned".into(),
+            runner_id: Some("task-runner-workspace-01".into()),
+            incarnation_id: Some("task-runner-workspace-01".into()),
+            hotel_id: Some("local-ansible-01".into()),
+            environment_id: Some("workspace://main".into()),
+            task_runner_kind: Some("workspace".into()),
+            selection_reason: Some("preferred_environment_live".into()),
+            workspace_ref: Some("workspace://main".into()),
+            task_runner_overlay: Some(TaskRunnerOverlay {
+                workspace_ref: Some("workspace://main".into()),
+            }),
+            reply_to: "local-ansible-01".into(),
+            reply_role: "agent".into(),
+            final_reply_to: "local-ansible-01".into(),
+            final_reply_role: "hegemon".into(),
+            final_reply_guest_id: None,
+        };
+
+        let json = serde_json::to_value(&payload).expect("serialize payload");
+        assert_eq!(json["task_runner_kind"], "workspace");
+        assert_eq!(
+            json["task_runner_overlay"]["workspace_ref"],
+            "workspace://main"
         );
     }
 }

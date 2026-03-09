@@ -5,8 +5,7 @@ use crate::r#loop::{
 };
 use crate::protocol::{
     FinalReplyPayload, InboundTaskPayload, ModelRequestPayload, TaskRunnerOverlay,
-    ToolExecutionPayload,
-    TransportAttachment,
+    ToolExecutionPayload, TransportAttachment,
 };
 use crate::session::{SessionState, ToolExecutionRoute, WorkingTurn, merge_session_index};
 use anyhow::Result;
@@ -614,13 +613,16 @@ impl AgentRuntime {
             task_runner_kind: route.task_runner_kind.clone(),
             selection_reason: route.selection_reason.clone(),
             workspace_ref: workspace_ref.clone(),
-            task_runner_overlay: route.task_runner_kind.as_deref().map(|kind| TaskRunnerOverlay {
-                workspace_ref: if kind == "workspace" {
-                    workspace_ref
-                } else {
-                    None
-                },
-            }),
+            task_runner_overlay: route
+                .task_runner_kind
+                .as_deref()
+                .map(|kind| TaskRunnerOverlay {
+                    workspace_ref: if kind == "workspace" {
+                        workspace_ref
+                    } else {
+                        None
+                    },
+                }),
             reply_to: LOCAL_NODE.to_string(),
             reply_role: "agent".into(),
             final_reply_to,
