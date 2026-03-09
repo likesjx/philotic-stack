@@ -114,7 +114,13 @@
 - [x] Define how session bindings identify the owning hegemon component/incarnation for outbound delivery.
 - [x] Define the normalized Telegram ingress envelope and prove it on the current text polling path.
 - [x] Expand `hegemon` polling ingestion beyond `message.text` while keeping one canonical transport-normalization path.
-- [ ] Add Telegram media download/fetch handling on top of normalized attachment metadata.
+- [x] Add an initial Telegram media transport step on top of normalized attachment metadata:
+  - resolve Telegram `file_id` values via `getFile`
+  - download attachment bytes
+  - upload them into the hotel blob service and attach blob refs to the envelope
+- [ ] Extend Telegram media transport:
+  - watched live validation against real Telegram media
+  - downstream media-analysis/transcription routing on top of blob-backed attachments
 - [x] Add an initial Telegram outbound formatting projector in `hegemon`:
   - translate a supported Markdown subset into Telegram-safe HTML `parse_mode`
   - apply it to outbound `sendMessage` replies

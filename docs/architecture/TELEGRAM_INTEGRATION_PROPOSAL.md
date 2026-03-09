@@ -79,7 +79,7 @@ Current repo truth:
 That is a useful membrane slice, but it is not yet a richer Telegram controller:
 
 - slash commands still execute in `agent-core`
-- attachment handling is metadata-first; media download/transcription/vision are not implemented yet
+- attachment handling now resolves `file_id` values through Telegram `getFile`, downloads bytes, and uploads them into the hotel blob service, but downstream media analysis/transcription/vision are not implemented yet
 - polling still does not cover the full Telegram update surface beyond `message` and `callback_query`
 
 ## Current Reality
@@ -311,7 +311,7 @@ Current implementation note:
 
 - the defined envelope now exists in `agent-core::protocol::InboundTaskPayload`
 - the Telegram polling path now populates it for text, captioned media, attachment-only media/file messages, and `callback_query`
-- attachment normalization is metadata-first; media fetch/download remains follow-on work
+- attachment normalization now includes first-hop media transport into blob storage; downstream interpretation remains follow-on work
 
 ## Outbound Formatting
 
