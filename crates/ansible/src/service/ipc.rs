@@ -248,19 +248,33 @@ impl IpcServer {
     async fn deliver_inbound_task(
         inboxes: &InboxRegistry,
         target_role: &str,
+        target_guest_id: Option<&str>,
         task_id: Uuid,
         task_json: String,
     ) {
         let subscribers = {
             let guard = inboxes.lock().await;
-            guard.get(target_role).cloned().unwrap_or_default()
+            let role_subscribers = guard.get(target_role).cloned().unwrap_or_default();
+            match target_guest_id {
+                Some(guest_id) => role_subscribers
+                    .into_iter()
+                    .filter(|subscriber| subscriber.guest_id == guest_id)
+                    .collect(),
+                None => role_subscribers,
+            }
         };
 
         if subscribers.is_empty() {
-            warn!(
-                "No local inbox subscribers for role '{}'; task {} stays ledger-only for now.",
-                target_role, task_id
-            );
+            match target_guest_id {
+                Some(guest_id) => warn!(
+                    "No local inbox subscriber for role '{}' and guest '{}'; task {} stays ledger-only for now.",
+                    target_role, guest_id, task_id
+                ),
+                None => warn!(
+                    "No local inbox subscribers for role '{}'; task {} stays ledger-only for now.",
+                    target_role, task_id
+                ),
+            }
             return;
         }
 
@@ -390,7 +404,8 @@ impl IpcServer {
                     trace: vec![],
                 };
                 let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(env)).await;
-                Self::deliver_inbound_task(inboxes, &target_role, task_id, payload_json).await;
+                Self::deliver_inbound_task(inboxes, &target_role, None, task_id, payload_json)
+                    .await;
                 IpcResponse::success("pub", None)
             }
             IpcRequest::CreateTask {
@@ -425,7 +440,8 @@ impl IpcServer {
                     trace: vec![],
                 };
                 let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(env)).await;
-                Self::deliver_inbound_task(inboxes, &target_role, task_id, payload_json).await;
+                Self::deliver_inbound_task(inboxes, &target_role, None, task_id, payload_json)
+                    .await;
                 IpcResponse::success(
                     "create",
                     Some(serde_json::json!({ "task_id": task_id.to_string() })),
@@ -585,11 +601,12 @@ impl IpcServer {
             IpcRequest::EmitTask {
                 target_node,
                 target_role,
+                target_guest_id,
                 task_json,
             } => {
                 info!(
-                    "EmitTask mapped to TaskInvoke for {}/{}",
-                    target_node, target_role
+                    "EmitTask mapped to TaskInvoke for {}/{} guest={:?}",
+                    target_node, target_role, target_guest_id
                 );
                 let task_id = Uuid::new_v4();
                 if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&task_json) {
@@ -619,7 +636,14 @@ impl IpcServer {
                     trace: vec![],
                 };
                 let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(env)).await;
-                Self::deliver_inbound_task(inboxes, &target_role, task_id, task_json).await;
+                Self::deliver_inbound_task(
+                    inboxes,
+                    &target_role,
+                    target_guest_id.as_deref(),
+                    task_id,
+                    task_json,
+                )
+                .await;
                 IpcResponse::success("emit", None)
             }
         }
@@ -1791,6 +1815,7 @@ mod tests {
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
                 target_role: "agent".into(),
+                target_guest_id: None,
                 task_json: task_payload.clone(),
             })
             .await
@@ -1833,6 +1858,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn emit_task_can_target_specific_guest_within_shared_role() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph: Arc<dyn GraphStorage> = Arc::new(TestGraphStorage);
+        let server = IpcServer::new(socket_path.clone(), dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut sender = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("sender connect");
+        let mut telegram_hegemon = PhiloticClient::connect(GuestIdentity {
+            guest_id: "hegemon-telegram-01".into(),
+            role: "hegemon".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("telegram hegemon connect");
+        let mut whatsapp_hegemon = PhiloticClient::connect(GuestIdentity {
+            guest_id: "hegemon-whatsapp-01".into(),
+            role: "hegemon".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("whatsapp hegemon connect");
+
+        sender
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-ansible-01".into(),
+                target_role: "hegemon".into(),
+                target_guest_id: Some("hegemon-telegram-01".into()),
+                task_json: serde_json::json!({
+                    "action": "send_reply",
+                    "session_id": "telegram:123:agent-jane-01",
+                    "turn_id": "turn-1",
+                    "chat_id": "123",
+                    "content": "hello targeted hegemon"
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit targeted task");
+
+        let targeted = tokio::time::timeout(
+            tokio::time::Duration::from_secs(1),
+            telegram_hegemon.recv_task(),
+        )
+        .await
+        .expect("telegram hegemon should receive targeted task")
+        .expect("telegram hegemon recv should succeed");
+        match targeted {
+            IpcResponse::InboundTask { task_json, .. } => {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("payload should decode");
+                assert_eq!(payload["content"], "hello targeted hegemon");
+            }
+            other => panic!("unexpected telegram hegemon response: {other:?}"),
+        }
+
+        assert!(
+            tokio::time::timeout(
+                tokio::time::Duration::from_millis(150),
+                whatsapp_hegemon.recv_task()
+            )
+            .await
+            .is_err(),
+            "non-target hegemon should not receive guest-targeted task"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
     async fn emit_task_persists_session_and_turn_metadata() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
@@ -1863,6 +1980,7 @@ mod tests {
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
                 target_role: "agent".into(),
+                target_guest_id: None,
                 task_json: serde_json::json!({
                     "source": "telegram",
                     "session_id": "telegram:123:agent-jane-01",
@@ -3027,7 +3145,7 @@ mod tests {
         .expect("agent connect");
         let mut model = PhiloticClient::connect(GuestIdentity {
             guest_id: "model-local".into(),
-            role: "model".into(),
+            role: "model.gemini".into(),
             supported_tools: Vec::new(),
         })
         .await
@@ -3040,6 +3158,7 @@ mod tests {
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
                 target_role: "agent".into(),
+                target_guest_id: None,
                 task_json: serde_json::json!({
                     "source": "telegram",
                     "session_id": session_id,
@@ -3089,7 +3208,8 @@ mod tests {
         agent
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
-                target_role: "model".into(),
+                target_role: "model.gemini".into(),
+                target_guest_id: None,
                 task_json: serde_json::json!({
                     "action": "generate_text",
                     "session_id": session_id,
@@ -3125,6 +3245,7 @@ mod tests {
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
                 target_role: "agent".into(),
+                target_guest_id: None,
                 task_json: serde_json::json!({
                     "action": "model_response",
                     "session_id": session_id,
@@ -3171,6 +3292,7 @@ mod tests {
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
                 target_role: "hegemon".into(),
+                target_guest_id: None,
                 task_json: serde_json::json!({
                     "action": "send_reply",
                     "session_id": session_id,
@@ -3273,7 +3395,7 @@ mod tests {
         .expect("agent connect");
         let mut model = PhiloticClient::connect(GuestIdentity {
             guest_id: "model-local".into(),
-            role: "model".into(),
+            role: "model.gemini".into(),
             supported_tools: Vec::new(),
         })
         .await
@@ -3286,6 +3408,7 @@ mod tests {
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
                 target_role: "agent".into(),
+                target_guest_id: None,
                 task_json: serde_json::json!({
                     "source": "telegram",
                     "session_id": session_id,
@@ -3335,7 +3458,8 @@ mod tests {
         agent
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
-                target_role: "model".into(),
+                target_role: "model.gemini".into(),
+                target_guest_id: None,
                 task_json: serde_json::json!({
                     "action": "generate_text",
                     "session_id": session_id,
@@ -3372,6 +3496,7 @@ mod tests {
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
                 target_role: "agent".into(),
+                target_guest_id: None,
                 task_json: serde_json::json!({
                     "action": "model_response",
                     "agent_action": {
@@ -3425,6 +3550,7 @@ mod tests {
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
                 target_role: "hegemon".into(),
+                target_guest_id: None,
                 task_json: serde_json::json!({
                     "action": "send_reply",
                     "session_id": session_id,

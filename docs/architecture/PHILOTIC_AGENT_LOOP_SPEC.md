@@ -395,7 +395,7 @@ Future required fields:
 
 - `effective_toolset`
 - `effective_skillset`
-- `effective_model_controller`
+- `component_routes`
 - `effective_workspace_ref`
 - `effective_policy`
 

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
+use philotic_client::{is_ipc_disconnect, GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
 use serde_json::json;
 use std::fs;
 use std::io::Read;
@@ -314,6 +314,7 @@ async fn main() -> Result<()> {
                     .send_request(IpcRequest::EmitTask {
                         target_node: reply_to,
                         target_role: reply_role,
+                        target_guest_id: None,
                         task_json: json!({
                             "action": "tool_result",
                             "session_id": session_id,
@@ -329,7 +330,13 @@ async fn main() -> Result<()> {
                     .await?;
             }
             Ok(Ok(_)) => {}
-            Ok(Err(err)) => warn!("IPC Recv error: {}", err),
+            Ok(Err(err)) => {
+                if is_ipc_disconnect(&err) {
+                    info!("Hotel IPC disconnected; tool-runner exiting.");
+                    return Ok(());
+                }
+                warn!("IPC Recv error: {}", err);
+            }
             Err(_) => {}
         }
     }

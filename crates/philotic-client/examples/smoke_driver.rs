@@ -29,6 +29,7 @@ async fn main() -> Result<()> {
         .send_request(IpcRequest::EmitTask {
             target_node: "local-ansible-01".into(),
             target_role: "agent".into(),
+            target_guest_id: None,
             task_json: serde_json::json!({
                 "source": "smoke",
                 "session_id": session_id,
@@ -36,7 +37,8 @@ async fn main() -> Result<()> {
                 "chat_id": chat_id,
                 "content": content,
                 "final_reply_to": "local-ansible-01",
-                "final_reply_role": "hegemon"
+                "final_reply_role": "hegemon",
+                "final_reply_guest_id": "smoke-driver-hegemon"
             })
             .to_string(),
         })

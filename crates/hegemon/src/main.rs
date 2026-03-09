@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
+use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, is_ipc_disconnect};
 use serde_json::{Value, json};
 use std::time::Duration;
 use tracing::{error, info, warn};
@@ -101,6 +101,7 @@ async fn main() -> Result<()> {
                                                 let task_req = IpcRequest::EmitTask {
                                                     target_node: "local-ansible-01".into(),
                                                     target_role: "agent".into(),
+                                                    target_guest_id: None,
                                                     task_json: json!({
                                                         "source": "telegram",
                                                         "session_id": session_id,
@@ -108,7 +109,8 @@ async fn main() -> Result<()> {
                                                         "chat_id": chat_id,
                                                         "content": text,
                                                         "final_reply_to": "local-ansible-01",
-                                                        "final_reply_role": "hegemon"
+                                                        "final_reply_role": "hegemon",
+                                                        "final_reply_guest_id": "hegemon-telegram-01"
                                                     }).to_string(),
                                                 };
 
@@ -165,7 +167,13 @@ async fn main() -> Result<()> {
                         }
                     }
                     Ok(other) => info!("Hegemon received non-task IPC message: {:?}", other),
-                    Err(e) => warn!("IPC Recv error: {}", e),
+                    Err(e) => {
+                        if is_ipc_disconnect(&e) {
+                            info!("Hotel IPC disconnected; hegemon exiting.");
+                            return Ok(());
+                        }
+                        warn!("IPC Recv error: {}", e);
+                    },
                 }
             }
         }

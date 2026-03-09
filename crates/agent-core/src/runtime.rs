@@ -8,7 +8,7 @@ use crate::protocol::{
 };
 use crate::session::{SessionState, ToolExecutionRoute, WorkingTurn, merge_session_index};
 use anyhow::Result;
-use philotic_client::{IpcRequest, IpcResponse, PhiloticClient};
+use philotic_client::{IpcRequest, IpcResponse, PhiloticClient, is_ipc_disconnect};
 use std::collections::HashMap;
 use std::time::Duration;
 use tracing::{error, info, warn};
@@ -17,6 +17,15 @@ use uuid::Uuid;
 pub const AGENT_ID: &str = "agent-jane-01";
 const DEFAULT_REPLY_ROLE: &str = "hegemon";
 const LOCAL_NODE: &str = "local-ansible-01";
+const DEFAULT_TEXT_MODEL_ROLE: &str = "model.gemini";
+
+fn implementation_to_model_role(implementation: &str) -> String {
+    let normalized = implementation
+        .split(['.', '-', '@', '/'])
+        .find(|segment| !segment.is_empty())
+        .unwrap_or("gemini");
+    format!("model.{normalized}")
+}
 
 pub struct AgentRuntime {
     ipc_client: PhiloticClient,
@@ -65,7 +74,13 @@ impl AgentRuntime {
                 Ok(Ok(other)) => {
                     info!("Jane received non-task IPC message: {:?}", other);
                 }
-                Ok(Err(err)) => warn!("IPC Recv error: {}", err),
+                Ok(Err(err)) => {
+                    if is_ipc_disconnect(&err) {
+                        info!("Hotel IPC disconnected; agent-core exiting.");
+                        return Ok(());
+                    }
+                    warn!("IPC Recv error: {}", err);
+                }
                 Err(_) => {}
             }
         }
@@ -93,6 +108,7 @@ impl AgentRuntime {
             .final_reply_role
             .clone()
             .unwrap_or_else(|| DEFAULT_REPLY_ROLE.to_string());
+        let final_reply_guest_id = task.final_reply_guest_id.clone();
 
         self.ensure_session_loaded(&session_id, &source).await?;
 
@@ -115,6 +131,7 @@ impl AgentRuntime {
                             chat_id,
                             final_reply_to,
                             final_reply_role,
+                            final_reply_guest_id,
                             command,
                         )
                         .await;
@@ -137,6 +154,7 @@ impl AgentRuntime {
                 user_content: content.clone(),
                 final_reply_to: final_reply_to.clone(),
                 final_reply_role: final_reply_role.clone(),
+                final_reply_guest_id: final_reply_guest_id.clone(),
                 phase: TurnPhase::Queued,
                 iteration: 0,
                 pending_tool_call: None,
@@ -241,7 +259,7 @@ impl AgentRuntime {
 
         let model_req = ModelRequestPayload {
             action: "generate_text",
-            session_id,
+            session_id: session_id.clone(),
             turn_id,
             prompt: model_prompt,
             user_content: content,
@@ -251,13 +269,22 @@ impl AgentRuntime {
             reply_role: "agent".into(),
             final_reply_to,
             final_reply_role,
+            final_reply_guest_id,
         };
 
-        info!("Asking the Hotel to route inference to the Model Router...");
+        let target_role = self
+            .sessions
+            .get(&session_id)
+            .and_then(|state| state.preferred_component_implementation("text.generate"))
+            .map(implementation_to_model_role)
+            .unwrap_or_else(|| DEFAULT_TEXT_MODEL_ROLE.into());
+
+        info!("Asking the Hotel to route inference to the model controller...");
         self.ipc_client
             .send_request(IpcRequest::EmitTask {
                 target_node: LOCAL_NODE.into(),
-                target_role: "model".into(),
+                target_role,
+                target_guest_id: None,
                 task_json: serde_json::to_string(&model_req)?,
             })
             .await?;
@@ -316,6 +343,7 @@ impl AgentRuntime {
             chat_id,
             final_reply_to,
             final_reply_role,
+            final_reply_guest_id,
             checkpoint_memory_type,
             checkpoint_json,
             index_state,
@@ -338,6 +366,7 @@ impl AgentRuntime {
             let chat_id = active_turn.chat_id.clone();
             let final_reply_to = active_turn.final_reply_to.clone();
             let final_reply_role = active_turn.final_reply_role.clone();
+            let final_reply_guest_id = active_turn.final_reply_guest_id.clone();
             if preapproved {
                 state.clear_pending_approval();
                 state.set_active_turn_phase(TurnPhase::Thinking);
@@ -350,6 +379,7 @@ impl AgentRuntime {
                 chat_id,
                 final_reply_to,
                 final_reply_role,
+                final_reply_guest_id,
                 state.checkpoint_memory_type(),
                 state.checkpoint_json(),
                 state.clone(),
@@ -424,6 +454,7 @@ impl AgentRuntime {
             .send_request(IpcRequest::EmitTask {
                 target_node: final_reply_to,
                 target_role: final_reply_role,
+                target_guest_id: final_reply_guest_id,
                 task_json: serde_json::to_string(&reply_payload)?,
             })
             .await?;
@@ -456,7 +487,7 @@ impl AgentRuntime {
             .await?;
         self.sync_session_index(&index_state).await?;
 
-        let (chat_id, final_reply_to, final_reply_role, workspace_ref, route) = {
+        let (chat_id, final_reply_to, final_reply_role, final_reply_guest_id, workspace_ref, route) = {
             let Some(state) = self.sessions.get(&session_id) else {
                 warn!(
                     "Tool execution requested for unknown session {}",
@@ -480,6 +511,7 @@ impl AgentRuntime {
                 active_turn.chat_id.clone(),
                 active_turn.final_reply_to.clone(),
                 active_turn.final_reply_role.clone(),
+                active_turn.final_reply_guest_id.clone(),
                 state.bindings.effective_workspace_ref.clone(),
                 route,
             )
@@ -503,6 +535,7 @@ impl AgentRuntime {
             reply_role: "agent".into(),
             final_reply_to,
             final_reply_role,
+            final_reply_guest_id,
         };
 
         if route.execution_mode == "local_agent" {
@@ -513,6 +546,7 @@ impl AgentRuntime {
             .send_request(IpcRequest::EmitTask {
                 target_node: route.target_node,
                 target_role: route.target_role,
+                target_guest_id: route.incarnation_id.clone(),
                 task_json: serde_json::to_string(&tool_req)?,
             })
             .await?;
@@ -646,6 +680,7 @@ impl AgentRuntime {
             .send_request(IpcRequest::EmitTask {
                 target_node: completed_turn.final_reply_to,
                 target_role: completed_turn.final_reply_role,
+                target_guest_id: completed_turn.final_reply_guest_id,
                 task_json: serde_json::to_string(&reply_payload)?,
             })
             .await?;
@@ -667,6 +702,7 @@ impl AgentRuntime {
             chat_id,
             final_reply_to,
             final_reply_role,
+            final_reply_guest_id,
         ) = {
             let Some(state) = self.sessions.get_mut(&session_id) else {
                 warn!("Received fail action for unknown session {}", session_id);
@@ -683,6 +719,7 @@ impl AgentRuntime {
             let chat_id = active_turn.chat_id.clone();
             let final_reply_to = active_turn.final_reply_to.clone();
             let final_reply_role = active_turn.final_reply_role.clone();
+            let final_reply_guest_id = active_turn.final_reply_guest_id.clone();
             state.set_active_turn_phase(TurnPhase::Failed);
             (
                 task_id,
@@ -692,6 +729,7 @@ impl AgentRuntime {
                 chat_id,
                 final_reply_to,
                 final_reply_role,
+                final_reply_guest_id,
             )
         };
 
@@ -721,6 +759,7 @@ impl AgentRuntime {
             .send_request(IpcRequest::EmitTask {
                 target_node: final_reply_to,
                 target_role: final_reply_role,
+                target_guest_id: final_reply_guest_id,
                 task_json: serde_json::to_string(&reply_payload)?,
             })
             .await?;
@@ -736,6 +775,7 @@ impl AgentRuntime {
         command_chat_id: String,
         command_reply_to: String,
         command_reply_role: String,
+        command_reply_guest_id: Option<String>,
         command: SlashCommand,
     ) -> Result<()> {
         let pending = self
@@ -751,6 +791,7 @@ impl AgentRuntime {
                             turn.chat_id.clone(),
                             turn.final_reply_to.clone(),
                             turn.final_reply_role.clone(),
+                            turn.final_reply_guest_id.clone(),
                             approval,
                         )
                     })
@@ -765,6 +806,7 @@ impl AgentRuntime {
             original_chat_id,
             original_reply_to,
             original_reply_role,
+            original_reply_guest_id,
             approval,
         )) = pending
         else {
@@ -791,6 +833,7 @@ impl AgentRuntime {
                 .send_request(IpcRequest::EmitTask {
                     target_node: command_reply_to,
                     target_role: command_reply_role,
+                    target_guest_id: command_reply_guest_id,
                     task_json: serde_json::to_string(&reply_payload)?,
                 })
                 .await?;
@@ -910,6 +953,7 @@ impl AgentRuntime {
                     .send_request(IpcRequest::EmitTask {
                         target_node: original_reply_to,
                         target_role: original_reply_role,
+                        target_guest_id: original_reply_guest_id.clone(),
                         task_json: serde_json::to_string(&reply_payload)?,
                     })
                     .await?;
@@ -967,6 +1011,7 @@ impl AgentRuntime {
                     .send_request(IpcRequest::EmitTask {
                         target_node: original_reply_to,
                         target_role: original_reply_role,
+                        target_guest_id: original_reply_guest_id,
                         task_json: serde_json::to_string(&reply_payload)?,
                     })
                     .await?;
@@ -1002,6 +1047,7 @@ impl AgentRuntime {
             task_id,
             final_reply_to,
             final_reply_role,
+            final_reply_guest_id,
             prompt,
             checkpoint_memory_type,
             checkpoint_json,
@@ -1040,6 +1086,7 @@ impl AgentRuntime {
                 active_turn.task_id,
                 active_turn.final_reply_to.clone(),
                 active_turn.final_reply_role.clone(),
+                active_turn.final_reply_guest_id.clone(),
                 prompt,
                 state.checkpoint_memory_type(),
                 state.checkpoint_json(),
@@ -1075,7 +1122,7 @@ impl AgentRuntime {
 
         let model_req = ModelRequestPayload {
             action: "generate_text",
-            session_id,
+            session_id: session_id.clone(),
             turn_id,
             prompt,
             user_content,
@@ -1085,12 +1132,21 @@ impl AgentRuntime {
             reply_role: "agent".into(),
             final_reply_to,
             final_reply_role,
+            final_reply_guest_id,
         };
+
+        let target_role = self
+            .sessions
+            .get(&session_id)
+            .and_then(|state| state.preferred_component_implementation("text.generate"))
+            .map(implementation_to_model_role)
+            .unwrap_or_else(|| DEFAULT_TEXT_MODEL_ROLE.into());
 
         self.ipc_client
             .send_request(IpcRequest::EmitTask {
                 target_node: LOCAL_NODE.into(),
-                target_role: "model".into(),
+                target_role,
+                target_guest_id: None,
                 task_json: serde_json::to_string(&model_req)?,
             })
             .await?;
@@ -1424,6 +1480,7 @@ impl AgentRuntime {
                     arguments: None,
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
                 })
                 .await
             }
@@ -1499,6 +1556,7 @@ impl AgentRuntime {
             .send_request(IpcRequest::EmitTask {
                 target_node: completed_turn.final_reply_to,
                 target_role: completed_turn.final_reply_role,
+                target_guest_id: completed_turn.final_reply_guest_id,
                 task_json: serde_json::to_string(&reply_payload)?,
             })
             .await?;
@@ -1578,10 +1636,10 @@ impl AgentRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::LOCAL_NODE;
+    use super::{DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE};
     use crate::r#loop::{ApprovalRequest, ToolCall};
     use crate::protocol::{FinalReplyPayload, ModelRequestPayload};
-    use crate::session::{ApprovalPolicy, SessionState};
+    use crate::session::{ApprovalPolicy, ComponentRouteBinding, SessionState};
 
     #[test]
     fn model_request_targets_agent_for_reply() {
@@ -1597,11 +1655,53 @@ mod tests {
             reply_role: "agent".into(),
             final_reply_to: LOCAL_NODE.into(),
             final_reply_role: "hegemon".into(),
+            final_reply_guest_id: None,
         };
 
         let json = serde_json::to_value(&request).expect("serialize request");
         assert_eq!(json["reply_role"], "agent");
         assert_eq!(json["final_reply_role"], "hegemon");
+    }
+
+    #[test]
+    fn default_text_model_role_targets_gemini_controller() {
+        assert_eq!(DEFAULT_TEXT_MODEL_ROLE, "model.gemini");
+    }
+
+    #[test]
+    fn implementation_names_map_to_model_roles() {
+        assert_eq!(
+            super::implementation_to_model_role("gemini"),
+            "model.gemini"
+        );
+        assert_eq!(
+            super::implementation_to_model_role("gemini-flash"),
+            "model.gemini"
+        );
+        assert_eq!(
+            super::implementation_to_model_role("elevenlabs-v1"),
+            "model.elevenlabs"
+        );
+    }
+
+    #[test]
+    fn session_component_route_can_override_text_model_implementation() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.bindings.component_routes.push(ComponentRouteBinding {
+            capability: "text.generate".into(),
+            selection_mode: "preferred".into(),
+            implementation: Some("elevenlabs".into()),
+            incarnation: None,
+            preferred_hotel_id: None,
+            preferred_environment_id: None,
+        });
+
+        let target_role = state
+            .preferred_component_implementation("text.generate")
+            .map(super::implementation_to_model_role);
+
+        assert_eq!(target_role.as_deref(), Some("model.elevenlabs"));
     }
 
     #[test]

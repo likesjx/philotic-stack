@@ -39,11 +39,42 @@ all guest processes, and acts as the routing hub for every interaction inside th
 
 ```bash
 # Standard start
-cargo run -p ansible
+cargo run -p ansible -- --hotel local-hotel
 
 # Load initial config
-cargo run -p ansible -- --load-config path/to/config.json
+cargo run -p ansible -- --hotel local-hotel --load-config path/to/config.json
 ```
+
+### Startup Smoke: Hotel-Routed ElevenLabs Voice Sample
+
+```bash
+cargo run -p ansible -- \
+  --hotel startup-test-hotel \
+  --load-config mesh-config.json \
+  --test voice-sample \
+  --test-output /tmp/ansible-startup-voice-sample.mp3 \
+  --test-text "Hello from the Philotic startup test."
+```
+
+### Startup Smoke: Hotel-Routed Text Round-Trip
+
+```bash
+cargo run -p ansible -- \
+  --hotel startup-test-hotel \
+  --load-config mesh-config.json \
+  --test text-roundtrip \
+  --test-text "hello model controller"
+```
+
+`--load-config` accepts either a flat JSON object for backward compatibility or a
+top-level `context_graph` object whose keys are injected into `node_config`. The
+structured form is preferred for secrets like `telegram_bot_token`,
+`gemini_api_key`, `elevenlabs_api_key`, and `elevenlabs_voice_id`.
+
+`--test text-roundtrip` and `--test voice-sample` are startup self-tests. They
+build the required guest binaries, boot the hotel, route a task through the hotel
+IPC plane, verify the reply, and then shut the hotel down. The voice test also
+forces inline audio for the `model.elevenlabs` guest and writes the returned MP3.
 
 ## Architecture Reference
 

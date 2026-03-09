@@ -45,6 +45,19 @@
 - [ ] Define approval interrupt/resume semantics.
 - [ ] Define loop event streaming and tracing payloads.
 
+## New Project: Model Controller
+
+- [x] Define the controller seam so mesh routing (`model.manager.*`) and provider invocation have separate owners.
+- [x] Treat `model-router` as shared SDK/runtime infrastructure instead of the single materialized model guest.
+- [x] Add a provider abstraction in `crates/model-router` and move Gemini invocation behind it.
+- [x] Add separate materialized controller guests for Gemini (`model.gemini`) and ElevenLabs (`model.elevenlabs`).
+- [x] Point the current text-generation path at the Gemini-specific controller role so multiple model guests do not all receive the same task.
+- [x] Add a hotel-startup self-test path for routed ElevenLabs voice synthesis via `ansible --test voice-sample`.
+- [x] Add a hotel-startup self-test path for text model-controller round-trips via `ansible --test text-roundtrip`.
+- [ ] Define the canonical model task envelope for text, voice, structured output, and future multimodal requests.
+- [ ] Add first-class audio artifact delivery from model controller through agent/hegemon or the future voice machine.
+- [ ] Decide whether ElevenLabs stays in the model controller long-term or moves wholly behind the dedicated voice machine.
+
 ## Next Project: Tool Assembly and Routed Execution
 
 - [ ] Review [TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md).
@@ -78,6 +91,31 @@
   - preferred runner
   - route selection reason in `tool_assembly`
 - [ ] Add runner fallback policy and smarter reroute behavior when the preferred route cannot materialize or should be bypassed.
+
+## New Work Item: Telegram Controller
+
+- [x] Research current Telegram Bot API capabilities and identify the transport boundary opportunity.
+- [x] Review webhook ingress with a security-first lens before treating it as a default inbound mode.
+- [x] Accept [TELEGRAM_INTEGRATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_INTEGRATION_PROPOSAL.md) for the current slice:
+  - polling remains the default ingress
+  - webhook support is deferred behind an explicit security contract
+- [x] Review [HEGEMON_COMPONENT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/HEGEMON_COMPONENT_PROPOSAL.md).
+- [x] Define `hegemon` as a component type with transport-specific implementations rather than a single Telegram-named implementation.
+- [x] Mark the generic `final_reply_role = "hegemon"` routing path as transitional and define the first replacement step:
+  - optional guest-specific local delivery via `target_guest_id`
+  - optional turn-level `final_reply_guest_id` preserved through agent/model/hegemon flow
+- [ ] Define how session bindings identify the owning hegemon component/incarnation for outbound delivery.
+- [ ] Define the normalized Telegram ingress envelope for text, commands, callback actions, and attachments.
+- [ ] Expand `hegemon` polling ingestion beyond `message.text` while keeping one canonical transport-normalization path.
+- [ ] Elevate deterministic Telegram slash commands into `hegemon` before the normal agent loop.
+- [ ] Add Telegram delivery primitives for typing state, partial streaming, and final message commit.
+- [ ] Specify webhook config shape and verification behavior:
+  - Telegram secret-token enforcement
+  - request size/time limits
+  - update dedupe/idempotency
+  - tunnel/proxy deployment guidance
+- [ ] Add targeted tests for Telegram normalization and webhook security gates.
+- [ ] Run a Telegram smoke pass for command routing and partial/final delivery before broadening the transport story.
 
 ## Next Project: Personality and Context
 
@@ -152,11 +190,10 @@
 - [ ] Approval UX evolution: add `/preapprove`, `/approval status`, `/approval reset`, and richer session policy editing for constrained transports like Telegram.
 - [ ] Review [TELEGRAM_INTEGRATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_INTEGRATION_PROPOSAL.md).
 - [ ] Review [VOICE_MACHINE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/VOICE_MACHINE_PROPOSAL.md).
-- [ ] Telegram slash-command elevation: raise deterministic `/commands` into `hegemon` before the normal agent loop so Telegram-side testing and operational control become faster and cleaner.
 - [ ] Telegram approval card UX: include request IDs, tool/action names, args summaries, and resolution messages in a more native Telegram approval experience.
-- [ ] Telegram streaming and media UX: define partial delivery, edits vs follow-up messages, and interruption behavior for Telegram replies.
 - [ ] Voice machine design: define STT, TTS, speech-to-speech, transcript generation, and media artifact/session handling.
 - [ ] Nostr communication-plane investigation: evaluate Nostr as a decentralized/event-native transport, with security and privacy-first scrutiny before any implementation.
+- [ ] Loop incarnations and delegation model: explore whether different agent loops should materialize as specialized agent incarnations, and define how delegation, subagents, and loop-specialized workers relate to the primary conversational agent.
 - [ ] Tool runner lifecycle policy: define idle retention, sleep/teardown timing, wake-up thresholds, and environment-specific materialization rules for routed tools.
 - [ ] Runner artifact plane: define builder trust, sandboxing, testing, signing, release, and distribution policy for executable tool runners.
 - [ ] Memory consolidation / dreaming: define how short-term session state becomes long-term memory, including sleep/dream cycles, compaction, and candidate memory backends such as `scryper/miniminddb`.

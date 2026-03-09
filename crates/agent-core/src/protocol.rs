@@ -26,6 +26,8 @@ pub struct InboundTaskPayload {
     pub final_reply_to: Option<String>,
     #[serde(default)]
     pub final_reply_role: Option<String>,
+    #[serde(default)]
+    pub final_reply_guest_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -41,6 +43,8 @@ pub struct ModelRequestPayload {
     pub reply_role: String,
     pub final_reply_to: String,
     pub final_reply_role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_reply_guest_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -77,6 +81,8 @@ pub struct ToolExecutionPayload {
     pub reply_role: String,
     pub final_reply_to: String,
     pub final_reply_role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_reply_guest_id: Option<String>,
 }
 
 impl InboundTaskPayload {
@@ -117,6 +123,7 @@ mod tests {
             arguments: None,
             final_reply_to: None,
             final_reply_role: None,
+            final_reply_guest_id: None,
         };
 
         assert_eq!(
@@ -139,6 +146,7 @@ mod tests {
             arguments: None,
             final_reply_to: None,
             final_reply_role: None,
+            final_reply_guest_id: None,
         };
 
         assert!(payload.is_model_response());
@@ -158,6 +166,7 @@ mod tests {
             arguments: None,
             final_reply_to: None,
             final_reply_role: None,
+            final_reply_guest_id: None,
         };
 
         assert!(payload.is_tool_result());

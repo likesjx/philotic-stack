@@ -18,6 +18,7 @@ pub struct WorkingTurn {
     pub user_content: String,
     pub final_reply_to: String,
     pub final_reply_role: String,
+    pub final_reply_guest_id: Option<String>,
     pub phase: TurnPhase,
     pub iteration: u32,
     pub pending_tool_call: Option<ToolCall>,
@@ -59,6 +60,8 @@ pub struct SessionBindings {
     #[serde(default)]
     pub effective_workspace_ref: Option<String>,
     #[serde(default)]
+    pub component_routes: Vec<ComponentRouteBinding>,
+    #[serde(default)]
     pub effective_model_controller: Option<String>,
     #[serde(default)]
     pub preferred_tool_runner_incarnation: Option<String>,
@@ -70,6 +73,21 @@ pub struct SessionBindings {
     pub preferred_environment_id: Option<String>,
     #[serde(default)]
     pub allowed_tool_runner_incarnations: Vec<ToolRunnerIncarnationBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ComponentRouteBinding {
+    pub capability: String,
+    #[serde(default = "default_selection_mode")]
+    pub selection_mode: String,
+    #[serde(default)]
+    pub implementation: Option<String>,
+    #[serde(default)]
+    pub incarnation: Option<String>,
+    #[serde(default)]
+    pub preferred_hotel_id: Option<String>,
+    #[serde(default)]
+    pub preferred_environment_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -144,6 +162,10 @@ fn default_route_availability() -> String {
 
 fn default_capability_execution_mode() -> String {
     "capability".into()
+}
+
+fn default_selection_mode() -> String {
+    "preferred".into()
 }
 
 #[derive(Debug, Clone)]
@@ -291,6 +313,62 @@ impl SessionState {
         self.bindings.effective_workspace_ref = None;
     }
 
+    pub fn component_route_for_capability(
+        &self,
+        capability: &str,
+    ) -> Option<&ComponentRouteBinding> {
+        self.bindings
+            .component_routes
+            .iter()
+            .find(|route| route.capability == capability)
+    }
+
+    pub fn preferred_component_implementation(&self, capability: &str) -> Option<&str> {
+        self.component_route_for_capability(capability)
+            .and_then(|route| route.implementation.as_deref())
+            .or_else(|| {
+                if capability == "text.generate" {
+                    self.bindings.effective_model_controller.as_deref()
+                } else {
+                    None
+                }
+            })
+    }
+
+    pub fn component_route_summary(&self) -> Option<String> {
+        if !self.bindings.component_routes.is_empty() {
+            return Some(
+                self.bindings
+                    .component_routes
+                    .iter()
+                    .map(|route| {
+                        let mut line =
+                            format!("{} [{}]", route.capability, route.selection_mode.as_str());
+                        if let Some(implementation) = route.implementation.as_deref() {
+                            line.push_str(&format!(" impl={implementation}"));
+                        }
+                        if let Some(incarnation) = route.incarnation.as_deref() {
+                            line.push_str(&format!(" inc={incarnation}"));
+                        }
+                        if let Some(hotel_id) = route.preferred_hotel_id.as_deref() {
+                            line.push_str(&format!(" hotel={hotel_id}"));
+                        }
+                        if let Some(environment_id) = route.preferred_environment_id.as_deref() {
+                            line.push_str(&format!(" env={environment_id}"));
+                        }
+                        line
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            );
+        }
+
+        self.bindings
+            .effective_model_controller
+            .as_deref()
+            .map(|controller| format!("text.generate [legacy] impl={controller}"))
+    }
+
     pub fn tool_is_enabled(&self, tool_name: &str) -> bool {
         if self
             .tool_assembly
@@ -368,15 +446,13 @@ impl SessionState {
             .effective_workspace_ref
             .clone()
             .unwrap_or_else(|| "default".into());
-        let controller = self
-            .bindings
-            .effective_model_controller
-            .clone()
+        let routing = self
+            .component_route_summary()
             .unwrap_or_else(|| "default".into());
 
         format!(
-            "Session status: {}. {}. Toolset: {}. Skillset: {}. Workspace: {}. Model controller: {}.",
-            self.status, active_turn, toolset, skillset, workspace, controller
+            "Session status: {}. {}. Toolset: {}. Skillset: {}. Workspace: {}. Component routes: {}.",
+            self.status, active_turn, toolset, skillset, workspace, routing
         )
     }
 
@@ -593,8 +669,8 @@ impl SessionState {
         if let Some(workspace) = &self.bindings.effective_workspace_ref {
             envelope.push_str(&format!("Workspace: {}.\n", workspace));
         }
-        if let Some(controller) = &self.bindings.effective_model_controller {
-            envelope.push_str(&format!("Model controller: {}.\n", controller));
+        if let Some(routes) = self.component_route_summary() {
+            envelope.push_str(&format!("Component routes: {}.\n", routes));
         }
         if !self.summary_text().is_empty() {
             envelope.push_str(&format!("Recent summary: {}.\n", self.summary_text()));
@@ -623,6 +699,7 @@ impl SessionState {
                 "user_content": turn.user_content,
                 "final_reply_to": turn.final_reply_to,
                 "final_reply_role": turn.final_reply_role,
+                "final_reply_guest_id": turn.final_reply_guest_id,
                 "phase": turn.phase.as_str(),
                 "iteration": turn.iteration,
                 "pending_tool_call": turn.pending_tool_call,
@@ -769,6 +846,10 @@ impl SessionState {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("hegemon")
                     .to_string(),
+                final_reply_guest_id: turn
+                    .get("final_reply_guest_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
                 phase: TurnPhase::from_str(
                     turn.get("phase")
                         .and_then(serde_json::Value::as_str)
@@ -1162,8 +1243,9 @@ fn current_unix_ts() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApprovalPolicy, SessionBindings, SessionState, ToolRunnerIncarnationBinding, WorkingTurn,
-        merge_session_index, session_checkpoint_memory_type,
+        ApprovalPolicy, ComponentRouteBinding, SessionBindings, SessionState,
+        ToolRunnerIncarnationBinding, WorkingTurn, merge_session_index,
+        session_checkpoint_memory_type,
     };
     use crate::r#loop::{ApprovalRequest, ToolCall, TurnPhase};
     use uuid::Uuid;
@@ -1179,6 +1261,7 @@ mod tests {
             user_content: "hello".into(),
             final_reply_to: "local-ansible-01".into(),
             final_reply_role: "hegemon".into(),
+            final_reply_guest_id: Some("hegemon-telegram-01".into()),
             phase: TurnPhase::Queued,
             iteration: 0,
             pending_tool_call: None,
@@ -1189,6 +1272,10 @@ mod tests {
         assert_eq!(checkpoint["session_id"], "sess-1");
         assert_eq!(checkpoint["active_turn"]["turn_id"], "turn-1");
         assert_eq!(checkpoint["active_turn"]["phase"], "queued");
+        assert_eq!(
+            checkpoint["active_turn"]["final_reply_guest_id"],
+            "hegemon-telegram-01"
+        );
         assert!(checkpoint["tool_assembly"].is_object());
     }
 
@@ -1203,6 +1290,7 @@ mod tests {
             user_content: "hello".into(),
             final_reply_to: "local-ansible-01".into(),
             final_reply_role: "hegemon".into(),
+            final_reply_guest_id: None,
             phase: TurnPhase::Queued,
             iteration: 0,
             pending_tool_call: None,
@@ -1274,6 +1362,7 @@ mod tests {
                 effective_toolset: vec!["echo".into(), "workspace.read".into()],
                 effective_skillset: vec!["planning".into()],
                 effective_workspace_ref: Some("workspace://main".into()),
+                component_routes: Vec::new(),
                 effective_model_controller: Some("gemini-flash".into()),
                 preferred_tool_runner_incarnation: None,
                 preferred_tool_runner: None,
@@ -1350,6 +1439,7 @@ mod tests {
             effective_toolset: vec!["echo".into()],
             effective_skillset: vec!["planning".into()],
             effective_workspace_ref: Some("workspace://main".into()),
+            component_routes: Vec::new(),
             effective_model_controller: Some("gemini-flash".into()),
             preferred_tool_runner_incarnation: None,
             preferred_tool_runner: None,
@@ -1405,6 +1495,26 @@ mod tests {
         assert!(text.contains("Session status: paused."));
         assert!(text.contains("Toolset: echo."));
         assert!(text.contains("Workspace: workspace://main."));
+        assert!(text.contains("Component routes: text.generate [legacy] impl=gemini-flash."));
+    }
+
+    #[test]
+    fn component_route_summary_prefers_structured_routes() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.bindings.component_routes.push(ComponentRouteBinding {
+            capability: "text.generate".into(),
+            selection_mode: "preferred".into(),
+            implementation: Some("gemini".into()),
+            incarnation: Some("model-controller-gemini-01".into()),
+            preferred_hotel_id: Some("local-ansible-01".into()),
+            preferred_environment_id: Some("env://local".into()),
+        });
+
+        let summary = state.component_route_summary().expect("route summary");
+        assert!(summary.contains("text.generate [preferred]"));
+        assert!(summary.contains("impl=gemini"));
+        assert!(summary.contains("inc=model-controller-gemini-01"));
     }
 
     #[test]
@@ -1619,6 +1729,7 @@ mod tests {
             user_content: "hello".into(),
             final_reply_to: "local-ansible-01".into(),
             final_reply_role: "hegemon".into(),
+            final_reply_guest_id: None,
             phase: TurnPhase::Queued,
             iteration: 0,
             pending_tool_call: None,

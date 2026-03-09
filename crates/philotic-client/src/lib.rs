@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::io::ErrorKind;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tracing::{debug, info};
@@ -65,6 +66,8 @@ pub enum IpcRequest {
     EmitTask {
         target_node: String,
         target_role: String,
+        #[serde(default)]
+        target_guest_id: Option<String>,
         task_json: String,
     },
     /// Optimistically push a RAM-based memory apartment update to the Hotel's SQLite Graph
@@ -148,6 +151,24 @@ pub struct PhiloticClient {
     pending_push: VecDeque<IpcResponse>,
 }
 
+pub fn is_ipc_disconnect(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .map(|io_err| {
+                matches!(
+                    io_err.kind(),
+                    ErrorKind::UnexpectedEof
+                        | ErrorKind::BrokenPipe
+                        | ErrorKind::ConnectionReset
+                        | ErrorKind::ConnectionAborted
+                        | ErrorKind::NotConnected
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
 impl PhiloticClient {
     async fn write_frame(&mut self, payload: &[u8]) -> Result<()> {
         let len = u32::try_from(payload.len()).context("IPC payload too large")?;
@@ -182,10 +203,8 @@ impl PhiloticClient {
             .unwrap_or_else(|_| "/tmp/philotic-ansible.sock".to_string())
     }
 
-    /// Connect to the local Ansible daemon automatically, driven by environment variables.
-    /// Default Hotel socket is `/tmp/philotic-ansible.sock` unless `PHILOTIC_HOTEL_SOCKET` is specified.
-    pub async fn connect(identity: GuestIdentity) -> Result<Self> {
-        let socket_path = Self::socket_path();
+    pub async fn connect_at(socket_path: impl AsRef<str>, identity: GuestIdentity) -> Result<Self> {
+        let socket_path = socket_path.as_ref().to_string();
         let stream = UnixStream::connect(&socket_path)
             .await
             .with_context(|| format!("Failed to connect to hotel IPC socket at {}", socket_path))?;
@@ -201,7 +220,6 @@ impl PhiloticClient {
             pending_push: VecDeque::new(),
         };
 
-        // Execute the Registration Handshake
         info!("Registering as Materialized Guest: {:?}", identity);
         let resp = client.send_request(IpcRequest::Register(identity)).await?;
         info!("Ansible Hotel Registration Response: {:?}", resp);
@@ -213,12 +231,16 @@ impl PhiloticClient {
             IpcResponse::Error(msg) => {
                 anyhow::bail!("Hotel rejected registration: {}", msg);
             }
-            _ => {
-                // Success
-            }
+            _ => {}
         }
 
         Ok(client)
+    }
+
+    /// Connect to the local Ansible daemon automatically, driven by environment variables.
+    /// Default Hotel socket is `/tmp/philotic-ansible.sock` unless `PHILOTIC_HOTEL_SOCKET` is specified.
+    pub async fn connect(identity: GuestIdentity) -> Result<Self> {
+        Self::connect_at(Self::socket_path(), identity).await
     }
 
     /// Send an IPC request to the local Ansible
@@ -298,6 +320,7 @@ impl PhiloticClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::ErrorKind;
     use std::path::Path;
     use std::sync::{LazyLock, Mutex as StdMutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -519,5 +542,11 @@ mod tests {
         if Path::new(&socket_path).exists() {
             let _ = std::fs::remove_file(&socket_path);
         }
+    }
+
+    #[test]
+    fn disconnect_detection_matches_unexpected_eof() {
+        let err = anyhow::Error::new(std::io::Error::from(ErrorKind::UnexpectedEof));
+        assert!(is_ipc_disconnect(&err));
     }
 }
