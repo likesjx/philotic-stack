@@ -718,19 +718,28 @@ async fn run_startup_test(
             let telegram_api_base_url = startup_test_telegram_api_base_url(hotel_name);
             let telegram_addr = format!("127.0.0.1:{}", startup_test_telegram_port(hotel_name));
             let telegram_state = Arc::new(FakeTelegramState::default());
-            telegram_state
-                .updates
-                .lock()
-                .expect("updates lock")
-                .push_back(serde_json::json!({
-                    "update_id": 1,
-                    "message": {
-                        "message_id": 1,
-                        "text": text.unwrap_or("hello from telegram startup test"),
-                        "chat": { "id": 777000 },
-                        "from": { "id": 42, "username": "startup_test" }
-                    }
-                }));
+            {
+                let telegram_state = Arc::clone(&telegram_state);
+                let startup_text = text
+                    .unwrap_or("hello from telegram startup test")
+                    .to_string();
+                tokio::spawn(async move {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
+                    telegram_state
+                        .updates
+                        .lock()
+                        .expect("updates lock")
+                        .push_back(serde_json::json!({
+                            "update_id": 1,
+                            "message": {
+                                "message_id": 1,
+                                "text": startup_text,
+                                "chat": { "id": 777000 },
+                                "from": { "id": 42, "username": "startup_test" }
+                            }
+                        }));
+                });
+            }
 
             let listener = tokio::net::TcpListener::bind(&telegram_addr)
                 .await
@@ -746,7 +755,7 @@ async fn run_startup_test(
 
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
-            for attempt in 1..=10 {
+            for attempt in 1..=20 {
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                 let maybe_message = telegram_state
                     .sent_messages
