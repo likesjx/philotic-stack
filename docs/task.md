@@ -82,10 +82,11 @@
 - [x] Define the first vault record schema and context-graph secret references.
 - [x] Begin removing new OAuth access-token storage from plain `node_config` by storing secret refs instead.
 - [x] Define and implement the first hotel-local secret fetch API for guests.
-- [ ] Define envelope-encryption and root-key strategy:
+- [x] Define and implement the first envelope-encryption and root-key strategy:
   - OS keychain / TPM / Secure Enclave preferred
   - cloud KMS/HSM for hosted hotels
   - operator master key only as fallback
+- [ ] Replace the current local root-key bootstrap with stronger platform-native backing beyond basic macOS Keychain item storage.
 - [ ] Define secret lifecycle:
   - create
   - stage

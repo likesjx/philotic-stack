@@ -51,6 +51,8 @@ cargo run -p ansible -- auth google start --provider gemini --client-id YOUR_CLI
 cargo run -p ansible -- auth google validate --provider gemini
 ```
 
+On macOS, the hotel now uses a Keychain-backed vault root key automatically and creates one on first use if needed. `PHILOTIC_VAULT_MASTER_KEY` remains a bootstrap fallback for non-macOS environments or explicit operator override. `PHILOTIC_VAULT_KEY_ID` can scope the Keychain item label when you want separate local vault roots.
+
 ## Architecture Reference
 
 See [docs/architecture/ARCHITECTURE.md](../../docs/architecture/ARCHITECTURE.md).
