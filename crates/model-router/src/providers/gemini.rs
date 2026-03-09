@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde_json::{Value, json};
+use std::borrow::Cow;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GeminiAuth {
@@ -357,7 +358,27 @@ mod tests {
             transport_error: None,
         };
 
-        assert_eq!(super::attachment_mime_type(&attachment), Some("image/jpeg"));
+        assert_eq!(
+            super::attachment_mime_type(&attachment).as_deref(),
+            Some("image/jpeg")
+        );
+    }
+
+    #[test]
+    fn markdown_document_mime_normalizes_to_text_plain() {
+        let attachment = AttachmentInput {
+            kind: Some("document".into()),
+            file_id: Some("doc-1".into()),
+            mime_type: Some("text/x-web-markdown".into()),
+            url: Some("http://127.0.0.1:9001/download/sha256-doc".into()),
+            blob_ref: Some("sha256-doc".into()),
+            transport_error: None,
+        };
+
+        assert_eq!(
+            super::attachment_mime_type(&attachment).as_deref(),
+            Some("text/plain")
+        );
     }
 
     #[test]
@@ -400,14 +421,27 @@ mod tests {
     }
 }
 
-fn attachment_mime_type(attachment: &AttachmentInput) -> Option<&str> {
+fn attachment_mime_type(attachment: &AttachmentInput) -> Option<Cow<'_, str>> {
     attachment
         .mime_type
         .as_deref()
-        .or(match attachment.kind.as_deref() {
-            Some("photo") | Some("image") => Some("image/jpeg"),
-            Some("voice") => Some("audio/ogg"),
-            Some("sticker") => Some("image/webp"),
+        .map(normalize_attachment_mime_type)
+        .or_else(|| match attachment.kind.as_deref() {
+            Some("photo") | Some("image") => Some(Cow::Borrowed("image/jpeg")),
+            Some("voice") => Some(Cow::Borrowed("audio/ogg")),
+            Some("sticker") => Some(Cow::Borrowed("image/webp")),
             _ => None,
         })
+}
+
+fn normalize_attachment_mime_type(mime_type: &str) -> Cow<'_, str> {
+    let normalized = mime_type.trim();
+    if normalized.eq_ignore_ascii_case("text/x-web-markdown")
+        || normalized.eq_ignore_ascii_case("text/markdown")
+        || normalized.eq_ignore_ascii_case("text/x-markdown")
+    {
+        Cow::Borrowed("text/plain")
+    } else {
+        Cow::Borrowed(normalized)
+    }
 }
