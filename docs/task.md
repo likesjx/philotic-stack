@@ -56,6 +56,7 @@
 - [x] Add a hotel-startup self-test path for text model-controller round-trips via `ansible --test text-roundtrip`.
 - [ ] Define the canonical model task envelope for text, voice, structured output, and future multimodal requests.
 - [ ] Add first-class audio artifact delivery from model controller through agent/hegemon or the future voice machine.
+- [ ] Define the agent/model outbound rich-text contract so `agent-core` is not forced to emit transport-specific Markdown quirks for Telegram, WhatsApp, or future hegemon transports.
 - [ ] Decide whether ElevenLabs stays in the model controller long-term or moves wholly behind the dedicated voice machine.
 
 ## Next Project: Tool Assembly and Routed Execution
@@ -114,6 +115,10 @@
 - [x] Define the normalized Telegram ingress envelope and prove it on the current text polling path.
 - [x] Expand `hegemon` polling ingestion beyond `message.text` while keeping one canonical transport-normalization path.
 - [ ] Add Telegram media download/fetch handling on top of normalized attachment metadata.
+- [ ] Add Telegram outbound formatting projection in `hegemon`:
+  - translate model Markdown/rich text into Telegram-safe formatting
+  - choose between `parse_mode` projection and explicit `entities`
+  - account for Telegram text and caption length limits
 - [ ] Elevate deterministic Telegram slash commands into `hegemon` before the normal agent loop.
 - [ ] Add Telegram delivery primitives for typing state, partial streaming, and final message commit.
 - [ ] Specify webhook config shape and verification behavior:

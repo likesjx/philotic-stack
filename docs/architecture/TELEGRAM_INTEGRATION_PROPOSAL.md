@@ -310,8 +310,30 @@ This envelope should become the one object `hegemon` emits into the rest of the 
 Current implementation note:
 
 - the defined envelope now exists in `agent-core::protocol::InboundTaskPayload`
-- the Telegram polling path populates it for text messages, including thread-aware session defaults
-- callback and attachment population remain follow-on work
+- the Telegram polling path now populates it for text, captioned media, attachment-only media/file messages, and `callback_query`
+- attachment normalization is metadata-first; media fetch/download remains follow-on work
+
+## Outbound Formatting
+
+Telegram gives us three real outbound text-formatting paths:
+
+- `parse_mode = MarkdownV2`
+- `parse_mode = HTML`
+- explicit formatting entities instead of parse-mode string parsing
+
+Observed tradeoff:
+
+- `MarkdownV2` is available, but escaping rules are fussy enough that it turns innocent model output into a reliability tax
+- `HTML` is usually easier to project into clean Telegram messages from model-authored Markdown-like text
+- explicit entities are the strongest long-term projection boundary, but they require us to represent formatting structurally instead of as one decorated string
+
+Recommendation:
+
+- near-term: keep model output transport-neutral and let `hegemon` translate a supported Markdown subset into Telegram-safe HTML
+- medium-term: define an outbound rich-text contract above Telegram so `hegemon` can project to explicit Telegram entities without teaching `agent-core` transport-specific markup trivia
+- respect Telegram-specific limits when projecting:
+  - normal message text length after formatting parse
+  - caption length limits for media messages
 
 ## Slash Commands
 
