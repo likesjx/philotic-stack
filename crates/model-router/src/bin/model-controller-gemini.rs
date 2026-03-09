@@ -11,7 +11,12 @@ async fn main() -> Result<()> {
         providers: Box::new(|http_client, configs| {
             vec![std::sync::Arc::new(GeminiProvider::new(
                 http_client,
-                configs.gemini_api_key.clone(),
+                GeminiProvider::auth_from_config(
+                    configs.gemini_oauth_access_token.clone(),
+                    configs.gemini_oauth_project_id.clone(),
+                    configs.gemini_api_key.clone(),
+                ),
+                configs.gemini_base_url.clone(),
             ))]
         }),
     })

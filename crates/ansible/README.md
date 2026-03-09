@@ -39,57 +39,37 @@ all guest processes, and acts as the routing hub for every interaction inside th
 
 ```bash
 # Standard start
-cargo run -p ansible -- --hotel local-hotel
+cargo run -p ansible
 
 # Load initial config
-cargo run -p ansible -- --hotel local-hotel --load-config path/to/config.json
+cargo run -p ansible -- --load-config path/to/config.json
+
+# Start the transitional Gemini OAuth flow
+cargo run -p ansible -- auth google start --provider gemini --client-id YOUR_CLIENT_ID --project-id YOUR_GCP_PROJECT
+
+# Validate the stored Gemini OAuth path with a real Gemini call
+cargo run -p ansible -- auth google validate --provider gemini
+
+# Run the startup text model-controller smoke through the hotel
+cargo run -p ansible -- --hotel startup-test-hotel --load-config mesh-config.json --test text-roundtrip --test-text "hello model controller"
+
+# Run the startup Gemini OAuth smoke through the materialized model-controller guest.
+# This harness seeds a temporary vaulted bearer token and talks to a local fake Gemini endpoint,
+# so it proves the guest-path OAuth contract without depending on live Google.
+cargo run -p ansible -- --hotel startup-test-hotel --test gemini-oauth-roundtrip --test-text "oauth-guest-ok"
+
+# Run the startup voice sample through the hotel
+cargo run -p ansible -- --hotel startup-test-hotel --load-config mesh-config.json --test voice-sample --test-output /tmp/ansible-startup-voice-sample.mp3 --test-text "Hello from the startup voice test."
+
+# Run the startup Telegram controller smoke through the hotel
+cargo run -p ansible -- --hotel startup-test-hotel --test telegram-roundtrip --test-text "hello telegram controller"
 ```
 
-### Startup Smoke: Hotel-Routed ElevenLabs Voice Sample
+On macOS, the hotel now uses a Keychain-backed vault root key automatically and creates one on first use if needed. `PHILOTIC_VAULT_MASTER_KEY` remains a bootstrap fallback for non-macOS environments or explicit operator override. `PHILOTIC_VAULT_KEY_ID` can scope the Keychain item label when you want separate local vault roots.
 
-```bash
-cargo run -p ansible -- \
-  --hotel startup-test-hotel \
-  --load-config mesh-config.json \
-  --test voice-sample \
-  --test-output /tmp/ansible-startup-voice-sample.mp3 \
-  --test-text "Hello from the Philotic startup test."
-```
+`mesh-config.json` can be a flat object or a top-level `context_graph` object. The structured form is preferred for secrets like `telegram_bot_token`, `gemini_api_key`, `elevenlabs_api_key`, and related routing defaults.
 
-### Startup Smoke: Hotel-Routed Text Round-Trip
-
-```bash
-cargo run -p ansible -- \
-  --hotel startup-test-hotel \
-  --load-config mesh-config.json \
-  --test text-roundtrip \
-  --test-text "hello model controller"
-```
-
-### Startup Smoke: Telegram Controller Round-Trip
-
-```bash
-cargo run -p ansible -- \
-  --hotel startup-test-hotel \
-  --load-config mesh-config.json \
-  --test telegram-roundtrip \
-  --test-text "hello telegram controller"
-```
-
-`--load-config` accepts either a flat JSON object for backward compatibility or a
-top-level `context_graph` object whose keys are injected into `node_config`. The
-structured form is preferred for secrets like `telegram_bot_token`,
-`gemini_api_key`, `elevenlabs_api_key`, and `elevenlabs_voice_id`.
-
-`--test text-roundtrip`, `--test telegram-roundtrip`, and `--test voice-sample`
-are startup self-tests. They build the required guest binaries, boot the hotel,
-route a task through the hotel IPC plane, verify the reply, and then shut the
-hotel down. The Telegram smoke points `hegemon` at a local fake Telegram API and
-asserts that the controller sends the expected `sendMessage` replies for text,
-photo, and voice-note inputs. It also points the Gemini controller at a local
-fake Gemini API so the simulated media path exercises real `getFile`, blob
-upload, and multimodal request assembly. The voice test also forces inline
-audio for the `model.elevenlabs` guest and writes the returned MP3.
+Current startup self-tests include `--test text-roundtrip`, `--test gemini-oauth-roundtrip`, `--test telegram-roundtrip`, and `--test voice-sample`.
 
 ## Architecture Reference
 

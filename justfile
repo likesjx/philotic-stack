@@ -17,6 +17,17 @@ start-ansible hotel:
     cargo build --workspace
     cargo run -p ansible -- --hotel {{hotel}} --load-config mesh-config.json
 
+# Start the transitional Gemini OAuth flow through the hotel CLI
+gemini-oauth-start client_id project_id:
+    @echo "Using GOOGLE_CLIENT_SECRET from env if needed by the OAuth client."
+    @echo "On macOS, the hotel will use or create a Keychain-backed vault root key automatically."
+    @echo "PHILOTIC_VAULT_MASTER_KEY remains a fallback for non-macOS or explicit override cases."
+    cargo run -p ansible -- auth google start --provider gemini --client-id {{client_id}} --project-id {{project_id}}
+
+# Validate that stored Gemini OAuth auth can call a real Gemini model
+gemini-oauth-validate:
+    cargo run -p ansible -- auth google validate --provider gemini
+
 # Start the local UAT stack. Ansible will materialize the gateway, agent, model, and tool guests.
 start-ansible-uat:
     @echo "Starting UAT stack on hotel 'local-telegram' using mesh-config.json..."
@@ -58,6 +69,18 @@ format:
 # Create a dedicated Codex worktree for an active thread.
 worktree-create slug base="main":
     ./scripts/codex-worktree.sh create {{slug}} {{base}}
+
+# Bootstrap an implementation workstream with a dedicated sibling worktree and checklist.
+workstream-start slug base="main":
+    ./scripts/codex-workstream.sh start {{slug}} {{base}}
+
+# Show git status plus hot-file overlap for an active workstream.
+workstream-status slug compare_ref="origin/main":
+    ./scripts/codex-workstream.sh status {{slug}} {{compare_ref}}
+
+# Show only hot-file overlap for an active workstream.
+workstream-overlap slug compare_ref="origin/main":
+    ./scripts/codex-workstream.sh overlap {{slug}} {{compare_ref}}
 
 # List registered git worktrees for this repo.
 worktree-list:

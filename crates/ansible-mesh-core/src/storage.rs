@@ -137,6 +137,20 @@ pub struct SessionEventRecord {
     pub created_at: u64,
 }
 
+/// An encrypted secret owned by the hotel vault.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SecretRecord {
+    pub secret_ref: String,
+    pub secret_kind: String,
+    pub scope: String,
+    pub allowed_roles: Vec<String>,
+    pub allowed_guests: Vec<String>,
+    pub ciphertext_b64: String,
+    pub nonce_b64: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
 /// Abstraction over the local Context Graph database.
 pub trait GraphStorage: Send + Sync {
     // ── Node configuration ───────────────────────────────────────────
@@ -152,6 +166,12 @@ pub trait GraphStorage: Send + Sync {
 
     /// Persist (upsert) an arbitrary JSON config value by key.
     fn set_config_value(&self, key: &str, value_json: &str) -> Result<()>;
+
+    /// Persist (upsert) an encrypted vault secret record.
+    fn upsert_secret(&self, secret: &SecretRecord) -> Result<()>;
+
+    /// Load an encrypted vault secret record by secret ref.
+    fn get_secret(&self, secret_ref: &str) -> Result<Option<SecretRecord>>;
 
     /// Load a named hotel record, or `None` if it has not been bootstrapped yet.
     fn get_hotel(&self, hotel_name: &str) -> Result<Option<HotelRecord>>;

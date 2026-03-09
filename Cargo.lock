@@ -65,6 +65,7 @@ dependencies = [
 name = "ansible"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "ansible-mesh-core",
  "anyhow",
  "async-trait",
@@ -90,8 +91,10 @@ dependencies = [
 name = "ansible-mesh-core"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "async-trait",
+ "base64",
  "bincode",
  "hmac",
  "log",

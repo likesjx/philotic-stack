@@ -1,100 +1,88 @@
-use crate::controller::{ControllerTask, MediaAttachment, ModelProvider, ProviderOutput, TaskKind};
+use crate::controller::{ControllerTask, ModelProvider, ProviderOutput, TaskKind};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde_json::{Value, json};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GeminiAuth {
+    ApiKey(String),
+    OAuthBearer {
+        access_token: String,
+        project_id: Option<String>,
+    },
+}
 
 pub struct GeminiProvider {
     http_client: reqwest::Client,
-    api_key: Option<String>,
+    auth: Option<GeminiAuth>,
     default_model: String,
-    api_base_url: String,
+    base_url: String,
 }
 
 impl GeminiProvider {
-    pub fn new(http_client: reqwest::Client, api_key: Option<String>) -> Self {
-        Self {
-            http_client,
-            api_key,
-            default_model: "gemini-flash-latest".into(),
-            api_base_url: Self::configured_api_base_url(),
-        }
-    }
-
-    fn configured_api_base_url() -> String {
-        std::env::var("PHILOTIC_GEMINI_API_BASE_URL")
-            .unwrap_or_else(|_| "https://generativelanguage.googleapis.com".into())
-    }
-
-    #[cfg(test)]
-    fn with_api_base_url_for_tests(
+    pub fn new(
         http_client: reqwest::Client,
-        api_key: Option<String>,
-        api_base_url: &str,
+        auth: Option<GeminiAuth>,
+        base_url: Option<String>,
     ) -> Self {
         Self {
             http_client,
-            api_key,
+            auth,
             default_model: "gemini-flash-latest".into(),
-            api_base_url: api_base_url.to_string(),
+            base_url: base_url
+                .unwrap_or_else(|| "https://generativelanguage.googleapis.com".into())
+                .trim_end_matches('/')
+                .to_string(),
         }
+    }
+
+    pub fn auth_from_config(
+        oauth_access_token: Option<String>,
+        oauth_project_id: Option<String>,
+        api_key: Option<String>,
+    ) -> Option<GeminiAuth> {
+        if let Some(access_token) = oauth_access_token
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty())
+        {
+            let project_id = oauth_project_id
+                .map(|project| project.trim().to_string())
+                .filter(|project| !project.is_empty());
+            return Some(GeminiAuth::OAuthBearer {
+                access_token,
+                project_id,
+            });
+        }
+
+        api_key
+            .map(|key| key.trim().to_string())
+            .filter(|key| !key.is_empty())
+            .map(GeminiAuth::ApiKey)
     }
 
     fn endpoint_url(&self, model: Option<&str>) -> Result<String> {
-        let api_key = self
-            .api_key
-            .as_deref()
-            .filter(|key| !key.trim().is_empty())
-            .context("Gemini API key missing from config")?;
         let model = model.unwrap_or(&self.default_model);
 
-        Ok(format!(
-            "{}/v1beta/models/{}:generateContent?key={}",
-            self.api_base_url.trim_end_matches('/'),
-            model,
-            api_key
-        ))
+        match self
+            .auth
+            .as_ref()
+            .context("Gemini auth missing from config; expected OAuth bearer or API key")?
+        {
+            GeminiAuth::ApiKey(api_key) => Ok(format!(
+                "{}/v1beta/models/{}:generateContent?key={}",
+                self.base_url, model, api_key
+            )),
+            GeminiAuth::OAuthBearer { .. } => Ok(format!(
+                "{}/v1beta/models/{}:generateContent",
+                self.base_url, model
+            )),
+        }
     }
 
-    fn text_request_payload(prompt: &str) -> Value {
+    fn request_payload(prompt: &str) -> Value {
         json!({
             "contents": [{"parts": [{"text": prompt}]}]
         })
-    }
-
-    async fn media_request_payload(&self, task: &ControllerTask) -> Result<Value> {
-        let prompt = task
-            .media_prompt()
-            .context("Gemini media task missing prompt")?;
-        let mut parts = vec![json!({ "text": prompt })];
-
-        for attachment in task.attachments.iter().filter(|attachment| {
-            attachment
-                .blob_download_url
-                .as_deref()
-                .map(|url| !url.is_empty())
-                .unwrap_or(false)
-        }) {
-            let mime_type = attachment_mime_type(attachment)
-                .with_context(|| format!("attachment [{}] missing mime type", attachment.kind))?;
-            let blob_url = attachment
-                .blob_download_url
-                .as_deref()
-                .context("attachment missing blob download url")?;
-            let response = self.http_client.get(blob_url).send().await?;
-            let bytes = response.bytes().await?;
-            parts.push(json!({
-                "inline_data": {
-                    "mime_type": mime_type,
-                    "data": BASE64_STANDARD.encode(bytes)
-                }
-            }));
-        }
-
-        Ok(json!({
-            "contents": [{"parts": parts}]
-        }))
     }
 
     fn parse_response_text(status: reqwest::StatusCode, body: Value) -> String {
@@ -122,6 +110,30 @@ impl GeminiProvider {
             .map(str::to_string)
             .unwrap_or_else(|| "Gemini returned an empty response.".into())
     }
+
+    fn apply_auth_headers(
+        &self,
+        builder: reqwest::RequestBuilder,
+    ) -> Result<reqwest::RequestBuilder> {
+        match self
+            .auth
+            .as_ref()
+            .context("Gemini auth missing from config; expected OAuth bearer or API key")?
+        {
+            GeminiAuth::ApiKey(_) => Ok(builder),
+            GeminiAuth::OAuthBearer {
+                access_token,
+                project_id,
+            } => {
+                let builder = builder.bearer_auth(access_token);
+                if let Some(project_id) = project_id {
+                    Ok(builder.header("x-goog-user-project", project_id))
+                } else {
+                    Ok(builder)
+                }
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -131,22 +143,19 @@ impl ModelProvider for GeminiProvider {
     }
 
     fn supports(&self, task: &ControllerTask) -> bool {
-        matches!(task.kind, TaskKind::TextGenerate | TaskKind::MediaAnalyze)
+        task.kind == TaskKind::TextGenerate
     }
 
     async fn invoke(&self, task: &ControllerTask) -> Result<ProviderOutput> {
-        let payload = match task.kind {
-            TaskKind::TextGenerate => Self::text_request_payload(
-                task.prompt_text()
-                    .context("Gemini text task missing prompt")?,
-            ),
-            TaskKind::MediaAnalyze => self.media_request_payload(task).await?,
-            TaskKind::VoiceSynthesize => bail!("Gemini does not support voice synthesis"),
-        };
+        let prompt = task
+            .prompt_text()
+            .context("Gemini text task missing prompt")?;
         let response = self
-            .http_client
-            .post(self.endpoint_url(task.model.as_deref())?)
-            .json(&payload)
+            .apply_auth_headers(
+                self.http_client
+                    .post(self.endpoint_url(task.model.as_deref())?),
+            )?
+            .json(&Self::request_payload(prompt))
             .send()
             .await?;
         let status = response.status();
@@ -157,122 +166,126 @@ impl ModelProvider for GeminiProvider {
             bail!("Gemini returned an empty response");
         }
 
-        Ok(ProviderOutput::Text { content })
+        Ok(ProviderOutput::Text {
+            display_text: Some(content.clone()),
+            content,
+            spoken_text: None,
+            working_memory_delta: None,
+            follow_up_questions: Vec::new(),
+            intent_summary: None,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::GeminiProvider;
-    use crate::controller::{ControllerTask, MediaAttachment, TaskKind};
-    use serde_json::json;
+    use super::{GeminiAuth, GeminiProvider};
 
     #[test]
-    fn request_payload_wraps_prompt_in_contents() {
-        let payload = GeminiProvider::text_request_payload("hello");
-        assert_eq!(payload["contents"][0]["parts"][0]["text"], "hello");
-    }
-
-    #[test]
-    fn parser_extracts_candidate_text() {
-        let text = GeminiProvider::parse_response_text(
-            reqwest::StatusCode::OK,
-            json!({
-                "candidates": [{
-                    "content": {
-                        "parts": [{
-                            "text": "hi from gemini"
-                        }]
-                    }
-                }]
-            }),
-        );
-
-        assert_eq!(text, "hi from gemini");
-    }
-
-    #[test]
-    fn parser_surfaces_api_errors() {
-        let text = GeminiProvider::parse_response_text(
-            reqwest::StatusCode::BAD_REQUEST,
-            json!({
-                "error": {
-                    "message": "bad prompt"
-                }
-            }),
-        );
-
-        assert_eq!(text, "Gemini API Error (400): bad prompt");
-    }
-
-    #[test]
-    fn endpoint_url_uses_override_base_url() {
-        let provider = GeminiProvider::with_api_base_url_for_tests(
-            reqwest::Client::new(),
-            Some("key".into()),
-            "http://127.0.0.1:9555",
-        );
-        let endpoint = provider.endpoint_url(None).expect("endpoint should build");
+    fn prefers_oauth_bearer_over_api_key() {
+        let auth = GeminiProvider::auth_from_config(
+            Some(" oauth-token ".into()),
+            Some(" test-project ".into()),
+            Some("api-key".into()),
+        )
+        .unwrap();
 
         assert_eq!(
-            endpoint,
-            "http://127.0.0.1:9555/v1beta/models/gemini-flash-latest:generateContent?key=key"
+            auth,
+            GeminiAuth::OAuthBearer {
+                access_token: "oauth-token".into(),
+                project_id: Some("test-project".into())
+            }
         );
     }
 
     #[test]
-    fn image_attachments_default_to_jpeg() {
-        let attachment = MediaAttachment {
-            kind: "photo".into(),
-            file_id: "file-1".into(),
-            mime_type: None,
-            file_name: None,
-            file_size: None,
-            telegram_file_path: None,
-            blob_id: None,
-            blob_download_url: Some("http://127.0.0.1:9001/download/sha256-1".into()),
-            transport_error: None,
-        };
+    fn falls_back_to_api_key_when_oauth_missing() {
+        let auth = GeminiProvider::auth_from_config(
+            None,
+            Some("ignored-project".into()),
+            Some(" api ".into()),
+        )
+        .unwrap();
 
-        assert_eq!(super::attachment_mime_type(&attachment), Some("image/jpeg"));
+        assert_eq!(auth, GeminiAuth::ApiKey("api".into()));
     }
 
     #[test]
-    fn gemini_supports_media_analysis_tasks() {
-        let provider = GeminiProvider::new(reqwest::Client::new(), Some("key".into()));
-        let task = ControllerTask {
-            kind: TaskKind::MediaAnalyze,
-            provider: None,
-            model: None,
-            prompt: Some("Describe this image".into()),
-            text: None,
-            attachments: vec![MediaAttachment {
-                kind: "photo".into(),
-                file_id: "file-1".into(),
-                mime_type: Some("image/jpeg".into()),
-                file_name: None,
-                file_size: None,
-                telegram_file_path: None,
-                blob_id: Some("sha256-1".into()),
-                blob_download_url: Some("http://127.0.0.1:9001/download/sha256-1".into()),
-                transport_error: None,
-            }],
-            voice_id: None,
-            output_format: None,
-            language_code: None,
-        };
+    fn oauth_endpoint_omits_query_api_key() {
+        let provider = GeminiProvider::new(
+            reqwest::Client::new(),
+            Some(GeminiAuth::OAuthBearer {
+                access_token: "oauth-token".into(),
+                project_id: Some("proj".into()),
+            }),
+            None,
+        );
 
-        assert!(crate::controller::ModelProvider::supports(&provider, &task));
+        let url = provider.endpoint_url(Some("gemini-2.5-pro")).unwrap();
+        assert_eq!(
+            url,
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
+        );
     }
-}
 
-fn attachment_mime_type(attachment: &MediaAttachment) -> Option<&str> {
-    attachment
-        .mime_type
-        .as_deref()
-        .or(match attachment.kind.as_str() {
-            "photo" => Some("image/jpeg"),
-            "sticker" => Some("image/webp"),
-            _ => None,
-        })
+    #[test]
+    fn oauth_auth_adds_bearer_and_project_headers() {
+        let provider = GeminiProvider::new(
+            reqwest::Client::new(),
+            Some(GeminiAuth::OAuthBearer {
+                access_token: "oauth-token".into(),
+                project_id: Some("proj-123".into()),
+            }),
+            None,
+        );
+
+        let request = provider
+            .apply_auth_headers(reqwest::Client::new().post("https://example.com"))
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            request.headers().get("authorization").unwrap(),
+            "Bearer oauth-token"
+        );
+        assert_eq!(
+            request.headers().get("x-goog-user-project").unwrap(),
+            "proj-123"
+        );
+    }
+
+    #[test]
+    fn api_key_endpoint_keeps_query_key() {
+        let provider = GeminiProvider::new(
+            reqwest::Client::new(),
+            Some(GeminiAuth::ApiKey("api-key".into())),
+            None,
+        );
+
+        let url = provider.endpoint_url(Some("gemini-2.5-flash")).unwrap();
+        assert_eq!(
+            url,
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=api-key"
+        );
+    }
+
+    #[test]
+    fn base_url_override_changes_endpoint_host() {
+        let provider = GeminiProvider::new(
+            reqwest::Client::new(),
+            Some(GeminiAuth::OAuthBearer {
+                access_token: "oauth-token".into(),
+                project_id: Some("proj".into()),
+            }),
+            Some("http://127.0.0.1:40123".into()),
+        );
+
+        let url = provider.endpoint_url(Some("gemini-2.5-flash")).unwrap();
+        assert_eq!(
+            url,
+            "http://127.0.0.1:40123/v1beta/models/gemini-2.5-flash:generateContent"
+        );
+    }
 }

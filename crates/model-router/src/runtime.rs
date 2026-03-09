@@ -1,6 +1,6 @@
 use crate::controller::{
-    ControllerTask, ModelProvider, ProviderConfigs, ProviderOutput, ProviderRegistry, TaskKind,
-    serialize_audio_artifact,
+    ControllerResponseEnvelope, ControllerTask, ModelProvider, ProviderConfigs, ProviderRegistry,
+    TaskKind,
 };
 use anyhow::Result;
 use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, is_ipc_disconnect};
@@ -48,8 +48,6 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
         .build()?;
-    let provider_configs = ProviderConfigs::load(&mut ipc_client).await?;
-    let providers = ProviderRegistry::new((config.providers)(http_client, &provider_configs));
     let stub_response = std::env::var("PHILOTIC_MODEL_ROUTER_STUB_RESPONSE").ok();
 
     info!(
@@ -82,7 +80,19 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                 if let Some(response_text) =
                     short_circuit_response(&task_value, stub_response.as_deref())
                 {
-                    emit_text_response(&mut ipc_client, &reply, response_text).await?;
+                    emit_text_response(
+                        &mut ipc_client,
+                        &reply,
+                        ControllerResponseEnvelope {
+                            capability: TaskKind::TextGenerate.as_str().to_string(),
+                            content: response_text.clone(),
+                            result: json!({ "display_text": response_text }),
+                            artifacts: Vec::new(),
+                            trace: Default::default(),
+                            provider_output: Value::Null,
+                        },
+                    )
+                    .await?;
                     continue;
                 }
 
@@ -109,6 +119,26 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                     continue;
                 }
 
+                let provider_configs = match ProviderConfigs::load(&mut ipc_client).await {
+                    Ok(configs) => configs,
+                    Err(err) => {
+                        emit_failure(
+                            &mut ipc_client,
+                            &reply,
+                            format!(
+                                "Model controller failed to refresh provider config: {}",
+                                err
+                            ),
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
+                let providers = ProviderRegistry::new((config.providers)(
+                    http_client.clone(),
+                    &provider_configs,
+                ));
+
                 let provider = match providers.resolve(&controller_task) {
                     Ok(provider) => provider,
                     Err(err) => {
@@ -130,12 +160,13 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                 );
 
                 match provider.invoke(&controller_task).await {
-                    Ok(ProviderOutput::Text { content }) => {
-                        emit_text_response(&mut ipc_client, &reply, content).await?;
-                    }
-                    Ok(ProviderOutput::Audio(audio)) => {
-                        let serialized = serialize_audio_artifact(&audio)?;
-                        emit_text_response(&mut ipc_client, &reply, serialized).await?;
+                    Ok(output) => {
+                        let response = ControllerResponseEnvelope::from_output(
+                            &controller_task,
+                            provider.id(),
+                            output,
+                        )?;
+                        emit_text_response(&mut ipc_client, &reply, response).await?;
                     }
                     Err(err) => {
                         error!("Provider invocation failed: {}", err);
@@ -170,93 +201,11 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
 }
 
 fn short_circuit_response(task: &Value, stub_response: Option<&str>) -> Option<String> {
-    let user_content = task
-        .get("user_content")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-
     if let Some(stub_text) = stub_response {
         if task.get("prompt").and_then(Value::as_str).is_some() {
             info!("Model controller stub mode returning deterministic response.");
             return Some(stub_text.to_string());
         }
-    }
-
-    if let Some(echo_text) = user_content.strip_prefix("use echo ") {
-        return Some(
-            json!({
-                "kind": "tool_call",
-                "tool_name": "echo",
-                "arguments": {
-                    "text": echo_text.trim()
-                }
-            })
-            .to_string(),
-        );
-    }
-
-    if let Some(path) = user_content.strip_prefix("use workspace.list ") {
-        return Some(
-            json!({
-                "kind": "tool_call",
-                "tool_name": "workspace.list",
-                "arguments": {
-                    "path": path.trim()
-                }
-            })
-            .to_string(),
-        );
-    }
-
-    if user_content.trim() == "use workspace.list" {
-        return Some(
-            json!({
-                "kind": "tool_call",
-                "tool_name": "workspace.list",
-                "arguments": {
-                    "path": "."
-                }
-            })
-            .to_string(),
-        );
-    }
-
-    if let Some(path) = user_content.strip_prefix("use workspace.read ") {
-        return Some(
-            json!({
-                "kind": "tool_call",
-                "tool_name": "workspace.read",
-                "arguments": {
-                    "path": path.trim()
-                }
-            })
-            .to_string(),
-        );
-    }
-
-    if let Some(steering_note) = user_content.split("[User approval steering]\n").nth(1) {
-        return Some(format!(
-            "Steered approval acknowledged: {}",
-            steering_note.trim()
-        ));
-    }
-
-    if let Some(redirect_note) = user_content
-        .split("[User denied the proposed action. Do this instead]\n")
-        .nth(1)
-    {
-        return Some(format!("Redirected: {}", redirect_note.trim()));
-    }
-
-    if let Some(approval_reason) = user_content.strip_prefix("need approval ") {
-        return Some(
-            json!({
-                "kind": "request_approval",
-                "reason": approval_reason.trim(),
-                "approved_response": format!("Approved: {}", approval_reason.trim())
-            })
-            .to_string(),
-        );
     }
 
     None
@@ -265,20 +214,40 @@ fn short_circuit_response(task: &Value, stub_response: Option<&str>) -> Option<S
 async fn emit_text_response(
     ipc_client: &mut PhiloticClient,
     reply: &ReplyRoute,
-    content: String,
+    response: ControllerResponseEnvelope,
 ) -> Result<()> {
-    let agent_action = agent_action_from_content(&content);
     let reply_req = IpcRequest::EmitTask {
         target_node: reply.reply_to.clone(),
         target_role: reply.reply_role.clone(),
         target_guest_id: None,
         task_json: json!({
             "action": "model_response",
-            "agent_action": agent_action,
+            "agent_action": {
+                "kind": "respond",
+                "content": response.content,
+                "model_result": {
+                    "capability": response.capability,
+                    "result": response.result,
+                    "artifacts": response.artifacts.iter().map(|artifact| {
+                        json!({
+                            "kind": artifact.kind,
+                            "mime_type": artifact.mime_type,
+                            "output_format": artifact.output_format,
+                            "payload": artifact.payload,
+                        })
+                    }).collect::<Vec<_>>(),
+                    "trace": {
+                        "provider": response.trace.provider,
+                        "model": response.trace.model,
+                        "voice": response.trace.voice,
+                    },
+                    "provider_output": response.provider_output,
+                }
+            },
             "session_id": reply.session_id,
             "turn_id": reply.turn_id,
             "chat_id": reply.chat_id,
-            "content": content,
+            "content": response.content,
             "final_reply_to": reply.final_reply_to,
             "final_reply_role": reply.final_reply_role,
             "final_reply_guest_id": reply.final_reply_guest_id
@@ -320,34 +289,18 @@ async fn emit_failure(
     Ok(())
 }
 
-fn agent_action_from_content(content: &str) -> Value {
-    if let Ok(value) = serde_json::from_str::<Value>(content) {
-        if let Some(kind) = value.get("kind").and_then(Value::as_str) {
-            match kind {
-                "tool_call" | "request_approval" | "respond" | "fail" => return value,
-                _ => {}
-            }
-        }
-    }
-
-    json!({
-        "kind": "respond",
-        "content": content
-    })
-}
-
 impl ReplyRoute {
     fn from_task(task: &Value) -> Self {
         Self {
             reply_to: task
                 .get("reply_to")
                 .and_then(Value::as_str)
-                .unwrap_or("hegemon")
+                .unwrap_or("local-ansible-01")
                 .to_string(),
             reply_role: task
                 .get("reply_role")
                 .and_then(Value::as_str)
-                .unwrap_or("hegemon")
+                .unwrap_or("agent")
                 .to_string(),
             final_reply_to: task
                 .get("final_reply_to")

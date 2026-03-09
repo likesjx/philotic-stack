@@ -69,6 +69,14 @@ The same principle should apply to skills and tools:
 
 That keeps token usage lower and reduces the model’s temptation to fondle irrelevant machinery.
 
+This proposal now aligns with the model-controller request envelope split:
+
+- personality/context projections should fill the structured `context` object
+- skills and tools should be projected into a separate `affordances` object
+- the model-controller should receive structured layers, not one flattened prompt blob
+
+That separation matters because semantic context and executable affordances optimize differently and should not be forced into the same trimming path.
+
 ## Projection Layers
 
 The practical projection layers for the first implementation should be:

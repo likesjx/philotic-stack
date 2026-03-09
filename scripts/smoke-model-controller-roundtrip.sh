@@ -21,11 +21,19 @@ echo "Building ansible startup-smoke binary..."
 cargo build -p ansible >/dev/null
 
 echo "Running startup-driven model-controller smoke..."
-"${ROOT_DIR}/target/debug/ansible" \
-  --hotel "${HOTEL_NAME}" \
-  --load-config "${ROOT_DIR}/mesh-config.json" \
-  --test text-roundtrip \
-  --test-text "${PHILOTIC_SMOKE_USER_CONTENT:-hello model controller}" \
-  >"${TMP_DIR}/ansible.log" 2>&1
+if [[ -f "${ROOT_DIR}/mesh-config.json" ]]; then
+  "${ROOT_DIR}/target/debug/ansible" \
+    --hotel "${HOTEL_NAME}" \
+    --load-config "${ROOT_DIR}/mesh-config.json" \
+    --test text-roundtrip \
+    --test-text "${PHILOTIC_SMOKE_USER_CONTENT:-hello model controller}" \
+    >"${TMP_DIR}/ansible.log" 2>&1
+else
+  "${ROOT_DIR}/target/debug/ansible" \
+    --hotel "${HOTEL_NAME}" \
+    --test text-roundtrip \
+    --test-text "${PHILOTIC_SMOKE_USER_CONTENT:-hello model controller}" \
+    >"${TMP_DIR}/ansible.log" 2>&1
+fi
 
 echo "Model-controller smoke round-trip succeeded."

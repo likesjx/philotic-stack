@@ -248,7 +248,11 @@ When multiple conversations or workstreams are active in parallel:
 - let one thread own architectural boundary changes while other threads implement within those boundaries
 - capture assumption-vs-reality gaps quickly, because drift accelerates when work is parallel
 
-Use the repo-local worktree workflow in [docs/worktree-workflow.md](/Users/jaredlikes/code/philotic-stack/docs/worktree-workflow.md).
+Use the repo-local worktree workflow in [parallel-worktree-runbook.md](/Users/jaredlikes/code/philotic-stack/docs/operations/parallel-worktree-runbook.md), and prefer:
+
+- `just workstream-start <slug>`
+- `just workstream-status <slug>`
+- `just workstream-overlap <slug>`
 
 If two threads need the same files and the same architectural decisions at the same time, that is usually a seam problem, not a coordination failure.
 
