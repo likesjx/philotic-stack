@@ -352,15 +352,10 @@ fn default_guest_seed(hotel_name: &str) -> Vec<GuestRecord> {
     ]
 }
 
-fn architect_identity_bundle() -> serde_json::Value {
-    let Some(home) = std::env::var_os("HOME") else {
-        return serde_json::json!({});
-    };
-    let workspace = Path::new(&home).join(".openclaw/architect");
-
+fn identity_bundle_from_workspace(source_agent: &str, workspace: &Path) -> serde_json::Value {
     serde_json::json!({
         "source_kind": "openclaw_workspace",
-        "source_agent": "architect",
+        "source_agent": source_agent,
         "workspace_path": workspace,
         "soul_text": maybe_load_text(&workspace.join("SOUL.md")),
         "identity_text": maybe_load_text(&workspace.join("IDENTITY.md")),
@@ -370,17 +365,31 @@ fn architect_identity_bundle() -> serde_json::Value {
     })
 }
 
+fn default_identity_bundle_for_profile(profile: BuiltInAgentProfile) -> serde_json::Value {
+    let Some(home) = std::env::var_os("HOME") else {
+        return serde_json::json!({});
+    };
+
+    let workspace = match profile.slug {
+        "jane" => Path::new(&home).join(".openclaw/workspace-vps-jane"),
+        "aria" => Path::new(&home).join(".openclaw/architect"),
+        _ => return serde_json::json!({}),
+    };
+
+    identity_bundle_from_workspace(profile.slug, &workspace)
+}
+
 fn builtin_agent_identities() -> [AgentIdentityRecord; 2] {
     [
         AgentIdentityRecord {
             agent_id: JANE_PROFILE.agent_id.into(),
             persona_name: JANE_PROFILE.persona_name.into(),
-            bundle_json: vps_jane_identity_bundle(),
+            bundle_json: default_identity_bundle_for_profile(JANE_PROFILE),
         },
         AgentIdentityRecord {
             agent_id: ARIA_PROFILE.agent_id.into(),
             persona_name: ARIA_PROFILE.persona_name.into(),
-            bundle_json: architect_identity_bundle(),
+            bundle_json: default_identity_bundle_for_profile(ARIA_PROFILE),
         },
     ]
 }
@@ -506,6 +515,32 @@ fn merge_telegram_entries(
     if let Some(allowed_users) = telegram.get("allowed_users") {
         merged.insert("telegram_allowed_users".into(), allowed_users.clone());
     }
+}
+
+fn configured_agent_identity_from_config(
+    config_json: &serde_json::Value,
+    hotel_name: &str,
+) -> Option<AgentIdentityRecord> {
+    let obj = config_json.as_object()?;
+    let hotels = obj.get("hotels")?.as_object()?;
+    let hotel = hotels.get(hotel_name)?.as_object()?;
+    let agents = hotel.get("agents")?.as_object()?;
+    let profile = profile_for_hotel(hotel_name);
+    let agent = agents
+        .get(profile.slug)
+        .or_else(|| agents.get(profile.agent_id))
+        .or_else(|| agents.get("default"))?
+        .as_object()?;
+    let import_workspace = agent.get("import_workspace")?.as_str()?.trim();
+    if import_workspace.is_empty() {
+        return None;
+    }
+
+    Some(AgentIdentityRecord {
+        agent_id: profile.agent_id.into(),
+        persona_name: profile.persona_name.into(),
+        bundle_json: identity_bundle_from_workspace(profile.slug, Path::new(import_workspace)),
+    })
 }
 
 fn enable_guest_test_overrides(
@@ -1584,24 +1619,6 @@ fn assert_fake_gemini_media_request(
     Ok(())
 }
 
-fn vps_jane_identity_bundle() -> serde_json::Value {
-    let Some(home) = std::env::var_os("HOME") else {
-        return serde_json::json!({});
-    };
-    let workspace = Path::new(&home).join(".openclaw/workspace-vps-jane");
-
-    serde_json::json!({
-        "source_kind": "openclaw_workspace",
-        "source_agent": "vps-jane",
-        "workspace_path": workspace,
-        "soul_text": maybe_load_text(&workspace.join("SOUL.md")),
-        "identity_text": maybe_load_text(&workspace.join("IDENTITY.md")),
-        "user_context_text": maybe_load_text(&workspace.join("USER.md")),
-        "agents_text": maybe_load_text(&workspace.join("AGENTS.md")),
-        "memory_summary": maybe_load_text(&workspace.join("MEMORY.md")),
-    })
-}
-
 fn pid_exists(pid: u32) -> bool {
     std::process::Command::new("ps")
         .arg("-p")
@@ -1701,6 +1718,7 @@ async fn main() -> Result<()> {
     let hotel_name = args.hotel.clone();
 
     // Handle Config Loading if requested
+    let mut imported_agent_identity = None;
     if let Some(config_path) = args.load_config {
         info!(
             "Loading configuration from '{}' into the Context Graph...",
@@ -1709,6 +1727,11 @@ async fn main() -> Result<()> {
         let config_data = fs::read_to_string(&config_path).context("Failed to read config file")?;
         let config_json: serde_json::Value =
             serde_json::from_str(&config_data).context("Invalid JSON config file")?;
+
+        if let Some(hotel_name) = hotel_name.as_deref() {
+            imported_agent_identity =
+                configured_agent_identity_from_config(&config_json, hotel_name);
+        }
 
         let entries = extract_context_graph_entries(&config_json, hotel_name.as_deref());
 
@@ -1765,6 +1788,17 @@ async fn main() -> Result<()> {
             .with_context(|| {
                 format!(
                     "Failed to seed agent identity bundle for {}",
+                    identity.agent_id
+                )
+            })?;
+    }
+
+    if let Some(identity) = imported_agent_identity {
+        graph_storage
+            .upsert_agent_identity(&identity)
+            .with_context(|| {
+                format!(
+                    "Failed to seed imported agent identity bundle for {}",
                     identity.agent_id
                 )
             })?;
@@ -2440,6 +2474,31 @@ mod tests {
                     .as_array()
                     .is_some_and(|arr| arr.len() == 1 && arr[0] == "shared-bot")
         }));
+    }
+
+    #[test]
+    fn configured_agent_identity_reads_import_workspace_for_selected_hotel() {
+        let config = serde_json::json!({
+            "hotels": {
+                "aria-architect-hotel": {
+                    "agents": {
+                        "aria": {
+                            "import_workspace": "/tmp/aria-workspace"
+                        }
+                    }
+                }
+            }
+        });
+
+        let identity =
+            super::configured_agent_identity_from_config(&config, "aria-architect-hotel")
+                .expect("aria import workspace should be detected");
+        assert_eq!(identity.agent_id, "agent-aria-01");
+        assert_eq!(identity.persona_name, "Aria");
+        assert_eq!(
+            identity.bundle_json["workspace_path"].as_str(),
+            Some("/tmp/aria-workspace")
+        );
     }
 
     #[test]

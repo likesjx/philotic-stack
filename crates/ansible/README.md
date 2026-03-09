@@ -67,7 +67,7 @@ cargo run -p ansible -- --hotel startup-test-hotel --test telegram-roundtrip --t
 
 On macOS, the hotel now uses a Keychain-backed vault root key automatically and creates one on first use if needed. `PHILOTIC_VAULT_MASTER_KEY` remains a bootstrap fallback for non-macOS environments or explicit operator override. `PHILOTIC_VAULT_KEY_ID` can scope the Keychain item label when you want separate local vault roots.
 
-`mesh-config.json` can be a flat object, a top-level `context_graph` object, or a hotel-structured object. The preferred shape is `hotels.<hotel>.agents.<agent>.telegram` plus optional agent-scoped `model`/`context_graph` sections. On startup, Ansible merges top-level shared keys, then `hotels.default`, then the selected hotel's overlay, and flattens nested agent telegram/model settings into the current runtime config keys.
+`mesh-config.json` can be a flat object, a top-level `context_graph` object, or a hotel-structured object. The preferred shape is `hotels.<hotel>.agents.<agent>.telegram` plus optional agent-scoped `model`, `context_graph`, and `import_workspace` sections. On startup, Ansible merges top-level shared keys, then `hotels.default`, then the selected hotel's overlay, flattens nested agent telegram/model settings into the current runtime config keys, and uses `import_workspace` to seed the selected agent identity bundle from an OpenClaw-style workspace.
 
 Current startup self-tests include `--test text-roundtrip`, `--test gemini-oauth-roundtrip`, `--test telegram-roundtrip`, and `--test voice-sample`.
 
