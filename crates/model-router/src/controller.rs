@@ -25,6 +25,7 @@ impl TaskKind {
 pub struct ResponseContract {
     pub modalities: Vec<String>,
     pub style: Option<String>,
+    pub channels: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -250,6 +251,13 @@ impl ControllerTask {
         self.provider_options.get(key).and_then(Value::as_str)
     }
 
+    pub fn wants_channel(&self, channel: &str) -> bool {
+        self.response_contract
+            .channels
+            .iter()
+            .any(|item| item == channel)
+    }
+
     fn validate(&self) -> Result<()> {
         match self.kind {
             TaskKind::TextGenerate => {
@@ -295,6 +303,17 @@ fn parse_response_contract(value: Option<&Value>) -> ResponseContract {
             .get("style")
             .and_then(Value::as_str)
             .map(str::to_string),
+        channels: object
+            .get("channels")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -511,10 +530,136 @@ pub struct AudioArtifact {
     pub audio_bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TextResult {
+    pub display_text: Option<String>,
+    pub spoken_text: Option<String>,
+    pub working_memory_delta: Option<String>,
+    pub follow_up_questions: Vec<String>,
+    pub intent_summary: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderOutput {
-    Text { content: String },
+    Text {
+        content: String,
+        display_text: Option<String>,
+        spoken_text: Option<String>,
+        working_memory_delta: Option<String>,
+        follow_up_questions: Vec<String>,
+        intent_summary: Option<String>,
+    },
     Audio(AudioArtifact),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResponseArtifact {
+    pub kind: String,
+    pub mime_type: Option<String>,
+    pub output_format: Option<String>,
+    pub payload: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ResponseTrace {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub voice: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControllerResponseEnvelope {
+    pub capability: String,
+    pub content: String,
+    pub result: Value,
+    pub artifacts: Vec<ResponseArtifact>,
+    pub trace: ResponseTrace,
+    pub provider_output: Value,
+}
+
+impl ControllerResponseEnvelope {
+    pub fn from_output(
+        task: &ControllerTask,
+        provider_id: &str,
+        output: ProviderOutput,
+    ) -> Result<Self> {
+        match output {
+            ProviderOutput::Text {
+                content,
+                display_text,
+                spoken_text,
+                working_memory_delta,
+                follow_up_questions,
+                intent_summary,
+            } => {
+                let text_result = TextResult {
+                    display_text: display_text.or_else(|| Some(content.clone())),
+                    spoken_text,
+                    working_memory_delta,
+                    follow_up_questions,
+                    intent_summary,
+                };
+                let result = serialize_text_result(task, &text_result);
+                let content = result
+                    .get("display_text")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&content)
+                    .to_string();
+
+                Ok(Self {
+                    capability: task.kind.as_str().to_string(),
+                    content,
+                    result,
+                    artifacts: Vec::new(),
+                    trace: ResponseTrace {
+                        provider: Some(provider_id.to_string()),
+                        model: task.model.clone(),
+                        voice: None,
+                    },
+                    provider_output: Value::Null,
+                })
+            }
+            ProviderOutput::Audio(audio) => {
+                let serialized_audio = serialize_audio_artifact(&audio)?;
+                Ok(Self {
+                    capability: task.kind.as_str().to_string(),
+                    content: serialized_audio.clone(),
+                    result: json!({
+                        "display_text": task.display_text(),
+                        "spoken_text": task.voice_text(),
+                    }),
+                    artifacts: vec![ResponseArtifact {
+                        kind: "audio".into(),
+                        mime_type: Some(audio.mime_type.clone()),
+                        output_format: Some(audio.output_format.clone()),
+                        payload: serde_json::from_str(&serialized_audio)?,
+                    }],
+                    trace: ResponseTrace {
+                        provider: Some(provider_id.to_string()),
+                        model: Some(audio.model.clone()),
+                        voice: Some(audio.voice_id.clone()),
+                    },
+                    provider_output: Value::Null,
+                })
+            }
+        }
+    }
+}
+
+fn serialize_text_result(task: &ControllerTask, result: &TextResult) -> Value {
+    let channels_requested = !task.response_contract.channels.is_empty();
+    let include_spoken = channels_requested && task.wants_channel("spoken_text");
+    let include_memory = channels_requested && task.wants_channel("working_memory_delta");
+    let include_questions = channels_requested && task.wants_channel("follow_up_questions");
+    let include_intent = channels_requested && task.wants_channel("intent_summary");
+
+    json!({
+        "display_text": result.display_text,
+        "spoken_text": if include_spoken { result.spoken_text.clone() } else { None::<String> },
+        "working_memory_delta": if include_memory { result.working_memory_delta.clone() } else { None::<String> },
+        "follow_up_questions": if include_questions { result.follow_up_questions.clone() } else { Vec::<String>::new() },
+        "intent_summary": if include_intent { result.intent_summary.clone() } else { None::<String> },
+    })
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -684,7 +829,8 @@ async fn fetch_secret_string(
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioArtifact, ControllerTask, ProviderRegistry, TaskKind, serialize_audio_artifact,
+        AudioArtifact, ControllerResponseEnvelope, ControllerTask, ProviderOutput,
+        ProviderRegistry, TaskKind, serialize_audio_artifact,
     };
     use anyhow::Result;
     use async_trait::async_trait;
@@ -801,6 +947,99 @@ mod tests {
             task.affordances.tools[0].name.as_deref(),
             Some("workspace.read")
         );
+    }
+
+    #[test]
+    fn parses_response_contract_channels() {
+        let task = ControllerTask::from_value(&json!({
+            "kind": "text.generate",
+            "context": {
+                "active_turn": {
+                    "text": "hello"
+                }
+            },
+            "response_contract": {
+                "channels": ["display_text", "spoken_text", "working_memory_delta"]
+            }
+        }))
+        .unwrap();
+
+        assert!(task.wants_channel("spoken_text"));
+        assert!(task.wants_channel("working_memory_delta"));
+        assert!(!task.wants_channel("follow_up_questions"));
+    }
+
+    #[test]
+    fn structured_text_response_preserves_minimal_content_path() {
+        let task = ControllerTask::from_value(&json!({
+            "kind": "text.generate",
+            "context": {
+                "active_turn": {
+                    "text": "hello"
+                }
+            }
+        }))
+        .unwrap();
+
+        let response = ControllerResponseEnvelope::from_output(
+            &task,
+            "gemini",
+            ProviderOutput::Text {
+                content: "Hello back".into(),
+                display_text: None,
+                spoken_text: Some("Hello back, warmly.".into()),
+                working_memory_delta: Some("The user greeted the assistant.".into()),
+                follow_up_questions: vec!["How can I help next?".into()],
+                intent_summary: Some("Exchange greetings".into()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.content, "Hello back");
+        assert_eq!(response.result["display_text"], "Hello back");
+        assert!(response.result["spoken_text"].is_null());
+        assert_eq!(response.result["follow_up_questions"], json!([]));
+    }
+
+    #[test]
+    fn structured_text_response_includes_requested_channels() {
+        let task = ControllerTask::from_value(&json!({
+            "kind": "text.generate",
+            "context": {
+                "active_turn": {
+                    "text": "hello"
+                }
+            },
+            "response_contract": {
+                "channels": ["spoken_text", "working_memory_delta", "follow_up_questions", "intent_summary"]
+            }
+        }))
+        .unwrap();
+
+        let response = ControllerResponseEnvelope::from_output(
+            &task,
+            "gemini",
+            ProviderOutput::Text {
+                content: "Hello back".into(),
+                display_text: Some("Hello back".into()),
+                spoken_text: Some("Hello back, warmly.".into()),
+                working_memory_delta: Some("The user greeted the assistant.".into()),
+                follow_up_questions: vec!["How can I help next?".into()],
+                intent_summary: Some("Exchange greetings".into()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.result["spoken_text"], "Hello back, warmly.");
+        assert_eq!(
+            response.result["working_memory_delta"],
+            "The user greeted the assistant."
+        );
+        assert_eq!(
+            response.result["follow_up_questions"],
+            json!(["How can I help next?"])
+        );
+        assert_eq!(response.result["intent_summary"], "Exchange greetings");
     }
 
     #[test]

@@ -85,10 +85,10 @@
   - `active_turn`
   - `attachments`
 - [x] Decide that tools and skills should project separately from semantic context under `affordances`.
-- [ ] Implement the first compatibility-first structured model response seam in `model-router`.
+- [x] Implement the first compatibility-first structured model response seam in `model-router`.
 - [ ] Preserve a first-class minimal prompt-response path with the structured envelope fields remaining mostly optional.
-- [ ] Add initial `response_contract.channels` handling for text-generation requests.
-- [ ] Add first structured response fields for:
+- [x] Add initial `response_contract.channels` handling for text-generation requests.
+- [x] Add first structured response fields for:
   - `display_text`
   - `spoken_text`
   - `working_memory_delta`

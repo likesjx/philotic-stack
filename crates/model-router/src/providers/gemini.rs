@@ -157,7 +157,14 @@ impl ModelProvider for GeminiProvider {
             bail!("Gemini returned an empty response");
         }
 
-        Ok(ProviderOutput::Text { content })
+        Ok(ProviderOutput::Text {
+            display_text: Some(content.clone()),
+            content,
+            spoken_text: None,
+            working_memory_delta: None,
+            follow_up_questions: Vec::new(),
+            intent_summary: None,
+        })
     }
 }
 

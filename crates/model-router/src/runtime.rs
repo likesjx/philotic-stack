@@ -1,6 +1,6 @@
 use crate::controller::{
-    ControllerTask, ModelProvider, ProviderConfigs, ProviderOutput, ProviderRegistry, TaskKind,
-    serialize_audio_artifact,
+    ControllerResponseEnvelope, ControllerTask, ModelProvider, ProviderConfigs, ProviderRegistry,
+    TaskKind,
 };
 use anyhow::Result;
 use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, is_ipc_disconnect};
@@ -80,7 +80,19 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                 if let Some(response_text) =
                     short_circuit_response(&task_value, stub_response.as_deref())
                 {
-                    emit_text_response(&mut ipc_client, &reply, response_text).await?;
+                    emit_text_response(
+                        &mut ipc_client,
+                        &reply,
+                        ControllerResponseEnvelope {
+                            capability: TaskKind::TextGenerate.as_str().to_string(),
+                            content: response_text.clone(),
+                            result: json!({ "display_text": response_text }),
+                            artifacts: Vec::new(),
+                            trace: Default::default(),
+                            provider_output: Value::Null,
+                        },
+                    )
+                    .await?;
                     continue;
                 }
 
@@ -148,12 +160,13 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                 );
 
                 match provider.invoke(&controller_task).await {
-                    Ok(ProviderOutput::Text { content }) => {
-                        emit_text_response(&mut ipc_client, &reply, content).await?;
-                    }
-                    Ok(ProviderOutput::Audio(audio)) => {
-                        let serialized = serialize_audio_artifact(&audio)?;
-                        emit_text_response(&mut ipc_client, &reply, serialized).await?;
+                    Ok(output) => {
+                        let response = ControllerResponseEnvelope::from_output(
+                            &controller_task,
+                            provider.id(),
+                            output,
+                        )?;
+                        emit_text_response(&mut ipc_client, &reply, response).await?;
                     }
                     Err(err) => {
                         error!("Provider invocation failed: {}", err);
@@ -201,7 +214,7 @@ fn short_circuit_response(task: &Value, stub_response: Option<&str>) -> Option<S
 async fn emit_text_response(
     ipc_client: &mut PhiloticClient,
     reply: &ReplyRoute,
-    content: String,
+    response: ControllerResponseEnvelope,
 ) -> Result<()> {
     let reply_req = IpcRequest::EmitTask {
         target_node: reply.reply_to.clone(),
@@ -211,12 +224,30 @@ async fn emit_text_response(
             "action": "model_response",
             "agent_action": {
                 "kind": "respond",
-                "content": content
+                "content": response.content,
+                "model_result": {
+                    "capability": response.capability,
+                    "result": response.result,
+                    "artifacts": response.artifacts.iter().map(|artifact| {
+                        json!({
+                            "kind": artifact.kind,
+                            "mime_type": artifact.mime_type,
+                            "output_format": artifact.output_format,
+                            "payload": artifact.payload,
+                        })
+                    }).collect::<Vec<_>>(),
+                    "trace": {
+                        "provider": response.trace.provider,
+                        "model": response.trace.model,
+                        "voice": response.trace.voice,
+                    },
+                    "provider_output": response.provider_output,
+                }
             },
             "session_id": reply.session_id,
             "turn_id": reply.turn_id,
             "chat_id": reply.chat_id,
-            "content": content,
+            "content": response.content,
             "final_reply_to": reply.final_reply_to,
             "final_reply_role": reply.final_reply_role,
             "final_reply_guest_id": reply.final_reply_guest_id
