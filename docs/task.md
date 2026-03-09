@@ -45,6 +45,54 @@
 - [ ] Define approval interrupt/resume semantics.
 - [ ] Define loop event streaming and tracing payloads.
 
+## New Project: Model Controller
+
+- [ ] Review [MODEL_CONTROLLER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack-model-controller-abstraction/docs/architecture/MODEL_CONTROLLER_PROPOSAL.md).
+- [ ] Define the canonical capability envelope for:
+  - `text.generate`
+  - `voice.synthesize`
+  - `voice.dialogue`
+  - `sound.generate`
+  - `music.generate`
+  - `response.generate`
+- [ ] Add `spoken_text` / expressive speech projection alongside user-visible text.
+- [ ] Define ElevenLabs default-voice pinning plus upstream voice override behavior.
+- [ ] Add Eleven v3 model selection and expressive-tag support without pretending it is the same as the low-latency conversational path.
+- [ ] Define how native-audio multimodal models emit text plus audio without being forced through TTS.
+- [ ] Define Gemini auth modes:
+  - hotel-managed OAuth
+  - API key fallback
+  - possible ADC path
+- [ ] Define hotel CLI OAuth UX:
+  - browser launch
+  - temporary localhost callback listener
+  - token exchange
+  - token storage/refresh
+  - guest handoff
+
+## New Project: Key Vault
+
+- [ ] Review [KEY_VAULT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack-model-controller-abstraction/docs/architecture/KEY_VAULT_PROPOSAL.md).
+- [ ] Define vault record schema and context-graph secret references.
+- [ ] Remove long-term raw secret storage from plain `node_config`.
+- [ ] Define hotel-local secret lease/fetch API for guests.
+- [ ] Define envelope-encryption and root-key strategy:
+  - OS keychain / TPM / Secure Enclave preferred
+  - cloud KMS/HSM for hosted hotels
+  - operator master key only as fallback
+- [ ] Define secret lifecycle:
+  - create
+  - stage
+  - rotate
+  - revoke
+  - rollback
+- [ ] Move Gemini OAuth refresh tokens behind vault references.
+- [ ] Define Telegram-safe secret onboarding:
+  - control-plane command in chat
+  - Mini App or secure browser handoff
+  - no plaintext secret entry in normal chat messages
+- [ ] Define Telegram-safe rotation UX and operator approvals.
+
 ## Next Project: Tool Assembly and Routed Execution
 
 - [ ] Review [TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md).
