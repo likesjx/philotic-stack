@@ -25,16 +25,17 @@ For the current direction:
 
 ## Disposition
 
-Proposed.
+Accepted for current slice.
 
 ## Current Slice
 
-Pin the first design contract for:
+Pin and prove the first design contract for:
 
 - ElevenLabs capability surface and request envelope
 - expressive speech text vs user-visible text
 - native-audio multimodal model support
 - hotel-driven Gemini OAuth UX
+- an upstream producer path for `voice.synthesize`
 
 Linked task surface: [docs/task.md](/Users/jaredlikes/code/philotic-stack-model-controller-abstraction/docs/task.md)
 

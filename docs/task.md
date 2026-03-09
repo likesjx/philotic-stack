@@ -48,6 +48,8 @@
 ## New Project: Model Controller
 
 - [ ] Review [MODEL_CONTROLLER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack-model-controller-abstraction/docs/architecture/MODEL_CONTROLLER_PROPOSAL.md).
+- [x] Land the first `voice.synthesize` request envelope with `display_text`, `spoken_text`, `voice`, `model`, and `provider_options`.
+- [x] Add an upstream producer example that emits the richer `voice.synthesize` envelope through the hotel.
 - [ ] Define the canonical capability envelope for:
   - `text.generate`
   - `voice.synthesize`
