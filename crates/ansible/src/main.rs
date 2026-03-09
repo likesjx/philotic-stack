@@ -252,7 +252,7 @@ const ARIA_PROFILE: BuiltInAgentProfile = BuiltInAgentProfile {
     slug: "aria",
     agent_id: "agent-aria-01",
     persona_name: "Aria",
-    telegram_token_key: "telegram_bot_token_aria",
+    telegram_token_key: "telegram_bot_token",
 };
 
 fn profile_for_hotel(hotel_name: &str) -> BuiltInAgentProfile {
@@ -404,19 +404,48 @@ fn maybe_load_text(path: &Path) -> Option<String> {
 
 fn extract_context_graph_entries(
     config_json: &serde_json::Value,
+    hotel_name: Option<&str>,
 ) -> Vec<(String, serde_json::Value)> {
     let Some(obj) = config_json.as_object() else {
         return Vec::new();
     };
 
+    let mut merged = serde_json::Map::new();
+
     if let Some(context_graph) = obj
         .get("context_graph")
         .and_then(serde_json::Value::as_object)
     {
-        return context_graph
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
+        merged.extend(context_graph.clone());
+    }
+
+    if let Some(hotels) = obj.get("hotels").and_then(serde_json::Value::as_object) {
+        if let Some(default_hotel) = hotels.get("default").and_then(serde_json::Value::as_object) {
+            if let Some(context_graph) = default_hotel
+                .get("context_graph")
+                .and_then(serde_json::Value::as_object)
+            {
+                merged.extend(context_graph.clone());
+            }
+        }
+
+        if let Some(hotel_name) = hotel_name {
+            if let Some(hotel) = hotels
+                .get(hotel_name)
+                .and_then(serde_json::Value::as_object)
+            {
+                if let Some(context_graph) = hotel
+                    .get("context_graph")
+                    .and_then(serde_json::Value::as_object)
+                {
+                    merged.extend(context_graph.clone());
+                }
+            }
+        }
+    }
+
+    if !merged.is_empty() {
+        return merged.into_iter().collect();
     }
 
     obj.iter()
@@ -1614,6 +1643,8 @@ async fn main() -> Result<()> {
     let db_path = Path::new("ansible_context.db");
     let graph_storage = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open(db_path)?;
 
+    let hotel_name = args.hotel.clone();
+
     // Handle Config Loading if requested
     if let Some(config_path) = args.load_config {
         info!(
@@ -1624,7 +1655,7 @@ async fn main() -> Result<()> {
         let config_json: serde_json::Value =
             serde_json::from_str(&config_data).context("Invalid JSON config file")?;
 
-        let entries = extract_context_graph_entries(&config_json);
+        let entries = extract_context_graph_entries(&config_json, hotel_name.as_deref());
 
         if !entries.is_empty() {
             let mut count = 0;
@@ -1648,10 +1679,8 @@ async fn main() -> Result<()> {
         }
     }
 
-    let hotel_name = args
-        .hotel
-        .clone()
-        .context("--hotel is required unless using a subcommand such as `auth`")?;
+    let hotel_name =
+        hotel_name.context("--hotel is required unless using a subcommand such as `auth`")?;
     let startup_test = args.test;
     ensure_builtin_hotel_manifests(&graph_storage)
         .context("Failed to seed built-in hotel manifests")?;
@@ -2243,7 +2272,7 @@ mod tests {
         );
         assert_eq!(
             hegemon["env"]["PHILOTIC_TELEGRAM_BOT_TOKEN_KEY"].as_str(),
-            Some("telegram_bot_token_aria")
+            Some("telegram_bot_token")
         );
         assert_eq!(
             agent["env"]["PHILOTIC_AGENT_ID"].as_str(),
@@ -2255,19 +2284,60 @@ mod tests {
 
     #[test]
     fn context_graph_entries_support_nested_section() {
-        let entries = extract_context_graph_entries(&serde_json::json!({
-            "context_graph": {
-                "telegram_bot_token": "token",
-                "elevenlabs_api_key": "key"
-            },
-            "ignored": {
-                "not": "imported"
-            }
-        }));
+        let entries = extract_context_graph_entries(
+            &serde_json::json!({
+                "context_graph": {
+                    "telegram_bot_token": "token",
+                    "elevenlabs_api_key": "key"
+                },
+                "ignored": {
+                    "not": "imported"
+                }
+            }),
+            None,
+        );
 
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().any(|(key, _)| key == "telegram_bot_token"));
         assert!(entries.iter().any(|(key, _)| key == "elevenlabs_api_key"));
+    }
+
+    #[test]
+    fn context_graph_entries_merge_default_and_hotel_specific_sections() {
+        let entries = extract_context_graph_entries(
+            &serde_json::json!({
+                "context_graph": {
+                    "gemini_api_key": "shared"
+                },
+                "hotels": {
+                    "default": {
+                        "context_graph": {
+                            "telegram_bot_token": "jane-token",
+                            "default_model": "gemini-pro"
+                        }
+                    },
+                    "aria-architect-hotel": {
+                        "context_graph": {
+                            "telegram_bot_token": "aria-token",
+                            "default_model": "gemini-2.5-pro"
+                        }
+                    }
+                }
+            }),
+            Some("aria-architect-hotel"),
+        );
+
+        assert!(
+            entries.iter().any(|(key, value)| {
+                key == "gemini_api_key" && value.as_str() == Some("shared")
+            })
+        );
+        assert!(entries.iter().any(|(key, value)| {
+            key == "telegram_bot_token" && value.as_str() == Some("aria-token")
+        }));
+        assert!(entries.iter().any(|(key, value)| {
+            key == "default_model" && value.as_str() == Some("gemini-2.5-pro")
+        }));
     }
 
     #[test]
