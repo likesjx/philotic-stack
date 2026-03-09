@@ -64,6 +64,19 @@
   - `routing_hints`
   - `provider_options`
 - [x] Implement the first compatibility-first structured model envelope seam in `model-router`.
+- [x] Propose the first structured model response envelope split:
+  - `result`
+  - `artifacts`
+  - `trace`
+  - `provider_output`
+- [x] Define optimization-oriented response channels:
+  - `display_text`
+  - `spoken_text`
+  - `working_memory_delta`
+  - `follow_up_questions`
+  - `intent_summary`
+  - `state_updates`
+  - `delivery_hints`
 - [x] Define canonical context layers for model requests:
   - `instructions`
   - `identity`
@@ -72,6 +85,13 @@
   - `active_turn`
   - `attachments`
 - [x] Decide that tools and skills should project separately from semantic context under `affordances`.
+- [ ] Implement the first compatibility-first structured model response seam in `model-router`.
+- [ ] Add initial `response_contract.channels` handling for text-generation requests.
+- [ ] Add first structured response fields for:
+  - `display_text`
+  - `spoken_text`
+  - `working_memory_delta`
+  - `follow_up_questions`
 - [ ] Add `spoken_text` / expressive speech projection alongside user-visible text.
 - [ ] Define ElevenLabs default-voice pinning plus upstream voice override behavior.
 - [ ] Add Eleven v3 model selection and expressive-tag support without pretending it is the same as the low-latency conversational path.

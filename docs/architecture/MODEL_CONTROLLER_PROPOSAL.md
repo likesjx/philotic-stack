@@ -39,6 +39,7 @@ Pin and prove the first design contract for:
 - a guest-side Gemini auth abstraction that prefers OAuth bearer material over API key fallback
 - a hotel-side Gemini OAuth validation path that proves stored auth can call a real Gemini model
 - a structured model request envelope that separates context layers from routing hints and provider options
+- a structured model response envelope with explicit response channels for optimization-oriented outputs
 
 Linked task surface: [docs/task.md](/Users/jaredlikes/code/philotic-stack-model-controller-abstraction/docs/task.md)
 
@@ -106,6 +107,172 @@ This gives the system a stable capability-facing request while preserving struct
 - routing decisions
 
 If everything becomes one giant prompt string, Philotic loses the ability to reason about what can be cached, dropped, summarized, or projected differently per model.
+
+## Structured Response Envelope
+
+The response side should follow the same philosophy: do not collapse every model result back into a single text field.
+
+Recommended top-level response shape:
+
+- `capability`
+- `result`
+- `artifacts`
+- `trace`
+- `provider_output`
+
+Recommended example:
+
+```json
+{
+  "capability": "text.generate",
+  "result": {
+    "display_text": "...",
+    "spoken_text": null,
+    "working_memory_delta": null,
+    "follow_up_questions": []
+  },
+  "artifacts": [],
+  "trace": {
+    "provider": "gemini",
+    "model": "gemini-2.5-flash"
+  },
+  "provider_output": {}
+}
+```
+
+This should not be a naive mirror of the request envelope just for aesthetic symmetry.
+
+The response envelope exists to separate:
+
+- what the user should see
+- what downstream delivery systems should perform
+- what the runtime should retain for tighter future turns
+- what machine-readable hints the agent or UI can use next
+- what provenance/provider detail should be preserved without polluting the main semantic result
+
+If the request becomes structured but the response falls back into a glorified string return value, Philotic keeps only half of the optimization seam.
+
+## Response Channel Recommendation
+
+The response contract should be able to request explicit result channels such as:
+
+- `display_text`
+- `spoken_text`
+- `working_memory_delta`
+- `follow_up_questions`
+- `intent_summary`
+- `state_updates`
+- `delivery_hints`
+
+These should be requested through `response_contract`, not smuggled in through prompt folklore.
+
+Recommended shape:
+
+```json
+{
+  "response_contract": {
+    "modalities": ["text"],
+    "channels": [
+      "display_text",
+      "spoken_text",
+      "working_memory_delta",
+      "follow_up_questions"
+    ]
+  }
+}
+```
+
+This allows a caller to say:
+
+- ordinary text reply only
+- text plus expressive speech projection
+- text plus session-tightening memory delta
+- text plus suggested next questions
+
+without pretending every turn needs every output.
+
+## Optimization-Oriented Response Channels
+
+### `working_memory_delta`
+
+`working_memory_delta` should be a compact, bounded summary of what should remain active for the next turns.
+
+Why:
+
+- it helps keep a session tight without replaying the whole transcript
+- it can feed session compaction or short-horizon working memory
+- it is more honest than re-scraping the assistant reply later for state
+
+Guardrails:
+
+- it should summarize active state, not rewrite durable memory authority
+- it should be bounded and structured enough to avoid essay sprawl
+- it should be optional per turn
+
+### `spoken_text`
+
+`spoken_text` should be the expressive performable form of the reply.
+
+Why:
+
+- it lets the text model emit delivery-aware speech text directly
+- it gives ElevenLabs and later voice systems a better substrate than raw display prose
+- it keeps performance markup and spoken cadence out of the user-visible text
+
+This channel aligns directly with the earlier ElevenLabs recommendation.
+
+### `follow_up_questions`
+
+`follow_up_questions` should be a list of useful next questions or missing-information prompts.
+
+Why:
+
+- it helps guide future turns
+- it can power UI suggestion chips or agent steering
+- it makes uncertainty and missing inputs explicit
+
+This is a cleaner seam than hoping the model casually remembers to ask smart questions in prose.
+
+### `intent_summary`
+
+`intent_summary` should capture the current user ask in one concise line.
+
+Why:
+
+- useful for routing, labeling, and session summaries
+- can help session management and memory indexing
+- can be easier to trust downstream than scraping the whole response
+
+### `state_updates`
+
+`state_updates` should carry structured facts or decisions that the caller may want to merge into working or session state.
+
+Why:
+
+- this avoids reparsing prose to recover operational state
+- it creates a seam for bounded session updates without making the reply itself do all the jobs
+
+### `delivery_hints`
+
+`delivery_hints` should capture output-shaping metadata such as:
+
+- tone
+- intensity
+- pace
+- style hints
+
+These should stay provider-neutral where possible and only fall into provider-specific formatting at the projection layer.
+
+## Response Boundary Recommendation
+
+Important pushback:
+
+- do not ask the model to emit every structured channel on every turn
+- do not let `working_memory_delta` become a shadow canonical memory store
+- do not force provider-specific audio markup into `display_text`
+- do not treat follow-up suggestions as the same thing as the main answer
+
+The response contract should select only the channels that matter for the current turn, and the runtime should be able to ignore channels it did not ask for.
 
 ## Context Layer Recommendation
 
