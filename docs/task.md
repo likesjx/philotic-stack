@@ -105,9 +105,12 @@
 - [x] Add `ansible --test` startup harness support for:
   - `text-roundtrip`
   - `gemini-oauth-roundtrip`
+  - `telegram-roundtrip`
   - `voice-sample`
 - [x] Add a startup-driven model-controller smoke script for the text round-trip path.
 - [x] Add a startup-driven Gemini OAuth smoke through the materialized model-controller guest.
+- [x] Add a hotel-startup Telegram controller smoke via `ansible --test telegram-roundtrip` using a local fake Telegram API.
+- [x] Extend the startup Telegram smoke so it simulates text, photo, and voice-note ingress and exercises fake-Gemini multimodal requests on top of blob-backed media transport.
 - [ ] Define hotel CLI OAuth UX:
   - browser launch
   - temporary localhost callback listener

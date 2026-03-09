@@ -6,7 +6,7 @@ We have successfully evolved the monolithic ZeroClaw application into a service-
 
 ### 1. The Context Graph
 
-The native `rusqlite` Context Graph is now the absolute Source of Truth for the system's runtime state. The main backend no longer hardcodes API keys or configurations. Keys like `telegram_bot_token` and `gemini_api_key` are dynamically inserted into the SQLite `node_config` table from the `.gitignored` file `mesh-config.json` on boot.
+The native `rusqlite` Context Graph is now the absolute Source of Truth for the system's runtime state. The main backend no longer hardcodes API keys or configurations. Keys like `telegram_bot_token`, `gemini_api_key`, and `elevenlabs_api_key` are dynamically inserted into the SQLite `node_config` table from the `.gitignored` file `mesh-config.json` on boot. The preferred file shape now uses a top-level `context_graph` object so context-graph keys are explicit instead of being inferred from every top-level JSON key.
 
 ### 2. Universal Materialization (The Hotel and Guests)
 

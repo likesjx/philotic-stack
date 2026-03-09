@@ -60,9 +60,16 @@ cargo run -p ansible -- --hotel startup-test-hotel --test gemini-oauth-roundtrip
 
 # Run the startup voice sample through the hotel
 cargo run -p ansible -- --hotel startup-test-hotel --load-config mesh-config.json --test voice-sample --test-output /tmp/ansible-startup-voice-sample.mp3 --test-text "Hello from the startup voice test."
+
+# Run the startup Telegram controller smoke through the hotel
+cargo run -p ansible -- --hotel startup-test-hotel --test telegram-roundtrip --test-text "hello telegram controller"
 ```
 
 On macOS, the hotel now uses a Keychain-backed vault root key automatically and creates one on first use if needed. `PHILOTIC_VAULT_MASTER_KEY` remains a bootstrap fallback for non-macOS environments or explicit operator override. `PHILOTIC_VAULT_KEY_ID` can scope the Keychain item label when you want separate local vault roots.
+
+`mesh-config.json` can be a flat object or a top-level `context_graph` object. The structured form is preferred for secrets like `telegram_bot_token`, `gemini_api_key`, `elevenlabs_api_key`, and related routing defaults.
+
+Current startup self-tests include `--test text-roundtrip`, `--test gemini-oauth-roundtrip`, `--test telegram-roundtrip`, and `--test voice-sample`.
 
 ## Architecture Reference
 

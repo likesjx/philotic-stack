@@ -22,7 +22,8 @@ async fn emit_and_expect(
                 "chat_id": chat_id,
                 "content": content,
                 "final_reply_to": "local-ansible-01",
-                "final_reply_role": "hegemon"
+                "final_reply_role": "hegemon",
+                "final_reply_guest_id": "session-bindings-smoke-hegemon"
             })
             .to_string(),
         })

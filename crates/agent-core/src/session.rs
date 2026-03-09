@@ -18,6 +18,7 @@ pub struct WorkingTurn {
     pub user_content: String,
     pub final_reply_to: String,
     pub final_reply_role: String,
+    pub final_reply_guest_id: Option<String>,
     pub phase: TurnPhase,
     pub iteration: u32,
     pub pending_tool_call: Option<ToolCall>,
@@ -59,6 +60,12 @@ pub struct SessionBindings {
     #[serde(default)]
     pub effective_workspace_ref: Option<String>,
     #[serde(default)]
+    pub workspace_runner_config: Option<TaskRunnerBaseConfig>,
+    #[serde(default)]
+    pub transport_reply_target: Option<TransportReplyTargetBinding>,
+    #[serde(default)]
+    pub component_routes: Vec<ComponentRouteBinding>,
+    #[serde(default)]
     pub effective_model_controller: Option<String>,
     #[serde(default)]
     pub preferred_tool_runner_incarnation: Option<String>,
@@ -70,6 +77,41 @@ pub struct SessionBindings {
     pub preferred_environment_id: Option<String>,
     #[serde(default)]
     pub allowed_tool_runner_incarnations: Vec<ToolRunnerIncarnationBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TaskRunnerBaseConfig {
+    #[serde(default)]
+    pub default_workspace_ref: Option<String>,
+    #[serde(default)]
+    pub allowed_tools: Option<Vec<String>>,
+    #[serde(default)]
+    pub max_read_bytes: Option<usize>,
+    #[serde(default)]
+    pub max_search_results: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TransportReplyTargetBinding {
+    pub target_node: String,
+    pub target_role: String,
+    #[serde(default)]
+    pub target_guest_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ComponentRouteBinding {
+    pub capability: String,
+    #[serde(default = "default_selection_mode")]
+    pub selection_mode: String,
+    #[serde(default)]
+    pub implementation: Option<String>,
+    #[serde(default)]
+    pub incarnation: Option<String>,
+    #[serde(default)]
+    pub preferred_hotel_id: Option<String>,
+    #[serde(default)]
+    pub preferred_environment_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -92,6 +134,10 @@ pub struct ToolExecutionRoute {
     pub hotel_id: Option<String>,
     #[serde(default)]
     pub environment_id: Option<String>,
+    #[serde(default)]
+    pub task_runner_kind: Option<String>,
+    #[serde(default)]
+    pub task_runner_config: Option<TaskRunnerBaseConfig>,
     pub execution_mode: String,
     #[serde(default = "default_route_availability")]
     pub availability_state: String,
@@ -144,6 +190,10 @@ fn default_route_availability() -> String {
 
 fn default_capability_execution_mode() -> String {
     "capability".into()
+}
+
+fn default_selection_mode() -> String {
+    "preferred".into()
 }
 
 #[derive(Debug, Clone)]
@@ -291,6 +341,94 @@ impl SessionState {
         self.bindings.effective_workspace_ref = None;
     }
 
+    pub fn set_transport_reply_target(
+        &mut self,
+        target_node: impl Into<String>,
+        target_role: impl Into<String>,
+        target_guest_id: Option<String>,
+    ) {
+        self.bindings.transport_reply_target = Some(TransportReplyTargetBinding {
+            target_node: target_node.into(),
+            target_role: target_role.into(),
+            target_guest_id,
+        });
+    }
+
+    pub fn transport_reply_target(&self) -> Option<&TransportReplyTargetBinding> {
+        self.bindings.transport_reply_target.as_ref()
+    }
+
+    pub fn resolved_transport_reply_target(
+        &self,
+        fallback_node: impl Into<String>,
+        fallback_role: impl Into<String>,
+        fallback_guest_id: Option<String>,
+    ) -> TransportReplyTargetBinding {
+        self.transport_reply_target()
+            .cloned()
+            .unwrap_or_else(|| TransportReplyTargetBinding {
+                target_node: fallback_node.into(),
+                target_role: fallback_role.into(),
+                target_guest_id: fallback_guest_id,
+            })
+    }
+
+    pub fn component_route_for_capability(
+        &self,
+        capability: &str,
+    ) -> Option<&ComponentRouteBinding> {
+        self.bindings
+            .component_routes
+            .iter()
+            .find(|route| route.capability == capability)
+    }
+
+    pub fn preferred_component_implementation(&self, capability: &str) -> Option<&str> {
+        self.component_route_for_capability(capability)
+            .and_then(|route| route.implementation.as_deref())
+            .or_else(|| {
+                if capability == "text.generate" {
+                    self.bindings.effective_model_controller.as_deref()
+                } else {
+                    None
+                }
+            })
+    }
+
+    pub fn component_route_summary(&self) -> Option<String> {
+        if !self.bindings.component_routes.is_empty() {
+            return Some(
+                self.bindings
+                    .component_routes
+                    .iter()
+                    .map(|route| {
+                        let mut line =
+                            format!("{} [{}]", route.capability, route.selection_mode.as_str());
+                        if let Some(implementation) = route.implementation.as_deref() {
+                            line.push_str(&format!(" impl={implementation}"));
+                        }
+                        if let Some(incarnation) = route.incarnation.as_deref() {
+                            line.push_str(&format!(" inc={incarnation}"));
+                        }
+                        if let Some(hotel_id) = route.preferred_hotel_id.as_deref() {
+                            line.push_str(&format!(" hotel={hotel_id}"));
+                        }
+                        if let Some(environment_id) = route.preferred_environment_id.as_deref() {
+                            line.push_str(&format!(" env={environment_id}"));
+                        }
+                        line
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            );
+        }
+
+        self.bindings
+            .effective_model_controller
+            .as_deref()
+            .map(|controller| format!("text.generate [legacy] impl={controller}"))
+    }
+
     pub fn tool_is_enabled(&self, tool_name: &str) -> bool {
         if self
             .tool_assembly
@@ -368,15 +506,23 @@ impl SessionState {
             .effective_workspace_ref
             .clone()
             .unwrap_or_else(|| "default".into());
-        let controller = self
-            .bindings
-            .effective_model_controller
-            .clone()
+        let routing = self
+            .component_route_summary()
             .unwrap_or_else(|| "default".into());
+        let delivery = self
+            .transport_reply_target()
+            .map(|target| {
+                let mut text = format!("{} / {}", target.target_node, target.target_role);
+                if let Some(guest_id) = target.target_guest_id.as_deref() {
+                    text.push_str(&format!(" guest={guest_id}"));
+                }
+                text
+            })
+            .unwrap_or_else(|| "unbound".into());
 
         format!(
-            "Session status: {}. {}. Toolset: {}. Skillset: {}. Workspace: {}. Model controller: {}.",
-            self.status, active_turn, toolset, skillset, workspace, controller
+            "Session status: {}. {}. Toolset: {}. Skillset: {}. Workspace: {}. Component routes: {}. Delivery target: {}.",
+            self.status, active_turn, toolset, skillset, workspace, routing, delivery
         )
     }
 
@@ -593,8 +739,20 @@ impl SessionState {
         if let Some(workspace) = &self.bindings.effective_workspace_ref {
             envelope.push_str(&format!("Workspace: {}.\n", workspace));
         }
-        if let Some(controller) = &self.bindings.effective_model_controller {
-            envelope.push_str(&format!("Model controller: {}.\n", controller));
+        if let Some(target) = self.transport_reply_target() {
+            envelope.push_str(&format!(
+                "Delivery target: {} / {}{}.\n",
+                target.target_node,
+                target.target_role,
+                target
+                    .target_guest_id
+                    .as_deref()
+                    .map(|guest_id| format!(" guest={guest_id}"))
+                    .unwrap_or_default()
+            ));
+        }
+        if let Some(routes) = self.component_route_summary() {
+            envelope.push_str(&format!("Component routes: {}.\n", routes));
         }
         if !self.summary_text().is_empty() {
             envelope.push_str(&format!("Recent summary: {}.\n", self.summary_text()));
@@ -623,6 +781,7 @@ impl SessionState {
                 "user_content": turn.user_content,
                 "final_reply_to": turn.final_reply_to,
                 "final_reply_role": turn.final_reply_role,
+                "final_reply_guest_id": turn.final_reply_guest_id,
                 "phase": turn.phase.as_str(),
                 "iteration": turn.iteration,
                 "pending_tool_call": turn.pending_tool_call,
@@ -769,6 +928,10 @@ impl SessionState {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("hegemon")
                     .to_string(),
+                final_reply_guest_id: turn
+                    .get("final_reply_guest_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
                 phase: TurnPhase::from_str(
                     turn.get("phase")
                         .and_then(serde_json::Value::as_str)
@@ -927,6 +1090,8 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
                         Some("local-ansible-01".into())
                     },
                     environment_id: None,
+                    task_runner_kind: task_runner_kind_for_tool(tool_name),
+                    task_runner_config: task_runner_base_config_for_tool(bindings, tool_name),
                     execution_mode: execution_mode.into(),
                     availability_state: "live".into(),
                     selection_reason: Some(if execution_mode == "local_agent" {
@@ -978,6 +1143,52 @@ fn is_pinned_tool(tool_name: &str) -> bool {
         tool_name,
         "workspace.list" | "workspace.read" | "workspace.search" | "workspace.write"
     )
+}
+
+fn task_runner_kind_for_tool(tool_name: &str) -> Option<String> {
+    if tool_name.starts_with("workspace.") {
+        return Some("workspace".into());
+    }
+
+    if tool_name.starts_with("shell.") {
+        return Some("shell".into());
+    }
+
+    None
+}
+
+fn task_runner_base_config_for_tool(
+    bindings: &SessionBindings,
+    tool_name: &str,
+) -> Option<TaskRunnerBaseConfig> {
+    if !tool_name.starts_with("workspace.") {
+        return None;
+    }
+
+    let config = bindings.workspace_runner_config.clone().unwrap_or_default();
+    let default_workspace_ref = config
+        .default_workspace_ref
+        .or_else(|| bindings.effective_workspace_ref.clone());
+    let allowed_tools = config.allowed_tools.or_else(|| {
+        let workspace_tools = bindings
+            .effective_toolset
+            .iter()
+            .filter(|tool| tool.starts_with("workspace."))
+            .cloned()
+            .collect::<Vec<_>>();
+        if workspace_tools.is_empty() {
+            None
+        } else {
+            Some(workspace_tools)
+        }
+    });
+
+    Some(TaskRunnerBaseConfig {
+        default_workspace_ref,
+        allowed_tools,
+        max_read_bytes: config.max_read_bytes,
+        max_search_results: config.max_search_results,
+    })
 }
 
 fn tool_assembly_from_allowed_incarnations(bindings: &SessionBindings) -> ToolAssembly {
@@ -1067,6 +1278,8 @@ fn select_incarnation_route(
         incarnation_id: Some(selected.incarnation_id.clone()),
         hotel_id: selected.hotel_id.clone(),
         environment_id: selected.environment_id.clone(),
+        task_runner_kind: task_runner_kind_for_tool(tool_name),
+        task_runner_config: task_runner_base_config_for_tool(bindings, tool_name),
         execution_mode: selected.execution_mode.clone(),
         availability_state: selected.availability_state.clone(),
         selection_reason: Some(selection_reason),
@@ -1162,7 +1375,8 @@ fn current_unix_ts() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApprovalPolicy, SessionBindings, SessionState, ToolRunnerIncarnationBinding, WorkingTurn,
+        ApprovalPolicy, ComponentRouteBinding, SessionBindings, SessionState, TaskRunnerBaseConfig,
+        ToolRunnerIncarnationBinding, TransportReplyTargetBinding, WorkingTurn,
         merge_session_index, session_checkpoint_memory_type,
     };
     use crate::r#loop::{ApprovalRequest, ToolCall, TurnPhase};
@@ -1179,6 +1393,7 @@ mod tests {
             user_content: "hello".into(),
             final_reply_to: "local-ansible-01".into(),
             final_reply_role: "hegemon".into(),
+            final_reply_guest_id: Some("hegemon-telegram-01".into()),
             phase: TurnPhase::Queued,
             iteration: 0,
             pending_tool_call: None,
@@ -1189,6 +1404,10 @@ mod tests {
         assert_eq!(checkpoint["session_id"], "sess-1");
         assert_eq!(checkpoint["active_turn"]["turn_id"], "turn-1");
         assert_eq!(checkpoint["active_turn"]["phase"], "queued");
+        assert_eq!(
+            checkpoint["active_turn"]["final_reply_guest_id"],
+            "hegemon-telegram-01"
+        );
         assert!(checkpoint["tool_assembly"].is_object());
     }
 
@@ -1203,6 +1422,7 @@ mod tests {
             user_content: "hello".into(),
             final_reply_to: "local-ansible-01".into(),
             final_reply_role: "hegemon".into(),
+            final_reply_guest_id: None,
             phase: TurnPhase::Queued,
             iteration: 0,
             pending_tool_call: None,
@@ -1229,6 +1449,11 @@ mod tests {
                 "effective_toolset": ["echo", "workspace.read"],
                 "effective_skillset": ["planning"],
                 "effective_workspace_ref": "workspace://main",
+                "transport_reply_target": {
+                    "target_node": "local-ansible-01",
+                    "target_role": "hegemon",
+                    "target_guest_id": "hegemon-telegram-01"
+                },
                 "effective_model_controller": "gemini-flash"
             },
             "active_turn": {
@@ -1274,7 +1499,14 @@ mod tests {
                 effective_toolset: vec!["echo".into(), "workspace.read".into()],
                 effective_skillset: vec!["planning".into()],
                 effective_workspace_ref: Some("workspace://main".into()),
+                transport_reply_target: Some(TransportReplyTargetBinding {
+                    target_node: "local-ansible-01".into(),
+                    target_role: "hegemon".into(),
+                    target_guest_id: Some("hegemon-telegram-01".into()),
+                }),
+                component_routes: Vec::new(),
                 effective_model_controller: Some("gemini-flash".into()),
+                workspace_runner_config: None,
                 preferred_tool_runner_incarnation: None,
                 preferred_tool_runner: None,
                 preferred_hotel_id: None,
@@ -1350,7 +1582,14 @@ mod tests {
             effective_toolset: vec!["echo".into()],
             effective_skillset: vec!["planning".into()],
             effective_workspace_ref: Some("workspace://main".into()),
+            transport_reply_target: Some(TransportReplyTargetBinding {
+                target_node: "local-ansible-01".into(),
+                target_role: "hegemon".into(),
+                target_guest_id: Some("hegemon-telegram-01".into()),
+            }),
+            component_routes: Vec::new(),
             effective_model_controller: Some("gemini-flash".into()),
+            workspace_runner_config: None,
             preferred_tool_runner_incarnation: None,
             preferred_tool_runner: None,
             preferred_hotel_id: None,
@@ -1362,6 +1601,10 @@ mod tests {
         assert!(prompt.contains("Session status: paused."));
         assert!(prompt.contains("Effective tools: echo."));
         assert!(prompt.contains("Workspace: workspace://main."));
+        assert!(
+            prompt
+                .contains("Delivery target: local-ansible-01 / hegemon guest=hegemon-telegram-01.")
+        );
     }
 
     #[test]
@@ -1400,11 +1643,63 @@ mod tests {
         state.bindings.effective_skillset = vec!["planning".into()];
         state.bindings.effective_workspace_ref = Some("workspace://main".into());
         state.bindings.effective_model_controller = Some("gemini-flash".into());
+        state.bindings.transport_reply_target = Some(TransportReplyTargetBinding {
+            target_node: "local-ansible-01".into(),
+            target_role: "hegemon".into(),
+            target_guest_id: Some("hegemon-telegram-01".into()),
+        });
 
         let text = state.session_status_text();
         assert!(text.contains("Session status: paused."));
         assert!(text.contains("Toolset: echo."));
         assert!(text.contains("Workspace: workspace://main."));
+        assert!(text.contains("Component routes: text.generate [legacy] impl=gemini-flash."));
+        assert!(
+            text.contains("Delivery target: local-ansible-01 / hegemon guest=hegemon-telegram-01.")
+        );
+    }
+
+    #[test]
+    fn component_route_summary_prefers_structured_routes() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.bindings.component_routes.push(ComponentRouteBinding {
+            capability: "text.generate".into(),
+            selection_mode: "preferred".into(),
+            implementation: Some("gemini".into()),
+            incarnation: Some("model-controller-gemini-01".into()),
+            preferred_hotel_id: Some("local-ansible-01".into()),
+            preferred_environment_id: Some("env://local".into()),
+        });
+
+        let summary = state.component_route_summary().expect("route summary");
+        assert!(summary.contains("text.generate [preferred]"));
+        assert!(summary.contains("impl=gemini"));
+        assert!(summary.contains("inc=model-controller-gemini-01"));
+    }
+
+    #[test]
+    fn resolved_transport_reply_target_prefers_session_binding() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.set_transport_reply_target(
+            "local-ansible-01",
+            "hegemon",
+            Some("hegemon-telegram-01".into()),
+        );
+
+        let target = state.resolved_transport_reply_target(
+            "fallback-node",
+            "fallback-role",
+            Some("fallback-guest".into()),
+        );
+
+        assert_eq!(target.target_node, "local-ansible-01");
+        assert_eq!(target.target_role, "hegemon");
+        assert_eq!(
+            target.target_guest_id.as_deref(),
+            Some("hegemon-telegram-01")
+        );
     }
 
     #[test]
@@ -1540,6 +1835,14 @@ mod tests {
         state.add_tool_binding("workspace.read");
         state.add_tool_binding("workspace.list");
         state.add_tool_binding("workspace.search");
+        state.bindings.effective_workspace_ref = Some("workspace://main".into());
+        state.bindings.workspace_runner_config = Some(TaskRunnerBaseConfig {
+            default_workspace_ref: Some("workspace://policy".into()),
+            allowed_tools: Some(vec!["workspace.read".into(), "workspace.search".into()]),
+            max_read_bytes: Some(8192),
+            max_search_results: Some(25),
+        });
+        state.rebuild_default_tool_assembly();
 
         let read_route = state
             .resolve_tool_route("workspace.read")
@@ -1554,6 +1857,23 @@ mod tests {
         assert_eq!(read_route.execution_mode, "pinned");
         assert_eq!(list_route.execution_mode, "pinned");
         assert_eq!(search_route.execution_mode, "pinned");
+        assert_eq!(read_route.task_runner_kind.as_deref(), Some("workspace"));
+        assert_eq!(list_route.task_runner_kind.as_deref(), Some("workspace"));
+        assert_eq!(search_route.task_runner_kind.as_deref(), Some("workspace"));
+        assert_eq!(
+            read_route
+                .task_runner_config
+                .as_ref()
+                .and_then(|config| config.default_workspace_ref.as_deref()),
+            Some("workspace://policy")
+        );
+        assert_eq!(
+            read_route
+                .task_runner_config
+                .as_ref()
+                .and_then(|config| config.max_read_bytes),
+            Some(8192)
+        );
         assert_eq!(read_route.target_role, "tool.workspace.read");
         assert_eq!(list_route.target_role, "tool.workspace.list");
         assert_eq!(search_route.target_role, "tool.workspace.search");
@@ -1619,6 +1939,7 @@ mod tests {
             user_content: "hello".into(),
             final_reply_to: "local-ansible-01".into(),
             final_reply_role: "hegemon".into(),
+            final_reply_guest_id: None,
             phase: TurnPhase::Queued,
             iteration: 0,
             pending_tool_call: None,

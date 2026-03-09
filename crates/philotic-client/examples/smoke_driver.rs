@@ -37,7 +37,8 @@ async fn main() -> Result<()> {
                 "chat_id": chat_id,
                 "content": content,
                 "final_reply_to": "local-ansible-01",
-                "final_reply_role": "hegemon"
+                "final_reply_role": "hegemon",
+                "final_reply_guest_id": "smoke-driver-hegemon"
             })
             .to_string(),
         })
