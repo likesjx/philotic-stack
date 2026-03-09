@@ -21,6 +21,10 @@ start-ansible hotel:
 gemini-oauth-start client_id project_id:
     cargo run -p ansible -- auth google start --provider gemini --client-id {{client_id}} --project-id {{project_id}}
 
+# Validate that stored Gemini OAuth auth can call a real Gemini model
+gemini-oauth-validate:
+    cargo run -p ansible -- auth google validate --provider gemini
+
 # Start the local UAT stack. Ansible will materialize the gateway, agent, model, and tool guests.
 start-ansible-uat:
     @echo "Starting UAT stack on hotel 'local-telegram' using mesh-config.json..."

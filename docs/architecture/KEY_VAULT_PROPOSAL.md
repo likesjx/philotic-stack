@@ -58,6 +58,7 @@ The current implementation slice now begins that boundary:
 - config can store `*_ref` values instead of raw secret values
 - guests can request secrets through dedicated hotel IPC instead of generic `GetConfig`
 - Gemini OAuth access tokens now fit that path
+- hotel-side validation can exercise the vaulted Gemini OAuth path directly before guest fallback obscures failures
 
 The next boundary should continue toward:
 

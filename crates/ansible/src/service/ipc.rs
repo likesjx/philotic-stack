@@ -1924,7 +1924,10 @@ mod tests {
                 value_json: Some(value_json),
                 ..
             } => {
-                assert_eq!(serde_json::from_str::<String>(&value_json).unwrap(), "top-secret");
+                assert_eq!(
+                    serde_json::from_str::<String>(&value_json).unwrap(),
+                    "top-secret"
+                );
             }
             other => panic!("unexpected secret response: {other:?}"),
         }

@@ -37,6 +37,7 @@ Pin and prove the first design contract for:
 - hotel-driven Gemini OAuth UX
 - an upstream producer path for `voice.synthesize`
 - a guest-side Gemini auth abstraction that prefers OAuth bearer material over API key fallback
+- a hotel-side Gemini OAuth validation path that proves stored auth can call a real Gemini model
 
 Linked task surface: [docs/task.md](/Users/jaredlikes/code/philotic-stack-model-controller-abstraction/docs/task.md)
 
@@ -191,6 +192,14 @@ Current implementation slice:
 - refreshable credentials still belong to the future hotel/vault flow, not the guest
 - hotel CLI now has a transitional `auth google start --provider gemini` loopback flow
 - access-token updates can take effect on the next model request because provider config is refreshed per task
+- hotel CLI can validate the stored Gemini OAuth path with a real `generateContent` call
+
+Acceptance criterion for this seam:
+
+- hotel completes Google OAuth
+- hotel stores auth material safely enough for the current slice
+- a real Gemini model call succeeds using the OAuth path
+- failure is observable before fallback-to-api-key silently hides it
 
 The hotel should own the user experience for OAuth:
 
@@ -216,6 +225,7 @@ The hotel is the better authority because it already owns local runtime coordina
 Target operator experience:
 
 - `ansible auth google start --provider gemini`
+- `ansible auth google validate --provider gemini`
 - browser opens automatically
 - hotel captures callback on localhost
 - hotel confirms success
