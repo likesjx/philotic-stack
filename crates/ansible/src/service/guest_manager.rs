@@ -375,6 +375,17 @@ mod tests {
             Ok(())
         }
 
+        fn upsert_secret(&self, _secret: &ansible_mesh_core::storage::SecretRecord) -> Result<()> {
+            Ok(())
+        }
+
+        fn get_secret(
+            &self,
+            _secret_ref: &str,
+        ) -> Result<Option<ansible_mesh_core::storage::SecretRecord>> {
+            Ok(None)
+        }
+
         fn get_hotel(
             &self,
             _hotel_name: &str,

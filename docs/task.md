@@ -45,6 +45,61 @@
 - [ ] Define approval interrupt/resume semantics.
 - [ ] Define loop event streaming and tracing payloads.
 
+## New Project: Model Controller
+
+- [ ] Review [MODEL_CONTROLLER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack-model-controller-abstraction/docs/architecture/MODEL_CONTROLLER_PROPOSAL.md).
+- [x] Land the first `voice.synthesize` request envelope with `display_text`, `spoken_text`, `voice`, `model`, and `provider_options`.
+- [x] Add an upstream producer example that emits the richer `voice.synthesize` envelope through the hotel.
+- [ ] Define the canonical capability envelope for:
+  - `text.generate`
+  - `voice.synthesize`
+  - `voice.dialogue`
+  - `sound.generate`
+  - `music.generate`
+  - `response.generate`
+- [ ] Add `spoken_text` / expressive speech projection alongside user-visible text.
+- [ ] Define ElevenLabs default-voice pinning plus upstream voice override behavior.
+- [ ] Add Eleven v3 model selection and expressive-tag support without pretending it is the same as the low-latency conversational path.
+- [ ] Define how native-audio multimodal models emit text plus audio without being forced through TTS.
+- [ ] Define Gemini auth modes:
+  - hotel-managed OAuth
+  - API key fallback
+  - possible ADC path
+- [x] Add the first Gemini guest auth abstraction that prefers OAuth bearer config over API key fallback.
+- [ ] Define hotel CLI OAuth UX:
+  - browser launch
+  - temporary localhost callback listener
+  - token exchange
+  - token storage/refresh
+  - guest handoff
+- [x] Add a transitional `ansible auth google start --provider gemini` flow with browser launch, localhost callback, token exchange, and access-token persistence.
+- [x] Add a hotel-side Gemini OAuth validation command that performs a real model call with the stored auth path.
+- [x] Refresh model-controller provider config per task so updated Gemini auth takes effect without a guest restart.
+
+## New Project: Key Vault
+
+- [ ] Review [KEY_VAULT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack-model-controller-abstraction/docs/architecture/KEY_VAULT_PROPOSAL.md).
+- [x] Define the first vault record schema and context-graph secret references.
+- [x] Begin removing new OAuth access-token storage from plain `node_config` by storing secret refs instead.
+- [x] Define and implement the first hotel-local secret fetch API for guests.
+- [ ] Define envelope-encryption and root-key strategy:
+  - OS keychain / TPM / Secure Enclave preferred
+  - cloud KMS/HSM for hosted hotels
+  - operator master key only as fallback
+- [ ] Define secret lifecycle:
+  - create
+  - stage
+  - rotate
+  - revoke
+  - rollback
+- [ ] Move Gemini OAuth refresh tokens behind vault references.
+- [x] Move Gemini OAuth access tokens behind vault references for model-controller consumption.
+- [ ] Define Telegram-safe secret onboarding:
+  - control-plane command in chat
+  - Mini App or secure browser handoff
+  - no plaintext secret entry in normal chat messages
+- [ ] Define Telegram-safe rotation UX and operator approvals.
+
 ## Next Project: Tool Assembly and Routed Execution
 
 - [ ] Review [TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md).

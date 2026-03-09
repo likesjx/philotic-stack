@@ -1,9 +1,10 @@
 use crate::LedgerCommand;
+use crate::vault::{SecretAccess, resolve_secret};
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
 use ansible_mesh_core::storage::{
     GraphStorage, SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,
 };
-use philotic_client::{IpcRequest, IpcResponse};
+use philotic_client::{GuestIdentity, IpcRequest, IpcResponse};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -168,6 +169,7 @@ impl IpcServer {
         });
 
         let mut subscribed_roles = Vec::new();
+        let mut current_identity: Option<GuestIdentity> = None;
         loop {
             match Self::read_frame(&mut reader).await {
                 Ok(None) => {
@@ -185,6 +187,7 @@ impl IpcServer {
                             conn_id,
                             &outbound_tx,
                             &mut subscribed_roles,
+                            &mut current_identity,
                         )
                         .await;
                         let _ = outbound_tx.send(response);
@@ -293,6 +296,7 @@ impl IpcServer {
         conn_id: Uuid,
         outbound_tx: &mpsc::UnboundedSender<IpcResponse>,
         subscribed_roles: &mut Vec<String>,
+        current_identity: &mut Option<GuestIdentity>,
     ) -> IpcResponse {
         match req {
             IpcRequest::Register(identity) => {
@@ -315,6 +319,7 @@ impl IpcServer {
                         error!("Failed to persist tool runner registry entry: {}", err);
                     }
                 }
+                *current_identity = Some(identity.clone());
                 IpcResponse::success("reg", None)
             }
             IpcRequest::GetConfig { key } => {
@@ -355,6 +360,33 @@ impl IpcServer {
                     Err(e) => {
                         error!("Failed to load config key from GraphStorage: {}", e);
                         IpcResponse::error("config", "CONFIG_ERROR", e.to_string())
+                    }
+                }
+            }
+            IpcRequest::GetSecret { secret_ref } => {
+                let Some(identity) = current_identity.as_ref() else {
+                    return IpcResponse::error(
+                        "secret",
+                        "SECRET_UNREGISTERED",
+                        "guest must register before requesting vault secrets",
+                    );
+                };
+
+                match resolve_secret(
+                    graph,
+                    &secret_ref,
+                    &SecretAccess {
+                        role: identity.role.clone(),
+                        guest_id: identity.guest_id.clone(),
+                    },
+                ) {
+                    Ok(value_json) => IpcResponse::SecretData {
+                        secret_ref,
+                        value_json: value_json.map(|value| serde_json::to_string(&value).unwrap()),
+                    },
+                    Err(err) => {
+                        error!("Failed to resolve vault secret [{}]: {}", secret_ref, err);
+                        IpcResponse::error("secret", "SECRET_ERROR", err.to_string())
                     }
                 }
             }
@@ -585,6 +617,7 @@ impl IpcServer {
             IpcRequest::EmitTask {
                 target_node,
                 target_role,
+                target_guest_id: _,
                 task_json,
             } => {
                 info!(
@@ -1609,12 +1642,14 @@ fn merge_turn_status(current: &str, incoming: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vault::{SecretInput, store_secret};
     use ansible_mesh_core::NodeCapabilities;
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
     use ansible_mesh_core::storage::{
-        AgentIdentityRecord, GuestRecord, HotelRecord, SessionEventRecord,
+        AgentIdentityRecord, GuestRecord, HotelRecord, SecretRecord, SessionEventRecord,
         SessionParticipantRecord, SessionRecord, SessionTurnRecord,
     };
+    use base64::Engine;
     use philotic_client::{GuestIdentity, PhiloticClient};
     use std::path::Path;
     use std::sync::{LazyLock, Mutex as StdMutex};
@@ -1634,6 +1669,12 @@ mod tests {
         }
         fn set_config_value(&self, _key: &str, _value_json: &str) -> anyhow::Result<()> {
             Ok(())
+        }
+        fn upsert_secret(&self, _secret: &SecretRecord) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn get_secret(&self, _secret_ref: &str) -> anyhow::Result<Option<SecretRecord>> {
+            Ok(None)
         }
         fn get_hotel(&self, _hotel_name: &str) -> anyhow::Result<Option<HotelRecord>> {
             Ok(None)
@@ -1791,6 +1832,7 @@ mod tests {
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
                 target_role: "agent".into(),
+                target_guest_id: None,
                 task_json: task_payload.clone(),
             })
             .await
@@ -1833,6 +1875,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_secret_returns_vault_secret_for_authorized_guest() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
+        let server = IpcServer::new(socket_path.clone(), dispatcher_tx, graph.clone());
+
+        let vault_key = base64::engine::general_purpose::STANDARD.encode([5u8; 32]);
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+            std::env::set_var("PHILOTIC_VAULT_MASTER_KEY", vault_key);
+        }
+
+        let secret_ref = store_secret(
+            graph.as_ref(),
+            SecretInput {
+                secret_kind: "gemini-access-token".into(),
+                scope: "hotel".into(),
+                allowed_roles: vec!["model.gemini".into()],
+                allowed_guests: Vec::new(),
+                plaintext: "top-secret".into(),
+            },
+        )
+        .expect("store secret");
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let mut guest = PhiloticClient::connect(GuestIdentity {
+            guest_id: "model-gemini-guest".into(),
+            role: "model.gemini".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("guest connect");
+
+        let response = guest
+            .send_request(IpcRequest::GetSecret { secret_ref })
+            .await
+            .expect("get secret");
+
+        match response {
+            IpcResponse::SecretData {
+                value_json: Some(value_json),
+                ..
+            } => {
+                assert_eq!(
+                    serde_json::from_str::<String>(&value_json).unwrap(),
+                    "top-secret"
+                );
+            }
+            other => panic!("unexpected secret response: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+            std::env::remove_var("PHILOTIC_VAULT_MASTER_KEY");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
     async fn emit_task_persists_session_and_turn_metadata() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
@@ -1863,6 +1974,7 @@ mod tests {
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
                 target_role: "agent".into(),
+                target_guest_id: None,
                 task_json: serde_json::json!({
                     "source": "telegram",
                     "session_id": "telegram:123:agent-jane-01",
@@ -3040,6 +3152,7 @@ mod tests {
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
                 target_role: "agent".into(),
+                target_guest_id: None,
                 task_json: serde_json::json!({
                     "source": "telegram",
                     "session_id": session_id,
@@ -3090,6 +3203,7 @@ mod tests {
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
                 target_role: "model".into(),
+                target_guest_id: None,
                 task_json: serde_json::json!({
                     "action": "generate_text",
                     "session_id": session_id,
@@ -3125,6 +3239,7 @@ mod tests {
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
                 target_role: "agent".into(),
+                target_guest_id: None,
                 task_json: serde_json::json!({
                     "action": "model_response",
                     "session_id": session_id,
@@ -3171,6 +3286,7 @@ mod tests {
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
                 target_role: "hegemon".into(),
+                target_guest_id: None,
                 task_json: serde_json::json!({
                     "action": "send_reply",
                     "session_id": session_id,
@@ -3286,6 +3402,7 @@ mod tests {
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
                 target_role: "agent".into(),
+                target_guest_id: None,
                 task_json: serde_json::json!({
                     "source": "telegram",
                     "session_id": session_id,
@@ -3336,6 +3453,7 @@ mod tests {
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
                 target_role: "model".into(),
+                target_guest_id: None,
                 task_json: serde_json::json!({
                     "action": "generate_text",
                     "session_id": session_id,
@@ -3372,6 +3490,7 @@ mod tests {
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
                 target_role: "agent".into(),
+                target_guest_id: None,
                 task_json: serde_json::json!({
                     "action": "model_response",
                     "agent_action": {
@@ -3425,6 +3544,7 @@ mod tests {
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
                 target_role: "hegemon".into(),
+                target_guest_id: None,
                 task_json: serde_json::json!({
                     "action": "send_reply",
                     "session_id": session_id,

@@ -43,6 +43,12 @@ cargo run -p ansible
 
 # Load initial config
 cargo run -p ansible -- --load-config path/to/config.json
+
+# Start the transitional Gemini OAuth flow
+cargo run -p ansible -- auth google start --provider gemini --client-id YOUR_CLIENT_ID --project-id YOUR_GCP_PROJECT
+
+# Validate the stored Gemini OAuth path with a real Gemini call
+cargo run -p ansible -- auth google validate --provider gemini
 ```
 
 ## Architecture Reference
