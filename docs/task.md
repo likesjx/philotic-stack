@@ -110,8 +110,8 @@
 - [x] Mark the generic `final_reply_role = "hegemon"` routing path as transitional and define the first replacement step:
   - optional guest-specific local delivery via `target_guest_id`
   - optional turn-level `final_reply_guest_id` preserved through agent/model/hegemon flow
-- [ ] Define how session bindings identify the owning hegemon component/incarnation for outbound delivery.
-- [ ] Define the normalized Telegram ingress envelope for text, commands, callback actions, and attachments.
+- [x] Define how session bindings identify the owning hegemon component/incarnation for outbound delivery.
+- [x] Define the normalized Telegram ingress envelope and prove it on the current text polling path.
 - [ ] Expand `hegemon` polling ingestion beyond `message.text` while keeping one canonical transport-normalization path.
 - [ ] Elevate deterministic Telegram slash commands into `hegemon` before the normal agent loop.
 - [ ] Add Telegram delivery primitives for typing state, partial streaming, and final message commit.

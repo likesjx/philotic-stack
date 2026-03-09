@@ -54,12 +54,30 @@ Accepted here means:
 Current repo truth:
 
 - `crates/hegemon` is a long-polling Telegram guest
-- it currently handles only `message.text`
-- it emits a simple text task envelope to `agent-core`
+- it currently normalizes only the `message.text` polling path
+- it emits a normalized inbound transport envelope into `agent-core` with:
+  - `transport`
+  - `session_id`
+  - `turn_id`
+  - `chat_id`
+  - `thread_id`
+  - `sender_id`
+  - `sender_username`
+  - `message_kind`
+  - `content`
+  - `attachments`
+  - `command`
+  - `callback_data`
+  - `raw_transport_event`
 - it replies with `sendMessage`
-- it now preserves an optional `final_reply_guest_id` so the turn can route back to the owning local hegemon guest without relying only on shared-role fan-out
+- it now preserves an optional `final_reply_guest_id` and session-level transport reply target so the owning local hegemon guest survives beyond a single turn without relying only on shared-role fan-out
 
-That is a useful proof-of-life slice, but it is not yet a Telegram controller in the richer sense.
+That is a useful membrane slice, but it is not yet a richer Telegram controller:
+
+- callback queries are not normalized yet
+- media/file attachments are not normalized yet
+- slash commands still execute in `agent-core`
+- polling still only requests `message` updates
 
 ## Current Reality
 
@@ -286,6 +304,12 @@ Before broadening beyond plain text, define a normalized Telegram event envelope
 
 This envelope should become the one object `hegemon` emits into the rest of the system.
 
+Current implementation note:
+
+- the defined envelope now exists in `agent-core::protocol::InboundTaskPayload`
+- the Telegram polling path populates it for text messages, including thread-aware session defaults
+- callback and attachment population remain follow-on work
+
 ## Slash Commands
 
 ### Recommendation
@@ -368,7 +392,7 @@ Start with a transport-hardening slice, not public webhook enablement.
 
 Scope:
 
-- define the normalized Telegram ingress envelope
+- prove the normalized Telegram ingress envelope on the current text polling path
 - expand polling ingestion beyond text-only
 - elevate deterministic slash commands into `hegemon`
 - add delivery primitives for typing/partial/final responses

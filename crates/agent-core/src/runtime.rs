@@ -96,21 +96,47 @@ impl AgentRuntime {
             Some(content) => content.to_string(),
             None => return Ok(()),
         };
-        let source = task.source.clone().unwrap_or_else(|| "unknown".into());
+        let source = task
+            .transport
+            .clone()
+            .or(task.source.clone())
+            .unwrap_or_else(|| "unknown".into());
         let session_id = task.session_id_or_default(AGENT_ID);
         let turn_id = task.turn_id.clone().unwrap_or_else(|| task_id.to_string());
         let chat_id = task.chat_id.clone().unwrap_or_default();
-        let final_reply_to = task
+        let inbound_final_reply_to = task
             .final_reply_to
             .clone()
             .unwrap_or_else(|| LOCAL_NODE.to_string());
-        let final_reply_role = task
+        let inbound_final_reply_role = task
             .final_reply_role
             .clone()
             .unwrap_or_else(|| DEFAULT_REPLY_ROLE.to_string());
-        let final_reply_guest_id = task.final_reply_guest_id.clone();
+        let inbound_final_reply_guest_id = task.final_reply_guest_id.clone();
 
         self.ensure_session_loaded(&session_id, &source).await?;
+
+        let (final_reply_to, final_reply_role, final_reply_guest_id) = {
+            let state = self
+                .sessions
+                .entry(session_id.clone())
+                .or_insert_with(|| SessionState::new(session_id.clone(), AGENT_ID.into(), source));
+            state.set_transport_reply_target(
+                inbound_final_reply_to,
+                inbound_final_reply_role,
+                inbound_final_reply_guest_id,
+            );
+            let target = state.resolved_transport_reply_target(
+                LOCAL_NODE.to_string(),
+                DEFAULT_REPLY_ROLE.to_string(),
+                None,
+            );
+            (
+                target.target_node,
+                target.target_role,
+                target.target_guest_id,
+            )
+        };
 
         if let Some(command) = parse_slash_command(&content) {
             match command {
@@ -145,8 +171,8 @@ impl AgentRuntime {
         let (checkpoint_memory_type, checkpoint_json, index_state, model_prompt, tools_for_model) = {
             let state = self
                 .sessions
-                .entry(session_id.clone())
-                .or_insert_with(|| SessionState::new(session_id.clone(), AGENT_ID.into(), source));
+                .get_mut(&session_id)
+                .expect("session should exist after ensuring and binding transport target");
             state.start_turn(WorkingTurn {
                 task_id,
                 turn_id: turn_id.clone(),
@@ -1474,8 +1500,17 @@ impl AgentRuntime {
                     source: Some("agent".into()),
                     session_id: Some(payload.session_id),
                     turn_id: Some(payload.turn_id),
+                    transport: None,
                     chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
                     content: Some(content),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
                     tool_name: Some(payload.tool_name),
                     arguments: None,
                     final_reply_to: Some(payload.final_reply_to),

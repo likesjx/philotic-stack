@@ -60,6 +60,8 @@ pub struct SessionBindings {
     #[serde(default)]
     pub effective_workspace_ref: Option<String>,
     #[serde(default)]
+    pub transport_reply_target: Option<TransportReplyTargetBinding>,
+    #[serde(default)]
     pub component_routes: Vec<ComponentRouteBinding>,
     #[serde(default)]
     pub effective_model_controller: Option<String>,
@@ -73,6 +75,14 @@ pub struct SessionBindings {
     pub preferred_environment_id: Option<String>,
     #[serde(default)]
     pub allowed_tool_runner_incarnations: Vec<ToolRunnerIncarnationBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TransportReplyTargetBinding {
+    pub target_node: String,
+    pub target_role: String,
+    #[serde(default)]
+    pub target_guest_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -313,6 +323,38 @@ impl SessionState {
         self.bindings.effective_workspace_ref = None;
     }
 
+    pub fn set_transport_reply_target(
+        &mut self,
+        target_node: impl Into<String>,
+        target_role: impl Into<String>,
+        target_guest_id: Option<String>,
+    ) {
+        self.bindings.transport_reply_target = Some(TransportReplyTargetBinding {
+            target_node: target_node.into(),
+            target_role: target_role.into(),
+            target_guest_id,
+        });
+    }
+
+    pub fn transport_reply_target(&self) -> Option<&TransportReplyTargetBinding> {
+        self.bindings.transport_reply_target.as_ref()
+    }
+
+    pub fn resolved_transport_reply_target(
+        &self,
+        fallback_node: impl Into<String>,
+        fallback_role: impl Into<String>,
+        fallback_guest_id: Option<String>,
+    ) -> TransportReplyTargetBinding {
+        self.transport_reply_target()
+            .cloned()
+            .unwrap_or_else(|| TransportReplyTargetBinding {
+                target_node: fallback_node.into(),
+                target_role: fallback_role.into(),
+                target_guest_id: fallback_guest_id,
+            })
+    }
+
     pub fn component_route_for_capability(
         &self,
         capability: &str,
@@ -449,10 +491,20 @@ impl SessionState {
         let routing = self
             .component_route_summary()
             .unwrap_or_else(|| "default".into());
+        let delivery = self
+            .transport_reply_target()
+            .map(|target| {
+                let mut text = format!("{} / {}", target.target_node, target.target_role);
+                if let Some(guest_id) = target.target_guest_id.as_deref() {
+                    text.push_str(&format!(" guest={guest_id}"));
+                }
+                text
+            })
+            .unwrap_or_else(|| "unbound".into());
 
         format!(
-            "Session status: {}. {}. Toolset: {}. Skillset: {}. Workspace: {}. Component routes: {}.",
-            self.status, active_turn, toolset, skillset, workspace, routing
+            "Session status: {}. {}. Toolset: {}. Skillset: {}. Workspace: {}. Component routes: {}. Delivery target: {}.",
+            self.status, active_turn, toolset, skillset, workspace, routing, delivery
         )
     }
 
@@ -668,6 +720,18 @@ impl SessionState {
         }
         if let Some(workspace) = &self.bindings.effective_workspace_ref {
             envelope.push_str(&format!("Workspace: {}.\n", workspace));
+        }
+        if let Some(target) = self.transport_reply_target() {
+            envelope.push_str(&format!(
+                "Delivery target: {} / {}{}.\n",
+                target.target_node,
+                target.target_role,
+                target
+                    .target_guest_id
+                    .as_deref()
+                    .map(|guest_id| format!(" guest={guest_id}"))
+                    .unwrap_or_default()
+            ));
         }
         if let Some(routes) = self.component_route_summary() {
             envelope.push_str(&format!("Component routes: {}.\n", routes));
@@ -1244,8 +1308,8 @@ fn current_unix_ts() -> u64 {
 mod tests {
     use super::{
         ApprovalPolicy, ComponentRouteBinding, SessionBindings, SessionState,
-        ToolRunnerIncarnationBinding, WorkingTurn, merge_session_index,
-        session_checkpoint_memory_type,
+        ToolRunnerIncarnationBinding, TransportReplyTargetBinding, WorkingTurn,
+        merge_session_index, session_checkpoint_memory_type,
     };
     use crate::r#loop::{ApprovalRequest, ToolCall, TurnPhase};
     use uuid::Uuid;
@@ -1317,6 +1381,11 @@ mod tests {
                 "effective_toolset": ["echo", "workspace.read"],
                 "effective_skillset": ["planning"],
                 "effective_workspace_ref": "workspace://main",
+                "transport_reply_target": {
+                    "target_node": "local-ansible-01",
+                    "target_role": "hegemon",
+                    "target_guest_id": "hegemon-telegram-01"
+                },
                 "effective_model_controller": "gemini-flash"
             },
             "active_turn": {
@@ -1362,6 +1431,11 @@ mod tests {
                 effective_toolset: vec!["echo".into(), "workspace.read".into()],
                 effective_skillset: vec!["planning".into()],
                 effective_workspace_ref: Some("workspace://main".into()),
+                transport_reply_target: Some(TransportReplyTargetBinding {
+                    target_node: "local-ansible-01".into(),
+                    target_role: "hegemon".into(),
+                    target_guest_id: Some("hegemon-telegram-01".into()),
+                }),
                 component_routes: Vec::new(),
                 effective_model_controller: Some("gemini-flash".into()),
                 preferred_tool_runner_incarnation: None,
@@ -1439,6 +1513,11 @@ mod tests {
             effective_toolset: vec!["echo".into()],
             effective_skillset: vec!["planning".into()],
             effective_workspace_ref: Some("workspace://main".into()),
+            transport_reply_target: Some(TransportReplyTargetBinding {
+                target_node: "local-ansible-01".into(),
+                target_role: "hegemon".into(),
+                target_guest_id: Some("hegemon-telegram-01".into()),
+            }),
             component_routes: Vec::new(),
             effective_model_controller: Some("gemini-flash".into()),
             preferred_tool_runner_incarnation: None,
@@ -1452,6 +1531,10 @@ mod tests {
         assert!(prompt.contains("Session status: paused."));
         assert!(prompt.contains("Effective tools: echo."));
         assert!(prompt.contains("Workspace: workspace://main."));
+        assert!(
+            prompt
+                .contains("Delivery target: local-ansible-01 / hegemon guest=hegemon-telegram-01.")
+        );
     }
 
     #[test]
@@ -1490,12 +1573,20 @@ mod tests {
         state.bindings.effective_skillset = vec!["planning".into()];
         state.bindings.effective_workspace_ref = Some("workspace://main".into());
         state.bindings.effective_model_controller = Some("gemini-flash".into());
+        state.bindings.transport_reply_target = Some(TransportReplyTargetBinding {
+            target_node: "local-ansible-01".into(),
+            target_role: "hegemon".into(),
+            target_guest_id: Some("hegemon-telegram-01".into()),
+        });
 
         let text = state.session_status_text();
         assert!(text.contains("Session status: paused."));
         assert!(text.contains("Toolset: echo."));
         assert!(text.contains("Workspace: workspace://main."));
         assert!(text.contains("Component routes: text.generate [legacy] impl=gemini-flash."));
+        assert!(
+            text.contains("Delivery target: local-ansible-01 / hegemon guest=hegemon-telegram-01.")
+        );
     }
 
     #[test]
@@ -1515,6 +1606,30 @@ mod tests {
         assert!(summary.contains("text.generate [preferred]"));
         assert!(summary.contains("impl=gemini"));
         assert!(summary.contains("inc=model-controller-gemini-01"));
+    }
+
+    #[test]
+    fn resolved_transport_reply_target_prefers_session_binding() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.set_transport_reply_target(
+            "local-ansible-01",
+            "hegemon",
+            Some("hegemon-telegram-01".into()),
+        );
+
+        let target = state.resolved_transport_reply_target(
+            "fallback-node",
+            "fallback-role",
+            Some("fallback-guest".into()),
+        );
+
+        assert_eq!(target.target_node, "local-ansible-01");
+        assert_eq!(target.target_role, "hegemon");
+        assert_eq!(
+            target.target_guest_id.as_deref(),
+            Some("hegemon-telegram-01")
+        );
     }
 
     #[test]

@@ -13,6 +13,84 @@ struct Args {
     ansible_port: u16,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TelegramMessageEnvelope {
+    session_id: String,
+    turn_id: String,
+    chat_id: String,
+    thread_id: Option<String>,
+    sender_id: Option<String>,
+    sender_username: Option<String>,
+    message_kind: &'static str,
+    content: String,
+    command: Option<String>,
+    raw_transport_event: Value,
+}
+
+fn telegram_text_envelope(
+    update: &Value,
+    update_id: i64,
+    agent_id: &str,
+) -> Option<TelegramMessageEnvelope> {
+    let message = update.get("message")?;
+    let text = message.get("text")?.as_str()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+
+    let chat_id = message
+        .get("chat")
+        .and_then(|chat| chat.get("id"))
+        .and_then(value_to_id_string)?;
+    let thread_id = message
+        .get("message_thread_id")
+        .and_then(value_to_id_string)
+        .filter(|id| !id.is_empty());
+    let sender_id = message
+        .get("from")
+        .and_then(|from| from.get("id"))
+        .and_then(value_to_id_string)
+        .filter(|id| !id.is_empty());
+    let sender_username = message
+        .get("from")
+        .and_then(|from| from.get("username"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|name| !name.is_empty());
+    let session_id = match thread_id.as_deref() {
+        Some(thread_id) => format!("telegram:{chat_id}:{thread_id}:{agent_id}"),
+        None => format!("telegram:{chat_id}:{agent_id}"),
+    };
+
+    Some(TelegramMessageEnvelope {
+        session_id,
+        turn_id: format!("telegram-update-{update_id}"),
+        chat_id,
+        thread_id,
+        sender_id,
+        sender_username,
+        message_kind: "text",
+        content: text.to_string(),
+        command: telegram_command(text),
+        raw_transport_event: update.clone(),
+    })
+}
+
+fn telegram_command(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .next()
+        .filter(|token| token.starts_with('/'))
+        .map(str::to_string)
+}
+
+fn value_to_id_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -89,35 +167,47 @@ async fn main() -> Result<()> {
                                     if let Some(update_id) = update.get("update_id").and_then(|id| id.as_i64()) {
                                         offset = update_id + 1; // Ack the message
 
-                                        if let Some(message) = update.get("message") {
-                                            if let Some(text) = message.get("text").and_then(|t| t.as_str()) {
-                                                let chat_id = message.get("chat").and_then(|c| c.get("id")).map(|id| id.to_string()).unwrap_or_default();
-                                                let turn_id = format!("telegram-update-{}", update_id);
-                                                let session_id = format!("telegram:{}:agent-jane-01", chat_id);
+                                        if let Some(envelope) = telegram_text_envelope(update, update_id, "agent-jane-01") {
+                                            info!(
+                                                "Received Telegram {} message from chat [{}]{}: {}",
+                                                envelope.message_kind,
+                                                envelope.chat_id,
+                                                envelope
+                                                    .thread_id
+                                                    .as_deref()
+                                                    .map(|thread| format!(" thread [{}]", thread))
+                                                    .unwrap_or_default(),
+                                                envelope.content
+                                            );
 
-                                                info!("Received Telegram Message from Chat [{}]: {}", chat_id, text);
+                                            let task_req = IpcRequest::EmitTask {
+                                                target_node: "local-ansible-01".into(),
+                                                target_role: "agent".into(),
+                                                target_guest_id: None,
+                                                task_json: json!({
+                                                    "source": "telegram",
+                                                    "transport": "telegram",
+                                                    "session_id": envelope.session_id,
+                                                    "turn_id": envelope.turn_id,
+                                                    "chat_id": envelope.chat_id,
+                                                    "thread_id": envelope.thread_id,
+                                                    "sender_id": envelope.sender_id,
+                                                    "sender_username": envelope.sender_username,
+                                                    "message_kind": envelope.message_kind,
+                                                    "content": envelope.content,
+                                                    "attachments": [],
+                                                    "command": envelope.command,
+                                                    "callback_data": Value::Null,
+                                                    "raw_transport_event": envelope.raw_transport_event,
+                                                    "final_reply_to": "local-ansible-01",
+                                                    "final_reply_role": "hegemon",
+                                                    "final_reply_guest_id": "hegemon-telegram-01"
+                                                }).to_string(),
+                                            };
 
-                                                // 3. Route inbound message over Philotic Web IPC
-                                                let task_req = IpcRequest::EmitTask {
-                                                    target_node: "local-ansible-01".into(),
-                                                    target_role: "agent".into(),
-                                                    target_guest_id: None,
-                                                    task_json: json!({
-                                                        "source": "telegram",
-                                                        "session_id": session_id,
-                                                        "turn_id": turn_id,
-                                                        "chat_id": chat_id,
-                                                        "content": text,
-                                                        "final_reply_to": "local-ansible-01",
-                                                        "final_reply_role": "hegemon",
-                                                        "final_reply_guest_id": "hegemon-telegram-01"
-                                                    }).to_string(),
-                                                };
-
-                                                match ipc_client.send_request(task_req).await {
-                                                    Ok(_) => info!("Routed message to Ansible successfully."),
-                                                    Err(e) => error!("Failed to route message to Ansible: {}", e),
-                                                }
+                                            match ipc_client.send_request(task_req).await {
+                                                Ok(_) => info!("Routed message to Ansible successfully."),
+                                                Err(e) => error!("Failed to route message to Ansible: {}", e),
                                             }
                                         }
                                     }
@@ -177,5 +267,47 @@ async fn main() -> Result<()> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{telegram_command, telegram_text_envelope};
+    use serde_json::json;
+
+    #[test]
+    fn telegram_text_envelope_normalizes_threaded_message() {
+        let update = json!({
+            "update_id": 99,
+            "message": {
+                "message_thread_id": 77,
+                "text": "/status show me the room",
+                "chat": { "id": -10012345 },
+                "from": { "id": 888, "username": "jared" }
+            }
+        });
+
+        let envelope = telegram_text_envelope(&update, 99, "agent-jane-01")
+            .expect("text update should normalize");
+
+        assert_eq!(envelope.session_id, "telegram:-10012345:77:agent-jane-01");
+        assert_eq!(envelope.turn_id, "telegram-update-99");
+        assert_eq!(envelope.chat_id, "-10012345");
+        assert_eq!(envelope.thread_id.as_deref(), Some("77"));
+        assert_eq!(envelope.sender_id.as_deref(), Some("888"));
+        assert_eq!(envelope.sender_username.as_deref(), Some("jared"));
+        assert_eq!(envelope.message_kind, "text");
+        assert_eq!(envelope.content, "/status show me the room");
+        assert_eq!(envelope.command.as_deref(), Some("/status"));
+        assert_eq!(envelope.raw_transport_event, update);
+    }
+
+    #[test]
+    fn telegram_command_returns_only_slash_token() {
+        assert_eq!(
+            telegram_command("/approve use staging"),
+            Some("/approve".into())
+        );
+        assert_eq!(telegram_command("hello there"), None);
     }
 }

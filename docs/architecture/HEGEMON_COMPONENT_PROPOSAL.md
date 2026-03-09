@@ -36,6 +36,7 @@ Implemented so far:
 - the current generic `role = "hegemon"` reply path is explicitly marked transitional
 - the hotel IPC layer now supports optional guest-specific local delivery within a shared role
 - `agent-core`, `model-router`, and `hegemon` now carry an optional `final_reply_guest_id` so a turn can preserve its owning hegemon incarnation while keeping role-based fallback
+- session bindings now persist the transport reply target so new turns inherit their owning hegemon target from session state rather than only from inbound payload scaffolding
 
 Track follow-on work in [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md).
 
@@ -47,6 +48,7 @@ Current repo truth is transitional:
 - the hotel materializes it with `role = "hegemon"`
 - agent and model flows still preserve `final_reply_role = "hegemon"` as the fallback reply contract
 - agent and model flows can now also preserve an optional hegemon guest target for local delivery
+- session bindings now persist the current reply target (`node`, `role`, optional `guest_id`) so the owning hegemon target survives across turns and checkpoint rehydration
 
 This proves the edge-guest idea, but it does not yet define a scalable hegemon interface.
 
