@@ -6,6 +6,7 @@
 
 use crate::event::{EventEnvelope, EventId, EventKind, EventPayload};
 use crate::graph::{GraphEdge, GraphNode};
+use crate::graph::AbstractToolRecord;
 use crate::storage::{
     CursorStorage, EventStorage, GraphAdapter, GraphStorage, GuestRecord, HotelRecord,
     SecretRecord, SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,
@@ -59,6 +60,11 @@ impl SqliteEventStorage {
         )?;
         let _ = conn.execute("ALTER TABLE mesh_events ADD COLUMN target_node_id TEXT", []);
         Ok(())
+    }
+
+    /// Expose raw connection handle for tests and low-level queries.
+    pub fn raw_conn(&self) -> &Arc<Mutex<Connection>> {
+        &self.conn
     }
 }
 
@@ -236,6 +242,11 @@ impl SqliteCursorStorage {
             [],
         )?;
         Ok(())
+    }
+
+    /// Expose raw connection handle for tests and low-level queries.
+    pub fn raw_conn(&self) -> &Arc<Mutex<Connection>> {
+        &self.conn
     }
 }
 
@@ -1298,5 +1309,29 @@ impl GraphStorage for SqliteGraphStorage {
             out.drain(0..drain);
         }
         Ok(out)
+    }
+
+    fn upsert_abstract_tool(&self, tool: &AbstractToolRecord) -> Result<()> {
+        self.adapter.upsert_node(&GraphNode {
+            node_key: format!("abstract_tool:{}", tool.tool_name),
+            kind: "abstract_tool".into(),
+            label: Some(tool.tool_name.clone()),
+            data: serde_json::to_value(tool)?,
+        })
+    }
+
+    fn get_abstract_tool(&self, tool_name: &str) -> Result<Option<AbstractToolRecord>> {
+        match self.adapter.get_node(&format!("abstract_tool:{tool_name}"))? {
+            Some(node) => Ok(Some(serde_json::from_value(node.data)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn list_abstract_tools(&self) -> Result<Vec<AbstractToolRecord>> {
+        self.adapter
+            .list_nodes_by_kind("abstract_tool")?
+            .into_iter()
+            .map(|node| serde_json::from_value(node.data).map_err(Into::into))
+            .collect()
     }
 }

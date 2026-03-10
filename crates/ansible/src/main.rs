@@ -1,7 +1,8 @@
 use ansible_mesh_core::beacon::BeaconDaemon;
 use ansible_mesh_core::heartbeat::emit_heartbeat;
 use ansible_mesh_core::registry::{CapabilityAdvertisement, ExecutionReachability};
-use ansible_mesh_core::storage::{AgentIdentityRecord, GraphStorage, GuestRecord, HotelRecord};
+use ansible_mesh_core::graph::AbstractToolRecord;
+use ansible_mesh_core::storage::{AgentIdentityRecord, CursorStorage, EventStorage, GraphStorage, GuestRecord, HotelRecord};
 use ansible_mesh_core::{NodeCapabilities, NodeRole};
 use anyhow::{Context, Result};
 use axum::body::{Body, to_bytes};
@@ -750,6 +751,84 @@ fn agent_identity_record_for_profile(profile: &AgentProfile) -> AgentIdentityRec
         persona_name: profile.persona_name.clone(),
         bundle_json,
     }
+}
+
+/// Seed the built-in abstract tool catalog into the context graph.
+///
+/// Uses upsert semantics — safe to call on every startup. Tools not already
+/// present are inserted; existing entries are updated to the current definition.
+/// Operator-added or tool-runner-provided tools with distinct names are unaffected.
+fn seed_abstract_tool_catalog(graph: &dyn GraphStorage) -> anyhow::Result<()> {
+    let catalog = [
+        AbstractToolRecord {
+            tool_name: "session.status".into(),
+            description: "Returns a summary of the current session state, including the active \
+                          session ID, turn count, approval policy, and active tool runners."
+                .into(),
+            input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+            class: "session".into(),
+        },
+        AbstractToolRecord {
+            tool_name: "echo".into(),
+            description: "Echoes a string back unchanged. Use for testing tool routing and \
+                          round-trip connectivity."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string", "description": "The text to echo back." }
+                },
+                "required": ["text"]
+            }),
+            class: "utility".into(),
+        },
+        AbstractToolRecord {
+            tool_name: "workspace.list".into(),
+            description: "Lists files and directories at the given path within the workspace. \
+                          Defaults to the workspace root if no path is provided."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path within the workspace to list."
+                    }
+                }
+            }),
+            class: "workspace".into(),
+        },
+        AbstractToolRecord {
+            tool_name: "workspace.read".into(),
+            description: "Reads the contents of a file in the workspace. Supports optional \
+                          byte-range limiting via offset and limit."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path to the file within the workspace."
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Byte offset to start reading from."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of bytes to read."
+                    }
+                },
+                "required": ["path"]
+            }),
+            class: "workspace".into(),
+        },
+    ];
+
+    for tool in &catalog {
+        graph.upsert_abstract_tool(tool)?;
+    }
+    Ok(())
 }
 
 fn enable_guest_test_overrides(
@@ -1980,6 +2059,8 @@ async fn main() -> Result<()> {
         }
     };
 
+    seed_abstract_tool_catalog(&graph_storage)?;
+
     if let Some(test) = startup_test {
         prepare_startup_test_binaries(test)?;
         enable_guest_test_overrides(&graph_storage, &hotel_name, test)?;
@@ -2094,8 +2175,8 @@ async fn main() -> Result<()> {
     let db_path_writer = db_path.to_owned();
 
     // Initialize Mutable State Components First
-    let ledger = Arc::new(
-        match ansible_mesh_core::ledger::EventLedger::open(&db_path_writer) {
+    let ledger: Arc<dyn EventStorage> = Arc::new(
+        match ansible_mesh_core::sqlite_storage::SqliteEventStorage::open(&db_path_writer) {
             Ok(l) => l,
             Err(e) => {
                 error!("Failed to open Event Ledger: {}", e);
@@ -2104,8 +2185,8 @@ async fn main() -> Result<()> {
         },
     );
 
-    let tracker = Arc::new(
-        match ansible_mesh_core::cursor::CursorTracker::open(&db_path_writer) {
+    let tracker: Arc<dyn CursorStorage> = Arc::new(
+        match ansible_mesh_core::sqlite_storage::SqliteCursorStorage::open(&db_path_writer) {
             Ok(t) => t,
             Err(e) => {
                 error!("Failed to open Cursor Tracker: {}", e);
@@ -2642,7 +2723,9 @@ mod tests {
             .expect("seed guests");
 
         let ads = local_capability_advertisements(&graph, &hotel).expect("ads should build");
-        assert_eq!(ads.len(), guests.len());
+        // Only active guests generate advertisements; tool-runner is seeded with is_active=false.
+        let active_guest_count = guests.iter().filter(|g| g.is_active).count();
+        assert_eq!(ads.len(), active_guest_count);
         assert!(ads.iter().all(|ad| ad.hotel_id == "aria-architect-hotel"));
         assert!(
             ads.iter()

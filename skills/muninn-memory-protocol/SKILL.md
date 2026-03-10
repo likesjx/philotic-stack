@@ -15,7 +15,7 @@ This skill standardizes how a client should:
 
 - retrieve before meaningful work
 - write back after durable outcomes
-- keep memory atomic
+- keep memory atomic and fragmented into short, meaningful bursts
 - rely on the shared helper instead of hand-rolling MCP ceremony
 
 ## Use The Shared Helper
@@ -35,7 +35,7 @@ Before meaningful work:
 
 After durable outcomes:
 
-- run `remember` for atomic facts, preferences, and outcomes
+- run `remember` for atomic facts, preferences, and outcomes in short, meaningful bursts
 - run `decide` for explicit decisions with rationale
 
 ## Truth Rule

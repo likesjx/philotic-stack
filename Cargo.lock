@@ -1085,6 +1085,7 @@ name = "hegemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "philotic-client",
  "pulldown-cmark",

@@ -1,3 +1,4 @@
+mod catalog;
 mod commands;
 mod r#loop;
 mod protocol;

@@ -52,6 +52,22 @@ pub struct GraphRelationship {
     pub target: String,
 }
 
+/// A system-wide shared tool definition stored in the context graph.
+///
+/// Node kind: `abstract_tool`. Node key: `abstract_tool:{tool_name}`.
+/// These are the canonical capability definitions visible to agents and used
+/// for approval class evaluation. They are seeded at hotel startup and can be
+/// extended by tool-runner guests.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AbstractToolRecord {
+    pub tool_name: String,
+    pub description: String,
+    #[serde(default)]
+    pub input_schema: serde_json::Value,
+    /// Approval and projection class: "session", "workspace", "utility", "capability"
+    pub class: String,
+}
+
 /// A dedicated namespace for an agent's memory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryApartment {

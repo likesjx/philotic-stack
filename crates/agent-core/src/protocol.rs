@@ -70,7 +70,7 @@ pub struct InboundTaskPayload {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelRequestPayload {
-    pub action: &'static str,
+    pub action: String,
     pub session_id: String,
     pub turn_id: String,
     pub prompt: String,
@@ -94,6 +94,13 @@ pub struct FinalReplyPayload {
     pub turn_id: String,
     pub chat_id: String,
     pub content: String,
+    /// Serialized `AudioArtifact` JSON from a voice synthesis response, if TTS is enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_artifact: Option<String>,
+    /// When true and `audio_artifact` is present, the transport should also deliver the text
+    /// content alongside the audio (e.g. as a Telegram caption).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub send_text_caption: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

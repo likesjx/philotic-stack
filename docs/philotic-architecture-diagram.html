@@ -1,0 +1,1701 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Philotic Stack — Architecture</title>
+    <style>
+      @import url("https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap");
+
+      :root {
+        --bg: #0a0c14;
+        --surface: #111420;
+        --surface2: #161b2e;
+        --border: #1e2540;
+        --border-bright: #2a3360;
+
+        --cyan: #00e5ff;
+        --green: #00e676;
+        --amber: #ffc107;
+        --orange: #ff6d00;
+        --purple: #d500f9;
+        --pink: #f50057;
+        --blue: #2979ff;
+        --teal: #1de9b6;
+        --lime: #76ff03;
+        --red: #ff1744;
+
+        --text-primary: #e8eaf0;
+        --text-secondary: #8892b0;
+        --text-dim: #4a5370;
+
+        /* status colors */
+        --done: #00e676;
+        --in-prog: #ffc107;
+        --planned: #4a5370;
+        --partial: #ff6d00;
+      }
+
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+
+      body {
+        background: var(--bg);
+        color: var(--text-primary);
+        font-family: "Inter", sans-serif;
+        min-height: 100vh;
+        overflow-x: auto;
+      }
+
+      /* ── Header ── */
+      .header {
+        padding: 28px 36px 20px;
+        border-bottom: 1px solid var(--border);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        flex-wrap: wrap;
+        gap: 12px;
+      }
+      .header-title {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+      }
+      .logo-ring {
+        width: 40px;
+        height: 40px;
+        border-radius: 50%;
+        border: 2px solid var(--cyan);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        box-shadow: 0 0 14px rgba(0, 229, 255, 0.35);
+        font-size: 18px;
+      }
+      h1 {
+        font-size: 1.25rem;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+      }
+      h1 span {
+        color: var(--cyan);
+      }
+      .subtitle {
+        font-size: 0.75rem;
+        color: var(--text-secondary);
+        margin-top: 2px;
+      }
+
+      /* ── Tab Switch ── */
+      .tabs {
+        display: flex;
+        gap: 6px;
+      }
+      .tab-btn {
+        background: var(--surface2);
+        border: 1px solid var(--border);
+        color: var(--text-secondary);
+        padding: 8px 20px;
+        border-radius: 8px;
+        cursor: pointer;
+        font-family: "Inter", sans-serif;
+        font-size: 0.8rem;
+        font-weight: 500;
+        letter-spacing: 0.04em;
+        transition: all 0.2s;
+      }
+      .tab-btn:hover {
+        border-color: var(--cyan);
+        color: var(--cyan);
+      }
+      .tab-btn.active {
+        background: rgba(0, 229, 255, 0.08);
+        border-color: var(--cyan);
+        color: var(--cyan);
+        box-shadow: 0 0 10px rgba(0, 229, 255, 0.2);
+      }
+
+      /* ── View panels ── */
+      .view {
+        display: none;
+        padding: 28px 36px 40px;
+      }
+      .view.active {
+        display: block;
+      }
+
+      /* ── Diagram canvas ── */
+      .canvas {
+        position: relative;
+        width: 100%;
+        min-width: 1100px;
+        min-height: 820px;
+      }
+
+      /* ── Group / Zone boxes ── */
+      .zone {
+        position: absolute;
+        border-radius: 12px;
+        padding: 14px 16px 16px;
+        border: 1.5px solid;
+      }
+      .zone-label {
+        font-size: 0.6rem;
+        font-weight: 700;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        margin-bottom: 10px;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .zone-label::before {
+        content: "";
+        display: inline-block;
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: currentColor;
+        box-shadow: 0 0 6px currentColor;
+      }
+
+      /* color variants */
+      .zone-cyan {
+        border-color: rgba(0, 229, 255, 0.35);
+        background: rgba(0, 229, 255, 0.04);
+        color: var(--cyan);
+      }
+      .zone-green {
+        border-color: rgba(0, 230, 118, 0.35);
+        background: rgba(0, 230, 118, 0.04);
+        color: var(--green);
+      }
+      .zone-purple {
+        border-color: rgba(213, 0, 249, 0.3);
+        background: rgba(213, 0, 249, 0.04);
+        color: var(--purple);
+      }
+      .zone-amber {
+        border-color: rgba(255, 193, 7, 0.3);
+        background: rgba(255, 193, 7, 0.04);
+        color: var(--amber);
+      }
+      .zone-teal {
+        border-color: rgba(29, 233, 182, 0.3);
+        background: rgba(29, 233, 182, 0.04);
+        color: var(--teal);
+      }
+      .zone-blue {
+        border-color: rgba(41, 121, 255, 0.3);
+        background: rgba(41, 121, 255, 0.04);
+        color: var(--blue);
+      }
+      .zone-orange {
+        border-color: rgba(255, 109, 0, 0.3);
+        background: rgba(255, 109, 0, 0.04);
+        color: var(--orange);
+      }
+      .zone-pink {
+        border-color: rgba(245, 0, 87, 0.3);
+        background: rgba(245, 0, 87, 0.04);
+        color: var(--pink);
+      }
+
+      /* ── Component nodes ── */
+      .node {
+        display: inline-flex;
+        flex-direction: column;
+        border-radius: 8px;
+        border: 1px solid var(--border-bright);
+        background: var(--surface2);
+        padding: 7px 11px;
+        font-size: 0.72rem;
+        font-weight: 500;
+        line-height: 1.3;
+        cursor: default;
+        transition: all 0.2s;
+        position: relative;
+      }
+      .node:hover {
+        border-color: var(--cyan);
+        box-shadow: 0 0 12px rgba(0, 229, 255, 0.18);
+        transform: translateY(-1px);
+        z-index: 10;
+      }
+      .node-name {
+        font-weight: 600;
+        font-size: 0.72rem;
+        color: var(--text-primary);
+      }
+      .node-tag {
+        font-size: 0.6rem;
+        font-family: "JetBrains Mono", monospace;
+        color: var(--text-secondary);
+        margin-top: 2px;
+      }
+
+      /* node accent variants */
+      .node-cyan {
+        border-color: rgba(0, 229, 255, 0.45);
+        box-shadow: 0 0 0 1px rgba(0, 229, 255, 0.08) inset;
+      }
+      .node-green {
+        border-color: rgba(0, 230, 118, 0.45);
+        box-shadow: 0 0 0 1px rgba(0, 230, 118, 0.08) inset;
+      }
+      .node-purple {
+        border-color: rgba(213, 0, 249, 0.4);
+        box-shadow: 0 0 0 1px rgba(213, 0, 249, 0.08) inset;
+      }
+      .node-amber {
+        border-color: rgba(255, 193, 7, 0.45);
+        box-shadow: 0 0 0 1px rgba(255, 193, 7, 0.08) inset;
+      }
+      .node-teal {
+        border-color: rgba(29, 233, 182, 0.4);
+        box-shadow: 0 0 0 1px rgba(29, 233, 182, 0.08) inset;
+      }
+      .node-blue {
+        border-color: rgba(41, 121, 255, 0.45);
+        box-shadow: 0 0 0 1px rgba(41, 121, 255, 0.08) inset;
+      }
+      .node-orange {
+        border-color: rgba(255, 109, 0, 0.4);
+        box-shadow: 0 0 0 1px rgba(255, 109, 0, 0.08) inset;
+      }
+
+      /* tight row of nodes */
+      .node-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-top: 4px;
+      }
+
+      /* ── SVG arrows overlay ── */
+      .arrows-svg {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        pointer-events: none;
+        z-index: 5;
+      }
+      .arrow-line {
+        stroke-width: 1.5;
+        fill: none;
+        marker-end: url(#arrow-head);
+        opacity: 0.7;
+      }
+      .arrow-line.ipc {
+        stroke: var(--cyan);
+        stroke-dasharray: 5 3;
+      }
+      .arrow-line.udp {
+        stroke: var(--purple);
+      }
+      .arrow-line.tcp {
+        stroke: var(--blue);
+      }
+      .arrow-line.http {
+        stroke: var(--teal);
+        stroke-dasharray: 3 2;
+      }
+      .arrow-line.db {
+        stroke: var(--amber);
+        stroke-dasharray: 2 2;
+      }
+
+      /* ── Legend ── */
+      .legend {
+        margin-top: 28px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 16px 28px;
+        padding: 14px 18px;
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        width: fit-content;
+      }
+      .legend-item {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 0.72rem;
+        color: var(--text-secondary);
+      }
+      .legend-line {
+        width: 30px;
+        height: 2px;
+        display: inline-block;
+      }
+      .legend-dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 2px;
+      }
+
+      /* ── Status badges (overlay view) ── */
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        font-size: 0.58rem;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        padding: 2px 6px;
+        border-radius: 4px;
+        margin-left: 4px;
+      }
+      .badge-done {
+        background: rgba(0, 230, 118, 0.18);
+        color: var(--done);
+        border: 1px solid rgba(0, 230, 118, 0.4);
+      }
+      .badge-prog {
+        background: rgba(255, 193, 7, 0.15);
+        color: var(--amber);
+        border: 1px solid rgba(255, 193, 7, 0.4);
+      }
+      .badge-planned {
+        background: rgba(74, 83, 112, 0.2);
+        color: var(--text-secondary);
+        border: 1px solid rgba(74, 83, 112, 0.5);
+      }
+      .badge-partial {
+        background: rgba(255, 109, 0, 0.15);
+        color: var(--orange);
+        border: 1px solid rgba(255, 109, 0, 0.4);
+      }
+
+      /* status overlay dots on nodes */
+      .stat-dot {
+        position: absolute;
+        top: 5px;
+        right: 6px;
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+      }
+      .stat-dot.done {
+        background: var(--done);
+        box-shadow: 0 0 6px var(--done);
+      }
+      .stat-dot.prog {
+        background: var(--amber);
+        box-shadow: 0 0 6px var(--amber);
+      }
+      .stat-dot.planned {
+        background: var(--text-dim);
+      }
+      .stat-dot.partial {
+        background: var(--orange);
+        box-shadow: 0 0 6px var(--orange);
+      }
+
+      /* ── Status legend strip ── */
+      .status-strip {
+        display: flex;
+        gap: 20px;
+        flex-wrap: wrap;
+        margin-bottom: 18px;
+      }
+      .status-item {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        font-size: 0.72rem;
+        color: var(--text-secondary);
+      }
+      .status-sq {
+        width: 10px;
+        height: 10px;
+        border-radius: 3px;
+      }
+      .sq-done {
+        background: var(--done);
+        box-shadow: 0 0 5px var(--done);
+      }
+      .sq-prog {
+        background: var(--amber);
+        box-shadow: 0 0 5px var(--amber);
+      }
+      .sq-partial {
+        background: var(--orange);
+        box-shadow: 0 0 5px var(--orange);
+      }
+      .sq-planned {
+        background: var(--text-dim);
+      }
+
+      /* ── Progress bar strip ── */
+      .progress-bar-wrap {
+        margin-bottom: 20px;
+      }
+      .progress-label {
+        font-size: 0.7rem;
+        color: var(--text-secondary);
+        margin-bottom: 5px;
+        display: flex;
+        justify-content: space-between;
+      }
+      .progress-track {
+        height: 6px;
+        background: var(--surface2);
+        border-radius: 3px;
+        overflow: hidden;
+        display: flex;
+      }
+      .progress-seg {
+        height: 100%;
+      }
+      .seg-done {
+        background: var(--done);
+      }
+      .seg-prog {
+        background: var(--amber);
+      }
+      .seg-partial {
+        background: var(--orange);
+      }
+      .seg-planned {
+        background: var(--text-dim);
+        opacity: 0.4;
+      }
+
+      /* tooltip */
+      .node[data-tip]:hover::after {
+        content: attr(data-tip);
+        position: absolute;
+        top: calc(100% + 6px);
+        left: 50%;
+        transform: translateX(-50%);
+        background: #1a1f35;
+        border: 1px solid var(--border-bright);
+        color: var(--text-secondary);
+        font-size: 0.65rem;
+        line-height: 1.4;
+        padding: 5px 8px;
+        border-radius: 6px;
+        white-space: nowrap;
+        z-index: 100;
+        pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="header">
+      <div class="header-title">
+        <div class="logo-ring">⬡</div>
+        <div>
+          <h1>The <span>Philotic Stack</span> — Architecture</h1>
+          <div class="subtitle">
+            Distributed AI Agent OS · Rust · Hotel / Guest Model
+          </div>
+        </div>
+      </div>
+      <div class="tabs">
+        <button class="tab-btn active" onclick="switchTab('target')">
+          Target Architecture
+        </button>
+        <button class="tab-btn" onclick="switchTab('status')">
+          Implementation Status
+        </button>
+      </div>
+    </div>
+
+    <!-- ══════════════════════════════════════════════════════════
+     VIEW 1 — TARGET ARCHITECTURE
+═══════════════════════════════════════════════════════════ -->
+    <div class="view active" id="view-target">
+      <!-- legend -->
+      <div class="legend" style="margin-bottom: 24px">
+        <div class="legend-item">
+          <span class="legend-line" style="background: var(--cyan)"></span>IPC /
+          Unix Domain Socket
+        </div>
+        <div class="legend-item">
+          <span class="legend-line" style="background: var(--purple)"></span>UDP
+          Control Plane (BeaconMessage)
+        </div>
+        <div class="legend-item">
+          <span class="legend-line" style="background: var(--blue)"></span>TCP
+          Execution Plane
+        </div>
+        <div class="legend-item">
+          <span
+            class="legend-line"
+            style="
+              background: var(--teal);
+              height: 2px;
+              border-top: 2px dashed var(--teal);
+              background: none;
+            "
+          ></span
+          >HTTP / Blob Service
+        </div>
+        <div class="legend-item">
+          <span
+            class="legend-line"
+            style="border-top: 2px dashed var(--amber); background: none"
+          ></span
+          >SQLite Read/Write
+        </div>
+      </div>
+
+      <div class="canvas" id="canvas-target" style="min-height: 900px">
+        <!-- ─── ZONE: Physical Node (Ansible Daemon / The Hotel) ─── -->
+        <div
+          class="zone zone-cyan"
+          id="z-hotel"
+          style="top: 0; left: 0; right: 0; bottom: 310px; min-height: 540px"
+        >
+          <div class="zone-label">
+            Physical Node — The Hotel (ansible daemon)
+          </div>
+
+          <!-- Core Services sub-zone -->
+          <div
+            class="zone zone-amber"
+            style="
+              position: absolute;
+              top: 34px;
+              left: 14px;
+              width: 280px;
+              bottom: 14px;
+            "
+          >
+            <div class="zone-label">Core Services</div>
+            <div class="node-row" style="flex-direction: column; gap: 7px">
+              <div
+                class="node node-amber"
+                id="n-ipc"
+                data-tip="UDS @ /tmp/philotic-ansible.sock · newline-delimited JSON"
+              >
+                <span class="node-name">IpcServer</span>
+                <span class="node-tag">service/ipc.rs</span>
+              </div>
+              <div
+                class="node node-amber"
+                id="n-gm"
+                data-tip="Reads DB, spawns & supervises guest OS processes every 5s"
+              >
+                <span class="node-name">GuestManager</span>
+                <span class="node-tag">service/guest_manager.rs</span>
+              </div>
+              <div
+                class="node node-amber"
+                id="n-blob"
+                data-tip="HTTP :9001 · SHA-256 content-addressed large payloads"
+              >
+                <span class="node-name">BlobService</span>
+                <span class="node-tag">service/blob.rs · :9001</span>
+              </div>
+              <div
+                class="node node-amber"
+                id="n-disp"
+                data-tip="Polls EventLedger, sends unACKed events to peer hotels via TCP"
+              >
+                <span class="node-name">MeshDispatcher</span>
+                <span class="node-tag">service/mesh_dispatcher.rs</span>
+              </div>
+              <div
+                class="node node-amber"
+                id="n-webrtc"
+                data-tip="SDP signaling bridge for ephemeral P2P data channels"
+              >
+                <span class="node-name">WebRtcGuest</span>
+                <span class="node-tag">service/webrtc_guest.rs</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Storage sub-zone -->
+          <div
+            class="zone zone-orange"
+            style="
+              position: absolute;
+              top: 34px;
+              left: 310px;
+              width: 230px;
+              bottom: 14px;
+            "
+          >
+            <div class="zone-label">Storage Layer</div>
+            <div class="node-row" style="flex-direction: column; gap: 7px">
+              <div
+                class="node node-orange"
+                id="n-gs"
+                data-tip="GraphStorage trait → SqliteGraphStorage · node_config, materialized_guests, memory_apartments"
+              >
+                <span class="node-name">GraphStorage</span>
+                <span class="node-tag">Arc&lt;dyn GraphStorage&gt;</span>
+              </div>
+              <div
+                class="node node-orange"
+                id="n-es"
+                data-tip="EventStorage trait → SqliteEventStorage · mesh_events table"
+              >
+                <span class="node-name">EventStorage</span>
+                <span class="node-tag">Arc&lt;dyn EventStorage&gt;</span>
+              </div>
+              <div
+                class="node node-orange"
+                id="n-cs"
+                data-tip="CursorStorage trait → SqliteCursorStorage · mesh_cursors table"
+              >
+                <span class="node-name">CursorStorage</span>
+                <span class="node-tag">Arc&lt;dyn CursorStorage&gt;</span>
+              </div>
+              <div
+                class="node"
+                id="n-sqlite"
+                style="
+                  border-color: rgba(255, 109, 0, 0.6);
+                  background: #1a1000;
+                  margin-top: 6px;
+                "
+              >
+                <span class="node-name">📀 SQLite</span>
+                <span class="node-tag">ansible_context.db</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Mesh primitives sub-zone -->
+          <div
+            class="zone zone-purple"
+            style="
+              position: absolute;
+              top: 34px;
+              left: 556px;
+              width: 250px;
+              height: 240px;
+            "
+          >
+            <div class="zone-label">ansible-mesh-core Primitives</div>
+            <div class="node-row" style="flex-direction: column; gap: 7px">
+              <div
+                class="node node-purple"
+                id="n-beacon"
+                data-tip="UDP :8999 · HMAC-PSK auth, 5-min replay window"
+              >
+                <span class="node-name">BeaconDaemon</span>
+                <span class="node-tag">beacon.rs · UDP :8999</span>
+              </div>
+              <div
+                class="node node-purple"
+                id="n-reg"
+                data-tip="In-memory map of active mesh peer nodes and capabilities"
+              >
+                <span class="node-name">NodeRegistry</span>
+                <span class="node-tag">registry.rs</span>
+              </div>
+              <div
+                class="node node-purple"
+                id="n-authz"
+                data-tip="HMAC-SHA256 over PSK, replay guard ±5 min"
+              >
+                <span class="node-name">AuthZ (HMAC-PSK)</span>
+                <span class="node-tag">authz.rs</span>
+              </div>
+              <div
+                class="node node-purple"
+                id="n-mm"
+                data-tip="model.manager.list + model.manager.route IPC tools"
+              >
+                <span class="node-name">ModelManagerInvoker</span>
+                <span class="node-tag">model_manager.rs</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Guest Binaries zone (inside hotel but separate) -->
+          <div
+            class="zone zone-green"
+            style="
+              position: absolute;
+              top: 290px;
+              left: 556px;
+              right: 14px;
+              bottom: 14px;
+            "
+          >
+            <div class="zone-label">
+              Guest OS Processes (materialized by GuestManager)
+            </div>
+            <div class="node-row" style="gap: 10px; margin-top: 4px">
+              <div
+                class="node node-green"
+                id="n-hegemon"
+                data-tip="Telegram ingress/egress · registers IPC, polls webhooks"
+              >
+                <span class="node-name">Hegemon</span>
+                <span class="node-tag">hegemon-telegram-01</span>
+              </div>
+              <div
+                class="node node-green"
+                id="n-agent"
+                data-tip="Persona runtime · long-running reasoning loop · Jane / Aria"
+              >
+                <span class="node-name">Agent-Core</span>
+                <span class="node-tag">agent-jane-01</span>
+              </div>
+              <div
+                class="node node-green"
+                id="n-gemini"
+                data-tip="Gemini provider controller · model.gemini role"
+              >
+                <span class="node-name">Model·Gemini</span>
+                <span class="node-tag">model-controller-gemini-01</span>
+              </div>
+              <div
+                class="node node-green"
+                id="n-elabs"
+                data-tip="ElevenLabs TTS controller · model.elevenlabs role"
+              >
+                <span class="node-name">Model·ElevenLabs</span>
+                <span class="node-tag">model-controller-elevenlabs-01</span>
+              </div>
+              <div
+                class="node node-teal"
+                id="n-toolrunner"
+                data-tip="Workspace tool executor · inactive, not yet spawned"
+              >
+                <span class="node-name">Tool-Runner</span>
+                <span class="node-tag">{hotel}:tool-runner</span>
+              </div>
+              <div
+                class="node node-teal"
+                id="n-mcppy"
+                data-tip="Any MCP-compatible process can register as a guest via IPC"
+              >
+                <span class="node-name">MCP Guest (Python/Node)</span>
+                <span class="node-tag">any-mcp-process</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- philotic-client SDK label -->
+          <div
+            style="
+              position: absolute;
+              top: 46px;
+              left: 820px;
+              right: 14px;
+              height: 120px;
+              display: flex;
+              flex-direction: column;
+            "
+          >
+            <div
+              class="zone zone-teal"
+              style="position: relative; width: 100%; height: 100%"
+            >
+              <div class="zone-label">philotic-client SDK</div>
+              <div class="node-row">
+                <div
+                  class="node node-teal"
+                  id="n-pclient"
+                  data-tip="PhiloticClient: connect, publish_event, sync_apartment · UDS"
+                >
+                  <span class="node-name">PhiloticClient</span>
+                  <span class="node-tag">philotic-client crate</span>
+                </div>
+              </div>
+              <div
+                style="
+                  font-size: 0.6rem;
+                  color: var(--text-dim);
+                  margin-top: 6px;
+                "
+              >
+                Used by every guest binary
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ─── ZONE: The Philotic Web (mesh) ─── -->
+        <div
+          class="zone zone-purple"
+          id="z-mesh"
+          style="bottom: 0; left: 0; right: 0; height: 290px"
+        >
+          <div class="zone-label">The Philotic Web — Inter-Hotel Mesh</div>
+
+          <div
+            style="display: flex; gap: 20px; flex-wrap: wrap; margin-top: 4px"
+          >
+            <div
+              class="zone zone-blue"
+              style="position: relative; width: 300px; min-height: 180px"
+            >
+              <div class="zone-label">UDP Control Plane</div>
+              <div class="node-row" style="flex-direction: column; gap: 7px">
+                <div
+                  class="node node-blue"
+                  id="n-heartbeat"
+                  data-tip="Periodic liveness + capability advertisement to all peers"
+                >
+                  <span class="node-name">Heartbeat</span>
+                  <span class="node-tag">heartbeat.rs · HEARTBEAT msg</span>
+                </div>
+                <div
+                  class="node node-blue"
+                  id="n-gossip"
+                  data-tip="NodeRegistry updated by incoming HEARTBEAT BeaconMessages"
+                >
+                  <span class="node-name">Gossip / Peer Discovery</span>
+                  <span class="node-tag">registry + beacon</span>
+                </div>
+                <div
+                  class="node node-blue"
+                  id="n-memop"
+                  data-tip="MEMORY_OP messages route to GraphStorage.sync_apartment"
+                >
+                  <span class="node-name">Memory Op Routing</span>
+                  <span class="node-tag">MEMORY_OP · MEMORY_OP_ACK</span>
+                </div>
+              </div>
+            </div>
+
+            <div
+              class="zone zone-cyan"
+              style="position: relative; width: 330px; min-height: 180px"
+            >
+              <div class="zone-label">TCP Execution Plane (Data Plane)</div>
+              <div class="node-row" style="flex-direction: column; gap: 7px">
+                <div
+                  class="node node-cyan"
+                  id="n-ledger"
+                  data-tip="Append-only SQLite event log. Durable even when peer is offline."
+                >
+                  <span class="node-name">EventLedger</span>
+                  <span class="node-tag">ledger.rs · mesh_events table</span>
+                </div>
+                <div
+                  class="node node-cyan"
+                  id="n-cursor"
+                  data-tip="Per-(consumer, source) acked sequence pointer. Drives at-least-once."
+                >
+                  <span class="node-name">CursorTracker</span>
+                  <span class="node-tag">cursor.rs · mesh_cursors table</span>
+                </div>
+                <div
+                  class="node node-cyan"
+                  id="n-ack"
+                  data-tip="MESH_EVENT_BATCH dispatched via TCP. ACK advances cursor."
+                >
+                  <span class="node-name">Event Batch / ACK</span>
+                  <span class="node-tag">MESH_EVENT_BATCH · ACK</span>
+                </div>
+              </div>
+            </div>
+
+            <div
+              class="zone zone-teal"
+              style="position: relative; width: 220px; min-height: 180px"
+            >
+              <div class="zone-label">WebRTC Ephemeral Plane</div>
+              <div class="node-row" style="flex-direction: column; gap: 7px">
+                <div
+                  class="node node-teal"
+                  id="n-sdp"
+                  data-tip="SDP offer/answer exchange via WEBRTC_SIGNAL BeaconMessages"
+                >
+                  <span class="node-name">SDP Signaling</span>
+                  <span class="node-tag">webrtc.rs · WEBRTC_SIGNAL</span>
+                </div>
+                <div
+                  class="node node-teal"
+                  id="n-p2p"
+                  data-tip="Direct P2P data channel after ICE negotiation"
+                >
+                  <span class="node-name">P2P Data Channel</span>
+                  <span class="node-tag">ICE / DTLS bypasses mesh</span>
+                </div>
+              </div>
+            </div>
+
+            <div
+              class="zone zone-pink"
+              style="position: relative; width: 170px; min-height: 180px"
+            >
+              <div class="zone-label">Remote Hotel Node</div>
+              <div class="node-row" style="flex-direction: column; gap: 7px">
+                <div
+                  class="node"
+                  id="n-remote"
+                  style="
+                    border-color: rgba(245, 0, 87, 0.5);
+                    background: #1a0010;
+                  "
+                >
+                  <span class="node-name">Ansible Daemon</span>
+                  <span class="node-tag">remote hotel</span>
+                </div>
+                <div
+                  class="node"
+                  style="
+                    border-color: rgba(245, 0, 87, 0.5);
+                    background: #1a0010;
+                  "
+                >
+                  <span class="node-name">Guest Processes</span>
+                  <span class="node-tag">peer node agents</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- SVG arrows for target view -->
+        <svg class="arrows-svg" id="arrows-target">
+          <defs>
+            <marker
+              id="arrow-head"
+              markerWidth="7"
+              markerHeight="7"
+              refX="6"
+              refY="3.5"
+              orient="auto"
+            >
+              <path d="M0,0 L7,3.5 L0,7 Z" fill="rgba(0,229,255,.7)" />
+            </marker>
+            <marker
+              id="arrow-head-purple"
+              markerWidth="7"
+              markerHeight="7"
+              refX="6"
+              refY="3.5"
+              orient="auto"
+            >
+              <path d="M0,0 L7,3.5 L0,7 Z" fill="rgba(213,0,249,.7)" />
+            </marker>
+            <marker
+              id="arrow-head-blue"
+              markerWidth="7"
+              markerHeight="7"
+              refX="6"
+              refY="3.5"
+              orient="auto"
+            >
+              <path d="M0,0 L7,3.5 L0,7 Z" fill="rgba(41,121,255,.7)" />
+            </marker>
+            <marker
+              id="arrow-head-amber"
+              markerWidth="7"
+              markerHeight="7"
+              refX="6"
+              refY="3.5"
+              orient="auto"
+            >
+              <path d="M0,0 L7,3.5 L0,7 Z" fill="rgba(255,193,7,.7)" />
+            </marker>
+          </defs>
+        </svg>
+      </div>
+      <!-- /canvas-target -->
+    </div>
+    <!-- /view-target -->
+
+    <!-- ══════════════════════════════════════════════════════════
+     VIEW 2 — IMPLEMENTATION STATUS OVERLAY
+═══════════════════════════════════════════════════════════ -->
+    <div class="view" id="view-status">
+      <!-- Status legend -->
+      <div class="status-strip">
+        <div class="status-item">
+          <div class="status-sq sq-done"></div>
+          Implemented &amp; working
+        </div>
+        <div class="status-item">
+          <div class="status-sq sq-prog"></div>
+          In progress / partial
+        </div>
+        <div class="status-item">
+          <div class="status-sq sq-partial"></div>
+          Scaffolded / blocked
+        </div>
+        <div class="status-item">
+          <div class="status-sq sq-planned"></div>
+          Planned / docs only
+        </div>
+      </div>
+
+      <!-- Progress bar -->
+      <div class="progress-bar-wrap">
+        <div class="progress-label">
+          <span>Overall implementation progress (by surface area)</span>
+          <span style="color: var(--done)">~55% complete</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-seg seg-done" style="width: 50%"></div>
+          <div class="progress-seg seg-prog" style="width: 10%"></div>
+          <div class="progress-seg seg-partial" style="width: 8%"></div>
+          <div class="progress-seg seg-planned" style="width: 32%"></div>
+        </div>
+      </div>
+
+      <div class="canvas" id="canvas-status" style="min-height: 980px">
+        <!-- ─── ZONE: Hotel ─── -->
+        <div
+          class="zone zone-cyan"
+          style="top: 0; left: 0; right: 0; bottom: 380px; min-height: 560px"
+        >
+          <div class="zone-label">
+            Physical Node — The Hotel (ansible daemon)
+          </div>
+
+          <!-- Core Services -->
+          <div
+            class="zone zone-amber"
+            style="
+              position: absolute;
+              top: 34px;
+              left: 14px;
+              width: 310px;
+              bottom: 14px;
+            "
+          >
+            <div class="zone-label">Core Services</div>
+            <div class="node-row" style="flex-direction: column; gap: 8px">
+              <div
+                class="node node-amber"
+                data-tip="Full UDS IPC server — Registers, Routes, Dispatches"
+              >
+                <span class="stat-dot done"></span>
+                <span class="node-name"
+                  >IpcServer <span class="badge badge-done">✓ Done</span></span
+                >
+                <span class="node-tag">service/ipc.rs · 4,911 lines</span>
+                <span
+                  class="node-tag"
+                  style="color: var(--orange); margin-top: 3px"
+                  >⚠ Monolith — split recommended</span
+                >
+              </div>
+
+              <div
+                class="node node-amber"
+                data-tip="Materialize + 5s supervision loop with ghost PID detection"
+              >
+                <span class="stat-dot done"></span>
+                <span class="node-name"
+                  >GuestManager
+                  <span class="badge badge-done">✓ Done</span></span
+                >
+                <span class="node-tag"
+                  >guest_manager.rs · LocalProcessMaterializer</span
+                >
+              </div>
+
+              <div
+                class="node node-amber"
+                data-tip="HTTP SHA-256 blob service on :9001"
+              >
+                <span class="stat-dot done"></span>
+                <span class="node-name"
+                  >BlobService
+                  <span class="badge badge-done">✓ Done</span></span
+                >
+                <span class="node-tag"
+                  >service/blob.rs · :9001 · PORT-BP-007 ✓</span
+                >
+              </div>
+
+              <div
+                class="node node-amber"
+                data-tip="Polls EventLedger → TCP execution plane dispatch · env flag gated"
+              >
+                <span class="stat-dot done"></span>
+                <span class="node-name"
+                  >MeshDispatcher
+                  <span class="badge badge-done">✓ Done</span></span
+                >
+                <span class="node-tag">PHILOTIC_ENABLE_RUST_DISPATCHER</span>
+              </div>
+
+              <div
+                class="node node-amber"
+                data-tip="SDP scaffolding present; ICE/lifecycle incomplete"
+              >
+                <span class="stat-dot partial"></span>
+                <span class="node-name"
+                  >WebRtcGuest
+                  <span class="badge badge-partial">⚡ Partial</span></span
+                >
+                <span class="node-tag"
+                  >PORT-BP-008 · ICE handshake incomplete</span
+                >
+              </div>
+
+              <div
+                class="node"
+                style="border-color: rgba(74, 83, 112, 0.5); background: #111"
+                data-tip="Proposed — state machine with invariants"
+              >
+                <span class="stat-dot planned"></span>
+                <span class="node-name"
+                  >Task Lifecycle Engine
+                  <span class="badge badge-planned">Planned</span></span
+                >
+                <span class="node-tag"
+                  >PORT-BP-004 · docs/architecture only</span
+                >
+              </div>
+
+              <div
+                class="node"
+                style="border-color: rgba(74, 83, 112, 0.5); background: #111"
+                data-tip="Invite/ticket validation, nonce replay guard"
+              >
+                <span class="stat-dot planned"></span>
+                <span class="node-name"
+                  >Auth Exchange
+                  <span class="badge badge-planned">Planned</span></span
+                >
+                <span class="node-tag">PORT-BP-006</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Storage -->
+          <div
+            class="zone zone-orange"
+            style="
+              position: absolute;
+              top: 34px;
+              left: 340px;
+              width: 240px;
+              bottom: 14px;
+            "
+          >
+            <div class="zone-label">Storage Layer</div>
+            <div class="node-row" style="flex-direction: column; gap: 8px">
+              <div
+                class="node node-orange"
+                data-tip="GraphStorage trait with full SQLite impl"
+              >
+                <span class="stat-dot done"></span>
+                <span class="node-name"
+                  >GraphStorage
+                  <span class="badge badge-done">✓ Done</span></span
+                >
+                <span class="node-tag">node_config, guests, apartments</span>
+              </div>
+              <div
+                class="node node-orange"
+                data-tip="EventStorage trait with SQLite impl"
+              >
+                <span class="stat-dot done"></span>
+                <span class="node-name"
+                  >EventStorage
+                  <span class="badge badge-done">✓ Done</span></span
+                >
+                <span class="node-tag">mesh_events table</span>
+              </div>
+              <div
+                class="node node-orange"
+                data-tip="CursorStorage trait with SQLite impl"
+              >
+                <span class="stat-dot done"></span>
+                <span class="node-name"
+                  >CursorStorage
+                  <span class="badge badge-done">✓ Done</span></span
+                >
+                <span class="node-tag">mesh_cursors table</span>
+              </div>
+              <div
+                class="node"
+                style="
+                  border-color: rgba(255, 109, 0, 0.6);
+                  background: #1a1000;
+                "
+              >
+                <span class="stat-dot done"></span>
+                <span class="node-name"
+                  >SQLite Backend
+                  <span class="badge badge-done">✓ Active</span></span
+                >
+                <span class="node-tag">ansible_context.db</span>
+              </div>
+              <div
+                class="node"
+                style="border-color: rgba(74, 83, 112, 0.5); background: #111"
+              >
+                <span class="stat-dot planned"></span>
+                <span class="node-name"
+                  >Alt Backends
+                  <span class="badge badge-planned">Planned</span></span
+                >
+                <span class="node-tag">PebbleDB / RocksDB / Postgres</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- mesh-core primitives -->
+          <div
+            class="zone zone-purple"
+            style="
+              position: absolute;
+              top: 34px;
+              left: 596px;
+              width: 270px;
+              height: 260px;
+            "
+          >
+            <div class="zone-label">ansible-mesh-core Primitives</div>
+            <div class="node-row" style="flex-direction: column; gap: 8px">
+              <div
+                class="node node-purple"
+                data-tip="UDP :8999 · HMAC auth working"
+              >
+                <span class="stat-dot done"></span>
+                <span class="node-name"
+                  >BeaconDaemon
+                  <span class="badge badge-done">✓ Done</span></span
+                >
+                <span class="node-tag">UDP :8999</span>
+              </div>
+              <div
+                class="node node-purple"
+                data-tip="In-memory peer map, populated via HEARTBEAT"
+              >
+                <span class="stat-dot done"></span>
+                <span class="node-name"
+                  >NodeRegistry
+                  <span class="badge badge-done">✓ Done</span></span
+                >
+                <span class="node-tag">registry.rs</span>
+              </div>
+              <div
+                class="node node-purple"
+                data-tip="PSK HMAC · flag gated: PHILOTIC_ENABLE_RUST_AUTH"
+              >
+                <span class="stat-dot prog"></span>
+                <span class="node-name"
+                  >AuthZ
+                  <span class="badge badge-prog">⏳ Flag-gated</span></span
+                >
+                <span class="node-tag">PHILOTIC_ENABLE_RUST_AUTH</span>
+              </div>
+              <div class="node node-purple">
+                <span class="stat-dot done"></span>
+                <span class="node-name"
+                  >ModelManagerInvoker
+                  <span class="badge badge-done">✓ Done</span></span
+                >
+                <span class="node-tag">model_manager.rs</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Guests -->
+          <div
+            class="zone zone-green"
+            style="
+              position: absolute;
+              top: 308px;
+              left: 596px;
+              right: 14px;
+              bottom: 14px;
+            "
+          >
+            <div class="zone-label">Guest OS Processes</div>
+            <div class="node-row" style="gap: 10px">
+              <div
+                class="node node-green"
+                data-tip="Telegram gateway · materialized and working"
+              >
+                <span class="stat-dot done"></span>
+                <span class="node-name"
+                  >Hegemon <span class="badge badge-done">✓ Done</span></span
+                >
+                <span class="node-tag">hegemon-telegram-01</span>
+              </div>
+              <div
+                class="node node-green"
+                data-tip="Persona runtime · Jane / Aria running · agent loop proposals pending"
+              >
+                <span class="stat-dot prog"></span>
+                <span class="node-name"
+                  >Agent-Core
+                  <span class="badge badge-prog">⏳ Active</span></span
+                >
+                <span class="node-tag">agent-jane-01</span>
+              </div>
+              <div
+                class="node node-green"
+                data-tip="Gemini controller · materialized and routing"
+              >
+                <span class="stat-dot done"></span>
+                <span class="node-name"
+                  >Model·Gemini
+                  <span class="badge badge-done">✓ Done</span></span
+                >
+                <span class="node-tag">model-controller-gemini-01</span>
+              </div>
+              <div
+                class="node node-green"
+                data-tip="ElevenLabs TTS controller · working"
+              >
+                <span class="stat-dot done"></span>
+                <span class="node-name"
+                  >Model·ElevenLabs
+                  <span class="badge badge-done">✓ Done</span></span
+                >
+                <span class="node-tag">model-controller-elevenlabs-01</span>
+              </div>
+              <div
+                class="node node-teal"
+                data-tip="770 lines exist, seeded inactive. Status: unclear — activate or deprecate?"
+              >
+                <span class="stat-dot partial"></span>
+                <span class="node-name"
+                  >Tool-Runner
+                  <span class="badge badge-partial"
+                    >⚡ Seeded/Inactive</span
+                  ></span
+                >
+                <span class="node-tag">tool-runner · not spawned</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- philotic-client -->
+          <div
+            class="zone zone-teal"
+            style="
+              position: absolute;
+              top: 46px;
+              left: 882px;
+              right: 14px;
+              height: 140px;
+            "
+          >
+            <div class="zone-label">philotic-client SDK</div>
+            <div
+              class="node node-teal"
+              data-tip="connect, publish_event, sync_apartment · working"
+            >
+              <span class="stat-dot done"></span>
+              <span class="node-name"
+                >PhiloticClient
+                <span class="badge badge-done">✓ Done</span></span
+              >
+              <span class="node-tag">philotic-client crate</span>
+            </div>
+            <div
+              style="font-size: 0.6rem; color: var(--text-dim); margin-top: 8px"
+            >
+              Docs-only proposals pending:<br />agent-loop re-entry, forked
+              sessions, slash commands
+            </div>
+          </div>
+        </div>
+        <!-- /hotel zone -->
+
+        <!-- ─── ZONE: Philotic Web ─── -->
+        <div
+          class="zone zone-purple"
+          style="bottom: 0; left: 0; right: 0; height: 360px"
+        >
+          <div class="zone-label">The Philotic Web — Inter-Hotel Mesh</div>
+
+          <div
+            style="display: flex; gap: 16px; flex-wrap: wrap; margin-top: 4px"
+          >
+            <!-- UDP Control -->
+            <div
+              class="zone zone-blue"
+              style="position: relative; width: 290px; min-height: 230px"
+            >
+              <div class="zone-label">UDP Control Plane</div>
+              <div class="node-row" style="flex-direction: column; gap: 8px">
+                <div
+                  class="node node-blue"
+                  data-tip="Heartbeat broadcast · working"
+                >
+                  <span class="stat-dot done"></span>
+                  <span class="node-name"
+                    >Heartbeat
+                    <span class="badge badge-done">✓ Done</span></span
+                  >
+                  <span class="node-tag">heartbeat.rs</span>
+                </div>
+                <div
+                  class="node node-blue"
+                  data-tip="Peer discovery via HEARTBEAT · working"
+                >
+                  <span class="stat-dot done"></span>
+                  <span class="node-name"
+                    >Gossip / Peer Discovery
+                    <span class="badge badge-done">✓ Done</span></span
+                  >
+                  <span class="node-tag">NodeRegistry update</span>
+                </div>
+                <div
+                  class="node node-blue"
+                  data-tip="MEMORY_OP routes to sync_apartment · working"
+                >
+                  <span class="stat-dot done"></span>
+                  <span class="node-name"
+                    >Memory Op Routing
+                    <span class="badge badge-done">✓ Done</span></span
+                  >
+                  <span class="node-tag">MEMORY_OP BeaconMessage</span>
+                </div>
+                <div
+                  class="node"
+                  style="border-color: rgba(74, 83, 112, 0.5); background: #111"
+                >
+                  <span class="stat-dot planned"></span>
+                  <span class="node-name"
+                    >Scaling Monitor
+                    <span class="badge badge-planned">Planned</span></span
+                  >
+                  <span class="node-tag">PORT-BP performance metrics</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- TCP Execution -->
+            <div
+              class="zone zone-cyan"
+              style="position: relative; width: 320px; min-height: 230px"
+            >
+              <div class="zone-label">TCP Execution Plane</div>
+              <div class="node-row" style="flex-direction: column; gap: 8px">
+                <div
+                  class="node node-cyan"
+                  data-tip="Append-only SQLite event log · durable · working"
+                >
+                  <span class="stat-dot done"></span>
+                  <span class="node-name"
+                    >EventLedger
+                    <span class="badge badge-done">✓ Done</span></span
+                  >
+                  <span class="node-tag">durable at-least-once delivery</span>
+                </div>
+                <div
+                  class="node node-cyan"
+                  data-tip="Per-node acked sequence cursor · working"
+                >
+                  <span class="stat-dot done"></span>
+                  <span class="node-name"
+                    >CursorTracker
+                    <span class="badge badge-done">✓ Done</span></span
+                  >
+                  <span class="node-tag"
+                    >mesh_cursors · advances post-commit*</span
+                  >
+                </div>
+                <div
+                  class="node node-cyan"
+                  data-tip="MESH_EVENT_BATCH via TCP · 2-hotel smoke verified"
+                >
+                  <span class="stat-dot done"></span>
+                  <span class="node-name"
+                    >Event Batch / ACK
+                    <span class="badge badge-done">✓ Done</span></span
+                  >
+                  <span class="node-tag"
+                    >smoke-remote-model-roundtrip.sh ✓</span
+                  >
+                </div>
+                <div
+                  class="node"
+                  style="border-color: rgba(74, 83, 112, 0.5); background: #111"
+                >
+                  <span class="stat-dot planned"></span>
+                  <span class="node-name"
+                    >Multi-Hotel Parity Tests
+                    <span class="badge badge-planned">Planned</span></span
+                  >
+                  <span class="node-tag">PORT-BP-009 shadow mode + chaos</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- WebRTC -->
+            <div
+              class="zone zone-teal"
+              style="position: relative; width: 230px; min-height: 230px"
+            >
+              <div class="zone-label">WebRTC Ephemeral Plane</div>
+              <div class="node-row" style="flex-direction: column; gap: 8px">
+                <div
+                  class="node node-teal"
+                  data-tip="Signal types + message routing exist"
+                >
+                  <span class="stat-dot partial"></span>
+                  <span class="node-name"
+                    >SDP Signaling
+                    <span class="badge badge-partial">⚡ Partial</span></span
+                  >
+                  <span class="node-tag">webrtc.rs types present</span>
+                </div>
+                <div
+                  class="node"
+                  style="border-color: rgba(74, 83, 112, 0.5); background: #111"
+                >
+                  <span class="stat-dot planned"></span>
+                  <span class="node-name"
+                    >P2P Data Channel
+                    <span class="badge badge-planned">Planned</span></span
+                  >
+                  <span class="node-tag">ICE/DTLS not yet wired</span>
+                </div>
+                <div
+                  style="
+                    font-size: 0.6rem;
+                    color: var(--orange);
+                    margin-top: 4px;
+                  "
+                >
+                  PORT-BP-008<br />Listed as ✅ In Progress in road map<br />but
+                  ICE lifecycle incomplete
+                </div>
+              </div>
+            </div>
+
+            <!-- Proposals backlog -->
+            <div
+              class="zone zone-pink"
+              style="position: relative; width: 220px; min-height: 230px"
+            >
+              <div class="zone-label">Pending Proposals (Docs Only)</div>
+              <div class="node-row" style="flex-direction: column; gap: 6px">
+                <div
+                  class="node"
+                  style="
+                    border-color: rgba(74, 83, 112, 0.5);
+                    background: #111;
+                    font-size: 0.65rem;
+                  "
+                >
+                  <span class="stat-dot planned"></span>
+                  <span class="node-name">Agent Incarnation Model</span>
+                </div>
+                <div
+                  class="node"
+                  style="
+                    border-color: rgba(74, 83, 112, 0.5);
+                    background: #111;
+                    font-size: 0.65rem;
+                  "
+                >
+                  <span class="stat-dot planned"></span>
+                  <span class="node-name">Forked Sessions</span>
+                </div>
+                <div
+                  class="node"
+                  style="
+                    border-color: rgba(74, 83, 112, 0.5);
+                    background: #111;
+                    font-size: 0.65rem;
+                  "
+                >
+                  <span class="stat-dot planned"></span>
+                  <span class="node-name">Voice Machine</span>
+                </div>
+                <div
+                  class="node"
+                  style="
+                    border-color: rgba(74, 83, 112, 0.5);
+                    background: #111;
+                    font-size: 0.65rem;
+                  "
+                >
+                  <span class="stat-dot planned"></span>
+                  <span class="node-name">Native Overlay VPN</span>
+                </div>
+                <div
+                  class="node"
+                  style="
+                    border-color: rgba(74, 83, 112, 0.5);
+                    background: #111;
+                    font-size: 0.65rem;
+                  "
+                >
+                  <span class="stat-dot planned"></span>
+                  <span class="node-name">Slash Commands</span>
+                </div>
+                <div
+                  class="node"
+                  style="
+                    border-color: rgba(74, 83, 112, 0.5);
+                    background: #111;
+                    font-size: 0.65rem;
+                  "
+                >
+                  <span class="stat-dot planned"></span>
+                  <span class="node-name">Tool Management Plane</span>
+                </div>
+                <div
+                  class="node"
+                  style="
+                    border-color: rgba(74, 83, 112, 0.5);
+                    background: #111;
+                    font-size: 0.65rem;
+                  "
+                >
+                  <span class="stat-dot planned"></span>
+                  <span class="node-name">Approval UX</span>
+                </div>
+                <div
+                  class="node"
+                  style="
+                    border-color: rgba(74, 83, 112, 0.5);
+                    background: #111;
+                    font-size: 0.65rem;
+                  "
+                >
+                  <span class="stat-dot planned"></span>
+                  <span class="node-name">Muninn Memory Protocol</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <!-- /canvas-status -->
+    </div>
+    <!-- /view-status -->
+
+    <script>
+      function switchTab(which) {
+        document
+          .querySelectorAll(".view")
+          .forEach((v) => v.classList.remove("active"));
+        document
+          .querySelectorAll(".tab-btn")
+          .forEach((b) => b.classList.remove("active"));
+        document.getElementById("view-" + which).classList.add("active");
+        const idx = which === "target" ? 0 : 1;
+        document.querySelectorAll(".tab-btn")[idx].classList.add("active");
+      }
+
+      // Subtle pulse animation for status dots
+      const style = document.createElement("style");
+      style.textContent = `
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: .5; }
+    }
+    .stat-dot.prog { animation: pulse 1.8s ease-in-out infinite; }
+    .stat-dot.partial { animation: pulse 2.4s ease-in-out infinite; }
+  `;
+      document.head.appendChild(style);
+    </script>
+  </body>
+</html>

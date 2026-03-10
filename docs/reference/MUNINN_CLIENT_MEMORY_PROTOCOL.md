@@ -11,7 +11,7 @@ It is intentionally small.
 The client should:
 
 - retrieve before meaningful work
-- write back after durable outcomes
+- write back after durable outcomes as short, meaningful bursts
 - organize memory around self, user, and topic
 
 Track the broader rationale in [MUNINN_MEMORY_PROTOCOL_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MUNINN_MEMORY_PROTOCOL_PROPOSAL.md).
@@ -21,16 +21,19 @@ Track the broader rationale in [MUNINN_MEMORY_PROTOCOL_PROPOSAL.md](/Users/jared
 Organize retrieval around:
 
 1. Who am I?
+
 - identity
 - operating posture
 - collaboration style
 
 2. Who am I talking to?
+
 - user preferences
 - relationship fit
 - recurring interaction patterns
 
 3. What matters about this topic right now?
+
 - active goals
 - recent decisions
 - relevant constraints
@@ -73,7 +76,7 @@ Do not store every conversation.
 
 ## What To Store
 
-Store atomic memories.
+Store atomic memories. Prefer many small, meaningful "bursts" over a single large thought.
 
 Good:
 
@@ -81,6 +84,7 @@ Good:
 - one preference
 - one important constraint
 - one durable outcome
+- a short, meaningful observation
 
 Bad:
 
@@ -137,16 +141,20 @@ Recommended shared helper:
 If you are wiring this into another cognitive client, implement these hooks:
 
 1. Session start / meaningful resume hook
+
 - call `where_left_off`
 - call `recall`
 
 2. Durable outcome hook
+
 - call `remember` or `decide`
 
 3. Truth filter
+
 - if recalled memory conflicts with observed repo/runtime truth, prefer observed truth
 
 4. Atomic write discipline
+
 - one memory per decision, preference, or durable fact
 
 ## Suggested Helper Usage

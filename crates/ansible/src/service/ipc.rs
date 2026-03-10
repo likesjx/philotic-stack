@@ -2336,6 +2336,26 @@ mod tests {
         ) -> anyhow::Result<Vec<SessionEventRecord>> {
             Ok(vec![])
         }
+
+        fn upsert_abstract_tool(
+            &self,
+            _tool: &ansible_mesh_core::graph::AbstractToolRecord,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn get_abstract_tool(
+            &self,
+            _tool_name: &str,
+        ) -> anyhow::Result<Option<ansible_mesh_core::graph::AbstractToolRecord>> {
+            Ok(None)
+        }
+
+        fn list_abstract_tools(
+            &self,
+        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::AbstractToolRecord>> {
+            Ok(vec![])
+        }
     }
 
     fn test_socket_path() -> String {
