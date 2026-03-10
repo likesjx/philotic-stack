@@ -53,16 +53,50 @@
 
 ## New Project: Agent Incarnation Model
 
-- [ ] Review [AGENT_INCARNATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/AGENT_INCARNATION_PROPOSAL.md).
-- [ ] Add `active_incarnation_id` to session records in the Context Graph.
-- [ ] Configure the conversational incarnation with a minimal default toolset (no heavy side-effecting tools by default).
-- [ ] Implement `HandoffToWorker` / `HandoffBack` IPC actions and worker materialization in the hotel.
-- [ ] Add `session_facts` apartment type and `UpdateMemory` IPC action with hotel-side safety enforcement.
-- [ ] Add Muninn tool surface (`memory.search`, `memory.store`) as hotel-mediated tools via a local invoker.
-- [ ] Implement `SpawnSubagent` IPC and subagent result routing back to the spawning incarnation.
-- [ ] Add `DelegateToPeer` IPC action and `known_peers` in session snapshot for inter-agent communication.
-- [ ] Add `/worker`, `/abandon`, `/worker status`, `/memory show`, `/memory reset` slash commands.
-- [ ] Define and implement worker incarnation idle TTL and reclaim policy.
+Model revised: three-kind taxonomy (conversational/worker/subagent) replaced with role incarnations + workers/subagents. See [AGENT_INCARNATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/AGENT_INCARNATION_PROPOSAL.md).
+
+### Skill Catalog + Toolset Profiles (prerequisite for role provisioning)
+- [ ] Add `AbstractSkillRecord` to `ansible-mesh-core/src/graph.rs` (parallel to `AbstractToolRecord`).
+- [ ] Add `upsert_abstract_skill` / `get_abstract_skill` / `list_abstract_skills` to `GraphStorage` trait and `SqliteGraphStorage`.
+- [ ] Add `ToolsetProfileRecord` to the context graph (`toolset_profile` node kind).
+- [ ] Add `upsert_toolset_profile` / `get_toolset_profile` / `list_toolset_profiles` to `GraphStorage`.
+- [ ] Seed built-in skill catalog and toolset profiles at hotel startup (`orchestrator`, `codex`, `browser`, `research`, `utility`).
+- [ ] Update session binding assembly to expand skill grants into `implied_tools` when building `tools_for_model`.
+
+### Role Incarnation Records
+- [ ] Add `RoleIncarnationRecord` and `TurnLoopConfig` to the context graph (`role_incarnation` node kind).
+- [ ] Add `upsert_role_incarnation` / `get_role_incarnation` / `list_role_incarnations` to `GraphStorage`.
+- [ ] Add `ConfigureRole` IPC action (orchestrator → hotel); hotel enforces orchestrator-only writes.
+- [ ] Seed session bindings from the role's `toolset_profile` when a role incarnation session is initialized.
+
+### Active Membrane Routing
+- [ ] Add `active_incarnation_id` to `SessionRecord` in the Context Graph.
+- [ ] Update IpcServer task routing to read `active_incarnation_id` before routing inbound agent tasks.
+- [ ] Default to orchestrator incarnation if active ID is unregistered; buffer inbound during materialization.
+
+### Handoff Skill + Membrane Switching
+- [ ] Implement `HandoffToRole { role_name, handoff_bundle }` and `HandoffBack { summary, return_to? }` IPC actions.
+- [ ] Define the first handoff skill shape: trigger patterns, context bundle assembly, cleanup steps.
+- [ ] Add `/role <name>` and `/back` slash commands for manual membrane switching.
+
+### Inactive TTL + On-Demand Rematerialization
+- [ ] Add `inactive_ttl_seconds` to `RoleIncarnationRecord`.
+- [ ] Extend supervisor loop TTL check: reclaim inactive non-membrane-owner role processes after TTL.
+- [ ] On rematerialization: hotel sends session snapshot to restore working memory from Tier 2.
+
+### Workers / Subagents
+- [ ] Implement `SpawnSubagent` IPC and async result routing back to parent incarnation.
+- [ ] Add `PHILOTIC_AGENT_MODE=subagent` one-shot runtime mode to `agent-core`.
+- [ ] Add `/abandon` slash command; deliver `FailTask` summary to parent on abandonment.
+
+### Memory
+- [ ] Add `session_facts` apartment type and `UpdateMemory` IPC with hotel-side rate/size enforcement.
+- [ ] Add Muninn tool surface (`memory.search`, `memory.store`) as hotel-mediated tools with auto-injection into prompt context.
+- [ ] Add `/memory show` and `/memory reset` slash commands.
+
+### Inter-Agent Communication
+- [ ] Add `known_peers` (local hotel, role=agent) to session snapshot.
+- [ ] Validate same-hotel peer task emission via existing `EmitTask` before designing `DelegateToPeer`.
 
 ## New Project: Philotic Agent Loop
 
@@ -369,7 +403,11 @@
 - [ ] Review [VOICE_MACHINE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/VOICE_MACHINE_PROPOSAL.md).
 - [ ] Telegram slash-command elevation: raise deterministic `/commands` into `hegemon` before the normal agent loop so Telegram-side testing and operational control become faster and cleaner.
 - [ ] Telegram approval card UX: include request IDs, tool/action names, args summaries, and resolution messages in a more native Telegram approval experience.
-- [ ] Telegram streaming and media UX: define partial delivery, edits vs follow-up messages, and interruption behavior for Telegram replies.
+- [ ] Telegram streaming Layer 1: add typing indicator heartbeat to `hegemon` — `ActiveTurn` map, `sendChatAction(typing)` on dispatch, 4-second refresh loop, cancel on `send_reply`.
+- [ ] Telegram streaming: add message length chunking to `hegemon` — split at paragraph boundaries before `sendMessage`, shared `send_formatted_text` helper.
+- [ ] Telegram streaming Layer 2 protocol: add `TurnEventPayload` to `agent-core/src/protocol.rs` and `emit_turn_event` helper to `AgentRuntime`; emit `waiting_tool`, `waiting_approval`, `failed` events back to hegemon via the existing `EmitTask` path.
+- [ ] Telegram streaming Layer 2 hegemon: handle `action = "turn_event"` in `InboundTask` dispatch — maintain or cancel typing heartbeat per event type; stub approval card on `waiting_approval`.
+- [ ] Telegram streaming partial reply: add `action = "partial_reply"` signal from `agent-core` once model-router supports chunked output; implement edit-based progressive delivery in `hegemon`.
 - [ ] Voice machine design: define STT, TTS, speech-to-speech, transcript generation, and media artifact/session handling.
 - [ ] Nostr communication-plane investigation: evaluate Nostr as a decentralized/event-native transport, with security and privacy-first scrutiny before any implementation.
 - [ ] Tool runner lifecycle policy: define idle retention, sleep/teardown timing, wake-up thresholds, and environment-specific materialization rules for routed tools.

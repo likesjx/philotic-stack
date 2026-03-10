@@ -15,27 +15,19 @@ cp mesh-config.example.json mesh-config.json
 cargo run -p ansible -- --load-config mesh-config.json
 ```
 
-## Architecture Overview
+## Architecture Diagrams
 
-```
-         ┌──────────────────────────────────────┐
-         │            HOTEL (ansible)            │
-         │                                       │
-         │  ┌──────────┐  IPC  ┌──────────────┐ │
-         │  │ hegemon  │◄─────►│ ContextGraph │ │
-         │  └──────────┘       │ GuestManager │ │
-         │  ┌──────────┐       │ IpcServer    │ │
-         │  │agent-core│◄─────►│ BeaconDaemon │ │
-         │  └──────────┘       │ BlobService  │ │
-         │  ┌────────────┐     └──────────────┘ │
-         │  │model-router│◄───────────────────── │
-         │  └────────────┘                       │
-         └────────────────┬──────────────────────┘
-                          │ UDP Mesh
-         ┌────────────────▼──────────────────────┐
-         │          REMOTE HOTEL                  │
-         └────────────────────────────────────────┘
-```
+### Target Architecture
+
+![Target Architecture](docs/target_architecture.svg)
+
+### Implementation Status
+
+![Implementation Status](docs/implementation_status.svg)
+
+> **Legend** — 🟢 Implemented · 🟡 In progress / flag-gated · 🟠 Scaffolded / blocked · ⚫ Planned / docs only
+
+Interactive HTML version (with hover tooltips): [`docs/philotic-architecture-diagram.html`](docs/philotic-architecture-diagram.html)
 
 ## Crates
 

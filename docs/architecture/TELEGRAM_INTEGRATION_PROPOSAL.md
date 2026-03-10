@@ -376,18 +376,259 @@ Flow:
 
 Telegram now supports partial draft delivery, which makes it a much better fit for agent-style interaction than the older "wait and dump" model.
 
-Recommendation:
+### Current reality
 
-- keep canonical turn state in the graph
-- let `hegemon` project partial progress into Telegram delivery UX
-- prefer one transport-specific projection layer instead of leaking edits/drafts into `agent-core`
+The current implementation is atomic and silent:
 
-Near-term behaviors:
+1. Telegram update arrives; hegemon emits `EmitTask` to agent-core (fire and forget)
+2. Agent-core processes the full turn — model call, tool evaluation, response assembly
+3. Agent-core emits final `InboundTask` back to hegemon
+4. Hegemon calls `sendMessage` once with the final formatted reply
 
-- `sendChatAction` for typing/upload cues
-- partial delivery via draft/update methods when available
-- final message commit when a turn completes
-- interruption policy scoped to same sender and same chat/thread
+The user sees nothing until the full reply is ready. No typing indicator. No partial progress. No delivery signal while tools are running. This is the "wait and dump" model we want to move away from.
+
+### Design principle
+
+Keep canonical turn state in the context graph. Let `hegemon` project partial progress into Telegram delivery UX. Do not leak Telegram-specific draft/edit behavior into `agent-core`.
+
+`agent-core` should emit turn lifecycle signals. `hegemon` should own the projection of those signals into Telegram-native UX behaviors.
+
+### Layer 1: Typing indicator (no protocol changes required)
+
+The simplest improvement and the most valuable first step.
+
+Telegram's `sendChatAction` with `action = "typing"` shows a typing indicator to the user. The indicator lasts approximately 5 seconds before it expires. Re-sending refreshes it.
+
+Implementation:
+
+1. When `hegemon` emits a task to `agent-core`, record the active turn in a local in-memory map keyed by `(chat_id, thread_id)`.
+2. Immediately send `sendChatAction(chat_id, "typing")` before dispatching to `agent-core`.
+3. Spawn a background tokio task that re-sends `sendChatAction(chat_id, "typing")` every 4 seconds while the turn is active.
+4. When the final reply `InboundTask` arrives, cancel the typing refresh task and deliver the reply.
+
+This requires no IPC protocol changes and no changes to `agent-core`. The turn map is internal to `hegemon`.
+
+Action variants by turn phase (future extension, same pattern):
+
+| Turn Phase | `sendChatAction` value |
+|---|---|
+| Waiting for model | `typing` |
+| Processing a tool | `typing` |
+| Uploading media reply | `upload_photo`, `upload_voice`, `upload_document` |
+| Recording voice reply | `record_voice` |
+
+### Layer 2: Progressive delivery (edit-based streaming)
+
+Progressive delivery simulates streaming by sending an initial placeholder message and then editing it in place as content arrives. Telegram supports editing messages via `editMessageText`.
+
+This requires `agent-core` to emit intermediate partial reply signals back to `hegemon` over IPC.
+
+Proposed IPC protocol extension:
+
+```
+InboundTask with kind = "partial_reply":
+  - chat_id
+  - turn_id
+  - partial_content    (text fragment so far)
+  - is_final           (false = more coming, true = done)
+```
+
+`hegemon` behavior:
+
+1. On first `partial_reply` for a turn: call `sendMessage` with the partial content; store the returned `message_id` keyed by `(chat_id, turn_id)`.
+2. On subsequent `partial_reply`: call `editMessageText` with the updated partial content using the stored `message_id`.
+3. On `is_final = true`: make one last `editMessageText` call with the final formatted reply. Cancel the typing refresh task.
+4. If no `message_id` is stored (first partial never arrived, or `sendMessage` failed): fall back to the atomic path — send the final content as a new message.
+
+Constraints:
+
+- Telegram rate-limits `editMessageText`. Do not edit on every token. Batch partial content at reasonable intervals (e.g., every 500ms or every completed sentence/paragraph boundary).
+- Telegram enforces a minimum edit interval. Edits faster than approximately 1/second may be silently dropped or trigger 429 errors.
+- Do not edit a message after more than 48 hours (Telegram API limit). Not relevant for turn timescales.
+- `editMessageText` requires `parse_mode` to be re-specified on every edit. The HTML formatter must be called on each partial update.
+
+### Layer 3: Turn lifecycle signals
+
+For the typing indicator to accurately reflect what is happening, `agent-core` should emit structured turn lifecycle events rather than just final replies.
+
+Proposed lifecycle events:
+
+| Event | Description |
+|---|---|
+| `turn.started` | Agent received the task and is beginning the loop |
+| `turn.model_requested` | Model call is in flight |
+| `turn.tool_requested` | A tool call is being evaluated |
+| `turn.approval_pending` | Turn is paused, waiting for operator approval |
+| `turn.partial_reply` | Intermediate text content is available |
+| `turn.final_reply` | Turn is complete, full content is available |
+| `turn.failed` | Turn failed with an error |
+
+`hegemon` maps these to Telegram delivery behaviors:
+
+| Lifecycle event | Telegram action |
+|---|---|
+| `turn.started` | Send `sendChatAction(typing)`, start refresh loop |
+| `turn.model_requested` | No change (still typing) |
+| `turn.tool_requested` | No change (still typing) |
+| `turn.approval_pending` | Stop typing refresh; send approval card (see Approval Card UX section) |
+| `turn.partial_reply` | Edit message in place with latest partial content |
+| `turn.final_reply` | Final edit or new `sendMessage`; cancel typing refresh |
+| `turn.failed` | Cancel typing refresh; send error message |
+
+Near-term: implement typing indicator and final reply with no lifecycle events (Layer 1 only).
+Medium-term: add `turn.partial_reply` / `turn.final_reply` distinction (Layer 2).
+Long-term: add full lifecycle events when `agent-core` has a proper turn state machine (Layer 3).
+
+### Interruption handling
+
+Telegram users may send a new message while a turn is still in flight. This creates a conflict: the agent is in the middle of reasoning about a prior message, and now there is a new input.
+
+Three options:
+
+**Option A: Queue and process sequentially (recommended near-term)**
+
+- Accept the new message normally.
+- Do not dispatch it to `agent-core` until the active turn for that `(chat_id, thread_id)` completes.
+- The typing indicator naturally covers both turns from the user's perspective.
+- Simple to implement with a per-session pending queue in `hegemon`.
+
+**Option B: Cancel and restart**
+
+- When a new message arrives during an active turn: signal `agent-core` to abandon the current turn, then dispatch the new message immediately.
+- Requires a `CancelTurn` IPC request type and `agent-core` to support graceful cancellation.
+- More complex but more responsive for long-running turns.
+- Not recommended until `agent-core` has a proper cancellation boundary.
+
+**Option C: Reject and notify**
+
+- Reject the new message with a transport-level reply ("I'm still thinking about your last message...").
+- Simple but poor UX; not recommended.
+
+Recommended default: Option A (queue). Add Option B (cancel) when `agent-core` has a cancellation mechanism.
+
+### Thread and chat scoping
+
+Interruption policy, typing indicators, and partial delivery are scoped to `(chat_id, thread_id)`. Concurrent turns in different chats or different threads within the same chat should be fully independent.
+
+`hegemon` should track active turns in a `HashMap<(chat_id, thread_id), ActiveTurn>` where `ActiveTurn` holds:
+
+- the current `turn_id`
+- the typing refresh task handle
+- the last `message_id` (if a placeholder was sent for progressive delivery)
+- a pending message queue for Option A interruption handling
+
+### Message length and chunking
+
+Telegram enforces a 4096-character limit on `sendMessage` text. The current implementation does not enforce this.
+
+Required behavior:
+
+- Before sending any text reply, check byte length after HTML formatting.
+- If the reply exceeds 4096 characters, split at paragraph boundaries and send as sequential messages.
+- For `editMessageText`, the same 4096-character limit applies.
+- Do not split mid-sentence or mid-word. Prefer paragraph or section boundaries.
+
+This is independent of progressive delivery and should be handled in a shared `send_formatted_text(chat_id, thread_id, text)` helper in `hegemon` that both the atomic and streaming paths use.
+
+### Wiring to agent-core
+
+`TurnPhase` already exists in `agent-core/src/loop.rs` with the full state machine:
+
+```
+Queued → LoadingContext → WaitingModel → Thinking → WaitingTool → WaitingApproval → WaitingVoice → Completed / Failed
+```
+
+Every phase transition is already called via `set_active_turn_phase(...)` in `runtime.rs`. None of these transitions are currently emitted back to hegemon — they are only reflected to the context graph via `UpdateTask`. Hegemon receives exactly one IPC message per turn: the final `EmitTask` with `action: "send_reply"` from `deliver_text_reply`.
+
+#### New protocol type: TurnEventPayload
+
+Add `TurnEventPayload` to `agent-core/src/protocol.rs`:
+
+```rust
+pub struct TurnEventPayload {
+    pub action: &'static str,        // always "turn_event"
+    pub event: String,               // TurnPhase::as_str()
+    pub session_id: String,
+    pub turn_id: String,
+    pub chat_id: String,
+    pub partial_content: Option<String>,
+}
+```
+
+This travels the same `EmitTask` → `InboundTask` path already used for `FinalReplyPayload`. No new IPC primitives are needed — it's a different `action` value in the task JSON.
+
+#### New helper: emit_turn_event
+
+Add a private `emit_turn_event` helper to `AgentRuntime`:
+
+```rust
+async fn emit_turn_event(&mut self, session_id: &str, event: &str, partial_content: Option<String>)
+```
+
+It reads `final_reply_to`, `final_reply_role`, `final_reply_guest_id`, `turn_id`, and `chat_id` from the active session and fires `IpcRequest::EmitTask` with the `TurnEventPayload`. If there is no active turn (e.g., session not found), it logs a warning and returns without error.
+
+#### Emission points in runtime.rs
+
+Call `emit_turn_event` after these existing `set_active_turn_phase` calls:
+
+| Call site (approx. line) | Phase | event string | Hegemon action |
+|---|---|---|---|
+| line 459 — before model dispatch | `WaitingModel` | `"waiting_model"` | maintain typing |
+| line 774 — before tool dispatch | `WaitingTool` | `"waiting_tool"` | maintain typing |
+| line 670 — approval branch | `WaitingApproval` | `"waiting_approval"` | stop typing, queue approval card |
+| line 1124 — `deliver_text_reply` | `Completed` | `"completed"` | redundant with `send_reply`; omit |
+| line 1206 — failure path | `Failed` | `"failed"` | stop typing, send error |
+
+`Completed` is redundant because `deliver_text_reply` already sends `action: "send_reply"` which hegemon uses as the delivery trigger. Do not emit a separate `turn_event` for `Completed`.
+
+`Queued`, `LoadingContext`, and `Thinking` transitions are high-frequency internal state; emit them only if hegemon has a meaningful differentiation for them (currently it does not).
+
+#### Hegemon-side ActiveTurn tracking
+
+Add to hegemon's main loop state:
+
+```rust
+struct ActiveTurn {
+    turn_id: String,
+    chat_id: String,
+    thread_id: Option<String>,
+    typing_task: tokio::task::JoinHandle<()>,
+    draft_message_id: Option<i64>,    // set after first sendMessage for progressive delivery
+}
+
+active_turns: HashMap<String, ActiveTurn>    // keyed by session_id
+```
+
+When dispatching a new inbound update to agent-core:
+
+1. Create `ActiveTurn` for the session.
+2. Call `sendChatAction(chat_id, "typing")` immediately.
+3. Spawn the typing heartbeat as a tokio task (re-sends every 4 seconds).
+4. Insert into `active_turns`.
+
+When receiving `InboundTask`:
+
+- `action = "turn_event"` with `event = "waiting_tool"` or `"waiting_model"` → no change (typing continues)
+- `action = "turn_event"` with `event = "waiting_approval"` → abort typing task; send approval card placeholder
+- `action = "turn_event"` with `event = "failed"` → abort typing task; send error message; remove from `active_turns`
+- `action = "partial_reply"` (future, Layer 2) → send or edit draft message; update `draft_message_id`
+- `action = "send_reply"` (existing) → abort typing task; deliver final message; remove from `active_turns`
+
+The typing heartbeat task itself should be cancellation-safe. Use a `CancellationToken` or a channel-based approach rather than relying on `JoinHandle::abort` alone, to avoid leaving a dangling HTTP request in flight.
+
+#### Scope boundary
+
+`agent-core` emits turn lifecycle events. `hegemon` maps them to Telegram UX behaviors. `agent-core` does not know or care about Telegram-specific typing actions, message IDs, or edit behavior.
+
+### Implementation order
+
+1. Typing indicator heartbeat (Layer 1) — `hegemon`-only change, no IPC protocol changes
+2. Message length chunking — `hegemon`-only change, covers the safety gap immediately
+3. `TurnEventPayload` in `agent-core/src/protocol.rs` + `emit_turn_event` helper in `AgentRuntime` — wires `WaitingTool`, `WaitingApproval`, `Failed` to hegemon
+4. Hegemon `ActiveTurn` map + turn event dispatch (Layer 2 foundation)
+5. `turn.partial_reply` signal from model streaming once model-router supports chunked output
+6. Edit-based progressive delivery (Layer 2) — builds on step 5
+7. Full approval card suspension + approval card UX (Layer 3) — builds on step 4
 
 ## Media and Voice
 
