@@ -10,6 +10,7 @@ use std::sync::Arc;
 pub enum TaskKind {
     TextGenerate,
     MediaAnalyze,
+    AudioTranscribe,
     VoiceSynthesize,
 }
 
@@ -18,6 +19,7 @@ impl TaskKind {
         match self {
             Self::TextGenerate => "text.generate",
             Self::MediaAnalyze => "media.analyze",
+            Self::AudioTranscribe => "voice.transcribe",
             Self::VoiceSynthesize => "voice.synthesize",
         }
     }
@@ -165,6 +167,9 @@ impl ControllerTask {
             Some("media.analyze") | Some("media_analyze") | Some("analyze_media") => {
                 TaskKind::MediaAnalyze
             }
+            Some("voice.transcribe") | Some("audio.transcribe") | Some("transcribe") => {
+                TaskKind::AudioTranscribe
+            }
             Some("voice.synthesize") | Some("voice_synthesize") => TaskKind::VoiceSynthesize,
             Some(other) => bail!("unsupported task kind [{}]", other),
             None if task.get("prompt").and_then(Value::as_str).is_some() => TaskKind::TextGenerate,
@@ -294,15 +299,16 @@ impl ControllerTask {
                     bail!("text.generate task prompt cannot be empty");
                 }
             }
-            TaskKind::MediaAnalyze => {
+            TaskKind::MediaAnalyze | TaskKind::AudioTranscribe => {
+                let kind_label = self.kind.as_str();
                 let prompt = self
                     .media_prompt()
-                    .context("media.analyze task missing prompt")?;
+                    .with_context(|| format!("{kind_label} task missing prompt"))?;
                 if prompt.trim().is_empty() {
-                    bail!("media.analyze task prompt cannot be empty");
+                    bail!("{kind_label} task prompt cannot be empty");
                 }
                 if self.context.attachments.is_empty() {
-                    bail!("media.analyze task requires at least one attachment");
+                    bail!("{kind_label} task requires at least one attachment");
                 }
                 if !self.context.attachments.iter().any(|attachment| {
                     attachment
@@ -316,7 +322,7 @@ impl ControllerTask {
                             .map(|error| error.trim().is_empty())
                             .unwrap_or(true)
                 }) {
-                    bail!("media.analyze task requires at least one blob-backed attachment url");
+                    bail!("{kind_label} task requires at least one blob-backed attachment url");
                 }
             }
             TaskKind::VoiceSynthesize => {
@@ -1019,6 +1025,43 @@ mod tests {
             task.media_attachments()[0].url.as_deref(),
             Some("http://127.0.0.1:9001/download/sha256-1")
         );
+    }
+
+    #[test]
+    fn parses_audio_transcribe_task_from_voice_transcribe_kind() {
+        let task = ControllerTask::from_value(&json!({
+            "kind": "voice.transcribe",
+            "prompt": "Transcribe this audio verbatim.",
+            "attachments": [{
+                "kind": "voice",
+                "file_id": "voice-1",
+                "mime_type": "audio/ogg",
+                "blob_id": "sha256-audio-1",
+                "blob_download_url": "http://127.0.0.1:9001/download/sha256-audio-1"
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(task.kind, TaskKind::AudioTranscribe);
+        assert_eq!(task.kind.as_str(), "voice.transcribe");
+        assert_eq!(task.media_attachments().len(), 1);
+    }
+
+    #[test]
+    fn parses_audio_transcribe_from_legacy_transcribe_action() {
+        let task = ControllerTask::from_value(&json!({
+            "action": "transcribe",
+            "prompt": "Transcribe this audio verbatim.",
+            "attachments": [{
+                "kind": "audio",
+                "file_id": "audio-1",
+                "mime_type": "audio/mp4",
+                "blob_download_url": "http://127.0.0.1:9001/download/sha256-audio-1"
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(task.kind, TaskKind::AudioTranscribe);
     }
 
     #[test]

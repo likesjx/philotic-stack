@@ -1,3 +1,4 @@
+use crate::catalog::tool_catalog;
 use crate::r#loop::{ApprovalRequest, ToolCall, TurnPhase};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -23,6 +24,8 @@ pub struct WorkingTurn {
     pub iteration: u32,
     pub pending_tool_call: Option<ToolCall>,
     pub pending_approval: Option<ApprovalRequest>,
+    /// Stashed text content while waiting for voice synthesis to complete.
+    pub pending_text_reply: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -33,6 +36,92 @@ pub struct ApprovalPolicy {
     pub preapproved_tools: Vec<String>,
     #[serde(default)]
     pub preapproved_classes: Vec<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Per-agent policy controlling how inbound media attachments are routed to model components.
+///
+/// Each `*_action` field accepts either a well-known action name or a custom string:
+/// - `"analyze_media"` (default) — routes to the `media.analyze` capability (e.g. Gemini vision)
+/// - `"transcribe"` — routes to the `voice.transcribe` capability (dedicated STT model)
+/// - `"describe"` — routes to the `image.describe` capability
+/// - `"summarize"` — routes to the `document.summarize` capability
+/// - any other string — used verbatim as the action name; capability defaults to `media.analyze`
+///
+/// The capability string is then resolved against the session's `component_route_assembly` so
+/// each kind can be pointed at a different model guest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaRoutingPolicy {
+    /// When false, all attachments are stripped and the turn is treated as text-only.
+    #[serde(default = "default_true")]
+    pub forward_media_to_model: bool,
+    /// Action to use for voice/audio attachments. None = "analyze_media".
+    #[serde(default)]
+    pub voice_action: Option<String>,
+    /// Action to use for photo/image attachments. None = "analyze_media".
+    #[serde(default)]
+    pub image_action: Option<String>,
+    /// Action to use for document attachments. None = "analyze_media".
+    #[serde(default)]
+    pub document_action: Option<String>,
+    /// When true (default), tools are stripped from the model request on media turns.
+    #[serde(default = "default_true")]
+    pub strip_tools_on_media: bool,
+}
+
+impl Default for MediaRoutingPolicy {
+    fn default() -> Self {
+        Self {
+            forward_media_to_model: true,
+            voice_action: None,
+            image_action: None,
+            document_action: None,
+            strip_tools_on_media: true,
+        }
+    }
+}
+
+/// Controls whether the agent synthesizes speech for its text responses and, if so, how.
+///
+/// The agent's `voice_id` is the permanent voice identity for this persona — it doesn't change
+/// per message. `provider` and `model` select the synthesis engine. When `enabled` is false
+/// (the default) the agent replies with text only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoiceResponsePolicy {
+    /// Enable voice synthesis for agent responses. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Voice synthesis provider (e.g. "elevenlabs"). None = use whatever supports voice.synthesize.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// The agent's voice identity — a provider-specific voice ID (e.g. ElevenLabs voice ID).
+    #[serde(default)]
+    pub voice_id: Option<String>,
+    /// Provider model name override (e.g. "eleven_multilingual_v2").
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Also send the text alongside the audio as a caption. Default: true.
+    #[serde(default = "default_true")]
+    pub send_text_caption: bool,
+    /// If synthesis fails, fall back to text-only delivery instead of failing the turn. Default: true.
+    #[serde(default = "default_true")]
+    pub fallback_to_text: bool,
+}
+
+impl Default for VoiceResponsePolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: None,
+            voice_id: None,
+            model: None,
+            send_text_caption: true,
+            fallback_to_text: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -49,6 +138,10 @@ pub struct AgentProfile {
     pub agents_text: Option<String>,
     #[serde(default)]
     pub memory_summary: Option<String>,
+    #[serde(default)]
+    pub media_routing_policy: MediaRoutingPolicy,
+    #[serde(default)]
+    pub voice_response_policy: VoiceResponsePolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -120,6 +213,10 @@ pub struct ToolDefinition {
     pub description: String,
     #[serde(default)]
     pub input_schema: serde_json::Value,
+    /// Approval and projection class, e.g. "session", "workspace", "utility", "capability".
+    /// Drives class-based approval policy and tool projection filtering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -290,6 +387,16 @@ impl SessionState {
         if let Some(turn) = self.active_turn.as_mut() {
             turn.pending_approval = None;
         }
+    }
+
+    pub fn set_pending_text_reply(&mut self, text: String) {
+        if let Some(turn) = self.active_turn.as_mut() {
+            turn.pending_text_reply = Some(text);
+        }
+    }
+
+    pub fn take_pending_text_reply(&mut self) -> Option<String> {
+        self.active_turn.as_mut()?.pending_text_reply.take()
     }
 
     pub fn complete_active_turn(&mut self, assistant_content: String) -> Option<WorkingTurn> {
@@ -989,6 +1096,7 @@ impl SessionState {
                     .get("pending_approval")
                     .cloned()
                     .and_then(|value| serde_json::from_value::<ApprovalRequest>(value).ok()),
+                pending_text_reply: None,
             })
         });
 
@@ -1085,14 +1193,16 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
 
     let toolset = default_visible_toolset(bindings);
 
+    let catalog = tool_catalog();
     let tools_for_model = toolset
         .iter()
-        .map(|tool_name| ToolDefinition {
-            tool_name: tool_name.clone(),
-            description: format!("Execute the {} tool.", tool_name),
-            input_schema: json!({
-                "type": "object"
-            }),
+        .map(|tool_name| {
+            catalog.get(tool_name.as_str()).cloned().unwrap_or_else(|| ToolDefinition {
+                tool_name: tool_name.clone(),
+                description: format!("Execute the {} tool.", tool_name),
+                input_schema: json!({ "type": "object" }),
+                class: None,
+            })
         })
         .collect::<Vec<_>>();
 
@@ -1245,14 +1355,16 @@ fn tool_assembly_from_allowed_incarnations(bindings: &SessionBindings) -> ToolAs
         bindings.effective_toolset.clone()
     };
 
+    let catalog = tool_catalog();
     let tools_for_model = visible_tools
         .iter()
-        .map(|tool_name| ToolDefinition {
-            tool_name: tool_name.clone(),
-            description: format!("Execute the {} tool.", tool_name),
-            input_schema: json!({
-                "type": "object"
-            }),
+        .map(|tool_name| {
+            catalog.get(tool_name.as_str()).cloned().unwrap_or_else(|| ToolDefinition {
+                tool_name: tool_name.clone(),
+                description: format!("Execute the {} tool.", tool_name),
+                input_schema: json!({ "type": "object" }),
+                class: None,
+            })
         })
         .collect::<Vec<_>>();
 
@@ -1440,6 +1552,7 @@ mod tests {
             iteration: 0,
             pending_tool_call: None,
             pending_approval: None,
+            pending_text_reply: None,
         });
 
         let checkpoint = state.checkpoint_json();
@@ -1503,6 +1616,7 @@ mod tests {
             iteration: 0,
             pending_tool_call: None,
             pending_approval: None,
+            pending_text_reply: None,
         });
 
         state.complete_active_turn("hi".into());
@@ -2020,6 +2134,7 @@ mod tests {
             iteration: 0,
             pending_tool_call: None,
             pending_approval: None,
+            pending_text_reply: None,
         });
         let index = merge_session_index(None, &first);
         assert_eq!(index["active_sessions"].as_array().unwrap().len(), 1);

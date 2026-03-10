@@ -6,7 +6,13 @@ Close four concrete gaps in the current `agent-core` loop that prevent it from f
 
 ## Disposition
 
-`draft — proposed for next implementation slice`
+`in progress — Gap 2 (media routing) complete; Gap 3 (tool catalog) next`
+
+### Completed
+- **Gap 2 — Configurable Media Routing** — `MediaRoutingPolicy` landed in `AgentProfile`. Per-kind action overrides (`voice_action`, `image_action`, `document_action`) route to distinct capabilities (`voice.transcribe`, `image.describe`, `media.analyze`). `strip_tools_on_media` and `forward_media_to_model` are configurable. `TaskKind::AudioTranscribe` added to model-router; Gemini handles it via the same inline-bytes path. Voice routing defaults to `analyze_media` / `media.analyze`; set `voice_action: "transcribe"` to route to a dedicated STT guest.
+
+### Extended (beyond original Gap 2 scope)
+- **TTS response pipeline** — `VoiceResponsePolicy` added to `AgentProfile`. When `enabled: true`, the agent routes its text response through `voice.synthesize` before delivery. Turn phase `WaitingVoice` introduced. Hegemon now delivers audio via `sendVoice`/`sendAudio` multipart plus optional text caption.
 
 ## Linked Work Surface
 

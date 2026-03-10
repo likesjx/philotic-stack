@@ -531,6 +531,26 @@ mod tests {
         ) -> Result<Vec<SessionEventRecord>> {
             Ok(vec![])
         }
+
+        fn upsert_abstract_tool(
+            &self,
+            _tool: &ansible_mesh_core::graph::AbstractToolRecord,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn get_abstract_tool(
+            &self,
+            _tool_name: &str,
+        ) -> Result<Option<ansible_mesh_core::graph::AbstractToolRecord>> {
+            Ok(None)
+        }
+
+        fn list_abstract_tools(
+            &self,
+        ) -> Result<Vec<ansible_mesh_core::graph::AbstractToolRecord>> {
+            Ok(vec![])
+        }
     }
 
     struct MockMaterializer {

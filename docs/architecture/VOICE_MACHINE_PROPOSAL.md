@@ -14,11 +14,78 @@ without turning `agent-core` into an audio pipeline with opinions.
 
 ## Disposition
 
-Proposed and pinned for near-term design.
-
-This work is not implemented yet, but it should be treated as an important upcoming interface subsystem rather than a distant optional enhancement.
+`in progress — first policy slice landed; voice machine component not yet materialised`
 
 Track active work in [task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md).
+
+---
+
+## First Implementation Slice (landed on `codex/hegemon-membrane-slice`)
+
+Before the full voice machine component exists, two policy-driven seams were added to the existing pipeline:
+
+### Inbound: configurable media routing (`MediaRoutingPolicy`)
+
+Added to `AgentProfile` in `agent-core/src/session.rs`. Controls what happens when a blob-backed media attachment arrives from hegemon:
+
+| Field | Default | Effect |
+|---|---|---|
+| `forward_media_to_model` | `true` | When `false`, strip all attachments and treat turn as text-only |
+| `voice_action` | `None` → `"analyze_media"` | Action/capability used for voice/audio attachments |
+| `image_action` | `None` → `"analyze_media"` | Action/capability used for photo/image attachments |
+| `document_action` | `None` → `"analyze_media"` | Action/capability used for document attachments |
+| `strip_tools_on_media` | `true` | Suppress tools on media turns |
+
+Action → capability mapping: `"transcribe"` → `voice.transcribe`, `"describe"` → `image.describe`, `"summarize"` → `document.summarize`, anything else → `media.analyze`.
+
+`model-router` gained `TaskKind::AudioTranscribe` (`voice.transcribe`). Gemini handles it via the same inline-bytes path, using a transcription-focused prompt. A dedicated STT guest can be wired by pointing the `voice.transcribe` component route at it.
+
+### Outbound: policy-driven TTS (`VoiceResponsePolicy`)
+
+Added to `AgentProfile`. Controls whether the agent synthesises speech for its responses:
+
+| Field | Default | Effect |
+|---|---|---|
+| `enabled` | `false` | Must opt in; text-only by default |
+| `provider` | `None` | Provider hint (e.g. `"elevenlabs"`) |
+| `voice_id` | `None` | The agent's permanent voice identity |
+| `model` | `None` | Provider model override |
+| `send_text_caption` | `true` | Also deliver text alongside audio |
+| `fallback_to_text` | `true` | Text-only delivery if synthesis fails |
+
+Pipeline: model responds → `complete_agent_response` checks policy → `start_voice_synthesis` stashes text, sets `TurnPhase::WaitingVoice`, emits `voice.synthesize` to the voice component → response returns via `handle_voice_synthesis_response` → `deliver_text_reply` sends `FinalReplyPayload` (with `audio_artifact`) to hegemon → hegemon calls `sendVoice`/`sendAudio` via Telegram multipart.
+
+### Example config
+
+```json
+{
+  "agent_profile": {
+    "media_routing_policy": {
+      "voice_action": "transcribe",
+      "image_action": "analyze_media",
+      "strip_tools_on_media": true
+    },
+    "voice_response_policy": {
+      "enabled": true,
+      "provider": "elevenlabs",
+      "voice_id": "YOUR_ELEVENLABS_VOICE_ID",
+      "model": "eleven_multilingual_v2",
+      "send_text_caption": true,
+      "fallback_to_text": true
+    }
+  }
+}
+```
+
+### What this is NOT yet
+
+- No dedicated voice machine guest/component — the policy targets existing model guests (`model.elevenlabs`, `model.gemini`)
+- No streaming or chunked audio
+- No interruption/barge-in
+- No speech-to-speech (STT + TTS are separate hops)
+- No media artifact storage in the context graph
+
+---
 
 ## Core Recommendation
 
