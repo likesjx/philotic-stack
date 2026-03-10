@@ -215,6 +215,10 @@ fn startup_test_blob_base_url(hotel_name: &str) -> String {
     format!("http://127.0.0.1:{}", startup_test_blob_port(hotel_name))
 }
 
+fn hotel_execution_port(hotel_name: &str) -> u16 {
+    hotel_base_port(hotel_name) + 2
+}
+
 fn default_hotel_record(hotel_name: &str) -> HotelRecord {
     let safe_name = sanitize_hotel_name(hotel_name);
     let base_port = hotel_base_port(&safe_name);
@@ -230,6 +234,7 @@ fn default_hotel_record(hotel_name: &str) -> HotelRecord {
         },
         mesh_port: base_port,
         blob_port: base_port + 1,
+        execution_port: hotel_execution_port(&safe_name),
         ipc_socket_path: format!("/tmp/philotic-{safe_name}.sock"),
         active_pid: None,
     }
@@ -793,8 +798,7 @@ fn enable_guest_test_overrides(
 }
 
 fn startup_test_gemini_base_url(hotel_name: &str) -> String {
-    let port = hotel_base_port(hotel_name).saturating_add(2);
-    format!("http://127.0.0.1:{port}")
+    startup_test_gemini_api_base_url(hotel_name)
 }
 
 #[derive(Clone)]
@@ -806,12 +810,9 @@ fn spawn_fake_gemini_server(
     hotel_name: &str,
     expected_reply: String,
 ) -> tokio::task::JoinHandle<()> {
-    let bind_addr: SocketAddr = format!(
-        "127.0.0.1:{}",
-        hotel_base_port(hotel_name).saturating_add(2)
-    )
-    .parse()
-    .expect("startup fake Gemini socket address should parse");
+    let bind_addr: SocketAddr = format!("127.0.0.1:{}", startup_test_gemini_port(hotel_name))
+        .parse()
+        .expect("startup fake Gemini socket address should parse");
 
     let app = Router::new()
         .fallback(any(fake_gemini_handler))
@@ -1996,6 +1997,8 @@ async fn main() -> Result<()> {
 
     // Spawning the "Hotel Front Desk" local IPC listener for Materialized Guests
     let socket_path = hotel.ipc_socket_path.clone();
+    let execution_addr = format!("0.0.0.0:{}", hotel.execution_port);
+    let execution_enable_rust_auth = flags.enable_rust_auth;
 
     // Create the memory channel dispatcher for PORT-BP-003 to pick up
     // In PORT-BP-003, this receiver will hand off to the persistent mesh_events ledger
@@ -2108,6 +2111,25 @@ async fn main() -> Result<()> {
         }
     });
 
+    let execution_inbox_tx = daemon.inbox_tx().clone();
+    let execution_caps = caps.clone();
+    let execution_db_path = db_path.to_string_lossy().to_string();
+    let execution_psk = mesh_psk.clone();
+    tokio::spawn(async move {
+        if let Err(e) = crate::service::execution_transport::serve_execution_plane(
+            &execution_addr,
+            execution_caps,
+            execution_inbox_tx,
+            &execution_psk,
+            &execution_db_path,
+            execution_enable_rust_auth,
+        )
+        .await
+        {
+            error!("Hotel execution transport failed: {}", e);
+        }
+    });
+
     // MATERIALIZATION LOOP: Spin up all guests defined in the DB as child processes
     info!("--- BEGIN UNIVERSAL MATERIALIZATION ---");
 
@@ -2167,15 +2189,15 @@ async fn main() -> Result<()> {
         let dispatcher_ledger = ledger.clone();
         let dispatcher_tracker = tracker.clone();
         let dispatcher_socket = daemon.socket();
-        let targets = mesh_targets_for_graph(graph_arc.as_ref(), &caps.node_id)?;
+        let dispatcher_graph = graph_arc.clone();
 
         let rx_dispatch = shutdown_rx.resubscribe();
         tokio::spawn(crate::service::mesh_dispatcher::outbound_dispatcher(
             dispatcher_ledger,
             dispatcher_tracker,
             dispatcher_socket,
+            dispatcher_graph,
             caps.node_id.clone(),
-            targets,
             rx_dispatch,
         ));
     }
@@ -2452,6 +2474,7 @@ mod tests {
         assert_eq!(hotel.ipc_socket_path, "/tmp/philotic-alpha-hotel.sock");
         assert_eq!(hotel.mesh_port, hotel_base_port("alpha-hotel"));
         assert_eq!(hotel.blob_port, hotel.mesh_port + 1);
+        assert_eq!(hotel.execution_port, hotel.mesh_port + 2);
     }
 
     #[test]

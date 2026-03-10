@@ -13,7 +13,8 @@ all guest processes, and acts as the routing hub for every interaction inside th
 | **Guest supervision**     | Reconciliation loop every 5s — resurrects dead processes, reclaims inactive ones |
 | **IPC server**            | Unix Domain Socket at `/tmp/ansible.sock` — handles all guest↔hotel messages     |
 | **Mesh beacon**           | UDP server on port 8999 — handles inter-hotel `BeaconMessage` traffic            |
-| **Outbound dispatch**     | Polls `EventLedger`, ships unacked events to peer hotels over UDP                |
+| **Execution transport**   | TCP listener on port 9002 — handles point-to-point inter-hotel execution traffic |
+| **Outbound dispatch**     | Polls `EventLedger`, ships unacked routed events to peer hotels over TCP         |
 | **Blob service**          | HTTP server on port 9001 — content-addressed large payload store                 |
 | **State sync**            | `SyncApartment` IPC → LWW upsert into `memory_apartments`                        |
 
@@ -22,7 +23,8 @@ all guest processes, and acts as the routing hub for every interaction inside th
 - **`ipc.rs`** — `IpcServer` — Unix socket server, routes to `GraphStorage`
 - **`guest_manager.rs`** — `GuestManager` + `LocalProcessMaterializer` + supervision loop
 - **`blob.rs`** — `BlobService` — SHA-256 content-addressed HTTP store
-- **`mesh_dispatcher.rs`** — Outbound UDP event dispatcher
+- **`mesh_dispatcher.rs`** — Outbound inter-hotel routed-event dispatcher
+- **`execution_transport.rs`** — TCP execution-plane listener and point-to-point sender
 - **`webrtc_guest.rs`** — WebRTC transceiver for SDP signaling
 
 ## Environment Variables
@@ -32,7 +34,7 @@ all guest processes, and acts as the routing hub for every interaction inside th
 | `PHILOTIC_MESH_PSK`                   | `INSECURE_DEV_DEFAULT_PSK` | Mesh auth key                         |
 | `PHILOTIC_HOTEL_PORT`                 | `9000`                     | IPC listen port                       |
 | `PHILOTIC_ENABLE_RUST_AUTH`           | `0`                        | 1 = enforce HMAC auth on mesh         |
-| `PHILOTIC_ENABLE_RUST_DISPATCHER`     | `0`                        | 1 = start outbound UDP dispatcher     |
+| `PHILOTIC_ENABLE_RUST_DISPATCHER`     | `0`                        | 1 = start outbound inter-hotel dispatcher |
 | `PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE` | `0`                        | 1 = start durable event ledger writer |
 
 ## Running
@@ -68,6 +70,10 @@ cargo run -p ansible -- --hotel startup-test-hotel --test telegram-roundtrip --t
 On macOS, the hotel now uses a Keychain-backed vault root key automatically and creates one on first use if needed. `PHILOTIC_VAULT_MASTER_KEY` remains a bootstrap fallback for non-macOS environments or explicit operator override. `PHILOTIC_VAULT_KEY_ID` can scope the Keychain item label when you want separate local vault roots.
 
 `mesh-config.json` can be a flat object, a top-level `context_graph` object, or a hotel-structured object. The preferred shape is `hotels.<hotel>.agents.<agent>.telegram` plus optional agent-scoped `model`, `context_graph`, and `import_workspace` sections. On startup, Ansible merges top-level shared keys, then `hotels.default`, then the selected hotel's overlay, flattens nested agent telegram/model settings into the current runtime config keys, and uses `import_workspace` to seed the selected agent identity bundle from an OpenClaw-style workspace.
+
+Current inter-hotel transport split:
+- UDP mesh beacon remains the control plane for heartbeat, registry gossip, and compact coordination
+- routed inter-hotel task execution now uses a point-to-point TCP execution plane once placement resolves a destination hotel
 
 Current startup self-tests include `--test text-roundtrip`, `--test gemini-oauth-roundtrip`, `--test telegram-roundtrip`, and `--test voice-sample`.
 

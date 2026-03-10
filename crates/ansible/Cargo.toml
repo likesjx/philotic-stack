@@ -14,7 +14,7 @@ philotic-client = { path = "../philotic-client" }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "net", "process", "signal", "time", "sync"] }
+tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "net", "process", "signal", "time", "sync", "io-util"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 uuid = { version = "1.21.0", features = ["v4"] }

@@ -48,15 +48,34 @@
 ## New Project: Red Hat Ansible / VPS Deployment Boundary
 
 - [x] Pin the architecture boundary between Red Hat Ansible as the outer deployment orchestrator and Philotic `ansible` as the inner hotel runtime authority.
-- [ ] Define the first Linux/VPS deployment contract:
+- [x] Define the first Linux/VPS deployment contract:
   - host prerequisites
   - filesystem layout
   - service manager shape
   - config/secrets inputs
   - binary/artifact placement
-- [ ] Define the first peer inventory/rendering contract for deployed hotels so cross-host mesh no longer depends on loopback assumptions.
+- [x] Define the first peer inventory/rendering contract for deployed hotels so cross-host mesh no longer depends on loopback assumptions.
 - [ ] Prove a first VPS deployment smoke for one hotel.
 - [ ] Prove a first multi-host or local-to-VPS two-hotel roundtrip.
+
+## New Project: Native Overlay / VPN
+
+- [x] Decide that Philotic should separate UDP control-plane gossip from point-to-point execution transport rather than treating one datagram path as the final carriage for all inter-hotel work.
+- [x] Capture the migration constraint that hotel identity must be independent of current host VPN reachability so Tailscale/WireGuard can be replaced without a routing-schema rewrite.
+- [ ] Define the first tower execution-transport contract:
+  - transport negotiation inputs
+  - reachability advertisement shape
+  - reliability / streaming expectations
+  - blob handoff boundary
+- [ ] Define the first application-layer trust contract for a future native overlay:
+  - hotel identity keys
+  - mutual authentication
+  - authorization
+  - rotation / revocation
+- [ ] Add execution-plane reachability advertisement to the hotel capability registry.
+- [x] Implement the first point-to-point hotel execution transport for routed tasks.
+- [x] Move remote model/tool/task execution off raw UDP Beacon payload bodies.
+- [ ] Define NAT traversal / relay requirements explicitly before committing to a self-hosted overlay transport.
 
 ## New Project: Inter-Hotel Routing And Placement
 
@@ -76,6 +95,8 @@
 - [x] Implement the first placement-based remote selection for unpinned capability routes on tool fallback when no local runner is available.
 - [ ] Extend placement-based remote selection beyond the first tool/model fallback paths to broader routed component classes without breaking session-owned hegemon reply routing.
 - [ ] Move mesh ACK emission to a strict post-commit boundary.
+- [x] Replace routed execution over raw UDP with the first point-to-point execution channel for routed inter-hotel task traffic.
+- [ ] Add execution-plane reachability advertisement and negotiation so routing can choose among multiple point-to-point transports instead of assuming one TCP path.
 
 ## New Project: Model Controller
 
@@ -146,6 +167,7 @@
 - [x] Prove watched-live Telegram text/photo/voice/document delivery through hegemon -> agent-core -> Gemini and normalize markdown-ish document MIME for Gemini media analysis.
 - [x] Make materialized Telegram/agent guests configurable enough for separate hotel/persona stacks (for example Jane vs Aria) instead of hardcoding one Jane-shaped membrane.
 - [x] Make inter-hotel mesh dispatch node-aware by carrying `target_node_id`, discovering peer hotels from the Context Graph, and returning real mesh ACK packets for local multi-hotel development.
+- [x] Prove a first local two-hotel remote model smoke over the new TCP execution plane after remote model placement resolves through the live registry.
 - [ ] Seed `hotels.aria-architect-hotel.agents.aria.telegram.bot_token` in local `mesh-config.json` and run the first watched-live Aria hotel Telegram poller on its own bot token.
 - [ ] Tighten inter-hotel mesh reality gaps: preserve target guest specificity across hotels, move ACK emission to a true post-commit boundary, and replace loopback-only peer addressing with explicit host authority.
 - [x] Support `hotels.<hotel>.agents.<agent>.import_workspace` so startup can seed the selected agent identity bundle from a declared workspace path.

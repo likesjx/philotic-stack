@@ -57,7 +57,7 @@ impl EventLedger {
         let trace_json = serde_json::to_string(&env.trace).unwrap_or_else(|_| "[]".into());
 
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        match conn.execute(
             "INSERT INTO mesh_events (
                 event_id, source_node_id, target_node_id, source_agent_id, target_agent_id,
                 kind, corr_id, attempt, created_at, expires_at,
@@ -78,7 +78,21 @@ impl EventLedger {
                 payload_json,
                 trace_json
             ],
-        )?;
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ffi::ErrorCode::ConstraintViolation =>
+            {
+                let seq = conn.query_row(
+                    "SELECT seq FROM mesh_events WHERE event_id = ?1",
+                    params![env.event_id.to_string()],
+                    |row| row.get::<_, u64>(0),
+                )?;
+                env.seq = seq;
+                return Ok(seq);
+            }
+            Err(err) => return Err(err),
+        }
 
         let seq = conn.last_insert_rowid() as u64;
         env.seq = seq;

@@ -86,7 +86,7 @@ impl EventStorage for SqliteEventStorage {
         let trace_json = serde_json::to_string(&env.trace).unwrap_or_else(|_| "[]".into());
 
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        match conn.execute(
             "INSERT INTO mesh_events (
                 event_id, source_node_id, target_node_id, source_agent_id, target_agent_id,
                 kind, corr_id, attempt, created_at, expires_at,
@@ -107,7 +107,21 @@ impl EventStorage for SqliteEventStorage {
                 payload_json,
                 trace_json
             ],
-        )?;
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ffi::ErrorCode::ConstraintViolation =>
+            {
+                let seq = conn.query_row(
+                    "SELECT seq FROM mesh_events WHERE event_id = ?1",
+                    params![env.event_id.to_string()],
+                    |row| row.get::<_, u64>(0),
+                )?;
+                env.seq = seq;
+                return Ok(seq);
+            }
+            Err(err) => return Err(err.into()),
+        }
 
         let seq = conn.last_insert_rowid() as u64;
         env.seq = seq;
@@ -516,6 +530,7 @@ impl SqliteGraphStorage {
                 capabilities_json TEXT NOT NULL,
                 mesh_port INTEGER NOT NULL,
                 blob_port INTEGER NOT NULL,
+                execution_port INTEGER NOT NULL DEFAULT 0,
                 ipc_socket_path TEXT NOT NULL,
                 active_pid TEXT,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -557,6 +572,10 @@ impl SqliteGraphStorage {
         );
         let _ = conn.execute(
             "ALTER TABLE materialized_guests ADD COLUMN hotel_name TEXT NOT NULL DEFAULT 'default'",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE hotels ADD COLUMN execution_port INTEGER NOT NULL DEFAULT 0",
             [],
         );
         drop(conn);
@@ -755,7 +774,7 @@ impl GraphStorage for SqliteGraphStorage {
 
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT capabilities_json, mesh_port, blob_port, ipc_socket_path, active_pid
+            "SELECT capabilities_json, mesh_port, blob_port, execution_port, ipc_socket_path, active_pid
              FROM hotels
              WHERE hotel_name = ?1",
         )?;
@@ -769,8 +788,9 @@ impl GraphStorage for SqliteGraphStorage {
                 capabilities,
                 mesh_port: row.get(1)?,
                 blob_port: row.get(2)?,
-                ipc_socket_path: row.get(3)?,
-                active_pid: row.get(4).unwrap_or(None),
+                execution_port: row.get(3)?,
+                ipc_socket_path: row.get(4)?,
+                active_pid: row.get(5).unwrap_or(None),
             }))
         } else {
             Ok(None)
@@ -780,7 +800,7 @@ impl GraphStorage for SqliteGraphStorage {
     fn list_hotels(&self) -> Result<Vec<HotelRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT hotel_name, capabilities_json, mesh_port, blob_port, ipc_socket_path, active_pid
+            "SELECT hotel_name, capabilities_json, mesh_port, blob_port, execution_port, ipc_socket_path, active_pid
              FROM hotels
              ORDER BY hotel_name ASC",
         )?;
@@ -795,8 +815,9 @@ impl GraphStorage for SqliteGraphStorage {
                 capabilities,
                 mesh_port: row.get(2)?,
                 blob_port: row.get(3)?,
-                ipc_socket_path: row.get(4)?,
-                active_pid: row.get(5).unwrap_or(None),
+                execution_port: row.get(4)?,
+                ipc_socket_path: row.get(5)?,
+                active_pid: row.get(6).unwrap_or(None),
             });
         }
 
@@ -807,12 +828,13 @@ impl GraphStorage for SqliteGraphStorage {
         let conn = self.conn.lock().unwrap();
         let capabilities_json = serde_json::to_string(&hotel.capabilities)?;
         conn.execute(
-            "INSERT INTO hotels (hotel_name, capabilities_json, mesh_port, blob_port, ipc_socket_path, active_pid, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP)
+            "INSERT INTO hotels (hotel_name, capabilities_json, mesh_port, blob_port, execution_port, ipc_socket_path, active_pid, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, CURRENT_TIMESTAMP)
              ON CONFLICT(hotel_name) DO UPDATE SET
              capabilities_json = excluded.capabilities_json,
              mesh_port = excluded.mesh_port,
              blob_port = excluded.blob_port,
+             execution_port = excluded.execution_port,
              ipc_socket_path = excluded.ipc_socket_path,
              active_pid = excluded.active_pid,
              updated_at = CURRENT_TIMESTAMP",
@@ -821,6 +843,7 @@ impl GraphStorage for SqliteGraphStorage {
                 capabilities_json,
                 hotel.mesh_port,
                 hotel.blob_port,
+                hotel.execution_port,
                 hotel.ipc_socket_path,
                 hotel.active_pid
             ],

@@ -16,18 +16,33 @@ Define the authority boundary between Philotic's hotel runtime and Red Hat Ansib
 
 ## Current Slice
 
-This slice records the deployment boundary so infrastructure work does not leak into runtime architecture by accident.
+This slice defines the first concrete VPS deployment contract.
 
 What is accepted:
 - one hotel per deployed machine is the default deployment model
 - Red Hat Ansible is the outer control plane for VPS/bootstrap operations
 - Philotic hotel config remains the inner runtime authority
+- Tailscale is a named transitional scaffold for inter-hotel peer addressing (see Transitional Network Constraint)
+- peer inventory schema carries explicit `host`/`beacon_port` fields now so Tailscale can be swapped without a schema migration
+- build-on-host strategy is explicitly transitional; pre-built artifact distribution replaces it when CI cross-compilation is ready
+- `philotic` (non-root) system user runs the hotel daemon with progressive systemd hardening
 
 What remains deferred:
-- exact inventory schema for hotel peers and public/private addresses
-- systemd/service packaging details
-- secrets/bootstrap flow for VPS nodes
-- watched live VPS deployment validation
+- watched live VPS deployment smoke (`jane-vps` first hotel)
+- multi-host or local-to-VPS two-hotel roundtrip
+- pre-built artifact fetch replacing on-host compilation
+- Tailscale installation/auth automation in the role (currently flagged as a manual prerequisite)
+- firewall hardening beyond the Tailscale CGNAT range restriction on the blob port
+
+## Transitional Network Constraint
+
+Inter-hotel mesh peer addressing currently depends on Tailscale MagicDNS. This is a **named transitional scaffold**, not a permanent architectural commitment.
+
+Long-term intent is a native VPN built through the hotels themselves. That work is deferred behind hardening requirements and higher-priority functionality. Until then:
+
+- Tailscale is a **host prerequisite** for any deployed hotel participating in the mesh
+- `backbonePeers` entries must resolve via Tailscale MagicDNS (e.g. `jane-vps`)
+- The peer inventory/rendering contract should carry explicit host authority fields now so the Tailscale dependency can be dropped without a schema change when the native VPN lands
 
 ## Proposed Ownership Split
 
@@ -37,7 +52,7 @@ What remains deferred:
 - Linux package/runtime prerequisites
 - binary placement or build artifact deployment
 - service lifecycle (`systemd`, restart, rollback)
-- network/bootstrap setup such as Tailscale or WireGuard
+- Tailscale installation and auth key provisioning (transitional; will be replaced by native hotel VPN)
 - initial config and secret material placement
 - peer address rendering for hotels
 
@@ -51,11 +66,92 @@ What remains deferred:
 - blob/event/cursor persistence
 - agent identity import and runtime config projection
 
+## VPS Deployment Contract
+
+### Host Prerequisites
+
+- Ubuntu 22.04+ (Debian family)
+- Tailscale installed and authenticated (**transitional** — required for inter-hotel mesh until native hotel VPN lands)
+- SSH access: `deploy` user with sudo capability
+- Inbound UDP 8999 open for inter-hotel beacon traffic
+- Inbound TCP 9001 restricted to Tailscale CGNAT range (`100.64.0.0/10`) for blob transport
+
+### Filesystem Layout
+
+```
+/opt/philotic/
+  bin/
+    ansible          # hotel daemon
+    hegemon          # Telegram gateway guest
+    agent-core       # persona/cognitive loop guest
+    model-router     # LLM routing guest
+  etc/               # mode 0700 — philotic user only
+    mesh-config.json # hotel runtime config (rendered by Ansible, no secrets)
+    secrets.env      # runtime secrets injected via EnvironmentFile (from vault)
+  data/
+    context.db       # SQLite context graph (owned by hotel daemon)
+    blob/            # blob store (HTTP content-addressed artifacts)
+  src/               # build checkout (transitional; remove when artifact fetch lands)
+```
+
+### Runtime Ports
+
+| Port | Proto | Purpose |
+|---|---|---|
+| 8999 | UDP | Inter-hotel mesh beacon (BeaconMessage envelope) |
+| 9001 | TCP | Blob HTTP store (content-addressed artifact transport) |
+| 9002 | TCP | Inter-hotel execution plane (point-to-point routed task transport) |
+| `/tmp/philotic-ansible.sock` | UDS | Intra-hotel IPC (guests ↔ hotel daemon) |
+
+### Service Manager Shape
+
+- systemd service: `philotic-hotel.service`
+- Runs as `philotic` system user (non-root)
+- `EnvironmentFile` injects `PHILOTIC_MESH_PSK` from `secrets.env` — never on command line
+- Progressive systemd hardening: `NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=strict`
+- `After=tailscaled.service` (transitional; remove when native hotel VPN lands)
+
+### Config and Secrets Inputs
+
+| Input | Source | Location on host |
+|---|---|---|
+| `mesh-config.json` | Rendered by Ansible from `host_vars/<host>.yml` | `/opt/philotic/etc/mesh-config.json` |
+| `secrets.env` | Rendered from Ansible vault | `/opt/philotic/etc/secrets.env` (mode 0600) |
+| `PHILOTIC_MESH_PSK` | Ansible vault (`vault_philotic_mesh_psk`) | Via `secrets.env` → `EnvironmentFile` |
+| Telegram bot tokens | Ansible vault per-agent | Rendered into `mesh-config.json` at deploy time |
+
+### Binary / Artifact Placement
+
+**Transitional (current):** Ansible clones the repo to `/opt/philotic/src`, builds with `cargo build --release`, and installs binaries to `/opt/philotic/bin/`.
+
+**Intended:** CI pipeline cross-compiles for `x86_64-unknown-linux-gnu`, signs artifacts, and Ansible fetches and installs pre-built binaries. Eliminates Rust toolchain dependency on VPS nodes.
+
+### Peer Inventory Rendering
+
+Backbone peers are rendered explicitly per hotel in `mesh-config.json`. Each peer carries:
+- `name` — logical hotel name
+- `host` — Tailscale MagicDNS name today; explicit IP or hostname when native VPN lands
+- `beacon_port` — defaults to 8999
+
+Schema is stable across the Tailscale → native VPN transition. Only `host` values change.
+
+### Playbook
+
+```bash
+# Full deploy
+ansible-playbook -i ansible/inventory/hosts.ini ansible/deploy_hotel.yml
+
+# Single host
+ansible-playbook -i ansible/inventory/hosts.ini ansible/deploy_hotel.yml --limit jane-vps
+
+# Config-only (no rebuild)
+ansible-playbook -i ansible/inventory/hosts.ini ansible/deploy_hotel.yml --tags config
+```
+
 ## VPS Target
 
-The first deployment target is a Linux VPS running one Philotic hotel with a materialized guest stack. Multi-hotel and mixed local/VPS deployments should build on the same contract.
+The first deployment target is `jane-vps` — one Philotic hotel with a materialized guest stack (`hegemon`, `agent-core`, `model-router`). Multi-hotel and mixed local/VPS deployments build on the same contract.
 
 ## Active Work Links
 
 - [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md)
-- [docs/implementation_plan.md](/Users/jaredlikes/code/philotic-stack/docs/implementation_plan.md)

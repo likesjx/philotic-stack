@@ -69,6 +69,7 @@ pub struct HotelRecord {
     pub capabilities: NodeCapabilities,
     pub mesh_port: u16,
     pub blob_port: u16,
+    pub execution_port: u16,
     pub ipc_socket_path: String,
     pub active_pid: Option<String>,
 }
