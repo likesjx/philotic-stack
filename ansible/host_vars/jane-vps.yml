@@ -1,19 +1,33 @@
 ---
-# jane-vps — first VPS hotel deployment smoke
-philotic_hotel_name: "default"
+# jane-vps — beacon-test-hotel
+philotic_hotel_name: "beacon-test-hotel"
 philotic_default_model: "gemini-pro"
 philotic_repo_branch: "codex/hegemon-membrane-slice"
 
-# Backbone peers — this node knows about itself only for now
+# Backbone peers
 philotic_backbone_peers:
   - name: "jane-vps"
     host: "jane-vps"
     beacon_port: 8999
 
-# No agents for first boot smoke — just prove the hotel daemon starts
-philotic_agents: {}
+# Agents
+philotic_agents:
+  beacon:
+    agent_id: "agent-beacon-01"
+    persona_name: "Beacon"
+    import_workspace: "/home/node/.openclaw/workspace-chief-of-staff"
+    telegram:
+      bot_token: "{{ vault_beacon_telegram_bot_token }}"
+      allowed_users:
+        - "likesjx"
+    model:
+      default_model: "{{ philotic_default_model }}"
 
-# Enable mesh features
+# Artifacts — binaries built on host for first smoke
+philotic_artifacts_remote: true
+philotic_artifacts_dir: "/opt/philotic/src/target/release"
+
+# Mesh
 philotic_enable_rust_auth: "1"
 philotic_enable_rust_dispatcher: "1"
 philotic_enable_rust_task_lifecycle: "1"

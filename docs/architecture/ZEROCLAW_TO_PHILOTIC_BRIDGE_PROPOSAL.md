@@ -205,7 +205,7 @@ This is the right kind of boring. Boring is underrated in migrations right up un
 
 The current bridge slice is intentionally narrow:
 
-1. seed `agent-jane-01` from `workspace-vps-jane`
+1. seed `agent-jane-01` from `~/.openClaw/workspace`
 2. ingest:
    - `SOUL.md`
    - `IDENTITY.md`
