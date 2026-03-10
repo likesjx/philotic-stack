@@ -69,6 +69,7 @@ pub struct HotelRecord {
     pub capabilities: NodeCapabilities,
     pub mesh_port: u16,
     pub blob_port: u16,
+    pub execution_port: u16,
     pub ipc_socket_path: String,
     pub active_pid: Option<String>,
 }
@@ -175,6 +176,9 @@ pub trait GraphStorage: Send + Sync {
 
     /// Load a named hotel record, or `None` if it has not been bootstrapped yet.
     fn get_hotel(&self, hotel_name: &str) -> Result<Option<HotelRecord>>;
+
+    /// List all known hotel records.
+    fn list_hotels(&self) -> Result<Vec<HotelRecord>>;
 
     /// Persist (upsert) a named hotel record.
     fn upsert_hotel(&self, hotel: &HotelRecord) -> Result<()>;

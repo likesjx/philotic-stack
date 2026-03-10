@@ -1,0 +1,27 @@
+---
+# jane-vps — beacon-test-hotel
+philotic_hotel_name: "beacon-test-hotel"
+philotic_default_model: "gemini-pro"
+philotic_repo_branch: "codex/hegemon-membrane-slice"
+
+# Agents
+philotic_agents:
+  beacon:
+    agent_id: "agent-beacon-01"
+    persona_name: "Beacon"
+    import_workspace: "/home/deploy/apps/jane/data/workspace-chief-of-staff"
+    telegram:
+      bot_token: "{{ vault_beacon_telegram_bot_token }}"
+      allowed_users:
+        - "likesjx"
+    model:
+      default_model: "{{ philotic_default_model }}"
+
+# Artifacts — binaries built on host for first smoke
+philotic_artifacts_remote: true
+philotic_artifacts_dir: "/opt/philotic/src/target/release"
+
+# Mesh
+philotic_enable_rust_auth: "1"
+philotic_enable_rust_dispatcher: "1"
+philotic_enable_rust_task_lifecycle: "1"

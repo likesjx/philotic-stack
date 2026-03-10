@@ -15,7 +15,7 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-pub const AGENT_ID: &str = "agent-jane-01";
+pub const DEFAULT_AGENT_ID: &str = "agent-jane-01";
 const DEFAULT_REPLY_ROLE: &str = "hegemon";
 const LOCAL_NODE: &str = "local-ansible-01";
 const DEFAULT_TEXT_MODEL_ROLE: &str = "model.gemini";
@@ -26,6 +26,28 @@ fn implementation_to_model_role(implementation: &str) -> String {
         .find(|segment| !segment.is_empty())
         .unwrap_or("gemini");
     format!("model.{normalized}")
+}
+
+fn resolve_model_execution_target(
+    state: Option<&SessionState>,
+    capability: &str,
+    fallback_role: &str,
+) -> (String, String, Option<String>) {
+    if let Some(route) = state.and_then(|state| state.resolve_component_execution_route(capability))
+    {
+        return (
+            route.target_node.clone(),
+            route.target_role.clone(),
+            route.incarnation_id.clone(),
+        );
+    }
+
+    let target_role = state
+        .and_then(|state| state.preferred_component_implementation(capability))
+        .map(implementation_to_model_role)
+        .unwrap_or_else(|| fallback_role.into());
+
+    (LOCAL_NODE.into(), target_role, None)
 }
 
 fn normalized_user_content(task: &InboundTaskPayload) -> Option<String> {
@@ -124,13 +146,15 @@ fn media_analysis_prompt(content: &str, attachments: &[TransportAttachment]) -> 
 
 pub struct AgentRuntime {
     ipc_client: PhiloticClient,
+    agent_id: String,
     sessions: HashMap<String, SessionState>,
 }
 
 impl AgentRuntime {
-    pub fn new(ipc_client: PhiloticClient) -> Self {
+    pub fn new(ipc_client: PhiloticClient, agent_id: impl Into<String>) -> Self {
         Self {
             ipc_client,
+            agent_id: agent_id.into(),
             sessions: HashMap::new(),
         }
     }
@@ -191,7 +215,7 @@ impl AgentRuntime {
             .clone()
             .or(task.source.clone())
             .unwrap_or_else(|| "unknown".into());
-        let session_id = task.session_id_or_default(AGENT_ID);
+        let session_id = task.session_id_or_default(&self.agent_id);
         let turn_id = task.turn_id.clone().unwrap_or_else(|| task_id.to_string());
         let chat_id = task.chat_id.clone().unwrap_or_default();
         let inbound_final_reply_to = task
@@ -207,10 +231,9 @@ impl AgentRuntime {
         self.ensure_session_loaded(&session_id, &source).await?;
 
         let (final_reply_to, final_reply_role, final_reply_guest_id) = {
-            let state = self
-                .sessions
-                .entry(session_id.clone())
-                .or_insert_with(|| SessionState::new(session_id.clone(), AGENT_ID.into(), source));
+            let state = self.sessions.entry(session_id.clone()).or_insert_with(|| {
+                SessionState::new(session_id.clone(), self.agent_id.clone(), source)
+            });
             state.set_transport_reply_target(
                 inbound_final_reply_to,
                 inbound_final_reply_role,
@@ -289,7 +312,7 @@ impl AgentRuntime {
         };
 
         self.ipc_client
-            .sync_apartment(AGENT_ID, &checkpoint_memory_type, checkpoint_json)
+            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
             .await?;
         self.sync_session_index(&index_state).await?;
 
@@ -369,23 +392,19 @@ impl AgentRuntime {
         };
 
         self.ipc_client
-            .sync_apartment(AGENT_ID, &checkpoint_memory_type, checkpoint_json)
+            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
             .await?;
         self.sync_session_index(&index_state).await?;
 
         let media_attachments = media_analysis_attachments(&task);
-        let (action, prompt, attachments, tools_for_model, target_role) =
+        let (action, prompt, attachments, tools_for_model, capability) =
             if media_attachments.is_empty() {
                 (
                     "generate_text",
                     model_prompt,
                     Vec::new(),
                     tools_for_model,
-                    self.sessions
-                        .get(&session_id)
-                        .and_then(|state| state.preferred_component_implementation("text.generate"))
-                        .map(implementation_to_model_role)
-                        .unwrap_or_else(|| DEFAULT_TEXT_MODEL_ROLE.into()),
+                    "text.generate",
                 )
             } else {
                 (
@@ -393,13 +412,43 @@ impl AgentRuntime {
                     media_analysis_prompt(&content, &media_attachments),
                     media_attachments,
                     Vec::new(),
-                    self.sessions
-                        .get(&session_id)
-                        .and_then(|state| state.preferred_component_implementation("media.analyze"))
-                        .map(implementation_to_model_role)
-                        .unwrap_or_else(|| DEFAULT_TEXT_MODEL_ROLE.into()),
+                    "media.analyze",
                 )
             };
+        let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
+            self.sessions.get(&session_id),
+            capability,
+            DEFAULT_TEXT_MODEL_ROLE,
+        );
+
+        let attachment_kinds: Vec<&str> = attachments
+            .iter()
+            .filter_map(|attachment| {
+                if attachment.kind.is_empty() {
+                    None
+                } else {
+                    Some(attachment.kind.as_str())
+                }
+            })
+            .collect();
+        info!(
+            "Session [{}] routing turn {:?} as action [{}] to role [{}] with {} attachment(s) kinds {:?}",
+            session_id,
+            task.turn_id,
+            action,
+            target_role,
+            attachments.len(),
+            attachment_kinds
+        );
+        for attachment in &attachments {
+            info!(
+                "Model-bound attachment kind [{}] file_id [{}] blob {:?} transport_error {:?}",
+                attachment.kind,
+                attachment.file_id,
+                attachment.blob_id.as_deref(),
+                attachment.transport_error.as_deref()
+            );
+        }
 
         let model_req = ModelRequestPayload {
             action,
@@ -420,9 +469,9 @@ impl AgentRuntime {
         info!("Asking the Hotel to route inference to the model controller...");
         self.ipc_client
             .send_request(IpcRequest::EmitTask {
-                target_node: LOCAL_NODE.into(),
+                target_node,
                 target_role,
-                target_guest_id: None,
+                target_guest_id,
                 task_json: serde_json::to_string(&model_req)?,
             })
             .await?;
@@ -525,7 +574,7 @@ impl AgentRuntime {
         };
 
         self.ipc_client
-            .sync_apartment(AGENT_ID, &checkpoint_memory_type, checkpoint_json)
+            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
             .await?;
         self.sync_session_index(&index_state).await?;
 
@@ -621,7 +670,7 @@ impl AgentRuntime {
         };
 
         self.ipc_client
-            .sync_apartment(AGENT_ID, &checkpoint_memory_type, checkpoint_json)
+            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
             .await?;
         self.sync_session_index(&index_state).await?;
 
@@ -736,7 +785,7 @@ impl AgentRuntime {
         };
 
         self.ipc_client
-            .sync_apartment(AGENT_ID, &checkpoint_memory_type, checkpoint_json)
+            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
             .await?;
         self.sync_session_index(&index_state).await?;
 
@@ -804,7 +853,7 @@ impl AgentRuntime {
         };
 
         self.ipc_client
-            .sync_apartment(AGENT_ID, &checkpoint_memory_type, checkpoint_json)
+            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
             .await?;
         self.sync_session_index(&index_state).await?;
 
@@ -887,7 +936,7 @@ impl AgentRuntime {
         };
 
         self.ipc_client
-            .sync_apartment(AGENT_ID, &checkpoint_memory_type, checkpoint_json)
+            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
             .await?;
         self.sync_session_index(&index_state).await?;
 
@@ -1031,7 +1080,7 @@ impl AgentRuntime {
         };
 
         self.ipc_client
-            .sync_apartment(AGENT_ID, &checkpoint_memory_type, checkpoint_json)
+            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
             .await?;
         self.sync_session_index(&index_state).await?;
 
@@ -1249,7 +1298,7 @@ impl AgentRuntime {
         };
 
         self.ipc_client
-            .sync_apartment(AGENT_ID, &checkpoint_memory_type, checkpoint_json)
+            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
             .await?;
         self.sync_session_index(&index_state).await?;
 
@@ -1289,18 +1338,17 @@ impl AgentRuntime {
             final_reply_guest_id,
         };
 
-        let target_role = self
-            .sessions
-            .get(&session_id)
-            .and_then(|state| state.preferred_component_implementation("text.generate"))
-            .map(implementation_to_model_role)
-            .unwrap_or_else(|| DEFAULT_TEXT_MODEL_ROLE.into());
+        let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
+            self.sessions.get(&session_id),
+            "text.generate",
+            DEFAULT_TEXT_MODEL_ROLE,
+        );
 
         self.ipc_client
             .send_request(IpcRequest::EmitTask {
-                target_node: LOCAL_NODE.into(),
+                target_node,
                 target_role,
-                target_guest_id: None,
+                target_guest_id,
                 task_json: serde_json::to_string(&model_req)?,
             })
             .await?;
@@ -1548,7 +1596,7 @@ impl AgentRuntime {
         };
 
         self.ipc_client
-            .sync_apartment(AGENT_ID, &checkpoint_memory_type, checkpoint_json)
+            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
             .await?;
         self.sync_session_index(&index_state).await?;
 
@@ -1690,7 +1738,7 @@ impl AgentRuntime {
         };
 
         self.ipc_client
-            .sync_apartment(AGENT_ID, &checkpoint_memory_type, checkpoint_json)
+            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
             .await?;
         self.sync_session_index(&index_state).await?;
 
@@ -1766,7 +1814,7 @@ impl AgentRuntime {
             session_id.to_string(),
             SessionState::new(
                 session_id.to_string(),
-                AGENT_ID.into(),
+                self.agent_id.clone(),
                 fallback_source.into(),
             ),
         );
@@ -1777,7 +1825,7 @@ impl AgentRuntime {
         let response = self
             .ipc_client
             .send_request(IpcRequest::GetConfig {
-                key: format!("__apartment__:{AGENT_ID}:short"),
+                key: format!("__apartment__:{}:short", self.agent_id),
             })
             .await?;
 
@@ -1791,7 +1839,7 @@ impl AgentRuntime {
 
         let merged_index = merge_session_index(existing_index.as_ref(), state);
         self.ipc_client
-            .sync_apartment(AGENT_ID, "short", merged_index)
+            .sync_apartment(&self.agent_id, "short", merged_index)
             .await?;
         Ok(())
     }
@@ -1801,12 +1849,16 @@ impl AgentRuntime {
 mod tests {
     use super::{
         DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE, media_analysis_attachments, normalized_user_content,
+        resolve_model_execution_target,
     };
     use crate::r#loop::{ApprovalRequest, ToolCall};
     use crate::protocol::{
         FinalReplyPayload, InboundTaskPayload, ModelRequestPayload, TransportAttachment,
     };
-    use crate::session::{ApprovalPolicy, ComponentRouteBinding, SessionState};
+    use crate::session::{
+        ApprovalPolicy, ComponentExecutionRoute, ComponentRouteAssembly, ComponentRouteBinding,
+        SessionState,
+    };
 
     #[test]
     fn model_request_targets_agent_for_reply() {
@@ -1870,6 +1922,36 @@ mod tests {
             .map(super::implementation_to_model_role);
 
         assert_eq!(target_role.as_deref(), Some("model.elevenlabs"));
+    }
+
+    #[test]
+    fn resolved_component_route_can_drive_remote_model_target() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.component_route_assembly = ComponentRouteAssembly {
+            execution_routes: std::collections::BTreeMap::from([(
+                "media.analyze".into(),
+                ComponentExecutionRoute {
+                    target_node: "aria-node".into(),
+                    target_role: "model.gemini".into(),
+                    incarnation_id: Some("aria-architect-hotel:model-controller-gemini".into()),
+                    hotel_id: Some("aria-architect-hotel".into()),
+                    environment_id: None,
+                    execution_mode: "capability".into(),
+                    availability_state: "live".into(),
+                    selection_reason: Some("remote_latency_capacity".into()),
+                },
+            )]),
+        };
+
+        let target =
+            resolve_model_execution_target(Some(&state), "media.analyze", DEFAULT_TEXT_MODEL_ROLE);
+        assert_eq!(target.0, "aria-node");
+        assert_eq!(target.1, "model.gemini");
+        assert_eq!(
+            target.2.as_deref(),
+            Some("aria-architect-hotel:model-controller-gemini")
+        );
     }
 
     #[test]

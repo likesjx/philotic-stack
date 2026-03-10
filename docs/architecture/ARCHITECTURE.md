@@ -294,36 +294,57 @@ to dispatch durable writes to the serialized DB writer thread.
 
 ---
 
-## 8. Inter-Hotel Mesh (UDP / OTA)
+## 8. Inter-Hotel Mesh (Control Plane) and Execution Transport (Data Plane)
 
 ### 8.1 BeaconDaemon
 
-`BeaconDaemon` binds on UDP port **8999** and handles:
+`BeaconDaemon` binds on UDP port **8999** and handles control-plane traffic:
 
 - Receiving `BeaconMessage` packets from remote hotels
 - HMAC-PSK authentication with 5-minute replay window
 - Bubbling validated messages into the hotel's `inbox_rx` channel
-- Dispatching outbound `BeaconMessage`s via UDP send
+- Dispatching outbound control-plane `BeaconMessage`s via UDP send
 
-### 8.2 Outbound Dispatcher
+### 8.2 Outbound Dispatcher And Execution Plane
 
 A background tokio task (`mesh_dispatcher::outbound_dispatcher`) polls the
-durable `EventLedger` and sends unacknowledged events to known peer hotels:
+durable `EventLedger` and sends unacknowledged routed events to known peer hotels
+over the point-to-point execution plane:
 
 ```
 Tick (every 1s)
   │
-  ├─ For each (target_node_id, ip:port):
+  ├─ For each target_node_id:
   │    ├─ CursorTracker.get_cursor(target_node_id) → seq_N
   │    ├─ EventLedger.query_unacked_events(seq_N, limit=50) → [events]
+  │    ├─ GraphStorage.list_hotels() → execution target
   │    └─ For each event:
   │         └─ Wrap in BeaconMessage(MsgType::MeshEventBatch)
-  │         └─ udp_socket.send_to(target_addr)
+  │         └─ tcp_stream.write_framed(target_execution_addr)
 ```
 
 Enabled by `PHILOTIC_ENABLE_RUST_DISPATCHER=1`.
 
-### 8.3 Inbound Dispatch (main inbox loop)
+Current implementation note:
+- mesh events are now filtered by `target_node_id`, and peer addresses are discovered from known hotel records in the Context Graph
+- current loopback-only peer resolution is still transitional (`127.0.0.1:<mesh_port>` for control plane and `127.0.0.1:<execution_port>` for data plane), which is enough for multi-hotel local development but not yet a general cross-machine authority story
+
+### 8.3 Execution Plane Listener
+
+The hotel also runs a TCP execution listener on `execution_port` (default dev layout: base + 2).
+
+It handles:
+
+- accepting point-to-point framed `BeaconMessage` connections from peer hotels
+- validating the message envelope
+- forwarding `MESH_EVENT_BATCH` payloads into the local inbox for durable processing
+
+This is the first real separation between:
+
+- UDP control-plane gossip
+- reliable point-to-point execution traffic
+
+### 8.4 Inbound Dispatch (main inbox loop)
 
 Inbound `BeaconMessage`s arrive and are dispatched in `main.rs`:
 
@@ -336,12 +357,16 @@ Inbound `BeaconMessage`s arrive and are dispatched in `main.rs`:
 | `MODEL_MANAGER`    | Route to `ModelManagerInvoker`                    |
 | `WEBRTC_SIGNAL`    | Route to `WebRtcGuest` for SDP answer generation  |
 
-### 8.4 Message Queueing (Offline Hotels)
+### 8.5 Message Queueing (Offline Hotels)
 
 The `EventLedger` is an append-only, durable SQLite log. When a peer hotel
 goes offline, events accumulate in the ledger. When the peer comes back
 online, the outbound dispatcher resumes from the last acknowledged cursor
 position — guaranteeing **at-least-once delivery** with **idempotent processing**.
+
+Current implementation note:
+- inbound `MESH_EVENT_BATCH` payloads are now delivered into the local role inbox and trigger a real `MESH_EVENT_ACK` reply
+- the ACK is emitted from the async inbox loop after enqueueing the inbound batch to the writer thread; that is a transitional approximation of durable receipt, not yet a strictly post-commit acknowledgment boundary
 
 ---
 

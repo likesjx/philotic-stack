@@ -6,6 +6,7 @@
 *.db-*
 *.sqlite
 *.sqlite-*
+blobs/
 
 # Local runtime configuration and secrets
 .env
@@ -39,3 +40,4 @@ venv/
 
 # Misc local build results
 result
+ansible/vault/

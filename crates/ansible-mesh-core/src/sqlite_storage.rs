@@ -43,6 +43,7 @@ impl SqliteEventStorage {
                 seq INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_id TEXT NOT NULL UNIQUE,
                 source_node_id TEXT NOT NULL,
+                target_node_id TEXT,
                 source_agent_id TEXT NOT NULL,
                 target_agent_id TEXT,
                 kind TEXT NOT NULL,
@@ -56,6 +57,7 @@ impl SqliteEventStorage {
             )",
             [],
         )?;
+        let _ = conn.execute("ALTER TABLE mesh_events ADD COLUMN target_node_id TEXT", []);
         Ok(())
     }
 }
@@ -84,15 +86,16 @@ impl EventStorage for SqliteEventStorage {
         let trace_json = serde_json::to_string(&env.trace).unwrap_or_else(|_| "[]".into());
 
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        match conn.execute(
             "INSERT INTO mesh_events (
-                event_id, source_node_id, source_agent_id, target_agent_id,
+                event_id, source_node_id, target_node_id, source_agent_id, target_agent_id,
                 kind, corr_id, attempt, created_at, expires_at,
                 payload_type, payload_json, trace_json
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 env.event_id.to_string(),
                 env.source_node_id,
+                env.target_node_id,
                 env.source_agent_id,
                 env.target_agent_id,
                 serde_json::to_string(&env.kind).unwrap().trim_matches('"'),
@@ -104,7 +107,21 @@ impl EventStorage for SqliteEventStorage {
                 payload_json,
                 trace_json
             ],
-        )?;
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ffi::ErrorCode::ConstraintViolation =>
+            {
+                let seq = conn.query_row(
+                    "SELECT seq FROM mesh_events WHERE event_id = ?1",
+                    params![env.event_id.to_string()],
+                    |row| row.get::<_, u64>(0),
+                )?;
+                env.seq = seq;
+                return Ok(seq);
+            }
+            Err(err) => return Err(err.into()),
+        }
 
         let seq = conn.last_insert_rowid() as u64;
         env.seq = seq;
@@ -122,28 +139,29 @@ impl EventStorage for SqliteEventStorage {
 
     fn query_unacked_events(
         &self,
-        _target_node_id: &str,
+        target_node_id: &str,
         cursor_seq: u64,
         limit: u32,
     ) -> Result<Vec<EventEnvelope>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT
-                seq, event_id, source_node_id, source_agent_id, target_agent_id,
+                seq, event_id, source_node_id, target_node_id, source_agent_id, target_agent_id,
                 kind, corr_id, attempt, created_at, expires_at,
                 payload_type, payload_json, trace_json
              FROM mesh_events
              WHERE seq > ?1
+               AND (target_node_id IS NULL OR target_node_id = ?2)
              ORDER BY seq ASC
-             LIMIT ?2",
+             LIMIT ?3",
         )?;
 
-        let mut rows = stmt.query(params![cursor_seq, limit])?;
+        let mut rows = stmt.query(params![cursor_seq, target_node_id, limit])?;
         let mut events = Vec::new();
 
         while let Some(row) = rows.next()? {
-            let payload_type: String = row.get(10)?;
-            let payload_json: String = row.get(11)?;
+            let payload_type: String = row.get(11)?;
+            let payload_json: String = row.get(12)?;
 
             let payload = match payload_type.as_str() {
                 "inline" => EventPayload::Inline { data: payload_json },
@@ -160,10 +178,10 @@ impl EventStorage for SqliteEventStorage {
                 _ => EventPayload::Inline { data: payload_json },
             };
 
-            let trace_json: String = row.get(12)?;
+            let trace_json: String = row.get(13)?;
             let trace: Vec<String> = serde_json::from_str(&trace_json).unwrap_or_else(|_| vec![]);
 
-            let kind_str: String = row.get(5)?;
+            let kind_str: String = row.get(6)?;
             let kind_json = format!("\"{}\"", kind_str);
             let kind: EventKind = serde_json::from_str(&kind_json).unwrap_or(EventKind::TaskInvoke);
 
@@ -171,13 +189,14 @@ impl EventStorage for SqliteEventStorage {
                 seq: row.get(0)?,
                 event_id: uuid::Uuid::parse_str(&row.get::<_, String>(1)?).unwrap_or_default(),
                 source_node_id: row.get(2)?,
-                source_agent_id: row.get(3)?,
-                target_agent_id: row.get(4)?,
+                target_node_id: row.get(3)?,
+                source_agent_id: row.get(4)?,
+                target_agent_id: row.get(5)?,
                 kind,
-                corr_id: row.get(6)?,
-                attempt: row.get(7)?,
-                created_at: row.get(8)?,
-                expires_at: row.get(9)?,
+                corr_id: row.get(7)?,
+                attempt: row.get(8)?,
+                created_at: row.get(9)?,
+                expires_at: row.get(10)?,
                 payload,
                 trace,
             });
@@ -511,6 +530,7 @@ impl SqliteGraphStorage {
                 capabilities_json TEXT NOT NULL,
                 mesh_port INTEGER NOT NULL,
                 blob_port INTEGER NOT NULL,
+                execution_port INTEGER NOT NULL DEFAULT 0,
                 ipc_socket_path TEXT NOT NULL,
                 active_pid TEXT,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -552,6 +572,10 @@ impl SqliteGraphStorage {
         );
         let _ = conn.execute(
             "ALTER TABLE materialized_guests ADD COLUMN hotel_name TEXT NOT NULL DEFAULT 'default'",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE hotels ADD COLUMN execution_port INTEGER NOT NULL DEFAULT 0",
             [],
         );
         drop(conn);
@@ -750,7 +774,7 @@ impl GraphStorage for SqliteGraphStorage {
 
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT capabilities_json, mesh_port, blob_port, ipc_socket_path, active_pid
+            "SELECT capabilities_json, mesh_port, blob_port, execution_port, ipc_socket_path, active_pid
              FROM hotels
              WHERE hotel_name = ?1",
         )?;
@@ -764,24 +788,53 @@ impl GraphStorage for SqliteGraphStorage {
                 capabilities,
                 mesh_port: row.get(1)?,
                 blob_port: row.get(2)?,
-                ipc_socket_path: row.get(3)?,
-                active_pid: row.get(4).unwrap_or(None),
+                execution_port: row.get(3)?,
+                ipc_socket_path: row.get(4)?,
+                active_pid: row.get(5).unwrap_or(None),
             }))
         } else {
             Ok(None)
         }
     }
 
+    fn list_hotels(&self) -> Result<Vec<HotelRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT hotel_name, capabilities_json, mesh_port, blob_port, execution_port, ipc_socket_path, active_pid
+             FROM hotels
+             ORDER BY hotel_name ASC",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut hotels = Vec::new();
+
+        while let Some(row) = rows.next()? {
+            let capabilities_json: String = row.get(1)?;
+            let capabilities: NodeCapabilities = serde_json::from_str(&capabilities_json)?;
+            hotels.push(HotelRecord {
+                hotel_name: row.get(0)?,
+                capabilities,
+                mesh_port: row.get(2)?,
+                blob_port: row.get(3)?,
+                execution_port: row.get(4)?,
+                ipc_socket_path: row.get(5)?,
+                active_pid: row.get(6).unwrap_or(None),
+            });
+        }
+
+        Ok(hotels)
+    }
+
     fn upsert_hotel(&self, hotel: &HotelRecord) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let capabilities_json = serde_json::to_string(&hotel.capabilities)?;
         conn.execute(
-            "INSERT INTO hotels (hotel_name, capabilities_json, mesh_port, blob_port, ipc_socket_path, active_pid, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP)
+            "INSERT INTO hotels (hotel_name, capabilities_json, mesh_port, blob_port, execution_port, ipc_socket_path, active_pid, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, CURRENT_TIMESTAMP)
              ON CONFLICT(hotel_name) DO UPDATE SET
              capabilities_json = excluded.capabilities_json,
              mesh_port = excluded.mesh_port,
              blob_port = excluded.blob_port,
+             execution_port = excluded.execution_port,
              ipc_socket_path = excluded.ipc_socket_path,
              active_pid = excluded.active_pid,
              updated_at = CURRENT_TIMESTAMP",
@@ -790,6 +843,7 @@ impl GraphStorage for SqliteGraphStorage {
                 capabilities_json,
                 hotel.mesh_port,
                 hotel.blob_port,
+                hotel.execution_port,
                 hotel.ipc_socket_path,
                 hotel.active_pid
             ],

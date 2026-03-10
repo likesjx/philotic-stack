@@ -7,7 +7,7 @@ mod session;
 use anyhow::Result;
 use clap::Parser;
 use philotic_client::GuestIdentity;
-use runtime::{AGENT_ID, AgentRuntime};
+use runtime::{AgentRuntime, DEFAULT_AGENT_ID};
 use tracing::info;
 
 #[derive(Parser, Debug)]
@@ -24,13 +24,19 @@ async fn main() -> Result<()> {
 
     info!("Starting Materialized Persona (Agent Core) Guest Process...");
 
+    let agent_id = std::env::var("PHILOTIC_AGENT_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_AGENT_ID.to_string());
+
     let identity = GuestIdentity {
-        guest_id: AGENT_ID.into(),
+        guest_id: agent_id.clone(),
         role: "agent".into(),
         supported_tools: Vec::new(),
     };
 
     let ipc_client = philotic_client::PhiloticClient::connect(identity).await?;
-    let mut runtime = AgentRuntime::new(ipc_client);
+    let mut runtime = AgentRuntime::new(ipc_client, agent_id);
     runtime.run().await
 }
