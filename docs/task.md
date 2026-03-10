@@ -45,6 +45,15 @@
 - [ ] Define approval interrupt/resume semantics.
 - [ ] Define loop event streaming and tracing payloads.
 
+## New Project: Guest Binary Resolution
+
+- [ ] Review [GUEST_BINARY_RESOLUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GUEST_BINARY_RESOLUTION_PROPOSAL.md).
+- [ ] Replace hardcoded `target/debug/<name>` paths in `guest_seed_for_profile` with configurable absolute paths or binary names resolved via `PHILOTIC_BIN_DIR`.
+- [ ] Align seeded guest binary names with actual compiled binary names (`model-router` instead of `model-controller-gemini`/`model-controller-elevenlabs`).
+- [ ] Define the dev-mode vs deployed-mode binary resolution contract so the same seed logic works in both environments without shims.
+- [ ] Remove the `target/debug/` Ansible shim task once the Rust code is fixed.
+- [ ] Define placeholder policy for unimplemented guests (e.g. `tool-runner`) — skip or warn rather than fail spawn.
+
 ## New Project: Red Hat Ansible / VPS Deployment Boundary
 
 - [x] Pin the architecture boundary between Red Hat Ansible as the outer deployment orchestrator and Philotic `ansible` as the inner hotel runtime authority.

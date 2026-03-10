@@ -11,10 +11,11 @@ Type=simple
 User={{ philotic_user }}
 Group={{ philotic_group }}
 
-WorkingDirectory={{ philotic_install_dir }}
+WorkingDirectory={{ philotic_data_dir }}
 
 # Runtime environment
 Environment="RUST_LOG={{ philotic_rust_log }}"
+Environment="PATH={{ philotic_bin_dir }}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 Environment="PHILOTIC_HOTEL_SOCKET={{ philotic_hotel_socket }}"
 Environment="PHILOTIC_HOTEL_PORT={{ philotic_hotel_port }}"
 Environment="PHILOTIC_ENABLE_RUST_AUTH={{ philotic_enable_rust_auth }}"
@@ -37,6 +38,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ReadWritePaths={{ philotic_data_dir }} {{ philotic_blob_dir }}
+ReadOnlyPaths={% for item in philotic_agents.values() %}{% if item.import_workspace is defined %}{{ item.import_workspace }} {% endif %}{% endfor %}
 ProtectHome=yes
 
 [Install]

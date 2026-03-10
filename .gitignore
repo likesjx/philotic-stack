@@ -40,3 +40,4 @@ venv/
 
 # Misc local build results
 result
+ansible/vault/
