@@ -30,6 +30,7 @@ Accepted in this slice:
 - hotel or node identity must not be defined by IP/port
 - the first point-to-point execution transport now exists as a TCP execution plane for routed inter-hotel task traffic
 - the first honest two-hotel remote model smoke is now green over that TCP execution plane in local development
+- hotels now advertise node-level execution reachability (`protocol`, `host`, `port`) in heartbeat/registry state for that first execution plane
 
 Reality that triggered and then validated this proposal:
 - the first honest two-hotel remote model smoke reached real remote route selection, then failed because the old UDP execution path hit `Message too long (os error 40)` for model payloads
@@ -170,7 +171,8 @@ Philotic should migrate in stages rather than attempting a full VPN rewrite up f
 
 Current implementation note:
 - step 3 now exists as the first TCP execution plane for routed `MESH_EVENT_BATCH` delivery
-- steps 4-7 remain future work
+- step 4 has begun with node-level execution reachability advertisement in heartbeat/registry state
+- steps 5-7 remain future work
 
 ## What Building The Actual VPN Would Require
 

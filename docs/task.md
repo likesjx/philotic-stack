@@ -72,7 +72,7 @@
   - mutual authentication
   - authorization
   - rotation / revocation
-- [ ] Add execution-plane reachability advertisement to the hotel capability registry.
+- [x] Add execution-plane reachability advertisement to the hotel capability registry.
 - [x] Implement the first point-to-point hotel execution transport for routed tasks.
 - [x] Move remote model/tool/task execution off raw UDP Beacon payload bodies.
 - [ ] Define NAT traversal / relay requirements explicitly before committing to a self-hosted overlay transport.
@@ -96,7 +96,7 @@
 - [ ] Extend placement-based remote selection beyond the first tool/model fallback paths to broader routed component classes without breaking session-owned hegemon reply routing.
 - [ ] Move mesh ACK emission to a strict post-commit boundary.
 - [x] Replace routed execution over raw UDP with the first point-to-point execution channel for routed inter-hotel task traffic.
-- [ ] Add execution-plane reachability advertisement and negotiation so routing can choose among multiple point-to-point transports instead of assuming one TCP path.
+- [ ] Add execution-plane transport negotiation so routing can choose among multiple point-to-point transports instead of assuming one TCP path.
 
 ## New Project: Model Controller
 

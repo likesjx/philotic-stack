@@ -15,6 +15,9 @@ use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+#[cfg(test)]
+use ansible_mesh_core::registry::ExecutionReachability;
+
 pub(crate) type InboxRegistry = Arc<Mutex<HashMap<String, Vec<RoleSubscriber>>>>;
 
 #[derive(Clone)]
@@ -1266,6 +1269,7 @@ impl IpcServer {
                     "roles": status.capabilities.roles,
                     "models": status.capabilities.models,
                     "tools": status.capabilities.tools,
+                    "execution_reachability": status.execution_reachability,
                     "advertisements": status.advertisements,
                 })
             })
@@ -2644,6 +2648,11 @@ mod tests {
                 active_jobs: 1,
                 queue_depth: 0,
             }],
+            Some(ExecutionReachability {
+                protocol: "tcp-framed-v1".into(),
+                host: "aria-vps".into(),
+                port: 9002,
+            }),
         );
         let server = IpcServer::new(
             socket_path.clone(),
@@ -2685,6 +2694,10 @@ mod tests {
                 let snapshot: serde_json::Value =
                     serde_json::from_str(&value_json).expect("snapshot should decode");
                 assert_eq!(snapshot["nodes"][0]["node_id"], "aria-node");
+                assert_eq!(
+                    snapshot["nodes"][0]["execution_reachability"]["host"],
+                    "aria-vps"
+                );
                 assert_eq!(
                     snapshot["nodes"][0]["advertisements"][0]["target_role"],
                     "model.gemini"
@@ -3182,6 +3195,11 @@ mod tests {
                 active_jobs: 1,
                 queue_depth: 0,
             }],
+            Some(ExecutionReachability {
+                protocol: "tcp-framed-v1".into(),
+                host: "aria-vps".into(),
+                port: 9002,
+            }),
         );
         let server = IpcServer::new(
             socket_path.clone(),
@@ -3721,6 +3739,11 @@ mod tests {
                 active_jobs: 1,
                 queue_depth: 0,
             }],
+            Some(ExecutionReachability {
+                protocol: "tcp-framed-v1".into(),
+                host: "aria-vps".into(),
+                port: 9002,
+            }),
         );
         let server = IpcServer::new(
             socket_path.clone(),

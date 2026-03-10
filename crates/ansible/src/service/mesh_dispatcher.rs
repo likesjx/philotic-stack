@@ -1,9 +1,10 @@
+use ansible_mesh_core::registry::NodeRegistry;
 use ansible_mesh_core::storage::GraphStorage;
 use ansible_mesh_core::{BeaconMessage, MsgType, cursor::CursorTracker, ledger::EventLedger};
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::broadcast;
+use tokio::sync::{RwLock, broadcast};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -16,6 +17,7 @@ pub async fn outbound_dispatcher(
     tracker: Arc<CursorTracker>,
     _udp_socket: Arc<UdpSocket>,
     graph: Arc<dyn GraphStorage>,
+    registry: Arc<RwLock<NodeRegistry>>,
     local_node_id: String,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
@@ -27,7 +29,7 @@ pub async fn outbound_dispatcher(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                let targets = match execution_targets_for_graph(graph.as_ref(), &local_node_id) {
+                let targets = match execution_targets(graph.as_ref(), &registry, &local_node_id).await {
                     Ok(targets) => targets,
                     Err(e) => {
                         warn!("Failed to resolve execution targets: {}", e);
@@ -48,21 +50,27 @@ pub async fn outbound_dispatcher(
     }
 }
 
-fn execution_targets_for_graph(
+async fn execution_targets(
     graph: &dyn GraphStorage,
+    registry: &Arc<RwLock<NodeRegistry>>,
     local_node_id: &str,
 ) -> Result<Vec<(String, String)>> {
-    Ok(graph
-        .list_hotels()?
-        .into_iter()
-        .filter(|hotel| hotel.capabilities.node_id != local_node_id)
-        .map(|hotel| {
-            (
-                hotel.capabilities.node_id,
-                format!("127.0.0.1:{}", hotel.execution_port),
-            )
-        })
-        .collect())
+    let registry_guard = registry.read().await;
+    let mut targets = Vec::new();
+    for hotel in graph.list_hotels()? {
+        if hotel.capabilities.node_id == local_node_id {
+            continue;
+        }
+
+        let target_addr = registry_guard
+            .get_node(&hotel.capabilities.node_id)
+            .and_then(|status| status.execution_reachability.as_ref())
+            .map(|execution| format!("{}:{}", execution.host, execution.port))
+            .unwrap_or_else(|| format!("127.0.0.1:{}", hotel.execution_port));
+        targets.push((hotel.capabilities.node_id, target_addr));
+    }
+
+    Ok(targets)
 }
 
 async fn dispatch_for_target(

@@ -19,11 +19,19 @@ pub struct CapabilityAdvertisement {
     pub queue_depth: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionReachability {
+    pub protocol: String,
+    pub host: String,
+    pub port: u16,
+}
+
 /// Status and capability info for a discovered mesh node.
 #[derive(Debug, Clone)]
 pub struct NodeStatus {
     pub capabilities: NodeCapabilities,
     pub advertisements: Vec<CapabilityAdvertisement>,
+    pub execution_reachability: Option<ExecutionReachability>,
     pub last_seen: Instant,
 }
 
@@ -49,12 +57,14 @@ impl NodeRegistry {
         &mut self,
         capabilities: NodeCapabilities,
         advertisements: Vec<CapabilityAdvertisement>,
+        execution_reachability: Option<ExecutionReachability>,
     ) {
         self.nodes.insert(
             capabilities.node_id.clone(),
             NodeStatus {
                 capabilities,
                 advertisements,
+                execution_reachability,
                 last_seen: Instant::now(),
             },
         );
@@ -143,12 +153,23 @@ mod tests {
         registry.update_node(
             caps("aria-architect-hotel-ansible-01"),
             advertisements.clone(),
+            Some(ExecutionReachability {
+                protocol: "tcp-framed-v1".into(),
+                host: "aria-vps".into(),
+                port: 9002,
+            }),
         );
 
         let node = registry
             .get_node("aria-architect-hotel-ansible-01")
             .expect("node should exist");
         assert_eq!(node.advertisements, advertisements);
+        assert_eq!(
+            node.execution_reachability
+                .as_ref()
+                .map(|value| value.host.as_str()),
+            Some("aria-vps")
+        );
     }
 
     #[test]
@@ -168,6 +189,11 @@ mod tests {
                 active_jobs: 0,
                 queue_depth: 0,
             }],
+            Some(ExecutionReachability {
+                protocol: "tcp-framed-v1".into(),
+                host: "jane-vps".into(),
+                port: 9002,
+            }),
         );
         registry.update_node(
             caps("aria-node"),
@@ -183,6 +209,11 @@ mod tests {
                 active_jobs: 1,
                 queue_depth: 0,
             }],
+            Some(ExecutionReachability {
+                protocol: "tcp-framed-v1".into(),
+                host: "aria-vps".into(),
+                port: 9002,
+            }),
         );
 
         let model_ads: Vec<_> = registry.advertisements_for_role("model.gemini").collect();
@@ -196,8 +227,8 @@ mod tests {
     #[test]
     fn active_nodes_filters_stale_entries() {
         let mut registry = NodeRegistry::new();
-        registry.update_node(caps("fresh-node"), vec![]);
-        registry.update_node(caps("stale-node"), vec![]);
+        registry.update_node(caps("fresh-node"), vec![], None);
+        registry.update_node(caps("stale-node"), vec![], None);
 
         registry
             .nodes
@@ -227,6 +258,7 @@ mod tests {
                 active_jobs: 0,
                 queue_depth: 0,
             }],
+            None,
         );
         registry.update_node(
             caps("stale-node"),
@@ -242,6 +274,7 @@ mod tests {
                 active_jobs: 1,
                 queue_depth: 1,
             }],
+            None,
         );
 
         registry

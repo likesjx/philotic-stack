@@ -1,4 +1,4 @@
-use crate::registry::CapabilityAdvertisement;
+use crate::registry::{CapabilityAdvertisement, ExecutionReachability};
 use crate::{BeaconMessage, MsgType, NodeCapabilities};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -11,6 +11,8 @@ pub struct HeartbeatPayload {
     pub capabilities: NodeCapabilities,
     #[serde(default)]
     pub advertisements: Vec<CapabilityAdvertisement>,
+    #[serde(default)]
+    pub execution_reachability: Option<ExecutionReachability>,
 }
 
 /// Emits heartbeat messages over the given UDP socket to a target address.
@@ -19,10 +21,12 @@ pub async fn emit_heartbeat(
     target: SocketAddr,
     capabilities: &NodeCapabilities,
     advertisements: &[CapabilityAdvertisement],
+    execution_reachability: Option<ExecutionReachability>,
 ) -> Result<()> {
     let payload = HeartbeatPayload {
         capabilities: capabilities.clone(),
         advertisements: advertisements.to_vec(),
+        execution_reachability,
     };
 
     let msg = BeaconMessage {
@@ -75,6 +79,11 @@ mod tests {
                 active_jobs: 1,
                 queue_depth: 0,
             }],
+            execution_reachability: Some(ExecutionReachability {
+                protocol: "tcp-framed-v1".into(),
+                host: "aria-vps".into(),
+                port: 9002,
+            }),
         };
 
         let encoded = serde_json::to_vec(&payload).expect("payload should encode");
@@ -84,6 +93,13 @@ mod tests {
         assert_eq!(
             decoded.advertisements[0].incarnation_id,
             "aria-architect-hotel:model-controller-gemini"
+        );
+        assert_eq!(
+            decoded
+                .execution_reachability
+                .as_ref()
+                .map(|value| value.host.as_str()),
+            Some("aria-vps")
         );
     }
 }
