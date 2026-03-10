@@ -1,6 +1,6 @@
 # Philotic Stack — Architecture Reference
 
-> **Status:** Living Document | **Last Updated:** 2026-03-06
+> **Status:** Living Document | **Last Updated:** 2026-03-10
 
 This document describes the full runtime architecture of the Philotic Stack —
 a distributed AI agent operating system built in Rust. It covers the hotel
@@ -64,25 +64,20 @@ storage abstractions, and state synchronization.
 
 ## 2. Crate Map
 
-| Crate               | Role                                                   |
-| ------------------- | ------------------------------------------------------ |
-| `ansible`           | Hotel daemon — orchestration and service host          |
-| `ansible-mesh-core` | Shared primitives, traits, mesh types, storage         |
-| `philotic-client`   | Guest SDK — IPC client for guests to talk to the hotel |
-| `hegemon`           | Telegram/gateway guest binary                          |
-| `agent-core`        | Persona/agent guest binary                             |
-| `model-router`      | Model provider routing guest binary                    |
-| `robot-kit`         | Embedded robotics HAL (separate concern)               |
+| Crate               | Role                                                         |
+| ------------------- | ------------------------------------------------------------ |
+| `ansible`           | Hotel daemon — orchestration and service host                |
+| `ansible-mesh-core` | Shared primitives, traits, mesh types, storage               |
+| `philotic-client`   | Guest SDK — IPC client for guests to talk to the hotel       |
+| `hegemon`           | Telegram/gateway guest binary                                |
+| `agent-core`        | Persona/agent guest binary                                   |
+| `model-router`      | Model controller SDK + provider binaries (Gemini, ElevenLabs)|
+| `tool-runner`       | Workspace tool executor guest (inactive — not yet spawned)   |
+| `robot-kit`         | Embedded robotics HAL (separate concern, not hotel/guest)    |
 
-### 2.1 The Legacy Reference: `legacy-zeroclaw`
+### 2.1 The Legacy Reference
 
-The `legacy-zeroclaw` directory is a **pristine reference** cloned from the Zerocode open-source project. It is **not** part of the active Philotic Stack codebase.
-
-**Policy:**
-
-1. **Pristine State**: Do not modify files inside `legacy-zeroclaw`. It will be periodically updated from its upstream origin.
-2. **Copy / Mutate / Rewrite**: If logic from the legacy codebase is needed, **copy** it to a relevant crate under `crates/`, **mutate** it to fit the Philotic architecture, or **rewrite** it from scratch.
-3. **Isolation**: No active code in `crates/` should depend on `legacy-zeroclaw`. It is excluded from build, test, and coverage reporting.
+The `legacy-zeroclaw` submodule was removed from this repository. Historical reference docs are preserved under `docs/legacy/`. Consult the original `zeroclaw` repository directly if legacy implementation context is needed. No active code in `crates/` depends on the legacy codebase.
 
 ---
 
@@ -207,11 +202,15 @@ BeaconMessage {
 Guests are OS child processes spawned by `GuestManager`. They communicate with
 the hotel exclusively over the IPC UDS socket using `PhiloticClient`.
 
-| Binary         | Crate                 | Identity                 | Purpose                                                |
-| -------------- | --------------------- | ------------------------ | ------------------------------------------------------ |
-| `hegemon`      | `crates/hegemon`      | `hegemon-telegram-01`    | Telegram gateway, ingress/egress for external messages |
-| `agent-core`   | `crates/agent-core`   | `agent-jane-01`          | Persona runtime, long-running reasoning loop           |
-| `model-router` | `crates/model-router` | `model-router-gemini-01` | Routes LLM calls to available model providers via mesh |
+| Binary                      | Crate                 | Role identity                    | Purpose                                                    |
+| --------------------------- | --------------------- | -------------------------------- | ---------------------------------------------------------- |
+| `hegemon`                   | `crates/hegemon`      | `hegemon-telegram-01`            | Telegram gateway, ingress/egress for external messages     |
+| `agent-core`                | `crates/agent-core`   | `agent-jane-01`                  | Persona runtime, long-running reasoning loop               |
+| `model-controller-gemini`   | `crates/model-router` | `model-controller-gemini-01`     | Gemini provider controller; role `model.gemini`            |
+| `model-controller-elevenlabs` | `crates/model-router` | `model-controller-elevenlabs-01` | ElevenLabs TTS controller; role `model.elevenlabs`         |
+| `tool-runner`               | `crates/tool-runner`  | `{hotel}:tool-runner`            | Workspace tool executor (inactive — seeded but not spawned)|
+
+The `model-router` crate now acts as shared SDK/runtime infrastructure. The two `model-controller-*` binaries are separate materialized guests for their respective providers.
 
 ### Guest Boot Sequence
 
@@ -274,7 +273,7 @@ client.sync_apartment(agent_id, memory_type, content_json) -> Result<()>
 ## 7. Intra-Hotel IPC (Unix Domain Sockets)
 
 All communication between guests and the hotel daemon uses a **Unix Domain Socket**
-at `/tmp/ansible.sock` (configurable). The protocol is newline-delimited JSON
+at `/tmp/philotic-ansible.sock` (overridable via `PHILOTIC_HOTEL_SOCKET`). The protocol is newline-delimited JSON
 over a persistent stream connection.
 
 ```
@@ -545,13 +544,16 @@ Default is `INSECURE_DEV_DEFAULT_PSK` — override before production.
 
 ## 13. Environment Flags
 
-| Variable                              | Default                    | Effect                                  |
-| ------------------------------------- | -------------------------- | --------------------------------------- |
-| `PHILOTIC_MESH_PSK`                   | `INSECURE_DEV_DEFAULT_PSK` | Shared mesh authentication key          |
-| `PHILOTIC_HOTEL_PORT`                 | `9000`                     | IPC port                                |
-| `PHILOTIC_ENABLE_RUST_AUTH`           | `0`                        | Enable Rust-native HMAC auth (`1` = on) |
-| `PHILOTIC_ENABLE_RUST_DISPATCHER`     | `0`                        | Enable Rust outbound mesh dispatcher    |
-| `PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE` | `0`                        | Enable Rust durable event ledger writer |
+| Variable                              | Default                          | Effect                                              |
+| ------------------------------------- | -------------------------------- | --------------------------------------------------- |
+| `PHILOTIC_HOTEL_SOCKET`               | `/tmp/philotic-ansible.sock`     | IPC Unix domain socket path                         |
+| `PHILOTIC_MESH_PSK`                   | `INSECURE_DEV_DEFAULT_PSK`       | Shared mesh authentication key                      |
+| `PHILOTIC_HOTEL_PORT`                 | `9000`                           | IPC listen port                                     |
+| `PHILOTIC_BIN_DIR`                    | (none — uses `PATH`)             | Directory where guest binaries are resolved         |
+| `PHILOTIC_BLOB_BASE_URL`              | `http://127.0.0.1:<blob_port>`   | Base URL injected into guests for blob access       |
+| `PHILOTIC_ENABLE_RUST_AUTH`           | `0`                              | Enable Rust-native HMAC auth (`1` = on)             |
+| `PHILOTIC_ENABLE_RUST_DISPATCHER`     | `0`                              | Enable Rust outbound mesh dispatcher                |
+| `PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE` | `0`                              | Enable Rust durable event ledger writer             |
 
 ---
 
@@ -566,5 +568,5 @@ Default is `INSECURE_DEV_DEFAULT_PSK` — override before production.
 | Task Lifecycle Engine         | 🔲 Planned  | State machine with invariants (PORT-BP-004)            |
 | Auth Exchange                 | 🔲 Planned  | Invite/ticket validation (PORT-BP-006)                 |
 | Scaling / Performance Monitor | 🔲 Planned  | Process scale-out/in based on machine metrics          |
-| WebRTC P2P Data Channels      | 🔲 Planned  | Full SDP lifecycle + ICE (PORT-BP-008)                 |
+| WebRTC P2P Data Channels      | 🔶 In Progress | Signal/SDP types exist; `WebRtcGuest` started but ICE/lifecycle incomplete |
 | Multi-Hotel Parity Tests      | 🔲 Planned  | Shadow mode + chaos tests (PORT-BP-009)                |

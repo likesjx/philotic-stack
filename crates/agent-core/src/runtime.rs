@@ -7,7 +7,10 @@ use crate::protocol::{
     FinalReplyPayload, InboundTaskPayload, ModelRequestPayload, TaskRunnerOverlay,
     ToolExecutionPayload, TransportAttachment,
 };
-use crate::session::{SessionState, ToolExecutionRoute, WorkingTurn, merge_session_index};
+use crate::session::{
+    MediaRoutingPolicy, SessionState, ToolExecutionRoute, VoiceResponsePolicy, WorkingTurn,
+    merge_session_index,
+};
 use anyhow::Result;
 use philotic_client::{IpcRequest, IpcResponse, PhiloticClient, is_ipc_disconnect};
 use std::collections::HashMap;
@@ -19,6 +22,7 @@ pub const DEFAULT_AGENT_ID: &str = "agent-jane-01";
 const DEFAULT_REPLY_ROLE: &str = "hegemon";
 const LOCAL_NODE: &str = "local-ansible-01";
 const DEFAULT_TEXT_MODEL_ROLE: &str = "model.gemini";
+const DEFAULT_VOICE_MODEL_ROLE: &str = "model.elevenlabs";
 
 fn implementation_to_model_role(implementation: &str) -> String {
     let normalized = implementation
@@ -142,6 +146,74 @@ fn media_analysis_prompt(content: &str, attachments: &[TransportAttachment]) -> 
         "Analyze the attached media and respond helpfully to the user. User message/context: {}. Attachment kinds: {}.",
         content, kinds
     )
+}
+
+fn transcription_prompt(content: &str) -> String {
+    if content.trim().is_empty() {
+        "Transcribe this audio message verbatim.".to_string()
+    } else {
+        format!(
+            "Transcribe this audio message verbatim. User context: {}.",
+            content
+        )
+    }
+}
+
+/// Maps a configured action name to the capability key used for component route resolution.
+fn action_to_capability(action: &str) -> &'static str {
+    match action {
+        "transcribe" => "voice.transcribe",
+        "describe" => "image.describe",
+        "summarize" => "document.summarize",
+        _ => "media.analyze",
+    }
+}
+
+struct MediaRouting {
+    action: String,
+    capability: &'static str,
+    attachments: Vec<TransportAttachment>,
+    strip_tools: bool,
+}
+
+/// Applies the agent's `MediaRoutingPolicy` to the candidate blob-backed attachments and returns
+/// routing parameters, or `None` if media should be ignored (policy disabled or no attachments).
+///
+/// Routing priority for mixed-kind turns: voice > image > document.
+fn resolve_media_routing(
+    policy: &MediaRoutingPolicy,
+    candidate_attachments: Vec<TransportAttachment>,
+) -> Option<MediaRouting> {
+    if !policy.forward_media_to_model || candidate_attachments.is_empty() {
+        return None;
+    }
+
+    let has_voice = candidate_attachments
+        .iter()
+        .any(|a| matches!(a.kind.as_str(), "voice" | "audio"));
+    let has_image = candidate_attachments
+        .iter()
+        .any(|a| matches!(a.kind.as_str(), "photo" | "image"));
+    let has_document = candidate_attachments
+        .iter()
+        .any(|a| a.kind.as_str() == "document");
+
+    let action_str: &str = if has_voice {
+        policy.voice_action.as_deref().unwrap_or("analyze_media")
+    } else if has_image {
+        policy.image_action.as_deref().unwrap_or("analyze_media")
+    } else if has_document {
+        policy.document_action.as_deref().unwrap_or("analyze_media")
+    } else {
+        return None;
+    };
+
+    Some(MediaRouting {
+        action: action_str.to_string(),
+        capability: action_to_capability(action_str),
+        attachments: candidate_attachments,
+        strip_tools: policy.strip_tools_on_media,
+    })
 }
 
 pub struct AgentRuntime {
@@ -298,6 +370,7 @@ impl AgentRuntime {
                 iteration: 0,
                 pending_tool_call: None,
                 pending_approval: None,
+                pending_text_reply: None,
             });
             state.set_active_turn_phase(TurnPhase::LoadingContext);
 
@@ -396,23 +469,41 @@ impl AgentRuntime {
             .await?;
         self.sync_session_index(&index_state).await?;
 
+        let media_policy = self
+            .sessions
+            .get(&session_id)
+            .map(|s| s.agent_profile.media_routing_policy.clone())
+            .unwrap_or_default();
+
         let media_attachments = media_analysis_attachments(&task);
+        let media_routing = resolve_media_routing(&media_policy, media_attachments);
+
         let (action, prompt, attachments, tools_for_model, capability) =
-            if media_attachments.is_empty() {
+            if let Some(routing) = media_routing {
+                let prompt = if routing.action == "transcribe" {
+                    transcription_prompt(&content)
+                } else {
+                    media_analysis_prompt(&content, &routing.attachments)
+                };
+                let effective_tools = if routing.strip_tools {
+                    Vec::new()
+                } else {
+                    tools_for_model
+                };
                 (
-                    "generate_text",
+                    routing.action,
+                    prompt,
+                    routing.attachments,
+                    effective_tools,
+                    routing.capability,
+                )
+            } else {
+                (
+                    "generate_text".to_string(),
                     model_prompt,
                     Vec::new(),
                     tools_for_model,
                     "text.generate",
-                )
-            } else {
-                (
-                    "analyze_media",
-                    media_analysis_prompt(&content, &media_attachments),
-                    media_attachments,
-                    Vec::new(),
-                    "media.analyze",
                 )
             };
         let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
@@ -489,6 +580,23 @@ impl AgentRuntime {
             None => return Ok(()),
         };
         self.ensure_session_loaded(&session_id, "unknown").await?;
+
+        // If the turn is waiting for voice synthesis, this is the audio response — route it
+        // directly to the voice handler regardless of the agent_action kind.
+        let waiting_voice = self
+            .sessions
+            .get(&session_id)
+            .and_then(|s| s.active_turn.as_ref())
+            .map(|t| t.phase == TurnPhase::WaitingVoice)
+            .unwrap_or(false);
+
+        if waiting_voice {
+            let raw_content = task.content.unwrap_or_default();
+            return self
+                .handle_voice_synthesis_response(session_id, turn_id, raw_content)
+                .await;
+        }
+
         if let Some(state) = self.sessions.get_mut(&session_id) {
             state.set_active_turn_phase(TurnPhase::Thinking);
         }
@@ -635,6 +743,8 @@ impl AgentRuntime {
                 "Approval required: {}. Reply /approve or /deny.",
                 approval.reason
             ),
+            audio_artifact: None,
+            send_text_caption: false,
         };
 
         self.ipc_client
@@ -822,15 +932,184 @@ impl AgentRuntime {
         turn_id: String,
         content: String,
     ) -> Result<()> {
+        let voice_policy = self
+            .sessions
+            .get(&session_id)
+            .map(|s| s.agent_profile.voice_response_policy.clone())
+            .unwrap_or_default();
+
+        if voice_policy.enabled {
+            return self
+                .start_voice_synthesis(session_id, turn_id, content, voice_policy)
+                .await;
+        }
+
+        self.deliver_text_reply(session_id, turn_id, content, None, false)
+            .await
+    }
+
+    /// Stashes the text, sets `WaitingVoice`, and emits a `voice.synthesize` task.
+    async fn start_voice_synthesis(
+        &mut self,
+        session_id: String,
+        turn_id: String,
+        text: String,
+        policy: VoiceResponsePolicy,
+    ) -> Result<()> {
+        let (task_id, chat_id, final_reply_to, final_reply_role, final_reply_guest_id,
+             checkpoint_memory_type, checkpoint_json, index_state) = {
+            let Some(state) = self.sessions.get_mut(&session_id) else {
+                warn!("start_voice_synthesis: unknown session {}", session_id);
+                return Ok(());
+            };
+            let Some(active_turn) = state.active_turn.as_ref() else {
+                warn!("start_voice_synthesis: no active turn for session {}", session_id);
+                return Ok(());
+            };
+            let task_id = active_turn.task_id;
+            let chat_id = active_turn.chat_id.clone();
+            let final_reply_to = active_turn.final_reply_to.clone();
+            let final_reply_role = active_turn.final_reply_role.clone();
+            let final_reply_guest_id = active_turn.final_reply_guest_id.clone();
+            state.set_pending_text_reply(text.clone());
+            state.set_active_turn_phase(TurnPhase::WaitingVoice);
+            (
+                task_id, chat_id, final_reply_to, final_reply_role, final_reply_guest_id,
+                state.checkpoint_memory_type(),
+                state.checkpoint_json(),
+                state.clone(),
+            )
+        };
+
+        self.ipc_client
+            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
+            .await?;
+        self.sync_session_index(&index_state).await?;
+
+        let _ = self
+            .ipc_client
+            .send_request(IpcRequest::UpdateTask {
+                task_id,
+                state: "waiting_voice".into(),
+                payload: serde_json::json!({
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "chat_id": chat_id,
+                }),
+            })
+            .await?;
+
+        let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
+            self.sessions.get(&session_id),
+            "voice.synthesize",
+            DEFAULT_VOICE_MODEL_ROLE,
+        );
+
+        info!(
+            "Session [{}] routing voice synthesis for turn {:?} to role [{}] voice_id {:?}",
+            session_id,
+            turn_id,
+            target_role,
+            policy.voice_id.as_deref(),
+        );
+
+        let voice_task = serde_json::json!({
+            "kind": "voice.synthesize",
+            "provider": policy.provider,
+            "spoken_text": text,
+            "voice_id": policy.voice_id,
+            "model": policy.model,
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "chat_id": chat_id,
+            "reply_to": LOCAL_NODE,
+            "reply_role": "agent",
+            "final_reply_to": final_reply_to,
+            "final_reply_role": final_reply_role,
+            "final_reply_guest_id": final_reply_guest_id,
+        });
+
+        self.ipc_client
+            .send_request(IpcRequest::EmitTask {
+                target_node,
+                target_role,
+                target_guest_id,
+                task_json: serde_json::to_string(&voice_task)?,
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    /// Handles the voice synthesis response for a turn in `WaitingVoice` phase.
+    async fn handle_voice_synthesis_response(
+        &mut self,
+        session_id: String,
+        turn_id: String,
+        raw_audio_content: String,
+    ) -> Result<()> {
+        let voice_policy = self
+            .sessions
+            .get(&session_id)
+            .map(|s| s.agent_profile.voice_response_policy.clone())
+            .unwrap_or_default();
+
+        // Validate the audio content — if it doesn't look like a valid audio artifact, fall back.
+        let audio_artifact = if raw_audio_content.trim_start().starts_with('{') {
+            Some(raw_audio_content.clone())
+        } else {
+            warn!(
+                "Session [{}] voice synthesis response does not look like an audio artifact; fallback={}",
+                session_id, voice_policy.fallback_to_text
+            );
+            None
+        };
+
+        if audio_artifact.is_none() && !voice_policy.fallback_to_text {
+            return self
+                .fail_active_turn(
+                    session_id,
+                    turn_id,
+                    "Voice synthesis failed and fallback_to_text is disabled.".into(),
+                )
+                .await;
+        }
+
+        // Recover the stashed text and complete the turn.
+        let text = self
+            .sessions
+            .get_mut(&session_id)
+            .and_then(|s| s.take_pending_text_reply())
+            .unwrap_or_default();
+
+        self.deliver_text_reply(
+            session_id,
+            turn_id,
+            text,
+            audio_artifact,
+            voice_policy.send_text_caption,
+        )
+        .await
+    }
+
+    /// Final step: complete the turn, sync state, and emit `FinalReplyPayload` to hegemon.
+    async fn deliver_text_reply(
+        &mut self,
+        session_id: String,
+        turn_id: String,
+        content: String,
+        audio_artifact: Option<String>,
+        send_text_caption: bool,
+    ) -> Result<()> {
         let (completed_turn, checkpoint_memory_type, checkpoint_json, index_state) = {
             let Some(state) = self.sessions.get_mut(&session_id) else {
-                warn!("Received model response for unknown session {}", session_id);
+                warn!("deliver_text_reply: unknown session {}", session_id);
                 return Ok(());
             };
 
             let Some(completed_turn) = state.complete_active_turn(content.clone()) else {
                 warn!(
-                    "Received model response for session {} with no active turn",
+                    "deliver_text_reply: no active turn for session {}",
                     session_id
                 );
                 return Ok(());
@@ -876,6 +1155,8 @@ impl AgentRuntime {
             turn_id,
             chat_id: completed_turn.chat_id,
             content,
+            audio_artifact,
+            send_text_caption,
         };
 
         self.ipc_client
@@ -955,6 +1236,8 @@ impl AgentRuntime {
             turn_id,
             chat_id,
             content: message,
+            audio_artifact: None,
+            send_text_caption: false,
         };
 
         self.ipc_client
@@ -1030,6 +1313,8 @@ impl AgentRuntime {
                 turn_id: command_turn_id,
                 chat_id: command_chat_id,
                 content: "No approval pending.".into(),
+                audio_artifact: None,
+                send_text_caption: false,
             };
             self.ipc_client
                 .send_request(IpcRequest::EmitTask {
@@ -1149,6 +1434,8 @@ impl AgentRuntime {
                     turn_id: original_turn_id,
                     chat_id: original_chat_id,
                     content: approval.approved_response.clone(),
+                    audio_artifact: None,
+                    send_text_caption: false,
                 };
 
                 self.ipc_client
@@ -1207,6 +1494,8 @@ impl AgentRuntime {
                     turn_id: original_turn_id,
                     chat_id: original_chat_id,
                     content: format!("Denied: {}", approval.reason),
+                    audio_artifact: None,
+                    send_text_caption: false,
                 };
 
                 self.ipc_client
@@ -1323,7 +1612,7 @@ impl AgentRuntime {
             .unwrap_or_default();
 
         let model_req = ModelRequestPayload {
-            action: "generate_text",
+            action: "generate_text".to_string(),
             session_id: session_id.clone(),
             turn_id,
             prompt,
@@ -1761,6 +2050,8 @@ impl AgentRuntime {
             turn_id,
             chat_id: completed_turn.chat_id,
             content: reply_content,
+            audio_artifact: None,
+            send_text_caption: false,
         };
 
         self.ipc_client
@@ -1849,7 +2140,7 @@ impl AgentRuntime {
 mod tests {
     use super::{
         DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE, media_analysis_attachments, normalized_user_content,
-        resolve_model_execution_target,
+        resolve_media_routing, resolve_model_execution_target,
     };
     use crate::r#loop::{ApprovalRequest, ToolCall};
     use crate::protocol::{
@@ -1863,7 +2154,7 @@ mod tests {
     #[test]
     fn model_request_targets_agent_for_reply() {
         let request = ModelRequestPayload {
-            action: "generate_text",
+            action: "generate_text".to_string(),
             session_id: "sess-1".into(),
             turn_id: "turn-1".into(),
             prompt: "hello".into(),
@@ -1962,6 +2253,8 @@ mod tests {
             turn_id: "turn-1".into(),
             chat_id: "123".into(),
             content: "done".into(),
+            audio_artifact: None,
+            send_text_caption: false,
         };
 
         let json = serde_json::to_value(&payload).expect("serialize payload");
@@ -2246,5 +2539,111 @@ mod tests {
         let attachments = media_analysis_attachments(&task);
         assert_eq!(attachments.len(), 1);
         assert_eq!(attachments[0].kind, "photo");
+    }
+
+    fn blob_backed_attachment(kind: &str) -> TransportAttachment {
+        TransportAttachment {
+            kind: kind.into(),
+            file_id: format!("{kind}-1"),
+            mime_type: Some(if kind == "voice" || kind == "audio" {
+                "audio/ogg".into()
+            } else {
+                "image/jpeg".into()
+            }),
+            file_name: None,
+            file_size: None,
+            telegram_file_path: None,
+            blob_id: Some(format!("sha256-{kind}-1")),
+            blob_download_url: Some(format!("http://127.0.0.1:9001/download/sha256-{kind}-1")),
+            transport_error: None,
+        }
+    }
+
+    #[test]
+    fn default_media_routing_policy_routes_voice_to_analyze_media() {
+        use crate::session::MediaRoutingPolicy;
+
+        let policy = MediaRoutingPolicy::default();
+        let atts = vec![blob_backed_attachment("voice")];
+        let routing = resolve_media_routing(&policy, atts);
+        let r = routing.expect("should produce routing for blob-backed voice");
+        assert_eq!(r.action, "analyze_media");
+        assert_eq!(r.capability, "media.analyze");
+        assert!(r.strip_tools);
+    }
+
+    #[test]
+    fn voice_action_transcribe_routes_to_voice_transcribe_capability() {
+        use crate::session::MediaRoutingPolicy;
+
+        let policy = MediaRoutingPolicy {
+            voice_action: Some("transcribe".into()),
+            ..Default::default()
+        };
+        let atts = vec![blob_backed_attachment("voice")];
+        let routing = resolve_media_routing(&policy, atts);
+        let r = routing.expect("should produce routing for blob-backed voice with transcribe policy");
+        assert_eq!(r.action, "transcribe");
+        assert_eq!(r.capability, "voice.transcribe");
+    }
+
+    #[test]
+    fn image_action_describe_routes_to_image_describe_capability() {
+        use crate::session::MediaRoutingPolicy;
+
+        let policy = MediaRoutingPolicy {
+            image_action: Some("describe".into()),
+            ..Default::default()
+        };
+        let atts = vec![blob_backed_attachment("photo")];
+        let routing = resolve_media_routing(&policy, atts);
+        let r = routing.expect("should produce routing for blob-backed photo with describe policy");
+        assert_eq!(r.action, "describe");
+        assert_eq!(r.capability, "image.describe");
+    }
+
+    #[test]
+    fn voice_takes_priority_over_image_in_mixed_turn() {
+        use crate::session::MediaRoutingPolicy;
+
+        let policy = MediaRoutingPolicy {
+            voice_action: Some("transcribe".into()),
+            image_action: Some("describe".into()),
+            ..Default::default()
+        };
+        let atts = vec![
+            blob_backed_attachment("voice"),
+            blob_backed_attachment("photo"),
+        ];
+        let routing = resolve_media_routing(&policy, atts);
+        let r = routing.expect("should produce routing for mixed attachments");
+        assert_eq!(r.action, "transcribe");
+        assert_eq!(r.capability, "voice.transcribe");
+        assert_eq!(r.attachments.len(), 2, "all attachments forwarded");
+    }
+
+    #[test]
+    fn forward_media_false_returns_none() {
+        use crate::session::MediaRoutingPolicy;
+
+        let policy = MediaRoutingPolicy {
+            forward_media_to_model: false,
+            ..Default::default()
+        };
+        let atts = vec![blob_backed_attachment("voice")];
+        assert!(resolve_media_routing(&policy, atts).is_none());
+    }
+
+    #[test]
+    fn strip_tools_false_preserved_in_routing() {
+        use crate::session::MediaRoutingPolicy;
+
+        let policy = MediaRoutingPolicy {
+            strip_tools_on_media: false,
+            ..Default::default()
+        };
+        let atts = vec![blob_backed_attachment("photo")];
+        let r = resolve_media_routing(&policy, atts).unwrap();
+        assert!(!r.strip_tools);
     }
 }

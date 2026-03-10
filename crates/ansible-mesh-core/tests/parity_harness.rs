@@ -1,7 +1,7 @@
 use ansible_mesh_core::authz::{MeshAuth, NonceTracker};
-use ansible_mesh_core::cursor::CursorTracker;
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
-use ansible_mesh_core::ledger::EventLedger;
+use ansible_mesh_core::sqlite_storage::{SqliteCursorStorage, SqliteEventStorage};
+use ansible_mesh_core::storage::{CursorStorage, EventStorage};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const TEST_PSK: &str = "SHADOW_PARITY_TEST_KEY_2026";
@@ -94,7 +94,7 @@ fn test_nonce_replay_guard() {
 
 #[test]
 fn test_ledger_idempotent_deduplication() {
-    let ledger = EventLedger::open(":memory:").expect("Failed to open volatile DB");
+    let ledger = SqliteEventStorage::open(":memory:").expect("Failed to open volatile DB");
 
     let evt1 = mock_event(uuid::Uuid::new_v4(), 1);
     let evt2 = mock_event(uuid::Uuid::new_v4(), 2);
@@ -107,9 +107,9 @@ fn test_ledger_idempotent_deduplication() {
         .append_event(&mut evt2.clone())
         .expect("Append event 2");
 
-    // Check count
+    // Check count via raw connection
     let count: u64 = ledger
-        .conn
+        .raw_conn()
         .lock()
         .unwrap()
         .query_row("SELECT count(*) FROM mesh_events", [], |row| row.get(0))
@@ -122,7 +122,7 @@ fn test_ledger_idempotent_deduplication() {
 
     // The SQLite insert ignores conflicts on event_id. Check they did not append rows.
     let count_after: u64 = ledger
-        .conn
+        .raw_conn()
         .lock()
         .unwrap()
         .query_row("SELECT count(*) FROM mesh_events", [], |row| row.get(0))
@@ -135,7 +135,7 @@ fn test_ledger_idempotent_deduplication() {
 
 #[test]
 fn test_cursor_advancement() {
-    let tracker = CursorTracker::open(":memory:").expect("Failed to open volatile DB");
+    let tracker = SqliteCursorStorage::open(":memory:").expect("Failed to open volatile DB");
     let consumer = "consumer_node_alpha";
 
     // 1. Uninitialized

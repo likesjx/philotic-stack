@@ -6,7 +6,7 @@
 //! pluggable deployment-time decision.
 
 use crate::event::EventEnvelope;
-use crate::graph::{GraphEdge, GraphNode};
+use crate::graph::{AbstractToolRecord, GraphEdge, GraphNode};
 use crate::NodeCapabilities;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -234,6 +234,17 @@ pub trait GraphStorage: Send + Sync {
         session_id: &str,
         limit: usize,
     ) -> Result<Vec<SessionEventRecord>>;
+
+    // ── Abstract tool catalog (shareable tool definitions) ──────────────
+
+    /// Upsert a shared abstract tool definition into the context graph.
+    fn upsert_abstract_tool(&self, tool: &AbstractToolRecord) -> Result<()>;
+
+    /// Load a single abstract tool definition by tool name, or `None` if not cataloged.
+    fn get_abstract_tool(&self, tool_name: &str) -> Result<Option<AbstractToolRecord>>;
+
+    /// List all abstract tool definitions in the catalog.
+    fn list_abstract_tools(&self) -> Result<Vec<AbstractToolRecord>>;
 }
 
 /// Generic graph persistence contract.
