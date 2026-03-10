@@ -33,7 +33,7 @@ Land the first honest projection boundary in `agent-core` and feed it with one i
   - `project_agent_self`
   - `project_user`
   - `project_knowledge`
-- seed `agent-jane-01` from the legacy `workspace-vps-jane` bootstrap files
+- seed `agent-jane-01` from the canonical `~/.openClaw/workspace` bootstrap files
 - expose that imported profile in the canonical session snapshot
 - keep the first implementation compatibility-first and text-driven
 - preserve existing runtime behavior while creating a clean seam for later:

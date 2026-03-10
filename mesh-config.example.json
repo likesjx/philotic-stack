@@ -9,7 +9,7 @@
     "default": {
       "agents": {
         "jane": {
-          "import_workspace": "/absolute/path/to/jane-workspace",
+          "import_workspace": "/Users/you/.openClaw/workspace",
           "telegram": {
             "bot_token": "YOUR_TELEGRAM_BOT_TOKEN_HERE",
             "allowed_users": ["JaneHegemonBot"]
