@@ -1,0 +1,19 @@
+---
+# jane-vps — first VPS hotel deployment smoke
+philotic_hotel_name: "default"
+philotic_default_model: "gemini-pro"
+philotic_repo_branch: "codex/hegemon-membrane-slice"
+
+# Backbone peers — this node knows about itself only for now
+philotic_backbone_peers:
+  - name: "jane-vps"
+    host: "jane-vps"
+    beacon_port: 8999
+
+# No agents for first boot smoke — just prove the hotel daemon starts
+philotic_agents: {}
+
+# Enable mesh features
+philotic_enable_rust_auth: "1"
+philotic_enable_rust_dispatcher: "1"
+philotic_enable_rust_task_lifecycle: "1"

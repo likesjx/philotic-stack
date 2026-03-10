@@ -1,0 +1,43 @@
+[Unit]
+Description=Philotic Hotel Daemon — {{ philotic_hotel_name }}
+Documentation=https://github.com/your-org/philotic-stack
+After=network-online.target tailscaled.service
+Wants=network-online.target
+# NOTE: tailscaled.service is a transitional dependency.
+# Remove when native hotel VPN replaces Tailscale peer addressing.
+
+[Service]
+Type=simple
+User={{ philotic_user }}
+Group={{ philotic_group }}
+
+WorkingDirectory={{ philotic_install_dir }}
+
+# Runtime environment
+Environment="RUST_LOG={{ philotic_rust_log }}"
+Environment="PHILOTIC_HOTEL_SOCKET={{ philotic_hotel_socket }}"
+Environment="PHILOTIC_HOTEL_PORT={{ philotic_hotel_port }}"
+Environment="PHILOTIC_ENABLE_RUST_AUTH={{ philotic_enable_rust_auth }}"
+Environment="PHILOTIC_ENABLE_RUST_DISPATCHER={{ philotic_enable_rust_dispatcher }}"
+Environment="PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE={{ philotic_enable_rust_task_lifecycle }}"
+
+# Mesh PSK — injected from Ansible vault; never stored in plaintext on disk
+EnvironmentFile={{ philotic_etc_dir }}/secrets.env
+
+ExecStart={{ philotic_bin_dir }}/ansible \
+  --hotel {{ philotic_hotel_name }} \
+  --load-config {{ philotic_etc_dir }}/mesh-config.json
+
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+
+# Hardening (progressive — tighten as hotel VPN and vault mature)
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths={{ philotic_data_dir }} {{ philotic_blob_dir }}
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target
