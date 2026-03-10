@@ -195,7 +195,10 @@ impl ModelProvider for GeminiProvider {
     }
 
     fn supports(&self, task: &ControllerTask) -> bool {
-        matches!(task.kind, TaskKind::TextGenerate | TaskKind::MediaAnalyze)
+        matches!(
+            task.kind,
+            TaskKind::TextGenerate | TaskKind::MediaAnalyze | TaskKind::AudioTranscribe
+        )
     }
 
     async fn invoke(&self, task: &ControllerTask) -> Result<ProviderOutput> {
@@ -204,7 +207,9 @@ impl ModelProvider for GeminiProvider {
                 task.prompt_text()
                     .context("Gemini text task missing prompt")?,
             ),
-            TaskKind::MediaAnalyze => self.media_request_payload(task).await?,
+            TaskKind::MediaAnalyze | TaskKind::AudioTranscribe => {
+                self.media_request_payload(task).await?
+            }
             TaskKind::VoiceSynthesize => bail!("Gemini does not support voice synthesis"),
         };
         let response = self
@@ -410,6 +415,45 @@ mod tests {
                     mime_type: Some("audio/ogg".into()),
                     url: Some("http://127.0.0.1:9001/download/sha256-2".into()),
                     blob_ref: Some("sha256-2".into()),
+                    transport_error: None,
+                }],
+                ..Default::default()
+            },
+            affordances: Default::default(),
+            routing_hints: RoutingHints::default(),
+            provider_options: Default::default(),
+        };
+
+        assert!(crate::controller::ModelProvider::supports(&provider, &task));
+    }
+
+    #[test]
+    fn gemini_supports_audio_transcribe_tasks() {
+        let provider = GeminiProvider::new(
+            reqwest::Client::new(),
+            Some(GeminiAuth::ApiKey("api-key".into())),
+            None,
+        );
+        let task = ControllerTask {
+            kind: TaskKind::AudioTranscribe,
+            provider: None,
+            model: None,
+            prompt: Some("Transcribe this audio verbatim.".into()),
+            text: None,
+            spoken_text: None,
+            display_text: None,
+            voice: None,
+            voice_id: None,
+            output_format: None,
+            language_code: None,
+            response_contract: Default::default(),
+            context: ContextEnvelope {
+                attachments: vec![AttachmentInput {
+                    kind: Some("voice".into()),
+                    file_id: Some("voice-1".into()),
+                    mime_type: Some("audio/ogg".into()),
+                    url: Some("http://127.0.0.1:9001/download/sha256-voice-1".into()),
+                    blob_ref: Some("sha256-voice-1".into()),
                     transport_error: None,
                 }],
                 ..Default::default()

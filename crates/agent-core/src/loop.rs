@@ -9,6 +9,7 @@ pub enum TurnPhase {
     Thinking,
     WaitingTool,
     WaitingApproval,
+    WaitingVoice,
     Completed,
     Failed,
 }
@@ -22,6 +23,7 @@ impl TurnPhase {
             Self::Thinking => "thinking",
             Self::WaitingTool => "waiting_tool",
             Self::WaitingApproval => "waiting_approval",
+            Self::WaitingVoice => "waiting_voice",
             Self::Completed => "completed",
             Self::Failed => "failed",
         }
@@ -34,6 +36,7 @@ impl TurnPhase {
             "thinking" => Self::Thinking,
             "waiting_tool" => Self::WaitingTool,
             "waiting_approval" => Self::WaitingApproval,
+            "waiting_voice" => Self::WaitingVoice,
             "completed" => Self::Completed,
             "failed" => Self::Failed,
             _ => Self::Queued,

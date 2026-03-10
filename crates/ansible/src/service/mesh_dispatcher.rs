@@ -1,6 +1,6 @@
 use ansible_mesh_core::registry::NodeRegistry;
-use ansible_mesh_core::storage::GraphStorage;
-use ansible_mesh_core::{BeaconMessage, MsgType, cursor::CursorTracker, ledger::EventLedger};
+use ansible_mesh_core::storage::{CursorStorage, EventStorage, GraphStorage};
+use ansible_mesh_core::{BeaconMessage, MsgType};
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
@@ -10,11 +10,11 @@ use uuid::Uuid;
 
 use crate::service::execution_transport::send_execution_message;
 
-/// Continuously polls the EventLedger and CursorTracker to dispatch durable
+/// Continuously polls the EventStorage and CursorStorage to dispatch durable
 /// mesh events over UDP to their target nodes.
 pub async fn outbound_dispatcher(
-    ledger: Arc<EventLedger>,
-    tracker: Arc<CursorTracker>,
+    ledger: Arc<dyn EventStorage>,
+    tracker: Arc<dyn CursorStorage>,
     _udp_socket: Arc<UdpSocket>,
     graph: Arc<dyn GraphStorage>,
     registry: Arc<RwLock<NodeRegistry>>,
@@ -37,7 +37,7 @@ pub async fn outbound_dispatcher(
                     }
                 };
                 for (target_node_id, target_addr) in &targets {
-                    if let Err(e) = dispatch_for_target(&ledger, &tracker, &local_node_id, target_node_id, target_addr).await {
+                    if let Err(e) = dispatch_for_target(ledger.as_ref(), tracker.as_ref(), &local_node_id, target_node_id, target_addr).await {
                         error!("Failed to dispatch to {}: {}", target_node_id, e);
                     }
                 }
@@ -74,8 +74,8 @@ async fn execution_targets(
 }
 
 async fn dispatch_for_target(
-    ledger: &EventLedger,
-    tracker: &CursorTracker,
+    ledger: &dyn EventStorage,
+    tracker: &dyn CursorStorage,
     local_node_id: &str,
     target_node_id: &str,
     target_addr: &str,
