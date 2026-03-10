@@ -1,0 +1,333 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="1100" viewBox="0 0 1400 1100">
+<defs>
+  <style>text { font-family: Inter, system-ui, -apple-system, sans-serif; }</style>
+</defs>
+<rect width="1400" height="1100" fill="#0a0c14"/>
+
+  <circle cx="50" cy="44" r="20" fill="none" stroke="#00e5ff" stroke-width="2" opacity="0.9"/>
+  <text x="50" y="49" text-anchor="middle" font-size="16" fill="#00e5ff">&#x2B21;</text>
+  <text x="80" y="37" font-size="20" font-weight="700" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">The <tspan fill="#00e5ff">Philotic Stack</tspan></text>
+  <text x="80" y="56" font-size="11" fill="#8892b0" font-family="Inter, system-ui, -apple-system, sans-serif">Distributed AI Agent OS  ·  Rust  ·  Hotel / Guest Model  ·  Implementation Status</text>
+  <line x1="0" y1="76" x2="1400" y2="76" stroke="#1e2540" stroke-width="1"/>
+  <rect x="28" y="88" width="11" height="11" rx="3" fill="#00e676"/>
+  <text x="44" y="97" font-size="10" fill="#8892b0" font-family="Inter, system-ui, -apple-system, sans-serif">Implemented &amp; working</text>
+  <rect x="205" y="88" width="11" height="11" rx="3" fill="#ffc107"/>
+  <text x="221" y="97" font-size="10" fill="#8892b0" font-family="Inter, system-ui, -apple-system, sans-serif">In progress / flag-gated</text>
+  <rect x="403" y="88" width="11" height="11" rx="3" fill="#ff6d00"/>
+  <text x="419" y="97" font-size="10" fill="#8892b0" font-family="Inter, system-ui, -apple-system, sans-serif">Scaffolded / blocked</text>
+  <rect x="573" y="88" width="11" height="11" rx="3" fill="#4a5370"/>
+  <text x="589" y="97" font-size="10" fill="#8892b0" font-family="Inter, system-ui, -apple-system, sans-serif">Planned / docs only</text>
+  <text x="28" y="119" font-size="9" fill="#8892b0" font-family="Inter, system-ui, -apple-system, sans-serif">Overall implementation progress (by surface area)</text>
+  <text x="1372" y="119" text-anchor="end" font-size="9" font-weight="600" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif">~55% complete</text>
+  <rect x="28" y="126" width="1344" height="6" rx="3" fill="#161b2e"/>
+  <rect x="28" y="126" width="672" height="6" fill="#00e676" opacity="1.0"/>
+  <rect x="700" y="126" width="134" height="6" fill="#ffc107" opacity="1.0"/>
+  <rect x="834" y="126" width="107" height="6" fill="#ff6d00" opacity="1.0"/>
+  <rect x="941" y="126" width="430" height="6" fill="#4a5370" opacity="0.4"/>
+  <rect x="20" y="152" width="1360" height="640" rx="12" fill="#00e5ff" fill-opacity="0.04" stroke="#00e5ff" stroke-opacity="0.4" stroke-width="1.5"/>
+  <circle cx="38" cy="171" r="4" fill="#00e5ff" opacity="0.9"/>
+  <text x="50" y="176" font-size="9" font-weight="700" letter-spacing="1.6" fill="#00e5ff" font-family="Inter, system-ui, -apple-system, sans-serif" style="text-transform:uppercase">PHYSICAL NODE — THE HOTEL (ANSIBLE DAEMON)</text>
+  <rect x="36" y="182" width="300" height="588" rx="12" fill="#ffc107" fill-opacity="0.04" stroke="#ffc107" stroke-opacity="0.4" stroke-width="1.5"/>
+  <circle cx="54" cy="201" r="4" fill="#ffc107" opacity="0.9"/>
+  <text x="66" y="206" font-size="9" font-weight="700" letter-spacing="1.6" fill="#ffc107" font-family="Inter, system-ui, -apple-system, sans-serif" style="text-transform:uppercase">CORE SERVICES</text>
+  <rect x="46" y="208" width="280" height="64" rx="7" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
+  <circle cx="316" cy="220" r="6" fill="#00e676" opacity="0.2"/>
+  <circle cx="316" cy="220" r="3.5" fill="#00e676"/>
+  <text x="55" y="224" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">IpcServer</text>
+  <rect x="55" y="229" width="34.4" height="13" rx="3" fill="#00e676" fill-opacity="0.18" stroke="#00e676" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="60" y="238" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">DONE</text>
+  <text x="55" y="249" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">service/ipc.rs  4,911 lines</text>
+  <text x="55" y="260" font-size="8" fill="#ff6d00" font-family="Inter, system-ui, -apple-system, sans-serif">Monolith — split recommended</text>
+  <rect x="46" y="286" width="280" height="64" rx="7" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
+  <circle cx="316" cy="298" r="6" fill="#00e676" opacity="0.2"/>
+  <circle cx="316" cy="298" r="3.5" fill="#00e676"/>
+  <text x="55" y="302" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">GuestManager</text>
+  <rect x="55" y="307" width="34.4" height="13" rx="3" fill="#00e676" fill-opacity="0.18" stroke="#00e676" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="60" y="316" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">DONE</text>
+  <text x="55" y="327" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">guest_manager.rs LocalProcessMaterializer</text>
+  <rect x="46" y="364" width="280" height="64" rx="7" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
+  <circle cx="316" cy="376" r="6" fill="#00e676" opacity="0.2"/>
+  <circle cx="316" cy="376" r="3.5" fill="#00e676"/>
+  <text x="55" y="380" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">BlobService</text>
+  <rect x="55" y="385" width="34.4" height="13" rx="3" fill="#00e676" fill-opacity="0.18" stroke="#00e676" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="60" y="394" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">DONE</text>
+  <text x="55" y="405" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">service/blob.rs  :9001  PORT-BP-007</text>
+  <rect x="46" y="442" width="280" height="64" rx="7" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
+  <circle cx="316" cy="454" r="6" fill="#00e676" opacity="0.2"/>
+  <circle cx="316" cy="454" r="3.5" fill="#00e676"/>
+  <text x="55" y="458" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">MeshDispatcher</text>
+  <rect x="55" y="463" width="34.4" height="13" rx="3" fill="#00e676" fill-opacity="0.18" stroke="#00e676" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="60" y="472" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">DONE</text>
+  <text x="55" y="483" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">PHILOTIC_ENABLE_RUST_DISPATCHER</text>
+  <rect x="46" y="520" width="280" height="64" rx="7" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
+  <circle cx="316" cy="532" r="6" fill="#ff6d00" opacity="0.2"/>
+  <circle cx="316" cy="532" r="3.5" fill="#ff6d00"/>
+  <text x="55" y="536" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">WebRtcGuest</text>
+  <rect x="55" y="541" width="51.199999999999996" height="13" rx="3" fill="#ff6d00" fill-opacity="0.18" stroke="#ff6d00" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="60" y="550" font-size="7.5" font-weight="700" fill="#ff6d00" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">PARTIAL</text>
+  <text x="55" y="561" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">PORT-BP-008  ICE handshake incomplete</text>
+  <rect x="46" y="598" width="280" height="64" rx="7" fill="#111" stroke="#4a5370" stroke-width="1"/>
+  <circle cx="316" cy="610" r="6" fill="#4a5370" opacity="0.2"/>
+  <circle cx="316" cy="610" r="3.5" fill="#4a5370"/>
+  <text x="55" y="614" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Task Lifecycle Engine</text>
+  <rect x="55" y="619" width="51.199999999999996" height="13" rx="3" fill="#4a5370" fill-opacity="0.18" stroke="#4a5370" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="60" y="628" font-size="7.5" font-weight="700" fill="#4a5370" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">PLANNED</text>
+  <text x="55" y="639" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">PORT-BP-004  docs/architecture only</text>
+  <rect x="46" y="676" width="280" height="64" rx="7" fill="#111" stroke="#4a5370" stroke-width="1"/>
+  <circle cx="316" cy="688" r="6" fill="#4a5370" opacity="0.2"/>
+  <circle cx="316" cy="688" r="3.5" fill="#4a5370"/>
+  <text x="55" y="692" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Auth Exchange</text>
+  <rect x="55" y="697" width="51.199999999999996" height="13" rx="3" fill="#4a5370" fill-opacity="0.18" stroke="#4a5370" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="60" y="706" font-size="7.5" font-weight="700" fill="#4a5370" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">PLANNED</text>
+  <text x="55" y="717" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">PORT-BP-006</text>
+  <rect x="352" y="182" width="240" height="588" rx="12" fill="#ff6d00" fill-opacity="0.04" stroke="#ff6d00" stroke-opacity="0.4" stroke-width="1.5"/>
+  <circle cx="370" cy="201" r="4" fill="#ff6d00" opacity="0.9"/>
+  <text x="382" y="206" font-size="9" font-weight="700" letter-spacing="1.6" fill="#ff6d00" font-family="Inter, system-ui, -apple-system, sans-serif" style="text-transform:uppercase">STORAGE LAYER</text>
+  <rect x="362" y="208" width="220" height="72" rx="7" fill="#161b2e" stroke="#ff6d00" stroke-width="1"/>
+  <circle cx="572" cy="220" r="6" fill="#00e676" opacity="0.2"/>
+  <circle cx="572" cy="220" r="3.5" fill="#00e676"/>
+  <text x="371" y="224" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">GraphStorage</text>
+  <rect x="371" y="229" width="34.4" height="13" rx="3" fill="#00e676" fill-opacity="0.18" stroke="#00e676" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="376" y="238" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">DONE</text>
+  <text x="371" y="249" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">node_config, guests, apartments</text>
+  <rect x="362" y="294" width="220" height="72" rx="7" fill="#161b2e" stroke="#ff6d00" stroke-width="1"/>
+  <circle cx="572" cy="306" r="6" fill="#00e676" opacity="0.2"/>
+  <circle cx="572" cy="306" r="3.5" fill="#00e676"/>
+  <text x="371" y="310" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">EventStorage</text>
+  <rect x="371" y="315" width="34.4" height="13" rx="3" fill="#00e676" fill-opacity="0.18" stroke="#00e676" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="376" y="324" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">DONE</text>
+  <text x="371" y="335" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">mesh_events table</text>
+  <rect x="362" y="380" width="220" height="72" rx="7" fill="#161b2e" stroke="#ff6d00" stroke-width="1"/>
+  <circle cx="572" cy="392" r="6" fill="#00e676" opacity="0.2"/>
+  <circle cx="572" cy="392" r="3.5" fill="#00e676"/>
+  <text x="371" y="396" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">CursorStorage</text>
+  <rect x="371" y="401" width="34.4" height="13" rx="3" fill="#00e676" fill-opacity="0.18" stroke="#00e676" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="376" y="410" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">DONE</text>
+  <text x="371" y="421" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">mesh_cursors table</text>
+  <rect x="362" y="466" width="220" height="72" rx="7" fill="#1a1000" stroke="#ff6d00" stroke-width="1"/>
+  <circle cx="572" cy="478" r="6" fill="#00e676" opacity="0.2"/>
+  <circle cx="572" cy="478" r="3.5" fill="#00e676"/>
+  <text x="371" y="482" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">SQLite Backend</text>
+  <rect x="371" y="487" width="45.599999999999994" height="13" rx="3" fill="#00e676" fill-opacity="0.18" stroke="#00e676" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="376" y="496" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">ACTIVE</text>
+  <text x="371" y="507" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">ansible_context.db</text>
+  <rect x="362" y="552" width="220" height="72" rx="7" fill="#111" stroke="#4a5370" stroke-width="1"/>
+  <circle cx="572" cy="564" r="6" fill="#4a5370" opacity="0.2"/>
+  <circle cx="572" cy="564" r="3.5" fill="#4a5370"/>
+  <text x="371" y="568" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Alt Backends</text>
+  <rect x="371" y="573" width="51.199999999999996" height="13" rx="3" fill="#4a5370" fill-opacity="0.18" stroke="#4a5370" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="376" y="582" font-size="7.5" font-weight="700" fill="#4a5370" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">PLANNED</text>
+  <text x="371" y="593" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">PebbleDB / RocksDB / Postgres</text>
+  <rect x="608" y="182" width="272" height="288" rx="12" fill="#d500f9" fill-opacity="0.04" stroke="#d500f9" stroke-opacity="0.4" stroke-width="1.5"/>
+  <circle cx="626" cy="201" r="4" fill="#d500f9" opacity="0.9"/>
+  <text x="638" y="206" font-size="9" font-weight="700" letter-spacing="1.6" fill="#d500f9" font-family="Inter, system-ui, -apple-system, sans-serif" style="text-transform:uppercase">ANSIBLE-MESH-CORE PRIMITIVES</text>
+  <rect x="618" y="208" width="252" height="52" rx="7" fill="#161b2e" stroke="#d500f9" stroke-width="1"/>
+  <circle cx="860" cy="220" r="6" fill="#00e676" opacity="0.2"/>
+  <circle cx="860" cy="220" r="3.5" fill="#00e676"/>
+  <text x="627" y="224" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">BeaconDaemon</text>
+  <rect x="627" y="229" width="34.4" height="13" rx="3" fill="#00e676" fill-opacity="0.18" stroke="#00e676" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="632" y="238" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">DONE</text>
+  <text x="627" y="249" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">UDP :8999</text>
+  <rect x="618" y="270" width="252" height="52" rx="7" fill="#161b2e" stroke="#d500f9" stroke-width="1"/>
+  <circle cx="860" cy="282" r="6" fill="#00e676" opacity="0.2"/>
+  <circle cx="860" cy="282" r="3.5" fill="#00e676"/>
+  <text x="627" y="286" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">NodeRegistry</text>
+  <rect x="627" y="291" width="34.4" height="13" rx="3" fill="#00e676" fill-opacity="0.18" stroke="#00e676" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="632" y="300" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">DONE</text>
+  <text x="627" y="311" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">registry.rs</text>
+  <rect x="618" y="332" width="252" height="52" rx="7" fill="#161b2e" stroke="#d500f9" stroke-width="1"/>
+  <circle cx="860" cy="344" r="6" fill="#ffc107" opacity="0.2"/>
+  <circle cx="860" cy="344" r="3.5" fill="#ffc107"/>
+  <text x="627" y="348" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">AuthZ</text>
+  <rect x="627" y="353" width="68.0" height="13" rx="3" fill="#ffc107" fill-opacity="0.18" stroke="#ffc107" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="632" y="362" font-size="7.5" font-weight="700" fill="#ffc107" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">FLAG-GATED</text>
+  <text x="627" y="373" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">PHILOTIC_ENABLE_RUST_AUTH</text>
+  <rect x="618" y="394" width="252" height="52" rx="7" fill="#161b2e" stroke="#d500f9" stroke-width="1"/>
+  <circle cx="860" cy="406" r="6" fill="#00e676" opacity="0.2"/>
+  <circle cx="860" cy="406" r="3.5" fill="#00e676"/>
+  <text x="627" y="410" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">ModelManagerInvoker</text>
+  <rect x="627" y="415" width="34.4" height="13" rx="3" fill="#00e676" fill-opacity="0.18" stroke="#00e676" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="632" y="424" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">DONE</text>
+  <text x="627" y="435" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">model_manager.rs</text>
+  <rect x="896" y="182" width="200" height="288" rx="12" fill="#1de9b6" fill-opacity="0.04" stroke="#1de9b6" stroke-opacity="0.4" stroke-width="1.5"/>
+  <circle cx="914" cy="201" r="4" fill="#1de9b6" opacity="0.9"/>
+  <text x="926" y="206" font-size="9" font-weight="700" letter-spacing="1.6" fill="#1de9b6" font-family="Inter, system-ui, -apple-system, sans-serif" style="text-transform:uppercase">PHILOTIC-CLIENT SDK</text>
+  <rect x="906" y="208" width="180" height="52" rx="7" fill="#161b2e" stroke="#1de9b6" stroke-width="1"/>
+  <circle cx="1076" cy="220" r="6" fill="#00e676" opacity="0.2"/>
+  <circle cx="1076" cy="220" r="3.5" fill="#00e676"/>
+  <text x="915" y="224" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">PhiloticClient</text>
+  <rect x="915" y="229" width="34.4" height="13" rx="3" fill="#00e676" fill-opacity="0.18" stroke="#00e676" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="920" y="238" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">DONE</text>
+  <text x="915" y="249" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">philotic-client crate</text>
+  <text x="908" y="284" font-size="8" fill="#4a5370" font-family="Inter, system-ui, -apple-system, sans-serif">Docs-only proposals pending:</text>
+  <text x="908" y="297" font-size="8" fill="#4a5370" font-family="Inter, system-ui, -apple-system, sans-serif">· agent-loop re-entry</text>
+  <text x="908" y="309" font-size="8" fill="#4a5370" font-family="Inter, system-ui, -apple-system, sans-serif">· forked sessions</text>
+  <text x="908" y="321" font-size="8" fill="#4a5370" font-family="Inter, system-ui, -apple-system, sans-serif">· slash commands</text>
+  <text x="908" y="333" font-size="8" fill="#4a5370" font-family="Inter, system-ui, -apple-system, sans-serif">· approval UX</text>
+  <rect x="608" y="482" width="488" height="248" rx="12" fill="#00e676" fill-opacity="0.04" stroke="#00e676" stroke-opacity="0.4" stroke-width="1.5"/>
+  <circle cx="626" cy="501" r="4" fill="#00e676" opacity="0.9"/>
+  <text x="638" y="506" font-size="9" font-weight="700" letter-spacing="1.6" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" style="text-transform:uppercase">GUEST OS PROCESSES</text>
+  <rect x="618" y="508" width="225" height="60" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
+  <circle cx="833" cy="520" r="6" fill="#00e676" opacity="0.2"/>
+  <circle cx="833" cy="520" r="3.5" fill="#00e676"/>
+  <text x="627" y="524" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Hegemon</text>
+  <rect x="627" y="529" width="34.4" height="13" rx="3" fill="#00e676" fill-opacity="0.18" stroke="#00e676" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="632" y="538" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">DONE</text>
+  <text x="627" y="549" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">hegemon-telegram-01</text>
+  <rect x="853" y="508" width="225" height="60" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
+  <circle cx="1068" cy="520" r="6" fill="#ffc107" opacity="0.2"/>
+  <circle cx="1068" cy="520" r="3.5" fill="#ffc107"/>
+  <text x="862" y="524" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Agent-Core</text>
+  <rect x="862" y="529" width="45.599999999999994" height="13" rx="3" fill="#ffc107" fill-opacity="0.18" stroke="#ffc107" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="867" y="538" font-size="7.5" font-weight="700" fill="#ffc107" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">ACTIVE</text>
+  <text x="862" y="549" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">agent-jane-01</text>
+  <rect x="618" y="580" width="225" height="60" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
+  <circle cx="833" cy="592" r="6" fill="#00e676" opacity="0.2"/>
+  <circle cx="833" cy="592" r="3.5" fill="#00e676"/>
+  <text x="627" y="596" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Model-Gemini</text>
+  <rect x="627" y="601" width="34.4" height="13" rx="3" fill="#00e676" fill-opacity="0.18" stroke="#00e676" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="632" y="610" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">DONE</text>
+  <text x="627" y="621" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">model-controller-gemini-01</text>
+  <rect x="853" y="580" width="225" height="60" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
+  <circle cx="1068" cy="592" r="6" fill="#00e676" opacity="0.2"/>
+  <circle cx="1068" cy="592" r="3.5" fill="#00e676"/>
+  <text x="862" y="596" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Model-ElevenLabs</text>
+  <rect x="862" y="601" width="34.4" height="13" rx="3" fill="#00e676" fill-opacity="0.18" stroke="#00e676" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="867" y="610" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">DONE</text>
+  <text x="862" y="621" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">model-controller-elevenlabs-01</text>
+  <rect x="618" y="652" width="225" height="60" rx="7" fill="#161b2e" stroke="#ff6d00" stroke-width="1"/>
+  <circle cx="833" cy="664" r="6" fill="#ff6d00" opacity="0.2"/>
+  <circle cx="833" cy="664" r="3.5" fill="#ff6d00"/>
+  <text x="627" y="668" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Tool-Runner</text>
+  <rect x="627" y="673" width="96.0" height="13" rx="3" fill="#ff6d00" fill-opacity="0.18" stroke="#ff6d00" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="632" y="682" font-size="7.5" font-weight="700" fill="#ff6d00" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">SEEDED/INACTIVE</text>
+  <text x="627" y="693" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">tool-runner  not spawned</text>
+  <rect x="1112" y="482" width="257" height="248" rx="12" fill="#f50057" fill-opacity="0.04" stroke="#f50057" stroke-opacity="0.4" stroke-width="1.5"/>
+  <circle cx="1130" cy="501" r="4" fill="#f50057" opacity="0.9"/>
+  <text x="1142" y="506" font-size="9" font-weight="700" letter-spacing="1.6" fill="#f50057" font-family="Inter, system-ui, -apple-system, sans-serif" style="text-transform:uppercase">PENDING PROPOSALS (DOCS ONLY)</text>
+  <rect x="1122" y="510" width="237" height="21" rx="4" fill="#111" stroke="#4a5370" stroke-width="0.8" stroke-opacity="0.6"/>
+  <circle cx="1133" cy="520" r="3" fill="#4a5370"/>
+  <text x="1143" y="524" font-size="9" fill="#8892b0" font-family="Inter, system-ui, -apple-system, sans-serif">Agent Incarnation Model</text>
+  <rect x="1122" y="537" width="237" height="21" rx="4" fill="#111" stroke="#4a5370" stroke-width="0.8" stroke-opacity="0.6"/>
+  <circle cx="1133" cy="547" r="3" fill="#4a5370"/>
+  <text x="1143" y="551" font-size="9" fill="#8892b0" font-family="Inter, system-ui, -apple-system, sans-serif">Forked Sessions</text>
+  <rect x="1122" y="564" width="237" height="21" rx="4" fill="#111" stroke="#4a5370" stroke-width="0.8" stroke-opacity="0.6"/>
+  <circle cx="1133" cy="574" r="3" fill="#4a5370"/>
+  <text x="1143" y="578" font-size="9" fill="#8892b0" font-family="Inter, system-ui, -apple-system, sans-serif">Voice Machine</text>
+  <rect x="1122" y="591" width="237" height="21" rx="4" fill="#111" stroke="#4a5370" stroke-width="0.8" stroke-opacity="0.6"/>
+  <circle cx="1133" cy="601" r="3" fill="#4a5370"/>
+  <text x="1143" y="605" font-size="9" fill="#8892b0" font-family="Inter, system-ui, -apple-system, sans-serif">Native Overlay VPN</text>
+  <rect x="1122" y="618" width="237" height="21" rx="4" fill="#111" stroke="#4a5370" stroke-width="0.8" stroke-opacity="0.6"/>
+  <circle cx="1133" cy="628" r="3" fill="#4a5370"/>
+  <text x="1143" y="632" font-size="9" fill="#8892b0" font-family="Inter, system-ui, -apple-system, sans-serif">Slash Commands</text>
+  <rect x="1122" y="645" width="237" height="21" rx="4" fill="#111" stroke="#4a5370" stroke-width="0.8" stroke-opacity="0.6"/>
+  <circle cx="1133" cy="655" r="3" fill="#4a5370"/>
+  <text x="1143" y="659" font-size="9" fill="#8892b0" font-family="Inter, system-ui, -apple-system, sans-serif">Tool Management Plane</text>
+  <rect x="1122" y="672" width="237" height="21" rx="4" fill="#111" stroke="#4a5370" stroke-width="0.8" stroke-opacity="0.6"/>
+  <circle cx="1133" cy="682" r="3" fill="#4a5370"/>
+  <text x="1143" y="686" font-size="9" fill="#8892b0" font-family="Inter, system-ui, -apple-system, sans-serif">Approval UX</text>
+  <rect x="1122" y="699" width="237" height="21" rx="4" fill="#111" stroke="#4a5370" stroke-width="0.8" stroke-opacity="0.6"/>
+  <circle cx="1133" cy="709" r="3" fill="#4a5370"/>
+  <text x="1143" y="713" font-size="9" fill="#8892b0" font-family="Inter, system-ui, -apple-system, sans-serif">Muninn Memory Protocol</text>
+  <rect x="20" y="806" width="1360" height="282" rx="12" fill="#d500f9" fill-opacity="0.04" stroke="#d500f9" stroke-opacity="0.45" stroke-width="1.5"/>
+  <circle cx="38" cy="825" r="4" fill="#d500f9" opacity="0.9"/>
+  <text x="50" y="830" font-size="9" font-weight="700" letter-spacing="1.6" fill="#d500f9" font-family="Inter, system-ui, -apple-system, sans-serif" style="text-transform:uppercase">THE PHILOTIC WEB — INTER-HOTEL MESH</text>
+  <rect x="36" y="836" width="312" height="230" rx="12" fill="#2979ff" fill-opacity="0.04" stroke="#2979ff" stroke-opacity="0.5" stroke-width="1.5"/>
+  <circle cx="54" cy="855" r="4" fill="#2979ff" opacity="0.9"/>
+  <text x="66" y="860" font-size="9" font-weight="700" letter-spacing="1.6" fill="#2979ff" font-family="Inter, system-ui, -apple-system, sans-serif" style="text-transform:uppercase">UDP CONTROL PLANE</text>
+  <rect x="46" y="862" width="292" height="40" rx="7" fill="#161b2e" stroke="#2979ff" stroke-width="1"/>
+  <circle cx="328" cy="874" r="6" fill="#00e676" opacity="0.2"/>
+  <circle cx="328" cy="874" r="3.5" fill="#00e676"/>
+  <text x="55" y="878" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Heartbeat</text>
+  <rect x="55" y="883" width="34.4" height="13" rx="3" fill="#00e676" fill-opacity="0.18" stroke="#00e676" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="60" y="892" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">DONE</text>
+  <text x="55" y="903" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">heartbeat.rs</text>
+  <rect x="46" y="912" width="292" height="40" rx="7" fill="#161b2e" stroke="#2979ff" stroke-width="1"/>
+  <circle cx="328" cy="924" r="6" fill="#00e676" opacity="0.2"/>
+  <circle cx="328" cy="924" r="3.5" fill="#00e676"/>
+  <text x="55" y="928" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Gossip / Peer Disc.</text>
+  <rect x="55" y="933" width="34.4" height="13" rx="3" fill="#00e676" fill-opacity="0.18" stroke="#00e676" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="60" y="942" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">DONE</text>
+  <text x="55" y="953" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">NodeRegistry update</text>
+  <rect x="46" y="962" width="292" height="40" rx="7" fill="#161b2e" stroke="#2979ff" stroke-width="1"/>
+  <circle cx="328" cy="974" r="6" fill="#00e676" opacity="0.2"/>
+  <circle cx="328" cy="974" r="3.5" fill="#00e676"/>
+  <text x="55" y="978" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Memory Op Routing</text>
+  <rect x="55" y="983" width="34.4" height="13" rx="3" fill="#00e676" fill-opacity="0.18" stroke="#00e676" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="60" y="992" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">DONE</text>
+  <text x="55" y="1003" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">MEMORY_OP BeaconMessage</text>
+  <rect x="46" y="1012" width="292" height="40" rx="7" fill="#111" stroke="#4a5370" stroke-width="1"/>
+  <circle cx="328" cy="1024" r="6" fill="#4a5370" opacity="0.2"/>
+  <circle cx="328" cy="1024" r="3.5" fill="#4a5370"/>
+  <text x="55" y="1028" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Scaling Monitor</text>
+  <rect x="55" y="1033" width="51.199999999999996" height="13" rx="3" fill="#4a5370" fill-opacity="0.18" stroke="#4a5370" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="60" y="1042" font-size="7.5" font-weight="700" fill="#4a5370" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">PLANNED</text>
+  <text x="55" y="1053" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">PORT-BP performance metrics</text>
+  <rect x="364" y="836" width="340" height="230" rx="12" fill="#00e5ff" fill-opacity="0.04" stroke="#00e5ff" stroke-opacity="0.5" stroke-width="1.5"/>
+  <circle cx="382" cy="855" r="4" fill="#00e5ff" opacity="0.9"/>
+  <text x="394" y="860" font-size="9" font-weight="700" letter-spacing="1.6" fill="#00e5ff" font-family="Inter, system-ui, -apple-system, sans-serif" style="text-transform:uppercase">TCP EXECUTION PLANE</text>
+  <rect x="374" y="862" width="320" height="40" rx="7" fill="#161b2e" stroke="#00e5ff" stroke-width="1"/>
+  <circle cx="684" cy="874" r="6" fill="#00e676" opacity="0.2"/>
+  <circle cx="684" cy="874" r="3.5" fill="#00e676"/>
+  <text x="383" y="878" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">EventLedger</text>
+  <rect x="383" y="883" width="34.4" height="13" rx="3" fill="#00e676" fill-opacity="0.18" stroke="#00e676" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="388" y="892" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">DONE</text>
+  <text x="383" y="903" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">durable at-least-once delivery</text>
+  <rect x="374" y="912" width="320" height="40" rx="7" fill="#161b2e" stroke="#00e5ff" stroke-width="1"/>
+  <circle cx="684" cy="924" r="6" fill="#00e676" opacity="0.2"/>
+  <circle cx="684" cy="924" r="3.5" fill="#00e676"/>
+  <text x="383" y="928" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">CursorTracker</text>
+  <rect x="383" y="933" width="34.4" height="13" rx="3" fill="#00e676" fill-opacity="0.18" stroke="#00e676" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="388" y="942" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">DONE</text>
+  <text x="383" y="953" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">mesh_cursors  advances post-commit*</text>
+  <rect x="374" y="962" width="320" height="40" rx="7" fill="#161b2e" stroke="#00e5ff" stroke-width="1"/>
+  <circle cx="684" cy="974" r="6" fill="#00e676" opacity="0.2"/>
+  <circle cx="684" cy="974" r="3.5" fill="#00e676"/>
+  <text x="383" y="978" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Event Batch / ACK</text>
+  <rect x="383" y="983" width="34.4" height="13" rx="3" fill="#00e676" fill-opacity="0.18" stroke="#00e676" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="388" y="992" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">DONE</text>
+  <text x="383" y="1003" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">smoke-remote-model-roundtrip</text>
+  <rect x="374" y="1012" width="320" height="40" rx="7" fill="#111" stroke="#4a5370" stroke-width="1"/>
+  <circle cx="684" cy="1024" r="6" fill="#4a5370" opacity="0.2"/>
+  <circle cx="684" cy="1024" r="3.5" fill="#4a5370"/>
+  <text x="383" y="1028" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Multi-Hotel Parity Tests</text>
+  <rect x="383" y="1033" width="51.199999999999996" height="13" rx="3" fill="#4a5370" fill-opacity="0.18" stroke="#4a5370" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="388" y="1042" font-size="7.5" font-weight="700" fill="#4a5370" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">PLANNED</text>
+  <text x="383" y="1053" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">PORT-BP-009  shadow mode</text>
+  <rect x="720" y="836" width="238" height="230" rx="12" fill="#1de9b6" fill-opacity="0.04" stroke="#1de9b6" stroke-opacity="0.5" stroke-width="1.5"/>
+  <circle cx="738" cy="855" r="4" fill="#1de9b6" opacity="0.9"/>
+  <text x="750" y="860" font-size="9" font-weight="700" letter-spacing="1.6" fill="#1de9b6" font-family="Inter, system-ui, -apple-system, sans-serif" style="text-transform:uppercase">WEBRTC EPHEMERAL PLANE</text>
+  <rect x="730" y="862" width="218" height="62" rx="7" fill="#161b2e" stroke="#1de9b6" stroke-width="1"/>
+  <circle cx="938" cy="874" r="6" fill="#ff6d00" opacity="0.2"/>
+  <circle cx="938" cy="874" r="3.5" fill="#ff6d00"/>
+  <text x="739" y="878" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">SDP Signaling</text>
+  <rect x="739" y="883" width="51.199999999999996" height="13" rx="3" fill="#ff6d00" fill-opacity="0.18" stroke="#ff6d00" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="744" y="892" font-size="7.5" font-weight="700" fill="#ff6d00" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">PARTIAL</text>
+  <text x="739" y="903" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">webrtc.rs  types present</text>
+  <rect x="730" y="938" width="218" height="62" rx="7" fill="#111" stroke="#4a5370" stroke-width="1"/>
+  <circle cx="938" cy="950" r="6" fill="#4a5370" opacity="0.2"/>
+  <circle cx="938" cy="950" r="3.5" fill="#4a5370"/>
+  <text x="739" y="954" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">P2P Data Channel</text>
+  <rect x="739" y="959" width="51.199999999999996" height="13" rx="3" fill="#4a5370" fill-opacity="0.18" stroke="#4a5370" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="744" y="968" font-size="7.5" font-weight="700" fill="#4a5370" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">PLANNED</text>
+  <text x="739" y="979" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">ICE / DTLS not yet wired</text>
+  <text x="730" y="1036" font-size="8" fill="#ff6d00" font-family="Inter, system-ui, -apple-system, sans-serif">PORT-BP-008  ICE lifecycle incomplete</text>
+  <rect x="974" y="836" width="188" height="230" rx="12" fill="#f50057" fill-opacity="0.04" stroke="#f50057" stroke-opacity="0.5" stroke-width="1.5"/>
+  <circle cx="992" cy="855" r="4" fill="#f50057" opacity="0.9"/>
+  <text x="1004" y="860" font-size="9" font-weight="700" letter-spacing="1.6" fill="#f50057" font-family="Inter, system-ui, -apple-system, sans-serif" style="text-transform:uppercase">REMOTE HOTEL NODE</text>
+  <rect x="984" y="862" width="168" height="58" rx="7" fill="#1a0010" stroke="#f50057" stroke-width="1"/>
+  <circle cx="1142" cy="874" r="6" fill="#00e676" opacity="0.2"/>
+  <circle cx="1142" cy="874" r="3.5" fill="#00e676"/>
+  <text x="993" y="878" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Ansible Daemon</text>
+  <rect x="993" y="883" width="62.4" height="13" rx="3" fill="#00e676" fill-opacity="0.18" stroke="#00e676" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="998" y="892" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">REACHABLE</text>
+  <text x="993" y="903" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">remote hotel</text>
+  <rect x="984" y="932" width="168" height="58" rx="7" fill="#1a0010" stroke="#f50057" stroke-width="1"/>
+  <circle cx="1142" cy="944" r="6" fill="#00e676" opacity="0.2"/>
+  <circle cx="1142" cy="944" r="3.5" fill="#00e676"/>
+  <text x="993" y="948" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Guest Processes</text>
+  <rect x="993" y="953" width="79.19999999999999" height="13" rx="3" fill="#00e676" fill-opacity="0.18" stroke="#00e676" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="998" y="962" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">MATERIALIZED</text>
+  <text x="993" y="973" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">peer node agents</text>
+  <text x="500" y="1092" font-size="9" fill="#4a5370" font-family="Inter, system-ui, -apple-system, sans-serif">philotic-stack  Implementation Status  2026-03-10</text></svg>
