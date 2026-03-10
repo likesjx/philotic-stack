@@ -519,7 +519,7 @@ fn guest_seed_for_profile(hotel_name: &str, profile: &AgentProfile) -> Vec<Guest
             guest_id: format!("{hotel_name}:hegemon-gateway-{}", profile.agent_key),
             role: "hegemon".into(),
             config_json: serde_json::json!({
-                "command": "target/debug/hegemon",
+                "command": "hegemon",
                 "args": [],
                 "env": {
                     "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
@@ -537,7 +537,7 @@ fn guest_seed_for_profile(hotel_name: &str, profile: &AgentProfile) -> Vec<Guest
             guest_id: format!("{hotel_name}:agent-core-{}", profile.agent_key),
             role: "agent".into(),
             config_json: serde_json::json!({
-                "command": "target/debug/agent-core",
+                "command": "agent-core",
                 "args": [],
                 "env": {
                     "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
@@ -552,7 +552,7 @@ fn guest_seed_for_profile(hotel_name: &str, profile: &AgentProfile) -> Vec<Guest
             hotel_name: hotel_name.to_string(),
             guest_id: format!("{hotel_name}:model-controller-gemini"),
             config_json: serde_json::json!({
-                "command": "target/debug/model-controller-gemini",
+                "command": "model-router",
                 "args": [],
                 "env": {
                     "PHILOTIC_HOTEL_SOCKET": socket_path.clone()
@@ -568,7 +568,7 @@ fn guest_seed_for_profile(hotel_name: &str, profile: &AgentProfile) -> Vec<Guest
             guest_id: format!("{hotel_name}:model-controller-elevenlabs"),
             role: "model.elevenlabs".into(),
             config_json: serde_json::json!({
-                "command": "target/debug/model-controller-elevenlabs",
+                "command": "model-router",
                 "args": [],
                 "env": {
                     "PHILOTIC_HOTEL_SOCKET": socket_path.clone()
@@ -583,14 +583,16 @@ fn guest_seed_for_profile(hotel_name: &str, profile: &AgentProfile) -> Vec<Guest
             guest_id: format!("{hotel_name}:tool-runner"),
             role: "tool".into(),
             config_json: serde_json::json!({
-                "command": "target/debug/tool-runner",
+                "command": "tool-runner",
                 "args": [],
                 "env": {
                     "PHILOTIC_HOTEL_SOCKET": socket_path
                 }
             })
             .to_string(),
-            is_active: true,
+            // Not yet implemented — marked inactive so the hotel skips spawn
+            // without a hard failure. Activate when tool-runner crate exists.
+            is_active: false,
             active_pid: None,
         },
     ]

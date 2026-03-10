@@ -36,6 +36,28 @@
 - [x] Add slash-command short-circuiting for deterministic agent/system commands before the normal model loop.
 - [x] Add approval interrupts with explicit history and a pre-approval runtime path.
 
+## New Project: Agent Loop Gap Closure
+
+- [ ] Review [AGENT_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/AGENT_LOOP_PROPOSAL.md).
+- [ ] Build real tool catalog with proper descriptions and schemas (Gap 3 — prerequisite for Gap 4).
+- [ ] Implement `preapproved_tools` and `preapproved_classes` evaluation in `approval_policy_allows` (Gap 4a).
+- [ ] Inject operator steering notes from `/approve`/`/deny` back into the model prompt (Gap 4b).
+- [ ] Add `working_tool_history` to `WorkingTurn` and implement multi-turn tool re-entry loop with iteration cap (Gap 1).
+- [ ] Add `MediaRoutingPolicy` to `AgentProfile` and make media action selection configurable per agent (Gap 2).
+
+## New Project: Agent Incarnation Model
+
+- [ ] Review [AGENT_INCARNATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/AGENT_INCARNATION_PROPOSAL.md).
+- [ ] Add `active_incarnation_id` to session records in the Context Graph.
+- [ ] Configure the conversational incarnation with a minimal default toolset (no heavy side-effecting tools by default).
+- [ ] Implement `HandoffToWorker` / `HandoffBack` IPC actions and worker materialization in the hotel.
+- [ ] Add `session_facts` apartment type and `UpdateMemory` IPC action with hotel-side safety enforcement.
+- [ ] Add Muninn tool surface (`memory.search`, `memory.store`) as hotel-mediated tools via a local invoker.
+- [ ] Implement `SpawnSubagent` IPC and subagent result routing back to the spawning incarnation.
+- [ ] Add `DelegateToPeer` IPC action and `known_peers` in session snapshot for inter-agent communication.
+- [ ] Add `/worker`, `/abandon`, `/worker status`, `/memory show`, `/memory reset` slash commands.
+- [ ] Define and implement worker incarnation idle TTL and reclaim policy.
+
 ## New Project: Philotic Agent Loop
 
 - [ ] Write a dedicated proposal for the Philotic loop architecture using Pi as the core turn-engine reference.
@@ -48,11 +70,11 @@
 ## New Project: Guest Binary Resolution
 
 - [ ] Review [GUEST_BINARY_RESOLUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GUEST_BINARY_RESOLUTION_PROPOSAL.md).
-- [ ] Replace hardcoded `target/debug/<name>` paths in `guest_seed_for_profile` with configurable absolute paths or binary names resolved via `PHILOTIC_BIN_DIR`.
-- [ ] Align seeded guest binary names with actual compiled binary names (`model-router` instead of `model-controller-gemini`/`model-controller-elevenlabs`).
-- [ ] Define the dev-mode vs deployed-mode binary resolution contract so the same seed logic works in both environments without shims.
-- [ ] Remove the `target/debug/` Ansible shim task once the Rust code is fixed.
-- [ ] Define placeholder policy for unimplemented guests (e.g. `tool-runner`) — skip or warn rather than fail spawn.
+- [x] Replace hardcoded `target/debug/<name>` paths in `guest_seed_for_profile` with configurable absolute paths or binary names resolved via `PHILOTIC_BIN_DIR`.
+- [x] Align seeded guest binary names with actual compiled binary names (`model-router` instead of `model-controller-gemini`/`model-controller-elevenlabs`).
+- [x] Define the dev-mode vs deployed-mode binary resolution contract so the same seed logic works in both environments without shims.
+- [x] Remove the `target/debug/` Ansible shim task once the Rust code is fixed.
+- [x] Define placeholder policy for unimplemented guests (e.g. `tool-runner`) — skip or warn rather than fail spawn.
 
 ## New Project: Red Hat Ansible / VPS Deployment Boundary
 

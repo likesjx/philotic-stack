@@ -16,6 +16,7 @@ WorkingDirectory={{ philotic_data_dir }}
 # Runtime environment
 Environment="RUST_LOG={{ philotic_rust_log }}"
 Environment="PATH={{ philotic_bin_dir }}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="PHILOTIC_BIN_DIR={{ philotic_bin_dir }}"
 Environment="PHILOTIC_HOTEL_SOCKET={{ philotic_hotel_socket }}"
 Environment="PHILOTIC_HOTEL_PORT={{ philotic_hotel_port }}"
 Environment="PHILOTIC_ENABLE_RUST_AUTH={{ philotic_enable_rust_auth }}"

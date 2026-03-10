@@ -66,7 +66,16 @@ impl Materializer for LocalProcessMaterializer {
         config_json: &serde_json::Value,
     ) -> Result<String> {
         if let Some(cmd) = config_json.get("command").and_then(|c| c.as_str()) {
-            let mut command = TokioCommand::new(cmd);
+            // Resolve binary path: if PHILOTIC_BIN_DIR is set and the command is not
+            // already absolute, prepend the bin dir. Falls back to PATH in dev mode.
+            let resolved_cmd = if std::path::Path::new(cmd).is_absolute() {
+                cmd.to_string()
+            } else if let Ok(bin_dir) = std::env::var("PHILOTIC_BIN_DIR") {
+                format!("{}/{}", bin_dir.trim_end_matches('/'), cmd)
+            } else {
+                cmd.to_string()
+            };
+            let mut command = TokioCommand::new(&resolved_cmd);
             if let Some(args) = config_json.get("args").and_then(|a| a.as_array()) {
                 for arg in args {
                     if let Some(s) = arg.as_str() {
