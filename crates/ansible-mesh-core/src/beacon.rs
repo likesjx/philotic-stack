@@ -52,6 +52,12 @@ impl BeaconDaemon {
     pub fn socket(&self) -> Arc<UdpSocket> {
         self.socket.clone()
     }
+    pub fn registry(&self) -> Arc<RwLock<NodeRegistry>> {
+        self.registry.clone()
+    }
+    pub fn inbox_tx(&self) -> mpsc::Sender<BeaconMessage> {
+        self.inbox_tx.clone()
+    }
     /// Run the daemon loop, receiving UDP packets and decoding them into `BeaconMessage` envelopes.
     pub async fn run_loop(&self) -> Result<()> {
         let mut buf = vec![0u8; 65535]; // Max UDP packet size
@@ -131,7 +137,11 @@ impl BeaconDaemon {
                         payload.capabilities.node_id, payload.capabilities.roles
                     );
                     let mut registry = self.registry.write().await;
-                    registry.update_node(payload.capabilities);
+                    registry.update_node(
+                        payload.capabilities,
+                        payload.advertisements,
+                        payload.execution_reachability,
+                    );
                 }
             }
             MsgType::MeshEventBatch | MsgType::MeshEventAck | MsgType::WebRtcSignal => {

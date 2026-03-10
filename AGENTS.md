@@ -269,7 +269,7 @@ Keep this lightweight. The process should improve continuously without becoming 
 
 ## 11. Repository-Specific Notes
 
-- `legacy-zeroclaw/` is reference material, not active implementation. Do not modify it unless explicitly asked.
+- The legacy ZeroClaw/OpenClaw reference clone has been removed from this repo. Consult the original `zeroclaw` repository separately if needed.
 - Prefer `rg` for file and text search.
 - Use `apply_patch` for manual file edits.
 - Keep architecture docs and task tracking current when decisions shift.

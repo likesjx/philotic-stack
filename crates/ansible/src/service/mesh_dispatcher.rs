@@ -1,24 +1,27 @@
+use ansible_mesh_core::registry::NodeRegistry;
+use ansible_mesh_core::storage::GraphStorage;
 use ansible_mesh_core::{BeaconMessage, MsgType, cursor::CursorTracker, ledger::EventLedger};
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::broadcast;
+use tokio::sync::{RwLock, broadcast};
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
+
+use crate::service::execution_transport::send_execution_message;
 
 /// Continuously polls the EventLedger and CursorTracker to dispatch durable
 /// mesh events over UDP to their target nodes.
 pub async fn outbound_dispatcher(
     ledger: Arc<EventLedger>,
     tracker: Arc<CursorTracker>,
-    udp_socket: Arc<UdpSocket>,
+    _udp_socket: Arc<UdpSocket>,
+    graph: Arc<dyn GraphStorage>,
+    registry: Arc<RwLock<NodeRegistry>>,
     local_node_id: String,
-    targets: Vec<(String, String)>, // (node_id, ip:port)
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
-    info!(
-        "Started Outbound Mesh Dispatcher Loop for {} targets.",
-        targets.len()
-    );
+    info!("Started Outbound Mesh Dispatcher Loop.");
 
     // Poll every 1 second
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
@@ -26,8 +29,15 @@ pub async fn outbound_dispatcher(
     loop {
         tokio::select! {
             _ = interval.tick() => {
+                let targets = match execution_targets(graph.as_ref(), &registry, &local_node_id).await {
+                    Ok(targets) => targets,
+                    Err(e) => {
+                        warn!("Failed to resolve execution targets: {}", e);
+                        continue;
+                    }
+                };
                 for (target_node_id, target_addr) in &targets {
-                    if let Err(e) = dispatch_for_target(&ledger, &tracker, &udp_socket, &local_node_id, target_node_id, target_addr).await {
+                    if let Err(e) = dispatch_for_target(&ledger, &tracker, &local_node_id, target_node_id, target_addr).await {
                         error!("Failed to dispatch to {}: {}", target_node_id, e);
                     }
                 }
@@ -40,10 +50,32 @@ pub async fn outbound_dispatcher(
     }
 }
 
+async fn execution_targets(
+    graph: &dyn GraphStorage,
+    registry: &Arc<RwLock<NodeRegistry>>,
+    local_node_id: &str,
+) -> Result<Vec<(String, String)>> {
+    let registry_guard = registry.read().await;
+    let mut targets = Vec::new();
+    for hotel in graph.list_hotels()? {
+        if hotel.capabilities.node_id == local_node_id {
+            continue;
+        }
+
+        let target_addr = registry_guard
+            .get_node(&hotel.capabilities.node_id)
+            .and_then(|status| status.execution_reachability.as_ref())
+            .map(|execution| format!("{}:{}", execution.host, execution.port))
+            .unwrap_or_else(|| format!("127.0.0.1:{}", hotel.execution_port));
+        targets.push((hotel.capabilities.node_id, target_addr));
+    }
+
+    Ok(targets)
+}
+
 async fn dispatch_for_target(
     ledger: &EventLedger,
     tracker: &CursorTracker,
-    socket: &UdpSocket,
     local_node_id: &str,
     target_node_id: &str,
     target_addr: &str,
@@ -73,10 +105,10 @@ async fn dispatch_for_target(
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_micros() as u64;
+            .as_secs();
         let msg = BeaconMessage {
             version: 1,
-            msg_id: uuid::Uuid::new_v4(),
+            msg_id: Uuid::new_v4(),
             src_node: local_node_id.to_string(),
             dest_node: target_node_id.to_string(),
             msg_type: MsgType::MeshEventBatch,
@@ -87,16 +119,19 @@ async fn dispatch_for_target(
             hmac: vec![], // Future authz implementation
         };
 
-        let packet_bytes = serde_json::to_vec(&msg)?;
-        match socket.send_to(&packet_bytes, target_addr).await {
-            Ok(bytes_sent) => {
+        match send_execution_message(target_addr, &msg).await {
+            Ok(()) => {
+                let bytes_sent = serde_json::to_vec(&msg)?.len();
                 debug!(
-                    "Dispatched Event {} (seq: {}) to {} ({} bytes)",
+                    "Dispatched Event {} (seq: {}) to {} over execution transport ({} bytes)",
                     event.event_id, event.seq, target_node_id, bytes_sent
                 );
             }
             Err(e) => {
-                warn!("Failed to send UDP packet to {}: {}", target_node_id, e);
+                warn!(
+                    "Failed to send execution packet to {} at {}: {}",
+                    target_node_id, target_addr, e
+                );
                 // Break out of the loop and try again next tick so we don't spam errors
                 break;
             }

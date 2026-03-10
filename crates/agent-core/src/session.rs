@@ -184,6 +184,29 @@ pub struct ToolAssembly {
     pub policy_annotations: std::collections::BTreeMap<String, ToolPolicyAnnotation>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ComponentExecutionRoute {
+    pub target_node: String,
+    pub target_role: String,
+    #[serde(default)]
+    pub incarnation_id: Option<String>,
+    #[serde(default)]
+    pub hotel_id: Option<String>,
+    #[serde(default)]
+    pub environment_id: Option<String>,
+    pub execution_mode: String,
+    #[serde(default = "default_route_availability")]
+    pub availability_state: String,
+    #[serde(default)]
+    pub selection_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ComponentRouteAssembly {
+    #[serde(default)]
+    pub execution_routes: std::collections::BTreeMap<String, ComponentExecutionRoute>,
+}
+
 fn default_route_availability() -> String {
     "live".into()
 }
@@ -205,6 +228,7 @@ pub struct SessionState {
     pub status: String,
     pub approval_policy: ApprovalPolicy,
     pub bindings: SessionBindings,
+    pub component_route_assembly: ComponentRouteAssembly,
     pub tool_assembly: ToolAssembly,
     pub recent_turns: Vec<TurnRecord>,
     pub active_turn: Option<WorkingTurn>,
@@ -221,6 +245,7 @@ impl SessionState {
             status: "active".into(),
             approval_policy: ApprovalPolicy::default(),
             tool_assembly: default_tool_assembly_for_bindings(&bindings),
+            component_route_assembly: ComponentRouteAssembly::default(),
             bindings,
             recent_turns: Vec::new(),
             active_turn: None,
@@ -393,6 +418,15 @@ impl SessionState {
                     None
                 }
             })
+    }
+
+    pub fn resolve_component_execution_route(
+        &self,
+        capability: &str,
+    ) -> Option<&ComponentExecutionRoute> {
+        self.component_route_assembly
+            .execution_routes
+            .get(capability)
     }
 
     pub fn component_route_summary(&self) -> Option<String> {
@@ -797,6 +831,7 @@ impl SessionState {
             "status": self.status,
             "approval_policy": self.approval_policy,
             "bindings": self.bindings,
+            "component_route_assembly": self.component_route_assembly,
             "tool_assembly": self.tool_assembly,
             "active_turn": active_turn,
             "recent_turns": self.recent_turns.iter().map(|turn| {
@@ -873,6 +908,11 @@ impl SessionState {
             .cloned()
             .and_then(|value| serde_json::from_value::<ToolAssembly>(value).ok())
             .unwrap_or_else(|| default_tool_assembly_for_bindings(&bindings));
+        let component_route_assembly = checkpoint
+            .get("component_route_assembly")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<ComponentRouteAssembly>(value).ok())
+            .unwrap_or_default();
 
         let recent_turns = checkpoint
             .get("recent_turns")
@@ -960,6 +1000,7 @@ impl SessionState {
             status,
             approval_policy,
             bindings,
+            component_route_assembly,
             tool_assembly,
             recent_turns,
             active_turn,
@@ -1375,9 +1416,10 @@ fn current_unix_ts() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApprovalPolicy, ComponentRouteBinding, SessionBindings, SessionState, TaskRunnerBaseConfig,
-        ToolRunnerIncarnationBinding, TransportReplyTargetBinding, WorkingTurn,
-        merge_session_index, session_checkpoint_memory_type,
+        ApprovalPolicy, ComponentExecutionRoute, ComponentRouteAssembly, ComponentRouteBinding,
+        SessionBindings, SessionState, TaskRunnerBaseConfig, ToolRunnerIncarnationBinding,
+        TransportReplyTargetBinding, WorkingTurn, merge_session_index,
+        session_checkpoint_memory_type,
     };
     use crate::r#loop::{ApprovalRequest, ToolCall, TurnPhase};
     use uuid::Uuid;
@@ -1408,7 +1450,41 @@ mod tests {
             checkpoint["active_turn"]["final_reply_guest_id"],
             "hegemon-telegram-01"
         );
+        assert!(checkpoint["component_route_assembly"].is_object());
         assert!(checkpoint["tool_assembly"].is_object());
+    }
+
+    #[test]
+    fn checkpoint_round_trip_preserves_component_route_assembly() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.component_route_assembly = ComponentRouteAssembly {
+            execution_routes: std::collections::BTreeMap::from([(
+                "text.generate".into(),
+                ComponentExecutionRoute {
+                    target_node: "aria-node".into(),
+                    target_role: "model.gemini".into(),
+                    incarnation_id: Some("aria-architect-hotel:model-controller-gemini".into()),
+                    hotel_id: Some("aria-architect-hotel".into()),
+                    environment_id: None,
+                    execution_mode: "capability".into(),
+                    availability_state: "live".into(),
+                    selection_reason: Some("remote_latency_capacity".into()),
+                },
+            )]),
+        };
+
+        let checkpoint = state.checkpoint_json();
+        let restored =
+            SessionState::from_checkpoint(&checkpoint).expect("checkpoint should restore");
+        let route = restored
+            .resolve_component_execution_route("text.generate")
+            .expect("component route should restore");
+        assert_eq!(route.target_node, "aria-node");
+        assert_eq!(
+            route.incarnation_id.as_deref(),
+            Some("aria-architect-hotel:model-controller-gemini")
+        );
     }
 
     #[test]

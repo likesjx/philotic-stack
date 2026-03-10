@@ -27,6 +27,7 @@ impl EventLedger {
                 seq INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_id TEXT NOT NULL UNIQUE,
                 source_node_id TEXT NOT NULL,
+                target_node_id TEXT,
                 source_agent_id TEXT NOT NULL,
                 target_agent_id TEXT,
                 kind TEXT NOT NULL,
@@ -40,6 +41,7 @@ impl EventLedger {
             )",
             [],
         )?;
+        let _ = conn.execute("ALTER TABLE mesh_events ADD COLUMN target_node_id TEXT", []);
         Ok(())
     }
 
@@ -55,15 +57,16 @@ impl EventLedger {
         let trace_json = serde_json::to_string(&env.trace).unwrap_or_else(|_| "[]".into());
 
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        match conn.execute(
             "INSERT INTO mesh_events (
-                event_id, source_node_id, source_agent_id, target_agent_id,
+                event_id, source_node_id, target_node_id, source_agent_id, target_agent_id,
                 kind, corr_id, attempt, created_at, expires_at,
                 payload_type, payload_json, trace_json
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 env.event_id.to_string(),
                 env.source_node_id,
+                env.target_node_id,
                 env.source_agent_id,
                 env.target_agent_id,
                 serde_json::to_string(&env.kind).unwrap().trim_matches('"'),
@@ -75,7 +78,21 @@ impl EventLedger {
                 payload_json,
                 trace_json
             ],
-        )?;
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ffi::ErrorCode::ConstraintViolation =>
+            {
+                let seq = conn.query_row(
+                    "SELECT seq FROM mesh_events WHERE event_id = ?1",
+                    params![env.event_id.to_string()],
+                    |row| row.get::<_, u64>(0),
+                )?;
+                env.seq = seq;
+                return Ok(seq);
+            }
+            Err(err) => return Err(err),
+        }
 
         let seq = conn.last_insert_rowid() as u64;
         env.seq = seq;
@@ -96,31 +113,28 @@ impl EventLedger {
     /// Fetch events that have a sequence number greater than the provided cursor.
     pub fn query_unacked_events(
         &self,
-        _target_node_id: &str,
+        target_node_id: &str,
         cursor_seq: u64,
         limit: u32,
     ) -> SqlResult<Vec<crate::event::EventEnvelope>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT 
-                seq, event_id, source_node_id, source_agent_id, target_agent_id,
+                seq, event_id, source_node_id, target_node_id, source_agent_id, target_agent_id,
                 kind, corr_id, attempt, created_at, expires_at,
                 payload_type, payload_json, trace_json 
              FROM mesh_events 
-             WHERE seq > ?1 
+             WHERE seq > ?1
+               AND (target_node_id IS NULL OR target_node_id = ?2)
              ORDER BY seq ASC 
-             LIMIT ?2",
+             LIMIT ?3",
         )?;
-
-        // Note: For now we ignore the target_node_id filter and assume a simplistic broadcast or single network route
-        // A true implementation would filter by routing destination if events are explicitly addressed per node.
-
-        let mut rows = stmt.query(params![cursor_seq, limit])?;
+        let mut rows = stmt.query(params![cursor_seq, target_node_id, limit])?;
         let mut events = Vec::new();
 
         while let Some(row) = rows.next()? {
-            let payload_type: String = row.get(10)?;
-            let payload_json: String = row.get(11)?;
+            let payload_type: String = row.get(11)?;
+            let payload_json: String = row.get(12)?;
 
             let payload0 = match payload_type.as_str() {
                 "inline" => crate::event::EventPayload::Inline { data: payload_json },
@@ -137,10 +151,10 @@ impl EventLedger {
                 _ => crate::event::EventPayload::Inline { data: payload_json }, // Fallback
             };
 
-            let trace_json: String = row.get(12)?;
+            let trace_json: String = row.get(13)?;
             let trace0: Vec<String> = serde_json::from_str(&trace_json).unwrap_or_else(|_| vec![]);
 
-            let kind_str: String = row.get(5)?;
+            let kind_str: String = row.get(6)?;
             // Add quotes to make it a valid JSON string for Enum deserialization
             let kind_json = format!("\"{}\"", kind_str);
             let kind0: crate::event::EventKind =
@@ -150,13 +164,14 @@ impl EventLedger {
                 seq: row.get(0)?,
                 event_id: uuid::Uuid::parse_str(&row.get::<_, String>(1)?).unwrap_or_default(),
                 source_node_id: row.get(2)?,
-                source_agent_id: row.get(3)?,
-                target_agent_id: row.get(4)?,
+                target_node_id: row.get(3)?,
+                source_agent_id: row.get(4)?,
+                target_agent_id: row.get(5)?,
                 kind: kind0,
-                corr_id: row.get(6)?,
-                attempt: row.get(7)?,
-                created_at: row.get(8)?,
-                expires_at: row.get(9)?,
+                corr_id: row.get(7)?,
+                attempt: row.get(8)?,
+                created_at: row.get(9)?,
+                expires_at: row.get(10)?,
                 payload: payload0,
                 trace: trace0,
             });

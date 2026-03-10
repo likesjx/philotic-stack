@@ -1,0 +1,13 @@
+{
+  "context_graph": {
+    "default_model": "{{ philotic_default_model | default('gemini-pro') }}"{% if vault_gemini_api_key is defined and vault_gemini_api_key %},
+    "gemini_api_key": "{{ vault_gemini_api_key }}"{% endif %}{% if vault_elevenlabs_api_key is defined and vault_elevenlabs_api_key %},
+    "elevenlabs_api_key": "{{ vault_elevenlabs_api_key }}"{% endif %}{% if vault_elevenlabs_voice_id is defined and vault_elevenlabs_voice_id %},
+    "elevenlabs_voice_id": "{{ vault_elevenlabs_voice_id }}"{% endif %}
+  },
+  "hotels": {
+    "{{ philotic_hotel_name }}": {
+      "agents": {{ philotic_agents | to_nice_json }}
+    }
+  }
+}

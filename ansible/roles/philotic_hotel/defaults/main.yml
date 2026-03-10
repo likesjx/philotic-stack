@@ -1,0 +1,48 @@
+---
+# Hotel identity
+philotic_hotel_name: "default"
+
+# Install paths
+philotic_install_dir: "/opt/philotic"
+philotic_bin_dir: "/opt/philotic/bin"
+philotic_etc_dir: "/opt/philotic/etc"
+philotic_data_dir: "/opt/philotic/data"
+philotic_blob_dir: "/opt/philotic/data/blob"
+
+# Service user (non-root)
+philotic_user: "philotic"
+philotic_group: "philotic"
+
+# Artifacts — binaries delivered from the control machine or a CI artifact store.
+# Set philotic_artifacts_dir to the directory containing pre-built Linux binaries.
+# Set philotic_artifacts_remote: true if the binaries are already on the target host
+# (e.g. built manually on the VPS for the first smoke).
+philotic_artifacts_dir: "{{ playbook_dir }}/../dist"
+philotic_artifacts_remote: false
+philotic_binaries:
+  - ansible
+  - hegemon
+  - agent-core
+  - model-router
+
+# Runtime ports
+philotic_beacon_port: 8999       # UDP — inter-hotel mesh
+philotic_blob_port: 9001         # TCP — blob HTTP store
+philotic_hotel_port: 9000        # IPC listen port
+
+# IPC socket (default; override to move out of /tmp for hardened deployments)
+philotic_hotel_socket: "/tmp/philotic-ansible.sock"
+
+# Mesh auth
+philotic_enable_rust_auth: "1"
+philotic_enable_rust_dispatcher: "1"
+philotic_enable_rust_task_lifecycle: "1"
+
+# Backbone peers — Tailscale MagicDNS names (transitional; will become explicit host:port when native VPN lands)
+philotic_backbone_peers: []
+
+# Agent config projected into mesh-config.json — defaults to empty (no guests)
+philotic_agents: {}
+
+# Log level
+philotic_rust_log: "info"

@@ -36,6 +36,28 @@
 - [x] Add slash-command short-circuiting for deterministic agent/system commands before the normal model loop.
 - [x] Add approval interrupts with explicit history and a pre-approval runtime path.
 
+## New Project: Agent Loop Gap Closure
+
+- [ ] Review [AGENT_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/AGENT_LOOP_PROPOSAL.md).
+- [ ] Build real tool catalog with proper descriptions and schemas (Gap 3 — prerequisite for Gap 4).
+- [ ] Implement `preapproved_tools` and `preapproved_classes` evaluation in `approval_policy_allows` (Gap 4a).
+- [ ] Inject operator steering notes from `/approve`/`/deny` back into the model prompt (Gap 4b).
+- [ ] Add `working_tool_history` to `WorkingTurn` and implement multi-turn tool re-entry loop with iteration cap (Gap 1).
+- [ ] Add `MediaRoutingPolicy` to `AgentProfile` and make media action selection configurable per agent (Gap 2).
+
+## New Project: Agent Incarnation Model
+
+- [ ] Review [AGENT_INCARNATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/AGENT_INCARNATION_PROPOSAL.md).
+- [ ] Add `active_incarnation_id` to session records in the Context Graph.
+- [ ] Configure the conversational incarnation with a minimal default toolset (no heavy side-effecting tools by default).
+- [ ] Implement `HandoffToWorker` / `HandoffBack` IPC actions and worker materialization in the hotel.
+- [ ] Add `session_facts` apartment type and `UpdateMemory` IPC action with hotel-side safety enforcement.
+- [ ] Add Muninn tool surface (`memory.search`, `memory.store`) as hotel-mediated tools via a local invoker.
+- [ ] Implement `SpawnSubagent` IPC and subagent result routing back to the spawning incarnation.
+- [ ] Add `DelegateToPeer` IPC action and `known_peers` in session snapshot for inter-agent communication.
+- [ ] Add `/worker`, `/abandon`, `/worker status`, `/memory show`, `/memory reset` slash commands.
+- [ ] Define and implement worker incarnation idle TTL and reclaim policy.
+
 ## New Project: Philotic Agent Loop
 
 - [ ] Write a dedicated proposal for the Philotic loop architecture using Pi as the core turn-engine reference.
@@ -44,6 +66,69 @@
 - [ ] Define the bounded execution loop and checkpoint boundaries.
 - [ ] Define approval interrupt/resume semantics.
 - [ ] Define loop event streaming and tracing payloads.
+
+## New Project: Guest Binary Resolution
+
+- [ ] Review [GUEST_BINARY_RESOLUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GUEST_BINARY_RESOLUTION_PROPOSAL.md).
+- [x] Replace hardcoded `target/debug/<name>` paths in `guest_seed_for_profile` with configurable absolute paths or binary names resolved via `PHILOTIC_BIN_DIR`.
+- [x] Align seeded guest binary names with actual compiled binary names (`model-router` instead of `model-controller-gemini`/`model-controller-elevenlabs`).
+- [x] Define the dev-mode vs deployed-mode binary resolution contract so the same seed logic works in both environments without shims.
+- [x] Remove the `target/debug/` Ansible shim task once the Rust code is fixed.
+- [x] Define placeholder policy for unimplemented guests (e.g. `tool-runner`) — skip or warn rather than fail spawn.
+
+## New Project: Red Hat Ansible / VPS Deployment Boundary
+
+- [x] Pin the architecture boundary between Red Hat Ansible as the outer deployment orchestrator and Philotic `ansible` as the inner hotel runtime authority.
+- [x] Define the first Linux/VPS deployment contract:
+  - host prerequisites
+  - filesystem layout
+  - service manager shape
+  - config/secrets inputs
+  - binary/artifact placement
+- [x] Define the first peer inventory/rendering contract for deployed hotels so cross-host mesh no longer depends on loopback assumptions.
+- [ ] Prove a first VPS deployment smoke for one hotel.
+- [ ] Prove a first multi-host or local-to-VPS two-hotel roundtrip.
+- [ ] Render and deploy `beacon-test-hotel` on `vps-jane` with a Beacon agent profile, VPS-local `import_workspace`, and hotel-scoped Telegram credentials so Beacon can be UATed on the VPS test stack.
+
+## New Project: Native Overlay / VPN
+
+- [x] Decide that Philotic should separate UDP control-plane gossip from point-to-point execution transport rather than treating one datagram path as the final carriage for all inter-hotel work.
+- [x] Capture the migration constraint that hotel identity must be independent of current host VPN reachability so Tailscale/WireGuard can be replaced without a routing-schema rewrite.
+- [ ] Define the first tower execution-transport contract:
+  - transport negotiation inputs
+  - reachability advertisement shape
+  - reliability / streaming expectations
+  - blob handoff boundary
+- [ ] Define the first application-layer trust contract for a future native overlay:
+  - hotel identity keys
+  - mutual authentication
+  - authorization
+  - rotation / revocation
+- [x] Add execution-plane reachability advertisement to the hotel capability registry.
+- [x] Implement the first point-to-point hotel execution transport for routed tasks.
+- [x] Move remote model/tool/task execution off raw UDP Beacon payload bodies.
+- [ ] Define NAT traversal / relay requirements explicitly before committing to a self-hosted overlay transport.
+
+## New Project: Inter-Hotel Routing And Placement
+
+- [x] Decide that inter-hotel routing should extend the same route contract already used for intra-hotel execution rather than creating a second remote-only routing abstraction.
+- [x] Decide that hotels must advertise capabilities plus live incarnations and remain authoritative for the incarnations they materialize.
+- [x] Decide that incarnation identity is hotel-scoped and deterministic: `<hotel_name>:<guest_id>`.
+- [x] Decide that unpinned remote routing should resolve by deterministic placement scoring rather than first-match or broadcast behavior.
+- [x] Close the first placement inputs for remote selection:
+  - latency
+  - available capacity / CPU headroom
+  - deterministic tiebreak by canonical incarnation id
+- [x] Define the first capability advertisement payload and hotel-side registry shape for hotel-scoped incarnations.
+- [x] Add heartbeat emission / refresh / TTL rules for the capability advertisement plane.
+- [ ] Extend current session/tool/model/hegemon route records so the shared routing schema carries remote-capable incarnation metadata consistently.
+- [x] Extend placement-based remote selection into model capability routing for `text.generate` and `media.analyze` while keeping hegemon reply delivery session-owned.
+- [x] Build the first live capability registry view across hotels.
+- [x] Implement the first placement-based remote selection for unpinned capability routes on tool fallback when no local runner is available.
+- [ ] Extend placement-based remote selection beyond the first tool/model fallback paths to broader routed component classes without breaking session-owned hegemon reply routing.
+- [ ] Move mesh ACK emission to a strict post-commit boundary.
+- [x] Replace routed execution over raw UDP with the first point-to-point execution channel for routed inter-hotel task traffic.
+- [ ] Add execution-plane transport negotiation so routing can choose among multiple point-to-point transports instead of assuming one TCP path.
 
 ## New Project: Model Controller
 
@@ -111,6 +196,16 @@
 - [x] Add a startup-driven Gemini OAuth smoke through the materialized model-controller guest.
 - [x] Add a hotel-startup Telegram controller smoke via `ansible --test telegram-roundtrip` using a local fake Telegram API.
 - [x] Extend the startup Telegram smoke so it simulates text, photo, and voice-note ingress and exercises fake-Gemini multimodal requests on top of blob-backed media transport.
+- [x] Prove watched-live Telegram text/photo/voice/document delivery through hegemon -> agent-core -> Gemini and normalize markdown-ish document MIME for Gemini media analysis.
+- [x] Make materialized Telegram/agent guests configurable enough for separate hotel/persona stacks (for example Jane vs Aria) instead of hardcoding one Jane-shaped membrane.
+- [x] Remove Jane/Aria-specific built-in hotel/agent profile selection from `ansible` startup so agent identity, persona naming, and guest targeting resolve from hotel config or generic hotel-derived fallback rather than persona-specific Rust tables.
+- [x] Make inter-hotel mesh dispatch node-aware by carrying `target_node_id`, discovering peer hotels from the Context Graph, and returning real mesh ACK packets for local multi-hotel development.
+- [x] Prove a first local two-hotel remote model smoke over the new TCP execution plane after remote model placement resolves through the live registry.
+- [ ] Seed `hotels.aria-architect-hotel.agents.aria.telegram.bot_token` in local `mesh-config.json` and run the first watched-live Aria hotel Telegram poller on its own bot token.
+- [ ] Tighten inter-hotel mesh reality gaps: preserve target guest specificity across hotels, move ACK emission to a true post-commit boundary, and replace loopback-only peer addressing with explicit host authority.
+- [x] Support `hotels.<hotel>.agents.<agent>.import_workspace` so startup can seed the selected agent identity bundle from a declared workspace path.
+- [ ] Make agent-level media routing policy configurable so text/media/voice decisions are owned by the agent/session profile instead of one hardcoded runtime branch.
+- [ ] Investigate splitting voice-note transcription/understanding toward ElevenLabs or another speech-specialized provider while keeping richer text reasoning in the agent/model loop.
 - [ ] Define hotel CLI OAuth UX:
   - browser launch
   - temporary localhost callback listener

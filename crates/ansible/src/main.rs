@@ -1,4 +1,6 @@
 use ansible_mesh_core::beacon::BeaconDaemon;
+use ansible_mesh_core::heartbeat::emit_heartbeat;
+use ansible_mesh_core::registry::{CapabilityAdvertisement, ExecutionReachability};
 use ansible_mesh_core::storage::{AgentIdentityRecord, GraphStorage, GuestRecord, HotelRecord};
 use ansible_mesh_core::{NodeCapabilities, NodeRole};
 use anyhow::{Context, Result};
@@ -213,6 +215,10 @@ fn startup_test_blob_base_url(hotel_name: &str) -> String {
     format!("http://127.0.0.1:{}", startup_test_blob_port(hotel_name))
 }
 
+fn hotel_execution_port(hotel_name: &str) -> u16 {
+    hotel_base_port(hotel_name) + 2
+}
+
 fn default_hotel_record(hotel_name: &str) -> HotelRecord {
     let safe_name = sanitize_hotel_name(hotel_name);
     let base_port = hotel_base_port(&safe_name);
@@ -228,23 +234,298 @@ fn default_hotel_record(hotel_name: &str) -> HotelRecord {
         },
         mesh_port: base_port,
         blob_port: base_port + 1,
+        execution_port: hotel_execution_port(&safe_name),
         ipc_socket_path: format!("/tmp/philotic-{safe_name}.sock"),
         active_pid: None,
     }
 }
 
-fn default_guest_seed(hotel_name: &str) -> Vec<GuestRecord> {
-    let socket_path = default_hotel_record(hotel_name).ipc_socket_path;
+fn mesh_targets_for_graph(
+    graph: &dyn GraphStorage,
+    local_node_id: &str,
+) -> Result<Vec<(String, String)>> {
+    Ok(graph
+        .list_hotels()?
+        .into_iter()
+        .filter(|hotel| hotel.capabilities.node_id != local_node_id)
+        .map(|hotel| {
+            (
+                hotel.capabilities.node_id,
+                format!("127.0.0.1:{}", hotel.mesh_port),
+            )
+        })
+        .collect())
+}
+
+fn mesh_target_addr_for_node(
+    graph: &dyn GraphStorage,
+    target_node_id: &str,
+) -> Result<Option<String>> {
+    Ok(graph
+        .list_hotels()?
+        .into_iter()
+        .find(|hotel| hotel.capabilities.node_id == target_node_id)
+        .map(|hotel| format!("127.0.0.1:{}", hotel.mesh_port)))
+}
+
+fn execution_reachability_for_hotel(
+    graph: &dyn GraphStorage,
+    hotel: &HotelRecord,
+) -> ExecutionReachability {
+    let host = graph
+        .get_config_value("execution_host")
+        .ok()
+        .flatten()
+        .and_then(|value| serde_json::from_str::<String>(&value).ok().or(Some(value)))
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "127.0.0.1".into());
+    let protocol = graph
+        .get_config_value("execution_protocol")
+        .ok()
+        .flatten()
+        .and_then(|value| serde_json::from_str::<String>(&value).ok().or(Some(value)))
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "tcp-framed-v1".into());
+
+    ExecutionReachability {
+        protocol,
+        host,
+        port: hotel.execution_port,
+    }
+}
+
+fn local_capability_advertisements(
+    graph: &dyn GraphStorage,
+    hotel: &HotelRecord,
+) -> Result<Vec<CapabilityAdvertisement>> {
+    let tool_runner_registry = graph
+        .get_config_value("tool_runner_registry")?
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    let tool_capabilities = tool_runner_registry
+        .into_iter()
+        .filter_map(|entry| {
+            Some((
+                entry.get("guest_id")?.as_str()?.to_string(),
+                entry
+                    .get("supported_tools")?
+                    .as_array()?
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+            ))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+
+    let mut advertisements = Vec::new();
+    for guest in graph.list_guests(&hotel.hotel_name, true)? {
+        let availability_state = if guest.active_pid.is_some() {
+            "live"
+        } else {
+            "materialization_required"
+        };
+        let selection_hint = if guest.active_pid.is_some() {
+            Some("local_live_preferred".into())
+        } else {
+            Some("local_materialization_required".into())
+        };
+
+        if guest.role == "tool" {
+            if let Some(supported_tools) = tool_capabilities.get(&guest.guest_id) {
+                for tool_name in supported_tools {
+                    advertisements.push(CapabilityAdvertisement {
+                        hotel_id: hotel.hotel_name.clone(),
+                        node_id: hotel.capabilities.node_id.clone(),
+                        incarnation_id: guest.guest_id.clone(),
+                        target_role: format!("tool.{tool_name}"),
+                        availability_state: availability_state.into(),
+                        selection_hint: selection_hint.clone(),
+                        latency_hint_ms: hotel.capabilities.constraints.latency_hint_ms,
+                        max_concurrent_jobs: hotel.capabilities.constraints.max_concurrent_jobs,
+                        active_jobs: 0,
+                        queue_depth: 0,
+                    });
+                }
+                continue;
+            }
+        }
+
+        advertisements.push(CapabilityAdvertisement {
+            hotel_id: hotel.hotel_name.clone(),
+            node_id: hotel.capabilities.node_id.clone(),
+            incarnation_id: guest.guest_id,
+            target_role: guest.role,
+            availability_state: availability_state.into(),
+            selection_hint: selection_hint.clone(),
+            latency_hint_ms: hotel.capabilities.constraints.latency_hint_ms,
+            max_concurrent_jobs: hotel.capabilities.constraints.max_concurrent_jobs,
+            active_jobs: 0,
+            queue_depth: 0,
+        });
+    }
+    Ok(advertisements)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentProfile {
+    agent_key: String,
+    agent_id: String,
+    persona_name: String,
+    import_workspace: Option<String>,
+}
+
+fn title_case_agent_name(agent_key: &str) -> String {
+    agent_key
+        .split(['-', '_'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn default_agent_key_for_hotel(hotel_name: &str) -> String {
+    hotel_name
+        .split('-')
+        .find(|part| !part.is_empty() && *part != "hotel" && *part != "test")
+        .unwrap_or(hotel_name)
+        .to_ascii_lowercase()
+}
+
+fn default_agent_profile_for_hotel(hotel_name: &str) -> AgentProfile {
+    let agent_key = default_agent_key_for_hotel(hotel_name);
+    AgentProfile {
+        agent_id: format!("agent-{}-01", agent_key),
+        persona_name: title_case_agent_name(&agent_key),
+        agent_key,
+        import_workspace: None,
+    }
+}
+
+fn hotel_object<'a>(
+    config_json: &'a serde_json::Value,
+    hotel_name: &str,
+) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
+    config_json
+        .as_object()?
+        .get("hotels")?
+        .as_object()?
+        .get(hotel_name)?
+        .as_object()
+}
+
+fn selected_agent_key_for_hotel(
+    hotel: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    let agents = hotel.get("agents")?.as_object()?;
+    if let Some(selected) = hotel.get("selected_agent").and_then(serde_json::Value::as_str) {
+        if agents.contains_key(selected) {
+            return Some(selected.to_string());
+        }
+    }
+    if agents.len() == 1 {
+        return agents.keys().next().cloned();
+    }
+    if agents.contains_key("default") {
+        return Some("default".into());
+    }
+    None
+}
+
+fn merged_agent_config(
+    config_json: &serde_json::Value,
+    hotel_name: &str,
+) -> Option<(String, serde_json::Map<String, serde_json::Value>)> {
+    let default_hotel = hotel_object(config_json, "default");
+    let selected_hotel = hotel_object(config_json, hotel_name);
+    let selected_key = selected_hotel
+        .and_then(selected_agent_key_for_hotel)
+        .or_else(|| default_hotel.and_then(selected_agent_key_for_hotel))?;
+    let mut merged = serde_json::Map::new();
+
+    for hotel in [default_hotel, selected_hotel] {
+        let Some(hotel) = hotel else {
+            continue;
+        };
+        let Some(agents) = hotel.get("agents").and_then(serde_json::Value::as_object) else {
+            continue;
+        };
+        if selected_key != "default" {
+            if let Some(default_agent) = agents.get("default").and_then(serde_json::Value::as_object)
+            {
+                merged.extend(default_agent.clone());
+            }
+        }
+        if let Some(agent) = agents
+            .get(&selected_key)
+            .and_then(serde_json::Value::as_object)
+        {
+            merged.extend(agent.clone());
+        }
+    }
+
+    Some((selected_key, merged))
+}
+
+fn agent_profile_from_config(config_json: &serde_json::Value, hotel_name: &str) -> Option<AgentProfile> {
+    let (selected_key, agent) = merged_agent_config(config_json, hotel_name)?;
+    let agent_key = if selected_key == "default" {
+        agent.get("agent_key")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| default_agent_key_for_hotel(hotel_name))
+    } else {
+        selected_key
+    };
+    let agent_id = agent
+        .get("agent_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("agent-{}-01", agent_key));
+    let persona_name = agent
+        .get("persona_name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| title_case_agent_name(&agent_key));
+    let import_workspace = agent
+        .get("import_workspace")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    Some(AgentProfile {
+        agent_key,
+        agent_id,
+        persona_name,
+        import_workspace,
+    })
+}
+
+fn guest_seed_for_profile(hotel_name: &str, profile: &AgentProfile) -> Vec<GuestRecord> {
+    let hotel = default_hotel_record(hotel_name);
+    let socket_path = hotel.ipc_socket_path;
+    let blob_base_url = format!("http://127.0.0.1:{}", hotel.blob_port);
     vec![
         GuestRecord {
             hotel_name: hotel_name.to_string(),
-            guest_id: format!("{hotel_name}:hegemon-gateway"),
+            guest_id: format!("{hotel_name}:hegemon-gateway-{}", profile.agent_key),
             role: "hegemon".into(),
             config_json: serde_json::json!({
-                "command": "target/debug/hegemon",
+                "command": "hegemon",
                 "args": [],
                 "env": {
-                    "PHILOTIC_HOTEL_SOCKET": socket_path.clone()
+                    "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
+                    "PHILOTIC_BLOB_BASE_URL": blob_base_url,
+                    "PHILOTIC_TARGET_AGENT_ID": profile.agent_id,
+                    "PHILOTIC_TELEGRAM_BOT_TOKEN_KEY": "telegram_bot_token"
                 }
             })
             .to_string(),
@@ -253,13 +534,14 @@ fn default_guest_seed(hotel_name: &str) -> Vec<GuestRecord> {
         },
         GuestRecord {
             hotel_name: hotel_name.to_string(),
-            guest_id: format!("{hotel_name}:agent-core-jane"),
+            guest_id: format!("{hotel_name}:agent-core-{}", profile.agent_key),
             role: "agent".into(),
             config_json: serde_json::json!({
-                "command": "target/debug/agent-core",
+                "command": "agent-core",
                 "args": [],
                 "env": {
-                    "PHILOTIC_HOTEL_SOCKET": socket_path.clone()
+                    "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
+                    "PHILOTIC_AGENT_ID": profile.agent_id
                 }
             })
             .to_string(),
@@ -270,7 +552,7 @@ fn default_guest_seed(hotel_name: &str) -> Vec<GuestRecord> {
             hotel_name: hotel_name.to_string(),
             guest_id: format!("{hotel_name}:model-controller-gemini"),
             config_json: serde_json::json!({
-                "command": "target/debug/model-controller-gemini",
+                "command": "model-router",
                 "args": [],
                 "env": {
                     "PHILOTIC_HOTEL_SOCKET": socket_path.clone()
@@ -286,7 +568,7 @@ fn default_guest_seed(hotel_name: &str) -> Vec<GuestRecord> {
             guest_id: format!("{hotel_name}:model-controller-elevenlabs"),
             role: "model.elevenlabs".into(),
             config_json: serde_json::json!({
-                "command": "target/debug/model-controller-elevenlabs",
+                "command": "model-router",
                 "args": [],
                 "env": {
                     "PHILOTIC_HOTEL_SOCKET": socket_path.clone()
@@ -301,17 +583,37 @@ fn default_guest_seed(hotel_name: &str) -> Vec<GuestRecord> {
             guest_id: format!("{hotel_name}:tool-runner"),
             role: "tool".into(),
             config_json: serde_json::json!({
-                "command": "target/debug/tool-runner",
+                "command": "tool-runner",
                 "args": [],
                 "env": {
                     "PHILOTIC_HOTEL_SOCKET": socket_path
                 }
             })
             .to_string(),
-            is_active: true,
+            // Not yet implemented — marked inactive so the hotel skips spawn
+            // without a hard failure. Activate when tool-runner crate exists.
+            is_active: false,
             active_pid: None,
         },
     ]
+}
+
+#[cfg(test)]
+fn default_guest_seed(hotel_name: &str) -> Vec<GuestRecord> {
+    guest_seed_for_profile(hotel_name, &default_agent_profile_for_hotel(hotel_name))
+}
+
+fn identity_bundle_from_workspace(source_agent: &str, workspace: &Path) -> serde_json::Value {
+    serde_json::json!({
+        "source_kind": "openclaw_workspace",
+        "source_agent": source_agent,
+        "workspace_path": workspace,
+        "soul_text": maybe_load_text(&workspace.join("SOUL.md")),
+        "identity_text": maybe_load_text(&workspace.join("IDENTITY.md")),
+        "user_context_text": maybe_load_text(&workspace.join("USER.md")),
+        "agents_text": maybe_load_text(&workspace.join("AGENTS.md")),
+        "memory_summary": maybe_load_text(&workspace.join("MEMORY.md")),
+    })
 }
 
 fn maybe_load_text(path: &Path) -> Option<String> {
@@ -323,24 +625,131 @@ fn maybe_load_text(path: &Path) -> Option<String> {
 
 fn extract_context_graph_entries(
     config_json: &serde_json::Value,
+    hotel_name: Option<&str>,
 ) -> Vec<(String, serde_json::Value)> {
     let Some(obj) = config_json.as_object() else {
         return Vec::new();
     };
 
+    let mut merged = serde_json::Map::new();
+
     if let Some(context_graph) = obj
         .get("context_graph")
         .and_then(serde_json::Value::as_object)
     {
-        return context_graph
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
+        merged.extend(context_graph.clone());
+    }
+
+    if let Some(hotels) = obj.get("hotels").and_then(serde_json::Value::as_object) {
+        if let Some(default_hotel) = hotels.get("default").and_then(serde_json::Value::as_object) {
+            merge_hotel_base_entries(&mut merged, default_hotel);
+        }
+
+        if let Some(hotel_name) = hotel_name {
+            if let Some(hotel) = hotels
+                .get(hotel_name)
+                .and_then(serde_json::Value::as_object)
+            {
+                merge_hotel_base_entries(&mut merged, hotel);
+            }
+        }
+    }
+
+    if let Some(hotel_name) = hotel_name {
+        if let Some((_, agent)) = merged_agent_config(config_json, hotel_name) {
+            merge_agent_entries(&mut merged, &agent);
+        }
+    }
+
+    if !merged.is_empty() {
+        return merged.into_iter().collect();
     }
 
     obj.iter()
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect()
+}
+
+fn merge_hotel_base_entries(
+    merged: &mut serde_json::Map<String, serde_json::Value>,
+    hotel: &serde_json::Map<String, serde_json::Value>,
+) {
+    if let Some(context_graph) = hotel
+        .get("context_graph")
+        .and_then(serde_json::Value::as_object)
+    {
+        merged.extend(context_graph.clone());
+    }
+
+    if let Some(telegram) = hotel.get("telegram").and_then(serde_json::Value::as_object) {
+        merge_telegram_entries(merged, telegram);
+    }
+}
+
+fn merge_agent_entries(
+    merged: &mut serde_json::Map<String, serde_json::Value>,
+    agent: &serde_json::Map<String, serde_json::Value>,
+) {
+    if let Some(context_graph) = agent
+        .get("context_graph")
+        .and_then(serde_json::Value::as_object)
+    {
+        merged.extend(context_graph.clone());
+    }
+
+    if let Some(telegram) = agent.get("telegram").and_then(serde_json::Value::as_object) {
+        merge_telegram_entries(merged, telegram);
+    }
+
+    if let Some(model) = agent.get("model").and_then(serde_json::Value::as_object) {
+        if let Some(default_model) = model.get("default_model") {
+            merged.insert("default_model".into(), default_model.clone());
+        }
+    }
+}
+
+fn merge_telegram_entries(
+    merged: &mut serde_json::Map<String, serde_json::Value>,
+    telegram: &serde_json::Map<String, serde_json::Value>,
+) {
+    if let Some(bot_token) = telegram.get("bot_token") {
+        merged.insert("telegram_bot_token".into(), bot_token.clone());
+    }
+    if let Some(allowed_users) = telegram.get("allowed_users") {
+        merged.insert("telegram_allowed_users".into(), allowed_users.clone());
+    }
+}
+
+#[cfg(test)]
+fn configured_agent_identity_from_config(
+    config_json: &serde_json::Value,
+    hotel_name: &str,
+) -> Option<AgentIdentityRecord> {
+    let profile = agent_profile_from_config(config_json, hotel_name)?;
+    let import_workspace = profile.import_workspace.as_deref()?;
+    if import_workspace.is_empty() {
+        return None;
+    }
+
+    Some(AgentIdentityRecord {
+        agent_id: profile.agent_id,
+        persona_name: profile.persona_name,
+        bundle_json: identity_bundle_from_workspace(&profile.agent_key, Path::new(import_workspace)),
+    })
+}
+
+fn agent_identity_record_for_profile(profile: &AgentProfile) -> AgentIdentityRecord {
+    let bundle_json = profile
+        .import_workspace
+        .as_deref()
+        .map(|workspace| identity_bundle_from_workspace(&profile.agent_key, Path::new(workspace)))
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    AgentIdentityRecord {
+        agent_id: profile.agent_id.clone(),
+        persona_name: profile.persona_name.clone(),
+        bundle_json,
+    }
 }
 
 fn enable_guest_test_overrides(
@@ -489,8 +898,7 @@ fn enable_guest_test_overrides(
 }
 
 fn startup_test_gemini_base_url(hotel_name: &str) -> String {
-    let port = hotel_base_port(hotel_name).saturating_add(2);
-    format!("http://127.0.0.1:{port}")
+    startup_test_gemini_api_base_url(hotel_name)
 }
 
 #[derive(Clone)]
@@ -502,12 +910,9 @@ fn spawn_fake_gemini_server(
     hotel_name: &str,
     expected_reply: String,
 ) -> tokio::task::JoinHandle<()> {
-    let bind_addr: SocketAddr = format!(
-        "127.0.0.1:{}",
-        hotel_base_port(hotel_name).saturating_add(2)
-    )
-    .parse()
-    .expect("startup fake Gemini socket address should parse");
+    let bind_addr: SocketAddr = format!("127.0.0.1:{}", startup_test_gemini_port(hotel_name))
+        .parse()
+        .expect("startup fake Gemini socket address should parse");
 
     let app = Router::new()
         .fallback(any(fake_gemini_handler))
@@ -1419,24 +1824,6 @@ fn assert_fake_gemini_media_request(
     Ok(())
 }
 
-fn vps_jane_identity_bundle() -> serde_json::Value {
-    let Some(home) = std::env::var_os("HOME") else {
-        return serde_json::json!({});
-    };
-    let workspace = Path::new(&home).join(".openclaw/workspace-vps-jane");
-
-    serde_json::json!({
-        "source_kind": "openclaw_workspace",
-        "source_agent": "vps-jane",
-        "workspace_path": workspace,
-        "soul_text": maybe_load_text(&workspace.join("SOUL.md")),
-        "identity_text": maybe_load_text(&workspace.join("IDENTITY.md")),
-        "user_context_text": maybe_load_text(&workspace.join("USER.md")),
-        "agents_text": maybe_load_text(&workspace.join("AGENTS.md")),
-        "memory_summary": maybe_load_text(&workspace.join("MEMORY.md")),
-    })
-}
-
 fn pid_exists(pid: u32) -> bool {
     std::process::Command::new("ps")
         .arg("-p")
@@ -1533,7 +1920,10 @@ async fn main() -> Result<()> {
     let db_path = Path::new("ansible_context.db");
     let graph_storage = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open(db_path)?;
 
+    let hotel_name = args.hotel.clone();
+
     // Handle Config Loading if requested
+    let mut effective_agent_profile = None;
     if let Some(config_path) = args.load_config {
         info!(
             "Loading configuration from '{}' into the Context Graph...",
@@ -1542,8 +1932,11 @@ async fn main() -> Result<()> {
         let config_data = fs::read_to_string(&config_path).context("Failed to read config file")?;
         let config_json: serde_json::Value =
             serde_json::from_str(&config_data).context("Invalid JSON config file")?;
+        if let Some(hotel_name) = hotel_name.as_deref() {
+            effective_agent_profile = agent_profile_from_config(&config_json, hotel_name);
+        }
 
-        let entries = extract_context_graph_entries(&config_json);
+        let entries = extract_context_graph_entries(&config_json, hotel_name.as_deref());
 
         if !entries.is_empty() {
             let mut count = 0;
@@ -1567,10 +1960,10 @@ async fn main() -> Result<()> {
         }
     }
 
-    let hotel_name = args
-        .hotel
-        .clone()
-        .context("--hotel is required unless using a subcommand such as `auth`")?;
+    let hotel_name =
+        hotel_name.context("--hotel is required unless using a subcommand such as `auth`")?;
+    let effective_agent_profile = effective_agent_profile
+        .unwrap_or_else(|| default_agent_profile_for_hotel(&hotel_name));
     let startup_test = args.test;
     let mut hotel = match graph_storage.get_hotel(&hotel_name)? {
         Some(hotel) => hotel,
@@ -1581,7 +1974,7 @@ async fn main() -> Result<()> {
             );
             let hotel = default_hotel_record(&hotel_name);
             graph_storage.upsert_hotel(&hotel)?;
-            let guests = default_guest_seed(&hotel_name);
+            let guests = guest_seed_for_profile(&hotel_name, &effective_agent_profile);
             graph_storage.seed_guests(&hotel_name, &guests)?;
             hotel
         }
@@ -1592,13 +1985,15 @@ async fn main() -> Result<()> {
         enable_guest_test_overrides(&graph_storage, &hotel_name, test)?;
     }
 
+    let effective_identity = agent_identity_record_for_profile(&effective_agent_profile);
     graph_storage
-        .upsert_agent_identity(&AgentIdentityRecord {
-            agent_id: "agent-jane-01".into(),
-            persona_name: "Jane".into(),
-            bundle_json: vps_jane_identity_bundle(),
-        })
-        .context("Failed to seed default agent identity bundle")?;
+        .upsert_agent_identity(&effective_identity)
+        .with_context(|| {
+            format!(
+                "Failed to seed effective agent identity bundle for {}",
+                effective_identity.agent_id
+            )
+        })?;
 
     if let Some(active_pid) = hotel.active_pid.as_deref() {
         if let Ok(pid) = active_pid.parse::<u32>() {
@@ -1639,6 +2034,7 @@ async fn main() -> Result<()> {
 
         let ipc_server = IpcServer::new(
             hotel.ipc_socket_path.clone(),
+            caps.node_id.clone(),
             dispatcher_tx,
             graph_arc.clone(),
         );
@@ -1687,6 +2083,8 @@ async fn main() -> Result<()> {
 
     // Spawning the "Hotel Front Desk" local IPC listener for Materialized Guests
     let socket_path = hotel.ipc_socket_path.clone();
+    let execution_addr = format!("0.0.0.0:{}", hotel.execution_port);
+    let execution_enable_rust_auth = flags.enable_rust_auth;
 
     // Create the memory channel dispatcher for PORT-BP-003 to pick up
     // In PORT-BP-003, this receiver will hand off to the persistent mesh_events ledger
@@ -1784,11 +2182,37 @@ async fn main() -> Result<()> {
         });
     }
 
-    let ipc_server = IpcServer::new(socket_path, dispatcher_tx.clone(), graph_arc.clone());
+    let ipc_server = IpcServer::new(
+        socket_path,
+        caps.node_id.clone(),
+        dispatcher_tx.clone(),
+        graph_arc.clone(),
+    )
+    .with_registry(daemon.registry());
+    let ipc_inboxes = ipc_server.inboxes();
 
     tokio::spawn(async move {
         if let Err(e) = ipc_server.run().await {
             error!("Hotel Front Desk (UDS) failed: {}", e);
+        }
+    });
+
+    let execution_inbox_tx = daemon.inbox_tx().clone();
+    let execution_caps = caps.clone();
+    let execution_db_path = db_path.to_string_lossy().to_string();
+    let execution_psk = mesh_psk.clone();
+    tokio::spawn(async move {
+        if let Err(e) = crate::service::execution_transport::serve_execution_plane(
+            &execution_addr,
+            execution_caps,
+            execution_inbox_tx,
+            &execution_psk,
+            &execution_db_path,
+            execution_enable_rust_auth,
+        )
+        .await
+        {
+            error!("Hotel execution transport failed: {}", e);
         }
     });
 
@@ -1851,19 +2275,72 @@ async fn main() -> Result<()> {
         let dispatcher_ledger = ledger.clone();
         let dispatcher_tracker = tracker.clone();
         let dispatcher_socket = daemon.socket();
-        // MVP: Hardcode target for now or leave generic for extension
-        let targets = vec![("central-hotel".to_string(), "127.0.0.1:9099".to_string())];
+        let dispatcher_graph = graph_arc.clone();
+        let dispatcher_registry = daemon.registry();
 
         let rx_dispatch = shutdown_rx.resubscribe();
         tokio::spawn(crate::service::mesh_dispatcher::outbound_dispatcher(
             dispatcher_ledger,
             dispatcher_tracker,
             dispatcher_socket,
+            dispatcher_graph,
+            dispatcher_registry,
             caps.node_id.clone(),
-            targets,
             rx_dispatch,
         ));
     }
+
+    let heartbeat_socket = daemon.socket().clone();
+    let heartbeat_graph = graph_arc.clone();
+    let heartbeat_hotel = hotel.clone();
+    let heartbeat_caps = caps.clone();
+    let mut heartbeat_shutdown = shutdown_rx.resubscribe();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let targets = match mesh_targets_for_graph(heartbeat_graph.as_ref(), &heartbeat_caps.node_id) {
+                        Ok(targets) => targets,
+                        Err(err) => {
+                            warn!("Failed to resolve mesh heartbeat targets: {}", err);
+                            continue;
+                        }
+                    };
+                    if targets.is_empty() {
+                        continue;
+                    }
+                    let advertisements = match local_capability_advertisements(heartbeat_graph.as_ref(), &heartbeat_hotel) {
+                        Ok(advertisements) => advertisements,
+                        Err(err) => {
+                            warn!("Failed to build local capability advertisements: {}", err);
+                            continue;
+                        }
+                    };
+                    let execution_reachability =
+                        execution_reachability_for_hotel(heartbeat_graph.as_ref(), &heartbeat_hotel);
+                    for (_target_node_id, target_addr) in targets {
+                        let Ok(target) = target_addr.parse::<SocketAddr>() else {
+                            warn!("Skipping invalid heartbeat target address {}", target_addr);
+                            continue;
+                        };
+                        if let Err(err) = emit_heartbeat(
+                            &heartbeat_socket,
+                            target,
+                            &heartbeat_caps,
+                            &advertisements,
+                            Some(execution_reachability.clone()),
+                        )
+                        .await
+                        {
+                            warn!("Failed to emit heartbeat to {}: {}", target_addr, err);
+                        }
+                    }
+                }
+                _ = heartbeat_shutdown.recv() => break,
+            }
+        }
+    });
 
     // PORT-BP-005: Large Payload Transport via Dedicated HTTP Server
     let blob_port = hotel.blob_port;
@@ -1882,6 +2359,11 @@ async fn main() -> Result<()> {
     // PORT-BP-004: Async Mesh Inbound Router
     // Receives BeaconMessages from the UDP socket and forwards them to the single DB writer thread
     let dispatcher_inbound_tx = dispatcher_tx.clone();
+    let inbound_socket = daemon.socket().clone();
+    let inbound_graph = graph_arc.clone();
+    let inbound_inboxes = ipc_inboxes.clone();
+    let inbound_local_node_id = caps.node_id.clone();
+    let mesh_auth_inbound = ansible_mesh_core::authz::MeshAuth::new(&mesh_psk);
     tokio::spawn(async move {
         while let Some(msg) = inbox_rx.recv().await {
             match msg.msg_type {
@@ -1889,6 +2371,9 @@ async fn main() -> Result<()> {
                     if let Ok(events) = serde_json::from_slice::<Vec<EventEnvelope>>(&msg.payload) {
                         if !events.is_empty() {
                             let max_seq = events.iter().map(|e| e.seq).max().unwrap_or(0);
+                            for event in &events {
+                                IpcServer::deliver_event_envelope(&inbound_inboxes, event).await;
+                            }
                             let _ = dispatcher_inbound_tx
                                 .send(LedgerCommand::CommitInboundBatch {
                                     events,
@@ -1896,11 +2381,56 @@ async fn main() -> Result<()> {
                                 })
                                 .await; // The DB writer pushes this durably to the Inbox
 
-                            // ACK immediately per idempotent design
-                            let _ack_payload =
+                            let ack_payload =
                                 serde_json::json!({ "acked_seq": max_seq }).to_string();
-                            // In a real scenario, this ACK would be enqueued back out to the remote node.
-                            // For MVP, if we had a socket handle here, we'd fire an ACK UDP packet back.
+                            if let Some(target_addr) =
+                                mesh_target_addr_for_node(inbound_graph.as_ref(), &msg.src_node)
+                                    .ok()
+                                    .flatten()
+                            {
+                                let msg_id = uuid::Uuid::new_v4();
+                                let seq = 0;
+                                let timestamp = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                let payload = ack_payload.into_bytes();
+                                let hmac = mesh_auth_inbound
+                                    .sign(&msg_id, seq as u64, &payload, timestamp);
+                                let ack = ansible_mesh_core::BeaconMessage {
+                                    version: 1,
+                                    msg_id,
+                                    src_node: inbound_local_node_id.clone(),
+                                    dest_node: msg.src_node.clone(),
+                                    msg_type: ansible_mesh_core::MsgType::MeshEventAck,
+                                    seq,
+                                    total: 1,
+                                    payload,
+                                    timestamp,
+                                    hmac,
+                                };
+                                match serde_json::to_vec(&ack) {
+                                    Ok(packet) => {
+                                        if let Err(err) =
+                                            inbound_socket.send_to(&packet, &target_addr).await
+                                        {
+                                            warn!(
+                                                "Failed to return mesh ACK to {} at {}: {}",
+                                                msg.src_node, target_addr, err
+                                            );
+                                        }
+                                    }
+                                    Err(err) => warn!(
+                                        "Failed to serialize mesh ACK for {}: {}",
+                                        msg.src_node, err
+                                    ),
+                                }
+                            } else {
+                                warn!(
+                                    "No mesh target address found for ACK destination {}",
+                                    msg.src_node
+                                );
+                            }
                         }
                     }
                 }
@@ -1995,82 +2525,6 @@ async fn main() -> Result<()> {
         }
     });
 
-    // PORT-BP-004: Async Mesh Outbound Dispatcher Loop
-    // Polls unacked events and packages them into UDP batches over the WireGuard interface
-    let db_path_dispatcher = db_path.to_owned();
-    let socket_dispatcher = daemon.socket().clone();
-    let local_node_id_dispatcher = local_node_id.clone();
-    let mesh_auth_dispatcher = ansible_mesh_core::authz::MeshAuth::new(&mesh_psk);
-
-    if flags.enable_rust_dispatcher {
-        tokio::spawn(async move {
-            let ledger = match ansible_mesh_core::ledger::EventLedger::open(&db_path_dispatcher) {
-                Ok(l) => l,
-                Err(_) => return,
-            };
-            let tracker = match ansible_mesh_core::cursor::CursorTracker::open(&db_path_dispatcher)
-            {
-                Ok(t) => t,
-                Err(_) => return,
-            };
-
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
-            loop {
-                interval.tick().await;
-
-                // For MVP: Target node is remote-ansible-02
-                let target_node = "remote-ansible-02";
-                let cursor = tracker.get_cursor(target_node).unwrap_or(0);
-
-                if let Ok(events) = ledger.query_unacked_events(target_node, cursor, 50) {
-                    if !events.is_empty() {
-                        // trace!("Dispatcher pushing {} unacked events to {}", events.len(), target_node);
-
-                        if let Ok(payload_bytes) = serde_json::to_vec(&events) {
-                            let msg_id = uuid::Uuid::new_v4();
-                            let seq = 0;
-                            let timestamp = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
-
-                            let hmac = mesh_auth_dispatcher.sign(
-                                &msg_id,
-                                seq as u64,
-                                &payload_bytes,
-                                timestamp,
-                            );
-
-                            let msg = ansible_mesh_core::BeaconMessage {
-                                version: 1,
-                                msg_id,
-                                src_node: local_node_id_dispatcher.clone(),
-                                dest_node: target_node.to_string(),
-                                msg_type: ansible_mesh_core::MsgType::MeshEventBatch,
-                                seq,
-                                total: 1,
-                                timestamp,
-                                payload: payload_bytes,
-                                hmac,
-                            };
-
-                            // UDP MTU is ~1420 bytes. For MVP, assuming the batch fits.
-                            // For larger payloads, PORT_BLUEPRINT requires attachment by reference TCP.
-                            if let Ok(packet) = serde_json::to_vec(&msg) {
-                                let target_addr = "127.0.0.1:8999";
-                                if let Err(e) =
-                                    socket_dispatcher.send_to(&packet, target_addr).await
-                                {
-                                    tracing::error!("UDP send failed: {}", e);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        });
-    }
-
     tokio::select! {
         res = daemon.run_loop() => {
             if let Err(e) = res {
@@ -2095,8 +2549,10 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        StartupTest, default_guest_seed, default_hotel_record, enable_guest_test_overrides,
-        extract_context_graph_entries, guest_supervision_enabled, hotel_base_port,
+        AgentProfile, StartupTest, agent_profile_from_config, default_agent_profile_for_hotel,
+        default_guest_seed, default_hotel_record, enable_guest_test_overrides,
+        execution_reachability_for_hotel, extract_context_graph_entries, guest_seed_for_profile,
+        guest_supervision_enabled, hotel_base_port, local_capability_advertisements,
         startup_test_gemini_base_url,
     };
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
@@ -2118,6 +2574,7 @@ mod tests {
         assert_eq!(hotel.ipc_socket_path, "/tmp/philotic-alpha-hotel.sock");
         assert_eq!(hotel.mesh_port, hotel_base_port("alpha-hotel"));
         assert_eq!(hotel.blob_port, hotel.mesh_port + 1);
+        assert_eq!(hotel.execution_port, hotel.mesh_port + 2);
     }
 
     #[test]
@@ -2133,23 +2590,245 @@ mod tests {
         assert!(guests.iter().any(|guest| guest.role == "model.gemini"));
         assert!(guests.iter().any(|guest| guest.role == "model.elevenlabs"));
         assert!(guests.iter().any(|guest| guest.role == "tool"));
+        assert_eq!(
+            config["env"]["PHILOTIC_TARGET_AGENT_ID"].as_str(),
+            Some("agent-beta-01")
+        );
+        assert_eq!(
+            config["env"]["PHILOTIC_TELEGRAM_BOT_TOKEN_KEY"].as_str(),
+            Some("telegram_bot_token")
+        );
+    }
+
+    #[test]
+    fn guest_seed_for_profile_targets_profile_agent_and_token_key() {
+        let guests = guest_seed_for_profile(
+            "beacon-test-hotel",
+            &AgentProfile {
+                agent_key: "beacon".into(),
+                agent_id: "agent-beacon-01".into(),
+                persona_name: "Beacon".into(),
+                import_workspace: None,
+            },
+        );
+        let hegemon: serde_json::Value =
+            serde_json::from_str(&guests[0].config_json).expect("hegemon config");
+        let agent: serde_json::Value =
+            serde_json::from_str(&guests[1].config_json).expect("agent config");
+
+        assert_eq!(
+            hegemon["env"]["PHILOTIC_TARGET_AGENT_ID"].as_str(),
+            Some("agent-beacon-01")
+        );
+        assert_eq!(
+            hegemon["env"]["PHILOTIC_TELEGRAM_BOT_TOKEN_KEY"].as_str(),
+            Some("telegram_bot_token")
+        );
+        assert_eq!(
+            agent["env"]["PHILOTIC_AGENT_ID"].as_str(),
+            Some("agent-beacon-01")
+        );
+        assert!(guests[0].guest_id.contains("beacon"));
+        assert!(guests[1].guest_id.contains("beacon"));
+    }
+
+    #[test]
+    fn local_capability_advertisements_include_hotel_scoped_incarnations() {
+        let graph = SqliteGraphStorage::open(":memory:").expect("open sqlite graph");
+        let hotel = default_hotel_record("aria-architect-hotel");
+        let guests = default_guest_seed("aria-architect-hotel");
+        graph
+            .seed_guests("aria-architect-hotel", &guests)
+            .expect("seed guests");
+
+        let ads = local_capability_advertisements(&graph, &hotel).expect("ads should build");
+        assert_eq!(ads.len(), guests.len());
+        assert!(ads.iter().all(|ad| ad.hotel_id == "aria-architect-hotel"));
+        assert!(
+            ads.iter()
+                .all(|ad| ad.incarnation_id.starts_with("aria-architect-hotel:"))
+        );
+        assert!(
+            ads.iter()
+                .all(|ad| ad.selection_hint.as_deref() == Some("local_materialization_required"))
+        );
+    }
+
+    #[test]
+    fn execution_reachability_prefers_configured_host() {
+        let graph = SqliteGraphStorage::open(":memory:").expect("open sqlite graph");
+        graph
+            .set_config_value("execution_host", &serde_json::json!("jane-vps").to_string())
+            .expect("set execution host");
+        let hotel = default_hotel_record("default");
+
+        let reachability = execution_reachability_for_hotel(&graph, &hotel);
+
+        assert_eq!(reachability.protocol, "tcp-framed-v1");
+        assert_eq!(reachability.host, "jane-vps");
+        assert_eq!(reachability.port, hotel.execution_port);
     }
 
     #[test]
     fn context_graph_entries_support_nested_section() {
-        let entries = extract_context_graph_entries(&serde_json::json!({
-            "context_graph": {
-                "telegram_bot_token": "token",
-                "elevenlabs_api_key": "key"
-            },
-            "ignored": {
-                "not": "imported"
-            }
-        }));
+        let entries = extract_context_graph_entries(
+            &serde_json::json!({
+                "context_graph": {
+                    "telegram_bot_token": "token",
+                    "elevenlabs_api_key": "key"
+                },
+                "ignored": {
+                    "not": "imported"
+                }
+            }),
+            None,
+        );
 
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().any(|(key, _)| key == "telegram_bot_token"));
         assert!(entries.iter().any(|(key, _)| key == "elevenlabs_api_key"));
+    }
+
+    #[test]
+    fn context_graph_entries_merge_default_and_hotel_specific_sections() {
+        let entries = extract_context_graph_entries(
+            &serde_json::json!({
+                "context_graph": {
+                    "gemini_api_key": "shared"
+                },
+                "hotels": {
+                    "default": {
+                        "agents": {
+                            "jane": {
+                                "telegram": {
+                                    "bot_token": "jane-token",
+                                    "allowed_users": ["JaneHegemonBot"]
+                                },
+                                "model": {
+                                    "default_model": "gemini-pro"
+                                }
+                            }
+                        }
+                    },
+                    "aria-architect-hotel": {
+                        "agents": {
+                            "aria": {
+                                "telegram": {
+                                    "bot_token": "aria-token",
+                                    "allowed_users": ["AriaArchitectBot"]
+                                },
+                                "model": {
+                                    "default_model": "gemini-2.5-pro"
+                                }
+                            }
+                        }
+                    }
+                }
+            }),
+            Some("aria-architect-hotel"),
+        );
+
+        assert!(
+            entries.iter().any(|(key, value)| {
+                key == "gemini_api_key" && value.as_str() == Some("shared")
+            })
+        );
+        assert!(entries.iter().any(|(key, value)| {
+            key == "telegram_bot_token" && value.as_str() == Some("aria-token")
+        }));
+        assert!(entries.iter().any(|(key, value)| {
+            key == "telegram_allowed_users"
+                && value
+                    .as_array()
+                    .is_some_and(|arr| arr.len() == 1 && arr[0] == "AriaArchitectBot")
+        }));
+        assert!(entries.iter().any(|(key, value)| {
+            key == "default_model" && value.as_str() == Some("gemini-2.5-pro")
+        }));
+    }
+
+    #[test]
+    fn context_graph_entries_support_hotel_level_telegram_overlay() {
+        let entries = extract_context_graph_entries(
+            &serde_json::json!({
+                "hotels": {
+                    "default": {
+                        "telegram": {
+                            "bot_token": "fallback-token",
+                            "allowed_users": ["shared-bot"]
+                        }
+                    }
+                }
+            }),
+            Some("beta-hotel"),
+        );
+
+        assert!(entries.iter().any(|(key, value)| {
+            key == "telegram_bot_token" && value.as_str() == Some("fallback-token")
+        }));
+        assert!(entries.iter().any(|(key, value)| {
+            key == "telegram_allowed_users"
+                && value
+                    .as_array()
+                    .is_some_and(|arr| arr.len() == 1 && arr[0] == "shared-bot")
+        }));
+    }
+
+    #[test]
+    fn configured_agent_identity_reads_import_workspace_for_selected_hotel() {
+        let config = serde_json::json!({
+            "hotels": {
+                "beacon-test-hotel": {
+                    "agents": {
+                        "beacon": {
+                            "agent_id": "agent-beacon-01",
+                            "persona_name": "Beacon",
+                            "import_workspace": "/tmp/aria-workspace"
+                        }
+                    }
+                }
+            }
+        });
+
+        let identity =
+            super::configured_agent_identity_from_config(&config, "beacon-test-hotel")
+                .expect("beacon import workspace should be detected");
+        assert_eq!(identity.agent_id, "agent-beacon-01");
+        assert_eq!(identity.persona_name, "Beacon");
+        assert_eq!(
+            identity.bundle_json["workspace_path"].as_str(),
+            Some("/tmp/aria-workspace")
+        );
+    }
+
+    #[test]
+    fn agent_profile_from_config_prefers_hotel_agent_over_builtins() {
+        let config = serde_json::json!({
+            "hotels": {
+                "beacon-test-hotel": {
+                    "agents": {
+                        "beacon": {
+                            "agent_id": "agent-beacon-01",
+                            "persona_name": "Beacon"
+                        }
+                    }
+                }
+            }
+        });
+
+        let profile =
+            agent_profile_from_config(&config, "beacon-test-hotel").expect("profile should exist");
+        assert_eq!(profile.agent_key, "beacon");
+        assert_eq!(profile.agent_id, "agent-beacon-01");
+        assert_eq!(profile.persona_name, "Beacon");
+    }
+
+    #[test]
+    fn default_agent_profile_is_generic_from_hotel_name() {
+        let profile = default_agent_profile_for_hotel("beacon-test-hotel");
+        assert_eq!(profile.agent_key, "beacon");
+        assert_eq!(profile.agent_id, "agent-beacon-01");
+        assert_eq!(profile.persona_name, "Beacon");
     }
 
     #[test]
