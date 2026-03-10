@@ -137,7 +137,11 @@ impl BeaconDaemon {
                         payload.capabilities.node_id, payload.capabilities.roles
                     );
                     let mut registry = self.registry.write().await;
-                    registry.update_node(payload.capabilities, payload.advertisements);
+                    registry.update_node(
+                        payload.capabilities,
+                        payload.advertisements,
+                        payload.execution_reachability,
+                    );
                 }
             }
             MsgType::MeshEventBatch | MsgType::MeshEventAck | MsgType::WebRtcSignal => {

@@ -1,6 +1,6 @@
 use ansible_mesh_core::beacon::BeaconDaemon;
 use ansible_mesh_core::heartbeat::emit_heartbeat;
-use ansible_mesh_core::registry::CapabilityAdvertisement;
+use ansible_mesh_core::registry::{CapabilityAdvertisement, ExecutionReachability};
 use ansible_mesh_core::storage::{AgentIdentityRecord, GraphStorage, GuestRecord, HotelRecord};
 use ansible_mesh_core::{NodeCapabilities, NodeRole};
 use anyhow::{Context, Result};
@@ -266,6 +266,32 @@ fn mesh_target_addr_for_node(
         .into_iter()
         .find(|hotel| hotel.capabilities.node_id == target_node_id)
         .map(|hotel| format!("127.0.0.1:{}", hotel.mesh_port)))
+}
+
+fn execution_reachability_for_hotel(
+    graph: &dyn GraphStorage,
+    hotel: &HotelRecord,
+) -> ExecutionReachability {
+    let host = graph
+        .get_config_value("execution_host")
+        .ok()
+        .flatten()
+        .and_then(|value| serde_json::from_str::<String>(&value).ok().or(Some(value)))
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "127.0.0.1".into());
+    let protocol = graph
+        .get_config_value("execution_protocol")
+        .ok()
+        .flatten()
+        .and_then(|value| serde_json::from_str::<String>(&value).ok().or(Some(value)))
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "tcp-framed-v1".into());
+
+    ExecutionReachability {
+        protocol,
+        host,
+        port: hotel.execution_port,
+    }
 }
 
 fn local_capability_advertisements(
@@ -2190,6 +2216,7 @@ async fn main() -> Result<()> {
         let dispatcher_tracker = tracker.clone();
         let dispatcher_socket = daemon.socket();
         let dispatcher_graph = graph_arc.clone();
+        let dispatcher_registry = daemon.registry();
 
         let rx_dispatch = shutdown_rx.resubscribe();
         tokio::spawn(crate::service::mesh_dispatcher::outbound_dispatcher(
@@ -2197,6 +2224,7 @@ async fn main() -> Result<()> {
             dispatcher_tracker,
             dispatcher_socket,
             dispatcher_graph,
+            dispatcher_registry,
             caps.node_id.clone(),
             rx_dispatch,
         ));
@@ -2229,12 +2257,22 @@ async fn main() -> Result<()> {
                             continue;
                         }
                     };
+                    let execution_reachability =
+                        execution_reachability_for_hotel(heartbeat_graph.as_ref(), &heartbeat_hotel);
                     for (_target_node_id, target_addr) in targets {
                         let Ok(target) = target_addr.parse::<SocketAddr>() else {
                             warn!("Skipping invalid heartbeat target address {}", target_addr);
                             continue;
                         };
-                        if let Err(err) = emit_heartbeat(&heartbeat_socket, target, &heartbeat_caps, &advertisements).await {
+                        if let Err(err) = emit_heartbeat(
+                            &heartbeat_socket,
+                            target,
+                            &heartbeat_caps,
+                            &advertisements,
+                            Some(execution_reachability.clone()),
+                        )
+                        .await
+                        {
                             warn!("Failed to emit heartbeat to {}: {}", target_addr, err);
                         }
                     }
@@ -2452,8 +2490,8 @@ async fn main() -> Result<()> {
 mod tests {
     use super::{
         StartupTest, default_guest_seed, default_hotel_record, enable_guest_test_overrides,
-        extract_context_graph_entries, guest_supervision_enabled, hotel_base_port,
-        local_capability_advertisements, startup_test_gemini_base_url,
+        execution_reachability_for_hotel, extract_context_graph_entries, guest_supervision_enabled,
+        hotel_base_port, local_capability_advertisements, startup_test_gemini_base_url,
     };
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
     use ansible_mesh_core::storage::GraphStorage;
@@ -2544,6 +2582,21 @@ mod tests {
             ads.iter()
                 .all(|ad| ad.selection_hint.as_deref() == Some("local_materialization_required"))
         );
+    }
+
+    #[test]
+    fn execution_reachability_prefers_configured_host() {
+        let graph = SqliteGraphStorage::open(":memory:").expect("open sqlite graph");
+        graph
+            .set_config_value("execution_host", &serde_json::json!("jane-vps").to_string())
+            .expect("set execution host");
+        let hotel = default_hotel_record("default");
+
+        let reachability = execution_reachability_for_hotel(&graph, &hotel);
+
+        assert_eq!(reachability.protocol, "tcp-framed-v1");
+        assert_eq!(reachability.host, "jane-vps");
+        assert_eq!(reachability.port, hotel.execution_port);
     }
 
     #[test]

@@ -38,6 +38,7 @@ Accepted in this slice:
 - the hotel now resolves model capability routes from the same registry-backed placement plane for `text.generate` and `media.analyze`, while hegemon reply delivery remains session-owned rather than placement-selected
 - routed execution now uses a first point-to-point TCP execution plane for inter-hotel `MESH_EVENT_BATCH` delivery instead of trying to cram rich tasks into UDP packets
 - the first two-hotel remote model roundtrip is now smoke-green in local development over that TCP execution plane
+- heartbeat and registry snapshots now include node-level execution reachability, and the dispatcher prefers those advertised execution endpoints before falling back to local loopback assumptions
 
 Deferred from this slice:
 - broader placement-based route selection beyond the first tool-capability fallback
@@ -123,6 +124,7 @@ Hotels should advertise at least:
 - `latency_hint_ms`
 - `max_concurrent_jobs`
 - current load signal such as active jobs, queue depth, or normalized utilization
+- node-level execution reachability for the current execution plane
 
 Current implementation note:
 
@@ -130,10 +132,12 @@ Current implementation note:
 - the current builder derives local advertisements from active guest manifests and current live PID state
 - hotels now emit periodic heartbeats to discovered peers and stale registry entries age out by TTL when queried
 - `IpcServer` now exposes a live `__mesh_registry__` snapshot
+- heartbeat payloads and registry snapshots now carry node-level execution reachability (`protocol`, `host`, `port`) for the first TCP execution plane
 - current routing consumers now include:
   - tool assembly fallback: when no local runner exists for an unpinned tool capability, the hotel may choose a live remote advertisement using preferred hotel, lower latency, and higher available capacity before deterministic incarnation-id tiebreaking
   - model component route assembly: when no live local model implementation exists for `text.generate` or `media.analyze`, the hotel may choose a live remote advertisement using the same preferred-hotel, latency, capacity, and deterministic-id ordering
   - hegemon reply delivery is intentionally excluded from placement selection because reply transport is bound to the session-owning membrane
+  - outbound inter-hotel dispatch: when sending a routed task to a remote node, the dispatcher now prefers live execution reachability learned from heartbeat/registry and only falls back to `127.0.0.1:<execution_port>` for local multi-hotel development
 
 ## Placement Policy
 
