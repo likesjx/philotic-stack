@@ -90,44 +90,6 @@
     mode: "0600"
   notify: Restart philotic-hotel
 
-# ── Guest binary shim ─────────────────────────────────────────────────────────
-# The hotel daemon seeds guest commands as relative paths (target/debug/<bin>)
-# — a dev convention. Create a matching directory structure with symlinks to the
-# real installed binaries so the relative paths resolve from WorkingDirectory.
-# TODO: fix guest_seed_for_profile in the Rust code to use absolute/configurable paths.
-
-- name: Create target/debug shim directory
-  file:
-    path: "{{ philotic_data_dir }}/target/debug"
-    state: directory
-    owner: "{{ philotic_user }}"
-    group: "{{ philotic_group }}"
-    mode: "0755"
-
-- name: Symlink guest binaries into target/debug shim
-  file:
-    src: "{{ philotic_bin_dir }}/{{ item }}"
-    dest: "{{ philotic_data_dir }}/target/debug/{{ item }}"
-    state: link
-    owner: "{{ philotic_user }}"
-    group: "{{ philotic_group }}"
-  loop: "{{ philotic_binaries }}"
-  notify: Restart philotic-hotel
-
-# Alias shims: guest_seed_for_profile uses names that don't match compiled binaries yet.
-# TODO: fix guest_seed_for_profile in Rust to use canonical binary names.
-- name: Symlink model-router aliases for seeded guest names
-  file:
-    src: "{{ philotic_bin_dir }}/model-router"
-    dest: "{{ philotic_data_dir }}/target/debug/{{ item }}"
-    state: link
-    owner: "{{ philotic_user }}"
-    group: "{{ philotic_group }}"
-  loop:
-    - model-controller-gemini
-    - model-controller-elevenlabs
-  notify: Restart philotic-hotel
-
 # ── Agent workspace access ─────────────────────────────────────────────────────
 # Grant the philotic user read access to any declared agent import_workspace paths.
 

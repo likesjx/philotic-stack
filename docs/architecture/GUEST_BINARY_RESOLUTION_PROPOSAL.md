@@ -61,11 +61,15 @@ Guests with no binary (e.g. `tool-runner`) should produce a warning and be skipp
 
 ## Disposition
 
-`proposed`
+`implemented`
 
 ## Current Slice
 
-The `target/debug/` Ansible shim tasks in `philotic_hotel` role are the transitional workaround. They must be removed once `guest_seed_for_profile` is fixed.
+- `guest_seed_for_profile` now uses bare binary names (`hegemon`, `agent-core`, `model-router`)
+- `spawn_guest` prepends `PHILOTIC_BIN_DIR` when set, falls back to `PATH` in dev mode
+- `tool-runner` seeded as `is_active: false` — skipped at boot, no spawn failure
+- `PHILOTIC_BIN_DIR` wired into the systemd service template
+- `target/debug/` Ansible shim tasks removed
 
 What is deferred:
 - Splitting `model-router` into separate provider binaries
