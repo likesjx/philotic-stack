@@ -414,6 +414,7 @@ fn graph_storage_hotel_round_trip_and_pid_update() {
         },
         mesh_port: 9101,
         blob_port: 9201,
+        execution_port: 9301,
         ipc_socket_path: "/tmp/philotic-alpha.sock".into(),
         active_pid: None,
     };
@@ -428,6 +429,7 @@ fn graph_storage_hotel_round_trip_and_pid_update() {
     assert_eq!(loaded.capabilities.node_id, "alpha-node");
     assert_eq!(loaded.mesh_port, 9101);
     assert_eq!(loaded.blob_port, 9201);
+    assert_eq!(loaded.execution_port, 9301);
     assert_eq!(loaded.ipc_socket_path, "/tmp/philotic-alpha.sock");
     assert_eq!(loaded.active_pid.as_deref(), Some("2222"));
 }
@@ -447,6 +449,7 @@ fn graph_storage_lists_hotels() {
         },
         mesh_port: 9101,
         blob_port: 9201,
+        execution_port: 9301,
         ipc_socket_path: "/tmp/philotic-alpha.sock".into(),
         active_pid: None,
     };
@@ -461,6 +464,7 @@ fn graph_storage_lists_hotels() {
         },
         mesh_port: 9102,
         blob_port: 9202,
+        execution_port: 9302,
         ipc_socket_path: "/tmp/philotic-beta.sock".into(),
         active_pid: None,
     };
