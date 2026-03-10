@@ -1,0 +1,24 @@
+---
+# Deploy Philotic hotel daemon to VPS nodes.
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini deploy_hotel.yml
+#   ansible-playbook -i inventory/hosts.ini deploy_hotel.yml --limit jane-vps
+#   ansible-playbook -i inventory/hosts.ini deploy_hotel.yml --tags config   # config-only, no rebuild
+#
+# Prerequisites on the control machine:
+#   - ansible-vault password file or --ask-vault-pass
+#   - SSH key at ~/.ssh/vps_deploy_key (or override ansible_ssh_private_key_file)
+#   - host_vars/<hostname>.yml populated from host_vars/<hostname>.yml.example
+#
+# Prerequisites on each target host:
+#   - Ubuntu 22.04+ (Debian family)
+#   - Tailscale installed and authenticated (transitional peer networking)
+#   - SSH access for deploy user with sudo
+
+- name: Deploy Philotic Hotel
+  hosts: philotic_hotels
+  become: yes
+
+  roles:
+    - role: philotic_hotel

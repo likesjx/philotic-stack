@@ -1,0 +1,22 @@
+{
+  "context_graph": {
+    "default_model": "{{ philotic_default_model | default('gemini-pro') }}"
+  },
+  "backbone": {
+    "peers": [
+{% for peer in philotic_backbone_peers %}
+      {
+        "name": "{{ peer.name }}",
+        "host": "{{ peer.host }}",
+        "beacon_port": {{ peer.beacon_port | default(8999) }}
+      }{% if not loop.last %},{% endif %}
+
+{% endfor %}
+    ]
+  },
+  "hotels": {
+    "{{ philotic_hotel_name }}": {
+      "agents": {{ philotic_agents | to_nice_json }}
+    }
+  }
+}

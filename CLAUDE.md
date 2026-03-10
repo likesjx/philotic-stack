@@ -106,7 +106,7 @@ To add a new backend, implement the three traits and inject at startup in `ansib
 
 - `BeaconMessage` is the UDP envelope; `MsgType` identifies payload semantics. Payload is `Vec<u8>` (JSON, MsgPack, or CBOR).
 - Memory apartment writes are **optimistic / LWW** — guests call `SyncApartment` IPC and the hotel resolves conflicts on upsert.
-- `legacy-zeroclaw/` is a pristine reference clone — do not modify it or treat it as active code.
+- The legacy ZeroClaw reference clone has been removed from this repo. Consult the original `zeroclaw` repository separately if needed.
 - The `robot-kit` crate is a separate embedded robotics HAL concern, not part of the hotel/guest model.
 
 ### Reference Docs

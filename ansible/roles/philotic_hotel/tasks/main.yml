@@ -1,0 +1,155 @@
+---
+# ── Prerequisites ──────────────────────────────────────────────────────────────
+
+- name: Install system dependencies
+  apt:
+    name:
+      - sqlite3
+      - curl
+    state: present
+    update_cache: yes
+  when: ansible_os_family == 'Debian'
+
+# ── Service user ───────────────────────────────────────────────────────────────
+
+- name: Create philotic group
+  group:
+    name: "{{ philotic_group }}"
+    system: yes
+
+- name: Create philotic user
+  user:
+    name: "{{ philotic_user }}"
+    group: "{{ philotic_group }}"
+    system: yes
+    shell: /sbin/nologin
+    home: "{{ philotic_install_dir }}"
+    create_home: no
+
+# ── Filesystem layout ──────────────────────────────────────────────────────────
+
+- name: Create install directories
+  file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ philotic_user }}"
+    group: "{{ philotic_group }}"
+    mode: "0755"
+  loop:
+    - "{{ philotic_install_dir }}"
+    - "{{ philotic_bin_dir }}"
+    - "{{ philotic_etc_dir }}"
+    - "{{ philotic_data_dir }}"
+    - "{{ philotic_blob_dir }}"
+
+- name: Restrict etc directory (contains secrets)
+  file:
+    path: "{{ philotic_etc_dir }}"
+    state: directory
+    owner: "{{ philotic_user }}"
+    group: "{{ philotic_group }}"
+    mode: "0700"
+
+# ── Binaries ───────────────────────────────────────────────────────────────────
+# Binaries are delivered externally (rsync, artifact fetch, or CI distribution).
+# This role only places them. Build is not the role's responsibility.
+# philotic_artifacts_remote: false → copy from control machine (normal path)
+# philotic_artifacts_remote: true  → copy from already-present path on the host (first-smoke path)
+
+- name: Copy Philotic binaries (from control machine)
+  copy:
+    src: "{{ philotic_artifacts_dir }}/{{ item }}"
+    dest: "{{ philotic_bin_dir }}/{{ item }}"
+    owner: "{{ philotic_user }}"
+    group: "{{ philotic_group }}"
+    mode: "0755"
+  loop: "{{ philotic_binaries }}"
+  when: not philotic_artifacts_remote
+  notify: Restart philotic-hotel
+
+- name: Install Philotic binaries (already built on host)
+  copy:
+    src: "{{ philotic_artifacts_dir }}/{{ item }}"
+    dest: "{{ philotic_bin_dir }}/{{ item }}"
+    owner: "{{ philotic_user }}"
+    group: "{{ philotic_group }}"
+    mode: "0755"
+    remote_src: yes
+  loop: "{{ philotic_binaries }}"
+  when: philotic_artifacts_remote
+  notify: Restart philotic-hotel
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+
+- name: Deploy mesh-config.json
+  template:
+    src: mesh-config.json.j2
+    dest: "{{ philotic_etc_dir }}/mesh-config.json"
+    owner: "{{ philotic_user }}"
+    group: "{{ philotic_group }}"
+    mode: "0600"
+  notify: Restart philotic-hotel
+
+# ── Tailscale (transitional peer networking) ───────────────────────────────────
+
+- name: Check if Tailscale is installed
+  command: which tailscale
+  register: tailscale_check
+  failed_when: false
+  changed_when: false
+
+- name: Warn if Tailscale is not installed
+  debug:
+    msg: >
+      WARNING: Tailscale is not installed. Inter-hotel mesh backbone peers will
+      not resolve. Install Tailscale and authenticate before starting the hotel.
+      (Tailscale is a transitional scaffold — see RH_ANSIBLE_VPS_DEPLOYMENT_PROPOSAL.md)
+  when: tailscale_check.rc != 0
+
+# ── Firewall ───────────────────────────────────────────────────────────────────
+
+- name: Allow inter-hotel beacon port (UDP)
+  ufw:
+    rule: allow
+    port: "{{ philotic_beacon_port }}"
+    proto: udp
+  when: ansible_os_family == 'Debian'
+  ignore_errors: yes
+
+- name: Allow blob HTTP port (TCP, Tailscale-only — restrict if needed)
+  ufw:
+    rule: allow
+    port: "{{ philotic_blob_port }}"
+    proto: tcp
+    src: "100.64.0.0/10"  # Tailscale CGNAT range (transitional)
+  when: ansible_os_family == 'Debian'
+  ignore_errors: yes
+
+# ── Secrets ────────────────────────────────────────────────────────────────────
+
+- name: Deploy secrets.env (from vault — never stored in plaintext in source control)
+  template:
+    src: secrets.env.j2
+    dest: "{{ philotic_etc_dir }}/secrets.env"
+    owner: "{{ philotic_user }}"
+    group: "{{ philotic_group }}"
+    mode: "0600"
+  notify: Restart philotic-hotel
+
+# ── systemd service ────────────────────────────────────────────────────────────
+
+- name: Deploy philotic-hotel systemd unit
+  template:
+    src: philotic-hotel.service.j2
+    dest: /etc/systemd/system/philotic-hotel.service
+    mode: "0644"
+  notify:
+    - Reload systemd
+    - Restart philotic-hotel
+
+- name: Enable and start philotic-hotel
+  systemd:
+    name: philotic-hotel
+    enabled: yes
+    state: started
+    daemon_reload: yes

@@ -57,6 +57,7 @@
 - [x] Define the first peer inventory/rendering contract for deployed hotels so cross-host mesh no longer depends on loopback assumptions.
 - [ ] Prove a first VPS deployment smoke for one hotel.
 - [ ] Prove a first multi-host or local-to-VPS two-hotel roundtrip.
+- [ ] Render and deploy `beacon-test-hotel` on `vps-jane` with a Beacon agent profile, VPS-local `import_workspace`, and hotel-scoped Telegram credentials so Beacon can be UATed on the VPS test stack.
 
 ## New Project: Native Overlay / VPN
 
