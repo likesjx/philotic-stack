@@ -4,18 +4,12 @@ philotic_hotel_name: "beacon-test-hotel"
 philotic_default_model: "gemini-pro"
 philotic_repo_branch: "codex/hegemon-membrane-slice"
 
-# Backbone peers
-philotic_backbone_peers:
-  - name: "jane-vps"
-    host: "jane-vps"
-    beacon_port: 8999
-
 # Agents
 philotic_agents:
   beacon:
     agent_id: "agent-beacon-01"
     persona_name: "Beacon"
-    import_workspace: "/home/node/.openclaw/workspace-chief-of-staff"
+    import_workspace: "/home/deploy/apps/jane/data/workspace-chief-of-staff"
     telegram:
       bot_token: "{{ vault_beacon_telegram_bot_token }}"
       allowed_users:

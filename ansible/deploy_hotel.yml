@@ -20,5 +20,9 @@
   hosts: philotic_hotels
   become: yes
 
+  pre_tasks:
+    - name: Load host vault vars
+      include_vars: "vault/{{ inventory_hostname }}.yml"
+
   roles:
     - role: philotic_hotel
