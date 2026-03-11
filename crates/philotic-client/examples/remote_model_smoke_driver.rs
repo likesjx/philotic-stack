@@ -98,8 +98,8 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "explain the remote model placement smoke".to_string());
 
     let mut client = PhiloticClient::connect(GuestIdentity {
-        guest_id: "remote-model-smoke-hegemon".into(),
-        role: "hegemon".into(),
+        guest_id: "remote-model-smoke-membrane".into(),
+        role: "membrane".into(),
         supported_tools: Vec::new(),
     })
     .await
@@ -127,8 +127,8 @@ async fn main() -> Result<()> {
                 "chat_id": chat_id,
                 "content": content,
                 "final_reply_to": "local-ansible-01",
-                "final_reply_role": "hegemon",
-                "final_reply_guest_id": "remote-model-smoke-hegemon"
+                "final_reply_role": "membrane",
+                "final_reply_guest_id": "remote-model-smoke-membrane"
             })
             .to_string(),
         })

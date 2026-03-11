@@ -680,8 +680,8 @@ mod tests {
             Arc::new(TestGraphStorage::with_guests(vec![GuestRecord {
                 hotel_name: "test-hotel".into(),
                 guest_id: "guest-2".into(),
-                role: "hegemon".into(),
-                config_json: json!({ "command": "target/debug/hegemon" }).to_string(),
+                role: "membrane".into(),
+                config_json: json!({ "command": "target/debug/membrane" }).to_string(),
                 is_active: true,
                 active_pid: Some(pid.clone()),
             }]));

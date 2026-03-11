@@ -513,7 +513,7 @@ async fn main() -> Result<()> {
                 let final_reply_role = task
                     .get("final_reply_role")
                     .and_then(serde_json::Value::as_str)
-                    .unwrap_or("hegemon")
+                    .unwrap_or("membrane")
                     .to_string();
                 let runner_base_config = parse_workspace_runner_base_config(&task);
                 let runner_overlay = parse_workspace_runner_overlay(&task);

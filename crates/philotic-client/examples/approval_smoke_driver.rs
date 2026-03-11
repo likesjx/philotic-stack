@@ -21,8 +21,8 @@ async fn main() -> Result<()> {
         std::env::var("PHILOTIC_SMOKE_APPROVAL_COMMAND").unwrap_or_else(|_| "/approve".to_string());
 
     let mut client = PhiloticClient::connect(GuestIdentity {
-        guest_id: "approval-smoke-hegemon".into(),
-        role: "hegemon".into(),
+        guest_id: "approval-smoke-membrane".into(),
+        role: "membrane".into(),
         supported_tools: Vec::new(),
     })
     .await
@@ -41,8 +41,8 @@ async fn main() -> Result<()> {
                 "chat_id": chat_id,
                 "content": approval_request,
                 "final_reply_to": "local-ansible-01",
-                "final_reply_role": "hegemon",
-                "final_reply_guest_id": "approval-smoke-hegemon"
+                "final_reply_role": "membrane",
+                "final_reply_guest_id": "approval-smoke-membrane"
             })
             .to_string(),
         })
@@ -86,8 +86,8 @@ async fn main() -> Result<()> {
                 "chat_id": chat_id,
                 "content": approval_command,
                 "final_reply_to": "local-ansible-01",
-                "final_reply_role": "hegemon",
-                "final_reply_guest_id": "approval-smoke-hegemon"
+                "final_reply_role": "membrane",
+                "final_reply_guest_id": "approval-smoke-membrane"
             })
             .to_string(),
         })

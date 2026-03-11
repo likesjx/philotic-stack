@@ -778,7 +778,7 @@ fn graph_storage_session_participants_round_trip() {
     store
         .upsert_session_participant(&SessionParticipantRecord {
             session_id: "sess-1".into(),
-            component_id: "hegemon-telegram".into(),
+            component_id: "membrane-telegram".into(),
             role: "gateway".into(),
             joined_at: now_ms(),
             last_seen_at: now_ms(),
@@ -901,7 +901,7 @@ fn graph_storage_session_checkpoint_flow_e2e() {
     store
         .upsert_session_participant(&SessionParticipantRecord {
             session_id: "sess-1".into(),
-            component_id: "hegemon-telegram".into(),
+            component_id: "membrane-telegram".into(),
             role: "gateway".into(),
             joined_at: 100,
             last_seen_at: 100,

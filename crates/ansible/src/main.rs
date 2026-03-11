@@ -228,7 +228,7 @@ fn default_hotel_record(hotel_name: &str) -> HotelRecord {
         hotel_name: hotel_name.to_string(),
         capabilities: NodeCapabilities {
             node_id: format!("{safe_name}-ansible-01"),
-            roles: vec![NodeRole::AnsibleNode, NodeRole::Other("hegemon".into())],
+            roles: vec![NodeRole::AnsibleNode, NodeRole::Other("membrane".into())],
             models: vec![],
             tools: vec![],
             constraints: Default::default(),
@@ -517,10 +517,10 @@ fn guest_seed_for_profile(hotel_name: &str, profile: &AgentProfile) -> Vec<Guest
     vec![
         GuestRecord {
             hotel_name: hotel_name.to_string(),
-            guest_id: format!("{hotel_name}:hegemon-gateway-{}", profile.agent_key),
-            role: "hegemon".into(),
+            guest_id: format!("{hotel_name}:membrane-gateway-{}", profile.agent_key),
+            role: "membrane".into(),
             config_json: serde_json::json!({
-                "command": "hegemon",
+                "command": "membrane",
                 "args": [],
                 "env": {
                     "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
@@ -952,7 +952,7 @@ fn enable_guest_test_overrides(
                     );
                 }
 
-                if guest.role == "hegemon" {
+                if guest.role == "membrane" {
                     env.insert(
                         "PHILOTIC_TELEGRAM_API_BASE_URL".into(),
                         serde_json::Value::String(telegram_api_base_url.clone()),
@@ -1305,7 +1305,7 @@ fn prepare_startup_test_binaries(_test: StartupTest) -> Result<()> {
         .args([
             "build",
             "-p",
-            "hegemon",
+            "membrane",
             "-p",
             "agent-core",
             "-p",
@@ -2692,17 +2692,17 @@ mod tests {
                 import_workspace: None,
             },
         );
-        let hegemon: serde_json::Value =
-            serde_json::from_str(&guests[0].config_json).expect("hegemon config");
+        let membrane: serde_json::Value =
+            serde_json::from_str(&guests[0].config_json).expect("membrane config");
         let agent: serde_json::Value =
             serde_json::from_str(&guests[1].config_json).expect("agent config");
 
         assert_eq!(
-            hegemon["env"]["PHILOTIC_TARGET_AGENT_ID"].as_str(),
+            membrane["env"]["PHILOTIC_TARGET_AGENT_ID"].as_str(),
             Some("agent-beacon-01")
         );
         assert_eq!(
-            hegemon["env"]["PHILOTIC_TELEGRAM_BOT_TOKEN_KEY"].as_str(),
+            membrane["env"]["PHILOTIC_TELEGRAM_BOT_TOKEN_KEY"].as_str(),
             Some("telegram_bot_token")
         );
         assert_eq!(

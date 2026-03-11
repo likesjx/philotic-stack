@@ -390,7 +390,7 @@ mod tests {
             reply_to: "local-ansible-01".into(),
             reply_role: "agent".into(),
             final_reply_to: "local-ansible-01".into(),
-            final_reply_role: "hegemon".into(),
+            final_reply_role: "membrane".into(),
             final_reply_guest_id: None,
         };
 
