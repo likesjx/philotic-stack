@@ -19,7 +19,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 pub const DEFAULT_AGENT_ID: &str = "agent-jane-01";
-const DEFAULT_REPLY_ROLE: &str = "hegemon";
+const DEFAULT_REPLY_ROLE: &str = "membrane";
 const LOCAL_NODE: &str = "local-ansible-01";
 const DEFAULT_TEXT_MODEL_ROLE: &str = "model.gemini";
 const DEFAULT_VOICE_MODEL_ROLE: &str = "model.elevenlabs";
@@ -1092,7 +1092,7 @@ impl AgentRuntime {
         .await
     }
 
-    /// Final step: complete the turn, sync state, and emit `FinalReplyPayload` to hegemon.
+    /// Final step: complete the turn, sync state, and emit `FinalReplyPayload` to membrane.
     async fn deliver_text_reply(
         &mut self,
         session_id: String,
@@ -2165,13 +2165,13 @@ mod tests {
             reply_to: LOCAL_NODE.into(),
             reply_role: "agent".into(),
             final_reply_to: LOCAL_NODE.into(),
-            final_reply_role: "hegemon".into(),
+            final_reply_role: "membrane".into(),
             final_reply_guest_id: None,
         };
 
         let json = serde_json::to_value(&request).expect("serialize request");
         assert_eq!(json["reply_role"], "agent");
-        assert_eq!(json["final_reply_role"], "hegemon");
+        assert_eq!(json["final_reply_role"], "membrane");
     }
 
     #[test]

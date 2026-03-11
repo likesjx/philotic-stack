@@ -18,8 +18,8 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "Approved: deploy the thing".to_string());
 
     let mut client = PhiloticClient::connect(GuestIdentity {
-        guest_id: "preapprove-smoke-hegemon".into(),
-        role: "hegemon".into(),
+        guest_id: "preapprove-smoke-membrane".into(),
+        role: "membrane".into(),
         supported_tools: Vec::new(),
     })
     .await
@@ -37,8 +37,8 @@ async fn main() -> Result<()> {
                 "chat_id": chat_id,
                 "content": "/preapprove this-session",
                 "final_reply_to": "local-ansible-01",
-                "final_reply_role": "hegemon",
-                "final_reply_guest_id": "preapprove-smoke-hegemon"
+                "final_reply_role": "membrane",
+                "final_reply_guest_id": "preapprove-smoke-membrane"
             })
             .to_string(),
         })
@@ -76,8 +76,8 @@ async fn main() -> Result<()> {
                 "chat_id": chat_id,
                 "content": "need approval deploy the thing",
                 "final_reply_to": "local-ansible-01",
-                "final_reply_role": "hegemon",
-                "final_reply_guest_id": "preapprove-smoke-hegemon"
+                "final_reply_role": "membrane",
+                "final_reply_guest_id": "preapprove-smoke-membrane"
             })
             .to_string(),
         })

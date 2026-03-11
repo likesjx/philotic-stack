@@ -975,8 +975,8 @@ async fn main() -> Result<()> {
     info!("Starting Materialized Hegemon (Telegram Gateway) Guest Process...");
 
     let identity = GuestIdentity {
-        guest_id: "hegemon-telegram-01".into(),
-        role: "hegemon".into(),
+        guest_id: "membrane-telegram-01".into(),
+        role: "membrane".into(),
         supported_tools: Vec::new(),
     };
 
@@ -1115,8 +1115,8 @@ async fn main() -> Result<()> {
                                                     "callback_data": envelope.callback_data,
                                                     "raw_transport_event": envelope.raw_transport_event,
                                                     "final_reply_to": "local-ansible-01",
-                                                    "final_reply_role": "hegemon",
-                                                    "final_reply_guest_id": "hegemon-telegram-01"
+                                                    "final_reply_role": "membrane",
+                                                    "final_reply_guest_id": "membrane-telegram-01"
                                                 }).to_string(),
                                             };
 
@@ -1230,7 +1230,7 @@ async fn main() -> Result<()> {
                     Ok(other) => info!("Hegemon received non-task IPC message: {:?}", other),
                     Err(e) => {
                         if is_ipc_disconnect(&e) {
-                            info!("Hotel IPC disconnected; hegemon exiting.");
+                            info!("Hotel IPC disconnected; membrane exiting.");
                             return Ok(());
                         }
                         warn!("IPC Recv error: {}", e);
