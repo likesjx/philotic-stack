@@ -1,6 +1,6 @@
-# `hegemon` — Telegram/External Gateway Guest
+# `membrane` — Telegram/External Gateway Guest
 
-`hegemon` is a materialized guest process that acts as the external gateway
+`membrane` is a materialized guest process that acts as the external gateway
 for the Philotic hotel — currently handling Telegram bot integration and
 inbound message routing.
 
@@ -18,7 +18,7 @@ inbound message routing.
 main()
   │
   ├─ PhiloticClient::connect(ansible_port)
-  ├─ client.register(GuestIdentity { guest_id: "hegemon-telegram-01" })
+  ├─ client.register(GuestIdentity { guest_id: "membrane-telegram-01" })
   ├─ Subscribe to hotel events
   └─ Enter message processing loop
 ```
@@ -35,5 +35,5 @@ Spawned automatically by `GuestManager` when `is_active=1` in the Context Graph.
 Can also be run standalone for development:
 
 ```bash
-cargo run -p hegemon -- --ansible-port 9000
+cargo run -p membrane -- --ansible-port 9000
 ```

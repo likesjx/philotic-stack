@@ -2397,18 +2397,18 @@ mod tests {
             role: "agent".into(),
             supported_tools: Vec::new(),
         };
-        let hegemon_identity = GuestIdentity {
-            guest_id: "hegemon-local".into(),
-            role: "hegemon".into(),
+        let membrane_identity = GuestIdentity {
+            guest_id: "membrane-local".into(),
+            role: "membrane".into(),
             supported_tools: Vec::new(),
         };
 
         let mut agent = PhiloticClient::connect(agent_identity)
             .await
             .expect("agent connect");
-        let mut hegemon = PhiloticClient::connect(hegemon_identity)
+        let mut membrane = PhiloticClient::connect(membrane_identity)
             .await
-            .expect("hegemon connect");
+            .expect("membrane connect");
 
         let task_payload = serde_json::json!({
             "source": "telegram",
@@ -2417,7 +2417,7 @@ mod tests {
         })
         .to_string();
 
-        let response = hegemon
+        let response = membrane
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
                 target_role: "agent".into(),
@@ -2498,32 +2498,32 @@ mod tests {
         })
         .await
         .expect("sender connect");
-        let mut telegram_hegemon = PhiloticClient::connect(GuestIdentity {
-            guest_id: "hegemon-telegram-01".into(),
-            role: "hegemon".into(),
+        let mut telegram_membrane = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-telegram-01".into(),
+            role: "membrane".into(),
             supported_tools: Vec::new(),
         })
         .await
-        .expect("telegram hegemon connect");
-        let mut whatsapp_hegemon = PhiloticClient::connect(GuestIdentity {
-            guest_id: "hegemon-whatsapp-01".into(),
-            role: "hegemon".into(),
+        .expect("telegram membrane connect");
+        let mut whatsapp_membrane = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-whatsapp-01".into(),
+            role: "membrane".into(),
             supported_tools: Vec::new(),
         })
         .await
-        .expect("whatsapp hegemon connect");
+        .expect("whatsapp membrane connect");
 
         sender
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
-                target_role: "hegemon".into(),
-                target_guest_id: Some("hegemon-telegram-01".into()),
+                target_role: "membrane".into(),
+                target_guest_id: Some("membrane-telegram-01".into()),
                 task_json: serde_json::json!({
                     "action": "send_reply",
                     "session_id": "telegram:123:agent-jane-01",
                     "turn_id": "turn-1",
                     "chat_id": "123",
-                    "content": "hello targeted hegemon"
+                    "content": "hello targeted membrane"
                 })
                 .to_string(),
             })
@@ -2532,28 +2532,28 @@ mod tests {
 
         let targeted = tokio::time::timeout(
             tokio::time::Duration::from_secs(1),
-            telegram_hegemon.recv_task(),
+            telegram_membrane.recv_task(),
         )
         .await
-        .expect("telegram hegemon should receive targeted task")
-        .expect("telegram hegemon recv should succeed");
+        .expect("telegram membrane should receive targeted task")
+        .expect("telegram membrane recv should succeed");
         match targeted {
             IpcResponse::InboundTask { task_json, .. } => {
                 let payload: serde_json::Value =
                     serde_json::from_str(&task_json).expect("payload should decode");
-                assert_eq!(payload["content"], "hello targeted hegemon");
+                assert_eq!(payload["content"], "hello targeted membrane");
             }
-            other => panic!("unexpected telegram hegemon response: {other:?}"),
+            other => panic!("unexpected telegram membrane response: {other:?}"),
         }
 
         assert!(
             tokio::time::timeout(
                 tokio::time::Duration::from_millis(150),
-                whatsapp_hegemon.recv_task()
+                whatsapp_membrane.recv_task()
             )
             .await
             .is_err(),
-            "non-target hegemon should not receive guest-targeted task"
+            "non-target membrane should not receive guest-targeted task"
         );
 
         unsafe {
@@ -2833,16 +2833,16 @@ mod tests {
             std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
         }
 
-        let hegemon_identity = GuestIdentity {
-            guest_id: "hegemon-local".into(),
-            role: "hegemon".into(),
+        let membrane_identity = GuestIdentity {
+            guest_id: "membrane-local".into(),
+            role: "membrane".into(),
             supported_tools: Vec::new(),
         };
-        let mut hegemon = PhiloticClient::connect(hegemon_identity)
+        let mut membrane = PhiloticClient::connect(membrane_identity)
             .await
-            .expect("hegemon connect");
+            .expect("membrane connect");
 
-        hegemon
+        membrane
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
                 target_role: "agent".into(),
@@ -4069,7 +4069,7 @@ mod tests {
                         "chat_id": "chat-sess-1",
                         "user_content": "hello from sess-1",
                         "final_reply_to": "local-ansible-01",
-                        "final_reply_role": "hegemon"
+                        "final_reply_role": "membrane"
                     },
                     "recent_turns": [{
                         "turn_id": "turn-1z",
@@ -4424,13 +4424,13 @@ mod tests {
             std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
         }
 
-        let mut hegemon = PhiloticClient::connect(GuestIdentity {
-            guest_id: "hegemon-local".into(),
-            role: "hegemon".into(),
+        let mut membrane = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-local".into(),
+            role: "membrane".into(),
             supported_tools: Vec::new(),
         })
         .await
-        .expect("hegemon connect");
+        .expect("membrane connect");
         let mut agent = PhiloticClient::connect(GuestIdentity {
             guest_id: "agent-local".into(),
             role: "agent".into(),
@@ -4449,7 +4449,7 @@ mod tests {
         let session_id = "telegram:123:agent-jane-01";
         let turn_id = "telegram-update-1";
 
-        hegemon
+        membrane
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
                 target_role: "agent".into(),
@@ -4461,7 +4461,7 @@ mod tests {
                     "chat_id": "123",
                     "content": "hello from telegram",
                     "final_reply_to": "local-ansible-01",
-                    "final_reply_role": "hegemon"
+                    "final_reply_role": "membrane"
                 })
                 .to_string(),
             })
@@ -4514,7 +4514,7 @@ mod tests {
                     "reply_to": "local-ansible-01",
                     "reply_role": "agent",
                     "final_reply_to": "local-ansible-01",
-                    "final_reply_role": "hegemon"
+                    "final_reply_role": "membrane"
                 })
                 .to_string(),
             })
@@ -4548,7 +4548,7 @@ mod tests {
                     "chat_id": "123",
                     "content": "hi back",
                     "final_reply_to": "local-ansible-01",
-                    "final_reply_role": "hegemon"
+                    "final_reply_role": "membrane"
                 })
                 .to_string(),
             })
@@ -4586,7 +4586,7 @@ mod tests {
         agent
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
-                target_role: "hegemon".into(),
+                target_role: "membrane".into(),
                 target_guest_id: None,
                 task_json: serde_json::json!({
                     "action": "send_reply",
@@ -4601,10 +4601,10 @@ mod tests {
             .expect("emit final reply");
 
         let final_reply =
-            tokio::time::timeout(tokio::time::Duration::from_secs(1), hegemon.recv_task())
+            tokio::time::timeout(tokio::time::Duration::from_secs(1), membrane.recv_task())
                 .await
-                .expect("hegemon should receive final reply")
-                .expect("hegemon recv should succeed");
+                .expect("membrane should receive final reply")
+                .expect("membrane recv should succeed");
 
         match final_reply {
             IpcResponse::InboundTask { task_json, .. } => {
@@ -4613,7 +4613,7 @@ mod tests {
                 assert_eq!(payload["action"], "send_reply");
                 assert_eq!(payload["content"], "hi back");
             }
-            other => panic!("unexpected final response to hegemon: {other:?}"),
+            other => panic!("unexpected final response to membrane: {other:?}"),
         }
 
         let turn = graph_store
@@ -4679,13 +4679,13 @@ mod tests {
             std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
         }
 
-        let mut hegemon = PhiloticClient::connect(GuestIdentity {
-            guest_id: "hegemon-local".into(),
-            role: "hegemon".into(),
+        let mut membrane = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-local".into(),
+            role: "membrane".into(),
             supported_tools: Vec::new(),
         })
         .await
-        .expect("hegemon connect");
+        .expect("membrane connect");
         let mut agent = PhiloticClient::connect(GuestIdentity {
             guest_id: "agent-local".into(),
             role: "agent".into(),
@@ -4704,7 +4704,7 @@ mod tests {
         let session_id = "telegram:456:agent-jane-01";
         let turn_id = "telegram-update-tool-1";
 
-        hegemon
+        membrane
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
                 target_role: "agent".into(),
@@ -4716,7 +4716,7 @@ mod tests {
                     "chat_id": "456",
                     "content": "use echo hello structured tool",
                     "final_reply_to": "local-ansible-01",
-                    "final_reply_role": "hegemon"
+                    "final_reply_role": "membrane"
                 })
                 .to_string(),
             })
@@ -4770,7 +4770,7 @@ mod tests {
                     "reply_to": "local-ansible-01",
                     "reply_role": "agent",
                     "final_reply_to": "local-ansible-01",
-                    "final_reply_role": "hegemon"
+                    "final_reply_role": "membrane"
                 })
                 .to_string(),
             })
@@ -4811,7 +4811,7 @@ mod tests {
                     "chat_id": "456",
                     "content": "tool_call: echo hello structured tool",
                     "final_reply_to": "local-ansible-01",
-                    "final_reply_role": "hegemon"
+                    "final_reply_role": "membrane"
                 })
                 .to_string(),
             })
@@ -4849,7 +4849,7 @@ mod tests {
         agent
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
-                target_role: "hegemon".into(),
+                target_role: "membrane".into(),
                 target_guest_id: None,
                 task_json: serde_json::json!({
                     "action": "send_reply",
@@ -4864,10 +4864,10 @@ mod tests {
             .expect("emit final reply");
 
         let final_reply =
-            tokio::time::timeout(tokio::time::Duration::from_secs(1), hegemon.recv_task())
+            tokio::time::timeout(tokio::time::Duration::from_secs(1), membrane.recv_task())
                 .await
-                .expect("hegemon should receive final reply")
-                .expect("hegemon recv should succeed");
+                .expect("membrane should receive final reply")
+                .expect("membrane recv should succeed");
 
         match final_reply {
             IpcResponse::InboundTask { task_json, .. } => {
@@ -4876,7 +4876,7 @@ mod tests {
                 assert_eq!(payload["action"], "send_reply");
                 assert_eq!(payload["content"], "Tool echo says: hello structured tool");
             }
-            other => panic!("unexpected final response to hegemon: {other:?}"),
+            other => panic!("unexpected final response to membrane: {other:?}"),
         }
 
         let turn = graph_store

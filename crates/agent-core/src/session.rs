@@ -1073,7 +1073,7 @@ impl SessionState {
                 final_reply_role: turn
                     .get("final_reply_role")
                     .and_then(serde_json::Value::as_str)
-                    .unwrap_or("hegemon")
+                    .unwrap_or("membrane")
                     .to_string(),
                 final_reply_guest_id: turn
                     .get("final_reply_guest_id")
@@ -1546,8 +1546,8 @@ mod tests {
             chat_id: "123".into(),
             user_content: "hello".into(),
             final_reply_to: "local-ansible-01".into(),
-            final_reply_role: "hegemon".into(),
-            final_reply_guest_id: Some("hegemon-telegram-01".into()),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: Some("membrane-telegram-01".into()),
             phase: TurnPhase::Queued,
             iteration: 0,
             pending_tool_call: None,
@@ -1561,7 +1561,7 @@ mod tests {
         assert_eq!(checkpoint["active_turn"]["phase"], "queued");
         assert_eq!(
             checkpoint["active_turn"]["final_reply_guest_id"],
-            "hegemon-telegram-01"
+            "membrane-telegram-01"
         );
         assert!(checkpoint["component_route_assembly"].is_object());
         assert!(checkpoint["tool_assembly"].is_object());
@@ -1610,7 +1610,7 @@ mod tests {
             chat_id: "123".into(),
             user_content: "hello".into(),
             final_reply_to: "local-ansible-01".into(),
-            final_reply_role: "hegemon".into(),
+            final_reply_role: "membrane".into(),
             final_reply_guest_id: None,
             phase: TurnPhase::Queued,
             iteration: 0,
@@ -1641,8 +1641,8 @@ mod tests {
                 "effective_workspace_ref": "workspace://main",
                 "transport_reply_target": {
                     "target_node": "local-ansible-01",
-                    "target_role": "hegemon",
-                    "target_guest_id": "hegemon-telegram-01"
+                    "target_role": "membrane",
+                    "target_guest_id": "membrane-telegram-01"
                 },
                 "effective_model_controller": "gemini-flash"
             },
@@ -1652,7 +1652,7 @@ mod tests {
                 "chat_id": "123",
                 "user_content": "status?",
                 "final_reply_to": "local-ansible-01",
-                "final_reply_role": "hegemon",
+                "final_reply_role": "membrane",
                 "phase": "waiting_model",
                 "iteration": 1,
                 "pending_tool_call": {
@@ -1691,8 +1691,8 @@ mod tests {
                 effective_workspace_ref: Some("workspace://main".into()),
                 transport_reply_target: Some(TransportReplyTargetBinding {
                     target_node: "local-ansible-01".into(),
-                    target_role: "hegemon".into(),
-                    target_guest_id: Some("hegemon-telegram-01".into()),
+                    target_role: "membrane".into(),
+                    target_guest_id: Some("membrane-telegram-01".into()),
                 }),
                 component_routes: Vec::new(),
                 effective_model_controller: Some("gemini-flash".into()),
@@ -1774,8 +1774,8 @@ mod tests {
             effective_workspace_ref: Some("workspace://main".into()),
             transport_reply_target: Some(TransportReplyTargetBinding {
                 target_node: "local-ansible-01".into(),
-                target_role: "hegemon".into(),
-                target_guest_id: Some("hegemon-telegram-01".into()),
+                target_role: "membrane".into(),
+                target_guest_id: Some("membrane-telegram-01".into()),
             }),
             component_routes: Vec::new(),
             effective_model_controller: Some("gemini-flash".into()),
@@ -1793,7 +1793,7 @@ mod tests {
         assert!(prompt.contains("Workspace: workspace://main."));
         assert!(
             prompt
-                .contains("Delivery target: local-ansible-01 / hegemon guest=hegemon-telegram-01.")
+                .contains("Delivery target: local-ansible-01 / membrane guest=membrane-telegram-01.")
         );
     }
 
@@ -1835,8 +1835,8 @@ mod tests {
         state.bindings.effective_model_controller = Some("gemini-flash".into());
         state.bindings.transport_reply_target = Some(TransportReplyTargetBinding {
             target_node: "local-ansible-01".into(),
-            target_role: "hegemon".into(),
-            target_guest_id: Some("hegemon-telegram-01".into()),
+            target_role: "membrane".into(),
+            target_guest_id: Some("membrane-telegram-01".into()),
         });
 
         let text = state.session_status_text();
@@ -1845,7 +1845,7 @@ mod tests {
         assert!(text.contains("Workspace: workspace://main."));
         assert!(text.contains("Component routes: text.generate [legacy] impl=gemini-flash."));
         assert!(
-            text.contains("Delivery target: local-ansible-01 / hegemon guest=hegemon-telegram-01.")
+            text.contains("Delivery target: local-ansible-01 / membrane guest=membrane-telegram-01.")
         );
     }
 
@@ -1874,8 +1874,8 @@ mod tests {
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.set_transport_reply_target(
             "local-ansible-01",
-            "hegemon",
-            Some("hegemon-telegram-01".into()),
+            "membrane",
+            Some("membrane-telegram-01".into()),
         );
 
         let target = state.resolved_transport_reply_target(
@@ -1885,10 +1885,10 @@ mod tests {
         );
 
         assert_eq!(target.target_node, "local-ansible-01");
-        assert_eq!(target.target_role, "hegemon");
+        assert_eq!(target.target_role, "membrane");
         assert_eq!(
             target.target_guest_id.as_deref(),
-            Some("hegemon-telegram-01")
+            Some("membrane-telegram-01")
         );
     }
 
@@ -2128,7 +2128,7 @@ mod tests {
             chat_id: "123".into(),
             user_content: "hello".into(),
             final_reply_to: "local-ansible-01".into(),
-            final_reply_role: "hegemon".into(),
+            final_reply_role: "membrane".into(),
             final_reply_guest_id: None,
             phase: TurnPhase::Queued,
             iteration: 0,
