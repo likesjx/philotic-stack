@@ -2,20 +2,36 @@
   "context_graph": {
     "gemini_api_key": "YOUR_GEMINI_API_KEY_HERE",
     "elevenlabs_api_key": "YOUR_ELEVENLABS_API_KEY_HERE",
-    "elevenlabs_voice_id": "YOUR_DEFAULT_ELEVENLABS_VOICE_ID_HERE",
-    "default_model": "gemini-pro"
+    "default_model": "gemini-flash-latest"
   },
   "hotels": {
     "default": {
       "agents": {
         "jane": {
+          "agent_id": "agent-jane-01",
+          "persona_name": "Jane",
           "import_workspace": "/Users/you/.openClaw/workspace",
           "telegram": {
             "bot_token": "YOUR_TELEGRAM_BOT_TOKEN_HERE",
-            "allowed_users": ["JaneHegemonBot"]
+            "allowed_users": ["your_telegram_username"]
           },
           "model": {
-            "default_model": "gemini-pro"
+            "default_model": "gemini-flash-latest"
+          },
+          "voice_response_policy": {
+            "mode": "off",
+            "provider": "elevenlabs",
+            "voice_id": "YOUR_ELEVENLABS_VOICE_ID_HERE",
+            "model": "eleven_multilingual_v2",
+            "send_text_caption": true,
+            "fallback_to_text": true
+          },
+          "media_routing_policy": {
+            "forward_media_to_model": true,
+            "voice_action": "transcribe",
+            "image_action": "analyze_media",
+            "document_action": "analyze_media",
+            "strip_tools_on_media": true
           }
         }
       }
@@ -23,13 +39,30 @@
     "aria-architect-hotel": {
       "agents": {
         "aria": {
+          "agent_id": "agent-aria-01",
+          "persona_name": "Aria",
           "import_workspace": "/absolute/path/to/aria-workspace",
           "telegram": {
             "bot_token": "YOUR_ARIA_TELEGRAM_BOT_TOKEN_HERE",
             "allowed_users": []
           },
           "model": {
-            "default_model": "gemini-pro"
+            "default_model": "gemini-flash-latest"
+          },
+          "voice_response_policy": {
+            "mode": "off",
+            "provider": "elevenlabs",
+            "voice_id": "YOUR_ARIA_ELEVENLABS_VOICE_ID_HERE",
+            "model": "eleven_multilingual_v2",
+            "send_text_caption": true,
+            "fallback_to_text": true
+          },
+          "media_routing_policy": {
+            "forward_media_to_model": true,
+            "voice_action": "transcribe",
+            "image_action": "analyze_media",
+            "document_action": "analyze_media",
+            "strip_tools_on_media": true
           }
         }
       }

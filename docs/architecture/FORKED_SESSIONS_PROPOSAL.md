@@ -99,7 +99,7 @@ Problems:
 - leases become ambiguous
 - "latest turn" stops being a single thing
 - checkpoints need branch selectors everywhere
-- model-router, hegemon, and approvals all need branch-aware routing rules
+- model-router, membrane, and approvals all need branch-aware routing rules
 - apartment recovery becomes harder because one "session" no longer corresponds to one working thread
 
 In other words, the irony is that a single "session tree" sounds simpler but forces every consumer to become a branch engine.
@@ -249,7 +249,7 @@ Default user conversations should stay linear unless there is a meaningful reaso
 - clone only the required prefix/summary into the new branch
 - keep new turns and checkpoints isolated to the forked session
 
-### Hegemon / UX
+### Membrane / UX
 
 - support explicit fork commands later
 - display fork labels and branch ancestry in UI/logs

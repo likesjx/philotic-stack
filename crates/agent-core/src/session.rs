@@ -1,5 +1,5 @@
-use crate::catalog::tool_catalog;
-use crate::r#loop::{ApprovalRequest, ToolCall, TurnPhase};
+use crate::catalog::{tool_catalog, tool_class, tool_requires_approval};
+use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
@@ -21,11 +21,17 @@ pub struct WorkingTurn {
     pub final_reply_role: String,
     pub final_reply_guest_id: Option<String>,
     pub phase: TurnPhase,
+    /// Number of model round-trips completed for this turn. Used as the loop counter
+    /// against `MAX_TOOL_ITERATIONS` to bound the re-entry loop.
     pub iteration: u32,
     pub pending_tool_call: Option<ToolCall>,
     pub pending_approval: Option<ApprovalRequest>,
+    /// Accumulated (tool_call, tool_result) pairs for the current in-flight turn.
+    /// Fed back into the model prompt on each re-entry so the model has full context.
+    pub working_tool_history: Vec<(ToolCall, ToolResult)>,
     /// Stashed text content while waiting for voice synthesis to complete.
     pub pending_text_reply: Option<String>,
+    pub had_voice_input: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -40,6 +46,18 @@ pub struct ApprovalPolicy {
 
 fn default_true() -> bool {
     true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TtsMode {
+    /// Never synthesize voice. Default.
+    #[default]
+    Off,
+    /// Synthesize iff the inbound turn had voice/audio input (mirrors modality).
+    Auto,
+    /// Always synthesize regardless of input type.
+    On,
 }
 
 /// Per-agent policy controlling how inbound media attachments are routed to model components.
@@ -87,34 +105,55 @@ impl Default for MediaRoutingPolicy {
 /// Controls whether the agent synthesizes speech for its text responses and, if so, how.
 ///
 /// The agent's `voice_id` is the permanent voice identity for this persona — it doesn't change
-/// per message. `provider` and `model` select the synthesis engine. When `enabled` is false
+/// per message. `provider` and `model` select the synthesis engine. When `mode` is `Off`
 /// (the default) the agent replies with text only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VoiceResponsePolicy {
-    /// Enable voice synthesis for agent responses. Default: false.
+    /// Controls when the agent synthesizes speech for its responses.
     #[serde(default)]
-    pub enabled: bool,
-    /// Voice synthesis provider (e.g. "elevenlabs"). None = use whatever supports voice.synthesize.
+    pub mode: TtsMode,
+    /// Voice synthesis provider hint (e.g. "elevenlabs").
     #[serde(default)]
     pub provider: Option<String>,
-    /// The agent's voice identity — a provider-specific voice ID (e.g. ElevenLabs voice ID).
+    /// The agent's permanent voice identity — a provider-specific voice ID.
     #[serde(default)]
     pub voice_id: Option<String>,
-    /// Provider model name override (e.g. "eleven_multilingual_v2").
+    /// Provider model override (e.g. "eleven_multilingual_v2").
     #[serde(default)]
     pub model: Option<String>,
-    /// Also send the text alongside the audio as a caption. Default: true.
+    /// When mode is `On`, also deliver the text alongside the audio as a caption.
+    /// Ignored for `Auto` (no caption when mirroring voice input).
     #[serde(default = "default_true")]
     pub send_text_caption: bool,
-    /// If synthesis fails, fall back to text-only delivery instead of failing the turn. Default: true.
+    /// Fall back to text-only delivery if synthesis fails. Default: true.
     #[serde(default = "default_true")]
     pub fallback_to_text: bool,
+}
+
+impl VoiceResponsePolicy {
+    /// Returns true if voice synthesis should fire for this turn.
+    pub fn is_active(&self, had_voice_input: bool) -> bool {
+        match self.mode {
+            TtsMode::Off => false,
+            TtsMode::On => true,
+            TtsMode::Auto => had_voice_input,
+        }
+    }
+
+    /// Returns true if the text caption should be sent alongside the audio.
+    pub fn caption_enabled(&self) -> bool {
+        match self.mode {
+            TtsMode::Off => false,
+            TtsMode::On => self.send_text_caption,
+            TtsMode::Auto => false,
+        }
+    }
 }
 
 impl Default for VoiceResponsePolicy {
     fn default() -> Self {
         Self {
-            enabled: false,
+            mode: TtsMode::Off,
             provider: None,
             voice_id: None,
             model: None,
@@ -413,8 +452,31 @@ impl SessionState {
         Some(turn)
     }
 
-    pub fn approval_policy_allows(&self, _approval: &ApprovalRequest) -> bool {
-        self.approval_policy.auto_approve_all
+    /// Returns true if the current approval policy permits auto-approving this request.
+    ///
+    /// Evaluation order:
+    /// 1. `auto_approve_all` — blanket approval for everything
+    /// 2. `preapproved_tools` — the specific tool name is on the preapproval list
+    /// 3. `preapproved_classes` — the tool's catalog class is on the preapproval list
+    ///
+    /// Pass `tool` as the pending `ToolCall` so class-based approval can be evaluated.
+    /// When `tool` is `None` (e.g. a free-form model approval request with no associated
+    /// tool), only `auto_approve_all` is checked.
+    pub fn approval_policy_allows(&self, _approval: &ApprovalRequest, tool: Option<&ToolCall>) -> bool {
+        if self.approval_policy.auto_approve_all {
+            return true;
+        }
+        if let Some(tool) = tool {
+            if self.approval_policy.preapproved_tools.contains(&tool.tool_name) {
+                return true;
+            }
+            if let Some(class) = tool_class(&tool.tool_name) {
+                if self.approval_policy.preapproved_classes.iter().any(|c| c == class) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     pub fn set_preapprove_this_session(&mut self) {
@@ -423,6 +485,118 @@ impl SessionState {
 
     pub fn reset_approval_policy(&mut self) {
         self.approval_policy = ApprovalPolicy::default();
+    }
+
+    /// Apply a configuration change from the `agent.configure` tool.
+    ///
+    /// Returns a human-readable confirmation string on success, or an error message.
+    /// After calling this, the caller should rebuild the tool assembly if bindings changed.
+    pub fn apply_configure(
+        &mut self,
+        config_path: &str,
+        value: &serde_json::Value,
+        operation: &str,
+    ) -> Result<String, String> {
+        match config_path {
+            // ── Approval policy ──────────────────────────────────────────────────
+            "approval_policy.auto_approve_all" => {
+                let v = value
+                    .as_bool()
+                    .ok_or("approval_policy.auto_approve_all requires a boolean value")?;
+                self.approval_policy.auto_approve_all = v;
+                Ok(format!("Set approval_policy.auto_approve_all = {v}."))
+            }
+            "approval_policy.preapproved_tools" => {
+                let item = value
+                    .as_str()
+                    .ok_or("approval_policy.preapproved_tools requires a string value")?
+                    .to_string();
+                apply_string_list_op(&mut self.approval_policy.preapproved_tools, &item, operation)
+                    .map(|_| format!("{operation} '{item}' in approval_policy.preapproved_tools."))
+            }
+            "approval_policy.preapproved_classes" => {
+                let item = value
+                    .as_str()
+                    .ok_or("approval_policy.preapproved_classes requires a string value")?
+                    .to_string();
+                apply_string_list_op(
+                    &mut self.approval_policy.preapproved_classes,
+                    &item,
+                    operation,
+                )
+                .map(|_| {
+                    format!("{operation} '{item}' in approval_policy.preapproved_classes.")
+                })
+            }
+            // ── Agent profile ────────────────────────────────────────────────────
+            "profile.persona_name" => {
+                self.agent_profile.persona_name = Some(
+                    value
+                        .as_str()
+                        .ok_or("profile.persona_name requires a string value")?
+                        .to_string(),
+                );
+                Ok("Updated profile.persona_name.".into())
+            }
+            "profile.soul_text" => {
+                self.agent_profile.soul_text = Some(
+                    value
+                        .as_str()
+                        .ok_or("profile.soul_text requires a string value")?
+                        .to_string(),
+                );
+                Ok("Updated profile.soul_text.".into())
+            }
+            "profile.identity_text" => {
+                self.agent_profile.identity_text = Some(
+                    value
+                        .as_str()
+                        .ok_or("profile.identity_text requires a string value")?
+                        .to_string(),
+                );
+                Ok("Updated profile.identity_text.".into())
+            }
+            "profile.user_context_text" => {
+                self.agent_profile.user_context_text = Some(
+                    value
+                        .as_str()
+                        .ok_or("profile.user_context_text requires a string value")?
+                        .to_string(),
+                );
+                Ok("Updated profile.user_context_text.".into())
+            }
+            "profile.memory_summary" => {
+                self.agent_profile.memory_summary = Some(
+                    value
+                        .as_str()
+                        .ok_or("profile.memory_summary requires a string value")?
+                        .to_string(),
+                );
+                Ok("Updated profile.memory_summary.".into())
+            }
+            // ── Session bindings ─────────────────────────────────────────────────
+            "bindings.effective_toolset" => {
+                let item = value
+                    .as_str()
+                    .ok_or("bindings.effective_toolset requires a string value")?
+                    .to_string();
+                apply_string_list_op(&mut self.bindings.effective_toolset, &item, operation)
+                    .map(|_| format!("{operation} '{item}' in bindings.effective_toolset."))
+            }
+            "bindings.effective_skillset" => {
+                let item = value
+                    .as_str()
+                    .ok_or("bindings.effective_skillset requires a string value")?
+                    .to_string();
+                apply_string_list_op(&mut self.bindings.effective_skillset, &item, operation)
+                    .map(|_| format!("{operation} '{item}' in bindings.effective_skillset."))
+            }
+            other => Err(format!("Unknown config path: '{other}'. Supported paths: \
+                approval_policy.auto_approve_all, approval_policy.preapproved_tools, \
+                approval_policy.preapproved_classes, profile.persona_name, profile.soul_text, \
+                profile.identity_text, profile.user_context_text, profile.memory_summary, \
+                bindings.effective_toolset, bindings.effective_skillset")),
+        }
     }
 
     pub fn set_status(&mut self, status: impl Into<String>) {
@@ -598,6 +772,43 @@ impl SessionState {
 
     pub fn rebuild_default_tool_assembly(&mut self) {
         self.tool_assembly = default_tool_assembly_for_bindings(&self.bindings);
+    }
+
+    /// Record a completed tool call/result pair on the active turn's history.
+    pub fn push_tool_history(&mut self, call: ToolCall, result: ToolResult) {
+        if let Some(turn) = self.active_turn.as_mut() {
+            turn.working_tool_history.push((call, result));
+        }
+    }
+
+    /// Build a re-entry prompt that includes the accumulated tool call history.
+    ///
+    /// Used when the loop re-submits to the model after receiving a tool result.
+    /// The history is appended as a `[Tool call history]` section so the model
+    /// has full context to decide its next action.
+    pub fn build_reentry_prompt(&self) -> Option<String> {
+        let turn = self.active_turn.as_ref()?;
+        let tools = self.project_tools_for_turn(&turn.user_content);
+        let mut prompt = self.build_prompt_with_tools(&turn.user_content, &tools);
+
+        if !turn.working_tool_history.is_empty() {
+            prompt.push_str("\n\n[Tool call history]\n");
+            for (i, (call, result)) in turn.working_tool_history.iter().enumerate() {
+                let args = serde_json::to_string(&call.arguments).unwrap_or_default();
+                prompt.push_str(&format!(
+                    "Call {n}: {name}({args})\nResult {n}: {content}\n\n",
+                    n = i + 1,
+                    name = call.tool_name,
+                    content = result.content,
+                ));
+            }
+            prompt.push_str(
+                "Review the above tool results and continue. \
+                 Call another tool if needed, or respond to the user if you have enough information.",
+            );
+        }
+
+        Some(prompt)
     }
 
     pub fn approval_policy_status_text(&self) -> String {
@@ -927,6 +1138,9 @@ impl SessionState {
                 "iteration": turn.iteration,
                 "pending_tool_call": turn.pending_tool_call,
                 "pending_approval": turn.pending_approval,
+                "working_tool_history": turn.working_tool_history.iter().map(|(call, result)| {
+                    json!({ "call": call, "result": result })
+                }).collect::<Vec<_>>(),
             })
         });
 
@@ -1096,7 +1310,28 @@ impl SessionState {
                     .get("pending_approval")
                     .cloned()
                     .and_then(|value| serde_json::from_value::<ApprovalRequest>(value).ok()),
+                working_tool_history: turn
+                    .get("working_tool_history")
+                    .and_then(|v| v.as_array())
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .filter_map(|entry| {
+                                let call = serde_json::from_value::<ToolCall>(
+                                    entry.get("call")?.clone(),
+                                )
+                                .ok()?;
+                                let result = serde_json::from_value::<ToolResult>(
+                                    entry.get("result")?.clone(),
+                                )
+                                .ok()?;
+                                Some((call, result))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 pending_text_reply: None,
+                had_voice_input: false,
             })
         });
 
@@ -1260,11 +1495,12 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
     let policy_annotations = toolset
         .iter()
         .map(|tool_name| {
+            let class = tool_class(tool_name).unwrap_or("tool");
             (
                 tool_name.clone(),
                 ToolPolicyAnnotation {
-                    policy_class: format!("tool:{tool_name}"),
-                    approval_required: false,
+                    policy_class: class.to_string(),
+                    approval_required: tool_requires_approval(tool_name),
                 },
             )
         })
@@ -1286,7 +1522,7 @@ fn default_visible_toolset(bindings: &SessionBindings) -> Vec<String> {
 }
 
 fn is_local_agent_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "session.status")
+    matches!(tool_name, "session.status" | "agent.configure")
 }
 
 fn is_pinned_tool(tool_name: &str) -> bool {
@@ -1381,8 +1617,8 @@ fn tool_assembly_from_allowed_incarnations(bindings: &SessionBindings) -> ToolAs
             (
                 tool_name.clone(),
                 ToolPolicyAnnotation {
-                    policy_class: format!("tool:{tool_name}"),
-                    approval_required: false,
+                    policy_class: tool_class(tool_name).unwrap_or("tool").to_string(),
+                    approval_required: tool_requires_approval(tool_name),
                 },
             )
         })
@@ -1525,15 +1761,35 @@ fn current_unix_ts() -> u64 {
         .as_secs()
 }
 
+/// Apply a set / append / remove operation to a `Vec<String>` field.
+fn apply_string_list_op(list: &mut Vec<String>, item: &str, operation: &str) -> Result<(), String> {
+    match operation {
+        "set" => {
+            *list = vec![item.to_string()];
+        }
+        "append" => {
+            if !list.contains(&item.to_string()) {
+                list.push(item.to_string());
+            }
+        }
+        "remove" => {
+            list.retain(|x| x != item);
+        }
+        other => return Err(format!("Unknown operation '{other}'. Use 'set', 'append', or 'remove'.")),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
     use super::{
         ApprovalPolicy, ComponentExecutionRoute, ComponentRouteAssembly, ComponentRouteBinding,
         SessionBindings, SessionState, TaskRunnerBaseConfig, ToolRunnerIncarnationBinding,
-        TransportReplyTargetBinding, WorkingTurn, merge_session_index,
+        TransportReplyTargetBinding, WorkingTurn, default_tool_assembly_for_bindings,
+        merge_session_index,
         session_checkpoint_memory_type,
     };
-    use crate::r#loop::{ApprovalRequest, ToolCall, TurnPhase};
     use uuid::Uuid;
 
     #[test]
@@ -1552,7 +1808,9 @@ mod tests {
             iteration: 0,
             pending_tool_call: None,
             pending_approval: None,
+            working_tool_history: Vec::new(),
             pending_text_reply: None,
+            had_voice_input: false,
         });
 
         let checkpoint = state.checkpoint_json();
@@ -1616,7 +1874,9 @@ mod tests {
             iteration: 0,
             pending_tool_call: None,
             pending_approval: None,
+            working_tool_history: Vec::new(),
             pending_text_reply: None,
+            had_voice_input: false,
         });
 
         state.complete_active_turn("hi".into());
@@ -1750,7 +2010,144 @@ mod tests {
             approval_id: Some("appr-2".into()),
             reason: "deploy the thing".into(),
             approved_response: "Approved: deploy the thing".into(),
-        }));
+        }, None));
+    }
+
+    #[test]
+    fn preapproved_tools_bypasses_approval_for_named_tool() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.approval_policy = ApprovalPolicy {
+            auto_approve_all: false,
+            preapproved_tools: vec!["echo".into()],
+            preapproved_classes: Vec::new(),
+        };
+        let approval = ApprovalRequest {
+            approval_id: None,
+            reason: "use echo".into(),
+            approved_response: "ok".into(),
+        };
+        let echo_call = ToolCall { tool_name: "echo".into(), arguments: serde_json::json!({}) };
+        let other_call = ToolCall { tool_name: "workspace.read".into(), arguments: serde_json::json!({}) };
+
+        assert!(state.approval_policy_allows(&approval, Some(&echo_call)));
+        assert!(!state.approval_policy_allows(&approval, Some(&other_call)));
+        assert!(!state.approval_policy_allows(&approval, None));
+    }
+
+    #[test]
+    fn preapproved_classes_bypasses_approval_for_class_members() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.approval_policy = ApprovalPolicy {
+            auto_approve_all: false,
+            preapproved_tools: Vec::new(),
+            preapproved_classes: vec!["workspace".into()],
+        };
+        let approval = ApprovalRequest {
+            approval_id: None,
+            reason: "read file".into(),
+            approved_response: "ok".into(),
+        };
+        let workspace_call = ToolCall { tool_name: "workspace.read".into(), arguments: serde_json::json!({}) };
+        let config_call = ToolCall { tool_name: "agent.configure".into(), arguments: serde_json::json!({}) };
+
+        assert!(state.approval_policy_allows(&approval, Some(&workspace_call)));
+        assert!(!state.approval_policy_allows(&approval, Some(&config_call)));
+    }
+
+    #[test]
+    fn agent_configure_requires_approval_and_is_in_config_class() {
+        use crate::catalog::{tool_class, tool_requires_approval};
+        assert_eq!(tool_class("agent.configure"), Some("config"));
+        assert!(tool_requires_approval("agent.configure"));
+        assert!(!tool_requires_approval("echo"));
+        assert!(!tool_requires_approval("workspace.read"));
+    }
+
+    #[test]
+    fn agent_configure_apply_mutates_approval_policy() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+
+        // Append a tool to preapproved_tools
+        let result = state.apply_configure(
+            "approval_policy.preapproved_tools",
+            &serde_json::json!("echo"),
+            "append",
+        );
+        assert!(result.is_ok());
+        assert!(state.approval_policy.preapproved_tools.contains(&"echo".to_string()));
+
+        // Append a class to preapproved_classes
+        let result = state.apply_configure(
+            "approval_policy.preapproved_classes",
+            &serde_json::json!("workspace"),
+            "append",
+        );
+        assert!(result.is_ok());
+        assert!(state.approval_policy.preapproved_classes.contains(&"workspace".to_string()));
+
+        // Remove the tool
+        let result = state.apply_configure(
+            "approval_policy.preapproved_tools",
+            &serde_json::json!("echo"),
+            "remove",
+        );
+        assert!(result.is_ok());
+        assert!(!state.approval_policy.preapproved_tools.contains(&"echo".to_string()));
+
+        // Set auto_approve_all
+        let result = state.apply_configure(
+            "approval_policy.auto_approve_all",
+            &serde_json::json!(true),
+            "set",
+        );
+        assert!(result.is_ok());
+        assert!(state.approval_policy.auto_approve_all);
+    }
+
+    #[test]
+    fn agent_configure_apply_mutates_profile() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+
+        let result = state.apply_configure(
+            "profile.soul_text",
+            &serde_json::json!("You are a curious and helpful agent."),
+            "set",
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            state.agent_profile.soul_text.as_deref(),
+            Some("You are a curious and helpful agent.")
+        );
+    }
+
+    #[test]
+    fn agent_configure_rejects_unknown_path() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        let result = state.apply_configure("unknown.path", &serde_json::json!("x"), "set");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn policy_annotation_uses_catalog_class_and_approval_required() {
+        let state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        // agent.configure is local_agent so it only appears if in effective_toolset
+        let mut bindings = state.bindings.clone();
+        bindings.effective_toolset = vec!["agent.configure".into(), "echo".into()];
+        let assembly = default_tool_assembly_for_bindings(&bindings);
+
+        let configure_ann = assembly.policy_annotations.get("agent.configure").unwrap();
+        assert_eq!(configure_ann.policy_class, "config");
+        assert!(configure_ann.approval_required);
+
+        let echo_ann = assembly.policy_annotations.get("echo").unwrap();
+        assert_eq!(echo_ann.policy_class, "utility");
+        assert!(!echo_ann.approval_required);
     }
 
     #[test]
@@ -2134,7 +2531,9 @@ mod tests {
             iteration: 0,
             pending_tool_call: None,
             pending_approval: None,
+            working_tool_history: Vec::new(),
             pending_text_reply: None,
+            had_voice_input: false,
         });
         let index = merge_session_index(None, &first);
         assert_eq!(index["active_sessions"].as_array().unwrap().len(), 1);
@@ -2152,5 +2551,90 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(session_ids.iter().filter(|id| **id == "sess-1").count(), 1);
         assert_eq!(session_ids.iter().filter(|id| **id == "sess-2").count(), 1);
+    }
+
+    #[test]
+    fn tool_history_accumulates_and_survives_checkpoint_round_trip() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.start_turn(WorkingTurn {
+            task_id: Uuid::nil(),
+            turn_id: "turn-1".into(),
+            chat_id: "123".into(),
+            user_content: "list workspace files".into(),
+            final_reply_to: "local-ansible-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase: TurnPhase::WaitingTool,
+            iteration: 1,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            pending_text_reply: None,
+            had_voice_input: false,
+        });
+
+        state.push_tool_history(
+            ToolCall { tool_name: "workspace.list".into(), arguments: serde_json::json!({}) },
+            ToolResult { tool_name: "workspace.list".into(), content: "main.rs\nlib.rs".into() },
+        );
+
+        assert_eq!(
+            state.active_turn.as_ref().unwrap().working_tool_history.len(),
+            1
+        );
+
+        // Round-trip through checkpoint
+        let checkpoint = state.checkpoint_json();
+        let restored = SessionState::from_checkpoint(&checkpoint).unwrap();
+        let history = &restored.active_turn.unwrap().working_tool_history;
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].0.tool_name, "workspace.list");
+        assert_eq!(history[0].1.content, "main.rs\nlib.rs");
+    }
+
+    #[test]
+    fn reentry_prompt_includes_tool_call_history() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.start_turn(WorkingTurn {
+            task_id: Uuid::nil(),
+            turn_id: "turn-1".into(),
+            chat_id: "123".into(),
+            user_content: "read the README".into(),
+            final_reply_to: "local-ansible-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase: TurnPhase::WaitingTool,
+            iteration: 1,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            pending_text_reply: None,
+            had_voice_input: false,
+        });
+
+        state.push_tool_history(
+            ToolCall {
+                tool_name: "workspace.read".into(),
+                arguments: serde_json::json!({ "path": "README.md" }),
+            },
+            ToolResult {
+                tool_name: "workspace.read".into(),
+                content: "# Philotic Stack".into(),
+            },
+        );
+
+        let prompt = state.build_reentry_prompt().unwrap();
+        assert!(prompt.contains("[Tool call history]"), "prompt should contain history section");
+        assert!(prompt.contains("workspace.read"), "prompt should name the tool");
+        assert!(prompt.contains("# Philotic Stack"), "prompt should contain result content");
+        assert!(prompt.contains("Call 1:"), "prompt should number the calls");
+    }
+
+    #[test]
+    fn reentry_prompt_returns_none_without_active_turn() {
+        let state = SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        assert!(state.build_reentry_prompt().is_none());
     }
 }

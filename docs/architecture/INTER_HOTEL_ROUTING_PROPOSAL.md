@@ -35,7 +35,7 @@ Accepted in this slice:
 - first heartbeat/registry advertisement shape now exists for hotel-scoped incarnations with availability and placement hints
 - heartbeat refresh and registry freshness filtering now exist for the first advertisement plane slice
 - the hotel now exposes a live mesh-registry view and can route unpinned remote tool capabilities from that registry when no local runner is available
-- the hotel now resolves model capability routes from the same registry-backed placement plane for `text.generate` and `media.analyze`, while hegemon reply delivery remains session-owned rather than placement-selected
+- the hotel now resolves model capability routes from the same registry-backed placement plane for `text.generate` and `media.analyze`, while membrane reply delivery remains session-owned rather than placement-selected
 - routed execution now uses a first point-to-point TCP execution plane for inter-hotel `MESH_EVENT_BATCH` delivery instead of trying to cram rich tasks into UDP packets
 - the first two-hotel remote model roundtrip is now smoke-green in local development over that TCP execution plane
 - heartbeat and registry snapshots now include node-level execution reachability, and the dispatcher prefers those advertised execution endpoints before falling back to local loopback assumptions
@@ -136,7 +136,7 @@ Current implementation note:
 - current routing consumers now include:
   - tool assembly fallback: when no local runner exists for an unpinned tool capability, the hotel may choose a live remote advertisement using preferred hotel, lower latency, and higher available capacity before deterministic incarnation-id tiebreaking
   - model component route assembly: when no live local model implementation exists for `text.generate` or `media.analyze`, the hotel may choose a live remote advertisement using the same preferred-hotel, latency, capacity, and deterministic-id ordering
-  - hegemon reply delivery is intentionally excluded from placement selection because reply transport is bound to the session-owning membrane
+  - membrane reply delivery is intentionally excluded from placement selection because reply transport is bound to the session-owning membrane
   - outbound inter-hotel dispatch: when sending a routed task to a remote node, the dispatcher now prefers live execution reachability learned from heartbeat/registry and only falls back to `127.0.0.1:<execution_port>` for local multi-hotel development
 
 ## Placement Policy

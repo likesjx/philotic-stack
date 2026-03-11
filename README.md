@@ -15,27 +15,19 @@ cp mesh-config.example.json mesh-config.json
 cargo run -p ansible -- --load-config mesh-config.json
 ```
 
-## Architecture Overview
+## Architecture Diagrams
 
-```
-         ┌──────────────────────────────────────┐
-         │            HOTEL (ansible)            │
-         │                                       │
-         │  ┌──────────┐  IPC  ┌──────────────┐ │
-         │  │ hegemon  │◄─────►│ ContextGraph │ │
-         │  └──────────┘       │ GuestManager │ │
-         │  ┌──────────┐       │ IpcServer    │ │
-         │  │agent-core│◄─────►│ BeaconDaemon │ │
-         │  └──────────┘       │ BlobService  │ │
-         │  ┌────────────┐     └──────────────┘ │
-         │  │model-router│◄───────────────────── │
-         │  └────────────┘                       │
-         └────────────────┬──────────────────────┘
-                          │ UDP Mesh
-         ┌────────────────▼──────────────────────┐
-         │          REMOTE HOTEL                  │
-         └────────────────────────────────────────┘
-```
+### Target Architecture
+
+![Target Architecture](docs/target_architecture.svg)
+
+### Implementation Status
+
+![Implementation Status](docs/implementation_status.svg)
+
+> **Legend** — 🟢 Implemented · 🟡 In progress / flag-gated · 🟠 Scaffolded / blocked · ⚫ Planned / docs only
+
+Interactive HTML version (with hover tooltips): [`docs/philotic-architecture-diagram.html`](docs/philotic-architecture-diagram.html)
 
 ## Crates
 
@@ -44,7 +36,7 @@ cargo run -p ansible -- --load-config mesh-config.json
 | [`ansible`](crates/ansible/README.md)                     | Hotel daemon — guest materialization, IPC, mesh routing    |
 | [`ansible-mesh-core`](crates/ansible-mesh-core/README.md) | Core primitives, traits, event types, storage abstractions |
 | [`philotic-client`](crates/philotic-client/README.md)     | Guest SDK — IPC client for hotel communication             |
-| [`hegemon`](crates/hegemon/README.md)                     | Telegram/external protocol gateway guest                   |
+| [`membrane`](crates/membrane/README.md)                     | Telegram/external protocol gateway guest                   |
 | [`agent-core`](crates/agent-core/README.md)               | Persona/agent cognitive loop guest                         |
 | [`model-router`](crates/model-router/README.md)           | LLM model provider routing guest                           |
 

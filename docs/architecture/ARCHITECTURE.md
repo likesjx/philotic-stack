@@ -35,7 +35,7 @@ storage abstractions, and state synchronization.
            │               HOTEL  (Ansible daemon)         │
            │                                               │
            │  ┌──────────┐   IPC    ┌────────────────────┐ │
-           │  │ hegemon  │◄────────►│  ansible (hotel)   │ │
+           │  │ membrane  │◄────────►│  ansible (hotel)   │ │
            │  └──────────┘   UDS    │                    │ │
            │                        │  • ContextGraph DB  │ │
            │  ┌──────────┐          │  • GuestManager     │ │
@@ -69,7 +69,7 @@ storage abstractions, and state synchronization.
 | `ansible`           | Hotel daemon — orchestration and service host                |
 | `ansible-mesh-core` | Shared primitives, traits, mesh types, storage               |
 | `philotic-client`   | Guest SDK — IPC client for guests to talk to the hotel       |
-| `hegemon`           | Telegram/gateway guest binary                                |
+| `membrane`           | Telegram/gateway guest binary                                |
 | `agent-core`        | Persona/agent guest binary                                   |
 | `model-router`      | Model controller SDK + provider binaries (Gemini, ElevenLabs)|
 | `tool-runner`       | Workspace tool executor guest (inactive — not yet spawned)   |
@@ -204,7 +204,7 @@ the hotel exclusively over the IPC UDS socket using `PhiloticClient`.
 
 | Binary                      | Crate                 | Role identity                    | Purpose                                                    |
 | --------------------------- | --------------------- | -------------------------------- | ---------------------------------------------------------- |
-| `hegemon`                   | `crates/hegemon`      | `hegemon-telegram-01`            | Telegram gateway, ingress/egress for external messages     |
+| `membrane`                   | `crates/membrane`      | `membrane-telegram-01`            | Telegram gateway, ingress/egress for external messages     |
 | `agent-core`                | `crates/agent-core`   | `agent-jane-01`                  | Persona runtime, long-running reasoning loop               |
 | `model-controller-gemini`   | `crates/model-router` | `model-controller-gemini-01`     | Gemini provider controller; role `model.gemini`            |
 | `model-controller-elevenlabs` | `crates/model-router` | `model-controller-elevenlabs-01` | ElevenLabs TTS controller; role `model.elevenlabs`         |

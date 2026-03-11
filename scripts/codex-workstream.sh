@@ -45,7 +45,7 @@ hot_file_patterns() {
 crates/ansible/src/main.rs
 crates/ansible/src/service/ipc.rs
 crates/agent-core/src/runtime.rs
-crates/hegemon/src/main.rs
+crates/membrane/src/main.rs
 crates/model-router/src/main.rs
 crates/model-router/src/runtime.rs
 crates/model-router/src/controller.rs

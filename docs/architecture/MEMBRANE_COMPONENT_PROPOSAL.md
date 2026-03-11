@@ -1,28 +1,28 @@
-# Hegemon Component Proposal
+# Membrane Component Proposal
 
 ## Goal
 
-Define `hegemon` as a Philotic component type and interface, not as the name of one specific Telegram implementation.
+Define `membrane` as a Philotic component type and interface, not as the name of one specific Telegram implementation.
 
 This proposal exists to answer four questions cleanly:
 
-- what a hegemon component is
+- what a membrane component is
 - what authority it owns
 - how it connects to the hotel
-- how multiple hegemon implementations can coexist without role confusion
+- how multiple membrane implementations can coexist without role confusion
 
 ## Core Recommendation
 
-Treat `hegemon` as the component class for Philotic's outside-world membrane.
+Treat `membrane` as the component class for Philotic's outside-world membrane.
 
-A hegemon component is the translator, guard, and delivery provider between an external communication surface and the internal Philotic world.
+A membrane component is the translator, guard, and delivery provider between an external communication surface and the internal Philotic world.
 
-Examples of hegemon implementations:
+Examples of membrane implementations:
 
-- `hegemon.telegram`
-- `hegemon.https_listener`
-- `hegemon.whatsapp`
-- `hegemon.imessage`
+- `membrane.telegram`
+- `membrane.https_listener`
+- `membrane.whatsapp`
+- `membrane.imessage`
 
 These are implementations of the same component type, not separate architectural species that just happen to wear similar hats.
 
@@ -32,11 +32,11 @@ Accepted for current slice.
 
 Implemented so far:
 
-- `hegemon` is now explicitly documented as a component type rather than synonymous with Telegram
-- the current generic `role = "hegemon"` reply path is explicitly marked transitional
+- `membrane` is now explicitly documented as a component type rather than synonymous with Telegram
+- the current generic `role = "membrane"` reply path is explicitly marked transitional
 - the hotel IPC layer now supports optional guest-specific local delivery within a shared role
-- `agent-core`, `model-router`, and `hegemon` now carry an optional `final_reply_guest_id` so a turn can preserve its owning hegemon incarnation while keeping role-based fallback
-- session bindings now persist the transport reply target so new turns inherit their owning hegemon target from session state rather than only from inbound payload scaffolding
+- `agent-core`, `model-router`, and `membrane` now carry an optional `final_reply_guest_id` so a turn can preserve its owning membrane incarnation while keeping role-based fallback
+- session bindings now persist the transport reply target so new turns inherit their owning membrane target from session state rather than only from inbound payload scaffolding
 
 Track follow-on work in [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md).
 
@@ -44,15 +44,15 @@ Track follow-on work in [docs/task.md](/Users/jaredlikes/code/philotic-stack/doc
 
 Current repo truth is transitional:
 
-- `crates/hegemon` is a Telegram-oriented guest binary
-- the hotel materializes it with `role = "hegemon"`
-- agent and model flows still preserve `final_reply_role = "hegemon"` as the fallback reply contract
-- agent and model flows can now also preserve an optional hegemon guest target for local delivery
-- session bindings now persist the current reply target (`node`, `role`, optional `guest_id`) so the owning hegemon target survives across turns and checkpoint rehydration
+- `crates/membrane` is a Telegram-oriented guest binary
+- the hotel materializes it with `role = "membrane"`
+- agent and model flows still preserve `final_reply_role = "membrane"` as the fallback reply contract
+- agent and model flows can now also preserve an optional membrane guest target for local delivery
+- session bindings now persist the current reply target (`node`, `role`, optional `guest_id`) so the owning membrane target survives across turns and checkpoint rehydration
 
-This proves the edge-guest idea, but it does not yet define a scalable hegemon interface.
+This proves the edge-guest idea, but it does not yet define a scalable membrane interface.
 
-If we keep one generic reply role forever, multiple hegemons will either:
+If we keep one generic reply role forever, multiple membranes will either:
 
 - all receive the same outbound reply
 - need hidden side-routing logic
@@ -60,9 +60,9 @@ If we keep one generic reply role forever, multiple hegemons will either:
 
 All three are boundary smell.
 
-## What A Hegemon Is
+## What A Membrane Is
 
-A hegemon is the membrane between Philotic and an external communication environment.
+A membrane is the membrane between Philotic and an external communication environment.
 
 It is responsible for:
 
@@ -80,9 +80,9 @@ It is not:
 - a general-purpose arbitrary HTTP gateway
 - a place to bury random business logic because "it touches the outside"
 
-## Hegemon Responsibilities
+## Membrane Responsibilities
 
-Every hegemon implementation should own the same responsibility categories.
+Every membrane implementation should own the same responsibility categories.
 
 ### 1. Ingress Translation
 
@@ -143,7 +143,7 @@ Canonical truth still belongs elsewhere.
 
 ## Non-Responsibilities
 
-Hegemon components should not own:
+Membrane components should not own:
 
 - the conversation loop itself
 - prompt assembly
@@ -152,11 +152,11 @@ Hegemon components should not own:
 - generic tool execution
 - hotel-wide routing policy
 
-If a hegemon starts deciding how the agent should think, it has crossed the membrane and is trying to annex the utopia.
+If a membrane starts deciding how the agent should think, it has crossed the membrane and is trying to annex the utopia.
 
 ## Interface To The Hotel
 
-The hegemon-hotel boundary should be explicit and narrow.
+The membrane-hotel boundary should be explicit and narrow.
 
 ### Hotel-owned concerns
 
@@ -168,9 +168,9 @@ The hotel owns:
 - routing of internal tasks/events between components
 - durable config/secrets retrieval
 
-### Hegemon-owned concerns
+### Membrane-owned concerns
 
-The hegemon owns:
+The membrane owns:
 
 - transport connectivity
 - transport-specific validation
@@ -179,7 +179,7 @@ The hegemon owns:
 
 ### Required interactions
 
-A hegemon should be able to ask the hotel to:
+A membrane should be able to ask the hotel to:
 
 - fetch component config and secrets
 - resolve or create a session binding
@@ -191,13 +191,13 @@ A hegemon should be able to ask the hotel to:
 
 The internal contract should be phrased in terms of normalized events, not Telegram/WhatsApp-specific payloads.
 
-Inbound from hegemon to hotel:
+Inbound from membrane to hotel:
 
 - `ResolveSessionBinding`
 - `EmitInboundTransportEvent`
 - `RecordTransportCheckpoint` when needed
 
-Outbound from hotel to hegemon:
+Outbound from hotel to membrane:
 
 - `DeliverOutboundTransportEvent`
 - `DeliverApprovalRequest`
@@ -212,45 +212,45 @@ Components are blueprints for materialization.
 
 That means the graph should eventually distinguish:
 
-- component type: `hegemon`
+- component type: `membrane`
 - implementation: `telegram`, `https_listener`, `whatsapp`, `imessage`
 - incarnation: the concrete materialized instance on a hotel/environment
 
 Example mental model:
 
-- component type: `hegemon`
+- component type: `membrane`
 - capability: `transport.telegram`
 - implementation: `telegram`
-- incarnation: `hegemon-telegram-01`
+- incarnation: `membrane-telegram-01`
 
 Or:
 
-- component type: `hegemon`
+- component type: `membrane`
 - capability: `transport.whatsapp`
 - implementation: `whatsapp`
-- incarnation: `hegemon-whatsapp-01`
+- incarnation: `membrane-whatsapp-01`
 
 The exact naming can be refined, but the three layers should stay distinct.
 
 ## Routing Recommendation
 
-Do not keep one forever-generic reply target of `hegemon`.
+Do not keep one forever-generic reply target of `membrane`.
 
-Instead, outbound routing should resolve to the hegemon implementation that owns the session binding.
+Instead, outbound routing should resolve to the membrane implementation that owns the session binding.
 
 Recommended direction:
 
-- session binding records the owning hegemon component/incarnation or routable transport target
+- session binding records the owning membrane component/incarnation or routable transport target
 - `agent-core` emits transport-agnostic outbound events
-- the hotel routes those events to the correct hegemon implementation
+- the hotel routes those events to the correct membrane implementation
 
 This avoids teaching `agent-core` whether a session belongs to Telegram, WhatsApp, or a constrained HTTPS listener.
 
 ## Why The Current Generic Role Is Transitional
 
-The current `final_reply_role = "hegemon"` path is useful scaffolding, but it does not scale honestly.
+The current `final_reply_role = "membrane"` path is useful scaffolding, but it does not scale honestly.
 
-Problems it creates once we have multiple hegemons:
+Problems it creates once we have multiple membranes:
 
 - ambiguous fan-out
 - wrong-destination replies
@@ -259,21 +259,21 @@ Problems it creates once we have multiple hegemons:
 
 So the rule should be:
 
-- generic `hegemon` role is acceptable as a current-slice shortcut
-- guest-specific hegemon targeting is the first implemented bridge away from pure role fan-out
-- transport-specific hegemon routing is the real destination architecture
+- generic `membrane` role is acceptable as a current-slice shortcut
+- guest-specific membrane targeting is the first implemented bridge away from pure role fan-out
+- transport-specific membrane routing is the real destination architecture
 
 ## HTTPS Listener Clarification
 
-An HTTPS listener hegemon should not mean a universal raw webhook sink for everything.
+An HTTPS listener membrane should not mean a universal raw webhook sink for everything.
 
-It should mean a deliberate hegemon implementation for one bounded outside-world contract.
+It should mean a deliberate membrane implementation for one bounded outside-world contract.
 
 Examples:
 
-- `hegemon.https_listener.approvals`
-- `hegemon.https_listener.partner_events`
-- `hegemon.https_listener.operator_ingress`
+- `membrane.https_listener.approvals`
+- `membrane.https_listener.partner_events`
+- `membrane.https_listener.operator_ingress`
 
 That keeps the membrane strong:
 
@@ -285,7 +285,7 @@ Not "POST anything here and we will figure out which civilization it belongs to 
 
 ## Relationship To The Telegram Proposal
 
-The Telegram proposal should be read as one hegemon implementation proposal.
+The Telegram proposal should be read as one membrane implementation proposal.
 
 Telegram-specific items belong there:
 
@@ -298,19 +298,19 @@ This proposal defines the more general architectural frame those Telegram choice
 
 ## Recommended Next Slice
 
-Before broadening Telegram itself further, establish the hegemon component boundary in docs and routing language.
+Before broadening Telegram itself further, establish the membrane component boundary in docs and routing language.
 
 That slice should:
 
-- define `hegemon` as a component type
-- mark the generic `role = "hegemon"` reply path as transitional
-- define how session bindings route outbound events back to the owning hegemon
-- prepare for transport-specific hegemon implementations
+- define `membrane` as a component type
+- mark the generic `role = "membrane"` reply path as transitional
+- define how session bindings route outbound events back to the owning membrane
+- prepare for transport-specific membrane implementations
 
 ## Next Seam
 
 After this boundary is accepted, the next highest-value seam is:
 
-- move reply routing from generic `hegemon` role delivery toward binding-owned hegemon targets
+- move reply routing from generic `membrane` role delivery toward binding-owned membrane targets
 
 That is the point where the architecture stops talking about membranes poetically and starts actually honoring them.

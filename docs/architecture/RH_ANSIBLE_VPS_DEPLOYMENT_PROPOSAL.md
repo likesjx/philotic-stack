@@ -82,7 +82,7 @@ Long-term intent is a native VPN built through the hotels themselves. That work 
 /opt/philotic/
   bin/
     ansible          # hotel daemon
-    hegemon          # Telegram gateway guest
+    membrane          # Telegram gateway guest
     agent-core       # persona/cognitive loop guest
     model-router     # LLM routing guest
   etc/               # mode 0700 — philotic user only
@@ -150,7 +150,7 @@ ansible-playbook -i ansible/inventory/hosts.ini ansible/deploy_hotel.yml --tags 
 
 ## VPS Target
 
-The first deployment target is `jane-vps` — one Philotic hotel with a materialized guest stack (`hegemon`, `agent-core`, `model-router`). Multi-hotel and mixed local/VPS deployments build on the same contract.
+The first deployment target is `jane-vps` — one Philotic hotel with a materialized guest stack (`membrane`, `agent-core`, `model-router`). Multi-hotel and mixed local/VPS deployments build on the same contract.
 
 ## Active Work Links
 

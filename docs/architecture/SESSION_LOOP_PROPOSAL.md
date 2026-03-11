@@ -8,7 +8,7 @@ The key architectural decision is:
 
 - `ansible` owns generalized session state, routing, leases, participants, and event history.
 - `agent-core` owns cognition inside a session: prompt assembly, model invocation, tool planning, tool execution coordination, compaction, and final reply synthesis.
-- `hegemon` and other edge guests own transport-specific bindings (`telegram chat -> philotic session`) and delivery UX, not reasoning.
+- `membrane` and other edge guests own transport-specific bindings (`telegram chat -> philotic session`) and delivery UX, not reasoning.
 - `SyncApartment` remains the agent's checkpoint path back to the Context Graph, but it should be treated as snapshot sync, not as a fine-grained event stream.
 
 This keeps Philotic aligned with the hotel/guest model already described in [CLAUDE.md](/Users/jaredlikes/code/philotic-stack/CLAUDE.md) and [PHILOTIC-ARCHITECTURE.md](/Users/jaredlikes/code/philotic-stack/docs/PHILOTIC-ARCHITECTURE.md).
@@ -52,7 +52,7 @@ Today Philotic already has some of the right primitives:
 
 - Guests register over UDS and subscribe by role in [ipc.rs](/Users/jaredlikes/code/philotic-stack/crates/ansible/src/service/ipc.rs).
 - The graph persists guest materialization metadata and memory apartments in [sqlite_storage.rs](/Users/jaredlikes/code/philotic-stack/crates/ansible-mesh-core/src/sqlite_storage.rs).
-- `hegemon`, `agent-core`, and `model-router` already exchange routed tasks over IPC.
+- `membrane`, `agent-core`, and `model-router` already exchange routed tasks over IPC.
 - `agent-core` is still a stub and has no first-class session lifecycle.
 
 The main missing concept is a durable `session` object that survives guest restarts and can drive turn replay, resumption, multi-channel continuity, and cross-component coordination.
@@ -65,7 +65,7 @@ This is not just a chat transcript container.
 
 A Philotic session should be a durable coordination envelope that any guest can participate in:
 
-- `hegemon` can bind an external user/channel to it
+- `membrane` can bind an external user/channel to it
 - `agent-core` can own the cognitive state within it
 - `model-router` can contribute inference work to it
 - approval or streaming guests can observe or extend it
@@ -180,7 +180,7 @@ Examples:
 - CLI ephemeral: `cli:<tty-or-client-id>:agent-jane-01`
 - WebRTC: `webrtc:<remote-peer-id>:agent-jane-01`
 
-`hegemon` should resolve or create a session through the hotel and receive:
+`membrane` should resolve or create a session through the hotel and receive:
 
 - `session_id`
 - current status
@@ -193,7 +193,7 @@ That keeps channel guests stateless apart from transport cursors.
 
 ### 1. Intake
 
-`hegemon` receives a user message and asks `ansible` to:
+`membrane` receives a user message and asks `ansible` to:
 
 - resolve or create session
 - append an inbound event / queued turn
@@ -268,9 +268,9 @@ When the loop completes, `ansible`:
 - marks the turn completed
 - updates session summary / recent transcript cache
 - accepts memory apartment checkpoint updates
-- emits outbound event for `hegemon`
+- emits outbound event for `membrane`
 
-Then `hegemon` sends the transport reply.
+Then `membrane` sends the transport reply.
 
 ## Recommended Communication Shape
 
@@ -367,7 +367,7 @@ Design:
 
 - `agent-core` detects approval-required tools before execution
 - `ansible` records `waiting_approval` on the turn
-- `hegemon` or another UX guest delivers the approval request
+- `membrane` or another UX guest delivers the approval request
 - approval response is written back through hotel IPC
 - `agent-core` resumes from checkpoint
 
@@ -389,7 +389,7 @@ The session loop should be restart-safe.
 - if lease expired and turn is `running`, requeue from latest checkpoint
 - if no checkpoint exists beyond intake, rerun turn from original input
 - if tool side effects are non-idempotent, mark turn `failed_requires_operator`
-- if final response was produced but not delivered, let `hegemon` retry outbound delivery idempotently
+- if final response was produced but not delivered, let `membrane` retry outbound delivery idempotently
 
 This argues for storing a generalized session/turn state machine explicitly instead of treating conversation as one opaque blob.
 
@@ -403,7 +403,7 @@ Scope:
 
 - generalized session model in the graph
 - session participants, lifecycle, leases, and timeline events
-- transport-to-session binding in `hegemon`
+- transport-to-session binding in `membrane`
 - recovery semantics and approval/session visibility
 - generic event envelopes carrying `session_id` / `turn_id`
 
@@ -447,7 +447,7 @@ Deliverables:
 ### Phase 1: Session substrate
 
 - Add graph entities and adapter methods for sessions, participants, and turns
-- Add `hegemon` session resolution before emitting agent work
+- Add `membrane` session resolution before emitting agent work
 - Keep the IPC plane general by carrying session identifiers in existing task/event payloads
 
 ### Phase 2: Single-turn durable loop
@@ -479,7 +479,7 @@ Build only:
 - durable turn records
 - lease acquisition
 - legacy-style bounded tool loop in `agent-core`
-- final response delivery back through `hegemon`
+- final response delivery back through `membrane`
 
 Defer for later:
 
@@ -495,7 +495,7 @@ The cleanest Philotic implementation is:
 
 - `ansible` becomes the source of truth for generalized session and turn lifecycle
 - `agent-core` ports the ZeroClaw cognitive loop as a resumable worker inside that session
-- `hegemon` becomes a transport adapter that binds users to sessions and renders replies/approvals
+- `membrane` becomes a transport adapter that binds users to sessions and renders replies/approvals
 - memory apartments remain the agent checkpoint path back to the graph
 - `SyncApartment` stays snapshot-oriented while smaller session events carry deltas/progress
 

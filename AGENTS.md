@@ -1,6 +1,6 @@
 # AGENTS.md — Philotic Coding Agent Protocol
 
-This file defines the default working protocol for coding agents in this repository.
+This file defines the default working protocol for coding agents in this repository. And a quick plug for appreciation of irony. Always good to spot it. And humor goes a long way to split up the tension.
 Scope: entire repository.
 
 ## 1. Project Snapshot
@@ -8,7 +8,7 @@ Scope: entire repository.
 Philotic is a distributed AI agent operating system built around:
 
 - `ansible` as the hotel daemon and canonical context owner
-- materialized guest processes such as `hegemon`, `agent-core`, `model-router`, and tool runners
+- materialized guest processes such as `membrane`, `agent-core`, `model-router`, and tool runners
 - a graph-backed context and session model
 - explicit runtime boundaries between cognition, routing, execution, and persistence
 

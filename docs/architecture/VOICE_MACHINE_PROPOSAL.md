@@ -20,13 +20,13 @@ Track active work in [task.md](/Users/jaredlikes/code/philotic-stack/docs/task.m
 
 ---
 
-## First Implementation Slice (landed on `codex/hegemon-membrane-slice`)
+## First Implementation Slice (landed on `codex/membrane-membrane-slice`)
 
 Before the full voice machine component exists, two policy-driven seams were added to the existing pipeline:
 
 ### Inbound: configurable media routing (`MediaRoutingPolicy`)
 
-Added to `AgentProfile` in `agent-core/src/session.rs`. Controls what happens when a blob-backed media attachment arrives from hegemon:
+Added to `AgentProfile` in `agent-core/src/session.rs`. Controls what happens when a blob-backed media attachment arrives from membrane:
 
 | Field | Default | Effect |
 |---|---|---|
@@ -53,7 +53,7 @@ Added to `AgentProfile`. Controls whether the agent synthesises speech for its r
 | `send_text_caption` | `true` | Also deliver text alongside audio |
 | `fallback_to_text` | `true` | Text-only delivery if synthesis fails |
 
-Pipeline: model responds → `complete_agent_response` checks policy → `start_voice_synthesis` stashes text, sets `TurnPhase::WaitingVoice`, emits `voice.synthesize` to the voice component → response returns via `handle_voice_synthesis_response` → `deliver_text_reply` sends `FinalReplyPayload` (with `audio_artifact`) to hegemon → hegemon calls `sendVoice`/`sendAudio` via Telegram multipart.
+Pipeline: model responds → `complete_agent_response` checks policy → `start_voice_synthesis` stashes text, sets `TurnPhase::WaitingVoice`, emits `voice.synthesize` to the voice component → response returns via `handle_voice_synthesis_response` → `deliver_text_reply` sends `FinalReplyPayload` (with `audio_artifact`) to membrane → membrane calls `sendVoice`/`sendAudio` via Telegram multipart.
 
 ### Example config
 
@@ -168,7 +168,7 @@ Not because text is sacred, but because systems become much easier to reason abo
 - transcript and media artifact generation
 - emitting normalized turn/session payloads
 
-### Hegemon
+### Membrane
 
 - transport-specific media ingress/egress
 - handing voice messages to the voice machine

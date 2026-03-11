@@ -2,11 +2,11 @@
 
 ## Goal
 
-Define a first-class incarnation model for agents so that a single agent identity can exist as multiple concurrent instances with different capability postures, lifetimes, and ownership of the communication plane. This closes the design gap between a conversational presence and goal-focused execution, while establishing the right primitives for memory, forking, subagent spawning, and inter-agent communication.
+Define a first-class incarnation model for agents so that a single agent identity can operate as multiple concurrent role incarnations with distinct capability postures, separate running contexts, and controlled ownership of the communication plane. Establish the right primitives for role provisioning, membrane routing, memory sharing, handoff, and ephemeral task delegation.
 
 ## Disposition
 
-`draft — proposed for design review before implementation`
+`design review complete — revised model adopted, implementation sequencing next`
 
 ## Linked Work Surface
 
@@ -17,455 +17,419 @@ Define a first-class incarnation model for agents so that a single agent identit
 
 ## Core Thesis
 
-An **agent** is an identity: a profile with soul, history, relationships, and memory.
+An **agent** is an identity: soul, history, relationships, and shared memory. That identity is singular and continuous — it does not fork.
 
-An **incarnation** is a running instance of that agent with a specific capability posture, a bounded lifetime, and — at any given moment — possible ownership of the communication plane for a session.
+An **incarnation** is a long-lived, named role that the agent plays. Each incarnation has its own capability posture (toolset/skillset), its own role identity addendum layered on top of the base soul, and its own running session context (turn history, working memory). Multiple incarnations can be active concurrently. The **philotic membrane (membrane)** routes inbound user messages to exactly one incarnation at a time — the active one — but all incarnations can send outbound messages back through the membrane.
 
-The communication plane (hegemon) should deliver inbound messages to whichever incarnation currently owns the session. Forking is the act of a running incarnation delegating session ownership to a new one. The original incarnation stays alive but goes quiet until control returns.
+**Workers and subagents** are a separate, ephemeral category: short-lived task delegates that have no access to the communication plane. Their results bubble up to the incarnation that spawned them.
 
-This maps naturally to how people work: you talk to someone (conversational), they spin up a focused mode to do a task (worker), maybe they delegate a subtask to someone else (subagent). The session tracks who is "on duty."
-
----
-
-## Incarnation Taxonomy
-
-Three incarnation kinds. All run as `agent-core` binary processes — the kind is a configuration posture, not a different binary.
-
-### `conversational`
-
-- **Purpose**: User-facing. The default presence on the communication plane.
-- **Lifetime**: Long-lived. Supervised by the hotel (auto-respawned if it dies). One per agent identity per hotel.
-- **Toolset posture**: Minimal. Primary tools are: memory operations, profile query/update, status, and handoff/kickoff actions. No heavy side-effecting tools by default.
-- **Memory access**: Full — has working memory (turns), session memory, and long-term memory access.
-- **Session ownership**: Owns inbound messages when no worker is active.
-
-### `worker`
-
-- **Purpose**: Goal-focused execution. Spawned by the conversational incarnation for a specific declared goal.
-- **Lifetime**: Medium-lived. Exists until the goal is complete, the user abandons it, or a configured idle TTL expires (suggested default: 30 minutes). Not auto-respawned on crash — failure is a terminal event that returns ownership to conversational.
-- **Toolset posture**: Pre-configured named profile (e.g., `"codex"`, `"browser"`, `"research"`). Tools are selected at spawn time and do not change during the worker's life.
-- **Memory access**: Read-only access to shared long-term memory. Writes go through explicit `UpdateMemory` actions so the conversational agent can review them on handoff-back.
-- **Session ownership**: Owns inbound messages from the moment it acknowledges the handoff until it emits HandoffBack or is abandoned.
-
-### `subagent`
-
-- **Purpose**: Single atomic task. Spawned by any incarnation. Not user-facing.
-- **Lifetime**: Short. Dies after emitting a result (or a failure) or hitting a hard TTL (suggested default: 5 minutes). Not supervised — no auto-respawn.
-- **Toolset posture**: Explicitly enumerated at spawn time. No defaults.
-- **Memory access**: None by default. May receive a snapshot of relevant context at spawn.
-- **Session ownership**: Never. Subagents do not appear in the communication plane. Their results are delivered to the spawning incarnation as task results.
+The analogy: an agent is a person. Their role incarnations are the hats they wear — developer, architect, researcher. Switching hats doesn't change who they are or what they know. A worker is more like a contractor they've hired for a specific job.
 
 ---
 
-## Session Ownership and Communication Plane Switching
+## Incarnation Categories
 
-### Current gap
+### Category 1: Role Incarnations
 
-Today the communication plane routes inbound messages using a per-task `final_reply_role` / `final_reply_guest_id`. This is per-turn, not per-session. Hegemon has no session-level concept of which incarnation is "on duty."
+Long-lived, named, provisioned through the orchestrator. Each is a persistent process on the hotel.
 
-### Recommendation
+**Properties:**
+- **Identity**: shares the base agent soul + carries a `role_identity_addendum` (extra persona/directive text specific to this role)
+- **Context**: own session — separate turn history, working memory, active turn state
+- **Toolset**: defined by a named `toolset_profile` (see Role Provisioning)
+- **Skillset**: defined by a named skill set in the profile
+- **Turn loop config**: per-role — iteration cap, approval policy, model selection, context window policy
+- **Memory**: full read/write access to the shared agent memory layer (same as all other incarnations)
+- **Membrane**: can own inbound routing; can always send outbound
+- **Lifetime**: long-lived, supervised by the hotel, auto-respawned on crash. Subject to **inactive TTL** — if a role has no active session and no pending tasks for longer than its configured idle TTL, the hotel may reclaim the process. The role definition persists in the Context Graph; it is rematerialized on-demand when it next receives a handoff or inbound task.
+- **Provisioning**: created and configured via the `agent.configure_role` tool, available to the orchestrator incarnation
 
-Add `active_incarnation_id` to the session record in the Context Graph.
-
-Before routing an inbound message, hegemon queries the session record to determine which incarnation currently owns it, then routes to that guest. If no session record exists, fall back to the default conversational incarnation for the agent.
-
-The session record is owned by the hotel (Context Graph). Only the hotel updates `active_incarnation_id`, in response to IPC requests from incarnations — not directly by hegemon.
-
-### Handoff Flow
-
+**Example: Aria's role incarnations**
 ```
-conversational emits: HandoffToWorker { goal, toolset_profile, workspace_ref?, ttl_s }
-  ↓
-IpcServer receives HandoffToWorker
-  hotel materializes worker incarnation if not already live (with toolset_profile bindings)
-  hotel updates session.active_incarnation_id = worker.guest_id
-  hotel emits SessionHandoffTask to worker with {goal, session_id, memory_snapshot}
-  hotel emits HandoffAck to conversational
-  ↓
-worker receives SessionHandoffTask → starts loop
-next inbound message from hegemon → routes to worker
-  ↓
-worker emits: HandoffBack { summary, memory_updates? }
-  hotel updates session.active_incarnation_id = conversational.guest_id
-  hotel delivers summary to conversational as an InboundTask
-  hotel applies memory_updates (with validation)
-  ↓
-next inbound message → routes back to conversational
+aria:orchestrator     ← default active; user-facing; spawns/delegates; minimal tools
+aria:tech-researcher  ← web search, doc reading, synthesis
+aria:scrum-lead       ← project/task management tools
+aria:developer        ← workspace.* + shell.* tools; high iteration cap
+aria:architect        ← design tools, long-horizon planning; auto-approve reads
+aria:env-engineer     ← infrastructure and deployment tools
 ```
 
-### Abandonment
+### Category 2: Workers / Subagents
 
-The user can send `/abandon` to abort the current worker. Hegemon forwards this to the active incarnation. If it is a worker, it terminates and control returns to conversational with a summary of what was in progress.
+Ephemeral task delegates. Spawned by any incarnation for a specific, bounded task.
 
-A worker may also self-abandon with `AbandonSelf { reason }` if it determines the goal is impossible.
-
----
-
-## Forking Semantics
-
-Forking is not process-level — it is session ownership transfer. The original incarnation is not killed. Multiple incarnations of the same agent can coexist on the hotel, but only one owns the session at a time.
-
-Key rules:
-
-- **Only the active session owner can fork.** Conversational can hand off to a worker; a worker cannot directly promote a subagent to session owner.
-- **Forks are sequential, not parallel.** There is one active session owner at all times. Parallel multi-worker execution is a later concern.
-- **Forking is scoped to a session.** A hotel can have multiple sessions active (different Telegram chat IDs, different users). Each session has its own `active_incarnation_id`.
-- **Workers do not persist across hotel restarts.** When the hotel restarts, all worker incarnations are gone. The conversational incarnation is re-materialized and the session returns to it.
+**Properties:**
+- **No membrane access**: never own inbound routing; never send directly to the user
+- **Results bubble up**: all outputs are delivered back to the spawning incarnation as task results
+- **Toolset**: explicitly enumerated at spawn time — no profile lookup
+- **Context**: receives a context snapshot passed by the spawner at spawn time; no persistent history
+- **Memory**: no direct memory access by default; may receive a memory excerpt in the context snapshot
+- **Lifetime**: ephemeral — exits after emitting a result or hitting TTL. Caller-configurable TTL with a hard maximum (suggested: 30 minutes). No auto-respawn; failure delivers `FailTask` to the parent.
+- **From the loop's perspective**: spawning a worker looks like calling a slow tool — `WaitingTool` phase, result re-enters the model loop as a tool result
 
 ---
 
-## Subagent Spawning
+## Active Membrane Routing
 
-A subagent is spawned via a new `SpawnSubagent` IPC action:
+### The `active_incarnation_id` primitive
+
+The Context Graph session record carries `active_incarnation_id`. The hotel's IpcServer reads this field when routing inbound tasks from membrane.
+
+- Default: the agent's orchestrator/conversational incarnation
+- Updated by the hotel in response to handoff signals from incarnations
+- If the active incarnation is not registered (race window, crash), fall back to the orchestrator immediately and log
+
+Inbound routing rule:
+```
+incoming message for agent X in session S
+  → hotel reads session.active_incarnation_id
+  → route to that guest via UDS
+  → if not registered: route to default orchestrator incarnation
+```
+
+### Concurrent roles
+
+Multiple role incarnations can be running concurrently. The `active_incarnation_id` governs inbound only. Any incarnation can emit outbound to membrane at any time (e.g. a developer role sending a progress update while the orchestrator owns inbound).
+
+This means a user may receive messages from multiple incarnations interleaved. Membrane should label the sender (role name) in the delivery context so the user has visibility into which role is speaking.
+
+### Membrane switching
+
+The active incarnation changes when:
+1. An incarnation emits a `HandoffToRole` or `HandoffBack` IPC signal
+2. The user issues a `/role <name>` or `/back` slash command
+3. An operator sends a control signal (future)
+
+The hotel processes the switch: updates `active_incarnation_id`, queues inbound for the new owner, notifies both the outgoing and incoming incarnation.
+
+**Race window handling**: the hotel does not update `active_incarnation_id` until the target incarnation's process is registered and responsive. If the target is not yet live, the hotel materializes it, queues the inbound message, and delivers once registration is confirmed.
+
+---
+
+## Handoff Skill
+
+Handoff is not a raw IPC call — it is a **defined skill** that incarnations invoke to signal and execute a role transition. This makes handoff parametric, introspectable, and extensible.
+
+### What a handoff skill defines
+
+A handoff skill specifies:
+- **Trigger patterns**: the prompt shapes or content signals that indicate this handoff should occur (used by the model to decide when to invoke it)
+- **Handoff instructions**: what context to gather, how to summarize the current state, what to pass to the receiving incarnation
+- **Cleanup steps**: what the outgoing incarnation should do before yielding (flush working memory, update session facts, emit a user-facing status message)
+- **Target role**: which incarnation should receive the handoff
+
+### Handoff context bundle
+
+The handoff passes a structured bundle to the receiving incarnation:
 
 ```rust
-SpawnSubagent {
-    parent_task_id: Uuid,
-    goal: String,
-    toolset: Vec<String>,
-    context_snapshot: Option<String>,  // JSON, agent decides what to pass
-    workspace_ref: Option<String>,
-    ttl_seconds: u64,
+HandoffBundle {
+    goal: String,               // what the receiving role should accomplish
+    context_excerpt: String,    // relevant recent turns / decisions from the sender
+    session_id: String,         // shared session ID (both incarnations work within the same session)
+    initiating_turn_id: String, // the turn that triggered the handoff
+    return_to: Option<String>,  // role to hand back to when complete (defaults to orchestrator)
 }
 ```
 
-The hotel:
-1. Materializes a short-lived `agent-core` process with `PHILOTIC_AGENT_ROLE=subagent`, `PHILOTIC_AGENT_PARENT_ID=<spawner>`, and the provided toolset bindings.
-2. Sends the subagent a single inbound task containing the goal and context snapshot.
-3. Waits for the subagent to emit a result (via `CompleteTask` or `FailTask`).
-4. Delivers the result to the spawning incarnation as a `tool_result`-shaped InboundTask.
-5. Reclaims the subagent process after result delivery.
+The receiving incarnation gets: its own prior session history + the `HandoffBundle`. It does not get the full turn history of the sender — that is the explicit isolation boundary.
 
-Subagents are opaque to hegemon and to the user. From the parent's perspective, spawning a subagent looks like invoking a slow tool.
+### Handoff flow
 
-From the agent loop perspective, `SpawnSubagent` is an `AgentAction` kind. The loop handles it the same way as a tool call: `WaitingTool` phase, with subagent result delivered as a tool result that re-enters the model loop.
+```
+orchestrator decides to hand off to developer
+  → invokes handoff.to_developer skill
+  → skill builds HandoffBundle from recent context
+  → emits HandoffToRole IPC with bundle
+  ↓
+hotel receives HandoffToRole
+  → materializes developer incarnation if not live
+  → queues HandoffBundle for delivery on registration
+  → updates session.active_incarnation_id = developer.guest_id (after registration)
+  → emits HandoffAck to orchestrator
+  ↓
+orchestrator enters delegating phase (does not start new turns)
+developer receives HandoffBundle → starts loop
+next inbound user message → routes to developer
+  ↓
+developer completes goal
+  → emits HandoffBack { summary, return_to }
+hotel updates active_incarnation_id = orchestrator.guest_id
+  → delivers summary to orchestrator as InboundTask
+  → orchestrator resumes
+```
+
+### Return handoffs
+
+Any incarnation can hand back. The `HandoffBack` carries a summary that the receiving incarnation (usually orchestrator) gets as its next inbound. This is the feedback loop: the orchestrator learns what the developer did.
 
 ---
 
-## Memory Architecture
+## Role Provisioning
 
-Four tiers, ordered by scope and durability:
+Role incarnations are defined in the **Context Graph**, not in static config. The orchestrator incarnation has access to the `agent.configure_role` tool, which creates or updates a role definition.
 
-### Tier 1: Working Memory (in-process, per turn)
+### Role record
 
-- `recent_turns`: last 8 completed turns (already exists)
-- `working_tool_history`: tool call + result pairs for the current in-flight turn (required by AGENT_LOOP_PROPOSAL.md Gap 1)
-- Rolling summary: auto-generated summary injected when `recent_turns` window fills, replacing the oldest turns
+```rust
+RoleIncarnationRecord {
+    agent_id: String,
+    role_name: String,                    // e.g. "developer"
+    role_identity_addendum: String,       // persona/directive text layered on base soul
+    toolset_profile: String,              // reference to a ToolsetProfile in the graph
+    turn_loop_config: TurnLoopConfig,
+    inactive_ttl_seconds: Option<u64>,    // None = no reclaim
+    is_active_in_hotel: bool,
+}
 
-**Working memory summarization**: when `recent_turns` reaches 8, the conversational incarnation should emit a `SummarizeContext` internal action. This is a model call (short prompt: "Summarize the key facts from this conversation history in 3-5 sentences for future reference.") whose result replaces the oldest half of the turn window and is stored in Tier 2. This should be transparent to the user.
+TurnLoopConfig {
+    max_iterations: u32,                  // model round-trips per turn
+    approval_policy: ApprovalPolicy,      // preapproved_tools, preapproved_classes
+    preferred_model: Option<String>,      // override model selection for this role
+    context_window_turns: u32,            // how many recent turns to include in context
+}
+```
 
-### Tier 2: Session Memory (hotel apartment, per session)
+### Toolset profiles
 
-- Session checkpoint: already stored as `short_session:{session_id}` — includes bindings, active turn, recent turns, profile snapshot.
-- Session facts: new apartment type `session_facts:{session_id}` — structured facts the agent has written about this session (user preferences learned, decisions made, context established). Written via `UpdateMemory { kind: "session_fact" }`.
+A `ToolsetProfile` is a named bundle of tools and skills stored in the Context Graph as a `toolset_profile` node:
 
-### Tier 3: Agent Short-Term Memory (hotel apartment, per agent, cross-session)
+```rust
+ToolsetProfileRecord {
+    profile_name: String,
+    tools: Vec<String>,     // direct tool grants by abstract_tool name
+    skills: Vec<String>,    // skill grants (each expands to implied_tools at assembly time)
+}
+```
 
-- Agent profile: `soul_text`, `identity_text`, `user_context_text`, `memory_summary` — already seeded from config. Can be updated by the agent via `UpdateMemory { kind: "profile" }`.
-- Activity log: a rolling summary of recent sessions (what was worked on, outcomes, unresolved threads). Written on session end by the conversational incarnation.
-- Cross-session user context: persistent facts about the user that should survive across sessions (preferences, relationships, ongoing projects). Written explicitly by the agent.
+Built-in profiles seeded at hotel startup alongside the tool catalog:
 
-Tier 3 is stored in `memory_apartments` under agent-scoped keys (not session-scoped). Hotel enforces size limits.
+| Profile | Tools | Notes |
+|---|---|---|
+| `"orchestrator"` | `session.status`, `agent.configure_role`, `handoff.*`, `memory.search` | Default for conversational role |
+| `"codex"` | `workspace.read`, `workspace.list`, `workspace.write`, `workspace.search` | Software dev |
+| `"browser"` | `browser.navigate`, `browser.read`, `browser.screenshot` | Web research |
+| `"research"` | `workspace.read`, `workspace.search`, `memory.search` | Doc/memory synthesis |
+| `"utility"` | `echo`, `session.status` | Minimal capability |
 
-### Tier 4: Long-Term Memory (external service)
+### Skill catalog
 
-Initially: **Muninn** accessed as a hotel-mediated tool. The conversational agent can call `memory.search`, `memory.store`, and `memory.relate` tools that the hotel routes to a local Muninn HTTP endpoint. This is the same pattern as the current `model.manager.*` tools — a hotel-side invoker that wraps the external service.
+Skills are defined in the graph as `abstract_skill` nodes (parallel to `abstract_tool`):
 
-Later: **Philotic-native memory guest** (`muninn-core` crate) materializing as a hotel guest with its own UDS registration, exposing the same tool surface but without the HTTP hop. Whether this is a Rust rewrite of Muninn internals or a port of the protocol is a separate decision to make after Muninn's value is demonstrated in production.
+```rust
+AbstractSkillRecord {
+    skill_name: String,
+    description: String,           // model-facing description of what this skill represents
+    implied_tools: Vec<String>,    // tools implicitly granted when skill is active
+}
+```
 
-The decision of whether Muninn stays external or becomes native should be driven by whether cross-hotel memory federation is needed. If memory is hotel-local, a native guest is clean. If memory needs to be shared across hotels, Muninn's existing graph API may be the right substrate to keep.
+Skills serve dual purpose: a model prompt hint (`"Current skill posture: codex"`) and a tool grant mechanism. Assigning a skill to a role implicitly adds its `implied_tools` to the effective toolset at assembly time.
 
-### Memory Update Safety
+---
 
-The agent can propose memory updates via a new `UpdateMemory` action:
+## Inactive TTL and On-Demand Materialization
+
+Role incarnations that are not the active session owner and have no pending tasks may be reclaimed by the hotel after their `inactive_ttl_seconds` has elapsed.
+
+**Reclaim**: the hotel sends a graceful shutdown signal, waits for the incarnation to flush its in-memory state to the shared memory layer, then terminates the process and marks `is_active_in_hotel = false` in the Context Graph.
+
+**Rematerialization**: when the reclaimed role receives a handoff or inbound task, the hotel re-materializes it from its role record, delivers the pending task, and resumes normal operation. The role restores its session context from the shared memory layer.
+
+This makes long-tail role incarnations cheap: they don't consume a running process when idle, but they retain continuity because their session state is durably stored.
+
+The supervisor loop's existing 5s check handles this: add a TTL check alongside the liveness check. Active membrane owner is never reclaimed.
+
+---
+
+## Shared Memory
+
+All role incarnations share the same memory layer. There is no per-role memory isolation. This is the continuity guarantee: every incarnation operates on the same agent knowledge, regardless of which role is active.
+
+### Memory tiers
+
+**Tier 1 — Working memory (in-process, per turn)**
+- `recent_turns`: last N completed turns for the current incarnation's session
+- `working_tool_history`: tool call + result pairs for the current in-flight turn (Gap 1 of AGENT_LOOP_PROPOSAL)
+- Rolling summary: auto-generated on window overflow, stored to Tier 2
+
+**Tier 2 — Session memory (hotel apartment, per session)**
+- Session checkpoint: existing `short_session:{session_id}` — bindings, active turn, recent turns, profile snapshot
+- Session facts: `session_facts:{session_id}` — structured facts written during the session. List of fact records (not a blob) so the hotel can enforce count limits and the agent can target-delete entries.
+
+**Tier 3 — Agent memory (hotel apartment, per agent, cross-session)**
+- Agent profile: `soul_text`, `identity_text`, `user_context_text`, `memory_summary` — seeded from config, updatable via `UpdateMemory`
+- Activity log: rolling summary of recent sessions (outcomes, unresolved threads) — written on session end
+
+All role incarnations read and write the same Tier 2/3 apartments. Changes during a user turn are immediately visible to all incarnations reading memory — the LWW push/pull semantics of `SyncApartment` are the consistency model. No additional synchronization is needed.
+
+**Tier 4 — Long-term memory (external service)**
+Initially: **Muninn** accessed as a hotel-mediated tool. The active incarnation can call `memory.search`, `memory.store` tools that the hotel routes to the local Muninn endpoint. Memory retrieval is automatic at prompt build time: before building the model prompt, if Muninn is configured, the hotel runs `memory.search` with the user message as the query and injects top-N results into the `[Knowledge]` projection section. This is transparent to the model.
+
+If Muninn is unavailable, the hotel returns empty results with a logged warning — not a turn failure.
+
+Future: a **philotic-native memory guest** combining MuninnDB and HippoGraph. The substrate decision (external vs. native, graph structure) should be driven by demonstrated production value from the Muninn experiment, not pre-committed in this proposal.
+
+### Memory update safety
 
 ```rust
 UpdateMemory {
-    kind: MemoryUpdateKind,  // SessionFact | Profile | ActivityLog | UserContext
+    kind: MemoryUpdateKind,       // SessionFact | Profile | ActivityLog
     content: String,
     merge_strategy: MergeStrategy,  // Append | Replace | Patch
 }
 ```
 
 Hotel-side enforcement:
-- `SessionFact`: always allowed, size-limited.
-- `Profile` (`identity_text`, `soul_text`): rate-limited. Max 1 profile update per session. Content size-limited. Operator-configurable: can require `/approve` before applying.
-- `UserContext`: allowed but rate-limited. Size-limited.
-- `ActivityLog`: only on session end signal; not mid-session.
+- `SessionFact`: always allowed, size-limited, count-limited per session
+- `Profile` (`identity_text`, `soul_text`): rate-limited (max 1 per session), size-limited, operator-configurable approval gate
+- `ActivityLog`: only on session end signal; not mid-session
 
-The conversational incarnation is the only one allowed to write Tier 3 memory. Workers write to Tier 1/2 only, and propose Tier 3 updates via `HandoffBack.memory_updates`. Conversational reviews and applies (or discards) those proposals.
+All role incarnations may write to Tier 2. Tier 3 profile writes are rate-limited regardless of which incarnation emits them.
+
+---
+
+## Workers / Subagents (detail)
+
+A worker is spawned via `SpawnSubagent` IPC:
+
+```rust
+SpawnSubagent {
+    parent_task_id: Uuid,
+    goal: String,
+    toolset: Vec<String>,           // explicit list; no profile lookup
+    context_snapshot: Option<String>,
+    ttl_seconds: u64,               // caller-specified; hard max enforced by hotel
+}
+```
+
+The hotel:
+1. Materializes a short-lived `agent-core` process with `PHILOTIC_AGENT_MODE=subagent` and the provided toolset bindings
+2. Sends the subagent a single inbound task (goal + context snapshot) once the process registers
+3. Records the parent association (`parent_task_id → parent_guest_id`)
+4. When the subagent emits `CompleteTask` or `FailTask`, delivers the result to the parent as an `InboundTask` (fully async — the hotel does not block)
+5. Reclaims the subagent process after result delivery
+
+The `agent-core` runtime in subagent mode: after emitting `CompleteTask` or `FailTask`, exit rather than continue listening.
+
+Subagents cannot spawn subagents by default. Nested spawning, if later allowed, must cap child TTL to parent's remaining TTL.
 
 ---
 
 ## Inter-Agent Communication
 
-Agents can communicate with each other as peers via existing `EmitTask` IPC. The key gap is discovery: an agent needs to know what other agents are available.
+Agents communicate as peers via `EmitTask` IPC to a known peer's `guest_id`. The session snapshot includes a `known_peers` list scoped to the local hotel. Cross-hotel peer communication uses the inter-hotel mesh (after routing gaps are resolved).
 
-### Recommendation
+**First slice**: same-hotel peer task emission via existing `EmitTask`. Validate in live use before generalizing.
 
-The session snapshot returned by the hotel should include a `known_peers` list:
-
-```json
-"known_peers": [
-  { "agent_id": "agent-aria-01", "role": "agent", "hotel_id": "aria-architect-hotel" }
-]
-```
-
-An incarnation can then emit a task to a peer agent by `target_guest_id = "agent-aria-01"`. The hotel routes it via the normal `EmitTask` dispatch (local UDS if same hotel, inter-hotel mesh if remote).
-
-Peer task results return via the normal `InboundTask` path to the sending incarnation. From the loop's perspective, a peer task call looks like a slow tool call.
-
-A `DelegateToPeer` action is cleaner than a raw `EmitTask`:
-
-```rust
-DelegateToPeer {
-    peer_agent_id: String,
-    goal: String,
-    context_snapshot: Option<String>,
-}
-```
-
-The hotel wraps this in a proper `EmitTask` and wires up the reply routing.
-
-Deferred: streaming replies from peer agents; broadcast to all agents of a role.
+**Deferred**: `DelegateToPeer` abstraction, multi-turn peer exchange, cross-hotel result routing.
 
 ---
 
-## Incarnation Lifetime Policy
+## Incarnation Lifetime Summary
 
-| Kind | Supervised | Auto-respawn | Idle TTL | Death on failure |
+| Category | Supervised | Auto-respawn | Inactive TTL | On failure |
 |---|---|---|---|---|
-| `conversational` | Yes | Yes | None (persistent) | No — supervisor respawns |
-| `worker` | No | No | 30 min (configurable) | Yes — returns to conversational with error summary |
-| `subagent` | No | No | 5 min (hard) | Yes — delivers FailTask to parent |
-
-Workers and subagents are tracked in the Context Graph under `materialized_guests` with `incarnation_kind` field. The supervisor loop skips auto-respawn for non-conversational kinds.
+| Role incarnation | Yes | Yes | Configurable (default: none for orchestrator, 30 min for others) | Respawn; session stays assigned |
+| Active membrane owner | Yes | Yes | Never reclaimed while active | Respawn; buffer inbound |
+| Worker / subagent | No | No | Hard max (caller-specified) | Deliver `FailTask` to parent |
 
 On hotel restart:
-- Conversational incarnations are re-materialized (existing behavior).
-- Worker and subagent guests are marked `is_active=0` on restart (they had ephemeral state that is now gone).
-- Sessions that were owned by a worker revert to conversational on next inbound message (the hotel resolves this via `active_incarnation_id` fallback logic).
+- Role incarnations are re-materialized (same as current guest supervisor behavior)
+- Worker/subagent guests are marked `is_active=0`; in-flight tasks are failed to their parents on reconnect
+- Sessions retain their `active_incarnation_id`; if the active role is not yet re-materialized, the hotel buffers inbound until it registers
 
 ---
 
 ## New IPC Actions Required
 
-The following new `IpcRequest` variants are needed:
-
 | Action | Direction | Purpose |
 |---|---|---|
-| `HandoffToWorker { goal, toolset_profile, workspace_ref, ttl_s }` | guest → hotel | Fork session to a worker incarnation |
-| `HandoffBack { summary, memory_updates }` | guest → hotel | Return session to conversational |
-| `AbandonSelf { reason }` | guest → hotel | Worker/subagent self-terminates |
-| `SpawnSubagent { ... }` | guest → hotel | Materialize a short-lived subagent |
-| `UpdateMemory { kind, content, merge_strategy }` | guest → hotel | Propose a memory/profile update |
-| `DelegateToPeer { peer_agent_id, goal, context_snapshot }` | guest → hotel | Delegate a goal to another agent |
-
-The following new `IpcResponse` variants are needed:
+| `HandoffToRole { role_name, handoff_bundle }` | guest → hotel | Signal membrane switch to a named role incarnation |
+| `HandoffBack { summary, return_to? }` | guest → hotel | Return membrane to calling or specified role |
+| `AbandonSelf { reason }` | guest → hotel | Worker/subagent self-terminates; delivers FailTask to parent |
+| `SpawnSubagent { ... }` | guest → hotel | Materialize an ephemeral subagent |
+| `UpdateMemory { kind, content, merge_strategy }` | guest → hotel | Propose a memory update |
+| `ConfigureRole { role_record }` | guest → hotel | Create or update a role incarnation definition (orchestrator only) |
 
 | Response | Direction | Purpose |
 |---|---|---|
-| `HandoffAck { worker_incarnation_id }` | hotel → guest | Worker spawned and session transferred |
-| `HandoffBackAck` | hotel → guest | Session returned to conversational |
+| `HandoffAck { incarnation_id }` | hotel → guest | Role active, membrane transferred |
+| `HandoffBackAck` | hotel → guest | Membrane returned |
 | `SubagentResult { task_id, result }` | hotel → guest | Subagent completed |
 | `MemoryUpdateAck { applied: bool, reason? }` | hotel → guest | Memory update applied or rejected |
+| `RoleConfigAck { role_name, is_new: bool }` | hotel → guest | Role definition persisted |
 
 ---
 
 ## Slash Commands
 
-New slash commands for the communication plane:
-
 | Command | Effect |
 |---|---|
-| `/worker <goal>` | Request handoff to a worker incarnation for the stated goal |
-| `/abandon` | Abandon the current worker; return to conversational |
-| `/break` | Finish current worker iteration, yield session to conversational, keep worker idle for `/resume` |
-| `/worker status` | Show current session owner and worker state |
+| `/role <name>` | Request membrane switch to named role incarnation |
+| `/back` | Hand membrane back to orchestrator |
+| `/abandon` | Terminate current worker/subagent; return membrane to orchestrator |
+| `/roles` | List configured role incarnations and active membrane owner |
 | `/memory show` | Display current Tier 2/3 memory summary |
 | `/memory reset` | Reset session facts for this session |
-
-Worker switching is a **conversation plane action**, not a configuration action. `/worker <goal>` is the canonical switch mechanism — either typed directly or triggered by a Mini App button that sends the command on the user's behalf. There is no parallel control plane for runtime switching; the session plane owns it.
 
 ---
 
 ## Telegram Mini App — Configuration Surface
 
-The Telegram Mini App is the right surface for *configuration* of the incarnation model, not for runtime switching.
+The Telegram Mini App is the right surface for configuration — not runtime role switching (that belongs to the conversation plane).
 
-### What belongs in the Mini App
+**What belongs in the Mini App:**
+- Role incarnation catalog — browse, edit, create roles with identity addendum and toolset profile
+- Toolset profile browser — tools, skills, implied grants
+- Active incarnation status — which role owns the membrane, idle roles and their TTL status
+- Memory browser — Tier 2/3 session facts, delete specific entries
+- Approval management — pending approvals with full context, preapproval policy
+- Vault credential onboarding — secure path for entering credentials
 
-- Toolset profile catalog — browse available profiles, assign tools, set execution modes
-- Incarnation status — view active workers, how long they have been running, idle vs. active state
-- Agent profile editing — soul, identity, user context, memory summary (rich text, not chat commands)
-- Approval management — pending approvals with full context, preapproval policy configuration
-- Hook registry — view what listeners are registered at each lifecycle point
-- Memory browser — Tier 2/3 session facts, ability to delete specific entries
-- Vault credential onboarding — the secure path for entering credentials without plaintext in chat
-
-### What does not belong in the Mini App
-
-Runtime session switching. A "switch to worker" button in the Mini App is acceptable only if it sends a `/worker <goal>` message into the conversation plane — it is a shortcut, not a separate control mechanism.
-
-### Security model
-
-The BlobService (port 9001) must **not** host Mini App assets. It is internal hotel infrastructure with no access control beyond content-addressed IDs. Repurposing it as an external-facing web server conflates two services with incompatible trust requirements.
-
-Mini App architecture:
-
-- Assets hosted externally (static host or CDN) — no hotel HTTP exposure for assets
-- Mini App calls a dedicated hotel API endpoint, not the blob service
-- That endpoint sits **behind hegemon** as the perimeter, not directly internet-facing
-- Telegram Mini App auth is well-specified: `initData` signed by Telegram, backend verifies HMAC-SHA256 with the bot token — a real auth mechanism, not hand-rolled
-- HTTPS is required by Telegram for Mini App web app URLs — if a hotel-local endpoint is needed, a TLS proxy (e.g. Caddy) fronts it, same pattern as the Muninn Claude Desktop solution
-
-### BlobService security note
-
-The BlobService has no access control today — SHA-256 content IDs are unguessable but are not credentials. For production / VPS deployment:
-
-- Bind blob service to localhost only
-- External model providers (real Gemini cloud API) cannot fetch `http://localhost:9001/blob/<sha>` — this is a latent bug in the current media analysis path. Resolution: inline base64 encoding for small media, or signed temporary URLs for large blobs, rather than raw localhost URLs passed to cloud APIs.
-- Blob service security contract must be resolved before the stack is deployed beyond local development.
+**Security model** (unchanged from prior review):
+- Assets hosted externally, not on blob service
+- Mini App calls a hotel endpoint behind membrane as the perimeter
+- `initData` HMAC-SHA256 verification against bot token
+- HTTPS required; TLS proxy (Caddy) for hotel-local endpoints
+- BlobService bound to localhost only; no access control; latent bug with cloud Gemini URLs receiving localhost blob URLs
 
 ---
 
 ## Implementation Order
 
-This proposal has hard dependencies. Recommended sequencing:
+Dependencies are real and must be respected:
 
-1. **AGENT_LOOP_PROPOSAL.md gaps first.** The re-entry loop (Gap 1) is required before worker incarnations can do multi-step work. Tool catalog (Gap 3) is required before toolset profiles are meaningful.
+1. **AGENT_LOOP_PROPOSAL gaps first.** Re-entry loop (Gap 1) and approval granularity (Gap 4) before role incarnations do meaningful multi-step work. Tool catalog (Gap 3, done) and toolset profiles before profile-based role provisioning is meaningful.
 
-2. **Session ownership in Context Graph.** Add `active_incarnation_id` to session records. Hotel reads it during IpcServer `EmitTask` routing. This is the load-bearing primitive for everything else.
+2. **Skill catalog + toolset profiles in the Context Graph.** `abstract_skill` nodes and `toolset_profile` nodes. Seed built-in profiles at hotel startup. This closes the tool assignment gap and establishes the profile resolution path.
 
-3. **Conversational toolset restriction.** Configure the conversational incarnation with a minimal default toolset. Gate heavy tools behind worker-only posture. This is achievable by configuration before any new IPC actions exist.
+3. **Role incarnation records in the Context Graph.** `RoleIncarnationRecord` persisted and queryable. `agent.configure_role` IPC action. Hotel can now read role definitions at materialization time.
 
-4. **`HandoffToWorker` / `HandoffBack` IPC.** Once session ownership exists, implement the handoff protocol and worker materialization.
+4. **Session bindings seeded from role profile.** When a session is initialized for a role incarnation, the hotel seeds `SessionBindings` from the role's `toolset_profile`. No more `["echo"]` default.
 
-5. **Memory Tier 2 (session facts) and `UpdateMemory`.** These are safe to add before Tier 4 (Muninn), and they establish the memory write contract that Tier 4 can plug into later.
+5. **`active_incarnation_id` in session records + IpcServer routing update.** Hotel reads this field before routing inbound tasks. Default to orchestrator. Don't update until target is registered.
 
-6. **Muninn tool surface (Tier 4).** Add `memory.search` / `memory.store` as hotel-mediated tools pointing at the local Muninn endpoint.
+6. **`HandoffToRole` / `HandoffBack` IPC + handoff skill scaffolding.** Implement the membrane switch protocol. Define the first handoff skill shape.
 
-7. **`SpawnSubagent`.** Can land after HandoffToWorker since the infrastructure is similar.
+7. **Inactive TTL + on-demand rematerialization.** Add TTL check to the supervisor loop. Restore session context from memory on rematerialization.
 
-8. **Inter-agent communication (`DelegateToPeer`).** Land after subagents, since it uses the same result-routing pattern.
+8. **`SpawnSubagent` IPC + subagent runtime mode.** One-shot execution mode in `agent-core`. Async result routing in the hotel.
+
+9. **Memory Tier 2 (`session_facts`) and `UpdateMemory` IPC.** Establish the memory write contract before Tier 4 integration.
+
+10. **Muninn tool surface (Tier 4).** `memory.search` / `memory.store` as hotel-mediated tools. Auto-injection into prompt context.
 
 ---
 
 ## Open Questions
 
-- **Worker naming**: should toolset profiles be named strings (e.g., `"codex"`) that the hotel resolves from a catalog, or should the caller pass the full toolset list? Named profiles are cleaner for the user-facing UI; explicit lists are more general. Likely both: named profiles with an override list.
+- **Turn loop heterogeneity**: should different roles be able to run structurally different loop variants (e.g. a planning loop that builds a structured plan before tool use, vs. a reactive loop), or is per-role TurnLoopConfig sufficient? Start with config-only; defer structural loop variants unless a concrete use case requires it.
 
-- **Conversational agent identity continuity across worker periods**: while the worker owns the session, can the user break through to the conversational agent with a special command? Or is the session fully transferred? Recommendation: `/conversational` as an escape hatch that pauses the worker and lets the user speak directly to the conversational agent.
+- **Role identity addendum injection**: where in the prompt does the role addendum land? Recommended: injected between base `[Identity]` and `[Knowledge]` projections, labeled `[Role: developer]`. The model sees the full persona stack in order.
 
-- **Memory update operator review**: for profile updates, should approval always be required, or should there be a `trust level` on the agent that controls this? An untrusted agent should always require approval before profile changes.
+- **Concurrent outbound messages**: when two role incarnations send messages in the same user turn, what does the user experience? Membrane should deliver them in emission order, labeled by role. The user should be able to tell which role spoke.
 
-- **Muninn vs. native memory backend**: this decision should be driven by a concrete evaluation of whether Muninn's value is demonstrated through Codex/Claude use (the current experiment). If yes, port the protocol. If the evaluation is inconclusive, defer. Do not commit to a Rust rewrite before the value is clear.
+- **Memory sync on rematerialization**: when a reclaimed role is rematerialized, it restores from Tier 2/3. Is there a risk it has stale in-memory state from a prior life? Resolution: on materialization, the hotel sends a session snapshot that the incarnation uses to initialize its working memory. Prior in-process state is gone by definition (new process).
 
-- **Multi-hotel session ownership**: what if the conversational agent is on hotel A and the worker should run on hotel B? The `active_incarnation_id` model works if both hotels share the session record, which they currently do not. This is deferred to after the inter-hotel mesh is more mature.
-
-- **Parallel workers**: can a session ever have two active workers simultaneously? This proposal says no — sequential only. Parallel execution is addressed via subagents (which are not session owners) rather than multiple session owners.
-
----
-
-## Addendum: Design Review Analysis
-
-*Added after initial proposal draft. Records confidence levels, identified risks, and recommended revisions per design review.*
-
-### Confidence Summary
-
-| Component | Confidence | Key Risk |
-|---|---|---|
-| Taxonomy (conversational/worker/subagent) | 8/10 | Blurry toolset boundary, toolset profile catalog unspecified |
-| `active_incarnation_id` primitive | 8/10 | Race window during handoff, IpcServer routing change scope |
-| Handoff flow (HandoffToWorker/Back) | 5/10 | Worker readiness, conversational behavior during delegation |
-| Forking semantics | 8/10 | Solid; `/break` is the correct escape hatch, not `/conversational` |
-| Subagent spawning | 5/10 | One-shot runtime mode unspecified, hotel result routing should be async |
-| Memory Tiers 1–3 | 7/10 | Summarization failure path, session_facts granularity |
-| Memory Tier 4 (Muninn) | 4/10 | Context injection protocol unspecified, external dependency fragility |
-| Inter-agent communication | 3/10 | Tool-call abstraction breaks for multi-turn exchange; cross-hotel is the primary use case but unaddressed |
-| Mini App — config surface | 7/10 | HTTPS/TLS requirement, hegemon-proxied API design needed |
-| Mini App — worker switching | resolved | Not a Mini App concern; conversation plane owns runtime switching |
-| BlobService security | open risk | No access control, localhost-only required, latent bug with cloud Gemini URLs |
-
----
-
-### Section-by-Section Notes
-
-#### Taxonomy
-
-The conversational/worker/subagent split is right. The binary-with-posture approach (same process, different configuration) avoids build and deploy complexity.
-
-**Gotcha — toolset boundary is blurry.** The conversational agent's restricted toolset forces hand-off by making certain things literally impossible without tools. But the model still has to decide when to hand off versus answer directly, and it will get this wrong in both directions — spawning unnecessary workers for lightweight requests, or attempting complex tasks it doesn't have tools for. The restriction should be soft and configurable, not so tight that conversational is useless for routine requests.
-
-**Gap — the toolset profile catalog is unspecified.** `HandoffToWorker` takes a `toolset_profile` string like `"codex"` or `"browser"`. Where does this catalog live? Who configures it? How does the conversational model know what profiles exist? This is a blocking gap for the HandoffToWorker implementation. The catalog should live in the hotel config (mesh-config.json) as named toolset bundles the hotel can resolve at spawn time.
-
-#### `active_incarnation_id`
-
-The right primitive. One field, no new infrastructure, enables everything else.
-
-**Risk 1 — Race window during handoff.** The hotel updates `active_incarnation_id = worker.guest_id`, then spawns the worker process. The worker takes 500ms–2s to fork, exec, connect UDS, and register. If a message arrives from hegemon during this window, routing reads the new ID but the worker's socket isn't registered yet — the message fails or drops. Two options: (a) buffer inbound messages and replay them once the worker registers, or (b) don't update `active_incarnation_id` until the worker sends its registration acknowledgment. Option (b) is cleaner — conversational might receive one extra message before the handoff completes, which is acceptable.
-
-**Risk 2 — IpcServer routing change.** The proposal says "hegemon queries the session record," but hegemon doesn't read the Context Graph. It's the hotel's IpcServer that routes inbound tasks. The IpcServer routing logic needs to change from "route by target_role" to "for agent-type tasks, look up active_incarnation_id from the session record and route to that guest." This is more involved than the proposal implies and should be called out explicitly.
-
-#### Handoff Flow
-
-**Gap 1 — Worker readiness.** The flow shows the hotel sending `SessionHandoffTask` to the worker immediately after spawning it. The worker isn't connected yet when that send happens. The handoff task must be queued and delivered upon worker registration, not on spawn.
-
-**Gap 2 — Conversational behavior during delegation.** After emitting `HandoffToWorker` and receiving `HandoffAck`, what does the conversational agent do? It should enter a delegating phase that routes any new user messages to the worker rather than processing them directly. The protocol for this is unspecified. A simple approach: conversational transitions to a `delegating` turn phase and refuses to start new turns, relying on `active_incarnation_id` routing to send messages to the worker anyway.
-
-**Gap 3 — `/break` vs `/conversational` mechanics.** The escape hatch is mentioned but not specified. What does "pause the worker" mean concretely? A cleaner model: `/break` causes the worker to finish its current iteration, emit a status summary, and yield session control back to conversational while remaining live and idle. Conversational can then issue `/resume` to hand back to the same worker. True abandonment is `/abandon`.
-
-**Gap 4 — Stale worker state on reuse.** "Hotel materializes worker if not already live" implies reusing an idle worker. But an idle worker's in-memory session state may be stale from a prior task. The hotel must send a fresh `SessionHandoffTask` to any worker being reused, and the worker must reinitialize its session state on handoff receipt regardless of prior state.
-
-#### Subagent Spawning
-
-**Problem 1 — agent-core has no one-shot execution mode.** The current runtime loops forever on `recv_task()`. A subagent needs: receive one task, execute it (possibly with a tool loop), emit result, exit. This requires a runtime mode flag (`PHILOTIC_AGENT_MODE=subagent`) that changes loop behavior: after emitting `CompleteTask` or `FailTask`, exit rather than continue listening. This is a non-trivial runtime change.
-
-**Problem 2 — Hotel result routing must be async.** The proposal says the hotel "waits for the subagent to emit a result." The hotel cannot block its IPC handler thread synchronously on a subprocess. The correct model: hotel fires off the spawn, records the parent-child association (parent_task_id → parent_guest_id), and when the subagent later emits `CompleteTask`/`FailTask`, the IpcServer looks up the parent association and delivers the result as an `InboundTask` to the parent. This is fully async and matches the existing IPC model.
-
-**Problem 3 — TTL.** The "5 min (hard)" TTL in the lifetime table conflicts with the caller-configurable `ttl_seconds` in the SpawnSubagent struct. Resolution: caller-configurable with a hard maximum (suggest 30 minutes). The 5-minute default is too aggressive for any multi-step reasoning task.
-
-**Problem 4 — Nested subagents.** Unaddressed. Recommend: subagents cannot spawn subagents by default. If nested spawning is later allowed, child TTL must not exceed parent's remaining TTL.
-
-#### Memory Architecture
-
-**Tier 1** — Solid. One concern: the rolling summarization model call triggers on a fixed turn count (every 8 turns), adding a model round-trip at the worst moment (mid-conversation). Prefer lazy triggering (when the window would overflow) rather than eager. Also: the summary should be stored alongside `recent_turns`, not replacing them — so you can fall back to raw turns if the summary is absent or clearly wrong.
-
-**Tier 2** — Solid. Recommend structuring `session_facts` as a list of fact records rather than a single JSON blob, so the hotel can enforce count-based size limits and the agent can target-delete specific facts.
-
-**Tier 3** — Medium. The "cross-session user context" flat text field is the weakest part. In practice, agents write noise here, miss what matters, or write things that age poorly. Muninn (Tier 4) is the right long-term home for this kind of structured knowledge. Tier 3 should stay as profile metadata (soul, identity, memory_summary) rather than accumulating free-form user facts.
-
-**Tier 4 (Muninn)** — Most speculative. Two critical gaps:
-
-1. **Context injection is unspecified.** The agent calls `memory.search` as a tool and gets back N memories as a tool result. Then what? Does it inject them automatically into the next prompt? Does it re-submit to the model? Does the model have to explicitly request memory retrieval? The proposal needs to specify: before building the model prompt, if Muninn is configured, automatically run `memory.search` with the user message as the query, and inject top-N results into the `[Knowledge projection]` section. This makes retrieval transparent to the model rather than requiring the model to "think to use memory." This is a system design choice, not a tool design choice.
-
-2. **External dependency fragility.** If Muninn is down, the hotel-mediated invoker must return empty results with a logged warning — not fail the turn. Fallback behavior must be explicitly specified and tested.
-
-Do not commit to this integration until real usage reveals whether agents naturally reach for memory tools or whether it requires heavy system prompt engineering. The answer determines whether Muninn is a first-class feature or a later optimization.
-
-#### Inter-Agent Communication
-
-This section needs the most revision.
-
-**Problem 1 — Tool-call abstraction doesn't support multi-turn exchange.** "Peer task call looks like a slow tool call" works for fire-and-forget delegation. It breaks for agent collaboration that requires back-and-forth: Jane delegates to Aria, Aria sends a clarifying question, Jane responds. This cannot be modeled as a tool call. A "peer sub-session" abstraction is needed for that use case — one that's out of scope for the first slice.
-
-**Problem 2 — `known_peers` needs a policy.** Unspecified. Starting point: all active guests with `role=agent` on the local hotel. Cross-hotel peers are a separate problem.
-
-**Problem 3 — Cross-hotel is the primary use case.** Jane and Aria are on different hotels. `DelegateToPeer` across hotels requires inter-hotel result routing that currently has acknowledged gaps (ACK boundary, loopback-only addressing). Designing `DelegateToPeer` without resolving those gaps first produces a feature that works locally and fails in production.
-
-**Recommendation:** Remove `DelegateToPeer` from this proposal. Replace with a narrower first slice: same-hotel agent-to-agent task emission using existing `EmitTask` + `known_peers` in the session snapshot. Validate that this works in live use. Generalize to cross-hotel once the mesh result routing is solid.
-
----
-
-### Revised Minimum Viable Slice
-
-The components below have the highest confidence and deliver the core value without the high-risk pieces:
-
-1. **`active_incarnation_id` in Context Graph + IpcServer routing update.** Don't update until worker registers (option b above).
-2. **Soft conversational toolset restriction.** Configurable via hotel config, not hard-coded. Default: exclude workspace and execution tools; include memory, status, and handoff actions.
-3. **Toolset profile catalog in hotel config.** Named bundles (e.g. `"codex": [workspace.list, workspace.read, echo]`) resolvable at HandoffToWorker time.
-4. **Worker readiness protocol.** Buffer inbound messages between spawn and registration; deliver on registration.
-5. **`HandoffToWorker` / `HandoffBack` IPC** with the delegating phase on conversational and a `HandoffAck` that includes the worker incarnation ID.
-6. **Liveness fallback on session routing.** If `active_incarnation_id` points to an unregistered guest, fall back to the default conversational incarnation immediately and log the miss.
-
-Everything after this — subagent one-shot mode, Muninn context injection, inter-agent communication — builds on this foundation and should be sequenced based on what the live system reveals about actual usage patterns.
+- **`agent.configure_role` trust**: should any incarnation be able to configure roles, or only the orchestrator? Recommendation: hotel enforces orchestrator-only by checking the requesting guest's role field. Non-orchestrator configure attempts are rejected with an error.
