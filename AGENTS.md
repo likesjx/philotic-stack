@@ -277,7 +277,6 @@ The repository contains specialized skills in `skills/` to standardize common wo
 | `verification-ladder` | Deciding and reporting the honest validation level |
 | `proposal-maintainer` | Architecture/process proposal and spec hygiene |
 | `muninn-memory-habit` | Establishing consistent retrieval/write-back habits |
-| `command-center-context` | Jane Command Center session bootstrap and continuity |
 | `subagent-delegation` | Splitting large tasks into bounded sub-tasks |
 | `runtime-debugger` | Diagnosing live multi-process/multimodal stack failures |
 | `runtime-materialization` | Designing startup/wake/sleep and placement policy |
