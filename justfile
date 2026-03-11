@@ -34,9 +34,9 @@ start-ansible-uat:
     @echo "If you are testing Telegram, make sure only one Telegram poller is running for this bot token."
     cargo run -p ansible -- --hotel local-telegram --load-config mesh-config.json
 
-# Start the Gateway (Telegram Hegemon)
+# Start the Gateway (Telegram Membrane)
 start-gateway:
-    cargo run -p hegemon
+    cargo run -p membrane
 
 # Start the Persona (Agent Core)
 start-agent:
@@ -60,7 +60,7 @@ status:
     @echo "Checking Philotic Stack local status..."
     @# Ping the Ansible daemon port or check processes.
     @ps aux | grep -v grep | grep "cargo run -p ansible" || echo "Ansible daemon is not running."
-    @ps aux | grep -v grep | grep "cargo run -p hegemon" || echo "Hegemon gateway is not running."
+    @ps aux | grep -v grep | grep "cargo run -p membrane" || echo "Membrane gateway is not running."
 
 # Format code
 format:

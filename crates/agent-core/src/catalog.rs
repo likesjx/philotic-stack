@@ -24,6 +24,24 @@ pub fn tool_catalog() -> &'static HashMap<String, ToolDefinition> {
     TOOL_CATALOG.get_or_init(build_catalog)
 }
 
+/// Returns the approval/projection class for a tool name, or `None` if the tool
+/// is not in the built-in catalog.
+pub fn tool_class(tool_name: &str) -> Option<&'static str> {
+    tool_catalog()
+        .get(tool_name)
+        .and_then(|d| d.class.as_deref())
+}
+
+/// Returns true if the tool requires operator approval before execution, regardless
+/// of what the model requests. Tools in class "config" require approval by default;
+/// others do not unless explicitly flagged.
+pub fn tool_requires_approval(tool_name: &str) -> bool {
+    match tool_class(tool_name) {
+        Some("config") => true,
+        _ => false,
+    }
+}
+
 fn build_catalog() -> HashMap<String, ToolDefinition> {
     let mut m = HashMap::new();
 
@@ -109,6 +127,48 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                 "required": ["path"]
             }),
             class: Some("workspace".into()),
+        },
+    );
+
+    m.insert(
+        "agent.configure".into(),
+        ToolDefinition {
+            tool_name: "agent.configure".into(),
+            description: "Update an agent configuration field. Supports approval_policy, \
+                          profile, and bindings sections. Changes to sensitive fields \
+                          (soul, identity, approval policy) require operator approval unless \
+                          preapproved. Use operation 'set' to replace, 'append' to add to \
+                          arrays, or 'remove' to delete from arrays."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "config_path": {
+                        "type": "string",
+                        "description": "Dot-separated path to the config field. Examples: \
+                                        'approval_policy.preapproved_tools', \
+                                        'approval_policy.preapproved_classes', \
+                                        'approval_policy.auto_approve_all', \
+                                        'profile.soul_text', \
+                                        'profile.identity_text', \
+                                        'profile.user_context_text', \
+                                        'profile.memory_summary', \
+                                        'bindings.effective_toolset', \
+                                        'bindings.effective_skillset'"
+                    },
+                    "value": {
+                        "description": "The new value. For array fields with 'append'/'remove', \
+                                        provide a single string item."
+                    },
+                    "operation": {
+                        "type": "string",
+                        "enum": ["set", "append", "remove"],
+                        "description": "How to apply the change. Defaults to 'set'."
+                    }
+                },
+                "required": ["config_path", "value"]
+            }),
+            class: Some("config".into()),
         },
     );
 

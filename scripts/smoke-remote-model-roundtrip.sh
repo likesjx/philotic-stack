@@ -35,7 +35,7 @@ cargo build \
   -p model-router --bin model-controller-gemini \
   -p model-router --bin model-controller-elevenlabs \
   -p tool-runner --bin tool-runner \
-  -p hegemon --bin hegemon \
+  -p membrane --bin membrane \
   -p philotic-client --example remote_model_smoke_driver >/dev/null
 
 ln -s "${ROOT_DIR}/target" "${TMP_DIR}/target"

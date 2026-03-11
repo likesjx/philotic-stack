@@ -13,6 +13,7 @@ Core reference documents describing the implemented system.
 | [ARCHITECTURE.md](architecture/ARCHITECTURE.md) | Full system design — hotel model, crates, IPC, mesh, storage, guest lifecycle |
 | [PORT_BLUEPRINT.md](architecture/PORT_BLUEPRINT.md) | Migration plan from legacy plugin model |
 | [CODEBASE_HEALTH.md](architecture/CODEBASE_HEALTH.md) | Static analysis and honest assessment of current codebase state (2026-03-10) |
+| [CONCURRENCY_STRATEGY.md](architecture/CONCURRENCY_STRATEGY.md) | Concurrency audit — current bottlenecks, prioritized parallelism strategy, canonical patterns |
 
 ---
 
@@ -22,6 +23,7 @@ Design proposals for features in progress or planned. These are **not** referenc
 
 | Document | Topic |
 | -------- | ----- |
+| [CONCURRENCY_PROPOSAL.md](architecture/CONCURRENCY_PROPOSAL.md) | 6-change concurrency plan — WAL, block_on fix, parallel boot/dispatch/updates |
 | [AGENT_INCARNATION_PROPOSAL.md](architecture/AGENT_INCARNATION_PROPOSAL.md) | Conversational/worker/subagent taxonomy, session ownership |
 | [AGENT_LOOP_PROPOSAL.md](architecture/AGENT_LOOP_PROPOSAL.md) | Multi-turn tool re-entry, media routing policy, approval granularity |
 | [AGENT_LOOP_RESEARCH.md](architecture/AGENT_LOOP_RESEARCH.md) | Research backing the agent loop proposal |
@@ -29,7 +31,7 @@ Design proposals for features in progress or planned. These are **not** referenc
 | [APPROVAL_UX_PROPOSAL.md](architecture/APPROVAL_UX_PROPOSAL.md) | Human-in-the-loop approval flow design |
 | [FORKED_SESSIONS_PROPOSAL.md](architecture/FORKED_SESSIONS_PROPOSAL.md) | Session forking and delegation model |
 | [GUEST_BINARY_RESOLUTION_PROPOSAL.md](architecture/GUEST_BINARY_RESOLUTION_PROPOSAL.md) | How guest binaries are located and resolved |
-| [HEGEMON_COMPONENT_PROPOSAL.md](architecture/HEGEMON_COMPONENT_PROPOSAL.md) | Hegemon as outside-world membrane — transport, guard, session binding |
+| [MEMBRANE_COMPONENT_PROPOSAL.md](architecture/MEMBRANE_COMPONENT_PROPOSAL.md) | Membrane as outside-world membrane — transport, guard, session binding |
 | [HEURISTIC_MIND_AND_CONTEXT_PAPER.md](architecture/HEURISTIC_MIND_AND_CONTEXT_PAPER.md) | Cognitive model and context structure theory |
 | [INTER_HOTEL_ROUTING_PROPOSAL.md](architecture/INTER_HOTEL_ROUTING_PROPOSAL.md) | Cross-hotel event routing and execution plane design |
 | [KEY_VAULT_PROPOSAL.md](architecture/KEY_VAULT_PROPOSAL.md) | Keychain-backed hotel vault root key |

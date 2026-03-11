@@ -19,7 +19,7 @@
 - [x] Decide that session state has one canonical home in the Context Graph; apartment checkpoints are derived recovery projections, not a second source of truth.
 - [x] Generalize session as a cross-component coordination envelope rather than an agent-only transcript.
 - [x] Add graph-modeled session entities for session lifecycle, participants, and turns.
-- [x] Bind transport identities in `hegemon` to stable `session_id` values.
+- [x] Bind transport identities in `membrane` to stable `session_id` values.
 - [ ] Add session leases / ownership semantics for active work.
 - [x] Persist session timeline/progress events while keeping the IPC plane general.
 - [x] Support recovery flows at the session layer.
@@ -46,9 +46,23 @@
   - [x] Add `upsert_abstract_tool` / `get_abstract_tool` / `list_abstract_tools` to `GraphStorage` trait and `SqliteGraphStorage` impl.
   - [x] Seed catalog into context graph at hotel startup via `seed_abstract_tool_catalog`.
   - [x] Update both `default_tool_assembly_for_bindings` and `tool_assembly_from_allowed_incarnations` to look up from catalog before falling back to stubs.
-- [ ] Implement `preapproved_tools` and `preapproved_classes` evaluation in `approval_policy_allows` (Gap 4a).
-- [ ] Inject operator steering notes from `/approve`/`/deny` back into the model prompt (Gap 4b).
-- [ ] Add `working_tool_history` to `WorkingTurn` and implement multi-turn tool re-entry loop with iteration cap (Gap 1).
+- [x] Implement `preapproved_tools` and `preapproved_classes` evaluation in `approval_policy_allows` (Gap 4a).
+  - [x] `tool_class()` and `tool_requires_approval()` added to `catalog.rs`.
+  - [x] `approval_policy_allows` evaluates all three conditions in order: `auto_approve_all`, `preapproved_tools`, `preapproved_classes`.
+  - [x] `handle_tool_call` enforces `approval_required` from `ToolPolicyAnnotation` before dispatch — agent-level gate independent of model intent.
+  - [x] Policy annotations derive `policy_class` and `approval_required` from catalog.
+  - [x] `agent.configure` tool: class `"config"`, `approval_required: true`. Handles `approval_policy.*`, `profile.*`, `bindings.*` paths with set/append/remove. Rebuilds tool assembly when bindings change.
+- [x] Inject operator steering notes from `/approve`/`/deny` back into the model prompt (Gap 4b).
+  - [x] `/approve <note>` re-submits to model with `[User approval steering]` prefix appended to turn context.
+  - [x] `/deny <note>` re-submits as a new model turn with `[User denied the proposed action. Do this instead]` prefix.
+  - [x] `/deny` without note fails the turn (existing behavior preserved).
+  - [x] `resume_turn_with_steering` appends the note to `active_turn.user_content`, increments iteration, rebuilds prompt, re-submits to model.
+- [x] Add `working_tool_history` to `WorkingTurn` and implement multi-turn tool re-entry loop with iteration cap (Gap 1).
+  - [x] `working_tool_history: Vec<(ToolCall, ToolResult)>` added to `WorkingTurn`; serialized into checkpoint and rehydrated from it.
+  - [x] `push_tool_history` and `build_reentry_prompt` added to `SessionState`.
+  - [x] `build_reentry_prompt` appends `[Tool call history]` section with numbered call/result pairs; directs model to continue or respond.
+  - [x] `handle_tool_result` rewritten: pairs result with `pending_tool_call`, pushes to history, checks `MAX_TOOL_ITERATIONS` (10), increments `iteration`, re-submits `generate_text` to model. Loop exits only on `Respond`, `Fail`, `RequestApproval`, or iteration cap.
+  - [x] `interpret_tool_result` (old early-close stub) no longer called.
 - [x] Add `MediaRoutingPolicy` to `AgentProfile` and make media action selection configurable per agent (Gap 2).
 
 ## New Project: Agent Incarnation Model
@@ -161,11 +175,11 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
   - deterministic tiebreak by canonical incarnation id
 - [x] Define the first capability advertisement payload and hotel-side registry shape for hotel-scoped incarnations.
 - [x] Add heartbeat emission / refresh / TTL rules for the capability advertisement plane.
-- [ ] Extend current session/tool/model/hegemon route records so the shared routing schema carries remote-capable incarnation metadata consistently.
-- [x] Extend placement-based remote selection into model capability routing for `text.generate` and `media.analyze` while keeping hegemon reply delivery session-owned.
+- [ ] Extend current session/tool/model/membrane route records so the shared routing schema carries remote-capable incarnation metadata consistently.
+- [x] Extend placement-based remote selection into model capability routing for `text.generate` and `media.analyze` while keeping membrane reply delivery session-owned.
 - [x] Build the first live capability registry view across hotels.
 - [x] Implement the first placement-based remote selection for unpinned capability routes on tool fallback when no local runner is available.
-- [ ] Extend placement-based remote selection beyond the first tool/model fallback paths to broader routed component classes without breaking session-owned hegemon reply routing.
+- [ ] Extend placement-based remote selection beyond the first tool/model fallback paths to broader routed component classes without breaking session-owned membrane reply routing.
 - [ ] Move mesh ACK emission to a strict post-commit boundary.
 - [x] Replace routed execution over raw UDP with the first point-to-point execution channel for routed inter-hotel task traffic.
 - [ ] Add execution-plane transport negotiation so routing can choose among multiple point-to-point transports instead of assuming one TCP path.
@@ -236,7 +250,7 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 - [x] Add a startup-driven Gemini OAuth smoke through the materialized model-controller guest.
 - [x] Add a hotel-startup Telegram controller smoke via `ansible --test telegram-roundtrip` using a local fake Telegram API.
 - [x] Extend the startup Telegram smoke so it simulates text, photo, and voice-note ingress and exercises fake-Gemini multimodal requests on top of blob-backed media transport.
-- [x] Prove watched-live Telegram text/photo/voice/document delivery through hegemon -> agent-core -> Gemini and normalize markdown-ish document MIME for Gemini media analysis.
+- [x] Prove watched-live Telegram text/photo/voice/document delivery through membrane -> agent-core -> Gemini and normalize markdown-ish document MIME for Gemini media analysis.
 - [x] Make materialized Telegram/agent guests configurable enough for separate hotel/persona stacks (for example Jane vs Aria) instead of hardcoding one Jane-shaped membrane.
 - [x] Remove Jane/Aria-specific built-in hotel/agent profile selection from `ansible` startup so agent identity, persona naming, and guest targeting resolve from hotel config or generic hotel-derived fallback rather than persona-specific Rust tables.
 - [x] Make inter-hotel mesh dispatch node-aware by carrying `target_node_id`, discovering peer hotels from the Context Graph, and returning real mesh ACK packets for local multi-hotel development.
@@ -379,14 +393,6 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 - [ ] Measure whether Muninn materially improves continuity, personalization, and decision recall over repeated sessions.
 - [ ] Decide whether Muninn remains an external heuristic memory service or should inform a future Philotic-native memory layer.
 
-## Known Pre-Existing Test Failures
-
-- `tests::local_capability_advertisements_include_hotel_scoped_incarnations` (crates/ansible) — assertion `ads.len() == guests.len()` fails because `default_guest_seed` returns 5 guests (including the inactive `tool-runner`), but `local_capability_advertisements` filters to active-only (4). The assertion should compare against active guest count. Pre-dates the tool catalog slice.
-
-## Known Pre-Existing Compile Errors
-
-- `crates/ansible` — in-progress `AbstractToolRecord` slice: `ansible_mesh_core::graph::AbstractToolRecord` and matching `GraphStorage` trait methods (`upsert_abstract_tool`, `get_abstract_tool`, `list_abstract_tools`) are referenced in `ansible/src/main.rs`, `ansible/src/service/ipc.rs`, and `ansible/src/service/guest_manager.rs` but the implementations in `ansible-mesh-core` are incomplete. The `ansible` binary does not compile from tests when `--workspace` is used. Crates `agent-core`, `model-router`, `hegemon`, and `ansible-mesh-core` are unaffected.
-
 ## Deferred Design Threads
 
 - [ ] Agent workflow formalization: adopt a standing Codex process for context gathering, slice sizing, verification ladders, watched live runs, proposal disposition updates, per-slice commit/push discipline, and assumption-vs-reality capture.
@@ -401,13 +407,14 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 - [ ] Approval UX evolution: add `/preapprove`, `/approval status`, `/approval reset`, and richer session policy editing for constrained transports like Telegram.
 - [ ] Review [TELEGRAM_INTEGRATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_INTEGRATION_PROPOSAL.md).
 - [ ] Review [VOICE_MACHINE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/VOICE_MACHINE_PROPOSAL.md).
-- [ ] Telegram slash-command elevation: raise deterministic `/commands` into `hegemon` before the normal agent loop so Telegram-side testing and operational control become faster and cleaner.
+- [x] Telegram slash-command elevation (first slice): `/ping` handled in `membrane` before agent-core — `handle_membrane_command` short-circuits the `EmitTask` dispatch and replies directly.
+- [ ] Telegram slash-command elevation (next): `/new` resets session_id in membrane (start fresh conversation without round-trip); `/help` lists available commands from membrane directly.
 - [ ] Telegram approval card UX: include request IDs, tool/action names, args summaries, and resolution messages in a more native Telegram approval experience.
-- [ ] Telegram streaming Layer 1: add typing indicator heartbeat to `hegemon` — `ActiveTurn` map, `sendChatAction(typing)` on dispatch, 4-second refresh loop, cancel on `send_reply`.
-- [ ] Telegram streaming: add message length chunking to `hegemon` — split at paragraph boundaries before `sendMessage`, shared `send_formatted_text` helper.
-- [ ] Telegram streaming Layer 2 protocol: add `TurnEventPayload` to `agent-core/src/protocol.rs` and `emit_turn_event` helper to `AgentRuntime`; emit `waiting_tool`, `waiting_approval`, `failed` events back to hegemon via the existing `EmitTask` path.
-- [ ] Telegram streaming Layer 2 hegemon: handle `action = "turn_event"` in `InboundTask` dispatch — maintain or cancel typing heartbeat per event type; stub approval card on `waiting_approval`.
-- [ ] Telegram streaming partial reply: add `action = "partial_reply"` signal from `agent-core` once model-router supports chunked output; implement edit-based progressive delivery in `hegemon`.
+- [x] Telegram streaming Layer 1: add typing indicator heartbeat to `membrane` — `ActiveTurn` map, `sendChatAction(typing)` on dispatch, 4-second refresh loop, cancel on `send_reply`.
+- [ ] Telegram streaming: add message length chunking to `membrane` — split at paragraph boundaries before `sendMessage`, shared `send_formatted_text` helper.
+- [x] Telegram streaming Layer 2 protocol: add `TurnEventPayload` to `agent-core/src/protocol.rs` and `emit_turn_event` helper to `AgentRuntime`; emit `waiting_tool`, `waiting_approval` events back to membrane via the existing `EmitTask` path.
+- [x] Telegram streaming Layer 2 membrane: handle `action = "turn_event"` in `InboundTask` dispatch — maintain or cancel typing heartbeat per event type; stop typing on `waiting_approval`.
+- [ ] Telegram streaming partial reply: add `action = "partial_reply"` signal from `agent-core` once model-router supports chunked output; implement edit-based progressive delivery in `membrane`.
 - [ ] Voice machine design: define STT, TTS, speech-to-speech, transcript generation, and media artifact/session handling.
 - [ ] Nostr communication-plane investigation: evaluate Nostr as a decentralized/event-native transport, with security and privacy-first scrutiny before any implementation.
 - [ ] Tool runner lifecycle policy: define idle retention, sleep/teardown timing, wake-up thresholds, and environment-specific materialization rules for routed tools.
@@ -443,12 +450,12 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 - [x] Create `roles/mesh_node/` to install dependencies (Rust, systemd).
 - [x] Create `deploy_mesh_node.yml` playbook to compile and run ZeroClaw `mesh run` as a service.
 
-## Phase 1: Making it Ours (The Hegemon Workspace)
+## Phase 1: Making it Ours (The Membrane Workspace)
 
 - [x] Initialize new Rust crates to build the Philotic architecture alongside the legacy code.
 - [x] Formalize the Cargo Workspace (Monorepo) structure:
   - `crates/ansible` (The Hotel Manager / local UDP/IPC Event Bus).
-  - `crates/hegemon` (The primary CLI and routing logic).
+  - `crates/membrane` (The primary CLI and routing logic).
   - `crates/philotic-ipc` (The IPC client library for child processes).
 - [x] Port the essential `ansible-mesh-core` MVP 3 logic into the new `crates/ansible` bin.
 - [x] Leave the legacy `src/` monolith untouched for reference and gradual migration.
@@ -457,8 +464,8 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 
 - [x] Implement a concrete, disk-backed `ContextGraph` store (e.g. SQLite/RocksDB/Sled) to hold the entire system configuration, identities, and memory apartments.
 - [x] Scaffold the `PhiloticClient` (IPC) to allow external Guests (MCP Wrappers, Agent Personas) to connect to the local Ansible.
-- [x] Connect the `Hegemon` Telegram poller to the Philotic Web via the new IPC trait.
-- [x] Close the UDP Request/Response loop (Ansible Echoes back `MsgType::Result` to Hegemon).
+- [x] Connect the `Membrane` Telegram poller to the Philotic Web via the new IPC trait.
+- [x] Close the UDP Request/Response loop (Ansible Echoes back `MsgType::Result` to Membrane).
 - [x] Write a sample Python and Rust MCP wrapper that registers tools dynamically with the local Ansible.
 - [x] Implement Agent Materialization: Refactor the runtime to spawn child OS processes dynamically from graph data.
 
@@ -466,10 +473,10 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 
 We will materialize the core ZeroClaw pipeline as three completely independent binaries that communicate exclusively over the Ansible's UDP IPC:
 
-### 1. The Gateway (Telegram Hegemon)
+### 1. The Gateway (Telegram Membrane)
 
-- [x] Port the legacy `TelegramChannel` struct from `src/channels/telegram.rs` into the `crates/hegemon` binary.
-- [x] Connect the `Hegemon` Telegram poller to the Philotic Web via the `UdpPhiloticClient`.
+- [x] Port the legacy `TelegramChannel` struct from `src/channels/telegram.rs` into the `crates/membrane` binary.
+- [x] Connect the `Membrane` Telegram poller to the Philotic Web via the `UdpPhiloticClient`.
 - [x] Ensure inbound messages over Telegram are translated to `IpcRequest::EmitTask` and routed to the Agent persona.
 - [x] Refactor the long-polling loop to read the `bot_token` via an IPC config pull rather than the static `config.toml`.
 
@@ -483,7 +490,7 @@ We will materialize the core ZeroClaw pipeline as three completely independent b
 
 - [x] Create a new `crates/model-router` binary in the workspace.
 - [x] Implement the Gemini API payload constructor for text generation.
-- [x] Subscribe to Model invocation tasks over IPC, trigger inference, and pass the text back to Hegemon.uter receives an inference task from the Agent, it calls the Gemini API and routes the text response back via IPC.
+- [x] Subscribe to Model invocation tasks over IPC, trigger inference, and pass the text back to Membrane.uter receives an inference task from the Agent, it calls the Gemini API and routes the text response back via IPC.
 
 ## Phase 4: The Philotic Split & Metaphor Visualization
 
@@ -492,7 +499,7 @@ Now that the End-to-End Philotic architecture is complete, we need to separate i
 ### 1. Repository Separation
 
 - [x] Create a new repository for the Philotic architecture.
-- [x] Migrate the `ansible`, `hegemon`, `agent-core`, `model-router`, `philotic-ipc`, and `ansible-mesh-core` crates to the new repository.
+- [x] Migrate the `ansible`, `membrane`, `agent-core`, `model-router`, `philotic-ipc`, and `ansible-mesh-core` crates to the new repository.
 - [x] Ensure the legacy ZeroClaw/OpenClaw code remains accessible in the original repository as a reference for migrating future capabilities (tools, MCPs).
 
 ### 2. Veo3 Metaphor Video

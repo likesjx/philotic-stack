@@ -13,29 +13,29 @@ Define Telegram as a real outside-world transport boundary for Philotic, with ex
 
 This proposal is intentionally security-first. Telegram can be the outside-world interface, but that only helps if the outside world is not also our unauthenticated load tester.
 
-This proposal assumes the broader hegemon boundary defined in [HEGEMON_COMPONENT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/HEGEMON_COMPONENT_PROPOSAL.md): Telegram is one hegemon implementation, not the definition of hegemon itself.
+This proposal assumes the broader membrane boundary defined in [MEMBRANE_COMPONENT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMBRANE_COMPONENT_PROPOSAL.md): Telegram is one membrane implementation, not the definition of membrane itself.
 
 ## Core Recommendation
 
-Keep `hegemon` as the canonical Telegram transport boundary.
+Keep `membrane` as the canonical Telegram transport boundary.
 
 More precisely for long-term architecture:
 
-- `hegemon` is the component type
-- Telegram is one hegemon implementation
-- the current `crates/hegemon` binary is a transitional Telegram-oriented implementation of that type
+- `membrane` is the component type
+- Telegram is one membrane implementation
+- the current `crates/membrane` binary is a transitional Telegram-oriented implementation of that type
 
 For the first coherent slice:
 
 - keep polling as the default production ingress
 - design webhook ingress now, but gate it behind a stricter security contract than polling
-- raise Telegram-native control behavior into `hegemon`
+- raise Telegram-native control behavior into `membrane`
 - normalize Telegram updates into a transport-neutral envelope before handing them to `agent-core`
 - keep `agent-core` transport-agnostic and focused on cognition
 
 In other words:
 
-- `hegemon` owns Telegram semantics
+- `membrane` owns Telegram semantics
 - `agent-core` owns the conversational/agent loop
 - the context graph owns durable session truth
 
@@ -53,7 +53,7 @@ Accepted here means:
 
 Current repo truth:
 
-- `crates/hegemon` is a long-polling Telegram guest
+- `crates/membrane` is a long-polling Telegram guest
 - it now normalizes one canonical inbound path for:
   - `message.text`
   - captioned media messages
@@ -74,7 +74,7 @@ Current repo truth:
   - `callback_data`
   - `raw_transport_event`
 - it replies with `sendMessage`
-- it now preserves an optional `final_reply_guest_id` and session-level transport reply target so the owning local hegemon guest survives beyond a single turn without relying only on shared-role fan-out
+- it now preserves an optional `final_reply_guest_id` and session-level transport reply target so the owning local membrane guest survives beyond a single turn without relying only on shared-role fan-out
 - the startup smoke now simulates text, photo, and voice-note Telegram updates against local fake Telegram and fake Gemini APIs, so the blob-backed media path has a real regression harness even though watched live Telegram validation is still pending
 
 That is a useful membrane slice, but it is not yet a richer Telegram controller:
@@ -82,7 +82,7 @@ That is a useful membrane slice, but it is not yet a richer Telegram controller:
 - slash commands still execute in `agent-core`
 - attachment handling now resolves `file_id` values through Telegram `getFile`, downloads bytes, and uploads them into the hotel blob service
 - blob-backed Telegram attachments now have an initial downstream path through `agent-core` and `model-router` as `media.analyze`, so supported photos, audio/voice notes, and documents can reach Gemini for first-pass interpretation
-- hegemon/agent identity is now guest-configurable, so separate hotels can materialize separate Telegram pollers and separate agent identities without hardcoding Jane everywhere
+- membrane/agent identity is now guest-configurable, so separate hotels can materialize separate Telegram pollers and separate agent identities without hardcoding Jane everywhere
 - specialized voice transcription, richer vision workflows, and watched live validation of the blob-backed media path are still follow-on work
 - polling still does not cover the full Telegram update surface beyond `message` and `callback_query`
 
@@ -145,7 +145,7 @@ Operational tradeoff:
 
 This review covers:
 
-- the current Telegram implementation in `crates/hegemon`
+- the current Telegram implementation in `crates/membrane`
 - existing Telegram and deployment docs
 - the likely security requirements for adding Telegram webhook ingress
 
@@ -163,8 +163,8 @@ Why this matters:
 
 Examples:
 
-- [crates/hegemon/src/main.rs](/Users/jaredlikes/code/philotic-stack/crates/hegemon/src/main.rs#L74) shows `getUpdates` polling as the actual ingress path.
-- [docs/walkthrough.md](/Users/jaredlikes/code/philotic-stack/docs/walkthrough.md#L26) still says "Telegram Webhook hits the independent `hegemon` process."
+- [crates/membrane/src/main.rs](/Users/jaredlikes/code/philotic-stack/crates/membrane/src/main.rs#L74) shows `getUpdates` polling as the actual ingress path.
+- [docs/walkthrough.md](/Users/jaredlikes/code/philotic-stack/docs/walkthrough.md#L26) still says "Telegram Webhook hits the independent `membrane` process."
 - [docs/implementation_plan.md](/Users/jaredlikes/code/philotic-stack/docs/implementation_plan.md#L31) says the Telegram listener "listens to webhooks".
 
 Disposition:
@@ -198,7 +198,7 @@ Why this matters for webhook work:
 
 - multimodal updates will arrive with more shapes than a text field
 - callback queries, commands, media, and topic/thread metadata need a stable normalized envelope
-- extending this one field at a time encourages partial transport truth scattered across `hegemon` and `agent-core`
+- extending this one field at a time encourages partial transport truth scattered across `membrane` and `agent-core`
 
 Disposition:
 
@@ -272,7 +272,7 @@ Telegram's own docs recommend `secret_token`, and the Bot API includes it specif
 
 ## Telegram Transport Boundary
 
-`hegemon` should own:
+`membrane` should own:
 
 - inbound Telegram update ingestion
 - webhook or polling transport specifics
@@ -309,7 +309,7 @@ Before broadening beyond plain text, define a normalized Telegram event envelope
 - `callback_data`
 - `raw_update_ref` or retained raw payload blob when needed
 
-This envelope should become the one object `hegemon` emits into the rest of the system.
+This envelope should become the one object `membrane` emits into the rest of the system.
 
 Current implementation note:
 
@@ -333,15 +333,15 @@ Observed tradeoff:
 
 Recommendation:
 
-- near-term: keep model output transport-neutral and let `hegemon` translate a supported Markdown subset into Telegram-safe HTML
-- medium-term: define an outbound rich-text contract above Telegram so `hegemon` can project to explicit Telegram entities without teaching `agent-core` transport-specific markup trivia
+- near-term: keep model output transport-neutral and let `membrane` translate a supported Markdown subset into Telegram-safe HTML
+- medium-term: define an outbound rich-text contract above Telegram so `membrane` can project to explicit Telegram entities without teaching `agent-core` transport-specific markup trivia
 - respect Telegram-specific limits when projecting:
   - normal message text length after formatting parse
   - caption length limits for media messages
 
 Current implementation note:
 
-- `hegemon` now projects outbound `sendMessage` replies through a Markdown-subset to Telegram HTML formatter
+- `membrane` now projects outbound `sendMessage` replies through a Markdown-subset to Telegram HTML formatter
 - the current supported subset includes headings, bold, italic, strikethrough, inline code, fenced code blocks, links, blockquotes, and simple lists
 - explicit Telegram entities and length-aware chunking/fallback are still follow-on work
 
@@ -349,14 +349,14 @@ Current implementation note:
 
 ### Recommendation
 
-Elevate slash-command parsing into `hegemon`.
+Elevate slash-command parsing into `membrane`.
 
 Flow:
 
 1. Telegram update arrives
-2. `hegemon` normalizes it
-3. `hegemon` detects a deterministic `/command`
-4. `hegemon` emits a structured control payload or handles a transport-local action
+2. `membrane` normalizes it
+3. `membrane` detects a deterministic `/command`
+4. `membrane` emits a structured control payload or handles a transport-local action
 5. session metadata remains consistent
 
 ### Near-Term Commands
@@ -380,18 +380,18 @@ Telegram now supports partial draft delivery, which makes it a much better fit f
 
 The current implementation is atomic and silent:
 
-1. Telegram update arrives; hegemon emits `EmitTask` to agent-core (fire and forget)
+1. Telegram update arrives; membrane emits `EmitTask` to agent-core (fire and forget)
 2. Agent-core processes the full turn — model call, tool evaluation, response assembly
-3. Agent-core emits final `InboundTask` back to hegemon
-4. Hegemon calls `sendMessage` once with the final formatted reply
+3. Agent-core emits final `InboundTask` back to membrane
+4. Membrane calls `sendMessage` once with the final formatted reply
 
 The user sees nothing until the full reply is ready. No typing indicator. No partial progress. No delivery signal while tools are running. This is the "wait and dump" model we want to move away from.
 
 ### Design principle
 
-Keep canonical turn state in the context graph. Let `hegemon` project partial progress into Telegram delivery UX. Do not leak Telegram-specific draft/edit behavior into `agent-core`.
+Keep canonical turn state in the context graph. Let `membrane` project partial progress into Telegram delivery UX. Do not leak Telegram-specific draft/edit behavior into `agent-core`.
 
-`agent-core` should emit turn lifecycle signals. `hegemon` should own the projection of those signals into Telegram-native UX behaviors.
+`agent-core` should emit turn lifecycle signals. `membrane` should own the projection of those signals into Telegram-native UX behaviors.
 
 ### Layer 1: Typing indicator (no protocol changes required)
 
@@ -401,12 +401,12 @@ Telegram's `sendChatAction` with `action = "typing"` shows a typing indicator to
 
 Implementation:
 
-1. When `hegemon` emits a task to `agent-core`, record the active turn in a local in-memory map keyed by `(chat_id, thread_id)`.
+1. When `membrane` emits a task to `agent-core`, record the active turn in a local in-memory map keyed by `(chat_id, thread_id)`.
 2. Immediately send `sendChatAction(chat_id, "typing")` before dispatching to `agent-core`.
 3. Spawn a background tokio task that re-sends `sendChatAction(chat_id, "typing")` every 4 seconds while the turn is active.
 4. When the final reply `InboundTask` arrives, cancel the typing refresh task and deliver the reply.
 
-This requires no IPC protocol changes and no changes to `agent-core`. The turn map is internal to `hegemon`.
+This requires no IPC protocol changes and no changes to `agent-core`. The turn map is internal to `membrane`.
 
 Action variants by turn phase (future extension, same pattern):
 
@@ -421,7 +421,7 @@ Action variants by turn phase (future extension, same pattern):
 
 Progressive delivery simulates streaming by sending an initial placeholder message and then editing it in place as content arrives. Telegram supports editing messages via `editMessageText`.
 
-This requires `agent-core` to emit intermediate partial reply signals back to `hegemon` over IPC.
+This requires `agent-core` to emit intermediate partial reply signals back to `membrane` over IPC.
 
 Proposed IPC protocol extension:
 
@@ -433,7 +433,7 @@ InboundTask with kind = "partial_reply":
   - is_final           (false = more coming, true = done)
 ```
 
-`hegemon` behavior:
+`membrane` behavior:
 
 1. On first `partial_reply` for a turn: call `sendMessage` with the partial content; store the returned `message_id` keyed by `(chat_id, turn_id)`.
 2. On subsequent `partial_reply`: call `editMessageText` with the updated partial content using the stored `message_id`.
@@ -463,7 +463,7 @@ Proposed lifecycle events:
 | `turn.final_reply` | Turn is complete, full content is available |
 | `turn.failed` | Turn failed with an error |
 
-`hegemon` maps these to Telegram delivery behaviors:
+`membrane` maps these to Telegram delivery behaviors:
 
 | Lifecycle event | Telegram action |
 |---|---|
@@ -490,7 +490,7 @@ Three options:
 - Accept the new message normally.
 - Do not dispatch it to `agent-core` until the active turn for that `(chat_id, thread_id)` completes.
 - The typing indicator naturally covers both turns from the user's perspective.
-- Simple to implement with a per-session pending queue in `hegemon`.
+- Simple to implement with a per-session pending queue in `membrane`.
 
 **Option B: Cancel and restart**
 
@@ -510,7 +510,7 @@ Recommended default: Option A (queue). Add Option B (cancel) when `agent-core` h
 
 Interruption policy, typing indicators, and partial delivery are scoped to `(chat_id, thread_id)`. Concurrent turns in different chats or different threads within the same chat should be fully independent.
 
-`hegemon` should track active turns in a `HashMap<(chat_id, thread_id), ActiveTurn>` where `ActiveTurn` holds:
+`membrane` should track active turns in a `HashMap<(chat_id, thread_id), ActiveTurn>` where `ActiveTurn` holds:
 
 - the current `turn_id`
 - the typing refresh task handle
@@ -528,7 +528,7 @@ Required behavior:
 - For `editMessageText`, the same 4096-character limit applies.
 - Do not split mid-sentence or mid-word. Prefer paragraph or section boundaries.
 
-This is independent of progressive delivery and should be handled in a shared `send_formatted_text(chat_id, thread_id, text)` helper in `hegemon` that both the atomic and streaming paths use.
+This is independent of progressive delivery and should be handled in a shared `send_formatted_text(chat_id, thread_id, text)` helper in `membrane` that both the atomic and streaming paths use.
 
 ### Wiring to agent-core
 
@@ -538,7 +538,7 @@ This is independent of progressive delivery and should be handled in a shared `s
 Queued → LoadingContext → WaitingModel → Thinking → WaitingTool → WaitingApproval → WaitingVoice → Completed / Failed
 ```
 
-Every phase transition is already called via `set_active_turn_phase(...)` in `runtime.rs`. None of these transitions are currently emitted back to hegemon — they are only reflected to the context graph via `UpdateTask`. Hegemon receives exactly one IPC message per turn: the final `EmitTask` with `action: "send_reply"` from `deliver_text_reply`.
+Every phase transition is already called via `set_active_turn_phase(...)` in `runtime.rs`. None of these transitions are currently emitted back to membrane — they are only reflected to the context graph via `UpdateTask`. Membrane receives exactly one IPC message per turn: the final `EmitTask` with `action: "send_reply"` from `deliver_text_reply`.
 
 #### New protocol type: TurnEventPayload
 
@@ -571,7 +571,7 @@ It reads `final_reply_to`, `final_reply_role`, `final_reply_guest_id`, `turn_id`
 
 Call `emit_turn_event` after these existing `set_active_turn_phase` calls:
 
-| Call site (approx. line) | Phase | event string | Hegemon action |
+| Call site (approx. line) | Phase | event string | Membrane action |
 |---|---|---|---|
 | line 459 — before model dispatch | `WaitingModel` | `"waiting_model"` | maintain typing |
 | line 774 — before tool dispatch | `WaitingTool` | `"waiting_tool"` | maintain typing |
@@ -579,13 +579,13 @@ Call `emit_turn_event` after these existing `set_active_turn_phase` calls:
 | line 1124 — `deliver_text_reply` | `Completed` | `"completed"` | redundant with `send_reply`; omit |
 | line 1206 — failure path | `Failed` | `"failed"` | stop typing, send error |
 
-`Completed` is redundant because `deliver_text_reply` already sends `action: "send_reply"` which hegemon uses as the delivery trigger. Do not emit a separate `turn_event` for `Completed`.
+`Completed` is redundant because `deliver_text_reply` already sends `action: "send_reply"` which membrane uses as the delivery trigger. Do not emit a separate `turn_event` for `Completed`.
 
-`Queued`, `LoadingContext`, and `Thinking` transitions are high-frequency internal state; emit them only if hegemon has a meaningful differentiation for them (currently it does not).
+`Queued`, `LoadingContext`, and `Thinking` transitions are high-frequency internal state; emit them only if membrane has a meaningful differentiation for them (currently it does not).
 
-#### Hegemon-side ActiveTurn tracking
+#### Membrane-side ActiveTurn tracking
 
-Add to hegemon's main loop state:
+Add to membrane's main loop state:
 
 ```rust
 struct ActiveTurn {
@@ -618,14 +618,14 @@ The typing heartbeat task itself should be cancellation-safe. Use a `Cancellatio
 
 #### Scope boundary
 
-`agent-core` emits turn lifecycle events. `hegemon` maps them to Telegram UX behaviors. `agent-core` does not know or care about Telegram-specific typing actions, message IDs, or edit behavior.
+`agent-core` emits turn lifecycle events. `membrane` maps them to Telegram UX behaviors. `agent-core` does not know or care about Telegram-specific typing actions, message IDs, or edit behavior.
 
 ### Implementation order
 
-1. Typing indicator heartbeat (Layer 1) — `hegemon`-only change, no IPC protocol changes
-2. Message length chunking — `hegemon`-only change, covers the safety gap immediately
-3. `TurnEventPayload` in `agent-core/src/protocol.rs` + `emit_turn_event` helper in `AgentRuntime` — wires `WaitingTool`, `WaitingApproval`, `Failed` to hegemon
-4. Hegemon `ActiveTurn` map + turn event dispatch (Layer 2 foundation)
+1. Typing indicator heartbeat (Layer 1) — `membrane`-only change, no IPC protocol changes
+2. Message length chunking — `membrane`-only change, covers the safety gap immediately
+3. `TurnEventPayload` in `agent-core/src/protocol.rs` + `emit_turn_event` helper in `AgentRuntime` — wires `WaitingTool`, `WaitingApproval`, `Failed` to membrane
+4. Membrane `ActiveTurn` map + turn event dispatch (Layer 2 foundation)
 5. `turn.partial_reply` signal from model streaming once model-router supports chunked output
 6. Edit-based progressive delivery (Layer 2) — builds on step 5
 7. Full approval card suspension + approval card UX (Layer 3) — builds on step 4
@@ -636,9 +636,9 @@ Telegram should support multimodal ingress and egress, but Telegram itself is no
 
 Recommendation:
 
-- `hegemon` normalizes voice notes, audio, photos, and documents
+- `membrane` normalizes voice notes, audio, photos, and documents
 - media analysis and speech generation/transcription route to dedicated model or voice components
-- `hegemon` remains the transport adapter, not the media-processing owner
+- `membrane` remains the transport adapter, not the media-processing owner
 
 ## Transport Recommendation
 
@@ -670,7 +670,7 @@ Scope:
 
 - prove the normalized Telegram ingress envelope on the current text polling path
 - expand polling ingestion beyond text-only
-- elevate deterministic slash commands into `hegemon`
+- elevate deterministic slash commands into `membrane`
 - add delivery primitives for typing/partial/final responses
 - write the webhook security contract into config/docs/tests without enabling public webhook by default
 

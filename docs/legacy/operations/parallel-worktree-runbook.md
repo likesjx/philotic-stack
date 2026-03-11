@@ -14,7 +14,7 @@ Treat a worktree as the unit of an implementation conversation.
 - one `codex/<slug>` branch -> one sibling worktree
 - one PR per coherent slice
 
-When a thread needs `crates/ansible/src/main.rs`, `crates/ansible/src/service/ipc.rs`, `crates/agent-core/src/runtime.rs`, `crates/hegemon/src/main.rs`, or `docs/task.md`, sync it from `origin/main` first and check overlap before continuing.
+When a thread needs `crates/ansible/src/main.rs`, `crates/ansible/src/service/ipc.rs`, `crates/agent-core/src/runtime.rs`, `crates/membrane/src/main.rs`, or `docs/task.md`, sync it from `origin/main` first and check overlap before continuing.
 
 ## Standard Flow
 
@@ -49,7 +49,7 @@ These are the paths where parallel Philotic runtime work most often collides:
 - `crates/ansible/src/main.rs`
 - `crates/ansible/src/service/ipc.rs`
 - `crates/agent-core/src/runtime.rs`
-- `crates/hegemon/src/main.rs`
+- `crates/membrane/src/main.rs`
 - `crates/model-router/src/main.rs`
 - `crates/model-router/src/runtime.rs`
 - `crates/model-router/src/controller.rs`

@@ -78,6 +78,9 @@ pub struct ModelRequestPayload {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<TransportAttachment>,
     pub tools_for_model: Vec<ToolDefinition>,
+    /// Forwarded verbatim to the model controller as `response_contract`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_contract: Option<serde_json::Value>,
     pub chat_id: String,
     pub reply_to: String,
     pub reply_role: String,
@@ -101,6 +104,18 @@ pub struct FinalReplyPayload {
     /// content alongside the audio (e.g. as a Telegram caption).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub send_text_caption: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TurnEventPayload {
+    pub action: &'static str,
+    /// Value of `TurnPhase::as_str()` for the new phase.
+    pub event: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub chat_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partial_content: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

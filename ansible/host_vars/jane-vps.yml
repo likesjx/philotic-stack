@@ -1,7 +1,7 @@
 ---
 # jane-vps — beacon-test-hotel
 philotic_hotel_name: "beacon-test-hotel"
-philotic_default_model: "gemini-pro"
+philotic_default_model: "gemini-flash-latest"
 philotic_repo_branch: "codex/hegemon-membrane-slice"
 
 # Agents
@@ -16,6 +16,19 @@ philotic_agents:
         - "likesjx"
     model:
       default_model: "{{ philotic_default_model }}"
+    voice_response_policy:
+      mode: "off"                          # off | auto | on  (/tts to toggle)
+      provider: "elevenlabs"
+      voice_id: "{{ vault_beacon_elevenlabs_voice_id }}"
+      model: "eleven_multilingual_v2"
+      send_text_caption: true              # send text alongside audio when mode=on
+      fallback_to_text: true               # degrade gracefully if synthesis fails
+    media_routing_policy:
+      forward_media_to_model: true
+      voice_action: "transcribe"           # voice notes → voice.transcribe capability
+      image_action: "analyze_media"        # photos → media.analyze (Gemini vision)
+      document_action: "analyze_media"
+      strip_tools_on_media: true
 
 # Artifacts — binaries built on host for first smoke
 philotic_artifacts_remote: true

@@ -36,7 +36,7 @@ Interactive HTML version (with hover tooltips): [`docs/philotic-architecture-dia
 | [`ansible`](crates/ansible/README.md)                     | Hotel daemon — guest materialization, IPC, mesh routing    |
 | [`ansible-mesh-core`](crates/ansible-mesh-core/README.md) | Core primitives, traits, event types, storage abstractions |
 | [`philotic-client`](crates/philotic-client/README.md)     | Guest SDK — IPC client for hotel communication             |
-| [`hegemon`](crates/hegemon/README.md)                     | Telegram/external protocol gateway guest                   |
+| [`membrane`](crates/membrane/README.md)                     | Telegram/external protocol gateway guest                   |
 | [`agent-core`](crates/agent-core/README.md)               | Persona/agent cognitive loop guest                         |
 | [`model-router`](crates/model-router/README.md)           | LLM model provider routing guest                           |
 

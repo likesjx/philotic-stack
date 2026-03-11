@@ -25,10 +25,10 @@ This prevents the monolith from needing to compile in every provider. It support
   - **Memory Apartments:** Allocates a namespace (apartment) for each agent's short-term, long-term, episodic, and semantic memory. Accessible via mesh tools (`memory.read`, `memory.write`).
 - **Component File:** Functioning Local/Disk-backed KV or Graph store module (`src/memory/graph.rs` mounted inside `crates/ansible`).
 
-### 2. Chat / Communication Gateway (Materializing Hegemon)
+### 2. Chat / Communication Gateway (Materializing Membrane)
 
 - **Role:** Edge connectors to external chat networks (Telegram, Discord, Slack, Matrix).
-- **Function:** If an Ansible is assigned the "Hegemon" role in the Config Graph, it spawns a Telegram listener child process. This process pulls the `bot_key` and agent-mapping from the Graph, listens to webhooks, and translates user texts into tasks dropped onto the Philotic Web.
+- **Function:** If an Ansible is assigned the "Membrane" role in the Config Graph, it spawns a Telegram listener child process. This process pulls the `bot_key` and agent-mapping from the Graph, listens to webhooks, and translates user texts into tasks dropped onto the Philotic Web.
 
 ### 3. Agent Personas + Context + Session (Materializing Guests)
 
@@ -101,7 +101,7 @@ _Note on terminology: While "Ansible Meshops" refers to the Speaker for the Dead
 - **Focus:** Clean break from legacy monolithic architecture into a specialized mesh routing ecosystem.
 - **Strategy:**
   1. Initialize a completely new Git repository named `philotic-stack` (or similar).
-  2. Extract the newly built `crates/` directory (`ansible`, `hegemon`, `agent-core`, `model-router`, `philotic-ipc`, `ansible-mesh-core`) into the new workspace.
+  2. Extract the newly built `crates/` directory (`ansible`, `membrane`, `agent-core`, `model-router`, `philotic-ipc`, `ansible-mesh-core`) into the new workspace.
   3. Ensure the core UDP/UDS communication protocols build successfully devoid of legacy dependencies.
   4. Leave the current `zeroclaw`/`openclaw` monorepo perfectly intact. Coding agents can run parallel views to use the legacy code inside `src/` (e.g., Slack channels, Notion integrations, original MCP Hands) as an exact reference when migrating those capabilities to the new Philotic stack as discrete Guests.
 - **Goal:** Maintain an unpolluted baseline for the Philotic architecture while retaining the vast legacy monolithic code as a migration guidebook.

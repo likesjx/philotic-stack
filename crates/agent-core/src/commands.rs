@@ -15,6 +15,7 @@ pub enum SlashCommand {
     PreapproveThisSession,
     ApprovalStatus,
     ApprovalReset,
+    Tts { mode: Option<String> },
 }
 
 impl SlashCommand {
@@ -33,6 +34,7 @@ impl SlashCommand {
             Self::Approve { .. } => Some("approved"),
             Self::Deny { .. } => Some("denied"),
             Self::PreapproveThisSession | Self::ApprovalStatus | Self::ApprovalReset => None,
+            Self::Tts { .. } => None,
         }
     }
 
@@ -77,6 +79,8 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         ["/preapprove", "this-session", ..] => Some(SlashCommand::PreapproveThisSession),
         ["/approval", "status", ..] => Some(SlashCommand::ApprovalStatus),
         ["/approval", "reset", ..] => Some(SlashCommand::ApprovalReset),
+        ["/tts"] => Some(SlashCommand::Tts { mode: None }),
+        ["/tts", mode, ..] => Some(SlashCommand::Tts { mode: Some((*mode).to_string()) }),
         _ => None,
     }
 }
@@ -159,11 +163,52 @@ mod tests {
             parse_slash_command("/approval reset"),
             Some(SlashCommand::ApprovalReset)
         );
+        assert_eq!(parse_slash_command("/tts"), Some(SlashCommand::Tts { mode: None }));
+        assert_eq!(parse_slash_command("/tts on"), Some(SlashCommand::Tts { mode: Some("on".into()) }));
+        assert_eq!(parse_slash_command("/tts off"), Some(SlashCommand::Tts { mode: Some("off".into()) }));
+        assert_eq!(parse_slash_command("/tts auto"), Some(SlashCommand::Tts { mode: Some("auto".into()) }));
     }
 
     #[test]
     fn ignores_non_commands_and_unknown_commands() {
         assert_eq!(parse_slash_command("hello"), None);
         assert_eq!(parse_slash_command("/unknown"), None);
+    }
+
+    #[test]
+    fn steering_note_is_accessible_from_approve_and_deny() {
+        let approve_with_note = SlashCommand::Approve {
+            note: Some("use the staging environment".into()),
+        };
+        assert_eq!(
+            approve_with_note.steering_note(),
+            Some("use the staging environment")
+        );
+
+        let approve_bare = SlashCommand::Approve { note: None };
+        assert_eq!(approve_bare.steering_note(), None);
+
+        let deny_with_note = SlashCommand::Deny {
+            note: Some("summarize instead".into()),
+        };
+        assert_eq!(deny_with_note.steering_note(), Some("summarize instead"));
+
+        let deny_bare = SlashCommand::Deny { note: None };
+        assert_eq!(deny_bare.steering_note(), None);
+
+        // Non-approval commands never carry a steering note.
+        assert_eq!(SlashCommand::Ping.steering_note(), None);
+    }
+
+    #[test]
+    fn approve_with_note_has_steering_deny_without_does_not() {
+        let approve = parse_slash_command("/approve use staging").unwrap();
+        assert!(approve.steering_note().is_some());
+
+        let deny_bare = parse_slash_command("/deny").unwrap();
+        assert!(deny_bare.steering_note().is_none());
+
+        let deny_steered = parse_slash_command("/deny try a different approach").unwrap();
+        assert_eq!(deny_steered.steering_note(), Some("try a different approach"));
     }
 }
