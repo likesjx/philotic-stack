@@ -7,7 +7,7 @@ description: Use this skill when a client should adopt the shared Muninn memory 
 
 Use this skill when you need a client to participate in the shared Muninn memory experiment.
 
-Read [MUNINN_CLIENT_MEMORY_PROTOCOL.md](/Users/jaredlikes/code/philotic-stack/docs/reference/MUNINN_CLIENT_MEMORY_PROTOCOL.md) first for the portable contract.
+Read [MUNINN_CLIENT_MEMORY_PROTOCOL.md](../../docs/reference/MUNINN_CLIENT_MEMORY_PROTOCOL.md) first for the portable contract.
 
 ## Purpose
 
@@ -22,7 +22,7 @@ This skill standardizes how a client should:
 
 Preferred transport helper:
 
-- [muninn_mcp.py](/Users/jaredlikes/code/philotic-stack/scripts/muninn_mcp.py)
+- [muninn_mcp.py](../../scripts/muninn_mcp.py)
 
 Do not reimplement the MCP handshake ad hoc unless you are intentionally porting the helper into another runtime.
 

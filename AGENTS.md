@@ -267,7 +267,23 @@ At the end of a meaningful slice, perform a brief check for:
 
 Keep this lightweight. The process should improve continuously without becoming its own bureaucracy engine.
 
-## 11. Repository-Specific Notes
+## 11. Repo-Local Specialized Skills
+
+The repository contains specialized skills in `skills/` to standardize common workflows. Prioritize these over global skills for project-specific tasks.
+
+| Skill | Purpose |
+|---|---|
+| `philotic-slice-closeout` | Finalizing implementation slices (tasks, proposals, commits) |
+| `verification-ladder` | Deciding and reporting the honest validation level |
+| `proposal-maintainer` | Architecture/process proposal and spec hygiene |
+| `muninn-memory-habit` | Establishing consistent retrieval/write-back habits |
+| `command-center-context` | Jane Command Center session bootstrap and continuity |
+| `subagent-delegation` | Splitting large tasks into bounded sub-tasks |
+| `runtime-debugger` | Diagnosing live multi-process/multimodal stack failures |
+| `runtime-materialization` | Designing startup/wake/sleep and placement policy |
+| `muninn-memory-protocol` | Client adapter contract for memory integration |
+
+## 12. Repository-Specific Notes
 
 - The legacy ZeroClaw/OpenClaw reference clone has been removed from this repo. Consult the original `zeroclaw` repository separately if needed.
 - Prefer `rg` for file and text search.

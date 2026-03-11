@@ -1,0 +1,4 @@
+version: 1
+display_name: Command Center Context
+short_description: Run session handoff and context continuity workflow for Jane Command Center.
+default_prompt: Set up and execute the command-center context workflow for this task, including handoff and Aria ingestion when needed.
