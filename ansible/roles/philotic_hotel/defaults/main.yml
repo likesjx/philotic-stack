@@ -21,7 +21,7 @@ philotic_artifacts_dir: "{{ playbook_dir }}/../dist"
 philotic_artifacts_remote: false
 philotic_binaries:
   - ansible
-  - hegemon
+  - membrane
   - agent-core
   - model-router
 

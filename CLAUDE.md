@@ -17,7 +17,7 @@ cargo test <test_name>      # run a specific test by name
 
 # Run
 just start-ansible          # build + start hotel daemon (requires mesh-config.json)
-just start-gateway          # cargo run -p hegemon
+just start-gateway          # cargo run -p membrane
 just start-agent            # cargo run -p agent-core
 just start-model            # cargo run -p model-router
 
@@ -49,7 +49,7 @@ Before opening a PR from a worktree:
 just workstream-overlap <slug>
 ```
 
-Hot files include `crates/ansible/src/main.rs`, `crates/ansible/src/service/ipc.rs`, `crates/agent-core/src/runtime.rs`, `crates/hegemon/src/main.rs`, `crates/model-router/*`, `crates/philotic-client/src/lib.rs`, `crates/ansible/README.md`, `docs/task.md`, and `docs/architecture/MODEL_CONTROLLER_PROPOSAL.md`.
+Hot files include `crates/ansible/src/main.rs`, `crates/ansible/src/service/ipc.rs`, `crates/agent-core/src/runtime.rs`, `crates/membrane/src/main.rs`, `crates/model-router/*`, `crates/philotic-client/src/lib.rs`, `crates/ansible/README.md`, `docs/task.md`, and `docs/architecture/MODEL_CONTROLLER_PROPOSAL.md`.
 
 See [docs/operations/parallel-worktree-runbook.md](docs/operations/parallel-worktree-runbook.md).
 
@@ -63,7 +63,7 @@ The Philotic Stack is a distributed AI agent OS built in Rust. The metaphor: a *
 ansible-mesh-core       (shared primitives — everything else depends on this)
 philotic-client         (guest SDK — IPC client only, no hotel internals)
 ansible                 (hotel daemon — imports both above)
-hegemon / agent-core / model-router / robot-kit  (guests — import philotic-client)
+membrane / agent-core / model-router / robot-kit  (guests — import philotic-client)
 ```
 
 ### Communication Layers

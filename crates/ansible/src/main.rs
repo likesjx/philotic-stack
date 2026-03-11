@@ -707,6 +707,23 @@ fn merge_agent_entries(
             merged.insert("default_model".into(), default_model.clone());
         }
     }
+
+    // Store agent-level policy objects wholesale so any guest can read them via GetConfig.
+    for key in ["voice_response_policy", "media_routing_policy"] {
+        if let Some(policy) = agent.get(key) {
+            merged.insert(key.into(), policy.clone());
+        }
+    }
+
+    // Promote voice_id from voice_response_policy to elevenlabs_voice_id as a named fallback
+    // so model-router ProviderConfigs can pick it up without knowing about VoiceResponsePolicy.
+    if let Some(voice_id) = agent
+        .get("voice_response_policy")
+        .and_then(|p| p.get("voice_id"))
+        .filter(|v| v.is_string())
+    {
+        merged.entry("elevenlabs_voice_id".to_string()).or_insert_with(|| voice_id.clone());
+    }
 }
 
 fn merge_telegram_entries(
@@ -732,19 +749,34 @@ fn configured_agent_identity_from_config(
         return None;
     }
 
-    Some(AgentIdentityRecord {
-        agent_id: profile.agent_id,
-        persona_name: profile.persona_name,
-        bundle_json: identity_bundle_from_workspace(&profile.agent_key, Path::new(import_workspace)),
-    })
+    let agent_config = merged_agent_config(config_json, hotel_name).map(|(_, agent)| agent);
+    Some(agent_identity_record_for_profile(
+        &profile,
+        agent_config.as_ref(),
+    ))
 }
 
-fn agent_identity_record_for_profile(profile: &AgentProfile) -> AgentIdentityRecord {
-    let bundle_json = profile
+fn agent_identity_record_for_profile(
+    profile: &AgentProfile,
+    agent_config: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> AgentIdentityRecord {
+    let mut bundle_json = profile
         .import_workspace
         .as_deref()
         .map(|workspace| identity_bundle_from_workspace(&profile.agent_key, Path::new(workspace)))
         .unwrap_or_else(|| serde_json::json!({}));
+
+    // Merge policy fields from config into bundle so agent-core's AgentProfile picks them up
+    // via serde deserialization of the session snapshot's agent_profile field.
+    if let Some(bundle_obj) = bundle_json.as_object_mut() {
+        if let Some(config) = agent_config {
+            for key in ["voice_response_policy", "media_routing_policy"] {
+                if let Some(value) = config.get(key) {
+                    bundle_obj.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+    }
 
     AgentIdentityRecord {
         agent_id: profile.agent_id.clone(),
@@ -822,6 +854,26 @@ fn seed_abstract_tool_catalog(graph: &dyn GraphStorage) -> anyhow::Result<()> {
                 "required": ["path"]
             }),
             class: "workspace".into(),
+        },
+        AbstractToolRecord {
+            tool_name: "agent.configure".into(),
+            description: "Update an agent configuration field. Supports approval_policy, \
+                          profile, and bindings sections. Requires operator approval unless \
+                          preapproved."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "config_path": { "type": "string" },
+                    "value": {},
+                    "operation": {
+                        "type": "string",
+                        "enum": ["set", "append", "remove"]
+                    }
+                },
+                "required": ["config_path", "value"]
+            }),
+            class: "config".into(),
         },
     ];
 
@@ -2003,6 +2055,7 @@ async fn main() -> Result<()> {
 
     // Handle Config Loading if requested
     let mut effective_agent_profile = None;
+    let mut effective_agent_config: Option<serde_json::Map<String, serde_json::Value>> = None;
     if let Some(config_path) = args.load_config {
         info!(
             "Loading configuration from '{}' into the Context Graph...",
@@ -2013,6 +2066,9 @@ async fn main() -> Result<()> {
             serde_json::from_str(&config_data).context("Invalid JSON config file")?;
         if let Some(hotel_name) = hotel_name.as_deref() {
             effective_agent_profile = agent_profile_from_config(&config_json, hotel_name);
+            // Stash the raw merged agent config so policy fields can be seeded into bundle_json.
+            effective_agent_config = merged_agent_config(&config_json, hotel_name)
+                .map(|(_, agent)| agent);
         }
 
         let entries = extract_context_graph_entries(&config_json, hotel_name.as_deref());
@@ -2066,7 +2122,10 @@ async fn main() -> Result<()> {
         enable_guest_test_overrides(&graph_storage, &hotel_name, test)?;
     }
 
-    let effective_identity = agent_identity_record_for_profile(&effective_agent_profile);
+    let effective_identity = agent_identity_record_for_profile(
+        &effective_agent_profile,
+        effective_agent_config.as_ref(),
+    );
     graph_storage
         .upsert_agent_identity(&effective_identity)
         .with_context(|| {

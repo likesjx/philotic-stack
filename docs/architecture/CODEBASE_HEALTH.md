@@ -75,7 +75,7 @@ At **4,911 lines**, `service/ipc.rs` is the single most critical file in the sta
 This is not a criticism of the design process — the proposals are high quality. But the gap between `docs/architecture/` and `crates/` is wide, and it grows with each session.
 
 ### 4. No integration test directories for core crates
-Only `ansible-mesh-core` has a `tests/` directory. `ansible`, `agent-core`, and `hegemon` — which contain the most complex runtime behavior — have no integration test layer. The smoke scripts fill some of this gap but are environment-dependent and not CI-runnable.
+Only `ansible-mesh-core` has a `tests/` directory. `ansible`, `agent-core`, and `membrane` — which contain the most complex runtime behavior — have no integration test layer. The smoke scripts fill some of this gap but are environment-dependent and not CI-runnable.
 
 **Recommendation:** Add at least one integration test per crate that exercises the happy path without a live running hotel where possible (e.g., `GuestManager` can be tested with a mock materializer).
 
@@ -88,7 +88,7 @@ The `tool-runner` binary is registered in the hotel config seeding path with the
 `webrtc_guest.rs` imports the `webrtc` crate and defines the `WebRtcGuest` struct with connection setup scaffolding, but the ICE/signaling lifecycle is incomplete. It's listed in the Port Road Map as planned — it's actually in-progress but not yet usable.
 
 ### 7. Branch sprawl risk
-Two `codex/*` branches are active simultaneously (`hegemon-membrane-slice`, `model-controller-abstraction`). The `CLAUDE.md` worktree discipline is good. Keep it — each branch should reach a merge decision before a third is opened.
+Two `codex/*` branches are active simultaneously (`membrane-membrane-slice`, `model-controller-abstraction`). The `CLAUDE.md` worktree discipline is good. Keep it — each branch should reach a merge decision before a third is opened.
 
 ---
 
@@ -111,5 +111,5 @@ The biggest risk is **proposal accumulation outpacing implementation velocity**.
 1. **Split `ipc.rs`** into sub-modules by concern
 2. **Audit and fix `unwrap()` density** in async task bodies in `ansible/`
 3. **Activate or deprecate `tool-runner`** — resolve its status
-4. **Add one integration test per core crate** (`ansible`, `agent-core`, `hegemon`)
+4. **Add one integration test per core crate** (`ansible`, `agent-core`, `membrane`)
 5. **Close the current branches** before opening new proposal workstreams

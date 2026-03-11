@@ -6,13 +6,14 @@ Close four concrete gaps in the current `agent-core` loop that prevent it from f
 
 ## Disposition
 
-`in progress — Gap 2 (media routing) complete; Gap 3 (tool catalog) next`
+`complete — all four gaps closed`
 
 ### Completed
-- **Gap 2 — Configurable Media Routing** — `MediaRoutingPolicy` landed in `AgentProfile`. Per-kind action overrides (`voice_action`, `image_action`, `document_action`) route to distinct capabilities (`voice.transcribe`, `image.describe`, `media.analyze`). `strip_tools_on_media` and `forward_media_to_model` are configurable. `TaskKind::AudioTranscribe` added to model-router; Gemini handles it via the same inline-bytes path. Voice routing defaults to `analyze_media` / `media.analyze`; set `voice_action: "transcribe"` to route to a dedicated STT guest.
+- **Gap 3 — Real Tool Catalog** — `catalog.rs` in `agent-core` with proper descriptions and schemas for `session.status`, `echo`, `workspace.list`, `workspace.read`. `ToolDefinition` gained `class: Option<String>`. Hotel startup seeds the catalog into the context graph as `AbstractToolRecord` nodes. Both `default_tool_assembly_for_bindings` and `tool_assembly_from_allowed_incarnations` look up from the catalog before falling back to stubs.
+- **Gap 2 — Configurable Media Routing** — `MediaRoutingPolicy` landed in `AgentProfile`. Per-kind action overrides (`voice_action`, `image_action`, `document_action`) route to distinct capabilities (`voice.transcribe`, `image.describe`, `media.analyze`). `strip_tools_on_media` and `forward_media_to_model` are configurable. `TaskKind::AudioTranscribe` added to model-router; Gemini handles it via the same inline-bytes path.
 
 ### Extended (beyond original Gap 2 scope)
-- **TTS response pipeline** — `VoiceResponsePolicy` added to `AgentProfile`. When `enabled: true`, the agent routes its text response through `voice.synthesize` before delivery. Turn phase `WaitingVoice` introduced. Hegemon now delivers audio via `sendVoice`/`sendAudio` multipart plus optional text caption.
+- **TTS response pipeline** — `VoiceResponsePolicy` added to `AgentProfile`. When `enabled: true`, the agent routes its text response through `voice.synthesize` before delivery. Turn phase `WaitingVoice` introduced. Membrane now delivers audio via `sendVoice`/`sendAudio` multipart plus optional text caption.
 
 ## Linked Work Surface
 
@@ -24,7 +25,7 @@ Close four concrete gaps in the current `agent-core` loop that prevent it from f
 
 ### Current behavior
 
-After `handle_tool_result()`, `interpret_tool_result()` always returns `Respond { "Tool X says: <content>" }` — the tool result string is sent directly to hegemon. The model never sees it. There is no way for the model to reason about the result, chain another tool call, or change its mind.
+After `handle_tool_result()`, `interpret_tool_result()` always returns `Respond { "Tool X says: <content>" }` — the tool result string is sent directly to membrane. The model never sees it. There is no way for the model to reason about the result, chain another tool call, or change its mind.
 
 ### Recommendation
 

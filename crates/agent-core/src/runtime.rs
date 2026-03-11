@@ -1,14 +1,13 @@
 use crate::commands::{SlashCommand, parse_slash_command};
 use crate::r#loop::{
     AgentAction, ApprovalRequest, ToolCall, ToolResult, TurnPhase, interpret_model_payload,
-    interpret_tool_result,
 };
 use crate::protocol::{
     FinalReplyPayload, InboundTaskPayload, ModelRequestPayload, TaskRunnerOverlay,
-    ToolExecutionPayload, TransportAttachment,
+    ToolExecutionPayload, TransportAttachment, TurnEventPayload,
 };
 use crate::session::{
-    MediaRoutingPolicy, SessionState, ToolExecutionRoute, VoiceResponsePolicy, WorkingTurn,
+    MediaRoutingPolicy, SessionState, ToolExecutionRoute, TtsMode, VoiceResponsePolicy, WorkingTurn,
     merge_session_index,
 };
 use anyhow::Result;
@@ -23,6 +22,9 @@ const DEFAULT_REPLY_ROLE: &str = "membrane";
 const LOCAL_NODE: &str = "local-ansible-01";
 const DEFAULT_TEXT_MODEL_ROLE: &str = "model.gemini";
 const DEFAULT_VOICE_MODEL_ROLE: &str = "model.elevenlabs";
+/// Maximum model round-trips per turn. Exhausting this budget fails the turn with a
+/// clear error rather than looping indefinitely.
+const MAX_TOOL_ITERATIONS: u32 = 10;
 
 fn implementation_to_model_role(implementation: &str) -> String {
     let normalized = implementation
@@ -157,6 +159,94 @@ fn transcription_prompt(content: &str) -> String {
             content
         )
     }
+}
+
+/// Deterministically strips markdown/markup from text for voice delivery.
+/// Used as fallback when the model does not produce a `spoken_text` channel.
+pub(crate) fn strip_markup(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_code_block = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+
+        // Fenced code blocks
+        if trimmed.starts_with("```") {
+            in_code_block = !in_code_block;
+            if in_code_block {
+                out.push_str("The following code: ");
+            }
+            continue;
+        }
+        if in_code_block {
+            out.push_str(trimmed);
+            out.push(' ');
+            continue;
+        }
+
+        // ATX headings: # Heading → Heading
+        let line = if let Some(rest) = trimmed.strip_prefix("######").or_else(|| trimmed.strip_prefix("#####")).or_else(|| trimmed.strip_prefix("####")).or_else(|| trimmed.strip_prefix("###")).or_else(|| trimmed.strip_prefix("##")).or_else(|| trimmed.strip_prefix('#')) {
+            rest.trim().to_string()
+        } else {
+            trimmed.to_string()
+        };
+
+        // List items: - item or * item or 1. item
+        let line = if let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")).or_else(|| line.strip_prefix("• ")) {
+            rest.to_string()
+        } else if line.len() > 2 && line.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) && line.contains(". ") {
+            line.splitn(2, ". ").nth(1).unwrap_or(&line).to_string()
+        } else {
+            line
+        };
+
+        // Blockquotes
+        let line = line.strip_prefix("> ").unwrap_or(&line).to_string();
+
+        // Inline: **bold**, *italic*, __bold__, _italic_, `code`
+        let line = line
+            .replace("**", "")
+            .replace("__", "")
+            .replace('*', "")
+            .replace('_', "")
+            .replace('`', "");
+
+        // Inline links: [text](url) → text
+        let line = {
+            let mut result = String::new();
+            let mut rest = line.as_str();
+            while let Some(start) = rest.find('[') {
+                result.push_str(&rest[..start]);
+                rest = &rest[start + 1..];
+                if let Some(mid) = rest.find("](") {
+                    let link_text = &rest[..mid];
+                    rest = &rest[mid + 2..];
+                    if let Some(end) = rest.find(')') {
+                        result.push_str(link_text);
+                        rest = &rest[end + 1..];
+                    } else {
+                        result.push('[');
+                        result.push_str(link_text);
+                    }
+                } else {
+                    result.push('[');
+                }
+            }
+            result.push_str(rest);
+            result
+        };
+
+        if !line.trim().is_empty() {
+            out.push_str(line.trim());
+            out.push_str(". ");
+        }
+    }
+
+    // Collapse multiple spaces and trailing dots
+    let result = out.trim_end_matches(". ").trim().to_string();
+    // Collapse multiple ". "
+    let result = result.replace(". . ", ". ");
+    result
 }
 
 /// Maps a configured action name to the capability key used for component route resolution.
@@ -350,8 +440,14 @@ impl AgentRuntime {
                 SlashCommand::PreapproveThisSession
                 | SlashCommand::ApprovalStatus
                 | SlashCommand::ApprovalReset => {}
+                SlashCommand::Tts { .. } => {}
             }
         }
+
+        let had_voice_input = task.message_kind.as_deref()
+            .map(|k| matches!(k, "voice" | "audio"))
+            .unwrap_or(false)
+            || task.attachments.iter().any(|a| matches!(a.kind.as_str(), "voice" | "audio"));
 
         let (checkpoint_memory_type, checkpoint_json, index_state, model_prompt, tools_for_model) = {
             let state = self
@@ -370,7 +466,9 @@ impl AgentRuntime {
                 iteration: 0,
                 pending_tool_call: None,
                 pending_approval: None,
+                working_tool_history: Vec::new(),
                 pending_text_reply: None,
+                had_voice_input,
             });
             state.set_active_turn_phase(TurnPhase::LoadingContext);
 
@@ -412,6 +510,12 @@ impl AgentRuntime {
                 SlashCommand::PreapproveThisSession
                 | SlashCommand::ApprovalStatus
                 | SlashCommand::ApprovalReset => {
+                    self.handle_session_control_command(
+                        task_id, session_id, turn_id, chat_id, command,
+                    )
+                    .await
+                }
+                SlashCommand::Tts { .. } => {
                     self.handle_session_control_command(
                         task_id, session_id, turn_id, chat_id, command,
                     )
@@ -549,6 +653,7 @@ impl AgentRuntime {
             user_content: content,
             attachments,
             tools_for_model,
+            response_contract: Some(serde_json::json!({ "channels": ["spoken_text"] })),
             chat_id,
             reply_to: LOCAL_NODE.to_string(),
             reply_role: "agent".into(),
@@ -601,10 +706,20 @@ impl AgentRuntime {
             state.set_active_turn_phase(TurnPhase::Thinking);
         }
 
+        let spoken_text = task
+            .agent_action
+            .as_ref()
+            .and_then(|a| a.get("model_result"))
+            .and_then(|mr| mr.get("result"))
+            .and_then(|r| r.get("spoken_text"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string);
+
         let action = interpret_model_payload(task.agent_action.as_ref(), task.content.as_deref());
         match action {
             AgentAction::Respond { content } => {
-                self.complete_agent_response(session_id, turn_id, content)
+                self.complete_agent_response(session_id, turn_id, content, spoken_text)
                     .await
             }
             AgentAction::ToolCall(tool_call) => {
@@ -630,7 +745,13 @@ impl AgentRuntime {
         let preapproved = self
             .sessions
             .get(&session_id)
-            .map(|state| state.approval_policy_allows(&approval))
+            .map(|state| {
+                let tool = state
+                    .active_turn
+                    .as_ref()
+                    .and_then(|t| t.pending_tool_call.as_ref());
+                state.approval_policy_allows(&approval, tool)
+            })
             .unwrap_or(false);
 
         let (
@@ -712,7 +833,7 @@ impl AgentRuntime {
                 .await?;
 
             return self
-                .complete_agent_response(session_id, turn_id, approval.approved_response)
+                .complete_agent_response(session_id, turn_id, approval.approved_response, None)
                 .await;
         }
 
@@ -733,6 +854,10 @@ impl AgentRuntime {
                 }),
             })
             .await?;
+
+        let _ = self
+            .emit_turn_event(&session_id, "waiting_approval", Some(approval.reason.clone()))
+            .await;
 
         let reply_payload = FinalReplyPayload {
             action: "send_reply",
@@ -765,6 +890,57 @@ impl AgentRuntime {
         turn_id: String,
         tool_call: ToolCall,
     ) -> Result<()> {
+        // Agent-level approval enforcement: if the tool's policy annotation marks it as
+        // requiring approval, and the current approval policy does not preapprove it,
+        // synthesize an ApprovalRequest before executing. This runs independently of
+        // whether the model itself requested approval — it is the agent's safety gate.
+        let force_approval = self
+            .sessions
+            .get(&session_id)
+            .map(|state| {
+                let requires = state
+                    .tool_assembly
+                    .policy_annotations
+                    .get(&tool_call.tool_name)
+                    .map(|a| a.approval_required)
+                    .unwrap_or(false);
+                if requires {
+                    let synthetic = ApprovalRequest {
+                        approval_id: None,
+                        reason: format!(
+                            "Tool '{}' requires approval before execution.",
+                            tool_call.tool_name
+                        ),
+                        approved_response: format!(
+                            "Executing {}.",
+                            tool_call.tool_name
+                        ),
+                    };
+                    !state.approval_policy_allows(&synthetic, Some(&tool_call))
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false);
+
+        if force_approval {
+            // Set pending_tool_call so the approval handler can read it for class lookup.
+            if let Some(state) = self.sessions.get_mut(&session_id) {
+                state.set_pending_tool_call(tool_call.clone());
+            }
+            let synthetic = ApprovalRequest {
+                approval_id: Some(uuid::Uuid::new_v4().to_string()),
+                reason: format!(
+                    "Tool '{}' requires approval before execution.",
+                    tool_call.tool_name
+                ),
+                approved_response: format!("Executing {}.", tool_call.tool_name),
+            };
+            return self
+                .handle_approval_request(session_id, turn_id, synthetic)
+                .await;
+        }
+
         let (checkpoint_memory_type, checkpoint_json, index_state) = {
             let Some(state) = self.sessions.get_mut(&session_id) else {
                 warn!("Received tool call for unknown session {}", session_id);
@@ -783,6 +959,10 @@ impl AgentRuntime {
             .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
             .await?;
         self.sync_session_index(&index_state).await?;
+
+        let _ = self
+            .emit_turn_event(&session_id, "waiting_tool", None)
+            .await;
 
         let (chat_id, final_reply_to, final_reply_role, final_reply_guest_id, workspace_ref, route) = {
             let Some(state) = self.sessions.get(&session_id) else {
@@ -880,50 +1060,179 @@ impl AgentRuntime {
             content: task.content.clone().unwrap_or_default(),
         };
 
-        let (checkpoint_memory_type, checkpoint_json, index_state) = {
+        // Pair the result with the pending tool call, push to history, check iteration cap.
+        let loop_outcome = {
             let Some(state) = self.sessions.get_mut(&session_id) else {
                 warn!("Tool result returned for unknown session {}", session_id);
                 return Ok(());
             };
+
+            let tool_call = state
+                .active_turn
+                .as_ref()
+                .and_then(|t| t.pending_tool_call.clone())
+                .unwrap_or_else(|| ToolCall {
+                    tool_name: tool_result.tool_name.clone(),
+                    arguments: serde_json::json!({}),
+                });
+
+            state.push_tool_history(tool_call, tool_result.clone());
             state.clear_pending_tool_call();
-            state.set_active_turn_phase(TurnPhase::Thinking);
+
+            let iteration = state
+                .active_turn
+                .as_ref()
+                .map(|t| t.iteration)
+                .unwrap_or(0);
+
+            if iteration >= MAX_TOOL_ITERATIONS {
+                Err(format!(
+                    "Turn exceeded maximum tool iterations ({MAX_TOOL_ITERATIONS}). Aborting."
+                ))
+            } else {
+                // Build re-entry prompt with full tool history injected.
+                match state.build_reentry_prompt() {
+                    Some(prompt) => {
+                        if let Some(turn) = state.active_turn.as_mut() {
+                            turn.iteration += 1;
+                            turn.phase = TurnPhase::WaitingModel;
+                        }
+                        let tools = state.tool_assembly.tools_for_model.clone();
+                        let active_turn = state.active_turn.as_ref().expect("turn exists");
+                        Ok((
+                            prompt,
+                            active_turn.task_id,
+                            active_turn.user_content.clone(),
+                            active_turn.chat_id.clone(),
+                            active_turn.final_reply_to.clone(),
+                            active_turn.final_reply_role.clone(),
+                            active_turn.final_reply_guest_id.clone(),
+                            tools,
+                            state.checkpoint_memory_type(),
+                            state.checkpoint_json(),
+                            state.clone(),
+                        ))
+                    }
+                    None => Err("Active turn vanished before re-entry prompt could be built".into()),
+                }
+            }
+        };
+
+        match loop_outcome {
+            Err(msg) => self.fail_active_turn(session_id, turn_id, msg).await,
+            Ok((
+                prompt,
+                _task_id,
+                user_content,
+                chat_id,
+                final_reply_to,
+                final_reply_role,
+                final_reply_guest_id,
+                tools_for_model,
+                checkpoint_memory_type,
+                checkpoint_json,
+                index_state,
+            )) => {
+                self.ipc_client
+                    .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
+                    .await?;
+                self.sync_session_index(&index_state).await?;
+
+                let _ = self.emit_turn_event(&session_id, "waiting_tool", None).await;
+
+                let model_req = ModelRequestPayload {
+                    action: "generate_text".to_string(),
+                    session_id: session_id.clone(),
+                    turn_id,
+                    prompt,
+                    user_content,
+                    attachments: Vec::new(),
+                    tools_for_model,
+                    response_contract: None,
+                    chat_id,
+                    reply_to: LOCAL_NODE.to_string(),
+                    reply_role: "agent".into(),
+                    final_reply_to,
+                    final_reply_role,
+                    final_reply_guest_id,
+                };
+
+                let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
+                    self.sessions.get(&session_id),
+                    "text.generate",
+                    DEFAULT_TEXT_MODEL_ROLE,
+                );
+
+                info!(
+                    "Session [{}] re-entering model loop (iteration {})",
+                    session_id,
+                    self.sessions
+                        .get(&session_id)
+                        .and_then(|s| s.active_turn.as_ref())
+                        .map(|t| t.iteration)
+                        .unwrap_or(0)
+                );
+
+                self.ipc_client
+                    .send_request(IpcRequest::EmitTask {
+                        target_node,
+                        target_role,
+                        target_guest_id,
+                        task_json: serde_json::to_string(&model_req)?,
+                    })
+                    .await?;
+
+                Ok(())
+            }
+        }
+    }
+
+    /// Emit a turn lifecycle event back to the transport (membrane) so it can update delivery UX
+    /// (typing indicator, approval card, error message) without waiting for the final reply.
+    ///
+    /// Silently skips if there is no active turn or the session is unknown — turn events are
+    /// best-effort delivery signals, not transactional guarantees.
+    async fn emit_turn_event(
+        &mut self,
+        session_id: &str,
+        event: &str,
+        partial_content: Option<String>,
+    ) -> Result<()> {
+        let (turn_id, chat_id, final_reply_to, final_reply_role, final_reply_guest_id) = {
+            let Some(state) = self.sessions.get(session_id) else {
+                return Ok(());
+            };
+            let Some(active_turn) = state.active_turn.as_ref() else {
+                return Ok(());
+            };
             (
-                state.checkpoint_memory_type(),
-                state.checkpoint_json(),
-                state.clone(),
+                active_turn.turn_id.clone(),
+                active_turn.chat_id.clone(),
+                active_turn.final_reply_to.clone(),
+                active_turn.final_reply_role.clone(),
+                active_turn.final_reply_guest_id.clone(),
             )
         };
 
-        self.ipc_client
-            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
-            .await?;
-        self.sync_session_index(&index_state).await?;
+        let event_payload = TurnEventPayload {
+            action: "turn_event",
+            event: event.to_string(),
+            session_id: session_id.to_string(),
+            turn_id,
+            chat_id,
+            partial_content,
+        };
 
-        match interpret_tool_result(&tool_result) {
-            AgentAction::Respond { content } => {
-                self.complete_agent_response(session_id, turn_id, content)
-                    .await
-            }
-            AgentAction::ToolCall(_) => {
-                self.fail_active_turn(
-                    session_id,
-                    turn_id,
-                    "Nested tool calls are not supported yet".into(),
-                )
-                .await
-            }
-            AgentAction::RequestApproval(_) => {
-                self.fail_active_turn(
-                    session_id,
-                    turn_id,
-                    "Approval after tool execution is not supported yet".into(),
-                )
-                .await
-            }
-            AgentAction::Fail { message } => {
-                self.fail_active_turn(session_id, turn_id, message).await
-            }
-        }
+        self.ipc_client
+            .send_request(IpcRequest::EmitTask {
+                target_node: final_reply_to,
+                target_role: final_reply_role,
+                target_guest_id: final_reply_guest_id,
+                task_json: serde_json::to_string(&event_payload)?,
+            })
+            .await?;
+
+        Ok(())
     }
 
     async fn complete_agent_response(
@@ -931,6 +1240,7 @@ impl AgentRuntime {
         session_id: String,
         turn_id: String,
         content: String,
+        spoken_text: Option<String>,
     ) -> Result<()> {
         let voice_policy = self
             .sessions
@@ -938,9 +1248,16 @@ impl AgentRuntime {
             .map(|s| s.agent_profile.voice_response_policy.clone())
             .unwrap_or_default();
 
-        if voice_policy.enabled {
+        let had_voice_input = self
+            .sessions
+            .get(&session_id)
+            .and_then(|s| s.active_turn.as_ref())
+            .map(|t| t.had_voice_input)
+            .unwrap_or(false);
+
+        if voice_policy.is_active(had_voice_input) {
             return self
-                .start_voice_synthesis(session_id, turn_id, content, voice_policy)
+                .start_voice_synthesis(session_id, turn_id, content, spoken_text, voice_policy)
                 .await;
         }
 
@@ -953,7 +1270,8 @@ impl AgentRuntime {
         &mut self,
         session_id: String,
         turn_id: String,
-        text: String,
+        display_text: String,
+        spoken_text: Option<String>,
         policy: VoiceResponsePolicy,
     ) -> Result<()> {
         let (task_id, chat_id, final_reply_to, final_reply_role, final_reply_guest_id,
@@ -971,7 +1289,7 @@ impl AgentRuntime {
             let final_reply_to = active_turn.final_reply_to.clone();
             let final_reply_role = active_turn.final_reply_role.clone();
             let final_reply_guest_id = active_turn.final_reply_guest_id.clone();
-            state.set_pending_text_reply(text.clone());
+            state.set_pending_text_reply(display_text.clone());
             state.set_active_turn_phase(TurnPhase::WaitingVoice);
             (
                 task_id, chat_id, final_reply_to, final_reply_role, final_reply_guest_id,
@@ -1016,7 +1334,7 @@ impl AgentRuntime {
         let voice_task = serde_json::json!({
             "kind": "voice.synthesize",
             "provider": policy.provider,
-            "spoken_text": text,
+            "spoken_text": spoken_text.unwrap_or_else(|| strip_markup(&display_text)),
             "voice_id": policy.voice_id,
             "model": policy.model,
             "session_id": session_id,
@@ -1087,7 +1405,7 @@ impl AgentRuntime {
             turn_id,
             text,
             audio_artifact,
-            voice_policy.send_text_caption,
+            voice_policy.caption_enabled(),
         )
         .await
     }
@@ -1355,7 +1673,8 @@ impl AgentRuntime {
                 | SlashCommand::WorkspaceClear
                 | SlashCommand::PreapproveThisSession
                 | SlashCommand::ApprovalStatus
-                | SlashCommand::ApprovalReset => {}
+                | SlashCommand::ApprovalReset
+                | SlashCommand::Tts { .. } => {}
             }
             (
                 state.checkpoint_memory_type(),
@@ -1519,7 +1838,8 @@ impl AgentRuntime {
             | SlashCommand::WorkspaceClear
             | SlashCommand::PreapproveThisSession
             | SlashCommand::ApprovalStatus
-            | SlashCommand::ApprovalReset => {}
+            | SlashCommand::ApprovalReset
+            | SlashCommand::Tts { .. } => {}
         }
 
         Ok(())
@@ -1619,6 +1939,7 @@ impl AgentRuntime {
             user_content,
             attachments: Vec::new(),
             tools_for_model,
+            response_contract: None,
             chat_id,
             reply_to: LOCAL_NODE.to_string(),
             reply_role: "agent".into(),
@@ -1652,6 +1973,51 @@ impl AgentRuntime {
         command_chat_id: String,
         command: SlashCommand,
     ) -> Result<()> {
+        // Handle /tts early — it mutates voice policy and completes immediately.
+        if let SlashCommand::Tts { ref mode } = command {
+            let new_mode = match mode.as_deref() {
+                Some("on") => TtsMode::On,
+                Some("auto") => TtsMode::Auto,
+                Some("off") => TtsMode::Off,
+                _ => {
+                    // cycle: off → auto → on → off
+                    let current = self
+                        .sessions
+                        .get(&session_id)
+                        .map(|s| s.agent_profile.voice_response_policy.mode)
+                        .unwrap_or(TtsMode::Off);
+                    match current {
+                        TtsMode::Off => TtsMode::Auto,
+                        TtsMode::Auto => TtsMode::On,
+                        TtsMode::On => TtsMode::Off,
+                    }
+                }
+            };
+            if let Some(state) = self.sessions.get_mut(&session_id) {
+                state.agent_profile.voice_response_policy.mode = new_mode;
+            }
+            let reply = match new_mode {
+                TtsMode::Off => "Voice response off. I'll reply with text.",
+                TtsMode::Auto => "Voice response auto — I'll mirror your input modality.",
+                TtsMode::On => "Voice response on. I'll speak all replies.",
+            };
+            let _ = self
+                .ipc_client
+                .send_request(IpcRequest::UpdateTask {
+                    task_id: command_task_id,
+                    state: "session_policy_updated".into(),
+                    payload: serde_json::json!({
+                        "session_id": session_id,
+                        "turn_id": command_turn_id,
+                        "chat_id": command_chat_id,
+                    }),
+                })
+                .await?;
+            return self
+                .complete_local_command(session_id, command_turn_id, reply.into())
+                .await;
+        }
+
         let (
             reply_content,
             update_state,
@@ -1863,7 +2229,10 @@ impl AgentRuntime {
                         }),
                     )
                 }
-                SlashCommand::Ping | SlashCommand::Approve { .. } | SlashCommand::Deny { .. } => (
+                SlashCommand::Ping
+                | SlashCommand::Tts { .. }
+                | SlashCommand::Approve { .. }
+                | SlashCommand::Deny { .. } => (
                     "Unsupported session control command.".to_string(),
                     "session_control_unsupported",
                     serde_json::json!({
@@ -1958,6 +2327,96 @@ impl AgentRuntime {
                     .get(&payload.session_id)
                     .map(SessionState::session_status_text)
                     .unwrap_or_else(|| "Session status unavailable.".into());
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(content),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    tool_name: Some(payload.tool_name),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                })
+                .await
+            }
+            "agent.configure" => {
+                let args = &payload.arguments;
+                let config_path = match args.get("config_path").and_then(|v| v.as_str()) {
+                    Some(p) => p.to_string(),
+                    None => {
+                        return self
+                            .fail_active_turn(
+                                payload.session_id,
+                                payload.turn_id,
+                                "agent.configure: missing required argument 'config_path'".into(),
+                            )
+                            .await;
+                    }
+                };
+                let value = match args.get("value") {
+                    Some(v) => v.clone(),
+                    None => {
+                        return self
+                            .fail_active_turn(
+                                payload.session_id,
+                                payload.turn_id,
+                                "agent.configure: missing required argument 'value'".into(),
+                            )
+                            .await;
+                    }
+                };
+                let operation = args
+                    .get("operation")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("set")
+                    .to_string();
+
+                let (content, bindings_changed) = {
+                    let Some(state) = self.sessions.get_mut(&payload.session_id) else {
+                        return self
+                            .fail_active_turn(
+                                payload.session_id,
+                                payload.turn_id,
+                                "agent.configure: session not found".into(),
+                            )
+                            .await;
+                    };
+                    let bindings_before = state.bindings.clone();
+                    match state.apply_configure(&config_path, &value, &operation) {
+                        Ok(msg) => {
+                            let changed = state.bindings != bindings_before;
+                            (msg, changed)
+                        }
+                        Err(err) => {
+                            drop(state);
+                            return self
+                                .fail_active_turn(payload.session_id, payload.turn_id, err)
+                                .await;
+                        }
+                    }
+                };
+
+                // Rebuild tool assembly if bindings changed so the new toolset takes effect
+                // immediately within the same session.
+                if bindings_changed {
+                    if let Some(state) = self.sessions.get_mut(&payload.session_id) {
+                        state.rebuild_default_tool_assembly();
+                    }
+                }
 
                 self.handle_tool_result(InboundTaskPayload {
                     action: Some("tool_result".into()),
@@ -2161,6 +2620,7 @@ mod tests {
             user_content: "hello".into(),
             attachments: Vec::new(),
             tools_for_model: Vec::new(),
+            response_contract: None,
             chat_id: "123".into(),
             reply_to: LOCAL_NODE.into(),
             reply_role: "agent".into(),
@@ -2302,7 +2762,7 @@ mod tests {
             approval_id: Some("appr-1".into()),
             reason: "deploy the thing".into(),
             approved_response: "Approved: deploy the thing".into(),
-        }));
+        }, None));
     }
 
     #[test]

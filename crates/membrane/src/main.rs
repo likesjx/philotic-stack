@@ -5,7 +5,9 @@ use pulldown_cmark::{
     CodeBlockKind, Event, LinkType, Options, Parser as MarkdownParser, Tag, TagEnd,
 };
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::time::Duration;
+use tokio::sync::oneshot;
 use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
@@ -623,6 +625,109 @@ fn enrich_attachment_with_transport(
     attachment
 }
 
+/// Tracks an in-flight agent turn so membrane can maintain delivery UX (typing indicator,
+/// progressive delivery) independent of when the final reply arrives.
+struct ActiveTurn {
+    /// Sending on this channel cancels the typing heartbeat task.
+    cancel_typing: oneshot::Sender<()>,
+    /// `message_id` of the first message sent for this turn, used for edit-based streaming.
+    #[allow(dead_code)]
+    draft_message_id: Option<i64>,
+}
+
+impl ActiveTurn {
+    fn cancel(self) {
+        let _ = self.cancel_typing.send(());
+    }
+}
+
+/// Start a `sendChatAction(typing)` heartbeat that refreshes every 4 seconds until cancelled.
+fn spawn_typing_heartbeat(
+    http_client: reqwest::Client,
+    tg_base: String,
+    chat_id: String,
+) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    let (tx, mut rx) = oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        loop {
+            let url = format!("{}sendChatAction", tg_base);
+            let payload = json!({ "chat_id": chat_id, "action": "typing" });
+            if let Err(e) = http_client.post(&url).json(&payload).send().await {
+                warn!("sendChatAction failed: {}", e);
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(4)) => {}
+                _ = &mut rx => break,
+            }
+        }
+    });
+    (tx, handle)
+}
+
+/// Send a plain text reply to a Telegram chat, formatted as HTML.
+/// Returns the Telegram `message_id` if the send succeeded.
+async fn send_telegram_text(
+    http_client: &reqwest::Client,
+    tg_base: &str,
+    chat_id: &str,
+    thread_id: Option<&str>,
+    text: &str,
+) -> Option<i64> {
+    let formatted = telegram_format_text(text);
+    let send_url = format!("{tg_base}sendMessage");
+    let mut payload = json!({
+        "chat_id": chat_id,
+        "text": formatted.text,
+        "parse_mode": formatted.parse_mode,
+        "disable_web_page_preview": true
+    });
+    if let Some(tid) = thread_id {
+        payload["message_thread_id"] = Value::String(tid.to_string());
+    }
+    match http_client.post(&send_url).json(&payload).send().await {
+        Ok(res) => {
+            if let Ok(body) = res.json::<Value>().await {
+                body.get("result")
+                    .and_then(|r| r.get("message_id"))
+                    .and_then(Value::as_i64)
+            } else {
+                None
+            }
+        }
+        Err(e) => {
+            error!("sendMessage failed: {}", e);
+            None
+        }
+    }
+}
+
+/// Commands handled entirely within membrane, before the envelope reaches agent-core.
+/// Returns `true` if the command was handled locally (caller should skip the EmitTask).
+async fn handle_membrane_command(
+    http_client: &reqwest::Client,
+    tg_base: &str,
+    envelope: &TelegramMessageEnvelope,
+) -> bool {
+    let Some(command) = envelope.command.as_deref() else {
+        return false;
+    };
+    match command {
+        "/ping" => {
+            info!("Membrane handling /ping for chat [{}]", envelope.chat_id);
+            send_telegram_text(
+                http_client,
+                tg_base,
+                &envelope.chat_id,
+                envelope.thread_id.as_deref(),
+                "pong",
+            )
+            .await;
+            true
+        }
+        _ => false,
+    }
+}
+
 fn telegram_inbound_envelope(
     update: &Value,
     update_id: i64,
@@ -1047,6 +1152,8 @@ async fn main() -> Result<()> {
         .trim_end_matches('/')
         .to_string();
     let mut offset: i64 = 0;
+    // session_id → ActiveTurn for in-flight agent turns.
+    let mut active_turns: HashMap<String, ActiveTurn> = HashMap::new();
 
     info!("Starting Telegram long-polling loop...");
 
@@ -1095,6 +1202,18 @@ async fn main() -> Result<()> {
                                                 envelope.content
                                             );
 
+                                            // Elevation: handle deterministic commands in membrane
+                                            // before they reach agent-core.
+                                            if handle_membrane_command(
+                                                &http_client,
+                                                &tg_base,
+                                                &envelope,
+                                            )
+                                            .await
+                                            {
+                                                continue;
+                                            }
+
                                             let task_req = IpcRequest::EmitTask {
                                                 target_node: "local-ansible-01".into(),
                                                 target_role: "agent".into(),
@@ -1121,7 +1240,21 @@ async fn main() -> Result<()> {
                                             };
 
                                             match ipc_client.send_request(task_req).await {
-                                                Ok(_) => info!("Routed message to Ansible successfully."),
+                                                Ok(_) => {
+                                                    info!("Routed message to Ansible successfully.");
+                                                    let (cancel_tx, _handle) = spawn_typing_heartbeat(
+                                                        http_client.clone(),
+                                                        tg_base.clone(),
+                                                        envelope.chat_id.clone(),
+                                                    );
+                                                    active_turns.insert(
+                                                        envelope.session_id.clone(),
+                                                        ActiveTurn {
+                                                            cancel_typing: cancel_tx,
+                                                            draft_message_id: None,
+                                                        },
+                                                    );
+                                                }
                                                 Err(e) => error!("Failed to route message to Ansible: {}", e),
                                             }
                                         }
@@ -1143,56 +1276,93 @@ async fn main() -> Result<()> {
             ipc_result = ipc_client.recv_task() => {
                 match ipc_result {
                     Ok(IpcResponse::InboundTask { source_node, task_id, task_json }) => {
-                        info!("Hegemon received final response [{}] from Mesh Node [{}]", task_id, source_node);
+                        info!("Hegemon received IPC task [{}] from [{}]", task_id, source_node);
 
                         if let Ok(task) = serde_json::from_str::<Value>(&task_json) {
+                            let action = task.get("action").and_then(Value::as_str).unwrap_or("send_reply");
+                            let session_id = task.get("session_id").and_then(Value::as_str).unwrap_or_default().to_string();
                             let chat_id = task.get("chat_id").and_then(|id| id.as_str()).unwrap_or_default().to_string();
-                            let content = task.get("content").and_then(|c| c.as_str()).unwrap_or_default().to_string();
-                            let audio_artifact_json = task.get("audio_artifact").and_then(|a| a.as_str()).map(str::to_string);
-                            let send_text_caption = task.get("send_text_caption").and_then(|v| v.as_bool()).unwrap_or(false);
 
-                            if !chat_id.is_empty() {
-                                let http_client_clone = http_client.clone();
-                                let tg_base_clone = tg_base.clone();
+                            if action == "turn_event" {
+                                // Turn lifecycle signal from agent-core: update delivery UX without
+                                // delivering a final reply.
+                                let event = task.get("event").and_then(Value::as_str).unwrap_or_default();
+                                info!("Turn event [{}] for session [{}]", event, session_id);
+                                // waiting_approval stops the typing; the approval reply arrives as
+                                // a separate send_reply which will also cancel the turn entry.
+                                if event == "waiting_approval" {
+                                    if let Some(active) = active_turns.remove(&session_id) {
+                                        active.cancel();
+                                    }
+                                }
+                                // waiting_tool and waiting_model: typing continues — no action needed.
+                            } else {
+                                // send_reply (or any unrecognised action): deliver to Telegram and
+                                // cancel the typing heartbeat for this session.
+                                if let Some(active) = active_turns.remove(&session_id) {
+                                    active.cancel();
+                                }
 
-                                tokio::spawn(async move {
-                                    // Voice path: send audio first, then optional text caption.
-                                    if let Some(artifact_json) = audio_artifact_json {
-                                        if let Ok(artifact) = serde_json::from_str::<Value>(&artifact_json) {
-                                            let mime_type = artifact.get("mime_type").and_then(Value::as_str).unwrap_or("audio/mpeg");
-                                            let audio_b64 = artifact.get("audio_base64").and_then(Value::as_str).unwrap_or_default();
+                                let content = task.get("content").and_then(|c| c.as_str()).unwrap_or_default().to_string();
+                                let audio_artifact_json = task.get("audio_artifact").and_then(|a| a.as_str()).map(str::to_string);
+                                let send_text_caption = task.get("send_text_caption").and_then(|v| v.as_bool()).unwrap_or(false);
 
-                                            use base64::Engine;
-                                            match base64::engine::general_purpose::STANDARD.decode(audio_b64) {
-                                                Ok(audio_bytes) => {
-                                                    // Use sendVoice for OGG (voice notes), sendAudio for everything else.
-                                                    let (endpoint, field_name, file_name) = if mime_type.contains("ogg") {
-                                                        ("sendVoice", "voice", "voice.ogg")
-                                                    } else {
-                                                        ("sendAudio", "audio", "audio.mp3")
-                                                    };
-                                                    let send_url = format!("{}{}", tg_base_clone, endpoint);
-                                                    let part = reqwest::multipart::Part::bytes(audio_bytes)
-                                                        .file_name(file_name)
-                                                        .mime_str(mime_type)
-                                                        .unwrap_or_else(|_| reqwest::multipart::Part::bytes(Vec::new()));
-                                                    let form = reqwest::multipart::Form::new()
-                                                        .text("chat_id", chat_id.clone())
-                                                        .part(field_name, part);
-                                                    info!("Sending voice/audio via {} to Telegram Chat [{}]...", endpoint, chat_id);
-                                                    match http_client_clone.post(&send_url).multipart(form).send().await {
-                                                        Ok(_) => info!("Telegram audio sent successfully."),
-                                                        Err(e) => error!("Failed to send Telegram audio: {}", e),
+                                if !chat_id.is_empty() {
+                                    let http_client_clone = http_client.clone();
+                                    let tg_base_clone = tg_base.clone();
+
+                                    tokio::spawn(async move {
+                                        // Voice path: send audio first, then optional text caption.
+                                        if let Some(artifact_json) = audio_artifact_json {
+                                            if let Ok(artifact) = serde_json::from_str::<Value>(&artifact_json) {
+                                                let mime_type = artifact.get("mime_type").and_then(Value::as_str).unwrap_or("audio/mpeg");
+                                                let audio_b64 = artifact.get("audio_base64").and_then(Value::as_str).unwrap_or_default();
+
+                                                use base64::Engine;
+                                                match base64::engine::general_purpose::STANDARD.decode(audio_b64) {
+                                                    Ok(audio_bytes) => {
+                                                        // Use sendVoice for OGG (voice notes), sendAudio for everything else.
+                                                        let (endpoint, field_name, file_name) = if mime_type.contains("ogg") {
+                                                            ("sendVoice", "voice", "voice.ogg")
+                                                        } else {
+                                                            ("sendAudio", "audio", "audio.mp3")
+                                                        };
+                                                        let send_url = format!("{}{}", tg_base_clone, endpoint);
+                                                        let part = reqwest::multipart::Part::bytes(audio_bytes)
+                                                            .file_name(file_name)
+                                                            .mime_str(mime_type)
+                                                            .unwrap_or_else(|_| reqwest::multipart::Part::bytes(Vec::new()));
+                                                        let form = reqwest::multipart::Form::new()
+                                                            .text("chat_id", chat_id.clone())
+                                                            .part(field_name, part);
+                                                        info!("Sending voice/audio via {} to Telegram Chat [{}]...", endpoint, chat_id);
+                                                        match http_client_clone.post(&send_url).multipart(form).send().await {
+                                                            Ok(_) => info!("Telegram audio sent successfully."),
+                                                            Err(e) => error!("Failed to send Telegram audio: {}", e),
+                                                        }
                                                     }
+                                                    Err(e) => error!("Failed to decode audio_base64: {}", e),
                                                 }
-                                                Err(e) => error!("Failed to decode audio_base64: {}", e),
+                                            } else {
+                                                error!("Failed to parse audio_artifact JSON; skipping audio delivery.");
                                             }
-                                        } else {
-                                            error!("Failed to parse audio_artifact JSON; skipping audio delivery.");
-                                        }
 
-                                        // Also send text as a follow-up caption if requested.
-                                        if send_text_caption && !content.is_empty() {
+                                            // Also send text as a follow-up caption if requested.
+                                            if send_text_caption && !content.is_empty() {
+                                                let formatted = telegram_format_text(&content);
+                                                let send_url = format!("{}sendMessage", tg_base_clone);
+                                                let payload = json!({
+                                                    "chat_id": chat_id,
+                                                    "text": formatted.text,
+                                                    "parse_mode": formatted.parse_mode,
+                                                    "disable_web_page_preview": true
+                                                });
+                                                if let Err(e) = http_client_clone.post(&send_url).json(&payload).send().await {
+                                                    error!("Failed to send text caption after audio: {}", e);
+                                                }
+                                            }
+                                        } else if !content.is_empty() {
+                                            // Text-only path.
                                             let formatted = telegram_format_text(&content);
                                             let send_url = format!("{}sendMessage", tg_base_clone);
                                             let payload = json!({
@@ -1201,29 +1371,16 @@ async fn main() -> Result<()> {
                                                 "parse_mode": formatted.parse_mode,
                                                 "disable_web_page_preview": true
                                             });
-                                            if let Err(e) = http_client_clone.post(&send_url).json(&payload).send().await {
-                                                error!("Failed to send text caption after audio: {}", e);
+                                            info!("Sending final response back to Telegram Chat [{}]...", chat_id);
+                                            match http_client_clone.post(&send_url).json(&payload).send().await {
+                                                Ok(_) => info!("Telegram Response Sent Successfully!"),
+                                                Err(e) => error!("Failed to send Telegram Response: {}", e),
                                             }
                                         }
-                                    } else if !content.is_empty() {
-                                        // Text-only path (existing behaviour).
-                                        let formatted = telegram_format_text(&content);
-                                        let send_url = format!("{}sendMessage", tg_base_clone);
-                                        let payload = json!({
-                                            "chat_id": chat_id,
-                                            "text": formatted.text,
-                                            "parse_mode": formatted.parse_mode,
-                                            "disable_web_page_preview": true
-                                        });
-                                        info!("Sending final response back to Telegram Chat [{}]...", chat_id);
-                                        match http_client_clone.post(&send_url).json(&payload).send().await {
-                                            Ok(_) => info!("Telegram Response Sent Successfully!"),
-                                            Err(e) => error!("Failed to send Telegram Response: {}", e),
-                                        }
-                                    }
-                                });
-                            } else {
-                                warn!("Received a reply task but 'chat_id' was missing. Cannot route to Telegram.");
+                                    });
+                                } else {
+                                    warn!("Received a reply task but 'chat_id' was missing. Cannot route to Telegram.");
+                                }
                             }
                         }
                     }
@@ -1426,5 +1583,36 @@ mod tests {
         });
 
         assert_eq!(default_attachment_name(&attachment), "photo-abc123");
+    }
+
+    #[test]
+    fn ping_envelope_has_command_set() {
+        let update = json!({
+            "update_id": 200,
+            "message": {
+                "text": "/ping",
+                "chat": { "id": 12345 },
+                "from": { "id": 888, "username": "jared" }
+            }
+        });
+        let envelope = telegram_inbound_envelope(&update, 200, "agent-jane-01")
+            .expect("ping update should normalize");
+        assert_eq!(envelope.command.as_deref(), Some("/ping"));
+        assert_eq!(envelope.message_kind, "text");
+    }
+
+    #[test]
+    fn non_command_envelope_has_no_command() {
+        let update = json!({
+            "update_id": 201,
+            "message": {
+                "text": "hello there",
+                "chat": { "id": 12345 },
+                "from": { "id": 888, "username": "jared" }
+            }
+        });
+        let envelope = telegram_inbound_envelope(&update, 201, "agent-jane-01")
+            .expect("regular message should normalize");
+        assert_eq!(envelope.command, None);
     }
 }

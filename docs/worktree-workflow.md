@@ -30,8 +30,8 @@ Examples:
 - branch: `codex/telegram-controller`
 - worktree: `../philotic-stack-telegram-controller`
 
-- branch: `codex/hegemon-membrane`
-- worktree: `../philotic-stack-hegemon-membrane`
+- branch: `codex/membrane-membrane`
+- worktree: `../philotic-stack-membrane-membrane`
 
 ## Commands
 
@@ -44,7 +44,7 @@ just worktree-create telegram-controller
 Create a new worktree from another base ref:
 
 ```bash
-just worktree-create telegram-controller codex/hegemon-membrane-slice
+just worktree-create telegram-controller codex/membrane-membrane-slice
 ```
 
 List active worktrees:

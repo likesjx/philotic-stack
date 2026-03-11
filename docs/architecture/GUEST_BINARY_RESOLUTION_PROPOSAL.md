@@ -9,7 +9,7 @@ Replace hardcoded `target/debug/<name>` paths in `guest_seed_for_profile` with a
 `guest_seed_for_profile` in `crates/ansible/src/main.rs` seeds every guest with a hardcoded relative binary path:
 
 ```rust
-"command": "target/debug/hegemon"
+"command": "target/debug/membrane"
 "command": "target/debug/agent-core"
 "command": "target/debug/model-controller-gemini"   // no such binary
 "command": "target/debug/model-controller-elevenlabs" // no such binary
@@ -30,7 +30,7 @@ Seed guest commands using the actual compiled binary name, not the aspirational 
 
 | Guest role | Current seeded command | Correct command |
 |---|---|---|
-| `hegemon` | `target/debug/hegemon` | `hegemon` |
+| `membrane` | `target/debug/membrane` | `membrane` |
 | `agent` | `target/debug/agent-core` | `agent-core` |
 | `model.gemini` | `target/debug/model-controller-gemini` | `model-router` |
 | `model.elevenlabs` | `target/debug/model-controller-elevenlabs` | `model-router` |
@@ -65,7 +65,7 @@ Guests with no binary (e.g. `tool-runner`) should produce a warning and be skipp
 
 ## Current Slice
 
-- `guest_seed_for_profile` now uses bare binary names (`hegemon`, `agent-core`, `model-router`)
+- `guest_seed_for_profile` now uses bare binary names (`membrane`, `agent-core`, `model-router`)
 - `spawn_guest` prepends `PHILOTIC_BIN_DIR` when set, falls back to `PATH` in dev mode
 - `tool-runner` seeded as `is_active: false` — skipped at boot, no spawn failure
 - `PHILOTIC_BIN_DIR` wired into the systemd service template

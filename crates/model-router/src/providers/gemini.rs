@@ -88,6 +88,50 @@ impl GeminiProvider {
         })
     }
 
+    fn structured_text_request_payload(prompt: &str) -> Value {
+        json!({
+            "system_instruction": {
+                "parts": [{
+                    "text": "When generating your response, produce a JSON object with two fields: \
+                             \"display_text\" (your full response formatted for text display, \
+                             markdown is fine) and \"spoken_text\" (a natural, expressive version \
+                             for voice delivery — no markdown, conversational tone, written to be heard)."
+                }]
+            },
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "responseMimeType": "application/json",
+                "responseSchema": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "display_text": { "type": "STRING" },
+                        "spoken_text": { "type": "STRING" }
+                    },
+                    "required": ["display_text", "spoken_text"]
+                }
+            }
+        })
+    }
+
+    fn parse_structured_response(status: reqwest::StatusCode, body: Value) -> (String, Option<String>) {
+        let raw = Self::parse_response_text(status, body);
+        // Try to parse as structured JSON output
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw) {
+            let display = parsed.get("display_text")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string);
+            let spoken = parsed.get("spoken_text")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string);
+            if let Some(display) = display {
+                return (display, spoken);
+            }
+        }
+        (raw, None)
+    }
+
     async fn media_request_payload(&self, task: &ControllerTask) -> Result<Value> {
         let prompt = task
             .media_prompt()
@@ -203,10 +247,14 @@ impl ModelProvider for GeminiProvider {
 
     async fn invoke(&self, task: &ControllerTask) -> Result<ProviderOutput> {
         let payload = match task.kind {
-            TaskKind::TextGenerate => Self::request_payload(
-                task.prompt_text()
-                    .context("Gemini text task missing prompt")?,
-            ),
+            TaskKind::TextGenerate => {
+                let prompt = task.prompt_text().context("Gemini text task missing prompt")?;
+                if task.wants_channel("spoken_text") {
+                    Self::structured_text_request_payload(prompt)
+                } else {
+                    Self::request_payload(prompt)
+                }
+            }
             TaskKind::MediaAnalyze | TaskKind::AudioTranscribe => {
                 self.media_request_payload(task).await?
             }
@@ -222,7 +270,12 @@ impl ModelProvider for GeminiProvider {
             .await?;
         let status = response.status();
         let body = response.json::<Value>().await?;
-        let content = Self::parse_response_text(status, body);
+
+        let (content, spoken_text) = if task.kind == TaskKind::TextGenerate && task.wants_channel("spoken_text") {
+            Self::parse_structured_response(status, body)
+        } else {
+            (Self::parse_response_text(status, body), None)
+        };
 
         if content.trim().is_empty() {
             bail!("Gemini returned an empty response");
@@ -231,7 +284,7 @@ impl ModelProvider for GeminiProvider {
         Ok(ProviderOutput::Text {
             display_text: Some(content.clone()),
             content,
-            spoken_text: None,
+            spoken_text,
             working_memory_delta: None,
             follow_up_questions: Vec::new(),
             intent_summary: None,

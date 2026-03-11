@@ -104,7 +104,7 @@ The context graph should store only:
 Example:
 
 - `gemini_auth_ref = secret://hotel/default/gemini/oauth-refresh`
-- `telegram_bot_token_ref = secret://hegemon/telegram/bot-token`
+- `telegram_bot_token_ref = secret://membrane/telegram/bot-token`
 
 ## Encryption Recommendation
 

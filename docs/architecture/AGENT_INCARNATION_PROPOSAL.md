@@ -19,7 +19,7 @@ Define a first-class incarnation model for agents so that a single agent identit
 
 An **agent** is an identity: soul, history, relationships, and shared memory. That identity is singular and continuous — it does not fork.
 
-An **incarnation** is a long-lived, named role that the agent plays. Each incarnation has its own capability posture (toolset/skillset), its own role identity addendum layered on top of the base soul, and its own running session context (turn history, working memory). Multiple incarnations can be active concurrently. The **philotic membrane (hegemon)** routes inbound user messages to exactly one incarnation at a time — the active one — but all incarnations can send outbound messages back through the membrane.
+An **incarnation** is a long-lived, named role that the agent plays. Each incarnation has its own capability posture (toolset/skillset), its own role identity addendum layered on top of the base soul, and its own running session context (turn history, working memory). Multiple incarnations can be active concurrently. The **philotic membrane (membrane)** routes inbound user messages to exactly one incarnation at a time — the active one — but all incarnations can send outbound messages back through the membrane.
 
 **Workers and subagents** are a separate, ephemeral category: short-lived task delegates that have no access to the communication plane. Their results bubble up to the incarnation that spawned them.
 
@@ -73,7 +73,7 @@ Ephemeral task delegates. Spawned by any incarnation for a specific, bounded tas
 
 ### The `active_incarnation_id` primitive
 
-The Context Graph session record carries `active_incarnation_id`. The hotel's IpcServer reads this field when routing inbound tasks from hegemon.
+The Context Graph session record carries `active_incarnation_id`. The hotel's IpcServer reads this field when routing inbound tasks from membrane.
 
 - Default: the agent's orchestrator/conversational incarnation
 - Updated by the hotel in response to handoff signals from incarnations
@@ -89,9 +89,9 @@ incoming message for agent X in session S
 
 ### Concurrent roles
 
-Multiple role incarnations can be running concurrently. The `active_incarnation_id` governs inbound only. Any incarnation can emit outbound to hegemon at any time (e.g. a developer role sending a progress update while the orchestrator owns inbound).
+Multiple role incarnations can be running concurrently. The `active_incarnation_id` governs inbound only. Any incarnation can emit outbound to membrane at any time (e.g. a developer role sending a progress update while the orchestrator owns inbound).
 
-This means a user may receive messages from multiple incarnations interleaved. Hegemon should label the sender (role name) in the delivery context so the user has visibility into which role is speaking.
+This means a user may receive messages from multiple incarnations interleaved. Membrane should label the sender (role name) in the delivery context so the user has visibility into which role is speaking.
 
 ### Membrane switching
 
@@ -389,7 +389,7 @@ The Telegram Mini App is the right surface for configuration — not runtime rol
 
 **Security model** (unchanged from prior review):
 - Assets hosted externally, not on blob service
-- Mini App calls a hotel endpoint behind hegemon as the perimeter
+- Mini App calls a hotel endpoint behind membrane as the perimeter
 - `initData` HMAC-SHA256 verification against bot token
 - HTTPS required; TLS proxy (Caddy) for hotel-local endpoints
 - BlobService bound to localhost only; no access control; latent bug with cloud Gemini URLs receiving localhost blob URLs
@@ -428,7 +428,7 @@ Dependencies are real and must be respected:
 
 - **Role identity addendum injection**: where in the prompt does the role addendum land? Recommended: injected between base `[Identity]` and `[Knowledge]` projections, labeled `[Role: developer]`. The model sees the full persona stack in order.
 
-- **Concurrent outbound messages**: when two role incarnations send messages in the same user turn, what does the user experience? Hegemon should deliver them in emission order, labeled by role. The user should be able to tell which role spoke.
+- **Concurrent outbound messages**: when two role incarnations send messages in the same user turn, what does the user experience? Membrane should deliver them in emission order, labeled by role. The user should be able to tell which role spoke.
 
 - **Memory sync on rematerialization**: when a reclaimed role is rematerialized, it restores from Tier 2/3. Is there a risk it has stale in-memory state from a prior life? Resolution: on materialization, the hotel sends a session snapshot that the incarnation uses to initialize its working memory. Prior in-process state is gone by definition (new process).
 

@@ -64,7 +64,7 @@ The port is not complete until these capabilities exist in Rust and pass parity 
 1. `crates/ansible`: hotel daemon, orchestration entrypoint.
 2. `crates/ansible-mesh-core`: routing, graph, registry, runtime primitives.
 3. `crates/philotic-ipc`: IPC transport abstractions.
-4. `crates/hegemon`: edge gateway/protocol adapters.
+4. `crates/membrane`: edge gateway/protocol adapters.
 5. `crates/agent-core`: local agent runtime integration.
 6. `crates/model-router`: model-provider routing service.
 

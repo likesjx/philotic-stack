@@ -47,7 +47,7 @@ Examples:
 - `/approve`
 - `/deny`
 
-These should execute in `hegemon`, `ansible`, or another runtime service depending on ownership.
+These should execute in `membrane`, `ansible`, or another runtime service depending on ownership.
 
 ### 2. Agent Commands
 
@@ -79,7 +79,7 @@ These should enter `agent-core` with structured intent and arguments, then proce
 
 Recommended execution ownership:
 
-- `hegemon`
+- `membrane`
   - transport-local UX commands
   - transport help text
   - future command autocomplete/help menus
