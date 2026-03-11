@@ -1,7 +1,7 @@
 [workspace]
 members = [
     "crates/ansible",
-    "crates/hegemon",
+    "crates/membrane",
     "crates/agent-core",
     "crates/model-router",
     "crates/tool-runner",

@@ -22,8 +22,8 @@ async fn emit_and_expect(
                 "chat_id": chat_id,
                 "content": content,
                 "final_reply_to": "local-ansible-01",
-                "final_reply_role": "hegemon",
-                "final_reply_guest_id": "session-bindings-smoke-hegemon"
+                "final_reply_role": "membrane",
+                "final_reply_guest_id": "session-bindings-smoke-membrane"
             })
             .to_string(),
         })
@@ -55,8 +55,8 @@ async fn main() -> Result<()> {
     let chat_id = "smoke-session-bindings-chat";
 
     let mut client = PhiloticClient::connect(GuestIdentity {
-        guest_id: "session-bindings-smoke-hegemon".into(),
-        role: "hegemon".into(),
+        guest_id: "session-bindings-smoke-membrane".into(),
+        role: "membrane".into(),
         supported_tools: Vec::new(),
     })
     .await

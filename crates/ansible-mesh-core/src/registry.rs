@@ -180,8 +180,8 @@ mod tests {
             vec![CapabilityAdvertisement {
                 hotel_id: "default".into(),
                 node_id: "jane-node".into(),
-                incarnation_id: "default:hegemon-gateway-jane".into(),
-                target_role: "hegemon".into(),
+                incarnation_id: "default:membrane-gateway-jane".into(),
+                target_role: "membrane".into(),
                 availability_state: "live".into(),
                 selection_hint: Some("local_live_preferred".into()),
                 latency_hint_ms: Some(5),

@@ -18,8 +18,8 @@ async fn main() -> Result<()> {
         std::env::var("PHILOTIC_SMOKE_USER_CONTENT").unwrap_or_else(|_| "/ping".to_string());
 
     let mut client = PhiloticClient::connect(GuestIdentity {
-        guest_id: "smoke-driver-hegemon".into(),
-        role: "hegemon".into(),
+        guest_id: "smoke-driver-membrane".into(),
+        role: "membrane".into(),
         supported_tools: Vec::new(),
     })
     .await
@@ -37,8 +37,8 @@ async fn main() -> Result<()> {
                 "chat_id": chat_id,
                 "content": content,
                 "final_reply_to": "local-ansible-01",
-                "final_reply_role": "hegemon",
-                "final_reply_guest_id": "smoke-driver-hegemon"
+                "final_reply_role": "membrane",
+                "final_reply_guest_id": "smoke-driver-membrane"
             })
             .to_string(),
         })

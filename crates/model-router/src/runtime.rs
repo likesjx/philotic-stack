@@ -310,7 +310,7 @@ impl ReplyRoute {
             final_reply_role: task
                 .get("final_reply_role")
                 .and_then(Value::as_str)
-                .unwrap_or("hegemon")
+                .unwrap_or("membrane")
                 .to_string(),
             final_reply_guest_id: task
                 .get("final_reply_guest_id")
