@@ -393,6 +393,16 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 - [ ] Measure whether Muninn materially improves continuity, personalization, and decision recall over repeated sessions.
 - [ ] Decide whether Muninn remains an external heuristic memory service or should inform a future Philotic-native memory layer.
 
+## New Project: Dev Engine Optimization
+
+- [x] Review [DEV_ENGINE_OPTIMIZATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DEV_ENGINE_OPTIMIZATION_PROPOSAL.md).
+- [x] Port 9 specialized skills from `~/.codex/skills` to `skills/` and make them repo-local.
+- [x] Establish mandatory session bootstrap in `CLAUDE.md` and `AGENTS.md`.
+- [x] Implement `just engine-check` for one-command verification of Muninn, repo-local bootstrap assets, and the cargo check/test baseline.
+- [ ] Implement `just session-start` to automate the recall/identity orientation handshake.
+- [ ] Deploy Muninn "Truth Cache" to `vps-jane` with automated sync from local.
+- [ ] Formalize semantic "Optimization Loop" to update `AGENTS.md` rules based on recurring "Reality Gaps."
+
 ## Deferred Design Threads
 
 - [ ] Agent workflow formalization: adopt a standing Codex process for context gathering, slice sizing, verification ladders, watched live runs, proposal disposition updates, per-slice commit/push discipline, and assumption-vs-reality capture.

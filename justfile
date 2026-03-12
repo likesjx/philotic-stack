@@ -12,6 +12,10 @@ build:
 check:
     cargo check --workspace
 
+# Verify the repo bootstrap engine: Muninn, helper scripts, and workspace baseline.
+engine-check:
+    ./scripts/engine-check.sh
+
 # Start the Hotel Manager (Ansible Host Daemon)
 start-ansible hotel:
     cargo build --workspace
