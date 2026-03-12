@@ -62,6 +62,16 @@ When calling `muninn_recall`, bias the query around:
 - who am I talking to
 - what matters about this topic right now
 
+Before starting that sequence, clients should run a hard availability gate:
+
+- `python3 scripts/muninn_mcp.py require`
+
+If that gate fails:
+
+- the client must alert the user/operator immediately
+- the client must not pretend retrieval occurred
+- the client must obtain explicit approval before continuing without Muninn
+
 ## When To Write Back
 
 Write after:
@@ -162,6 +172,8 @@ If you are wiring this into another cognitive client, implement these hooks:
 Examples:
 
 ```bash
+python3 scripts/muninn_mcp.py require
+python3 scripts/muninn_mcp.py health
 python3 scripts/muninn_mcp.py where-left-off --limit 5
 python3 scripts/muninn_mcp.py recall --context "philotic memory protocol" --context "jared collaboration preferences" --limit 5
 python3 scripts/muninn_mcp.py remember --concept "decision" --content "Use helper-backed Muninn retrieval by default for meaningful work." --summary "Default Muninn habit"

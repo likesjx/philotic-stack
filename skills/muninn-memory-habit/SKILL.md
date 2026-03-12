@@ -20,10 +20,21 @@ When Muninn MCP is configured and reachable, this habit is the MANDATORY BOOTSTR
 ## The Bootstrap Sequence
 
 At the start of every session (before responding to the user):
-1.  **Recall Self**: `muninn_recall(identity, operating_posture)`
-2.  **Recall User**: `muninn_recall(user_preferences, collaboration_style)`
-3.  **Recall Topic**: `muninn_where_left_off` + `muninn_recall(active_goal, architecture_decisions)`
-4.  **Orient**: Summarize how the recalled context shapes your plan for the current turn.
+1.  **Require Muninn**: run `python3 scripts/muninn_mcp.py require`
+2.  **If require fails**: alert the user/operator immediately and do not continue without explicit approval
+3.  **Recall Self**: `muninn_recall(identity, operating_posture)`
+4.  **Recall User**: `muninn_recall(user_preferences, collaboration_style)`
+5.  **Recall Topic**: `muninn_where_left_off` + `muninn_recall(active_goal, architecture_decisions)`
+6.  **Orient**: Summarize how the recalled context shapes your plan for the current turn.
+
+## Failure Rule
+
+If the shared helper or Muninn MCP is unavailable:
+
+- say so immediately
+- do not imply memory retrieval occurred
+- pause and require explicit approval before proceeding without Muninn
+- if approval is granted, say clearly that you are continuing on observed repo/runtime truth only
 
 ## Memory Triad
 
@@ -59,6 +70,12 @@ Trigger recall:
 - at session start
 - when the conversation shifts to a new topic
 - before architectural decisions or proposals
+
+But before any recall attempt, the main thread should first verify the bootstrap gate with:
+
+- `python3 scripts/muninn_mcp.py require`
+
+If that gate fails, the main thread should not spawn recall subagents until the user/operator has explicitly approved proceeding without Muninn.
 
 **Write → background subagent** (fire and forget):
 
@@ -155,5 +172,6 @@ Do not claim Muninn improved continuity unless retrieval actually influenced the
 If Muninn was not consulted, say so.
 If Muninn returned irrelevant memory, say so.
 If the habit is too heavy, say so.
+If Muninn was unavailable, say so immediately and note whether the user approved continuing without it.
 
 The experiment is about whether the memory helps, not about pretending it helped.

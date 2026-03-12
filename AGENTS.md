@@ -233,6 +233,18 @@ While working:
 - prefer the next reasonable action over broad exploratory questioning
 - pause when a decision has non-obvious architectural consequences
 
+### 8.1 Muninn Failure Rule
+
+When Muninn is required by protocol for meaningful work:
+
+- if the Muninn MCP surface or helper is unavailable, say so immediately
+- do not silently continue as if recall happened
+- pause and require explicit user/operator approval before proceeding without Muninn
+- once approval is given, state clearly that the turn is continuing on observed repo/runtime truth only
+
+Use the shared helper in [scripts/muninn_mcp.py](/Users/jaredlikes/code/philotic-stack/scripts/muninn_mcp.py).
+The `require` mode exists specifically to fail loudly when memory bootstrap is unavailable.
+
 ## 9. Parallel Workstreams
 
 When multiple conversations or workstreams are active in parallel:

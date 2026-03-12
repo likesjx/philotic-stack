@@ -71,10 +71,10 @@ else
   fail "python3 is available for helper scripts"
 fi
 
-if python3 "${ROOT_DIR}/scripts/muninn_mcp.py" --base-url "$MUNINN_BASE_URL" tools >/dev/null; then
-  pass "Muninn MCP helper can list tools"
+if python3 "${ROOT_DIR}/scripts/muninn_mcp.py" --base-url "$MUNINN_BASE_URL" require >/dev/null; then
+  pass "Muninn MCP helper passes required bootstrap gate"
 else
-  fail "Muninn MCP helper can list tools"
+  fail "Muninn MCP helper passes required bootstrap gate"
 fi
 
 run_in_repo "cargo check workspace baseline" cargo check --workspace

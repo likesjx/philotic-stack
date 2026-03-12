@@ -5,7 +5,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Every session MUST begin with these three steps:
 1.  **Read [AGENTS.md](file:///Users/jaredlikes/code/philotic-stack/AGENTS.md)**: Adopt the standing protocol.
 2.  **Verify Green Status**: Run `just check` and `just test` (or the relevant smoke) to ensure the baseline is stable before editing.
-3.  **Orient and Recall**: Use the `$muninn-memory-habit` and `$proposal-maintainer` mindset. Retrieve project context via Muninn and align your plan with the current `Disposition` of active architecture proposals and [docs/task.md](file:///Users/jaredlikes/code/philotic-stack/docs/task.md).
+3.  **Orient and Recall**: Run `just session-start` first. Use the `$muninn-memory-habit` and `$proposal-maintainer` mindset. Retrieve project context via Muninn and align your plan with the current `Disposition` of active architecture proposals and [docs/task.md](file:///Users/jaredlikes/code/philotic-stack/docs/task.md).
+
+If `just session-start` fails, stop and alert the user/operator immediately. Do not continue with meaningful work until explicit approval is given to proceed without Muninn.
 
 ## Commands
 
@@ -14,6 +16,7 @@ Every session MUST begin with these three steps:
 just build                  # cargo build --workspace
 just check                  # cargo check --workspace (faster)
 just format                 # cargo fmt --all
+just session-start          # require Muninn bootstrap before meaningful work
 
 # Test
 just test                   # cargo test --workspace
@@ -82,4 +85,3 @@ All consumers hold `Arc<dyn XxxStorage>`:
 - `docs/architecture/PORT_BLUEPRINT.md` — migration blueprint
 - `README.md` — status overview & diagram gallery
 - `AGENTS.md` — standing protocol for coding agents
-

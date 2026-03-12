@@ -31,6 +31,7 @@ Still pending:
 - Philotic-native integration
 - automatic helper usage in every client runtime
 - retrieval quality and behavior evaluation over time
+- hard fail/approval-gate behavior in every client when Muninn bootstrap is unavailable
 
 Observed reality gap:
 
@@ -245,6 +246,7 @@ Implement Muninn adoption in this order:
 1. Shared helper first
 - one small transport client
 - no client-specific assumptions in the transport layer
+- include a hard availability gate that fails loudly and requires operator approval before continuing without Muninn
 
 2. Shared protocol second
 - one plain-language instruction contract

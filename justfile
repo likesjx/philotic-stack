@@ -16,6 +16,10 @@ check:
 engine-check:
     ./scripts/engine-check.sh
 
+# Mandatory Muninn bootstrap gate for meaningful sessions.
+session-start:
+    python3 scripts/muninn_mcp.py require
+
 # Start the Hotel Manager (Ansible Host Daemon)
 start-ansible hotel:
     cargo build --workspace

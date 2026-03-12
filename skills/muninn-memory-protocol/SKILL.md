@@ -30,6 +30,7 @@ Do not reimplement the MCP handshake ad hoc unless you are intentionally porting
 
 Before meaningful work:
 
+- run `require`
 - run `where-left-off`
 - run `recall`
 
@@ -37,6 +38,18 @@ After durable outcomes:
 
 - run `remember` for atomic facts, preferences, and outcomes in short, meaningful bursts
 - run `decide` for explicit decisions with rationale
+
+## Failure Rule
+
+The helper must be allowed to block.
+
+If `python3 scripts/muninn_mcp.py require` fails:
+
+- alert the user/operator immediately
+- do not pretend retrieval already happened
+- do not continue with meaningful work until explicit approval is given to proceed without Muninn
+
+The protocol is continuity first, not silent degradation dressed up as professionalism.
 
 ## Truth Rule
 
