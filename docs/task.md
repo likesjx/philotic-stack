@@ -113,6 +113,59 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 - [ ] Add `known_peers` (local hotel, role=agent) to session snapshot.
 - [ ] Validate same-hotel peer task emission via existing `EmitTask` before designing `DelegateToPeer`.
 
+## New Project: Agent Context Management
+
+- [x] Pin the need for a dedicated management plane for agent-owned and operator-owned context graph mutations instead of continuing to rely on `mesh-config.json` edits plus restart cycles.
+- [ ] Define the first hotel-mediated self-management tool for bounded agent profile updates:
+  - `identity_text`
+  - `user_context_text`
+  - `memory_summary`
+  - `voice_response_policy.*`
+  - `media_routing_policy.*`
+- [ ] Define the first admin/operator management surface for inspecting and mutating any agent's context graph-backed profile/config.
+- [ ] Decide which profile fields are self-editable vs admin-only, especially:
+  - `soul_text`
+  - transport config
+  - model defaults
+  - role/incarnation definitions
+- [ ] Make runtime/profile updates flow through hotel-owned validation, authorization, persistence, and audit logging rather than direct file edits.
+
+## New Project: Context And Memory Engines
+
+- [ ] Review [PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md).
+- [ ] Review [MEMORY_ENGINE_ABSTRACTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMORY_ENGINE_ABSTRACTION_PROPOSAL.md).
+- [ ] Define the first context-engine contract for deterministic turn context assembly.
+- [ ] Define the first memory-engine contract for `search`, `store`, and provenance.
+- [ ] Prove one current context path and one current memory path behind those abstractions.
+
+## New Project: Admin Role And Surfaces
+
+- [ ] Review [ROLE_POSTURE_AND_ADMIN_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ROLE_POSTURE_AND_ADMIN_PROPOSAL.md).
+- [ ] Review [CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md).
+- [ ] Make the admin role a first-class posture in role/incarnation records and operator UX.
+- [ ] Keep the conversational role intentionally narrow and membrane-facing by default.
+- [ ] Define the first deterministic context-graph manager surface in the main CLI.
+- [ ] Define the first TUI-backed admin workflow on top of that control plane.
+
+## New Project: Agent Plugin Hooks
+
+- [ ] Review [AGENT_PLUGIN_HOOKS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/AGENT_PLUGIN_HOOKS_PROPOSAL.md).
+- [ ] Define the first bounded hook families for context, memory, transcription, and response post-processing.
+- [ ] Move one live seam behind the hook model before broadening the design story.
+
+## New Project: Local Admin Fallback Model
+
+- [ ] Review [LOCAL_ADMIN_FALLBACK_MODEL_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/LOCAL_ADMIN_FALLBACK_MODEL_PROPOSAL.md).
+- [ ] Define the first bounded local-admin capability envelope.
+- [ ] Decide how ONNX fits for embeddings, tool-calling support, and local degraded-mode admin workflows.
+- [ ] Prove one local fallback path without external models.
+
+## New Project: OpenClaw Parity And Migration
+
+- [ ] Review [OPENCLAW_PARITY_MIGRATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OPENCLAW_PARITY_MIGRATION_PROPOSAL.md).
+- [ ] Build the first explicit parity matrix for OpenClaw capability vs Philotic owner/confidence/gap.
+- [ ] Identify the minimum migration-critical seams beyond simple feature demos.
+
 ## New Project: Philotic Agent Loop
 
 - [ ] Write a dedicated proposal for the Philotic loop architecture using Pi as the core turn-engine reference.
@@ -406,7 +459,8 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 - [x] Port 9 specialized skills from `~/.codex/skills` to `skills/` and make them repo-local.
 - [x] Establish mandatory session bootstrap in `CLAUDE.md` and `AGENTS.md`.
 - [x] Implement `just engine-check` for one-command verification of Muninn, repo-local bootstrap assets, and the cargo check/test baseline.
-- [ ] Implement `just session-start` to automate the recall/identity orientation handshake.
+- [x] Implement `just session-start` as the mandatory Muninn bootstrap gate for meaningful sessions.
+- [x] Require explicit user/operator approval before continuing without Muninn when the bootstrap gate fails.
 - [ ] Deploy Muninn "Truth Cache" to `vps-jane` with automated sync from local.
 - [ ] Formalize semantic "Optimization Loop" to update `AGENTS.md` rules based on recurring "Reality Gaps."
 

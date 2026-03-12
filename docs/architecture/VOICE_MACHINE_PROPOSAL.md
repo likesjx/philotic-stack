@@ -58,7 +58,7 @@ Current expected UX for the Telegram agents:
 
 - `mode = "auto"` means a voice memo should get a voice-only reply by default
 - `/tts on` switches to `mode = "on"` and should deliver both voice and text
-- `/tts off` switches back to text-only
+- `/tts off` switches text turns back to text-only, but voice memos should still get voice-only replies
 - `send_text_caption` is ignored in `auto` mode on purpose, so mirrored voice replies stay voice-only
 
 Pipeline: model responds → `complete_agent_response` checks policy → `start_voice_synthesis` stashes text, sets `TurnPhase::WaitingVoice`, emits `voice.synthesize` to the voice component → response returns via `handle_voice_synthesis_response` → `deliver_text_reply` sends `FinalReplyPayload` (with `audio_artifact`) to membrane → membrane calls `sendVoice`/`sendAudio` via Telegram multipart.
@@ -202,6 +202,7 @@ Not because text is sacred, but because systems become much easier to reason abo
 - how partial speech output is interrupted or superseded
 - how to store and reference media artifacts in the context graph
 - how much transcript fidelity is required for memory and auditability
+- how the dedicated transcription task should be finalized as a first-class bounded media transform rather than an ad hoc side path
 
 ## Recommendation
 
