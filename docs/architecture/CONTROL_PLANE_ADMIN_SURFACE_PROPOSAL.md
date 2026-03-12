@@ -28,6 +28,13 @@ The first recommended shape is:
 - show drift between startup overlays and graph truth
 - expose audit-friendly diffs and repair actions
 
+It should also own high-trust operator workflows that must not be reduced to ordinary chat commands or raw key handling:
+
+- secret add/rotate/revoke initiation
+- vault status and audit inspection
+- transport/perimeter trust changes
+- break-glass or recovery flows with stronger ceremony
+
 ## TUI Recommendation
 
 Yes, the TUI should be the first admin app.
@@ -58,6 +65,38 @@ Possible later layers:
 
 But the architecture should be proven in the CLI/TUI first.
 
+## Relationship To Membrane
+
+`membrane` may expose admin/operator entry points, but it should not become the owner of secret or policy truth.
+
+Recommended boundary:
+
+- `membrane` may start an authenticated operator control session
+- `membrane` may launch a Mini App or secure action link
+- `membrane` may collect approval intents and control-plane requests
+- `ansible` / hotel control plane validates, authorizes, persists, audits, and executes the requested admin action
+
+This keeps the outside-world interface useful without letting the transport boundary quietly become the admin database with better emojis.
+
+## Secret Administration Recommendation
+
+Adding or rotating secrets should be treated as an admin/control-plane workflow, not as ordinary conversational tool use.
+
+Recommended shape:
+
+1. operator issues a high-trust action such as `/vault add gemini` or `/vault rotate telegram`
+2. `membrane` verifies operator posture and opens a secure admin flow
+3. a CLI/TUI or Mini App collects the action under explicit auth/approval
+4. the hotel control plane performs the vault mutation
+5. the result returns as structured admin output without surfacing raw secret material
+
+The key rule is:
+
+- `membrane` starts and brokers the flow
+- the hotel control plane owns the mutation
+- the vault owns the secret
+- model-facing components never receive the admin key material
+
 ## First Slice Recommendation
 
 Start with a deterministic graph manager that can:
@@ -66,5 +105,6 @@ Start with a deterministic graph manager that can:
 - inspect hotel manifests and live guests
 - show routing/materialization state
 - patch a bounded set of records with audit output
+- initiate one high-trust vault admin flow without exposing raw secret material
 
 Then wrap that same management plane in a TUI.

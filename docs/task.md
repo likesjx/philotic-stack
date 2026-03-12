@@ -159,6 +159,10 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 - [ ] Keep the conversational role intentionally narrow and membrane-facing by default.
 - [ ] Define the first deterministic context-graph manager surface in the main CLI.
 - [ ] Define the first TUI-backed admin workflow on top of that control plane.
+- [ ] Define the first membrane-brokered admin workflow for secret add/rotate initiation where:
+  - `membrane` starts the authenticated operator flow
+  - hotel control plane owns authorization and mutation
+  - vault owns secret persistence
 
 ## New Project: Agent Plugin Hooks
 
@@ -422,6 +426,10 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
   - Mini App or secure browser handoff
   - no plaintext secret entry in normal chat messages
 - [ ] Define Telegram-safe rotation UX and operator approvals.
+- [ ] Define the membrane/admin split for secret workflows explicitly:
+  - `membrane` as operator entry point
+  - hotel control plane as mutation authority
+  - vault as secret authority
 
 ## Next Project: Tool Assembly and Routed Execution
 

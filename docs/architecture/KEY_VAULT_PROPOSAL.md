@@ -293,6 +293,12 @@ Telegram is still useful for:
 - launching a secure operator mini app
 - monitoring vault events
 
+The admin/control implication should be explicit:
+
+- Telegram via `membrane` may initiate or broker secret administration
+- Telegram via `membrane` should not own vault mutation authority
+- secret add/rotate flows belong to the hotel control plane and vault, with `membrane` acting as the outside-world entry point only
+
 ## Admin Key Management Recommendation
 
 Admin keys should be managed as a distinct control-plane concern, not folded into ordinary runtime secret handling.
