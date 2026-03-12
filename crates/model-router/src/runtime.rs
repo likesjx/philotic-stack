@@ -21,6 +21,8 @@ type ProviderFactory =
 pub struct ControllerGuestConfig {
     pub guest_id: &'static str,
     pub role: &'static str,
+    /// Transitional knob from the earlier inline-audio prototype. Canonical audio delivery is
+    /// now handled through the normal model-response artifact path, so this flag is ignored.
     pub allow_inline_audio: bool,
     pub providers: Box<ProviderFactory>,
 }
@@ -116,18 +118,6 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                         continue;
                     }
                 };
-
-                if controller_task.kind == TaskKind::VoiceSynthesize && !config.allow_inline_audio {
-                    emit_failure(
-                        &mut ipc_client,
-                        &reply,
-                        Some(controller_task.kind.as_str()),
-                        None,
-                        "Voice synthesis is wired as a separate model-controller guest, but canonical audio delivery is not implemented yet. Next seam: voice machine + media delivery.".into(),
-                    )
-                    .await?;
-                    continue;
-                }
 
                 let provider_configs = match ProviderConfigs::load(&mut ipc_client).await {
                     Ok(configs) => configs,

@@ -265,6 +265,8 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 - [x] Make agent-level media routing policy configurable so text/media/voice decisions are owned by the agent/session profile instead of one hardcoded runtime branch.
 - [x] Investigate splitting voice-note transcription/understanding toward ElevenLabs or another speech-specialized provider while keeping richer text reasoning in the agent/model loop.
 - [x] Add `VoiceResponsePolicy` to `AgentProfile` so the agent has its own voice identity and TTS is policy-driven, not tool-driven.
+- [ ] Make the default local Jane/Aria voice UX honest: `mode=auto` should mirror voice-input turns with voice-only replies, while `/tts on` should escalate to voice+text delivery.
+- [ ] Route `voice.transcribe` results back into the normal agent reasoning loop before `voice.synthesize`, so voice turns stop parroting the transcript and instead speak the post-reasoning answer.
 - [ ] Define hotel CLI OAuth UX:
   - browser launch
   - temporary localhost callback listener
@@ -277,7 +279,7 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 - [ ] Run a Keychain-backed Gemini OAuth smoke with `PHILOTIC_VAULT_MASTER_KEY` unset.
 - [x] Run a full guest-path Gemini OAuth smoke through the materialized model-controller, not just hotel-side validation.
 - [ ] Wire refresh-token persistence and refresh lifecycle behind the hotel vault.
-- [ ] Deliver an honest ElevenLabs end-to-end voice path beyond inline-audio/testing mode.
+- [x] Deliver an honest ElevenLabs end-to-end voice path beyond inline-audio/testing mode, including watched-live confirmation that `voice.synthesize` produces canonical audio artifacts instead of a model-router policy refusal.
 
 ## New Project: Key Vault
 

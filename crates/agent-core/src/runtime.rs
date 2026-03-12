@@ -540,6 +540,7 @@ impl AgentRuntime {
                 working_tool_history: Vec::new(),
                 pending_text_reply: None,
                 had_voice_input,
+                awaiting_transcription_reentry: false,
             });
             state.set_active_turn_phase(TurnPhase::LoadingContext);
 
@@ -611,6 +612,18 @@ impl AgentRuntime {
                 .await;
         }
 
+        let media_policy = self
+            .sessions
+            .get(&session_id)
+            .map(|s| s.agent_profile.media_routing_policy.clone())
+            .unwrap_or_default();
+        let media_attachments = media_analysis_attachments(&task);
+        let media_routing = resolve_media_routing(&media_policy, media_attachments);
+        let awaiting_transcription_reentry = media_routing
+            .as_ref()
+            .map(|routing| routing.action == "transcribe")
+            .unwrap_or(false);
+
         let _ = self
             .ipc_client
             .send_request(IpcRequest::UpdateTask {
@@ -632,6 +645,7 @@ impl AgentRuntime {
                 .expect("active turn should still exist after context build");
             state.bump_active_turn_iteration();
             state.set_active_turn_phase(TurnPhase::WaitingModel);
+            state.set_active_turn_awaiting_transcription_reentry(awaiting_transcription_reentry);
             (
                 state.checkpoint_memory_type(),
                 state.checkpoint_json(),
@@ -643,15 +657,6 @@ impl AgentRuntime {
             .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
             .await?;
         self.sync_session_index(&index_state).await?;
-
-        let media_policy = self
-            .sessions
-            .get(&session_id)
-            .map(|s| s.agent_profile.media_routing_policy.clone())
-            .unwrap_or_default();
-
-        let media_attachments = media_analysis_attachments(&task);
-        let media_routing = resolve_media_routing(&media_policy, media_attachments);
 
         let (action, prompt, attachments, tools_for_model, capability) =
             if let Some(routing) = media_routing {
@@ -795,6 +800,20 @@ impl AgentRuntime {
                 .await;
         }
 
+        if let Some(model_error) = extract_model_error(&task) {
+            warn!(
+                "Session [{}] model request failed before turn completion: {}",
+                session_id, model_error
+            );
+            return self
+                .fail_active_turn(
+                    session_id,
+                    turn_id,
+                    format!("Model failed: {}", model_error),
+                )
+                .await;
+        }
+
         if let Some(state) = self.sessions.get_mut(&session_id) {
             state.set_active_turn_phase(TurnPhase::Thinking);
         }
@@ -809,7 +828,36 @@ impl AgentRuntime {
             .filter(|s| !s.trim().is_empty())
             .map(str::to_string);
 
+        let awaiting_transcription_reentry = self
+            .sessions
+            .get(&session_id)
+            .map(|state| state.active_turn_awaiting_transcription_reentry())
+            .unwrap_or(false);
+
         let action = interpret_model_payload(task.agent_action.as_ref(), task.content.as_deref());
+        if awaiting_transcription_reentry {
+            return match action {
+                AgentAction::Respond { content } => {
+                    self.reenter_turn_after_transcription(session_id, turn_id, content)
+                        .await
+                }
+                AgentAction::Fail { message } => {
+                    self.fail_active_turn(session_id, turn_id, message).await
+                }
+                other => {
+                    self.fail_active_turn(
+                        session_id,
+                        turn_id,
+                        format!(
+                            "voice.transcribe returned unexpected action {:?}; expected transcript text",
+                            other
+                        ),
+                    )
+                    .await
+                }
+            };
+        }
+
         match action {
             AgentAction::Respond { content } => {
                 self.complete_agent_response(session_id, turn_id, content, spoken_text)
@@ -1279,6 +1327,107 @@ impl AgentRuntime {
                 Ok(())
             }
         }
+    }
+
+    async fn reenter_turn_after_transcription(
+        &mut self,
+        session_id: String,
+        turn_id: String,
+        transcript: String,
+    ) -> Result<()> {
+        let transcript = transcript.trim().to_string();
+        if transcript.is_empty() {
+            return self
+                .fail_active_turn(
+                    session_id,
+                    turn_id,
+                    "Voice transcription returned an empty transcript".into(),
+                )
+                .await;
+        }
+
+        let (reentry, checkpoint_memory_type, checkpoint_json, index_state) = {
+            let Some(state) = self.sessions.get_mut(&session_id) else {
+                warn!(
+                    "Received transcription re-entry for unknown session {}",
+                    session_id
+                );
+                return Ok(());
+            };
+            let Some(reentry) = state.prepare_transcription_reentry(&transcript) else {
+                return self
+                    .fail_active_turn(
+                        session_id,
+                        turn_id,
+                        "Voice transcription returned an empty transcript".into(),
+                    )
+                    .await;
+            };
+            (
+                reentry,
+                state.checkpoint_memory_type(),
+                state.checkpoint_json(),
+                state.clone(),
+            )
+        };
+
+        self.ipc_client
+            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
+            .await?;
+        self.sync_session_index(&index_state).await?;
+
+        let _ = self
+            .ipc_client
+            .send_request(IpcRequest::UpdateTask {
+                task_id: reentry.task_id,
+                state: "waiting_model".into(),
+                payload: serde_json::json!({
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "chat_id": reentry.chat_id,
+                    "content": reentry.user_content,
+                }),
+            })
+            .await?;
+
+        let model_req = ModelRequestPayload {
+            action: "generate_text".to_string(),
+            session_id: session_id.clone(),
+            turn_id,
+            prompt: reentry.prompt,
+            user_content: reentry.user_content.clone(),
+            attachments: Vec::new(),
+            tools_for_model: reentry.tools_for_model,
+            response_contract: Some(serde_json::json!({ "channels": ["spoken_text"] })),
+            chat_id: reentry.chat_id,
+            reply_to: local_node_id(),
+            reply_role: "agent".into(),
+            final_reply_to: reentry.final_reply_to,
+            final_reply_role: reentry.final_reply_role,
+            final_reply_guest_id: reentry.final_reply_guest_id,
+        };
+
+        let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
+            self.sessions.get(&session_id),
+            "text.generate",
+            DEFAULT_TEXT_MODEL_ROLE,
+        );
+
+        info!(
+            "Session [{}] re-entering normal reasoning after voice transcription",
+            session_id
+        );
+
+        self.ipc_client
+            .send_request(IpcRequest::EmitTask {
+                target_node,
+                target_role,
+                target_guest_id,
+                task_json: serde_json::to_string(&model_req)?,
+            })
+            .await?;
+
+        Ok(())
     }
 
     /// Emit a turn lifecycle event back to the transport (membrane) so it can update delivery UX

@@ -40,6 +40,21 @@ pub struct WorkingTurn {
     /// Stashed text content while waiting for voice synthesis to complete.
     pub pending_text_reply: Option<String>,
     pub had_voice_input: bool,
+    /// True when a voice transcription result should be routed back into the
+    /// normal reasoning loop instead of finalized as the assistant reply.
+    pub awaiting_transcription_reentry: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelReentryPlan {
+    pub task_id: Uuid,
+    pub user_content: String,
+    pub prompt: String,
+    pub chat_id: String,
+    pub final_reply_to: String,
+    pub final_reply_role: String,
+    pub final_reply_guest_id: Option<String>,
+    pub tools_for_model: Vec<ToolDefinition>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -444,6 +459,62 @@ impl SessionState {
 
     pub fn take_pending_text_reply(&mut self) -> Option<String> {
         self.active_turn.as_mut()?.pending_text_reply.take()
+    }
+
+    pub fn set_active_turn_awaiting_transcription_reentry(&mut self, awaiting: bool) {
+        if let Some(turn) = self.active_turn.as_mut() {
+            turn.awaiting_transcription_reentry = awaiting;
+        }
+    }
+
+    pub fn active_turn_awaiting_transcription_reentry(&self) -> bool {
+        self.active_turn
+            .as_ref()
+            .map(|turn| turn.awaiting_transcription_reentry)
+            .unwrap_or(false)
+    }
+
+    pub fn prepare_transcription_reentry(&mut self, transcript: &str) -> Option<ModelReentryPlan> {
+        let normalized = transcript.trim();
+        if normalized.is_empty() {
+            return None;
+        }
+
+        let (
+            task_id,
+            chat_id,
+            final_reply_to,
+            final_reply_role,
+            final_reply_guest_id,
+            user_content,
+        ) = {
+            let active_turn = self.active_turn.as_mut()?;
+            active_turn.user_content = normalized.to_string();
+            active_turn.iteration += 1;
+            active_turn.phase = TurnPhase::WaitingModel;
+            active_turn.awaiting_transcription_reentry = false;
+            (
+                active_turn.task_id,
+                active_turn.chat_id.clone(),
+                active_turn.final_reply_to.clone(),
+                active_turn.final_reply_role.clone(),
+                active_turn.final_reply_guest_id.clone(),
+                active_turn.user_content.clone(),
+            )
+        };
+
+        let tools_for_model = self.project_tools_for_turn(&user_content);
+        let prompt = self.build_prompt_with_tools(&user_content, &tools_for_model);
+        Some(ModelReentryPlan {
+            task_id,
+            user_content,
+            prompt,
+            chat_id,
+            final_reply_to,
+            final_reply_role,
+            final_reply_guest_id,
+            tools_for_model,
+        })
     }
 
     pub fn complete_active_turn(&mut self, assistant_content: String) -> Option<WorkingTurn> {
@@ -1166,6 +1237,9 @@ impl SessionState {
                 "working_tool_history": turn.working_tool_history.iter().map(|(call, result)| {
                     json!({ "call": call, "result": result })
                 }).collect::<Vec<_>>(),
+                "pending_text_reply": turn.pending_text_reply,
+                "had_voice_input": turn.had_voice_input,
+                "awaiting_transcription_reentry": turn.awaiting_transcription_reentry,
             })
         });
 
@@ -1356,8 +1430,18 @@ impl SessionState {
                             .collect()
                     })
                     .unwrap_or_default(),
-                pending_text_reply: None,
-                had_voice_input: false,
+                pending_text_reply: turn
+                    .get("pending_text_reply")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                had_voice_input: turn
+                    .get("had_voice_input")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                awaiting_transcription_reentry: turn
+                    .get("awaiting_transcription_reentry")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
             })
         });
 
@@ -1843,14 +1927,24 @@ mod tests {
             pending_tool_call: None,
             pending_approval: None,
             working_tool_history: Vec::new(),
-            pending_text_reply: None,
-            had_voice_input: false,
+            pending_text_reply: Some("hello back".into()),
+            had_voice_input: true,
+            awaiting_transcription_reentry: true,
         });
 
         let checkpoint = state.checkpoint_json();
         assert_eq!(checkpoint["session_id"], "sess-1");
         assert_eq!(checkpoint["active_turn"]["turn_id"], "turn-1");
         assert_eq!(checkpoint["active_turn"]["phase"], "queued");
+        assert_eq!(
+            checkpoint["active_turn"]["pending_text_reply"],
+            "hello back"
+        );
+        assert_eq!(checkpoint["active_turn"]["had_voice_input"], true);
+        assert_eq!(
+            checkpoint["active_turn"]["awaiting_transcription_reentry"],
+            true
+        );
         assert_eq!(
             checkpoint["active_turn"]["final_reply_guest_id"],
             "membrane-telegram-01"
@@ -1911,6 +2005,7 @@ mod tests {
             working_tool_history: Vec::new(),
             pending_text_reply: None,
             had_voice_input: false,
+            awaiting_transcription_reentry: false,
         });
 
         state.complete_active_turn("hi".into());
@@ -2600,6 +2695,7 @@ mod tests {
             working_tool_history: Vec::new(),
             pending_text_reply: None,
             had_voice_input: false,
+            awaiting_transcription_reentry: false,
         });
         let index = merge_session_index(None, &first);
         assert_eq!(index["active_sessions"].as_array().unwrap().len(), 1);
@@ -2638,6 +2734,7 @@ mod tests {
             working_tool_history: Vec::new(),
             pending_text_reply: None,
             had_voice_input: false,
+            awaiting_transcription_reentry: true,
         });
 
         state.push_tool_history(
@@ -2664,10 +2761,12 @@ mod tests {
         // Round-trip through checkpoint
         let checkpoint = state.checkpoint_json();
         let restored = SessionState::from_checkpoint(&checkpoint).unwrap();
-        let history = &restored.active_turn.unwrap().working_tool_history;
+        let active_turn = restored.active_turn.unwrap();
+        let history = &active_turn.working_tool_history;
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].0.tool_name, "workspace.list");
         assert_eq!(history[0].1.content, "main.rs\nlib.rs");
+        assert!(active_turn.awaiting_transcription_reentry);
     }
 
     #[test]
@@ -2689,6 +2788,7 @@ mod tests {
             working_tool_history: Vec::new(),
             pending_text_reply: None,
             had_voice_input: false,
+            awaiting_transcription_reentry: false,
         });
 
         state.push_tool_history(
@@ -2722,5 +2822,52 @@ mod tests {
     fn reentry_prompt_returns_none_without_active_turn() {
         let state = SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         assert!(state.build_reentry_prompt().is_none());
+    }
+
+    #[test]
+    fn prepare_transcription_reentry_turns_transcript_into_normal_user_turn() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.start_turn(WorkingTurn {
+            task_id: Uuid::nil(),
+            turn_id: "turn-voice-1".into(),
+            chat_id: "123".into(),
+            user_content: "User sent a Telegram voice message.".into(),
+            final_reply_to: "local-ansible-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase: TurnPhase::Thinking,
+            iteration: 1,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            pending_text_reply: None,
+            had_voice_input: true,
+            awaiting_transcription_reentry: true,
+        });
+
+        let reentry = state
+            .prepare_transcription_reentry("Please review the current architecture.")
+            .expect("transcript should produce a re-entry plan");
+
+        assert_eq!(
+            reentry.user_content,
+            "Please review the current architecture."
+        );
+        assert!(
+            reentry
+                .prompt
+                .contains("Please review the current architecture."),
+            "prompt should be rebuilt from the transcript"
+        );
+
+        let active_turn = state.active_turn.as_ref().expect("turn should still exist");
+        assert_eq!(
+            active_turn.user_content,
+            "Please review the current architecture."
+        );
+        assert_eq!(active_turn.phase, TurnPhase::WaitingModel);
+        assert_eq!(active_turn.iteration, 2);
+        assert!(!active_turn.awaiting_transcription_reentry);
     }
 }

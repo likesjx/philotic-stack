@@ -14,7 +14,7 @@ without turning `agent-core` into an audio pipeline with opinions.
 
 ## Disposition
 
-`in progress — first policy slice landed; voice machine component not yet materialised`
+`in progress — policy-driven voice ingress/egress and watched-live Telegram audio delivery are working; transcription-to-reasoning re-entry is the current agent-core seam, and the dedicated voice machine component is not yet materialised`
 
 Track active work in [task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md).
 
@@ -46,14 +46,27 @@ Added to `AgentProfile`. Controls whether the agent synthesises speech for its r
 
 | Field | Default | Effect |
 |---|---|---|
-| `enabled` | `false` | Must opt in; text-only by default |
+| `mode` | `"off"` | `off`, `auto`, or `on` |
 | `provider` | `None` | Provider hint (e.g. `"elevenlabs"`) |
 | `voice_id` | `None` | The agent's permanent voice identity |
 | `model` | `None` | Provider model override |
-| `send_text_caption` | `true` | Also deliver text alongside audio |
+| `send_text_caption` | `true` | Also deliver text alongside audio when mode is `on` |
 | `fallback_to_text` | `true` | Text-only delivery if synthesis fails |
 
+Current expected UX for the Telegram agents:
+
+- `mode = "auto"` means a voice memo should get a voice-only reply by default
+- `/tts on` switches to `mode = "on"` and should deliver both voice and text
+- `/tts off` switches back to text-only
+- `send_text_caption` is ignored in `auto` mode on purpose, so mirrored voice replies stay voice-only
+
 Pipeline: model responds → `complete_agent_response` checks policy → `start_voice_synthesis` stashes text, sets `TurnPhase::WaitingVoice`, emits `voice.synthesize` to the voice component → response returns via `handle_voice_synthesis_response` → `deliver_text_reply` sends `FinalReplyPayload` (with `audio_artifact`) to membrane → membrane calls `sendVoice`/`sendAudio` via Telegram multipart.
+
+Current agent-core requirement:
+
+- `voice.transcribe` is an intermediate transform, not the final assistant answer
+- the transcript must be routed back into the normal reasoning loop as the user turn
+- only the post-reasoning assistant reply should flow into `voice.synthesize`
 
 ### Example config
 
@@ -66,7 +79,7 @@ Pipeline: model responds → `complete_agent_response` checks policy → `start_
       "strip_tools_on_media": true
     },
     "voice_response_policy": {
-      "enabled": true,
+      "mode": "auto",
       "provider": "elevenlabs",
       "voice_id": "YOUR_ELEVENLABS_VOICE_ID",
       "model": "eleven_multilingual_v2",
