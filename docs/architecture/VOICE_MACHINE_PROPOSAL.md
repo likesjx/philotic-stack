@@ -50,6 +50,7 @@ Added to `AgentProfile`. Controls whether the agent synthesises speech for its r
 | `provider` | `None` | Provider hint (e.g. `"elevenlabs"`) |
 | `voice_id` | `None` | The agent's permanent voice identity |
 | `model` | `None` | Provider model override |
+| `speed_percent` | `None` | Speech rate override; `100` means normal speed |
 | `send_text_caption` | `true` | Also deliver text alongside audio when mode is `on` |
 | `fallback_to_text` | `true` | Text-only delivery if synthesis fails |
 
@@ -83,6 +84,7 @@ Current agent-core requirement:
       "provider": "elevenlabs",
       "voice_id": "YOUR_ELEVENLABS_VOICE_ID",
       "model": "eleven_multilingual_v2",
+      "speed_percent": 92,
       "send_text_caption": true,
       "fallback_to_text": true
     }

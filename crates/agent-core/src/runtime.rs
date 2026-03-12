@@ -1589,12 +1589,24 @@ impl AgentRuntime {
             policy.voice_id.as_deref(),
         );
 
+        let provider_options = if let Some(speed_percent) = policy.speed_percent {
+            let speed = f64::from(speed_percent) / 100.0;
+            serde_json::json!({
+                "voice_settings": {
+                    "speed": speed
+                }
+            })
+        } else {
+            serde_json::json!({})
+        };
+
         let voice_task = serde_json::json!({
             "kind": "voice.synthesize",
             "provider": policy.provider,
             "spoken_text": spoken_text.unwrap_or_else(|| strip_markup(&display_text)),
             "voice_id": policy.voice_id,
             "model": policy.model,
+            "provider_options": provider_options,
             "session_id": session_id,
             "turn_id": turn_id,
             "chat_id": chat_id,

@@ -175,6 +175,24 @@ mod tests {
     }
 
     #[test]
+    fn request_body_preserves_voice_speed_in_voice_settings() {
+        let provider = ElevenLabsProvider::new(reqwest::Client::new(), None, None);
+        let task = ControllerTask::from_value(&json!({
+            "kind": "voice.synthesize",
+            "spoken_text": "slow down a bit",
+            "provider_options": {
+                "voice_settings": {
+                    "speed": 0.85
+                }
+            }
+        }))
+        .unwrap();
+
+        let body = provider.request_body(&task).unwrap();
+        assert_eq!(body["voice_settings"]["speed"], 0.85);
+    }
+
+    #[test]
     fn resolves_request_voice_before_default_voice() {
         let provider =
             ElevenLabsProvider::new(reqwest::Client::new(), None, Some("default-voice".into()));

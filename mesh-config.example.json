@@ -23,6 +23,7 @@
             "provider": "elevenlabs",
             "voice_id": "YOUR_ELEVENLABS_VOICE_ID_HERE",
             "model": "eleven_multilingual_v2",
+            "speed_percent": 92,
             "send_text_caption": true,
             "fallback_to_text": true
           },
@@ -54,6 +55,7 @@
             "provider": "elevenlabs",
             "voice_id": "YOUR_ARIA_ELEVENLABS_VOICE_ID_HERE",
             "model": "eleven_multilingual_v2",
+            "speed_percent": 92,
             "send_text_caption": true,
             "fallback_to_text": true
           },

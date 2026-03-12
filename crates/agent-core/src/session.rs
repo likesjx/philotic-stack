@@ -144,6 +144,10 @@ pub struct VoiceResponsePolicy {
     /// Provider model override (e.g. "eleven_multilingual_v2").
     #[serde(default)]
     pub model: Option<String>,
+    /// Speech speed as a percentage of normal rate. `100` means provider default speed.
+    /// Lower values slow the voice down; higher values speed it up.
+    #[serde(default)]
+    pub speed_percent: Option<u16>,
     /// When mode is `On`, also deliver the text alongside the audio as a caption.
     /// Ignored for `Auto` (no caption when mirroring voice input).
     #[serde(default = "default_true")]
@@ -180,6 +184,7 @@ impl Default for VoiceResponsePolicy {
             provider: None,
             voice_id: None,
             model: None,
+            speed_percent: None,
             send_text_caption: true,
             fallback_to_text: true,
         }
