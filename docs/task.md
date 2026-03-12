@@ -443,6 +443,13 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
   - state/version
   - rotation/health status
   - no raw secret material
+- [ ] Define the first mesh-visible vault metadata record shape:
+  - `secret_ref`
+  - `owning_hotel`
+  - `secret_class`
+  - `state`
+  - `version`
+  - rotation/health fields
 - [ ] Enforce the rule that admin key material never flows to model-facing components or prompt-visible tool output.
 - [ ] Define admin-key workflows as hotel-owned control-plane operations rather than raw key release wherever possible.
 - [ ] Move Gemini OAuth refresh tokens behind vault references.
@@ -461,6 +468,15 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
   - owning hotel validates and executes
   - structured outcome returns across the mesh
   - no default raw secret export
+- [ ] Define the first remote vault admin delegation envelope:
+  - `request_id`
+  - `source_hotel`
+  - `target_hotel`
+  - `principal_id`
+  - `session_id`
+  - `grant_id`
+  - `action_class`
+  - structured payload
 
 ## Next Project: Tool Assembly and Routed Execution
 
@@ -708,5 +724,11 @@ Now that the End-to-End Philotic architecture is complete, we need to separate i
 - [x] Define architecture documentation domains as a lightweight organization layer instead of adding deep proposal folders immediately.
 - [x] Create a living architecture status snapshot that acts as the single source of truth for implemented behavior, transitional seams, and currently active work.
 - [x] Make the docs index point to an architecture hub and status snapshot before deeper reference or proposal reading.
+- [x] Define a lightweight tagging and frontmatter strategy for active architecture/process docs, including controlled `domain`, `doc_type`, and `status` vocabularies.
+- [ ] Apply the frontmatter schema to the highest-value active docs first:
+  - [ ] [docs/architecture/ARCHITECTURE_STATUS.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE_STATUS.md)
+  - [ ] [docs/architecture/ARCHITECTURE.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE.md)
+  - [ ] current active proposal set
+- [ ] Decide when seam docs become first-class artifacts instead of remaining proposal sections plus task items.
 - [ ] Tighten [docs/architecture/ARCHITECTURE.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE.md) against current execution-transport and current session-authority reality.
 - [ ] Audit historical docs and clearly mark any remaining non-authoritative architecture narratives as legacy or historical.

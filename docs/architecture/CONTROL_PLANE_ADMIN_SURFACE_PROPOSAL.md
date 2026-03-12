@@ -282,6 +282,28 @@ Recommended rule:
 
 This keeps secret ownership local while still allowing mesh-wide administration from one trusted operator surface.
 
+### First delegation contract
+
+The first remote admin delegation path should carry:
+
+- source hotel
+- target hotel
+- principal id
+- session id
+- action grant id
+- action class
+- optional action target
+- structured payload
+
+This gives the owning hotel enough context to validate that the request is:
+
+- coming from a trusted peer
+- tied to a valid elevated session
+- scoped to one dangerous action class
+- still within grant lifetime
+
+The result should come back as a structured admin outcome, not as an implicit success or a blob of human prose.
+
 ## First Slice Recommendation
 
 Start with a deterministic graph manager that can:
@@ -293,5 +315,6 @@ Start with a deterministic graph manager that can:
 - initiate one high-trust vault admin flow without exposing raw secret material
 - define and issue one explicit short-lived action grant for that flow
 - keep that flow channel-agnostic so hotels without `membrane` use the same control-plane model through CLI/TUI
+- define one explicit remote delegation envelope for actions owned by another hotel
 
 Then wrap that same management plane in a TUI.

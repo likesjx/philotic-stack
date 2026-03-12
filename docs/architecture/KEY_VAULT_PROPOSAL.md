@@ -158,6 +158,44 @@ The mesh should be able to answer:
 
 The mesh should not act like a gossip bus for the money itself.
 
+### First mesh-visible metadata record
+
+The first implementation should make the metadata shape explicit enough that it can be advertised or queried consistently across hotels.
+
+Suggested record shape:
+
+```json
+{
+  "secret_ref": "secret://hotel/default/gemini/oauth-refresh",
+  "owning_hotel": "default",
+  "secret_kind": "gemini_oauth_refresh",
+  "secret_class": "provider-root",
+  "provider": "gemini",
+  "scope": "hotel",
+  "state": "active",
+  "version": 3,
+  "last_rotated_at": 1741782000,
+  "health_status": "healthy",
+  "needs_rotation": false
+}
+```
+
+Recommended first fields:
+
+- `secret_ref`
+- `owning_hotel`
+- `secret_kind`
+- `secret_class`
+- optional `provider`
+- `scope`
+- `state`
+- `version`
+- optional `last_rotated_at`
+- `health_status`
+- `needs_rotation`
+
+This is enough for mesh-wide admin inspection and routing decisions without exposing secret material.
+
 ## Encryption Recommendation
 
 Use envelope encryption.
@@ -384,6 +422,65 @@ Recommended shape:
 5. the owning hotel performs the mutation locally and returns only structured outcome data
 
 This means a hotel without `membrane` is still fully administrable, and a hotel with `membrane` is not uniquely privileged to own vault operations.
+
+### First remote delegation envelope
+
+The first delegated admin request should also be explicit enough to become a canonical control-plane message rather than an ad hoc cross-hotel favor.
+
+Suggested request shape:
+
+```json
+{
+  "request_id": "req_01...",
+  "source_hotel": "aria-architect-hotel",
+  "target_hotel": "default",
+  "principal_id": "operator:likesjx",
+  "session_id": "telegram:7898847424:agent-aria-01",
+  "grant_id": "grant_01...",
+  "action_class": "vault.secret.rotate",
+  "action_target": "provider:gemini",
+  "payload": {
+    "secret_ref": "secret://hotel/default/gemini/oauth-refresh"
+  }
+}
+```
+
+Suggested response shape:
+
+```json
+{
+  "request_id": "req_01...",
+  "ok": true,
+  "status": "completed",
+  "result": {
+    "secret_ref": "secret://hotel/default/gemini/oauth-refresh",
+    "version": 4,
+    "state": "active"
+  },
+  "error": null
+}
+```
+
+Recommended first fields:
+
+- `request_id`
+- `source_hotel`
+- `target_hotel`
+- `principal_id`
+- `session_id`
+- `grant_id`
+- `action_class`
+- optional `action_target`
+- structured `payload`
+
+The owning hotel should validate:
+
+- perimeter trust
+- delegated action class
+- principal/session/grant consistency
+- local policy on the target hotel
+
+Only then should it execute the mutation locally.
 
 ## Safe Telegram Onboarding Path
 
