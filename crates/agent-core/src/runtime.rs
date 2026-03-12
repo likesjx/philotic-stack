@@ -32,6 +32,44 @@ fn local_node_id() -> String {
 #[cfg(test)]
 const LOCAL_NODE: &str = "local-ansible-01";
 
+fn extract_model_error(task: &InboundTaskPayload) -> Option<String> {
+    if let Some(error) = task.error.as_ref() {
+        return Some(error.display_message());
+    }
+
+    let agent_action = task.agent_action.as_ref()?;
+    let mut parts = Vec::new();
+
+    if let Some(message) = agent_action
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+    {
+        parts.push(message.to_string());
+    }
+
+    if let Some(error) = agent_action
+        .get("model_result")
+        .and_then(|mr| mr.get("error"))
+        .and_then(serde_json::Value::as_object)
+    {
+        if let Some(kind) = error.get("kind").and_then(serde_json::Value::as_str) {
+            parts.push(format!("kind={kind}"));
+        }
+        if let Some(provider) = error.get("provider").and_then(serde_json::Value::as_str) {
+            parts.push(format!("provider={provider}"));
+        }
+        if let Some(message) = error.get("message").and_then(serde_json::Value::as_str) {
+            parts.push(message.to_string());
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" | "))
+    }
+}
+
 fn implementation_to_model_role(implementation: &str) -> String {
     let normalized = implementation
         .split(['.', '-', '@', '/'])
@@ -729,6 +767,28 @@ impl AgentRuntime {
             .unwrap_or(false);
 
         if waiting_voice {
+            if let Some(model_error) = extract_model_error(&task) {
+                warn!(
+                    "Session [{}] voice synthesis failed before audio delivery: {}",
+                    session_id, model_error
+                );
+                let voice_policy = self
+                    .sessions
+                    .get(&session_id)
+                    .map(|s| s.agent_profile.voice_response_policy.clone())
+                    .unwrap_or_default();
+
+                if !voice_policy.fallback_to_text {
+                    return self
+                        .fail_active_turn(
+                            session_id,
+                            turn_id,
+                            format!("Voice synthesis failed: {}", model_error),
+                        )
+                        .await;
+                }
+            }
+
             let raw_content = task.content.unwrap_or_default();
             return self
                 .handle_voice_synthesis_response(session_id, turn_id, raw_content)
@@ -2399,6 +2459,7 @@ impl AgentRuntime {
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
+                    error: None,
                 })
                 .await
             }
@@ -2489,6 +2550,7 @@ impl AgentRuntime {
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
+                    error: None,
                 })
                 .await
             }
@@ -2647,8 +2709,8 @@ impl AgentRuntime {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE, media_analysis_attachments, normalized_user_content,
-        resolve_media_routing, resolve_model_execution_target,
+        DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE, extract_model_error, media_analysis_attachments,
+        normalized_user_content, resolve_media_routing, resolve_model_execution_target,
     };
     use crate::r#loop::{ApprovalRequest, ToolCall};
     use crate::protocol::{
@@ -2658,6 +2720,7 @@ mod tests {
         ApprovalPolicy, ComponentExecutionRoute, ComponentRouteAssembly, ComponentRouteBinding,
         SessionState,
     };
+    use philotic_client::TaskErrorPayload;
 
     #[test]
     fn model_request_targets_agent_for_reply() {
@@ -2769,6 +2832,60 @@ mod tests {
         let json = serde_json::to_value(&payload).expect("serialize payload");
         assert_eq!(json["session_id"], "sess-1");
         assert_eq!(json["turn_id"], "turn-1");
+    }
+
+    #[test]
+    fn extract_model_error_reads_structured_error_envelope() {
+        let payload = InboundTaskPayload {
+            agent_action: Some(serde_json::json!({
+                "kind": "fail",
+                "message": "Provider invocation failed: missing voice",
+                "model_result": {
+                    "error": {
+                        "kind": "provider_failure",
+                        "provider": "elevenlabs",
+                        "message": "voice.synthesize task is missing voice override"
+                    }
+                }
+            })),
+            action: None,
+            source: None,
+            session_id: None,
+            turn_id: None,
+            transport: None,
+            chat_id: None,
+            thread_id: None,
+            sender_id: None,
+            sender_username: None,
+            message_kind: None,
+            content: None,
+            attachments: Vec::new(),
+            command: None,
+            callback_data: None,
+            raw_transport_event: None,
+            tool_name: None,
+            arguments: None,
+            final_reply_to: None,
+            final_reply_role: None,
+            final_reply_guest_id: None,
+            error: Some(TaskErrorPayload {
+                kind: "provider_failure".into(),
+                message: "Provider invocation failed: missing voice".into(),
+                code: Some("ELEVENLABS_MISSING_VOICE".into()),
+                component: Some("model-router".into()),
+                provider: Some("elevenlabs".into()),
+                capability: Some("voice.synthesize".into()),
+                retryable: Some(false),
+            }),
+        };
+
+        let error = extract_model_error(&payload).expect("structured error should be extracted");
+        assert!(error.contains("Provider invocation failed"));
+        assert!(error.contains("kind=provider_failure"));
+        assert!(error.contains("code=ELEVENLABS_MISSING_VOICE"));
+        assert!(error.contains("component=model-router"));
+        assert!(error.contains("provider=elevenlabs"));
+        assert!(error.contains("capability=voice.synthesize"));
     }
 
     #[test]
@@ -2906,6 +3023,7 @@ mod tests {
             final_reply_to: None,
             final_reply_role: None,
             final_reply_guest_id: None,
+            error: None,
         };
 
         assert_eq!(normalized_user_content(&task), Some("caption text".into()));
@@ -2945,6 +3063,7 @@ mod tests {
             final_reply_to: None,
             final_reply_role: None,
             final_reply_guest_id: None,
+            error: None,
         };
 
         assert_eq!(
@@ -2980,6 +3099,7 @@ mod tests {
             final_reply_to: None,
             final_reply_role: None,
             final_reply_guest_id: None,
+            error: None,
         };
 
         assert_eq!(
@@ -3046,6 +3166,7 @@ mod tests {
             final_reply_to: None,
             final_reply_role: None,
             final_reply_guest_id: None,
+            error: None,
         };
 
         let attachments = media_analysis_attachments(&task);

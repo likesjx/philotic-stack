@@ -1,4 +1,5 @@
 use crate::session::{TaskRunnerBaseConfig, ToolDefinition};
+use philotic_client::TaskErrorPayload;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -66,7 +67,13 @@ pub struct InboundTaskPayload {
     pub final_reply_role: Option<String>,
     #[serde(default)]
     pub final_reply_guest_id: Option<String>,
+    #[serde(default)]
+    pub error: Option<TaskErrorPayload>,
 }
+
+// Transitional note: older emitters may still carry failures in
+// `agent_action.model_result.error`, but the preferred cross-component contract is the
+// top-level `error` envelope on inbound tasks.
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelRequestPayload {
@@ -222,6 +229,7 @@ mod tests {
             final_reply_to: None,
             final_reply_role: None,
             final_reply_guest_id: None,
+            error: None,
         };
 
         assert_eq!(
@@ -254,6 +262,7 @@ mod tests {
             final_reply_to: None,
             final_reply_role: None,
             final_reply_guest_id: None,
+            error: None,
         };
 
         assert!(payload.is_model_response());
@@ -283,6 +292,7 @@ mod tests {
             final_reply_to: None,
             final_reply_role: None,
             final_reply_guest_id: None,
+            error: None,
         };
 
         assert!(payload.is_tool_result());
@@ -365,6 +375,7 @@ mod tests {
             final_reply_to: None,
             final_reply_role: None,
             final_reply_guest_id: None,
+            error: None,
         };
 
         assert_eq!(

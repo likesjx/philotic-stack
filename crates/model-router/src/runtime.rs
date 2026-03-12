@@ -3,7 +3,9 @@ use crate::controller::{
     TaskKind,
 };
 use anyhow::Result;
-use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, is_ipc_disconnect};
+use philotic_client::{
+    GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, TaskErrorPayload, is_ipc_disconnect,
+};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
@@ -106,6 +108,8 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                         emit_failure(
                             &mut ipc_client,
                             &reply,
+                            None,
+                            None,
                             format!("Model controller could not interpret task: {}", err),
                         )
                         .await?;
@@ -117,6 +121,8 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                     emit_failure(
                         &mut ipc_client,
                         &reply,
+                        Some(controller_task.kind.as_str()),
+                        None,
                         "Voice synthesis is wired as a separate model-controller guest, but canonical audio delivery is not implemented yet. Next seam: voice machine + media delivery.".into(),
                     )
                     .await?;
@@ -129,6 +135,8 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                         emit_failure(
                             &mut ipc_client,
                             &reply,
+                            Some(controller_task.kind.as_str()),
+                            None,
                             format!(
                                 "Model controller failed to refresh provider config: {}",
                                 err
@@ -149,6 +157,8 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                         emit_failure(
                             &mut ipc_client,
                             &reply,
+                            Some(controller_task.kind.as_str()),
+                            None,
                             format!("No model provider available for task: {}", err),
                         )
                         .await?;
@@ -177,6 +187,8 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                         emit_failure(
                             &mut ipc_client,
                             &reply,
+                            Some(controller_task.kind.as_str()),
+                            Some(provider.id()),
                             format!("Provider invocation failed: {}", err),
                         )
                         .await?;
@@ -266,8 +278,16 @@ async fn emit_text_response(
 async fn emit_failure(
     ipc_client: &mut PhiloticClient,
     reply: &ReplyRoute,
+    capability: Option<&str>,
+    provider: Option<&str>,
     message: String,
 ) -> Result<()> {
+    let error_payload =
+        TaskErrorPayload::provider_failure("model-router", capability, provider, message.clone());
+    error!(
+        "Emitting model failure capability={:?} provider={:?}: {}",
+        capability, provider, message
+    );
     let reply_req = IpcRequest::EmitTask {
         target_node: reply.reply_to.clone(),
         target_role: reply.reply_role.clone(),
@@ -276,8 +296,13 @@ async fn emit_failure(
             "action": "model_response",
             "agent_action": {
                 "kind": "fail",
-                "message": message
+                "message": message,
+                "model_result": {
+                    "capability": capability,
+                    "error": serde_json::to_value(&error_payload)?,
+                }
             },
+            "error": serde_json::to_value(&error_payload)?,
             "session_id": reply.session_id,
             "turn_id": reply.turn_id,
             "chat_id": reply.chat_id,

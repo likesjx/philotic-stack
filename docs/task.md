@@ -35,6 +35,7 @@
 - [ ] Add compaction/checkpoint policy so apartment sync stays structured and reasonably small.
 - [x] Add slash-command short-circuiting for deterministic agent/system commands before the normal model loop.
 - [x] Add approval interrupts with explicit history and a pre-approval runtime path.
+- [ ] Extend the shared cross-component task error envelope beyond the current model/TTS path so tool-runner, membrane, and other routed components return structured failures instead of silent fallback strings.
 
 ## New Project: Agent Loop Gap Closure
 
@@ -189,6 +190,8 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 - [ ] Review [MODEL_CONTROLLER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack-model-controller-abstraction/docs/architecture/MODEL_CONTROLLER_PROPOSAL.md).
 - [x] Land the first `voice.synthesize` request envelope with `display_text`, `spoken_text`, `voice`, `model`, and `provider_options`.
 - [x] Add an upstream producer example that emits the richer `voice.synthesize` envelope through the hotel.
+- [x] Move the first task failure contract into the shared protocol layer (`philotic-client`) so `model-router` and `agent-core` can exchange structured errors without making `agent-core` the accidental owner of reality.
+- [ ] Emit structured task failures consistently from all model-controller capability paths and log provider/code/component fields during watched runs.
 - [ ] Define the canonical capability envelope for:
   - `text.generate`
   - `voice.synthesize`
@@ -430,6 +433,7 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 - [ ] Review [VOICE_MACHINE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/VOICE_MACHINE_PROPOSAL.md).
 - [x] Telegram slash-command elevation (first slice): `/ping` handled in `membrane` before agent-core — `handle_membrane_command` short-circuits the `EmitTask` dispatch and replies directly.
 - [ ] Telegram slash-command elevation (next): `/new` resets session_id in membrane (start fresh conversation without round-trip); `/help` lists available commands from membrane directly.
+- [ ] Telegram bot command registration/UI: call Telegram `setMyCommands` (and related chat-scoped variants if needed) so supported slash commands show up in the Telegram client command UI instead of existing only as hidden transport behavior.
 - [ ] Telegram approval card UX: include request IDs, tool/action names, args summaries, and resolution messages in a more native Telegram approval experience.
 - [x] Telegram streaming Layer 1: add typing indicator heartbeat to `membrane` — `ActiveTurn` map, `sendChatAction(typing)` on dispatch, 4-second refresh loop, cancel on `send_reply`.
 - [ ] Telegram streaming: add message length chunking to `membrane` — split at paragraph boundaries before `sendMessage`, shared `send_formatted_text` helper.

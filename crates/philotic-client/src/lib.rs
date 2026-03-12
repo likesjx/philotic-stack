@@ -16,6 +16,62 @@ pub struct GuestIdentity {
     pub supported_tools: Vec<String>,
 }
 
+/// Shared cross-component task failure envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TaskErrorPayload {
+    pub kind: String,
+    pub message: String,
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub component: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub capability: Option<String>,
+    #[serde(default)]
+    pub retryable: Option<bool>,
+}
+
+impl TaskErrorPayload {
+    pub fn provider_failure(
+        component: impl Into<String>,
+        capability: Option<&str>,
+        provider: Option<&str>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: "provider_failure".into(),
+            message: message.into(),
+            code: None,
+            component: Some(component.into()),
+            provider: provider.map(str::to_string),
+            capability: capability.map(str::to_string),
+            retryable: None,
+        }
+    }
+
+    pub fn display_message(&self) -> String {
+        let mut parts = vec![self.message.clone(), format!("kind={}", self.kind)];
+        if let Some(code) = self.code.as_deref() {
+            parts.push(format!("code={code}"));
+        }
+        if let Some(component) = self.component.as_deref() {
+            parts.push(format!("component={component}"));
+        }
+        if let Some(provider) = self.provider.as_deref() {
+            parts.push(format!("provider={provider}"));
+        }
+        if let Some(capability) = self.capability.as_deref() {
+            parts.push(format!("capability={capability}"));
+        }
+        if let Some(retryable) = self.retryable {
+            parts.push(format!("retryable={retryable}"));
+        }
+        parts.join(" | ")
+    }
+}
+
 /// Represents the types of operations a Guest can perform locally over IPC to the Ansible Hotel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "operation", content = "payload")]
@@ -346,6 +402,28 @@ mod tests {
 
     fn test_socket_path() -> String {
         format!("/tmp/pc-{}.sock", Uuid::new_v4().simple())
+    }
+
+    #[test]
+    fn task_error_payload_formats_for_logs_and_fallbacks() {
+        let payload = TaskErrorPayload {
+            kind: "provider_failure".into(),
+            message: "Voice synthesis failed".into(),
+            code: Some("ELEVENLABS_BAD_RESPONSE".into()),
+            component: Some("model-router".into()),
+            provider: Some("elevenlabs".into()),
+            capability: Some("voice.synthesize".into()),
+            retryable: Some(false),
+        };
+
+        let rendered = payload.display_message();
+        assert!(rendered.contains("Voice synthesis failed"));
+        assert!(rendered.contains("kind=provider_failure"));
+        assert!(rendered.contains("code=ELEVENLABS_BAD_RESPONSE"));
+        assert!(rendered.contains("component=model-router"));
+        assert!(rendered.contains("provider=elevenlabs"));
+        assert!(rendered.contains("capability=voice.synthesize"));
+        assert!(rendered.contains("retryable=false"));
     }
 
     async fn read_frame(stream: &mut tokio::net::UnixStream) -> Vec<u8> {
