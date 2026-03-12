@@ -140,6 +140,79 @@ These grants should be bound to:
 
 This lets the system prove “this exact session may perform this exact dangerous action right now” without handing the session a permanent treasury key.
 
+## First Action-Grant Contract
+
+The first implementation should make action grants explicit enough that they can become canonical hotel records later, instead of hiding them in ad hoc callback payloads.
+
+Suggested first record shape:
+
+```json
+{
+  "grant_id": "grant_01...",
+  "principal_id": "operator:likesjx",
+  "session_id": "telegram:7898847424:agent-jane-01",
+  "hotel_id": "default",
+  "channel_kind": "telegram",
+  "action_class": "vault.secret.rotate",
+  "action_target": "provider:gemini",
+  "status": "active",
+  "issued_at": 1741782000,
+  "expires_at": 1741782300,
+  "nonce": "random",
+  "one_time_use": true
+}
+```
+
+Recommended first semantic fields:
+
+- `grant_id`
+- `principal_id`
+- `session_id`
+- `hotel_id`
+- `channel_kind`
+- `action_class`
+- optional `action_target`
+- `status`
+- `issued_at`
+- `expires_at`
+- `nonce`
+- `one_time_use`
+
+Later expansions can add:
+
+- step-up auth state
+- approving operator identity
+- audit linkage
+- cryptographic signature or detached proof material
+
+### First grant lifecycle
+
+Recommended first lifecycle:
+
+1. session is elevated into `admin_elevated`
+2. operator requests a dangerous action
+3. hotel validates eligibility and issues a short-lived action grant
+4. the secure admin flow presents the grant back to the hotel
+5. hotel consumes the grant and performs the action
+6. grant becomes `consumed`, `expired`, `revoked`, or `denied`
+
+### First grant classes
+
+Recommended first action classes:
+
+- `vault.secret.add`
+- `vault.secret.rotate`
+- `vault.secret.revoke`
+- `vault.status.inspect`
+- later:
+  - `perimeter.membership.invite`
+  - `perimeter.membership.revoke`
+  - `break_glass.recovery`
+
+The point is not to create a giant permission ontology on day one.
+
+The point is to stop dangerous admin actions from being indistinguishable from ordinary tool calls.
+
 ## Elevation Eligibility Recommendation
 
 A session should become eligible for admin elevation only if policy says all of the following are true:
@@ -198,5 +271,6 @@ Start with a deterministic graph manager that can:
 - show routing/materialization state
 - patch a bounded set of records with audit output
 - initiate one high-trust vault admin flow without exposing raw secret material
+- define and issue one explicit short-lived action grant for that flow
 
 Then wrap that same management plane in a TUI.

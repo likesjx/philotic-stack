@@ -161,6 +161,15 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
   - session carries elevated posture
   - hotel decides eligibility
   - dangerous actions use short-lived action grants
+- [ ] Define the first admin action-grant contract:
+  - `grant_id`
+  - `principal_id`
+  - `session_id`
+  - `hotel_id`
+  - `action_class`
+  - optional `action_target`
+  - TTL / expiry
+  - one-time-use / nonce semantics
 - [ ] Keep the conversational role intentionally narrow and membrane-facing by default.
 - [ ] Define the first deterministic context-graph manager surface in the main CLI.
 - [ ] Define the first TUI-backed admin workflow on top of that control plane.
@@ -173,6 +182,7 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
   - approved channel/surface
   - hotel policy allows elevation
   - bounded TTL / expiry / revocation
+- [ ] Prove one first grant-backed admin flow for vault secret add/rotate initiation before broadening admin mutations.
 
 ## New Project: Agent Plugin Hooks
 
@@ -681,3 +691,11 @@ Now that the End-to-End Philotic architecture is complete, we need to separate i
 - [x] Brainstorm the visual concepts for the Veo3 video explaining the system metaphors in motion.
 - [x] Draft a storyboard artifact documenting the scenes (The Universal Materialization, The Hotel, The Ansible, The Guests).
 - [x] Refine prompts for Veo3 video generation based on the storyboard.
+
+## Documentation Process And Architecture Truth
+
+- [x] Define architecture documentation domains as a lightweight organization layer instead of adding deep proposal folders immediately.
+- [x] Create a living architecture status snapshot that acts as the single source of truth for implemented behavior, transitional seams, and currently active work.
+- [x] Make the docs index point to an architecture hub and status snapshot before deeper reference or proposal reading.
+- [ ] Tighten [docs/architecture/ARCHITECTURE.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE.md) against current execution-transport and current session-authority reality.
+- [ ] Audit historical docs and clearly mark any remaining non-authoritative architecture narratives as legacy or historical.
