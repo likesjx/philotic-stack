@@ -35,6 +35,14 @@ The user-facing conversational role should stay intentionally narrow.
 - owns system management, policy mutation, repair, and high-trust control actions
 - should be visible in both architecture and operator UX, not buried as an accidental toolset
 
+Important boundary:
+
+- the admin role is not the root source of authority by default
+- operator/session elevation should normally be what activates admin posture
+- a trusted automation role may be allowed later, but only as an explicit policy choice
+
+This keeps “admin-capable” distinct from “permanently admin-authoritative.”
+
 ### Specialist/worker roles
 
 - capability-specific
@@ -59,5 +67,6 @@ Make the role posture explicit in:
 - tool and skill grants
 - membrane routing
 - admin UX
+- session elevation rules
 
 and treat admin authority as first-class rather than as “whatever role happens to have the scary tools.”

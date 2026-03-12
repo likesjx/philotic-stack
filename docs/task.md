@@ -156,6 +156,11 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 - [ ] Review [ROLE_POSTURE_AND_ADMIN_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ROLE_POSTURE_AND_ADMIN_PROPOSAL.md).
 - [ ] Review [CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md).
 - [ ] Make the admin role a first-class posture in role/incarnation records and operator UX.
+- [ ] Define the first elevation model explicitly:
+  - principal requests elevation
+  - session carries elevated posture
+  - hotel decides eligibility
+  - dangerous actions use short-lived action grants
 - [ ] Keep the conversational role intentionally narrow and membrane-facing by default.
 - [ ] Define the first deterministic context-graph manager surface in the main CLI.
 - [ ] Define the first TUI-backed admin workflow on top of that control plane.
@@ -163,6 +168,11 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
   - `membrane` starts the authenticated operator flow
   - hotel control plane owns authorization and mutation
   - vault owns secret persistence
+- [ ] Define eligibility rules for admin elevation:
+  - trusted principal
+  - approved channel/surface
+  - hotel policy allows elevation
+  - bounded TTL / expiry / revocation
 
 ## New Project: Agent Plugin Hooks
 
@@ -556,15 +566,21 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 - [ ] `openclaw.json` ingestion: define a migration/import path that can consume legacy agent manifests and materialize Philotic agents.
 - [ ] Context graph deployment model: decide local-first vs cloud-backed vs hybrid graph ownership, sync, and operational model.
 - [ ] Context graph decentralization: decide how much of the graph can be replicated/federated across hotels versus kept locally authoritative.
+- [ ] Perimeter egress control: define the canonical outbound egress policy object and finding schema.
+- [ ] Perimeter egress inventory: classify current direct outbound HTTP paths into perimeter-controlled, temporary exceptions, and future violations.
+- [ ] Perimeter egress first implementation: route one non-model outbound HTTP path through a perimeter-controlled boundary while keeping model/provider egress as an explicit exception for now.
 - [ ] Approval UX evolution: add `/preapprove`, `/approval status`, `/approval reset`, and richer session policy editing for constrained transports like Telegram.
 - [ ] Review [TELEGRAM_INTEGRATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_INTEGRATION_PROPOSAL.md).
 - [ ] Review [TELEGRAM_POLL_LEASE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_POLL_LEASE_PROPOSAL.md).
+- [ ] Review [PERIMETER_EGRESS_CONTROL_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PERIMETER_EGRESS_CONTROL_PROPOSAL.md).
 - [ ] Review [VOICE_MACHINE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/VOICE_MACHINE_PROPOSAL.md).
 - [x] Telegram slash-command elevation (first slice): `/ping` handled in `membrane` before agent-core — `handle_membrane_command` short-circuits the `EmitTask` dispatch and replies directly.
 - [ ] Telegram slash-command elevation (next): `/new` resets session_id in membrane (start fresh conversation without round-trip); `/help` lists available commands from membrane directly.
 - [x] Telegram bot command registration/UI: call Telegram `setMyCommands` from `membrane` startup so supported slash commands show up in the Telegram client command UI instead of existing only as hidden transport behavior.
 - [x] Telegram poll ownership (first slice): add a hotel-owned poll lease per bot token fingerprint so only one local membrane long-polls `getUpdates` for a token at a time, and fail closed when lease acquisition is denied.
-- [ ] Telegram poll failover: teach `membrane` to renew and explicitly release the poll lease, and stop polling immediately on lost renewal or stale epoch.
+- [x] Telegram poll ownership (authority slice): anchor agent identity to `authority_hotel` and deny poll-lease acquisition when the current hotel is not that agent's home authority.
+- [x] Telegram poll failover (renewal slice): teach `membrane` to renew the poll lease, expire stale owners, and stop polling immediately on lost renewal or stale epoch.
+- [x] Telegram poll graceful release: explicitly release the poll lease on intentional membrane shutdown instead of relying only on disconnect cleanup.
 - [ ] Telegram poll lease smoke: prove only one of two membranes sharing a bot token polls at a time, then prove standby takeover after release or expiry.
 - [ ] Telegram poll lease mesh authority: move poll-lease truth from local hotel runtime state toward canonical mesh-visible authority so two hotels cannot race the same bot token.
 - [ ] Telegram approval card UX: include request IDs, tool/action names, args summaries, and resolution messages in a more native Telegram approval experience.
