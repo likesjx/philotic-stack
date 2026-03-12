@@ -217,6 +217,15 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 - [x] Move remote model/tool/task execution off raw UDP Beacon payload bodies.
 - [ ] Define NAT traversal / relay requirements explicitly before committing to a self-hosted overlay transport.
 
+## New Project: Hotel Perimeter Trust
+
+- [ ] Review [HOTEL_PERIMETER_TRUST_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/HOTEL_PERIMETER_TRUST_PROPOSAL.md).
+- [ ] Define hotel membership records so “inside the perimeter” is explicit rather than implied by peer discovery.
+- [ ] Define hotel identity/auth material beyond transitional dev PSK assumptions.
+- [ ] Define join / invite / revoke lifecycle for hotel membership.
+- [ ] Require authenticated control-plane traffic outside explicit dev mode.
+- [ ] Define authorization scope for which trusted hotels may receive which routed capability classes.
+
 ## New Project: Inter-Hotel Routing And Placement
 
 - [x] Decide that inter-hotel routing should extend the same route contract already used for intra-hotel execution rather than creating a second remote-only routing abstraction.
@@ -237,6 +246,19 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 - [ ] Move mesh ACK emission to a strict post-commit boundary.
 - [x] Replace routed execution over raw UDP with the first point-to-point execution channel for routed inter-hotel task traffic.
 - [ ] Add execution-plane transport negotiation so routing can choose among multiple point-to-point transports instead of assuming one TCP path.
+
+## New Project: Multi-Hotel Component Distribution
+
+- [ ] Review [MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md).
+- [ ] Extend remote-capable route metadata consistently across remaining routed component classes beyond the first tool/model paths.
+- [ ] Preserve session-owned membrane reply routing while proving broader distributed component placement.
+- [ ] Move inter-hotel ACK behavior toward strict post-commit truth before claiming multi-hop reliability.
+- [ ] Build the first watched local multi-hotel vertical slice:
+  - membrane on one hotel
+  - agent on another
+  - model on another
+  - tool runner on another
+- [ ] Build the first cross-host version of that distributed slice once perimeter trust is in place.
 
 ## New Project: Model Controller
 
