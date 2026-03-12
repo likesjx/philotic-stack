@@ -116,6 +116,19 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 ## New Project: Agent Context Management
 
 - [x] Pin the need for a dedicated management plane for agent-owned and operator-owned context graph mutations instead of continuing to rely on `mesh-config.json` edits plus restart cycles.
+- [x] Accept the first implementation target as a hotel-mediated self-update path that writes canonical `AgentIdentityRecord` state rather than only mutating `agent-core` session-local profile data.
+- [ ] Define the first request/response contract for `agent.context.update`, including:
+  - self-only scope
+  - path/update semantics
+  - refreshed canonical profile projection on success
+  - structured denial/validation failures
+- [ ] Implement hotel-side validation and patching for the first bounded allowlist:
+  - `identity_text`
+  - `user_context_text`
+  - `memory_summary`
+  - `voice_response_policy.*`
+  - `media_routing_policy.*`
+- [ ] Refresh live runtime profile state from the hotel response after successful update instead of continuing to treat local `agent.configure` mutation as canonical.
 - [ ] Define the first hotel-mediated self-management tool for bounded agent profile updates:
   - `identity_text`
   - `user_context_text`

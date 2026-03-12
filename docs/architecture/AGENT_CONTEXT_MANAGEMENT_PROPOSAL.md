@@ -14,9 +14,15 @@ This proposal focuses on:
 
 ## Disposition
 
-`proposed`
+`accepted for current slice`
 
 Track follow-on work in [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md).
+
+## Current Slice
+
+- pin the first implementation target as a hotel-mediated self-update path
+- make the request contract explicit before wiring more runtime behavior onto local `agent.configure`
+- defer broad admin surfaces until the self-update boundary is proven once
 
 ## Core Recommendation
 
@@ -153,6 +159,41 @@ Shape:
 - readable confirmations
 - structured error envelope on denial or validation failure
 
+Recommended first transport shape:
+
+- agent issues a hotel-mediated request
+- hotel validates self-targeting and field allowlist
+- hotel rewrites canonical `AgentIdentityRecord.bundle_json`
+- runtime gets an explicit refreshed projection instead of pretending local session mutation is canonical
+
+Suggested first request envelope:
+
+```json
+{
+  "agent_id": "agent-jane-01",
+  "updates": [
+    {
+      "path": "voice_response_policy.speed_percent",
+      "operation": "set",
+      "value": 108
+    }
+  ]
+}
+```
+
+Suggested first response shape:
+
+```json
+{
+  "updated_paths": ["voice_response_policy.speed_percent"],
+  "agent_profile": {
+    "...": "refreshed canonical projection"
+  }
+}
+```
+
+The exact IPC shape may differ, but the semantic contract should stay the same.
+
 Examples:
 
 - `voice_response_policy.speed_percent = 108`
@@ -195,6 +236,39 @@ Land the first honest self-management seam before broad admin panels:
 4. session/runtime refresh after successful write
 
 Then add admin management on top of the same hotel-owned write path instead of inventing a second mutation system.
+
+## First Slice Constraints
+
+The initial implementation should stay narrower than the full proposal:
+
+- self-only updates
+- no `soul_text`
+- no transport credentials
+- no model-secret mutation
+- no role/incarnation writes yet
+- no direct file edits
+
+This is intentionally not “full profile editing.”
+
+It is the first proof that live agent configuration can flow through the hotel into canonical graph-backed state without relying on `mesh-config.json` edits and restart rituals.
+
+## Canonical Write Path
+
+Recommended ownership for the first live slice:
+
+1. `agent-core` or another caller requests a bounded update
+2. `ansible` validates:
+   - caller identity
+   - self-only scope
+   - field allowlist
+   - value type/shape
+3. `ansible` loads current `AgentIdentityRecord`
+4. `ansible` applies the patch into `bundle_json`
+5. `ansible` persists via `upsert_agent_identity`
+6. `ansible` returns the refreshed canonical projection
+7. caller refreshes local runtime state from that canonical result
+
+That keeps the hotel as write authority and prevents local runtime convenience APIs from quietly becoming a shadow database.
 
 ## Open Questions
 
