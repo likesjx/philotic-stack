@@ -31,6 +31,26 @@ The context graph should not remain the long-term home for raw values like:
 
 That was acceptable for the current bootstrap slice, but it is not an acceptable final authority boundary.
 
+## Security Posture
+
+Treat secret material like money.
+
+That means:
+
+- minimize who can see it
+- minimize how long it exists in plaintext
+- audit every meaningful operation
+- assume accidental exposure is a real financial and operational risk, not an abstract hygiene issue
+
+In particular:
+
+- admin credentials are higher-trust than ordinary provider tokens
+- model-facing components should not receive admin credentials
+- LLM context should never contain raw secret values
+- secret-bearing operations should prefer explicit control-plane flows over conversational improvisation
+
+If a design leaves a raw key in prompt context, chat history, or model-visible tool output, the design is wrong even if the demo works.
+
 ## Disposition
 
 Accepted for current slice.
@@ -157,6 +177,48 @@ Access rules:
 - auditable reads
 - optional operator approval for especially sensitive reads
 
+### Secret classes
+
+Not all secrets deserve the same exposure policy.
+
+Recommended first classes:
+
+- `provider-runtime`
+  - example: short-lived Gemini access token
+  - may be vended to a narrowly authorized local runtime guest
+- `provider-root`
+  - example: OAuth refresh token, long-lived API key
+  - hotel/vault only unless there is no safer bounded alternative
+- `admin`
+  - example: operator signing keys, vault recovery material, destructive-control credentials
+  - never exposed to model-facing components
+  - never placed in prompt context
+  - should require stronger admin-only workflows, stronger audit, and ideally staged or dual-control handling
+- `transport`
+  - example: mesh PSKs, webhook secrets, signing keys
+  - only to the components that terminate or establish the transport boundary
+
+The crucial rule is that admin secrets are not just “another config value with a scary name.”
+They are a separate authority class.
+
+### Model boundary
+
+Model-facing components should receive only the smallest capability-specific secret material they absolutely need.
+
+Examples:
+
+- a model controller may receive a short-lived provider access token
+- a membrane may receive a Telegram bot token if it must terminate the Telegram boundary
+- an agent should receive references and capability outcomes, not raw admin credentials
+
+Strong rule:
+
+- no admin key material to the model
+- no vault recovery material to the model
+- no plaintext secret echo in model-visible error messages, traces, or logs
+
+If a model needs to initiate an admin action, it should request a hotel-owned control-plane operation and receive a structured result, not the key itself.
+
 Current implementation note:
 
 - the first slice uses per-secret allowed roles/guests enforced by the hotel
@@ -230,6 +292,26 @@ Telegram is still useful for:
 - approving or denying rotation
 - launching a secure operator mini app
 - monitoring vault events
+
+## Admin Key Management Recommendation
+
+Admin keys should be managed as a distinct control-plane concern, not folded into ordinary runtime secret handling.
+
+Recommended rules:
+
+- admin keys stay in the vault or hardware-backed store
+- admin actions should use signing, approval, or delegated control-plane operations rather than raw key release whenever possible
+- the hotel should expose admin operations as capability requests, not as “give me the key”
+- recovery or export paths should be exceptional, audited, and ideally require stronger ceremony than normal runtime secret access
+
+Examples of admin-key uses that should stay hotel-owned:
+
+- signing membership or invite actions for trusted hotels
+- rotating mesh trust material
+- approving destructive or perimeter-changing actions
+- vault recovery or break-glass operations
+
+This keeps the system from committing the deeply ironic mistake of making the most improvisational component the holder of the highest-trust credentials.
 
 ## Safe Telegram Onboarding Path
 
@@ -387,3 +469,12 @@ Implement in this order:
 5. add operator audit log for secret actions
 6. define Telegram Mini App onboarding and rotation flow
 7. only after that, implement Telegram-driven secret add/rotate UX
+
+## Relationship To Other Proposals
+
+- [AGENT_CONTEXT_MANAGEMENT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/AGENT_CONTEXT_MANAGEMENT_PROPOSAL.md)
+  - ordinary profile/context mutation must stay separate from secret mutation
+- [CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md)
+  - admin surfaces should invoke hotel-owned secret operations without surfacing raw key material to model-facing roles
+- [HOTEL_PERIMETER_TRUST_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/HOTEL_PERIMETER_TRUST_PROPOSAL.md)
+  - perimeter membership and trust operations will eventually depend on higher-trust admin key material

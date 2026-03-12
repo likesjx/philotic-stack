@@ -357,6 +357,7 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 - [x] Add a startup-driven Gemini OAuth smoke through the materialized model-controller guest.
 - [x] Add a hotel-startup Telegram controller smoke via `ansible --test telegram-roundtrip` using a local fake Telegram API.
 - [x] Extend the startup Telegram smoke so it simulates text, photo, and voice-note ingress and exercises fake-Gemini multimodal requests on top of blob-backed media transport.
+- [x] Make the startup Telegram smoke honestly green end-to-end by fixing `PhiloticClient` frame reads to survive `tokio::select!` cancellation during the final voice reply handoff to `membrane`.
 - [x] Prove watched-live Telegram text/photo/voice/document delivery through membrane -> agent-core -> Gemini and normalize markdown-ish document MIME for Gemini media analysis.
 - [x] Make materialized Telegram/agent guests configurable enough for separate hotel/persona stacks (for example Jane vs Aria) instead of hardcoding one Jane-shaped membrane.
 - [x] Remove Jane/Aria-specific built-in hotel/agent profile selection from `ansible` startup so agent identity, persona naming, and guest targeting resolve from hotel config or generic hotel-derived fallback rather than persona-specific Rust tables.
@@ -403,6 +404,13 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
   - rotate
   - revoke
   - rollback
+- [ ] Define explicit secret classes and exposure policy:
+  - `provider-runtime`
+  - `provider-root`
+  - `admin`
+  - `transport`
+- [ ] Enforce the rule that admin key material never flows to model-facing components or prompt-visible tool output.
+- [ ] Define admin-key workflows as hotel-owned control-plane operations rather than raw key release wherever possible.
 - [ ] Move Gemini OAuth refresh tokens behind vault references.
 - [x] Move Gemini OAuth access tokens behind vault references for model-controller consumption.
 - [ ] Define Telegram-safe secret onboarding:
