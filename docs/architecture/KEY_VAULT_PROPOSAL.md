@@ -126,6 +126,38 @@ Example:
 - `gemini_auth_ref = secret://hotel/default/gemini/oauth-refresh`
 - `telegram_bot_token_ref = secret://membrane/telegram/bot-token`
 
+## Mesh Visibility Recommendation
+
+Vault state should be mesh-visible at the metadata layer, not at the secret-material layer.
+
+Recommended mesh-visible fields:
+
+- `secret_ref`
+- `secret_kind`
+- `secret_class`
+- `provider`
+- `scope`
+- `state`
+- `version`
+- rotation / health metadata
+- owning hotel
+
+Recommended non-exposed fields:
+
+- plaintext secret values
+- wrapped ciphertext for routine mesh consumption
+- admin key material
+- provider-root secret payloads
+
+The mesh should be able to answer:
+
+- does this hotel have the required secret?
+- what state is it in?
+- which hotel owns it?
+- does rotation or repair appear necessary?
+
+The mesh should not act like a gossip bus for the money itself.
+
 ## Encryption Recommendation
 
 Use envelope encryption.
@@ -219,6 +251,18 @@ Strong rule:
 
 If a model needs to initiate an admin action, it should request a hotel-owned control-plane operation and receive a structured result, not the key itself.
 
+### Remote ownership rule
+
+Secrets should remain owned by the hotel that stores them unless there is an explicit replication or delegation design.
+
+Recommended rule:
+
+- remote hotels may inspect mesh-visible metadata if policy allows
+- remote hotels may request delegated admin actions against the owning hotel
+- remote hotels should not receive raw secret material by default
+
+This keeps mesh-wide administration possible without quietly turning every trusted hotel into a copy of every other hotel’s treasury.
+
 Current implementation note:
 
 - the first slice uses per-secret allowed roles/guests enforced by the hotel
@@ -299,6 +343,10 @@ The admin/control implication should be explicit:
 - Telegram via `membrane` should not own vault mutation authority
 - secret add/rotate flows belong to the hotel control plane and vault, with `membrane` acting as the outside-world entry point only
 
+If a hotel has no `membrane`, that should not block vault administration.
+
+`membrane` is one operator entrypoint, not the admin prerequisite.
+
 ## Admin Key Management Recommendation
 
 Admin keys should be managed as a distinct control-plane concern, not folded into ordinary runtime secret handling.
@@ -318,6 +366,24 @@ Examples of admin-key uses that should stay hotel-owned:
 - vault recovery or break-glass operations
 
 This keeps the system from committing the deeply ironic mistake of making the most improvisational component the holder of the highest-trust credentials.
+
+## Remote Administration Recommendation
+
+Remote vault administration should use delegation, not direct remote secret fetch.
+
+Recommended shape:
+
+1. operator enters through any trusted admin surface
+   - membrane when present
+   - CLI
+   - TUI
+   - future web/app
+2. the local hotel verifies operator/session/admin posture
+3. if the target secret lives on another hotel, the local hotel requests a delegated admin action from the owning hotel
+4. the owning hotel validates trust, grant scope, and action class
+5. the owning hotel performs the mutation locally and returns only structured outcome data
+
+This means a hotel without `membrane` is still fully administrable, and a hotel with `membrane` is not uniquely privileged to own vault operations.
 
 ## Safe Telegram Onboarding Path
 

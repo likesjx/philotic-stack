@@ -177,6 +177,7 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
   - `membrane` starts the authenticated operator flow
   - hotel control plane owns authorization and mutation
   - vault owns secret persistence
+- [ ] Make channel-agnostic admin ingress explicit so hotels without `membrane` remain fully manageable through CLI/TUI control-plane surfaces.
 - [ ] Define eligibility rules for admin elevation:
   - trusted principal
   - approved channel/surface
@@ -437,6 +438,11 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
   - `provider-root`
   - `admin`
   - `transport`
+- [ ] Define mesh-visible vault metadata:
+  - ownership
+  - state/version
+  - rotation/health status
+  - no raw secret material
 - [ ] Enforce the rule that admin key material never flows to model-facing components or prompt-visible tool output.
 - [ ] Define admin-key workflows as hotel-owned control-plane operations rather than raw key release wherever possible.
 - [ ] Move Gemini OAuth refresh tokens behind vault references.
@@ -450,6 +456,11 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
   - `membrane` as operator entry point
   - hotel control plane as mutation authority
   - vault as secret authority
+- [ ] Define remote vault admin delegation:
+  - local admin surface may broker
+  - owning hotel validates and executes
+  - structured outcome returns across the mesh
+  - no default raw secret export
 
 ## Next Project: Tool Assembly and Routed Execution
 

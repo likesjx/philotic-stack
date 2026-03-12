@@ -78,6 +78,12 @@ Recommended boundary:
 
 This keeps the outside-world interface useful without letting the transport boundary quietly become the admin database with better emojis.
 
+Important corollary:
+
+- a hotel without `membrane` must still remain fully administrable
+- CLI/TUI control-plane entrypoints are first-class admin surfaces, not degraded backups
+- `membrane` is optional ingress for admin, not the source of admin authority
+
 ## Elevation Model
 
 Admin authority should not exist as a permanent ambient property of an agent or chat.
@@ -262,6 +268,20 @@ The key rule is:
 - the vault owns the secret
 - model-facing components never receive the admin key material
 
+## Remote Admin Delegation
+
+When an operator is connected to one hotel but the target action belongs to another hotel, the system should delegate the admin action to the owning hotel rather than trying to move secret authority around the mesh.
+
+Recommended rule:
+
+- admin entrypoint may be local to hotel A
+- target vault action may belong to hotel B
+- hotel A may broker the request
+- hotel B must validate and execute the dangerous action locally
+- the result should come back as structured admin outcome, not as secret material
+
+This keeps secret ownership local while still allowing mesh-wide administration from one trusted operator surface.
+
 ## First Slice Recommendation
 
 Start with a deterministic graph manager that can:
@@ -272,5 +292,6 @@ Start with a deterministic graph manager that can:
 - patch a bounded set of records with audit output
 - initiate one high-trust vault admin flow without exposing raw secret material
 - define and issue one explicit short-lived action grant for that flow
+- keep that flow channel-agnostic so hotels without `membrane` use the same control-plane model through CLI/TUI
 
 Then wrap that same management plane in a TUI.
