@@ -39,6 +39,20 @@ After durable outcomes:
 - run `remember` for atomic facts, preferences, and outcomes in short, meaningful bursts
 - run `decide` for explicit decisions with rationale
 
+Keep writes small:
+
+- `remember`: 1-3 sentences, preferably under ~300 chars, hard ceiling ~500
+- `decide`: concise rationale, preferably under ~500 chars, hard ceiling ~800
+
+Use a small tag vocabulary only when it helps retrieval:
+
+- `flush-out`
+- `decision`
+- `reality-gap`
+- `validation`
+- `follow-up`
+- `operator-preference`
+
 ## Failure Rule
 
 The helper must be allowed to block.

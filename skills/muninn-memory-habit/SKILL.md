@@ -108,8 +108,18 @@ If the concept is urgent and must survive an immediate crash or context loss, wr
 
 Memory atomicity rules (enforced by the subagent):
 - **One concept per memory.** If there are five things, write five memories.
-- **Short.** 1-3 sentences max. No summaries of whole proposals.
+- **Short.** 1-3 sentences max. Aim for under ~300 characters when possible; do not exceed ~500 for ordinary `remember` writes.
 - Let clustering happen naturally — do not manually group.
+
+Recommended lightweight tags when helpful:
+- `flush-out`
+- `decision`
+- `reality-gap`
+- `validation`
+- `follow-up`
+- `operator-preference`
+
+Use tags sparingly. If a tag does not improve retrieval later, it is decorative bureaucracy.
 
 Good atomic candidates:
 - "active_incarnation_id is the load-bearing primitive for session ownership switching in Philotic."

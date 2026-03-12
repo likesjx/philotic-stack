@@ -107,6 +107,51 @@ Bad:
 - noisy logs
 - multiple unrelated concepts in one write
 
+## Memory Size Guidance
+
+Keep memories short.
+
+Recommended limits:
+
+- `remember`
+  - target: 1-3 sentences
+  - soft target: under ~300 characters when possible
+  - hard ceiling: under ~500 characters
+- `decide`
+  - concise rationale, still short
+  - soft target: under ~500 characters
+  - hard ceiling: under ~800 characters
+
+If a memory wants to become a paragraph, it probably wants to become multiple memories instead.
+
+Muninn is an experiment in useful continuity, not an excuse to re-host longform notes under a new brand.
+
+## Lightweight Tag Strategy
+
+Tags should stay few, stable, and retrieval-oriented.
+
+Recommended first tags:
+
+- `flush-out`
+  - early idea worth revisiting
+- `decision`
+  - durable architectural or workflow choice
+- `reality-gap`
+  - mismatch between assumption and observed truth
+- `validation`
+  - test, smoke, or watched-live outcome
+- `follow-up`
+  - explicitly actionable next seam
+- `operator-preference`
+  - stable user/operator workflow preference
+
+Guidance:
+
+- use `concept` as the main semantic anchor
+- use tags only for cross-cutting retrieval modes
+- do not create a decorative taxonomy
+- if a tag does not help retrieval, do not invent it
+
 ## Preferred Tool Usage
 
 Use:

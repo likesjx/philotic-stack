@@ -32,6 +32,7 @@ Still pending:
 - automatic helper usage in every client runtime
 - retrieval quality and behavior evaluation over time
 - hard fail/approval-gate behavior in every client when Muninn bootstrap is unavailable
+- validate whether short atomic memories plus a lightweight tag vocabulary actually improve retrieval quality enough to justify deeper agent-memory use
 
 Observed reality gap:
 
@@ -119,6 +120,34 @@ Bad write-back candidates:
 - low-signal pleasantries
 - raw transcript dumps
 - implementation noise with no durable value
+
+### Size Discipline
+
+Muninn memories should stay short enough to remain crisp retrieval artifacts rather than miniature documents.
+
+Recommended starting policy:
+
+- `remember`: 1-3 sentences, ideally under ~300 characters, hard ceiling ~500
+- `decide`: concise rationale, ideally under ~500 characters, hard ceiling ~800
+
+If this feels too small for a thought, that is usually a sign the thought should be split into several atomic memories instead.
+
+### Tag Discipline
+
+Tagging should remain minimal and experimental.
+
+Recommended first vocabulary:
+
+- `flush-out`
+- `decision`
+- `reality-gap`
+- `validation`
+- `follow-up`
+- `operator-preference`
+
+The experiment is not “can we invent a better taxonomy.”
+
+The experiment is whether a small number of tags improves retrieval enough to help continuity without creating tagging theater.
 
 ## Shared Client Contract
 
@@ -225,6 +254,7 @@ This experiment is working if we observe:
 - better user-fit behavior
 - reduced repetition
 - useful retrieval without excessive token overhead
+- better recall from short atomic memories and a small stable tag vocabulary
 
 It is not working if:
 
@@ -232,6 +262,8 @@ It is not working if:
 - write-back becomes ritual noise
 - clients ignore the helper because it is too awkward
 - recalled memory frequently conflicts with observed truth and causes confusion
+- memories become long-form note fragments instead of atomic retrieval units
+- tag sprawl turns retrieval into taxonomy maintenance
 
 ## Near-Term Next Steps
 
