@@ -5,8 +5,8 @@
 //! consume them as `Arc<dyn EventStorage>`, etc.
 
 use crate::event::{EventEnvelope, EventId, EventKind, EventPayload};
-use crate::graph::{GraphEdge, GraphNode};
 use crate::graph::AbstractToolRecord;
+use crate::graph::{GraphEdge, GraphNode};
 use crate::storage::{
     CursorStorage, EventStorage, GraphAdapter, GraphStorage, GuestRecord, HotelRecord,
     SecretRecord, SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,
@@ -1322,7 +1322,10 @@ impl GraphStorage for SqliteGraphStorage {
     }
 
     fn get_abstract_tool(&self, tool_name: &str) -> Result<Option<AbstractToolRecord>> {
-        match self.adapter.get_node(&format!("abstract_tool:{tool_name}"))? {
+        match self
+            .adapter
+            .get_node(&format!("abstract_tool:{tool_name}"))?
+        {
             Some(node) => Ok(Some(serde_json::from_value(node.data)?)),
             None => Ok(None),
         }

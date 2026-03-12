@@ -470,16 +470,29 @@ impl SessionState {
     /// Pass `tool` as the pending `ToolCall` so class-based approval can be evaluated.
     /// When `tool` is `None` (e.g. a free-form model approval request with no associated
     /// tool), only `auto_approve_all` is checked.
-    pub fn approval_policy_allows(&self, _approval: &ApprovalRequest, tool: Option<&ToolCall>) -> bool {
+    pub fn approval_policy_allows(
+        &self,
+        _approval: &ApprovalRequest,
+        tool: Option<&ToolCall>,
+    ) -> bool {
         if self.approval_policy.auto_approve_all {
             return true;
         }
         if let Some(tool) = tool {
-            if self.approval_policy.preapproved_tools.contains(&tool.tool_name) {
+            if self
+                .approval_policy
+                .preapproved_tools
+                .contains(&tool.tool_name)
+            {
                 return true;
             }
             if let Some(class) = tool_class(&tool.tool_name) {
-                if self.approval_policy.preapproved_classes.iter().any(|c| c == class) {
+                if self
+                    .approval_policy
+                    .preapproved_classes
+                    .iter()
+                    .any(|c| c == class)
+                {
                     return true;
                 }
             }
@@ -519,8 +532,12 @@ impl SessionState {
                     .as_str()
                     .ok_or("approval_policy.preapproved_tools requires a string value")?
                     .to_string();
-                apply_string_list_op(&mut self.approval_policy.preapproved_tools, &item, operation)
-                    .map(|_| format!("{operation} '{item}' in approval_policy.preapproved_tools."))
+                apply_string_list_op(
+                    &mut self.approval_policy.preapproved_tools,
+                    &item,
+                    operation,
+                )
+                .map(|_| format!("{operation} '{item}' in approval_policy.preapproved_tools."))
             }
             "approval_policy.preapproved_classes" => {
                 let item = value
@@ -532,9 +549,7 @@ impl SessionState {
                     &item,
                     operation,
                 )
-                .map(|_| {
-                    format!("{operation} '{item}' in approval_policy.preapproved_classes.")
-                })
+                .map(|_| format!("{operation} '{item}' in approval_policy.preapproved_classes."))
             }
             // ── Agent profile ────────────────────────────────────────────────────
             "profile.persona_name" => {
@@ -599,11 +614,13 @@ impl SessionState {
                 apply_string_list_op(&mut self.bindings.effective_skillset, &item, operation)
                     .map(|_| format!("{operation} '{item}' in bindings.effective_skillset."))
             }
-            other => Err(format!("Unknown config path: '{other}'. Supported paths: \
+            other => Err(format!(
+                "Unknown config path: '{other}'. Supported paths: \
                 approval_policy.auto_approve_all, approval_policy.preapproved_tools, \
                 approval_policy.preapproved_classes, profile.persona_name, profile.soul_text, \
                 profile.identity_text, profile.user_context_text, profile.memory_summary, \
-                bindings.effective_toolset, bindings.effective_skillset")),
+                bindings.effective_toolset, bindings.effective_skillset"
+            )),
         }
     }
 
@@ -1327,10 +1344,9 @@ impl SessionState {
                         entries
                             .iter()
                             .filter_map(|entry| {
-                                let call = serde_json::from_value::<ToolCall>(
-                                    entry.get("call")?.clone(),
-                                )
-                                .ok()?;
+                                let call =
+                                    serde_json::from_value::<ToolCall>(entry.get("call")?.clone())
+                                        .ok()?;
                                 let result = serde_json::from_value::<ToolResult>(
                                     entry.get("result")?.clone(),
                                 )
@@ -1442,12 +1458,15 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
     let tools_for_model = toolset
         .iter()
         .map(|tool_name| {
-            catalog.get(tool_name.as_str()).cloned().unwrap_or_else(|| ToolDefinition {
-                tool_name: tool_name.clone(),
-                description: format!("Execute the {} tool.", tool_name),
-                input_schema: json!({ "type": "object" }),
-                class: None,
-            })
+            catalog
+                .get(tool_name.as_str())
+                .cloned()
+                .unwrap_or_else(|| ToolDefinition {
+                    tool_name: tool_name.clone(),
+                    description: format!("Execute the {} tool.", tool_name),
+                    input_schema: json!({ "type": "object" }),
+                    class: None,
+                })
         })
         .collect::<Vec<_>>();
 
@@ -1602,12 +1621,15 @@ fn tool_assembly_from_allowed_incarnations(bindings: &SessionBindings) -> ToolAs
     let tools_for_model = visible_tools
         .iter()
         .map(|tool_name| {
-            catalog.get(tool_name.as_str()).cloned().unwrap_or_else(|| ToolDefinition {
-                tool_name: tool_name.clone(),
-                description: format!("Execute the {} tool.", tool_name),
-                input_schema: json!({ "type": "object" }),
-                class: None,
-            })
+            catalog
+                .get(tool_name.as_str())
+                .cloned()
+                .unwrap_or_else(|| ToolDefinition {
+                    tool_name: tool_name.clone(),
+                    description: format!("Execute the {} tool.", tool_name),
+                    input_schema: json!({ "type": "object" }),
+                    class: None,
+                })
         })
         .collect::<Vec<_>>();
 
@@ -1784,21 +1806,24 @@ fn apply_string_list_op(list: &mut Vec<String>, item: &str, operation: &str) -> 
         "remove" => {
             list.retain(|x| x != item);
         }
-        other => return Err(format!("Unknown operation '{other}'. Use 'set', 'append', or 'remove'.")),
+        other => {
+            return Err(format!(
+                "Unknown operation '{other}'. Use 'set', 'append', or 'remove'."
+            ));
+        }
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
     use super::{
         ApprovalPolicy, ComponentExecutionRoute, ComponentRouteAssembly, ComponentRouteBinding,
         SessionBindings, SessionState, TaskRunnerBaseConfig, ToolRunnerIncarnationBinding,
         TransportReplyTargetBinding, WorkingTurn, default_tool_assembly_for_bindings,
-        merge_session_index,
-        session_checkpoint_memory_type,
+        merge_session_index, session_checkpoint_memory_type,
     };
+    use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
     use uuid::Uuid;
 
     #[test]
@@ -2015,11 +2040,14 @@ mod tests {
             preapproved_classes: Vec::new(),
         };
 
-        assert!(state.approval_policy_allows(&ApprovalRequest {
-            approval_id: Some("appr-2".into()),
-            reason: "deploy the thing".into(),
-            approved_response: "Approved: deploy the thing".into(),
-        }, None));
+        assert!(state.approval_policy_allows(
+            &ApprovalRequest {
+                approval_id: Some("appr-2".into()),
+                reason: "deploy the thing".into(),
+                approved_response: "Approved: deploy the thing".into(),
+            },
+            None
+        ));
     }
 
     #[test]
@@ -2036,8 +2064,14 @@ mod tests {
             reason: "use echo".into(),
             approved_response: "ok".into(),
         };
-        let echo_call = ToolCall { tool_name: "echo".into(), arguments: serde_json::json!({}) };
-        let other_call = ToolCall { tool_name: "workspace.read".into(), arguments: serde_json::json!({}) };
+        let echo_call = ToolCall {
+            tool_name: "echo".into(),
+            arguments: serde_json::json!({}),
+        };
+        let other_call = ToolCall {
+            tool_name: "workspace.read".into(),
+            arguments: serde_json::json!({}),
+        };
 
         assert!(state.approval_policy_allows(&approval, Some(&echo_call)));
         assert!(!state.approval_policy_allows(&approval, Some(&other_call)));
@@ -2058,8 +2092,14 @@ mod tests {
             reason: "read file".into(),
             approved_response: "ok".into(),
         };
-        let workspace_call = ToolCall { tool_name: "workspace.read".into(), arguments: serde_json::json!({}) };
-        let config_call = ToolCall { tool_name: "agent.configure".into(), arguments: serde_json::json!({}) };
+        let workspace_call = ToolCall {
+            tool_name: "workspace.read".into(),
+            arguments: serde_json::json!({}),
+        };
+        let config_call = ToolCall {
+            tool_name: "agent.configure".into(),
+            arguments: serde_json::json!({}),
+        };
 
         assert!(state.approval_policy_allows(&approval, Some(&workspace_call)));
         assert!(!state.approval_policy_allows(&approval, Some(&config_call)));
@@ -2086,7 +2126,12 @@ mod tests {
             "append",
         );
         assert!(result.is_ok());
-        assert!(state.approval_policy.preapproved_tools.contains(&"echo".to_string()));
+        assert!(
+            state
+                .approval_policy
+                .preapproved_tools
+                .contains(&"echo".to_string())
+        );
 
         // Append a class to preapproved_classes
         let result = state.apply_configure(
@@ -2095,7 +2140,12 @@ mod tests {
             "append",
         );
         assert!(result.is_ok());
-        assert!(state.approval_policy.preapproved_classes.contains(&"workspace".to_string()));
+        assert!(
+            state
+                .approval_policy
+                .preapproved_classes
+                .contains(&"workspace".to_string())
+        );
 
         // Remove the tool
         let result = state.apply_configure(
@@ -2104,7 +2154,12 @@ mod tests {
             "remove",
         );
         assert!(result.is_ok());
-        assert!(!state.approval_policy.preapproved_tools.contains(&"echo".to_string()));
+        assert!(
+            !state
+                .approval_policy
+                .preapproved_tools
+                .contains(&"echo".to_string())
+        );
 
         // Set auto_approve_all
         let result = state.apply_configure(
@@ -2143,8 +2198,7 @@ mod tests {
 
     #[test]
     fn policy_annotation_uses_catalog_class_and_approval_required() {
-        let state =
-            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        let state = SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         // agent.configure is local_agent so it only appears if in effective_toolset
         let mut bindings = state.bindings.clone();
         bindings.effective_toolset = vec!["agent.configure".into(), "echo".into()];
@@ -2198,8 +2252,9 @@ mod tests {
         assert!(prompt.contains("Effective tools: echo."));
         assert!(prompt.contains("Workspace: workspace://main."));
         assert!(
-            prompt
-                .contains("Delivery target: local-ansible-01 / membrane guest=membrane-telegram-01.")
+            prompt.contains(
+                "Delivery target: local-ansible-01 / membrane guest=membrane-telegram-01."
+            )
         );
     }
 
@@ -2251,7 +2306,9 @@ mod tests {
         assert!(text.contains("Workspace: workspace://main."));
         assert!(text.contains("Component routes: text.generate [legacy] impl=gemini-flash."));
         assert!(
-            text.contains("Delivery target: local-ansible-01 / membrane guest=membrane-telegram-01.")
+            text.contains(
+                "Delivery target: local-ansible-01 / membrane guest=membrane-telegram-01."
+            )
         );
     }
 
@@ -2584,12 +2641,23 @@ mod tests {
         });
 
         state.push_tool_history(
-            ToolCall { tool_name: "workspace.list".into(), arguments: serde_json::json!({}) },
-            ToolResult { tool_name: "workspace.list".into(), content: "main.rs\nlib.rs".into() },
+            ToolCall {
+                tool_name: "workspace.list".into(),
+                arguments: serde_json::json!({}),
+            },
+            ToolResult {
+                tool_name: "workspace.list".into(),
+                content: "main.rs\nlib.rs".into(),
+            },
         );
 
         assert_eq!(
-            state.active_turn.as_ref().unwrap().working_tool_history.len(),
+            state
+                .active_turn
+                .as_ref()
+                .unwrap()
+                .working_tool_history
+                .len(),
             1
         );
 
@@ -2635,9 +2703,18 @@ mod tests {
         );
 
         let prompt = state.build_reentry_prompt().unwrap();
-        assert!(prompt.contains("[Tool call history]"), "prompt should contain history section");
-        assert!(prompt.contains("workspace.read"), "prompt should name the tool");
-        assert!(prompt.contains("# Philotic Stack"), "prompt should contain result content");
+        assert!(
+            prompt.contains("[Tool call history]"),
+            "prompt should contain history section"
+        );
+        assert!(
+            prompt.contains("workspace.read"),
+            "prompt should name the tool"
+        );
+        assert!(
+            prompt.contains("# Philotic Stack"),
+            "prompt should contain result content"
+        );
         assert!(prompt.contains("Call 1:"), "prompt should number the calls");
     }
 

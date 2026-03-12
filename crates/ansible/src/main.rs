@@ -1,8 +1,10 @@
 use ansible_mesh_core::beacon::BeaconDaemon;
+use ansible_mesh_core::graph::AbstractToolRecord;
 use ansible_mesh_core::heartbeat::emit_heartbeat;
 use ansible_mesh_core::registry::{CapabilityAdvertisement, ExecutionReachability};
-use ansible_mesh_core::graph::AbstractToolRecord;
-use ansible_mesh_core::storage::{AgentIdentityRecord, CursorStorage, EventStorage, GraphStorage, GuestRecord, HotelRecord};
+use ansible_mesh_core::storage::{
+    AgentIdentityRecord, CursorStorage, EventStorage, GraphStorage, GuestRecord, HotelRecord,
+};
 use ansible_mesh_core::{NodeCapabilities, NodeRole};
 use anyhow::{Context, Result};
 use axum::body::{Body, to_bytes};
@@ -426,7 +428,10 @@ fn selected_agent_key_for_hotel(
     hotel: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<String> {
     let agents = hotel.get("agents")?.as_object()?;
-    if let Some(selected) = hotel.get("selected_agent").and_then(serde_json::Value::as_str) {
+    if let Some(selected) = hotel
+        .get("selected_agent")
+        .and_then(serde_json::Value::as_str)
+    {
         if agents.contains_key(selected) {
             return Some(selected.to_string());
         }
@@ -459,7 +464,8 @@ fn merged_agent_config(
             continue;
         };
         if selected_key != "default" {
-            if let Some(default_agent) = agents.get("default").and_then(serde_json::Value::as_object)
+            if let Some(default_agent) =
+                agents.get("default").and_then(serde_json::Value::as_object)
             {
                 merged.extend(default_agent.clone());
             }
@@ -475,10 +481,14 @@ fn merged_agent_config(
     Some((selected_key, merged))
 }
 
-fn agent_profile_from_config(config_json: &serde_json::Value, hotel_name: &str) -> Option<AgentProfile> {
+fn agent_profile_from_config(
+    config_json: &serde_json::Value,
+    hotel_name: &str,
+) -> Option<AgentProfile> {
     let (selected_key, agent) = merged_agent_config(config_json, hotel_name)?;
     let agent_key = if selected_key == "default" {
-        agent.get("agent_key")
+        agent
+            .get("agent_key")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| default_agent_key_for_hotel(hotel_name))
@@ -728,7 +738,9 @@ fn merge_agent_entries(
         .and_then(|p| p.get("voice_id"))
         .filter(|v| v.is_string())
     {
-        merged.entry("elevenlabs_voice_id".to_string()).or_insert_with(|| voice_id.clone());
+        merged
+            .entry("elevenlabs_voice_id".to_string())
+            .or_insert_with(|| voice_id.clone());
     }
 }
 
@@ -2165,8 +2177,8 @@ async fn main() -> Result<()> {
         if let Some(hotel_name) = hotel_name.as_deref() {
             effective_agent_profile = agent_profile_from_config(&config_json, hotel_name);
             // Stash the raw merged agent config so policy fields can be seeded into bundle_json.
-            effective_agent_config = merged_agent_config(&config_json, hotel_name)
-                .map(|(_, agent)| agent);
+            effective_agent_config =
+                merged_agent_config(&config_json, hotel_name).map(|(_, agent)| agent);
         }
 
         let entries = extract_context_graph_entries(&config_json, hotel_name.as_deref());
@@ -2195,8 +2207,8 @@ async fn main() -> Result<()> {
 
     let hotel_name =
         hotel_name.context("--hotel is required unless using a subcommand such as `auth`")?;
-    let effective_agent_profile = effective_agent_profile
-        .unwrap_or_else(|| default_agent_profile_for_hotel(&hotel_name));
+    let effective_agent_profile =
+        effective_agent_profile.unwrap_or_else(|| default_agent_profile_for_hotel(&hotel_name));
     let startup_test = args.test;
     if graph_storage.get_hotel(&hotel_name)?.is_none() {
         info!(
@@ -3031,9 +3043,8 @@ mod tests {
             }
         });
 
-        let identity =
-            super::configured_agent_identity_from_config(&config, "beacon-test-hotel")
-                .expect("beacon import workspace should be detected");
+        let identity = super::configured_agent_identity_from_config(&config, "beacon-test-hotel")
+            .expect("beacon import workspace should be detected");
         assert_eq!(identity.agent_id, "agent-beacon-01");
         assert_eq!(identity.persona_name, "Beacon");
         assert_eq!(

@@ -7,8 +7,8 @@ use crate::protocol::{
     ToolExecutionPayload, TransportAttachment, TurnEventPayload,
 };
 use crate::session::{
-    MediaRoutingPolicy, SessionState, ToolExecutionRoute, TtsMode, VoiceResponsePolicy, WorkingTurn,
-    merge_session_index,
+    MediaRoutingPolicy, SessionState, ToolExecutionRoute, TtsMode, VoiceResponsePolicy,
+    WorkingTurn, merge_session_index,
 };
 use anyhow::Result;
 use philotic_client::{IpcRequest, IpcResponse, PhiloticClient, is_ipc_disconnect};
@@ -191,16 +191,34 @@ pub(crate) fn strip_markup(text: &str) -> String {
         }
 
         // ATX headings: # Heading → Heading
-        let line = if let Some(rest) = trimmed.strip_prefix("######").or_else(|| trimmed.strip_prefix("#####")).or_else(|| trimmed.strip_prefix("####")).or_else(|| trimmed.strip_prefix("###")).or_else(|| trimmed.strip_prefix("##")).or_else(|| trimmed.strip_prefix('#')) {
+        let line = if let Some(rest) = trimmed
+            .strip_prefix("######")
+            .or_else(|| trimmed.strip_prefix("#####"))
+            .or_else(|| trimmed.strip_prefix("####"))
+            .or_else(|| trimmed.strip_prefix("###"))
+            .or_else(|| trimmed.strip_prefix("##"))
+            .or_else(|| trimmed.strip_prefix('#'))
+        {
             rest.trim().to_string()
         } else {
             trimmed.to_string()
         };
 
         // List items: - item or * item or 1. item
-        let line = if let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")).or_else(|| line.strip_prefix("• ")) {
+        let line = if let Some(rest) = line
+            .strip_prefix("- ")
+            .or_else(|| line.strip_prefix("* "))
+            .or_else(|| line.strip_prefix("• "))
+        {
             rest.to_string()
-        } else if line.len() > 2 && line.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) && line.contains(". ") {
+        } else if line.len() > 2
+            && line
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false)
+            && line.contains(". ")
+        {
             line.splitn(2, ". ").nth(1).unwrap_or(&line).to_string()
         } else {
             line
@@ -454,10 +472,15 @@ impl AgentRuntime {
             }
         }
 
-        let had_voice_input = task.message_kind.as_deref()
+        let had_voice_input = task
+            .message_kind
+            .as_deref()
             .map(|k| matches!(k, "voice" | "audio"))
             .unwrap_or(false)
-            || task.attachments.iter().any(|a| matches!(a.kind.as_str(), "voice" | "audio"));
+            || task
+                .attachments
+                .iter()
+                .any(|a| matches!(a.kind.as_str(), "voice" | "audio"));
 
         let (checkpoint_memory_type, checkpoint_json, index_state, model_prompt, tools_for_model) = {
             let state = self
@@ -866,7 +889,11 @@ impl AgentRuntime {
             .await?;
 
         let _ = self
-            .emit_turn_event(&session_id, "waiting_approval", Some(approval.reason.clone()))
+            .emit_turn_event(
+                &session_id,
+                "waiting_approval",
+                Some(approval.reason.clone()),
+            )
             .await;
 
         let reply_payload = FinalReplyPayload {
@@ -921,10 +948,7 @@ impl AgentRuntime {
                             "Tool '{}' requires approval before execution.",
                             tool_call.tool_name
                         ),
-                        approved_response: format!(
-                            "Executing {}.",
-                            tool_call.tool_name
-                        ),
+                        approved_response: format!("Executing {}.", tool_call.tool_name),
                     };
                     !state.approval_policy_allows(&synthetic, Some(&tool_call))
                 } else {
@@ -1089,11 +1113,7 @@ impl AgentRuntime {
             state.push_tool_history(tool_call, tool_result.clone());
             state.clear_pending_tool_call();
 
-            let iteration = state
-                .active_turn
-                .as_ref()
-                .map(|t| t.iteration)
-                .unwrap_or(0);
+            let iteration = state.active_turn.as_ref().map(|t| t.iteration).unwrap_or(0);
 
             if iteration >= MAX_TOOL_ITERATIONS {
                 Err(format!(
@@ -1123,7 +1143,9 @@ impl AgentRuntime {
                             state.clone(),
                         ))
                     }
-                    None => Err("Active turn vanished before re-entry prompt could be built".into()),
+                    None => {
+                        Err("Active turn vanished before re-entry prompt could be built".into())
+                    }
                 }
             }
         };
@@ -1148,7 +1170,9 @@ impl AgentRuntime {
                     .await?;
                 self.sync_session_index(&index_state).await?;
 
-                let _ = self.emit_turn_event(&session_id, "waiting_tool", None).await;
+                let _ = self
+                    .emit_turn_event(&session_id, "waiting_tool", None)
+                    .await;
 
                 let model_req = ModelRequestPayload {
                     action: "generate_text".to_string(),
@@ -1284,14 +1308,25 @@ impl AgentRuntime {
         spoken_text: Option<String>,
         policy: VoiceResponsePolicy,
     ) -> Result<()> {
-        let (task_id, chat_id, final_reply_to, final_reply_role, final_reply_guest_id,
-             checkpoint_memory_type, checkpoint_json, index_state) = {
+        let (
+            task_id,
+            chat_id,
+            final_reply_to,
+            final_reply_role,
+            final_reply_guest_id,
+            checkpoint_memory_type,
+            checkpoint_json,
+            index_state,
+        ) = {
             let Some(state) = self.sessions.get_mut(&session_id) else {
                 warn!("start_voice_synthesis: unknown session {}", session_id);
                 return Ok(());
             };
             let Some(active_turn) = state.active_turn.as_ref() else {
-                warn!("start_voice_synthesis: no active turn for session {}", session_id);
+                warn!(
+                    "start_voice_synthesis: no active turn for session {}",
+                    session_id
+                );
                 return Ok(());
             };
             let task_id = active_turn.task_id;
@@ -1302,7 +1337,11 @@ impl AgentRuntime {
             state.set_pending_text_reply(display_text.clone());
             state.set_active_turn_phase(TurnPhase::WaitingVoice);
             (
-                task_id, chat_id, final_reply_to, final_reply_role, final_reply_guest_id,
+                task_id,
+                chat_id,
+                final_reply_to,
+                final_reply_role,
+                final_reply_guest_id,
                 state.checkpoint_memory_type(),
                 state.checkpoint_json(),
                 state.clone(),
@@ -2768,11 +2807,14 @@ mod tests {
             preapproved_classes: Vec::new(),
         };
 
-        assert!(state.approval_policy_allows(&ApprovalRequest {
-            approval_id: Some("appr-1".into()),
-            reason: "deploy the thing".into(),
-            approved_response: "Approved: deploy the thing".into(),
-        }, None));
+        assert!(state.approval_policy_allows(
+            &ApprovalRequest {
+                approval_id: Some("appr-1".into()),
+                reason: "deploy the thing".into(),
+                approved_response: "Approved: deploy the thing".into(),
+            },
+            None
+        ));
     }
 
     #[test]
@@ -3052,7 +3094,8 @@ mod tests {
         };
         let atts = vec![blob_backed_attachment("voice")];
         let routing = resolve_media_routing(&policy, atts);
-        let r = routing.expect("should produce routing for blob-backed voice with transcribe policy");
+        let r =
+            routing.expect("should produce routing for blob-backed voice with transcribe policy");
         assert_eq!(r.action, "transcribe");
         assert_eq!(r.capability, "voice.transcribe");
     }
