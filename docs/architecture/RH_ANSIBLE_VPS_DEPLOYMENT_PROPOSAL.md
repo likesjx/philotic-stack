@@ -87,7 +87,7 @@ Long-term intent is a native VPN built through the hotels themselves. That work 
     model-router     # LLM routing guest
   etc/               # mode 0700 — philotic user only
     mesh-config.json # hotel runtime config (rendered by Ansible, no secrets)
-    secrets.env      # runtime secrets injected via EnvironmentFile (from vault)
+    vault-bootstrap.json.enc # encrypted bootstrap material only when platform-native vault init is required
   data/
     context.db       # SQLite context graph (owned by hotel daemon)
     blob/            # blob store (HTTP content-addressed artifacts)
@@ -107,7 +107,8 @@ Long-term intent is a native VPN built through the hotels themselves. That work 
 
 - systemd service: `philotic-hotel.service`
 - Runs as `philotic` system user (non-root)
-- `EnvironmentFile` injects `PHILOTIC_MESH_PSK` from `secrets.env` — never on command line
+- avoid plaintext `EnvironmentFile` secrets on disk
+- if runtime bootstrap material is needed, it should be encrypted at rest and used only to initialize or unlock the hotel-owned vault / platform secret store
 - Progressive systemd hardening: `NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=strict`
 - `After=tailscaled.service` (transitional; remove when native hotel VPN lands)
 
@@ -116,9 +117,23 @@ Long-term intent is a native VPN built through the hotels themselves. That work 
 | Input | Source | Location on host |
 |---|---|---|
 | `mesh-config.json` | Rendered by Ansible from `host_vars/<host>.yml` | `/opt/philotic/etc/mesh-config.json` |
-| `secrets.env` | Rendered from Ansible vault | `/opt/philotic/etc/secrets.env` (mode 0600) |
-| `PHILOTIC_MESH_PSK` | Ansible vault (`vault_philotic_mesh_psk`) | Via `secrets.env` → `EnvironmentFile` |
-| Telegram bot tokens | Ansible vault per-agent | Rendered into `mesh-config.json` at deploy time |
+| encrypted vault bootstrap (optional) | Rendered from Ansible vault | `/opt/philotic/etc/vault-bootstrap.json.enc` |
+| `PHILOTIC_MESH_PSK` | Ansible vault / platform secret store | Loaded into the hotel-owned vault or injected through a non-persistent secret-store path |
+| Telegram bot tokens | Ansible vault per-agent | Stored in the hotel vault or platform secret store, never rendered into plaintext `mesh-config.json` |
+
+### Secret Handling Rule
+
+Raw secrets should not be written to disk unencrypted.
+
+That means this deployment contract should converge toward:
+
+- plaintext secrets do not live in `mesh-config.json`
+- plaintext secrets do not live in `secrets.env`
+- RH Ansible may render encrypted bootstrap material when absolutely necessary
+- the hotel should then import or unlock those secrets into the local vault / platform secret store
+- steady-state runtime should use secret references and hotel-owned vault access, not flat secret files
+
+Transitional convenience is not a valid reason to leave money lying around on disk.
 
 ### Binary / Artifact Placement
 
