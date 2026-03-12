@@ -4,6 +4,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
+fn local_node_id() -> String {
+    std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-ansible-01".to_string())
+}
+
+fn local_agent_id() -> String {
+    std::env::var("PHILOTIC_AGENT_ID").unwrap_or_else(|_| "agent-jane-01".to_string())
+}
+
 #[derive(Debug, Clone)]
 pub struct TurnRecord {
     pub turn_id: String,
@@ -1194,10 +1202,11 @@ impl SessionState {
 
     pub fn from_checkpoint(checkpoint: &serde_json::Value) -> Option<Self> {
         let session_id = checkpoint.get("session_id")?.as_str()?.to_string();
+        let local_agent_id = local_agent_id();
         let agent_id = checkpoint
             .get("agent_id")
             .and_then(serde_json::Value::as_str)
-            .unwrap_or("agent-jane-01")
+            .unwrap_or(local_agent_id.as_str())
             .to_string();
         let source = checkpoint
             .get("source")
@@ -1259,6 +1268,7 @@ impl SessionState {
             if turn.is_null() {
                 return None;
             }
+            let local_node_id = local_node_id();
 
             let task_id = turn
                 .get("task_id")
@@ -1282,7 +1292,7 @@ impl SessionState {
                 final_reply_to: turn
                     .get("final_reply_to")
                     .and_then(serde_json::Value::as_str)
-                    .unwrap_or("local-ansible-01")
+                    .unwrap_or(local_node_id.as_str())
                     .to_string(),
                 final_reply_role: turn
                     .get("final_reply_role")
@@ -1441,6 +1451,7 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
         })
         .collect::<Vec<_>>();
 
+    let local_node_id = local_node_id();
     let execution_routes = toolset
         .iter()
         .map(|tool_name| {
@@ -1454,11 +1465,7 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
             (
                 tool_name.clone(),
                 ToolExecutionRoute {
-                    target_node: if execution_mode == "local_agent" {
-                        "agent-jane-01".into()
-                    } else {
-                        "local-ansible-01".into()
-                    },
+                    target_node: local_node_id.clone(),
                     target_role: if execution_mode == "local_agent" {
                         "agent".into()
                     } else {
@@ -1473,7 +1480,7 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
                     hotel_id: if execution_mode == "local_agent" {
                         None
                     } else {
-                        Some("local-ansible-01".into())
+                        Some(local_node_id.clone())
                     },
                     environment_id: None,
                     task_runner_kind: task_runner_kind_for_tool(tool_name),
@@ -1655,7 +1662,7 @@ fn select_incarnation_route(
             .target_node
             .clone()
             .or_else(|| selected.hotel_id.clone())
-            .unwrap_or_else(|| "local-ansible-01".into()),
+            .unwrap_or_else(local_node_id),
         target_role: selected
             .target_role
             .clone()
@@ -1688,8 +1695,9 @@ fn compare_incarnation_bindings(
             right_live.cmp(&left_live)
         })
         .then_with(|| {
-            let left_local = left.hotel_id.as_deref() == Some("local-ansible-01");
-            let right_local = right.hotel_id.as_deref() == Some("local-ansible-01");
+            let local_node_id = local_node_id();
+            let left_local = left.hotel_id.as_deref() == Some(local_node_id.as_str());
+            let right_local = right.hotel_id.as_deref() == Some(local_node_id.as_str());
             right_local.cmp(&left_local)
         })
         .then_with(|| left.incarnation_id.cmp(&right.incarnation_id))
@@ -1736,14 +1744,15 @@ fn selection_reason_for_binding(
         format!("preferred_environment_{suffix}")
     } else if bindings.preferred_hotel_id.as_deref() == binding.hotel_id.as_deref() {
         format!("preferred_hotel_{suffix}")
-    } else if binding.availability_state == "live"
-        && binding.hotel_id.as_deref() == Some("local-ansible-01")
-    {
-        "live_local_fallback".into()
-    } else if binding.availability_state == "live" {
-        "live_allowed_incarnation".into()
     } else {
-        "allowed_incarnation_requires_materialization".into()
+        let local_node_id = local_node_id();
+        if binding.hotel_id.as_deref() == Some(local_node_id.as_str()) {
+            "live_local_fallback".into()
+        } else if binding.availability_state == "live" {
+            "live_allowed_incarnation".into()
+        } else {
+            "allowed_incarnation_requires_materialization".into()
+        }
     };
 
     let used_preference = binding_preference_rank(bindings, binding) > 0;

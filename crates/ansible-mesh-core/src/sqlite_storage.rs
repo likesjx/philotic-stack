@@ -14,6 +14,7 @@ use crate::storage::{
 use crate::NodeCapabilities;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
+use serde::Deserialize;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info};
@@ -780,7 +781,7 @@ impl GraphStorage for SqliteGraphStorage {
 
     fn get_hotel(&self, hotel_name: &str) -> Result<Option<HotelRecord>> {
         if let Some(node) = self.adapter.get_node(&Self::hotel_node_key(hotel_name))? {
-            return Ok(Some(serde_json::from_value(node.data)?));
+            return Ok(Some(decode_hotel_record(node.data, hotel_name)?));
         }
 
         let conn = self.conn.lock().unwrap();
@@ -1333,5 +1334,36 @@ impl GraphStorage for SqliteGraphStorage {
             .into_iter()
             .map(|node| serde_json::from_value(node.data).map_err(Into::into))
             .collect()
+    }
+}
+
+fn decode_hotel_record(data: serde_json::Value, hotel_name: &str) -> Result<HotelRecord> {
+    #[derive(Deserialize)]
+    struct LegacyHotelRecord {
+        hotel_name: Option<String>,
+        capabilities: NodeCapabilities,
+        mesh_port: u16,
+        blob_port: u16,
+        execution_port: Option<u16>,
+        ipc_socket_path: String,
+        active_pid: Option<String>,
+    }
+
+    match serde_json::from_value::<HotelRecord>(data.clone()) {
+        Ok(hotel) => Ok(hotel),
+        Err(_) => {
+            let legacy: LegacyHotelRecord = serde_json::from_value(data)?;
+            Ok(HotelRecord {
+                hotel_name: legacy.hotel_name.unwrap_or_else(|| hotel_name.to_string()),
+                capabilities: legacy.capabilities,
+                mesh_port: legacy.mesh_port,
+                blob_port: legacy.blob_port,
+                execution_port: legacy
+                    .execution_port
+                    .unwrap_or_else(|| legacy.blob_port.saturating_add(1)),
+                ipc_socket_path: legacy.ipc_socket_path,
+                active_pid: legacy.active_pid,
+            })
+        }
     }
 }

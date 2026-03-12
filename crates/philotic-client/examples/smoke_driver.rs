@@ -8,6 +8,10 @@ async fn main() -> Result<()> {
         .context("PHILOTIC_HOTEL_SOCKET must be set for smoke_driver")?;
     let expected =
         std::env::var("PHILOTIC_SMOKE_EXPECTED_REPLY").unwrap_or_else(|_| "pong".to_string());
+    let target_node =
+        std::env::var("PHILOTIC_TARGET_NODE").unwrap_or_else(|_| "local-ansible-01".to_string());
+    let final_reply_to =
+        std::env::var("PHILOTIC_FINAL_REPLY_TO").unwrap_or_else(|_| target_node.clone());
     let session_id = std::env::var("PHILOTIC_SMOKE_SESSION_ID")
         .unwrap_or_else(|_| "smoke:chat-1:agent-jane-01".to_string());
     let turn_id =
@@ -27,7 +31,7 @@ async fn main() -> Result<()> {
 
     let response = client
         .send_request(IpcRequest::EmitTask {
-            target_node: "local-ansible-01".into(),
+            target_node,
             target_role: "agent".into(),
             target_guest_id: None,
             task_json: serde_json::json!({
@@ -36,7 +40,7 @@ async fn main() -> Result<()> {
                 "turn_id": turn_id,
                 "chat_id": chat_id,
                 "content": content,
-                "final_reply_to": "local-ansible-01",
+                "final_reply_to": final_reply_to,
                 "final_reply_role": "membrane",
                 "final_reply_guest_id": "smoke-driver-membrane"
             })

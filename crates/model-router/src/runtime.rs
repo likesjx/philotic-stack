@@ -9,6 +9,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
+fn local_node_id() -> String {
+    std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-ansible-01".to_string())
+}
+
 type ProviderFactory =
     dyn Fn(reqwest::Client, &ProviderConfigs) -> Vec<Arc<dyn ModelProvider>> + Send + Sync;
 
@@ -291,11 +295,12 @@ async fn emit_failure(
 
 impl ReplyRoute {
     fn from_task(task: &Value) -> Self {
+        let local_node_id = local_node_id();
         Self {
             reply_to: task
                 .get("reply_to")
                 .and_then(Value::as_str)
-                .unwrap_or("local-ansible-01")
+                .unwrap_or(&local_node_id)
                 .to_string(),
             reply_role: task
                 .get("reply_role")
@@ -305,7 +310,7 @@ impl ReplyRoute {
             final_reply_to: task
                 .get("final_reply_to")
                 .and_then(Value::as_str)
-                .unwrap_or("local-ansible-01")
+                .unwrap_or(&local_node_id)
                 .to_string(),
             final_reply_role: task
                 .get("final_reply_role")

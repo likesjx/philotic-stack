@@ -514,6 +514,7 @@ fn guest_seed_for_profile(hotel_name: &str, profile: &AgentProfile) -> Vec<Guest
     let hotel = default_hotel_record(hotel_name);
     let socket_path = hotel.ipc_socket_path;
     let blob_base_url = format!("http://127.0.0.1:{}", hotel.blob_port);
+    let node_id = hotel.capabilities.node_id;
     vec![
         GuestRecord {
             hotel_name: hotel_name.to_string(),
@@ -524,6 +525,7 @@ fn guest_seed_for_profile(hotel_name: &str, profile: &AgentProfile) -> Vec<Guest
                 "args": [],
                 "env": {
                     "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
+                    "PHILOTIC_NODE_ID": node_id.clone(),
                     "PHILOTIC_BLOB_BASE_URL": blob_base_url,
                     "PHILOTIC_TARGET_AGENT_ID": profile.agent_id,
                     "PHILOTIC_TELEGRAM_BOT_TOKEN_KEY": "telegram_bot_token"
@@ -542,6 +544,7 @@ fn guest_seed_for_profile(hotel_name: &str, profile: &AgentProfile) -> Vec<Guest
                 "args": [],
                 "env": {
                     "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
+                    "PHILOTIC_NODE_ID": node_id.clone(),
                     "PHILOTIC_AGENT_ID": profile.agent_id
                 }
             })
@@ -553,10 +556,11 @@ fn guest_seed_for_profile(hotel_name: &str, profile: &AgentProfile) -> Vec<Guest
             hotel_name: hotel_name.to_string(),
             guest_id: format!("{hotel_name}:model-controller-gemini"),
             config_json: serde_json::json!({
-                "command": "model-router",
+                "command": "model-controller-gemini",
                 "args": [],
                 "env": {
-                    "PHILOTIC_HOTEL_SOCKET": socket_path.clone()
+                    "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
+                    "PHILOTIC_NODE_ID": node_id.clone()
                 }
             })
             .to_string(),
@@ -569,10 +573,11 @@ fn guest_seed_for_profile(hotel_name: &str, profile: &AgentProfile) -> Vec<Guest
             guest_id: format!("{hotel_name}:model-controller-elevenlabs"),
             role: "model.elevenlabs".into(),
             config_json: serde_json::json!({
-                "command": "model-router",
+                "command": "model-controller-elevenlabs",
                 "args": [],
                 "env": {
-                    "PHILOTIC_HOTEL_SOCKET": socket_path.clone()
+                    "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
+                    "PHILOTIC_NODE_ID": node_id.clone()
                 }
             })
             .to_string(),
@@ -587,7 +592,8 @@ fn guest_seed_for_profile(hotel_name: &str, profile: &AgentProfile) -> Vec<Guest
                 "command": "tool-runner",
                 "args": [],
                 "env": {
-                    "PHILOTIC_HOTEL_SOCKET": socket_path
+                    "PHILOTIC_HOTEL_SOCKET": socket_path,
+                    "PHILOTIC_NODE_ID": node_id
                 }
             })
             .to_string(),
@@ -783,6 +789,87 @@ fn agent_identity_record_for_profile(
         persona_name: profile.persona_name.clone(),
         bundle_json,
     }
+}
+
+fn reconcile_hotel_record(graph: &dyn GraphStorage, hotel_name: &str) -> Result<HotelRecord> {
+    let Some(mut hotel) = graph.get_hotel(hotel_name)? else {
+        let hotel = default_hotel_record(hotel_name);
+        graph.upsert_hotel(&hotel)?;
+        return Ok(hotel);
+    };
+
+    let desired = default_hotel_record(hotel_name);
+    let mut changed = false;
+
+    if hotel.execution_port == 0 {
+        hotel.execution_port = desired.execution_port;
+        changed = true;
+    }
+    if hotel.ipc_socket_path.trim().is_empty() {
+        hotel.ipc_socket_path = desired.ipc_socket_path;
+        changed = true;
+    }
+
+    if changed {
+        graph.upsert_hotel(&hotel)?;
+    }
+
+    Ok(hotel)
+}
+
+fn deactivate_legacy_managed_guests(
+    graph: &dyn GraphStorage,
+    hotel_name: &str,
+    profile: &AgentProfile,
+    desired_guests: &[GuestRecord],
+) -> Result<()> {
+    let desired_ids = desired_guests
+        .iter()
+        .map(|guest| guest.guest_id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let legacy_guest_ids = [
+        format!("agent-core-{}", profile.agent_key),
+        format!("hegemon-gateway-{}", profile.agent_key),
+        "hegemon-gateway".to_string(),
+        "model-router-gemini".to_string(),
+    ]
+    .into_iter()
+    .collect::<std::collections::HashSet<_>>();
+
+    let stale = graph
+        .list_guests(hotel_name, false)?
+        .into_iter()
+        .filter(|guest| {
+            if desired_ids.contains(guest.guest_id.as_str()) {
+                return false;
+            }
+
+            legacy_guest_ids.contains(&guest.guest_id)
+                || guest.guest_id == format!("{hotel_name}:hegemon-gateway-{}", profile.agent_key)
+                || (!guest.guest_id.starts_with(&format!("{hotel_name}:"))
+                    && matches!(
+                        guest.role.as_str(),
+                        "agent"
+                            | "hegemon"
+                            | "membrane"
+                            | "model"
+                            | "model.gemini"
+                            | "model.elevenlabs"
+                            | "tool"
+                    ))
+        })
+        .map(|mut guest| {
+            guest.is_active = false;
+            guest.active_pid = None;
+            guest
+        })
+        .collect::<Vec<_>>();
+
+    if !stale.is_empty() {
+        graph.seed_guests(hotel_name, &stale)?;
+    }
+
+    Ok(())
 }
 
 /// Seed the built-in abstract tool catalog into the context graph.
@@ -1383,6 +1470,7 @@ async fn run_startup_test(
     output: Option<&str>,
     text: Option<&str>,
 ) -> Result<()> {
+    let local_node_id = default_hotel_record(hotel_name).capabilities.node_id;
     match test {
         StartupTest::TextRoundTrip => {
             let text = text
@@ -1405,7 +1493,7 @@ async fn run_startup_test(
             for attempt in 1..=5 {
                 let response = client
                     .send_request(IpcRequest::EmitTask {
-                        target_node: "local-ansible-01".into(),
+                        target_node: local_node_id.clone(),
                         target_role: "agent".into(),
                         target_guest_id: None,
                         task_json: serde_json::json!({
@@ -1414,7 +1502,7 @@ async fn run_startup_test(
                             "turn_id": format!("startup-test-turn-{attempt}"),
                             "chat_id": "startup-test-chat",
                             "content": text,
-                            "final_reply_to": "local-ansible-01",
+                            "final_reply_to": local_node_id,
                             "final_reply_role": "ansible-startup-test",
                             "final_reply_guest_id": "ansible-startup-test-client"
                         })
@@ -1502,7 +1590,7 @@ async fn run_startup_test(
 
             let response = client
                 .send_request(IpcRequest::EmitTask {
-                    target_node: "local-ansible-01".into(),
+                    target_node: local_node_id.clone(),
                     target_role: "model.gemini".into(),
                     target_guest_id: None,
                     task_json: serde_json::json!({
@@ -1516,9 +1604,9 @@ async fn run_startup_test(
                         "session_id": "startup-test:gemini-oauth-roundtrip",
                         "turn_id": "startup-test-turn-1",
                         "chat_id": "startup-test-chat",
-                        "reply_to": "local-ansible-01",
+                        "reply_to": local_node_id.clone(),
                         "reply_role": "ansible-startup-test",
-                        "final_reply_to": "local-ansible-01",
+                        "final_reply_to": local_node_id.clone(),
                         "final_reply_role": "ansible-startup-test",
                         "final_reply_guest_id": "ansible-startup-test-client"
                     })
@@ -1607,7 +1695,7 @@ async fn run_startup_test(
 
             let response = client
                 .send_request(IpcRequest::EmitTask {
-                    target_node: "local-ansible-01".into(),
+                    target_node: local_node_id.clone(),
                     target_role: "model.elevenlabs".into(),
                     target_guest_id: None,
                     task_json: serde_json::json!({
@@ -1616,9 +1704,9 @@ async fn run_startup_test(
                         "turn_id": "startup-test-turn-1",
                         "chat_id": "startup-test-chat",
                         "text": text,
-                        "reply_to": "local-ansible-01",
+                        "reply_to": local_node_id.clone(),
                         "reply_role": "ansible-startup-test",
-                        "final_reply_to": "local-ansible-01",
+                        "final_reply_to": local_node_id.clone(),
                         "final_reply_role": "ansible-startup-test"
                     })
                     .to_string(),
@@ -2013,6 +2101,16 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
 
+    if std::env::var_os("PHILOTIC_BIN_DIR").is_none() {
+        if let Ok(current_exe) = std::env::current_exe() {
+            if let Some(bin_dir) = current_exe.parent() {
+                unsafe {
+                    std::env::set_var("PHILOTIC_BIN_DIR", bin_dir);
+                }
+            }
+        }
+    }
+
     if let Some(Command::Auth { provider }) = args.command {
         return auth::run_auth_command(provider).await;
     }
@@ -2100,20 +2198,21 @@ async fn main() -> Result<()> {
     let effective_agent_profile = effective_agent_profile
         .unwrap_or_else(|| default_agent_profile_for_hotel(&hotel_name));
     let startup_test = args.test;
-    let mut hotel = match graph_storage.get_hotel(&hotel_name)? {
-        Some(hotel) => hotel,
-        None => {
-            info!(
-                "Hotel '{}' is missing from the Context Graph. Bootstrapping it now.",
-                hotel_name
-            );
-            let hotel = default_hotel_record(&hotel_name);
-            graph_storage.upsert_hotel(&hotel)?;
-            let guests = guest_seed_for_profile(&hotel_name, &effective_agent_profile);
-            graph_storage.seed_guests(&hotel_name, &guests)?;
-            hotel
-        }
-    };
+    if graph_storage.get_hotel(&hotel_name)?.is_none() {
+        info!(
+            "Hotel '{}' is missing from the Context Graph. Bootstrapping it now.",
+            hotel_name
+        );
+    }
+    let desired_guests = guest_seed_for_profile(&hotel_name, &effective_agent_profile);
+    deactivate_legacy_managed_guests(
+        &graph_storage,
+        &hotel_name,
+        &effective_agent_profile,
+        &desired_guests,
+    )?;
+    graph_storage.seed_guests(&hotel_name, &desired_guests)?;
+    let mut hotel = reconcile_hotel_record(&graph_storage, &hotel_name)?;
 
     seed_abstract_tool_catalog(&graph_storage)?;
 

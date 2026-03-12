@@ -19,12 +19,18 @@ use uuid::Uuid;
 
 pub const DEFAULT_AGENT_ID: &str = "agent-jane-01";
 const DEFAULT_REPLY_ROLE: &str = "membrane";
-const LOCAL_NODE: &str = "local-ansible-01";
 const DEFAULT_TEXT_MODEL_ROLE: &str = "model.gemini";
 const DEFAULT_VOICE_MODEL_ROLE: &str = "model.elevenlabs";
 /// Maximum model round-trips per turn. Exhausting this budget fails the turn with a
 /// clear error rather than looping indefinitely.
 const MAX_TOOL_ITERATIONS: u32 = 10;
+
+fn local_node_id() -> String {
+    std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-ansible-01".to_string())
+}
+
+#[cfg(test)]
+const LOCAL_NODE: &str = "local-ansible-01";
 
 fn implementation_to_model_role(implementation: &str) -> String {
     let normalized = implementation
@@ -53,7 +59,7 @@ fn resolve_model_execution_target(
         .map(implementation_to_model_role)
         .unwrap_or_else(|| fallback_role.into());
 
-    (LOCAL_NODE.into(), target_role, None)
+    (local_node_id(), target_role, None)
 }
 
 fn normalized_user_content(task: &InboundTaskPayload) -> Option<String> {
@@ -331,7 +337,10 @@ impl AgentRuntime {
                     task_id,
                     task_json,
                 })) => {
-                    info!("Jane received task [{}] from [{}]", task_id, source_node);
+                    info!(
+                        "Agent [{}] received task [{}] from [{}]",
+                        self.agent_id, task_id, source_node
+                    );
 
                     match serde_json::from_str::<InboundTaskPayload>(&task_json) {
                         Ok(task) if task.is_model_response() => {
@@ -380,10 +389,11 @@ impl AgentRuntime {
         let session_id = task.session_id_or_default(&self.agent_id);
         let turn_id = task.turn_id.clone().unwrap_or_else(|| task_id.to_string());
         let chat_id = task.chat_id.clone().unwrap_or_default();
+        let local_node = local_node_id();
         let inbound_final_reply_to = task
             .final_reply_to
             .clone()
-            .unwrap_or_else(|| LOCAL_NODE.to_string());
+            .unwrap_or_else(|| local_node.clone());
         let inbound_final_reply_role = task
             .final_reply_role
             .clone()
@@ -402,7 +412,7 @@ impl AgentRuntime {
                 inbound_final_reply_guest_id,
             );
             let target = state.resolved_transport_reply_target(
-                LOCAL_NODE.to_string(),
+                local_node,
                 DEFAULT_REPLY_ROLE.to_string(),
                 None,
             );
@@ -655,7 +665,7 @@ impl AgentRuntime {
             tools_for_model,
             response_contract: Some(serde_json::json!({ "channels": ["spoken_text"] })),
             chat_id,
-            reply_to: LOCAL_NODE.to_string(),
+            reply_to: local_node_id(),
             reply_role: "agent".into(),
             final_reply_to,
             final_reply_role,
@@ -1023,7 +1033,7 @@ impl AgentRuntime {
                     max_read_bytes: None,
                     max_search_results: None,
                 }),
-            reply_to: LOCAL_NODE.to_string(),
+            reply_to: local_node_id(),
             reply_role: "agent".into(),
             final_reply_to,
             final_reply_role,
@@ -1150,7 +1160,7 @@ impl AgentRuntime {
                     tools_for_model,
                     response_contract: None,
                     chat_id,
-                    reply_to: LOCAL_NODE.to_string(),
+                    reply_to: local_node_id(),
                     reply_role: "agent".into(),
                     final_reply_to,
                     final_reply_role,
@@ -1340,7 +1350,7 @@ impl AgentRuntime {
             "session_id": session_id,
             "turn_id": turn_id,
             "chat_id": chat_id,
-            "reply_to": LOCAL_NODE,
+            "reply_to": local_node_id(),
             "reply_role": "agent",
             "final_reply_to": final_reply_to,
             "final_reply_role": final_reply_role,
@@ -1941,7 +1951,7 @@ impl AgentRuntime {
             tools_for_model,
             response_contract: None,
             chat_id,
-            reply_to: LOCAL_NODE.to_string(),
+            reply_to: local_node_id(),
             reply_role: "agent".into(),
             final_reply_to,
             final_reply_role,

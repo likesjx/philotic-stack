@@ -80,7 +80,9 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         ["/approval", "status", ..] => Some(SlashCommand::ApprovalStatus),
         ["/approval", "reset", ..] => Some(SlashCommand::ApprovalReset),
         ["/tts"] => Some(SlashCommand::Tts { mode: None }),
-        ["/tts", mode, ..] => Some(SlashCommand::Tts { mode: Some((*mode).to_string()) }),
+        ["/tts", mode, ..] => Some(SlashCommand::Tts {
+            mode: Some((*mode).to_string()),
+        }),
         _ => None,
     }
 }
@@ -163,10 +165,28 @@ mod tests {
             parse_slash_command("/approval reset"),
             Some(SlashCommand::ApprovalReset)
         );
-        assert_eq!(parse_slash_command("/tts"), Some(SlashCommand::Tts { mode: None }));
-        assert_eq!(parse_slash_command("/tts on"), Some(SlashCommand::Tts { mode: Some("on".into()) }));
-        assert_eq!(parse_slash_command("/tts off"), Some(SlashCommand::Tts { mode: Some("off".into()) }));
-        assert_eq!(parse_slash_command("/tts auto"), Some(SlashCommand::Tts { mode: Some("auto".into()) }));
+        assert_eq!(
+            parse_slash_command("/tts"),
+            Some(SlashCommand::Tts { mode: None })
+        );
+        assert_eq!(
+            parse_slash_command("/tts on"),
+            Some(SlashCommand::Tts {
+                mode: Some("on".into())
+            })
+        );
+        assert_eq!(
+            parse_slash_command("/tts off"),
+            Some(SlashCommand::Tts {
+                mode: Some("off".into())
+            })
+        );
+        assert_eq!(
+            parse_slash_command("/tts auto"),
+            Some(SlashCommand::Tts {
+                mode: Some("auto".into())
+            })
+        );
     }
 
     #[test]
@@ -209,6 +229,9 @@ mod tests {
         assert!(deny_bare.steering_note().is_none());
 
         let deny_steered = parse_slash_command("/deny try a different approach").unwrap();
-        assert_eq!(deny_steered.steering_note(), Some("try a different approach"));
+        assert_eq!(
+            deny_steered.steering_note(),
+            Some("try a different approach")
+        );
     }
 }

@@ -10,6 +10,10 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tracing::{error, info, warn};
 
+fn local_node_id() -> String {
+    std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-ansible-01".to_string())
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -1214,8 +1218,9 @@ async fn main() -> Result<()> {
                                                 continue;
                                             }
 
+                                            let local_node_id = local_node_id();
                                             let task_req = IpcRequest::EmitTask {
-                                                target_node: "local-ansible-01".into(),
+                                                target_node: local_node_id.clone(),
                                                 target_role: "agent".into(),
                                                 target_guest_id: None,
                                                 task_json: json!({
@@ -1233,7 +1238,7 @@ async fn main() -> Result<()> {
                                                     "command": envelope.command,
                                                     "callback_data": envelope.callback_data,
                                                     "raw_transport_event": envelope.raw_transport_event,
-                                                    "final_reply_to": "local-ansible-01",
+                                                    "final_reply_to": local_node_id,
                                                     "final_reply_role": "membrane",
                                                     "final_reply_guest_id": "membrane-telegram-01"
                                                 }).to_string(),

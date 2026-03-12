@@ -113,15 +113,20 @@ impl GeminiProvider {
         })
     }
 
-    fn parse_structured_response(status: reqwest::StatusCode, body: Value) -> (String, Option<String>) {
+    fn parse_structured_response(
+        status: reqwest::StatusCode,
+        body: Value,
+    ) -> (String, Option<String>) {
         let raw = Self::parse_response_text(status, body);
         // Try to parse as structured JSON output
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw) {
-            let display = parsed.get("display_text")
+            let display = parsed
+                .get("display_text")
                 .and_then(Value::as_str)
                 .filter(|s| !s.trim().is_empty())
                 .map(str::to_string);
-            let spoken = parsed.get("spoken_text")
+            let spoken = parsed
+                .get("spoken_text")
                 .and_then(Value::as_str)
                 .filter(|s| !s.trim().is_empty())
                 .map(str::to_string);
@@ -248,7 +253,9 @@ impl ModelProvider for GeminiProvider {
     async fn invoke(&self, task: &ControllerTask) -> Result<ProviderOutput> {
         let payload = match task.kind {
             TaskKind::TextGenerate => {
-                let prompt = task.prompt_text().context("Gemini text task missing prompt")?;
+                let prompt = task
+                    .prompt_text()
+                    .context("Gemini text task missing prompt")?;
                 if task.wants_channel("spoken_text") {
                     Self::structured_text_request_payload(prompt)
                 } else {
@@ -271,11 +278,12 @@ impl ModelProvider for GeminiProvider {
         let status = response.status();
         let body = response.json::<Value>().await?;
 
-        let (content, spoken_text) = if task.kind == TaskKind::TextGenerate && task.wants_channel("spoken_text") {
-            Self::parse_structured_response(status, body)
-        } else {
-            (Self::parse_response_text(status, body), None)
-        };
+        let (content, spoken_text) =
+            if task.kind == TaskKind::TextGenerate && task.wants_channel("spoken_text") {
+                Self::parse_structured_response(status, body)
+            } else {
+                (Self::parse_response_text(status, body), None)
+            };
 
         if content.trim().is_empty() {
             bail!("Gemini returned an empty response");

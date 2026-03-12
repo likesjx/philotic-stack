@@ -546,9 +546,7 @@ mod tests {
             Ok(None)
         }
 
-        fn list_abstract_tools(
-            &self,
-        ) -> Result<Vec<ansible_mesh_core::graph::AbstractToolRecord>> {
+        fn list_abstract_tools(&self) -> Result<Vec<ansible_mesh_core::graph::AbstractToolRecord>> {
             Ok(vec![])
         }
     }
