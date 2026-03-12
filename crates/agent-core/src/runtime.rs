@@ -11,7 +11,7 @@ use crate::session::{
     WorkingTurn, merge_session_index,
 };
 use anyhow::Result;
-use philotic_client::{IpcRequest, IpcResponse, PhiloticClient, is_ipc_disconnect};
+use philotic_client::{HandoffBundle, IpcRequest, IpcResponse, PhiloticClient, is_ipc_disconnect};
 use std::collections::HashMap;
 use std::time::Duration;
 use tracing::{error, info, warn};
@@ -368,6 +368,26 @@ fn resolve_media_routing(
     })
 }
 
+fn format_role_command_reply(command: &SlashCommand, became_active: bool) -> String {
+    match command {
+        SlashCommand::Role { role_name } => {
+            if became_active {
+                format!("Switched to role {role_name}.")
+            } else {
+                format!("Switching to role {role_name} once it finishes materializing.")
+            }
+        }
+        SlashCommand::Back => {
+            if became_active {
+                "Switched back to orchestrator.".into()
+            } else {
+                "Switching back to orchestrator once it finishes materializing.".into()
+            }
+        }
+        _ => "Role command completed.".into(),
+    }
+}
+
 pub struct AgentRuntime {
     ipc_client: PhiloticClient,
     agent_id: String,
@@ -483,6 +503,7 @@ impl AgentRuntime {
             match command {
                 SlashCommand::Ping => {}
                 SlashCommand::Status | SlashCommand::Pause | SlashCommand::Resume => {}
+                SlashCommand::Role { .. } | SlashCommand::Back => {}
                 SlashCommand::ToolsAdd { .. }
                 | SlashCommand::ToolsClear
                 | SlashCommand::SkillsAdd { .. }
@@ -520,7 +541,15 @@ impl AgentRuntime {
                 .iter()
                 .any(|a| matches!(a.kind.as_str(), "voice" | "audio"));
 
-        let (checkpoint_memory_type, checkpoint_json, index_state, model_prompt, tools_for_model) = {
+        let (
+            checkpoint_memory_type,
+            checkpoint_json,
+            index_state,
+            model_prompt,
+            model_context,
+            context_projection,
+            tools_for_model,
+        ) = {
             let state = self
                 .sessions
                 .get_mut(&session_id)
@@ -545,11 +574,15 @@ impl AgentRuntime {
             state.set_active_turn_phase(TurnPhase::LoadingContext);
 
             let tools_for_model = state.project_tools_for_turn(&content);
+            let (model_prompt, model_context, context_projection) =
+                state.model_request_payloads(&content, &tools_for_model);
             (
                 state.checkpoint_memory_type(),
                 state.checkpoint_json(),
                 state.clone(),
-                state.build_prompt_with_tools(&content, &tools_for_model),
+                model_prompt,
+                model_context,
+                context_projection,
                 tools_for_model,
             )
         };
@@ -592,6 +625,10 @@ impl AgentRuntime {
                         task_id, session_id, turn_id, chat_id, command,
                     )
                     .await
+                }
+                SlashCommand::Role { .. } | SlashCommand::Back => {
+                    self.handle_role_command(task_id, session_id, turn_id, chat_id, command)
+                        .await
                 }
                 SlashCommand::Approve { .. } | SlashCommand::Deny { .. } => Ok(()),
             };
@@ -727,6 +764,8 @@ impl AgentRuntime {
             turn_id,
             prompt,
             user_content: content,
+            context: Some(model_context),
+            context_projection: Some(context_projection),
             attachments,
             tools_for_model,
             response_contract: Some(serde_json::json!({ "channels": ["spoken_text"] })),
@@ -1288,6 +1327,8 @@ impl AgentRuntime {
                     turn_id,
                     prompt,
                     user_content,
+                    context: None,
+                    context_projection: None,
                     attachments: Vec::new(),
                     tools_for_model,
                     response_contract: None,
@@ -1390,12 +1431,29 @@ impl AgentRuntime {
             })
             .await?;
 
+        let (context, context_projection) = self
+            .sessions
+            .get(&session_id)
+            .map(|state| {
+                let projection = state.build_context_projection(&reentry.user_content);
+                (
+                    Some(state.model_context_from_projection(&projection)),
+                    Some(
+                        serde_json::to_value(&projection)
+                            .expect("context projection should serialize"),
+                    ),
+                )
+            })
+            .unwrap_or((None, None));
+
         let model_req = ModelRequestPayload {
             action: "generate_text".to_string(),
             session_id: session_id.clone(),
             turn_id,
             prompt: reentry.prompt,
             user_content: reentry.user_content.clone(),
+            context,
+            context_projection,
             attachments: Vec::new(),
             tools_for_model: reentry.tools_for_model,
             response_contract: Some(serde_json::json!({ "channels": ["spoken_text"] })),
@@ -1935,6 +1993,8 @@ impl AgentRuntime {
                 | SlashCommand::Status
                 | SlashCommand::Pause
                 | SlashCommand::Resume
+                | SlashCommand::Role { .. }
+                | SlashCommand::Back
                 | SlashCommand::ToolsAdd { .. }
                 | SlashCommand::ToolsClear
                 | SlashCommand::SkillsAdd { .. }
@@ -2100,6 +2160,8 @@ impl AgentRuntime {
             | SlashCommand::Status
             | SlashCommand::Pause
             | SlashCommand::Resume
+            | SlashCommand::Role { .. }
+            | SlashCommand::Back
             | SlashCommand::ToolsAdd { .. }
             | SlashCommand::ToolsClear
             | SlashCommand::SkillsAdd { .. }
@@ -2113,6 +2175,162 @@ impl AgentRuntime {
         }
 
         Ok(())
+    }
+
+    async fn handle_role_command(
+        &mut self,
+        command_task_id: Uuid,
+        session_id: String,
+        command_turn_id: String,
+        command_chat_id: String,
+        command: SlashCommand,
+    ) -> Result<()> {
+        let response = match &command {
+            SlashCommand::Role { role_name } => {
+                let handoff_bundle = HandoffBundle {
+                    goal: format!("Switch active role to {role_name} for this session."),
+                    context_excerpt: "Manual role switch requested by user slash command.".into(),
+                    session_id: session_id.clone(),
+                    initiating_turn_id: command_turn_id.clone(),
+                    return_to: Some("orchestrator".into()),
+                };
+                self.ipc_client
+                    .send_request(IpcRequest::HandoffToRole {
+                        session_id: session_id.clone(),
+                        role_name: role_name.clone(),
+                        handoff_bundle,
+                    })
+                    .await?
+            }
+            SlashCommand::Back => {
+                self.ipc_client
+                    .send_request(IpcRequest::HandoffBack {
+                        session_id: session_id.clone(),
+                        summary: "Manual return to orchestrator requested by user slash command."
+                            .into(),
+                        return_to: None,
+                    })
+                    .await?
+            }
+            _ => unreachable!("handle_role_command only accepts role handoff commands"),
+        };
+
+        let (reply_content, update_state, payload, next_active_incarnation) = match response {
+            IpcResponse::HandoffAck {
+                handoff_guest_id,
+                became_active,
+            } => (
+                format_role_command_reply(&command, became_active),
+                if became_active {
+                    "role_handoff_completed"
+                } else {
+                    "role_handoff_materializing"
+                },
+                serde_json::json!({
+                    "session_id": session_id,
+                    "turn_id": command_turn_id,
+                    "chat_id": command_chat_id,
+                    "role_command": "handoff_to_role",
+                    "handoff_guest_id": handoff_guest_id,
+                    "became_active": became_active,
+                }),
+                became_active.then_some(handoff_guest_id),
+            ),
+            IpcResponse::HandoffBackAck {
+                handoff_guest_id,
+                became_active,
+            } => (
+                format_role_command_reply(&command, became_active),
+                if became_active {
+                    "role_handoff_completed"
+                } else {
+                    "role_handoff_materializing"
+                },
+                serde_json::json!({
+                    "session_id": session_id,
+                    "turn_id": command_turn_id,
+                    "chat_id": command_chat_id,
+                    "role_command": "handoff_back",
+                    "handoff_guest_id": handoff_guest_id,
+                    "became_active": became_active,
+                }),
+                became_active.then_some(handoff_guest_id),
+            ),
+            IpcResponse::Error(message) => (
+                format!("Couldn't switch roles: {message}"),
+                "role_handoff_failed",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "turn_id": command_turn_id,
+                    "chat_id": command_chat_id,
+                    "error": message,
+                }),
+                None,
+            ),
+            IpcResponse::Standard {
+                ok: false,
+                code,
+                message,
+                ..
+            } => (
+                format!("Couldn't switch roles: {message} ({code})"),
+                "role_handoff_failed",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "turn_id": command_turn_id,
+                    "chat_id": command_chat_id,
+                    "error_code": code,
+                    "error": message,
+                }),
+                None,
+            ),
+            other => (
+                format!("Couldn't switch roles: unexpected hotel response {other:?}"),
+                "role_handoff_failed",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "turn_id": command_turn_id,
+                    "chat_id": command_chat_id,
+                    "error": format!("unexpected hotel response: {other:?}"),
+                }),
+                None,
+            ),
+        };
+
+        if let Some(active_incarnation_id) = next_active_incarnation {
+            if let Some(state) = self.sessions.get_mut(&session_id) {
+                state.active_incarnation_id = Some(active_incarnation_id);
+            }
+        }
+
+        let (checkpoint_memory_type, checkpoint_json, index_state) = {
+            let Some(state) = self.sessions.get(&session_id) else {
+                warn!("Received role command for unknown session {}", session_id);
+                return Ok(());
+            };
+            (
+                state.checkpoint_memory_type(),
+                state.checkpoint_json(),
+                state.clone(),
+            )
+        };
+
+        self.ipc_client
+            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
+            .await?;
+        self.sync_session_index(&index_state).await?;
+
+        let _ = self
+            .ipc_client
+            .send_request(IpcRequest::UpdateTask {
+                task_id: command_task_id,
+                state: update_state.into(),
+                payload,
+            })
+            .await?;
+
+        self.complete_local_command(session_id, command_turn_id, reply_content)
+            .await
     }
 
     async fn resume_turn_with_steering(
@@ -2201,12 +2419,29 @@ impl AgentRuntime {
             .map(|state| state.tool_assembly.tools_for_model.clone())
             .unwrap_or_default();
 
+        let (context, context_projection) = self
+            .sessions
+            .get(&session_id)
+            .map(|state| {
+                let projection = state.build_context_projection(&user_content);
+                (
+                    Some(state.model_context_from_projection(&projection)),
+                    Some(
+                        serde_json::to_value(&projection)
+                            .expect("context projection should serialize"),
+                    ),
+                )
+            })
+            .unwrap_or((None, None));
+
         let model_req = ModelRequestPayload {
             action: "generate_text".to_string(),
             session_id: session_id.clone(),
             turn_id,
             prompt,
             user_content,
+            context,
+            context_projection,
             attachments: Vec::new(),
             tools_for_model,
             response_contract: None,
@@ -2503,6 +2738,8 @@ impl AgentRuntime {
                 }
                 SlashCommand::Ping
                 | SlashCommand::Tts { .. }
+                | SlashCommand::Role { .. }
+                | SlashCommand::Back
                 | SlashCommand::Approve { .. }
                 | SlashCommand::Deny { .. } => (
                     "Unsupported session control command.".to_string(),
@@ -2658,7 +2895,7 @@ impl AgentRuntime {
                     .unwrap_or("set")
                     .to_string();
 
-                let (content, bindings_changed) = {
+                let configure_result = {
                     let Some(state) = self.sessions.get_mut(&payload.session_id) else {
                         return self
                             .fail_active_turn(
@@ -2672,14 +2909,17 @@ impl AgentRuntime {
                     match state.apply_configure(&config_path, &value, &operation) {
                         Ok(msg) => {
                             let changed = state.bindings != bindings_before;
-                            (msg, changed)
+                            Ok((msg, changed))
                         }
-                        Err(err) => {
-                            drop(state);
-                            return self
-                                .fail_active_turn(payload.session_id, payload.turn_id, err)
-                                .await;
-                        }
+                        Err(err) => Err(err),
+                    }
+                };
+                let (content, bindings_changed) = match configure_result {
+                    Ok(result) => result,
+                    Err(err) => {
+                        return self
+                            .fail_active_turn(payload.session_id, payload.turn_id, err)
+                            .await;
                     }
                 };
 
@@ -2872,9 +3112,11 @@ impl AgentRuntime {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE, extract_model_error, media_analysis_attachments,
-        normalized_user_content, resolve_media_routing, resolve_model_execution_target,
+        DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE, extract_model_error, format_role_command_reply,
+        media_analysis_attachments, normalized_user_content, resolve_media_routing,
+        resolve_model_execution_target,
     };
+    use crate::commands::SlashCommand;
     use crate::r#loop::{ApprovalRequest, ToolCall};
     use crate::protocol::{
         FinalReplyPayload, InboundTaskPayload, ModelRequestPayload, TransportAttachment,
@@ -2893,6 +3135,13 @@ mod tests {
             turn_id: "turn-1".into(),
             prompt: "hello".into(),
             user_content: "hello".into(),
+            context: Some(serde_json::json!({
+                "identity": [{"text": "You are Jane."}],
+                "active_turn": {"role": "user", "text": "hello"}
+            })),
+            context_projection: Some(serde_json::json!({
+                "conversation_turn": {"conversation_turn_id": "turn-1"}
+            })),
             attachments: Vec::new(),
             tools_for_model: Vec::new(),
             response_contract: None,
@@ -2907,6 +3156,11 @@ mod tests {
         let json = serde_json::to_value(&request).expect("serialize request");
         assert_eq!(json["reply_role"], "agent");
         assert_eq!(json["final_reply_role"], "membrane");
+        assert_eq!(json["context"]["active_turn"]["text"], "hello");
+        assert_eq!(
+            json["context_projection"]["conversation_turn"]["conversation_turn_id"],
+            "turn-1"
+        );
     }
 
     #[test]
@@ -3442,5 +3696,35 @@ mod tests {
         let atts = vec![blob_backed_attachment("photo")];
         let r = resolve_media_routing(&policy, atts).unwrap();
         assert!(!r.strip_tools);
+    }
+
+    #[test]
+    fn role_command_reply_text_distinguishes_active_and_materializing() {
+        assert_eq!(
+            format_role_command_reply(
+                &SlashCommand::Role {
+                    role_name: "developer".into()
+                },
+                true
+            ),
+            "Switched to role developer."
+        );
+        assert_eq!(
+            format_role_command_reply(
+                &SlashCommand::Role {
+                    role_name: "developer".into()
+                },
+                false
+            ),
+            "Switching to role developer once it finishes materializing."
+        );
+        assert_eq!(
+            format_role_command_reply(&SlashCommand::Back, true),
+            "Switched back to orchestrator."
+        );
+        assert_eq!(
+            format_role_command_reply(&SlashCommand::Back, false),
+            "Switching back to orchestrator once it finishes materializing."
+        );
     }
 }

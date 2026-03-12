@@ -4,6 +4,8 @@ pub enum SlashCommand {
     Status,
     Pause,
     Resume,
+    Role { role_name: String },
+    Back,
     ToolsAdd { tool: String },
     ToolsClear,
     SkillsAdd { skill: String },
@@ -25,6 +27,8 @@ impl SlashCommand {
             Self::Status => None,
             Self::Pause => None,
             Self::Resume => None,
+            Self::Role { .. } => None,
+            Self::Back => None,
             Self::ToolsAdd { .. } => None,
             Self::ToolsClear => None,
             Self::SkillsAdd { .. } => None,
@@ -58,6 +62,10 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         ["/status", ..] => Some(SlashCommand::Status),
         ["/pause", ..] => Some(SlashCommand::Pause),
         ["/resume", ..] => Some(SlashCommand::Resume),
+        ["/role", role_name, ..] => Some(SlashCommand::Role {
+            role_name: (*role_name).to_string(),
+        }),
+        ["/back", ..] => Some(SlashCommand::Back),
         ["/tools", "add", tool, ..] => Some(SlashCommand::ToolsAdd {
             tool: (*tool).to_string(),
         }),
@@ -103,6 +111,13 @@ mod tests {
         assert_eq!(parse_slash_command("/status"), Some(SlashCommand::Status));
         assert_eq!(parse_slash_command("/pause"), Some(SlashCommand::Pause));
         assert_eq!(parse_slash_command("/resume"), Some(SlashCommand::Resume));
+        assert_eq!(
+            parse_slash_command("/role developer"),
+            Some(SlashCommand::Role {
+                role_name: "developer".into()
+            })
+        );
+        assert_eq!(parse_slash_command("/back"), Some(SlashCommand::Back));
         assert_eq!(
             parse_slash_command("/tools add echo"),
             Some(SlashCommand::ToolsAdd {

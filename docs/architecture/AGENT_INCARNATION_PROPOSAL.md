@@ -50,12 +50,16 @@ The first runtime substrate for the incarnation model now exists:
 - `RoleIncarnationRecord` and `TurnLoopConfig` are persisted in the Context Graph
 - `SessionRecord` carries `active_incarnation_id`
 - hotel IPC routing now reads `session.active_incarnation_id` before delivering inbound agent tasks
+- inbound tasks for a configured but currently unregistered role can now be parked while the hotel requests on-demand materialization, then flushed on guest registration
 
 This slice is intentionally narrower than the full proposal:
 
 - role definitions exist, but `ConfigureRole` is not implemented yet
-- active route selection exists, and unregistered active-incarnation targets now fall back to a live orchestrator when one is present, but buffered materialization is not implemented yet
-- handoff IPC, role-profile seeding, inactive TTL reclaim, and subagents remain future slices
+- active route selection exists, and unregistered active-incarnation targets now fall back to a live orchestrator when one is present
+- the first parked-delivery/on-demand materialization path exists for inbound agent tasks
+- basic `HandoffToRole` / `HandoffBack` IPC now exists, and active route ownership only flips after the target incarnation is live or registers after on-demand materialization
+- `/role <name>` and `/back` now exist as manual operator surfaces in `agent-core`, backed by the same hotel handoff/runtime contract
+- handoff skill scaffolding, role-profile seeding, inactive TTL reclaim, and subagents remain future slices
 
 ## Linked Work Surface
 
@@ -521,9 +525,9 @@ Dependencies are real and must be respected:
 
 4. **Session bindings seeded from role profile.** When a session is initialized for a role incarnation, the hotel seeds `SessionBindings` from the role's `toolset_profile`. No more `["echo"]` default.
 
-5. **`active_incarnation_id` in session records + IpcServer routing update.** This is now implemented for inbound agent-task routing. Fallback to a live orchestrator when the active incarnation is unregistered is now implemented. Buffered materialization behavior is still pending.
+5. **`active_incarnation_id` in session records + IpcServer routing update.** This is now implemented for inbound agent-task routing. Fallback to a live orchestrator when the active incarnation is unregistered is now implemented. The first parked-delivery/on-demand materialization path for configured inbound targets is now implemented. Broader buffered ownership transfer during handoff is still pending.
 
-6. **`HandoffToRole` / `HandoffBack` IPC + handoff skill scaffolding.** Implement the membrane switch protocol. Define the first handoff skill shape.
+6. **`HandoffToRole` / `HandoffBack` IPC + manual switching surface.** The first membrane switch protocol is now implemented at the IPC/runtime layer, and `/role <name>` + `/back` now ride that same hotel-owned contract. The handoff skill shape is still pending.
 
 7. **Inactive TTL + on-demand rematerialization.** Add TTL check to the supervisor loop. Restore session context from memory on rematerialization.
 

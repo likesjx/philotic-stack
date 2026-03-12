@@ -97,12 +97,14 @@ Seam IDs: `role-incarnation-records`, `active-membrane-routing`, `handoff-skill`
 - [x] Add `active_incarnation_id` to `SessionRecord` in the Context Graph.
 - [x] Update IpcServer task routing to read `active_incarnation_id` before routing inbound agent tasks.
 - [x] Default to orchestrator incarnation if active ID is unregistered.
-- [ ] Buffer inbound during role materialization before switching active route ownership.
+- [x] Park inbound agent tasks and request on-demand materialization when a configured active role is missing locally.
+- [ ] Buffer inbound during explicit handoff/materialization before switching active route ownership.
 
 ### Handoff Skill + Membrane Switching
-- [ ] Implement `HandoffToRole { role_name, handoff_bundle }` and `HandoffBack { summary, return_to? }` IPC actions.
+- [x] Implement `HandoffToRole { role_name, handoff_bundle }` and `HandoffBack { summary, return_to? }` IPC actions.
 - [ ] Define the first handoff skill shape: trigger patterns, context bundle assembly, cleanup steps.
-- [ ] Add `/role <name>` and `/back` slash commands for manual membrane switching.
+- [x] Add `/role <name>` and `/back` slash commands for manual membrane switching.
+- [ ] Add `/roles` or equivalent status surface so operators can inspect configured roles and the active routed incarnation without guessing.
 
 ### Inactive TTL + On-Demand Rematerialization
 - [ ] Add `inactive_ttl_seconds` to `RoleIncarnationRecord`.
@@ -183,6 +185,12 @@ Seam IDs: `context-engine-contract`, `deterministic-context-assembly`, `memory-e
   - `static_for_turn`
   - `refreshable`
   - `live_local`
+- [ ] Define the first concrete context-engine payload shapes:
+  - `ConversationTurnScope`
+  - `CognitiveStepScope`
+  - `LayerContribution`
+  - `ContextProjection`
+  - `LayerPayload`
 - [ ] Prove one current context path and one current memory path behind those abstractions.
 
 ## New Project: Admin Role And Surfaces
@@ -238,6 +246,11 @@ Seam IDs: `agent-hook-registry`, `transcription-hook-extraction`
   - `checkpoint.after_tool`
   - `checkpoint.before_reply`
   - `conversation_turn.end`
+- [ ] Define the first concrete hook payload/result shapes:
+  - `HookRequest`
+  - `HookResult`
+  - `RefreshRequest`
+  - `PromotionAction`
 - [ ] Move one live seam behind the hook model before broadening the design story.
 
 ## New Project: Local Admin Fallback Model
