@@ -260,6 +260,22 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
   - tool runner on another
 - [ ] Build the first cross-host version of that distributed slice once perimeter trust is in place.
 
+## New Project: Router-Native Observability
+
+- [ ] Review [ROUTER_NATIVE_OBSERVABILITY_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ROUTER_NATIVE_OBSERVABILITY_PROPOSAL.md).
+- [ ] Define the first structured observability event envelope for routed runtime events.
+- [ ] Define attachable listener registration and filter semantics.
+- [ ] Keep a minimal bootstrap/fatal emergency sink outside the router so pre-router failures are still visible.
+- [ ] Prove one console listener and one persistent event sink.
+- [ ] Decide how observability events can later feed eval/reinforcement datasets without becoming a second logging ontology.
+
+## New Project: Proposal Organization
+
+- [ ] Review [PROPOSAL_ORGANIZATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PROPOSAL_ORGANIZATION_PROPOSAL.md).
+- [ ] Decide the first folder/tag/backlink strategy for organizing growing proposal volume in `docs/architecture/`.
+- [ ] Define which proposals should be grouped by domain versus lifecycle.
+- [ ] Add lightweight backlink conventions so active proposals can point to adjacent work without turning into wiki sprawl.
+
 ## New Project: Model Controller
 
 - [ ] Review [MODEL_CONTROLLER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack-model-controller-abstraction/docs/architecture/MODEL_CONTROLLER_PROPOSAL.md).
