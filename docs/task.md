@@ -404,6 +404,16 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 - [ ] Deploy Muninn "Truth Cache" to `vps-jane` with automated sync from local.
 - [ ] Formalize semantic "Optimization Loop" to update `AGENTS.md` rules based on recurring "Reality Gaps."
 
+## New Project: Homebrew Distribution
+
+- [x] Research current Homebrew distribution guidance for taps, formula acceptance, and bottles.
+- [x] Inspect Philotic binary/release shape and identify packaging constraints.
+- [x] Write [HOMEBREW_DISTRIBUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/HOMEBREW_DISTRIBUTION_PROPOSAL.md).
+- [ ] Decide the first public Homebrew binary name and install surface.
+- [ ] Add tagged release automation for the chosen public binary.
+- [ ] Create a dedicated tap repository and first formula.
+- [ ] Add bottle automation for supported platforms.
+
 ## Deferred Design Threads
 
 - [ ] Agent workflow formalization: adopt a standing Codex process for context gathering, slice sizing, verification ladders, watched live runs, proposal disposition updates, per-slice commit/push discipline, and assumption-vs-reality capture.
