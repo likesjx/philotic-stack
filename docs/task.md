@@ -14,7 +14,11 @@
 
 ## Current Work Item Split
 
+Stable seam refs live in [SEAM_REGISTRY.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SEAM_REGISTRY.md).
+
 ### WI 1: Session Management
+
+Seam IDs: `session-leases`
 
 - [x] Decide that session state has one canonical home in the Context Graph; apartment checkpoints are derived recovery projections, not a second source of truth.
 - [x] Generalize session as a cross-component coordination envelope rather than an agent-only transcript.
@@ -26,6 +30,8 @@
 - [x] Support approval flows at the session layer.
 
 ### WI 2: Agent Logic
+
+Seam IDs: `session-compaction`
 
 - [ ] Implement the bounded ZeroClaw-style loop in `agent-core`.
 - [ ] Build context from session snapshot plus memory apartments.
@@ -70,6 +76,8 @@
 
 Model revised: three-kind taxonomy (conversational/worker/subagent) replaced with role incarnations + workers/subagents. See [AGENT_INCARNATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/AGENT_INCARNATION_PROPOSAL.md).
 
+Seam IDs: `role-incarnation-records`, `active-membrane-routing`, `handoff-skill`
+
 ### Skill Catalog + Toolset Profiles (prerequisite for role provisioning)
 - [ ] Add `AbstractSkillRecord` to `ansible-mesh-core/src/graph.rs` (parallel to `AbstractToolRecord`).
 - [ ] Add `upsert_abstract_skill` / `get_abstract_skill` / `list_abstract_skills` to `GraphStorage` trait and `SqliteGraphStorage`.
@@ -79,15 +87,17 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 - [ ] Update session binding assembly to expand skill grants into `implied_tools` when building `tools_for_model`.
 
 ### Role Incarnation Records
-- [ ] Add `RoleIncarnationRecord` and `TurnLoopConfig` to the context graph (`role_incarnation` node kind).
-- [ ] Add `upsert_role_incarnation` / `get_role_incarnation` / `list_role_incarnations` to `GraphStorage`.
-- [ ] Add `ConfigureRole` IPC action (orchestrator → hotel); hotel enforces orchestrator-only writes.
+- [x] Add `RoleIncarnationRecord` and `TurnLoopConfig` to the context graph (`role_incarnation` node kind).
+- [x] Add `upsert_role_incarnation` / `get_role_incarnation` / `list_role_incarnations` to `GraphStorage`.
+- [ ] Add `ConfigureRole` IPC action (orchestrator → hotel); hotel enforces orchestrator-only writes for the same agent identity.
+- [ ] Define the first rigid orchestrator-only role-governance workflow skill for create/update, including required reasoning about purpose, toolset, skillset, handoff posture, and limits.
 - [ ] Seed session bindings from the role's `toolset_profile` when a role incarnation session is initialized.
 
 ### Active Membrane Routing
-- [ ] Add `active_incarnation_id` to `SessionRecord` in the Context Graph.
-- [ ] Update IpcServer task routing to read `active_incarnation_id` before routing inbound agent tasks.
-- [ ] Default to orchestrator incarnation if active ID is unregistered; buffer inbound during materialization.
+- [x] Add `active_incarnation_id` to `SessionRecord` in the Context Graph.
+- [x] Update IpcServer task routing to read `active_incarnation_id` before routing inbound agent tasks.
+- [x] Default to orchestrator incarnation if active ID is unregistered.
+- [ ] Buffer inbound during role materialization before switching active route ownership.
 
 ### Handoff Skill + Membrane Switching
 - [ ] Implement `HandoffToRole { role_name, handoff_bundle }` and `HandoffBack { summary, return_to? }` IPC actions.
@@ -141,17 +151,43 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
   - transport config
   - model defaults
   - role/incarnation definitions
+- [ ] Make the shared-identity boundary explicit in context management:
+  - agent identity fields remain canonical at the agent layer
+  - role addenda are additive posture only
+  - role governance must not replace or fork the base identity layer
 - [ ] Make runtime/profile updates flow through hotel-owned validation, authorization, persistence, and audit logging rather than direct file edits.
 
 ## New Project: Context And Memory Engines
 
+Seam IDs: `context-engine-contract`, `deterministic-context-assembly`, `memory-engine-contract`, `graph-muninn-memory-dual-path`, `philotic-native-memory-integration`
+
 - [ ] Review [PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md).
 - [ ] Review [MEMORY_ENGINE_ABSTRACTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMORY_ENGINE_ABSTRACTION_PROPOSAL.md).
 - [ ] Define the first context-engine contract for deterministic turn context assembly.
+- [ ] Lock the canonical vocabulary for context assembly scope:
+  - `conversation turn` for the external exchange boundary
+  - `cognitive step` for internal reasoning/action within that boundary
 - [ ] Define the first memory-engine contract for `search`, `store`, and provenance.
+- [ ] Define the first five context layers with owner, authority, mutability, and projection budget:
+  - identity
+  - relationship
+  - session
+  - working
+  - knowledge
+- [ ] Publish the first compact layer contract table for:
+  - canonical owner
+  - authority level
+  - refresh timing
+  - promotion target
+- [ ] Define the first mutability classes for context layers:
+  - `static_for_turn`
+  - `refreshable`
+  - `live_local`
 - [ ] Prove one current context path and one current memory path behind those abstractions.
 
 ## New Project: Admin Role And Surfaces
+
+Seam IDs: `admin-posture-model`, `session-admin-elevation`, `cli-tui-admin-surface`, `action-grant-contract`
 
 - [ ] Review [ROLE_POSTURE_AND_ADMIN_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ROLE_POSTURE_AND_ADMIN_PROPOSAL.md).
 - [ ] Review [CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md).
@@ -187,11 +223,26 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 
 ## New Project: Agent Plugin Hooks
 
+Seam IDs: `agent-hook-registry`, `transcription-hook-extraction`
+
 - [ ] Review [AGENT_PLUGIN_HOOKS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/AGENT_PLUGIN_HOOKS_PROPOSAL.md).
 - [ ] Define the first bounded hook families for context, memory, transcription, and response post-processing.
+- [ ] Align hook timing and scope to the context-engine vocabulary:
+  - run per `conversation turn` where appropriate
+  - refresh at named `cognitive step` checkpoints where needed
+- [ ] Define the first explicit hook checkpoints:
+  - `conversation_turn.start`
+  - `cognitive_step.context_build`
+  - `checkpoint.before_model`
+  - `checkpoint.after_model`
+  - `checkpoint.after_tool`
+  - `checkpoint.before_reply`
+  - `conversation_turn.end`
 - [ ] Move one live seam behind the hook model before broadening the design story.
 
 ## New Project: Local Admin Fallback Model
+
+Seam IDs: `local-admin-capability-envelope`, `onnx-admin-fallback-path`
 
 - [ ] Review [LOCAL_ADMIN_FALLBACK_MODEL_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/LOCAL_ADMIN_FALLBACK_MODEL_PROPOSAL.md).
 - [ ] Define the first bounded local-admin capability envelope.
@@ -223,6 +274,8 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 - [x] Define placeholder policy for unimplemented guests (e.g. `tool-runner`) — skip or warn rather than fail spawn.
 
 ## New Project: Red Hat Ansible / VPS Deployment Boundary
+
+Seam IDs: `secret-handling-hardening`, `watched-live-vps-smoke`, `artifact-distribution-rollout`
 
 - [x] Pin the architecture boundary between Red Hat Ansible as the outer deployment orchestrator and Philotic `ansible` as the inner hotel runtime authority.
 - [x] Define the first Linux/VPS deployment contract:
@@ -270,6 +323,8 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 
 ## New Project: Inter-Hotel Routing And Placement
 
+Seam IDs: `placement-policy-broadening`, `multi-host-watched-validation`
+
 - [x] Decide that inter-hotel routing should extend the same route contract already used for intra-hotel execution rather than creating a second remote-only routing abstraction.
 - [x] Decide that hotels must advertise capabilities plus live incarnations and remain authoritative for the incarnations they materialize.
 - [x] Decide that incarnation identity is hotel-scoped and deterministic: `<hotel_name>:<guest_id>`.
@@ -291,9 +346,22 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 
 ## New Project: Multi-Hotel Component Distribution
 
+Seam IDs: `multi-hotel-route-consistency`, `cross-host-distributed-validation`, `remote-materialization-ceremony`, `capacity-relief-placement`
+
 - [ ] Review [MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md).
 - [ ] Extend remote-capable route metadata consistently across remaining routed component classes beyond the first tool/model paths.
 - [ ] Preserve session-owned membrane reply routing while proving broader distributed component placement.
+- [ ] Define the first remote materialization ceremony:
+  - mesh-visible intent
+  - deterministic winning target selection
+  - targeted materialization request to the winner
+  - readiness publication before parked work is released
+  - explicit distinction between routeable-ready and lease-authorized when the component family is singleton-scoped
+- [ ] Define the first capacity-relief placement flow:
+  - stressed hotel help signal
+  - candidate offers
+  - winning offer selection
+  - drain/retire contract instead of immediate kill-by-panic
 - [ ] Move inter-hotel ACK behavior toward strict post-commit truth before claiming multi-hop reliability.
 - [ ] Build the first watched local multi-hotel vertical slice:
   - membrane on one hotel
@@ -320,7 +388,9 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 
 ## New Project: Model Controller
 
-- [ ] Review [MODEL_CONTROLLER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack-model-controller-abstraction/docs/architecture/MODEL_CONTROLLER_PROPOSAL.md).
+Seam IDs: `structured-model-envelope`, `hotel-gemini-oauth-flow`
+
+- [ ] Review [MODEL_CONTROLLER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MODEL_CONTROLLER_PROPOSAL.md).
 - [x] Land the first `voice.synthesize` request envelope with `display_text`, `spoken_text`, `voice`, `model`, and `provider_options`.
 - [x] Add an upstream producer example that emits the richer `voice.synthesize` envelope through the hotel.
 - [x] Move the first task failure contract into the shared protocol layer (`philotic-client`) so `model-router` and `agent-core` can exchange structured errors without making `agent-core` the accidental owner of reality.
@@ -418,7 +488,9 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 
 ## New Project: Key Vault
 
-- [ ] Review [KEY_VAULT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack-model-controller-abstraction/docs/architecture/KEY_VAULT_PROPOSAL.md).
+Seam IDs: `vault-secret-refs`, `remote-vault-delegation`
+
+- [ ] Review [KEY_VAULT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/KEY_VAULT_PROPOSAL.md).
 - [x] Define the first vault record schema and context-graph secret references.
 - [x] Begin removing new OAuth access-token storage from plain `node_config` by storing secret refs instead.
 - [x] Define and implement the first hotel-local secret fetch API for guests.
@@ -477,6 +549,77 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
   - `grant_id`
   - `action_class`
   - structured payload
+
+## New Project: Mesh Visibility And State Placement
+
+Seam IDs: `mesh-visible-state-contract`
+
+- [ ] Review [MESH_VISIBILITY_AND_STATE_PLACEMENT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MESH_VISIBILITY_AND_STATE_PLACEMENT_PROPOSAL.md).
+- [ ] Define the first shared state-classification rubric:
+  - hotel-local only
+  - hotel-owned canonical with remote query/delegation
+  - mesh-visible metadata
+  - single-writer leased state with mesh-visible owner
+  - replicated/federated state
+- [ ] Define the first common mesh-visible record envelope:
+  - `record_type`
+  - `record_id`
+  - `owning_hotel`
+  - `canonical_writer`
+  - `state`
+  - `version`
+  - `updated_at`
+  - optional health/lease/delegation fields
+- [ ] Inventory the first current candidate record families:
+  - Telegram poll lease authority
+  - vault metadata
+  - agent-home authority
+  - routed capability availability
+- [ ] Define the first decision checklist for when local SQLite/file-db truth is too cumbersome and needs a mesh-visible projection or a stronger state-plane boundary.
+- [ ] Decide the first publication/query mechanism for mesh-visible records without treating raw SQLite rows as a network contract.
+- [ ] Reclassify existing active seams against the shared rubric:
+  - [TELEGRAM_POLL_LEASE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_POLL_LEASE_PROPOSAL.md)
+  - [KEY_VAULT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/KEY_VAULT_PROPOSAL.md)
+  - [MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md)
+
+## New Project: Runtime Authority Leases
+
+Seam IDs: `runtime-authority-leases`
+
+- [ ] Review [RUNTIME_AUTHORITY_LEASES_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RUNTIME_AUTHORITY_LEASES_PROPOSAL.md).
+- [ ] Define the shared lease contract fields:
+  - `lease_type`
+  - `lease_scope`
+  - `authority_hotel`
+  - `owner_guest_id`
+  - optional `owner_hotel`
+  - `lease_epoch`
+  - `lease_expires_at`
+  - `last_heartbeat_at`
+  - `status`
+- [x] Compare [SESSION_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SESSION_LOOP_PROPOSAL.md) session leases and [TELEGRAM_POLL_LEASE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_POLL_LEASE_PROPOSAL.md) poll leases against the shared archetype and note field/behavior convergence.
+- [x] Define the first clear boundary contract between:
+  - lease authority
+  - materialization
+  - supervision
+  - routing
+  - vault/secret access
+- [x] Distinguish authority leases from retention leases so downscaling policy does not force exclusive authority semantics onto replicated capacity.
+- [ ] Apply that boundary contract to the next concrete runtime seam so route demand, standby materialization, and lease grant order are proven in one non-Telegram path.
+- [ ] Classify the first component families by authority profile and lease family:
+  - agents / session actors
+  - Telegram pollers
+  - model workers
+  - tool runners
+- [x] Implement the first shared lease abstraction:
+  - shared `LeaseEnvelope`
+  - provider contract
+  - observer hook vocabulary
+  - event hooks for owner-change, expiry, revoke, and stale-owner cleanup
+- [x] Adapt Telegram poll lease to the shared abstraction.
+- [x] Restore startup dual-poller smoke to green under the shared lease abstraction.
+- [x] Harden the startup dual-poller handoff so clearing dead guest PIDs cannot accidentally reactivate a retired poller.
+- [ ] Decide which next non-Telegram runtime seam should adopt the lease archetype first.
 
 ## Next Project: Tool Assembly and Routed Execution
 
@@ -561,6 +704,8 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 
 ## Next Work Item: Muninn Heuristic Memory Experiment
 
+Seam IDs: `wider-client-adoption`, `philotic-native-memory-integration`
+
 - [ ] Review [MUNINN_MEMORY_PROTOCOL_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MUNINN_MEMORY_PROTOCOL_PROPOSAL.md).
 - [ ] Review [MUNINN_CLIENT_MEMORY_PROTOCOL.md](/Users/jaredlikes/code/philotic-stack/docs/reference/MUNINN_CLIENT_MEMORY_PROTOCOL.md).
 - [x] Validate the local Muninn MCP handshake and core tool calls.
@@ -603,10 +748,10 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 - [ ] `openclaw.json` ingestion: define a migration/import path that can consume legacy agent manifests and materialize Philotic agents.
 - [ ] Context graph deployment model: decide local-first vs cloud-backed vs hybrid graph ownership, sync, and operational model.
 - [ ] Context graph decentralization: decide how much of the graph can be replicated/federated across hotels versus kept locally authoritative.
-- [ ] Perimeter egress control: define the canonical outbound egress policy object and finding schema.
-- [ ] Perimeter egress inventory: classify current direct outbound HTTP paths into perimeter-controlled, temporary exceptions, and future violations.
+- [ ] Perimeter egress control (`egress-policy-object`): define the canonical outbound egress policy object and finding schema.
+- [ ] Perimeter egress inventory (`outbound-classification`): classify current direct outbound HTTP paths into perimeter-controlled, temporary exceptions, and future violations.
 - [ ] Perimeter egress first implementation: route one non-model outbound HTTP path through a perimeter-controlled boundary while keeping model/provider egress as an explicit exception for now.
-- [ ] Approval UX evolution: add `/preapprove`, `/approval status`, `/approval reset`, and richer session policy editing for constrained transports like Telegram.
+- [ ] Approval UX evolution (`session-preapproval-ux`): add `/preapprove`, `/approval status`, `/approval reset`, and richer session policy editing for constrained transports like Telegram.
 - [ ] Review [TELEGRAM_INTEGRATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_INTEGRATION_PROPOSAL.md).
 - [ ] Review [TELEGRAM_POLL_LEASE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_POLL_LEASE_PROPOSAL.md).
 - [ ] Review [PERIMETER_EGRESS_CONTROL_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PERIMETER_EGRESS_CONTROL_PROPOSAL.md).
@@ -616,11 +761,12 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 - [x] Telegram bot command registration/UI: call Telegram `setMyCommands` from `membrane` startup so supported slash commands show up in the Telegram client command UI instead of existing only as hidden transport behavior.
 - [x] Telegram poll ownership (first slice): add a hotel-owned poll lease per bot token fingerprint so only one local membrane long-polls `getUpdates` for a token at a time, and fail closed when lease acquisition is denied.
 - [x] Telegram poll ownership (authority slice): anchor agent identity to `authority_hotel` and deny poll-lease acquisition when the current hotel is not that agent's home authority.
+- [x] Telegram poll delegated authority (transitional slice): allow a non-home hotel to acquire the poll lease only when the agent identity bundle explicitly lists that hotel in `telegram_poll_delegate_hotels`.
 - [x] Telegram poll failover (renewal slice): teach `membrane` to renew the poll lease, expire stale owners, and stop polling immediately on lost renewal or stale epoch.
 - [x] Telegram poll graceful release: explicitly release the poll lease on intentional membrane shutdown instead of relying only on disconnect cleanup.
-- [ ] Telegram poll lease smoke: prove only one of two membranes sharing a bot token polls at a time, then prove standby takeover after release or expiry.
+- [x] Telegram poll lease smoke: prove only one of two membranes sharing a bot token polls at a time, then prove standby takeover after release or expiry.
 - [ ] Telegram poll lease mesh authority: move poll-lease truth from local hotel runtime state toward canonical mesh-visible authority so two hotels cannot race the same bot token.
-- [ ] Telegram approval card UX: include request IDs, tool/action names, args summaries, and resolution messages in a more native Telegram approval experience.
+- [ ] Telegram approval card UX (`approval-card-ux`): include request IDs, tool/action names, args summaries, and resolution messages in a more native Telegram approval experience.
 - [x] Telegram streaming Layer 1: add typing indicator heartbeat to `membrane` — `ActiveTurn` map, `sendChatAction(typing)` on dispatch, 4-second refresh loop, cancel on `send_reply`.
 - [ ] Telegram streaming: add message length chunking to `membrane` — split at paragraph boundaries before `sendMessage`, shared `send_formatted_text` helper.
 - [x] Telegram streaming Layer 2 protocol: add `TurnEventPayload` to `agent-core/src/protocol.rs` and `emit_turn_event` helper to `AgentRuntime`; emit `waiting_tool`, `waiting_approval` events back to membrane via the existing `EmitTask` path.
@@ -628,7 +774,7 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 - [ ] Telegram streaming partial reply: add `action = "partial_reply"` signal from `agent-core` once model-router supports chunked output; implement edit-based progressive delivery in `membrane`.
 - [ ] Voice machine design: define STT, TTS, speech-to-speech, transcript generation, and media artifact/session handling.
 - [ ] Nostr communication-plane investigation: evaluate Nostr as a decentralized/event-native transport, with security and privacy-first scrutiny before any implementation.
-- [ ] Tool runner lifecycle policy: define idle retention, sleep/teardown timing, wake-up thresholds, and environment-specific materialization rules for routed tools.
+- [ ] Tool runner lifecycle policy (`runner-materialization-policy`): define idle retention, sleep/teardown timing, wake-up thresholds, and environment-specific materialization rules for routed tools.
 - [ ] Runner artifact plane: define builder trust, sandboxing, testing, signing, release, and distribution policy for executable tool runners.
 - [ ] Memory consolidation / dreaming: define how short-term session state becomes long-term memory, including sleep/dream cycles, compaction, and candidate memory backends such as `scryper/miniminddb`.
 
@@ -721,14 +867,19 @@ Now that the End-to-End Philotic architecture is complete, we need to separate i
 
 ## Documentation Process And Architecture Truth
 
+Seam IDs: `active-proposal-frontmatter-rollout`, `architecture-doc-metadata-rollout`, `proposal-disposition-rollout`
+
 - [x] Define architecture documentation domains as a lightweight organization layer instead of adding deep proposal folders immediately.
 - [x] Create a living architecture status snapshot that acts as the single source of truth for implemented behavior, transitional seams, and currently active work.
 - [x] Make the docs index point to an architecture hub and status snapshot before deeper reference or proposal reading.
 - [x] Define a lightweight tagging and frontmatter strategy for active architecture/process docs, including controlled `domain`, `doc_type`, and `status` vocabularies.
+- [x] Define stable seam IDs in [docs/architecture/SEAM_REGISTRY.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SEAM_REGISTRY.md) so proposals and the task surface can share one seam vocabulary.
 - [ ] Apply the frontmatter schema to the highest-value active docs first:
-  - [ ] [docs/architecture/ARCHITECTURE_STATUS.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE_STATUS.md)
-  - [ ] [docs/architecture/ARCHITECTURE.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE.md)
-  - [ ] current active proposal set
-- [ ] Decide when seam docs become first-class artifacts instead of remaining proposal sections plus task items.
-- [ ] Tighten [docs/architecture/ARCHITECTURE.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE.md) against current execution-transport and current session-authority reality.
-- [ ] Audit historical docs and clearly mark any remaining non-authoritative architecture narratives as legacy or historical.
+  - [x] [docs/architecture/ARCHITECTURE_STATUS.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE_STATUS.md)
+  - [x] [docs/architecture/ARCHITECTURE.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE.md)
+  - [x] current active repo-local proposal set
+- [x] Align model-controller and key-vault proposal docs with the same frontmatter discipline in this repository.
+- [x] Create a scope-first architecture domain catalog for navigating current truth and active proposals by domain.
+- [x] Decide that seam docs remain exception-based artifacts and only graduate from proposal + registry + task surfaces when cross-cutting complexity or repeated confusion justifies their own boundary doc.
+- [x] Tighten [docs/architecture/ARCHITECTURE.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE.md) against current execution-transport and current session-authority reality.
+- [x] Audit historical docs and clearly mark any remaining non-authoritative architecture narratives as legacy or historical.

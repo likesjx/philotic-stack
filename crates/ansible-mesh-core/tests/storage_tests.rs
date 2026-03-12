@@ -7,6 +7,7 @@
 //! - `IpcRequest` / `IpcResponse` serialization round-trips
 
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
+use ansible_mesh_core::graph::{RoleIncarnationRecord, TurnLoopConfig};
 use ansible_mesh_core::sqlite_storage::{
     SqliteCursorStorage, SqliteEventStorage, SqliteGraphStorage,
 };
@@ -66,6 +67,7 @@ fn sample_session() -> SessionRecord {
         session_id: "sess-1".into(),
         session_kind: "conversation".into(),
         primary_agent_id: Some("agent-jane".into()),
+        active_incarnation_id: Some("agent-jane:orchestrator".into()),
         channel_kind: Some("telegram".into()),
         channel_session_key: Some("telegram:123".into()),
         status: "active".into(),
@@ -74,6 +76,23 @@ fn sample_session() -> SessionRecord {
         summary_json: serde_json::json!({"summary": "user wants concise replies"}),
         created_at: now_ms(),
         updated_at: now_ms(),
+    }
+}
+
+fn sample_role_incarnation(role_name: &str) -> RoleIncarnationRecord {
+    RoleIncarnationRecord {
+        agent_id: "agent-jane".into(),
+        role_name: role_name.into(),
+        guest_id: format!("agent-jane:{role_name}"),
+        toolset_profile: format!("{role_name}-profile"),
+        role_identity_addendum: Some(format!("You are the {role_name} role.")),
+        inactive_ttl_seconds: Some(900),
+        turn_loop_config: TurnLoopConfig {
+            iteration_cap: Some(12),
+            approval_policy: Some("default".into()),
+            model_profile: Some("gemini-default".into()),
+            context_window_policy: Some("balanced".into()),
+        },
     }
 }
 
@@ -767,7 +786,51 @@ fn graph_storage_session_round_trip() {
         .expect("session should exist");
     assert_eq!(loaded.session_kind, "conversation");
     assert_eq!(loaded.primary_agent_id.as_deref(), Some("agent-jane"));
+    assert_eq!(
+        loaded.active_incarnation_id.as_deref(),
+        Some("agent-jane:orchestrator")
+    );
     assert_eq!(loaded.summary_json["summary"], "user wants concise replies");
+}
+
+#[test]
+fn graph_storage_role_incarnation_round_trip() {
+    let store = open_graph_storage();
+    let role = sample_role_incarnation("developer");
+
+    store.upsert_role_incarnation(&role).unwrap();
+
+    let loaded = store
+        .get_role_incarnation("agent-jane", "developer")
+        .unwrap()
+        .expect("role incarnation should exist");
+    assert_eq!(loaded, role);
+}
+
+#[test]
+fn graph_storage_lists_role_incarnations_by_agent() {
+    let store = open_graph_storage();
+    store
+        .upsert_role_incarnation(&sample_role_incarnation("orchestrator"))
+        .unwrap();
+    store
+        .upsert_role_incarnation(&sample_role_incarnation("developer"))
+        .unwrap();
+    store
+        .upsert_role_incarnation(&RoleIncarnationRecord {
+            agent_id: "agent-aria".into(),
+            role_name: "researcher".into(),
+            guest_id: "agent-aria:researcher".into(),
+            toolset_profile: "research-profile".into(),
+            role_identity_addendum: None,
+            inactive_ttl_seconds: None,
+            turn_loop_config: TurnLoopConfig::default(),
+        })
+        .unwrap();
+
+    let jane_roles = store.list_role_incarnations("agent-jane").unwrap();
+    assert_eq!(jane_roles.len(), 2);
+    assert!(jane_roles.iter().all(|role| role.agent_id == "agent-jane"));
 }
 
 #[test]

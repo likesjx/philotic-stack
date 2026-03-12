@@ -6,7 +6,7 @@
 //! pluggable deployment-time decision.
 
 use crate::event::EventEnvelope;
-use crate::graph::{AbstractToolRecord, GraphEdge, GraphNode};
+use crate::graph::{AbstractToolRecord, GraphEdge, GraphNode, RoleIncarnationRecord};
 use crate::NodeCapabilities;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -79,6 +79,7 @@ pub struct HotelRecord {
 pub struct AgentIdentityRecord {
     pub agent_id: String,
     pub persona_name: String,
+    pub authority_hotel: String,
     #[serde(default)]
     pub bundle_json: serde_json::Value,
 }
@@ -89,6 +90,8 @@ pub struct SessionRecord {
     pub session_id: String,
     pub session_kind: String,
     pub primary_agent_id: Option<String>,
+    #[serde(default)]
+    pub active_incarnation_id: Option<String>,
     pub channel_kind: Option<String>,
     pub channel_session_key: Option<String>,
     pub status: String,
@@ -219,6 +222,13 @@ pub trait GraphStorage: Send + Sync {
 
     fn upsert_session(&self, session: &SessionRecord) -> Result<()>;
     fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>>;
+    fn upsert_role_incarnation(&self, role: &RoleIncarnationRecord) -> Result<()>;
+    fn get_role_incarnation(
+        &self,
+        agent_id: &str,
+        role_name: &str,
+    ) -> Result<Option<RoleIncarnationRecord>>;
+    fn list_role_incarnations(&self, agent_id: &str) -> Result<Vec<RoleIncarnationRecord>>;
     fn upsert_session_participant(&self, participant: &SessionParticipantRecord) -> Result<()>;
     fn list_session_participants(&self, session_id: &str) -> Result<Vec<SessionParticipantRecord>>;
     fn upsert_session_turn(&self, turn: &SessionTurnRecord) -> Result<()>;

@@ -161,7 +161,7 @@ impl VoiceResponsePolicy {
     /// Returns true if voice synthesis should fire for this turn.
     pub fn is_active(&self, had_voice_input: bool) -> bool {
         match self.mode {
-            TtsMode::Off => false,
+            TtsMode::Off => had_voice_input,
             TtsMode::On => true,
             TtsMode::Auto => had_voice_input,
         }
@@ -1909,8 +1909,8 @@ mod tests {
     use super::{
         ApprovalPolicy, ComponentExecutionRoute, ComponentRouteAssembly, ComponentRouteBinding,
         SessionBindings, SessionState, TaskRunnerBaseConfig, ToolRunnerIncarnationBinding,
-        TransportReplyTargetBinding, WorkingTurn, default_tool_assembly_for_bindings,
-        merge_session_index, session_checkpoint_memory_type,
+        TransportReplyTargetBinding, TtsMode, VoiceResponsePolicy, WorkingTurn,
+        default_tool_assembly_for_bindings, merge_session_index, session_checkpoint_memory_type,
     };
     use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
     use uuid::Uuid;
@@ -1956,6 +1956,24 @@ mod tests {
         );
         assert!(checkpoint["component_route_assembly"].is_object());
         assert!(checkpoint["tool_assembly"].is_object());
+    }
+
+    #[test]
+    fn tts_off_still_mirrors_voice_input_without_caption() {
+        let policy = VoiceResponsePolicy {
+            mode: TtsMode::Off,
+            ..Default::default()
+        };
+
+        assert!(!policy.is_active(false), "plain text should stay text-only");
+        assert!(
+            policy.is_active(true),
+            "voice input should still get a voice reply"
+        );
+        assert!(
+            !policy.caption_enabled(),
+            "off mode should not attach text captions"
+        );
     }
 
     #[test]

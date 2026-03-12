@@ -5,7 +5,7 @@
 //! consume them as `Arc<dyn EventStorage>`, etc.
 
 use crate::event::{EventEnvelope, EventId, EventKind, EventPayload};
-use crate::graph::AbstractToolRecord;
+use crate::graph::{AbstractToolRecord, RoleIncarnationRecord};
 use crate::graph::{GraphEdge, GraphNode};
 use crate::storage::{
     CursorStorage, EventStorage, GraphAdapter, GraphStorage, GuestRecord, HotelRecord,
@@ -561,6 +561,7 @@ impl SqliteGraphStorage {
             CREATE TABLE IF NOT EXISTS agent_identities (
                 agent_id TEXT PRIMARY KEY,
                 persona_name TEXT NOT NULL,
+                authority_hotel TEXT NOT NULL DEFAULT '',
                 bundle_json TEXT NOT NULL
             );
 
@@ -588,6 +589,10 @@ impl SqliteGraphStorage {
         );
         let _ = conn.execute(
             "ALTER TABLE hotels ADD COLUMN execution_port INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE agent_identities ADD COLUMN authority_hotel TEXT NOT NULL DEFAULT ''",
             [],
         );
         drop(conn);
@@ -991,12 +996,18 @@ impl GraphStorage for SqliteGraphStorage {
         let conn = self.conn.lock().unwrap();
         let bundle_json = serde_json::to_string(&identity.bundle_json)?;
         conn.execute(
-            "INSERT INTO agent_identities (agent_id, persona_name, bundle_json)
-             VALUES (?1, ?2, ?3)
+            "INSERT INTO agent_identities (agent_id, persona_name, authority_hotel, bundle_json)
+             VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(agent_id) DO UPDATE SET
              persona_name = excluded.persona_name,
+             authority_hotel = excluded.authority_hotel,
              bundle_json = excluded.bundle_json",
-            params![identity.agent_id, identity.persona_name, bundle_json],
+            params![
+                identity.agent_id,
+                identity.persona_name,
+                identity.authority_hotel,
+                bundle_json
+            ],
         )?;
         drop(conn);
 
@@ -1041,14 +1052,15 @@ impl GraphStorage for SqliteGraphStorage {
 
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT agent_id, persona_name, bundle_json FROM agent_identities WHERE agent_id = ?1",
+            "SELECT agent_id, persona_name, authority_hotel, bundle_json FROM agent_identities WHERE agent_id = ?1",
         )?;
         let mut rows = stmt.query(params![agent_id])?;
         if let Some(row) = rows.next()? {
-            let bundle_json: String = row.get(2)?;
+            let bundle_json: String = row.get(3)?;
             Ok(Some(crate::storage::AgentIdentityRecord {
                 agent_id: row.get(0)?,
                 persona_name: row.get(1)?,
+                authority_hotel: row.get(2)?,
                 bundle_json: serde_json::from_str(&bundle_json)
                     .unwrap_or_else(|_| serde_json::json!({})),
             }))
@@ -1156,6 +1168,43 @@ impl GraphStorage for SqliteGraphStorage {
             Some(node) => Ok(Some(serde_json::from_value(node.data)?)),
             None => Ok(None),
         }
+    }
+
+    fn upsert_role_incarnation(&self, role: &RoleIncarnationRecord) -> Result<()> {
+        self.adapter.upsert_node(&GraphNode {
+            node_key: format!("role_incarnation:{}:{}", role.agent_id, role.role_name),
+            kind: "role_incarnation".into(),
+            label: Some(role.guest_id.clone()),
+            data: serde_json::to_value(role)?,
+        })
+    }
+
+    fn get_role_incarnation(
+        &self,
+        agent_id: &str,
+        role_name: &str,
+    ) -> Result<Option<RoleIncarnationRecord>> {
+        match self
+            .adapter
+            .get_node(&format!("role_incarnation:{agent_id}:{role_name}"))?
+        {
+            Some(node) => Ok(Some(serde_json::from_value(node.data)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn list_role_incarnations(&self, agent_id: &str) -> Result<Vec<RoleIncarnationRecord>> {
+        self.adapter
+            .list_nodes_by_kind("role_incarnation")?
+            .into_iter()
+            .map(|node| serde_json::from_value::<RoleIncarnationRecord>(node.data).map_err(Into::into))
+            .filter(|result| {
+                result
+                    .as_ref()
+                    .map(|role| role.agent_id == agent_id)
+                    .unwrap_or(true)
+            })
+            .collect()
     }
 
     fn upsert_session_participant(&self, participant: &SessionParticipantRecord) -> Result<()> {

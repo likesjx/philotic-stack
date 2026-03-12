@@ -1,3 +1,38 @@
+---
+title: "Agent Incarnation Model Proposal"
+doc_type: proposal
+domain: runtime-sessions
+status: accepted-current-slice
+last_updated: 2026-03-12
+tags:
+  - incarnations
+  - roles
+  - routing
+  - active-seam
+  - current-slice
+related_docs:
+  - ARCHITECTURE_STATUS.md
+  - SESSION_LOOP_PROPOSAL.md
+  - AGENT_LOOP_PROPOSAL.md
+  - TELEGRAM_POLL_LEASE_PROPOSAL.md
+task_refs:
+  - docs/task.md
+proposal_id: agent-incarnation
+implements:
+  - session-loop
+implemented_by:
+  - ../../crates/ansible-mesh-core/src/graph.rs
+  - ../../crates/ansible-mesh-core/src/storage.rs
+  - ../../crates/ansible-mesh-core/src/sqlite_storage.rs
+  - ../../crates/ansible/src/service/ipc.rs
+active_seams:
+  - role-incarnation-records
+  - active-membrane-routing
+  - handoff-skill
+source_of_truth_targets:
+  - ARCHITECTURE_STATUS.md
+---
+
 # Agent Incarnation Model Proposal
 
 ## Goal
@@ -6,7 +41,21 @@ Define a first-class incarnation model for agents so that a single agent identit
 
 ## Disposition
 
-`design review complete — revised model adopted, implementation sequencing next`
+`accepted for current slice`
+
+## Current Slice
+
+The first runtime substrate for the incarnation model now exists:
+
+- `RoleIncarnationRecord` and `TurnLoopConfig` are persisted in the Context Graph
+- `SessionRecord` carries `active_incarnation_id`
+- hotel IPC routing now reads `session.active_incarnation_id` before delivering inbound agent tasks
+
+This slice is intentionally narrower than the full proposal:
+
+- role definitions exist, but `ConfigureRole` is not implemented yet
+- active route selection exists, and unregistered active-incarnation targets now fall back to a live orchestrator when one is present, but buffered materialization is not implemented yet
+- handoff IPC, role-profile seeding, inactive TTL reclaim, and subagents remain future slices
 
 ## Linked Work Surface
 
@@ -21,9 +70,39 @@ An **agent** is an identity: soul, history, relationships, and shared memory. Th
 
 An **incarnation** is a long-lived, named role that the agent plays. Each incarnation has its own capability posture (toolset/skillset), its own role identity addendum layered on top of the base soul, and its own running session context (turn history, working memory). Multiple incarnations can be active concurrently. The **philotic membrane (membrane)** routes inbound user messages to exactly one incarnation at a time — the active one — but all incarnations can send outbound messages back through the membrane.
 
+Important boundary: role switching changes the current inbound route target, not the underlying membrane transport authority. A Telegram poller stays attached to the agent/home-hotel membrane authority even when the active routed incarnation changes from orchestrator to developer, architect, or another role.
+
+Important identity boundary: all role incarnations share the same base agent identity. A role addendum modifies posture, specialization, and stance; it does not create a second self. Philotic should treat roles as additive overlays on one continuous identity, not as sibling personas with shared storage.
+
 **Workers and subagents** are a separate, ephemeral category: short-lived task delegates that have no access to the communication plane. Their results bubble up to the incarnation that spawned them.
 
 The analogy: an agent is a person. Their role incarnations are the hats they wear — developer, architect, researcher. Switching hats doesn't change who they are or what they know. A worker is more like a contractor they've hired for a specific job.
+
+### Shared identity, additive role posture
+
+Role incarnations are not separate souls.
+
+They inherit the same:
+
+- base soul and identity
+- user relationship framing
+- shared memory continuity
+- long-term commitments and values
+
+They vary by:
+
+- role addendum
+- toolset and skillset posture
+- turn-loop posture
+- handoff behavior
+
+The rule is deliberately strict:
+
+- `role_identity_addendum` is additive, not replacing
+- role config must not redefine the agent's name, biography, operator relationship, or base value system
+- orchestrator is governing specialized stances for one agent identity, not creating new semi-agents
+
+This matters for both prompt construction and control-plane policy. If a role record can silently replace identity, the incarnation model degenerates into multiple agents wearing a shared database like a trench coat.
 
 ---
 
@@ -34,7 +113,7 @@ The analogy: an agent is a person. Their role incarnations are the hats they wea
 Long-lived, named, provisioned through the orchestrator. Each is a persistent process on the hotel.
 
 **Properties:**
-- **Identity**: shares the base agent soul + carries a `role_identity_addendum` (extra persona/directive text specific to this role)
+- **Identity**: shares the base agent soul, identity, user relationship layer, and durable memory ownership + carries a `role_identity_addendum` (extra posture/directive text specific to this role)
 - **Context**: own session — separate turn history, working memory, active turn state
 - **Toolset**: defined by a named `toolset_profile` (see Role Provisioning)
 - **Skillset**: defined by a named skill set in the profile
@@ -71,13 +150,20 @@ Ephemeral task delegates. Spawned by any incarnation for a specific, bounded tas
 
 ## Active Membrane Routing
 
+Before the routing details, separate two kinds of authority that should not be conflated:
+
+- **membrane transport authority**: who owns the external communication boundary itself (for example, which hotel/membrane polls Telegram for this agent)
+- **active membrane route**: which incarnation currently receives new inbound turns from that membrane
+
+The first should be stable at the agent identity / home-hotel layer. The second is the thing that handoff changes.
+
 ### The `active_incarnation_id` primitive
 
 The Context Graph session record carries `active_incarnation_id`. The hotel's IpcServer reads this field when routing inbound tasks from membrane.
 
 - Default: the agent's orchestrator/conversational incarnation
 - Updated by the hotel in response to handoff signals from incarnations
-- If the active incarnation is not registered (race window, crash), fall back to the orchestrator immediately and log
+- If the active incarnation is not registered (race window, crash), the intended behavior is to fall back to the orchestrator immediately and log
 
 Inbound routing rule:
 ```
@@ -86,6 +172,8 @@ incoming message for agent X in session S
   → route to that guest via UDS
   → if not registered: route to default orchestrator incarnation
 ```
+
+This is intentionally a routing decision, not a membrane-election decision. The membrane/poller remains the same transport endpoint; only the downstream role target changes.
 
 ### Concurrent roles
 
@@ -101,6 +189,14 @@ The active incarnation changes when:
 3. An operator sends a control signal (future)
 
 The hotel processes the switch: updates `active_incarnation_id`, queues inbound for the new owner, notifies both the outgoing and incoming incarnation.
+
+What does **not** change automatically:
+
+- Telegram poll lease ownership
+- membrane transport authority
+- the existence or health of the membrane process itself
+
+Those belong to the agent/home-hotel membrane boundary, not the currently active role incarnation.
 
 **Race window handling**: the hotel does not update `active_incarnation_id` until the target incarnation's process is registered and responsive. If the target is not yet live, the hotel materializes it, queues the inbound message, and delivers once registration is confirmed.
 
@@ -167,7 +263,7 @@ Any incarnation can hand back. The `HandoffBack` carries a summary that the rece
 
 ## Role Provisioning
 
-Role incarnations are defined in the **Context Graph**, not in static config. The orchestrator incarnation has access to the `agent.configure_role` tool, which creates or updates a role definition.
+Role incarnations are defined in the **Context Graph**, not in static config. The orchestrator incarnation has access to the `agent.configure_role` tool, which creates or updates a role definition for its own agent identity.
 
 ### Role record
 
@@ -175,18 +271,18 @@ Role incarnations are defined in the **Context Graph**, not in static config. Th
 RoleIncarnationRecord {
     agent_id: String,
     role_name: String,                    // e.g. "developer"
-    role_identity_addendum: String,       // persona/directive text layered on base soul
+    guest_id: String,                     // current routed guest identity for this incarnation
+    role_identity_addendum: String,       // additive posture/directive text layered on base identity
     toolset_profile: String,              // reference to a ToolsetProfile in the graph
     turn_loop_config: TurnLoopConfig,
     inactive_ttl_seconds: Option<u64>,    // None = no reclaim
-    is_active_in_hotel: bool,
 }
 
 TurnLoopConfig {
-    max_iterations: u32,                  // model round-trips per turn
-    approval_policy: ApprovalPolicy,      // preapproved_tools, preapproved_classes
-    preferred_model: Option<String>,      // override model selection for this role
-    context_window_turns: u32,            // how many recent turns to include in context
+    iteration_cap: u32,                   // model round-trips per turn
+    approval_policy: Option<String>,      // named policy/profile hook; concrete type still evolving
+    model_profile: Option<String>,        // override model selection for this role
+    context_window_policy: Option<String>,
 }
 ```
 
@@ -226,6 +322,17 @@ AbstractSkillRecord {
 
 Skills serve dual purpose: a model prompt hint (`"Current skill posture: codex"`) and a tool grant mechanism. Assigning a skill to a role implicitly adds its `implied_tools` to the effective toolset at assembly time.
 
+### Governance boundary
+
+Role creation and mutation should be governed through the orchestrator only.
+
+- only the orchestrator incarnation may create or update role definitions for its own agent identity
+- those writes should flow through a rigid workflow skill rather than a free-form mutation surface
+- the orchestrator's own core tool posture should remain intentionally narrow and not self-expand through ordinary role-management flows
+- handoff skills are governed separately from role capability profiles, even when the orchestrator manages both
+
+This keeps role governance centralized without letting the governing role quietly rewrite its own constitution in the middle of a conversation.
+
 ---
 
 ## Inactive TTL and On-Demand Materialization
@@ -262,6 +369,12 @@ All role incarnations share the same memory layer. There is no per-role memory i
 - Activity log: rolling summary of recent sessions (outcomes, unresolved threads) — written on session end
 
 All role incarnations read and write the same Tier 2/3 apartments. Changes during a user turn are immediately visible to all incarnations reading memory — the LWW push/pull semantics of `SyncApartment` are the consistency model. No additional synchronization is needed.
+
+Context-management implication:
+
+- base identity layers remain agent-level canonical data
+- role records may add posture, but they do not own or replace the agent-level identity fields
+- self-management of agent identity/context and governance of role posture are related but separate mutation surfaces
 
 **Tier 4 — Long-term memory (external service)**
 Initially: **Muninn** accessed as a hotel-mediated tool. The active incarnation can call `memory.search`, `memory.store` tools that the hotel routes to the local Muninn endpoint. Memory retrieval is automatic at prompt build time: before building the model prompt, if Muninn is configured, the hotel runs `memory.search` with the user message as the query and injects top-N results into the `[Knowledge]` projection section. This is transparent to the model.
@@ -404,11 +517,11 @@ Dependencies are real and must be respected:
 
 2. **Skill catalog + toolset profiles in the Context Graph.** `abstract_skill` nodes and `toolset_profile` nodes. Seed built-in profiles at hotel startup. This closes the tool assignment gap and establishes the profile resolution path.
 
-3. **Role incarnation records in the Context Graph.** `RoleIncarnationRecord` persisted and queryable. `agent.configure_role` IPC action. Hotel can now read role definitions at materialization time.
+3. **Role incarnation records in the Context Graph.** `RoleIncarnationRecord` persisted and queryable. This is now implemented. `agent.configure_role` IPC action is still pending.
 
 4. **Session bindings seeded from role profile.** When a session is initialized for a role incarnation, the hotel seeds `SessionBindings` from the role's `toolset_profile`. No more `["echo"]` default.
 
-5. **`active_incarnation_id` in session records + IpcServer routing update.** Hotel reads this field before routing inbound tasks. Default to orchestrator. Don't update until target is registered.
+5. **`active_incarnation_id` in session records + IpcServer routing update.** This is now implemented for inbound agent-task routing. Fallback to a live orchestrator when the active incarnation is unregistered is now implemented. Buffered materialization behavior is still pending.
 
 6. **`HandoffToRole` / `HandoffBack` IPC + handoff skill scaffolding.** Implement the membrane switch protocol. Define the first handoff skill shape.
 

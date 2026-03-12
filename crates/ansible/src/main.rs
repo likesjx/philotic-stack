@@ -17,10 +17,12 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use clap::{Parser, Subcommand, ValueEnum};
 use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -97,6 +99,8 @@ enum StartupTest {
     VoiceSample,
     #[value(name = "telegram-roundtrip", alias = "telegram-round-trip")]
     TelegramRoundTrip,
+    #[value(name = "telegram-poll-lease", alias = "telegram-poll-owner")]
+    TelegramPollLease,
 }
 
 const STARTUP_TEST_TEXT_REPLY: &str = "startup text smoke ok";
@@ -111,6 +115,10 @@ const STARTUP_TEST_TELEGRAM_VOICE_REPLY: &str = "startup telegram voice smoke ok
 struct FakeTelegramState {
     updates: std::sync::Mutex<VecDeque<serde_json::Value>>,
     sent_messages: std::sync::Mutex<Vec<serde_json::Value>>,
+    sent_media: std::sync::Mutex<Vec<serde_json::Value>>,
+    registered_commands: std::sync::Mutex<Vec<serde_json::Value>>,
+    deleted_command_syncs: std::sync::Mutex<u32>,
+    get_updates_calls: AtomicUsize,
     files: std::sync::Mutex<HashMap<String, FakeTelegramFile>>,
 }
 
@@ -136,6 +144,11 @@ struct TelegramSendMessageRequest {
     text: String,
     #[allow(dead_code)]
     parse_mode: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TelegramSetMyCommandsRequest {
+    commands: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -537,6 +550,7 @@ fn guest_seed_for_profile(hotel_name: &str, profile: &AgentProfile) -> Vec<Guest
                     "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
                     "PHILOTIC_NODE_ID": node_id.clone(),
                     "PHILOTIC_BLOB_BASE_URL": blob_base_url,
+                    "PHILOTIC_GUEST_ID": format!("{hotel_name}:membrane-gateway-{}", profile.agent_key),
                     "PHILOTIC_TARGET_AGENT_ID": profile.agent_id,
                     "PHILOTIC_TELEGRAM_BOT_TOKEN_KEY": "telegram_bot_token"
                 }
@@ -770,12 +784,14 @@ fn configured_agent_identity_from_config(
     let agent_config = merged_agent_config(config_json, hotel_name).map(|(_, agent)| agent);
     Some(agent_identity_record_for_profile(
         &profile,
+        hotel_name,
         agent_config.as_ref(),
     ))
 }
 
 fn agent_identity_record_for_profile(
     profile: &AgentProfile,
+    authority_hotel: &str,
     agent_config: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> AgentIdentityRecord {
     let mut bundle_json = profile
@@ -799,6 +815,7 @@ fn agent_identity_record_for_profile(
     AgentIdentityRecord {
         agent_id: profile.agent_id.clone(),
         persona_name: profile.persona_name.clone(),
+        authority_hotel: authority_hotel.to_string(),
         bundle_json,
     }
 }
@@ -835,13 +852,17 @@ fn deactivate_legacy_managed_guests(
     profile: &AgentProfile,
     desired_guests: &[GuestRecord],
 ) -> Result<()> {
+    // Transitional cleanup: the Telegram gateway used to be named "hegemon".
+    // Keep deactivating those legacy rows until old startup databases stop carrying them.
     let desired_ids = desired_guests
         .iter()
         .map(|guest| guest.guest_id.as_str())
         .collect::<std::collections::HashSet<_>>();
     let legacy_guest_ids = [
         format!("agent-core-{}", profile.agent_key),
+        format!("{hotel_name}:agent-core-{}", profile.agent_key),
         format!("hegemon-gateway-{}", profile.agent_key),
+        format!("{hotel_name}:hegemon-gateway-{}", profile.agent_key),
         "hegemon-gateway".to_string(),
         "model-router-gemini".to_string(),
     ]
@@ -856,8 +877,17 @@ fn deactivate_legacy_managed_guests(
                 return false;
             }
 
+            let hotel_prefixed_legacy_guest = guest
+                .guest_id
+                .strip_prefix(&format!("{hotel_name}:"))
+                .is_some_and(|suffix| {
+                    suffix.starts_with("agent-core-")
+                        || suffix.starts_with("hegemon-gateway")
+                        || suffix.starts_with("model-router-")
+                });
+
             legacy_guest_ids.contains(&guest.guest_id)
-                || guest.guest_id == format!("{hotel_name}:hegemon-gateway-{}", profile.agent_key)
+                || hotel_prefixed_legacy_guest
                 || (!guest.guest_id.starts_with(&format!("{hotel_name}:"))
                     && matches!(
                         guest.role.as_str(),
@@ -1072,15 +1102,17 @@ fn enable_guest_test_overrides(
                 guest.config_json = config.to_string();
             }
         }
-        StartupTest::TelegramRoundTrip => {
+        StartupTest::TelegramRoundTrip | StartupTest::TelegramPollLease => {
             graph.set_config_value(
                 "telegram_bot_token",
                 &serde_json::Value::String(STARTUP_TEST_TELEGRAM_TOKEN.into()).to_string(),
             )?;
-            graph.set_config_value(
-                "gemini_api_key",
-                &serde_json::Value::String(STARTUP_TEST_GEMINI_API_KEY.into()).to_string(),
-            )?;
+            if matches!(test, StartupTest::TelegramRoundTrip) {
+                graph.set_config_value(
+                    "gemini_api_key",
+                    &serde_json::Value::String(STARTUP_TEST_GEMINI_API_KEY.into()).to_string(),
+                )?;
+            }
 
             let telegram_api_base_url = startup_test_telegram_api_base_url(hotel_name);
             let gemini_api_base_url = startup_test_gemini_api_base_url(hotel_name);
@@ -1119,6 +1151,48 @@ fn enable_guest_test_overrides(
                 }
 
                 guest.config_json = config.to_string();
+            }
+
+            if matches!(test, StartupTest::TelegramPollLease) {
+                let hotel = default_hotel_record(hotel_name);
+                let primary_membrane = guests
+                    .iter()
+                    .find(|guest| guest.role == "membrane")
+                    .cloned()
+                    .context("telegram poll-lease startup test missing primary membrane guest")?;
+                let primary_config: serde_json::Value =
+                    serde_json::from_str(&primary_membrane.config_json).unwrap_or_default();
+                let primary_env = primary_config
+                    .get("env")
+                    .and_then(serde_json::Value::as_object)
+                    .context("primary membrane config missing env object")?;
+                let target_agent_id = primary_env
+                    .get("PHILOTIC_TARGET_AGENT_ID")
+                    .and_then(serde_json::Value::as_str)
+                    .context("primary membrane config missing PHILOTIC_TARGET_AGENT_ID")?;
+                let standby_guest_id = format!("{}-standby", primary_membrane.guest_id);
+                guests.push(GuestRecord {
+                    hotel_name: hotel_name.to_string(),
+                    guest_id: standby_guest_id.clone(),
+                    role: "membrane".into(),
+                    config_json: serde_json::json!({
+                        "command": "membrane",
+                        "args": [],
+                        "env": {
+                            "PHILOTIC_HOTEL_SOCKET": hotel.ipc_socket_path.clone(),
+                            "PHILOTIC_NODE_ID": hotel.capabilities.node_id.clone(),
+                            "PHILOTIC_BLOB_BASE_URL": blob_base_url,
+                            "PHILOTIC_GUEST_ID": standby_guest_id,
+                            "PHILOTIC_TARGET_AGENT_ID": target_agent_id,
+                            "PHILOTIC_TELEGRAM_BOT_TOKEN_KEY": "telegram_bot_token",
+                            "PHILOTIC_TELEGRAM_API_BASE_URL": telegram_api_base_url.clone(),
+                            "PHILOTIC_TELEGRAM_FILE_API_BASE_URL": telegram_api_base_url.clone()
+                        }
+                    })
+                    .to_string(),
+                    is_active: true,
+                    active_pid: None,
+                });
             }
         }
     }
@@ -1286,6 +1360,16 @@ fn fake_telegram_router(state: Arc<FakeTelegramState>) -> Router {
         .route("/bot:token/getFile", get(fake_telegram_get_file))
         .route("/file/*rest", get(fake_telegram_download_file))
         .route("/bot:token/sendMessage", post(fake_telegram_send_message))
+        .route("/bot:token/sendVoice", post(fake_telegram_send_media))
+        .route("/bot:token/sendAudio", post(fake_telegram_send_media))
+        .route(
+            "/bot:token/deleteMyCommands",
+            post(fake_telegram_delete_my_commands),
+        )
+        .route(
+            "/bot:token/setMyCommands",
+            post(fake_telegram_set_my_commands),
+        )
         .with_state(state)
 }
 
@@ -1294,6 +1378,7 @@ async fn fake_telegram_get_updates(
     Query(query): Query<TelegramGetUpdatesQuery>,
     State(state): State<Arc<FakeTelegramState>>,
 ) -> impl IntoResponse {
+    state.get_updates_calls.fetch_add(1, Ordering::Relaxed);
     let offset = query.offset.unwrap_or(0);
     let mut updates = state.updates.lock().expect("updates lock");
     let mut result = Vec::new();
@@ -1388,6 +1473,70 @@ async fn fake_telegram_send_message(
     }))
 }
 
+async fn fake_telegram_send_media(
+    AxumPath(_token): AxumPath<String>,
+    State(state): State<Arc<FakeTelegramState>>,
+    request: axum::extract::Request,
+) -> impl IntoResponse {
+    let headers = request.headers().clone();
+    let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
+        .await
+        .unwrap_or_default();
+
+    state
+        .sent_media
+        .lock()
+        .expect("sent media lock")
+        .push(serde_json::json!({
+            "content_type": headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default(),
+            "bytes_len": bytes.len(),
+        }));
+
+    Json(serde_json::json!({
+        "ok": true,
+        "result": {
+            "message_id": 1
+        }
+    }))
+}
+
+async fn fake_telegram_set_my_commands(
+    AxumPath(_token): AxumPath<String>,
+    State(state): State<Arc<FakeTelegramState>>,
+    Json(payload): Json<TelegramSetMyCommandsRequest>,
+) -> impl IntoResponse {
+    let commands = serde_json::to_value(payload.commands).unwrap_or(serde_json::Value::Null);
+    state
+        .registered_commands
+        .lock()
+        .expect("registered commands lock")
+        .push(commands);
+
+    Json(serde_json::json!({
+        "ok": true,
+        "result": true
+    }))
+}
+
+async fn fake_telegram_delete_my_commands(
+    AxumPath(_token): AxumPath<String>,
+    State(state): State<Arc<FakeTelegramState>>,
+) -> impl IntoResponse {
+    let mut deleted = state
+        .deleted_command_syncs
+        .lock()
+        .expect("deleted command syncs lock");
+    *deleted += 1;
+
+    Json(serde_json::json!({
+        "ok": true,
+        "result": true
+    }))
+}
+
 fn fake_gemini_router(state: Arc<FakeGeminiMediaState>) -> Router {
     Router::new()
         .route("/v1beta/models/*rest", post(fake_gemini_generate_content))
@@ -1449,6 +1598,62 @@ fn fake_gemini_reply_text(payload: &serde_json::Value) -> &'static str {
     }
 
     STARTUP_TEST_TELEGRAM_TEXT_REPLY
+}
+
+fn startup_test_telegram_poll_lease_key(token_key: &str, token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    let digest = hasher.finalize();
+    format!("{token_key}:{}", hex::encode(&digest[..8]))
+}
+
+fn startup_test_membrane_guests(hotel_name: &str) -> Result<Vec<GuestRecord>> {
+    let graph = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open("ansible_context.db")?;
+    let mut membranes = graph
+        .list_guests(hotel_name, false)?
+        .into_iter()
+        .filter(|guest| guest.role == "membrane")
+        .collect::<Vec<_>>();
+    membranes.sort_by(|left, right| left.guest_id.cmp(&right.guest_id));
+    Ok(membranes)
+}
+
+fn startup_test_set_guest_active(
+    hotel_name: &str,
+    guest_id: &str,
+    is_active: bool,
+    active_pid: Option<&str>,
+) -> Result<()> {
+    let conn = rusqlite::Connection::open("ansible_context.db")
+        .context("failed to open ansible_context.db for startup guest update")?;
+    conn.execute(
+        "UPDATE materialized_guests SET is_active = ?1, active_pid = ?2 WHERE hotel_name = ?3 AND guest_id = ?4",
+        rusqlite::params![is_active, active_pid, hotel_name, guest_id],
+    )
+    .with_context(|| format!("failed to update startup guest row for {}", guest_id))?;
+    Ok(())
+}
+
+fn startup_test_clear_guest_pid(hotel_name: &str, guest_id: &str) -> Result<()> {
+    let conn = rusqlite::Connection::open("ansible_context.db")
+        .context("failed to open ansible_context.db for startup guest pid clear")?;
+    conn.execute(
+        "UPDATE materialized_guests SET active_pid = NULL WHERE hotel_name = ?1 AND guest_id = ?2",
+        rusqlite::params![hotel_name, guest_id],
+    )
+    .with_context(|| format!("failed to clear startup guest pid for {}", guest_id))?;
+    Ok(())
+}
+
+fn startup_test_force_kill_pid(pid: u32) -> Result<()> {
+    let status = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status()
+        .with_context(|| format!("failed to send SIGKILL to pid {}", pid))?;
+    if !status.success() {
+        anyhow::bail!("kill -9 {} exited with status {}", pid, status);
+    }
+    Ok(())
 }
 
 fn prepare_startup_test_binaries(_test: StartupTest) -> Result<()> {
@@ -1787,6 +1992,291 @@ async fn run_startup_test(
             );
             Ok(())
         }
+        StartupTest::TelegramPollLease => {
+            let telegram_api_base_url = startup_test_telegram_api_base_url(hotel_name);
+            let telegram_addr = format!("127.0.0.1:{}", startup_test_telegram_port(hotel_name));
+            let telegram_state = Arc::new(FakeTelegramState::default());
+            let poll_lease_key = startup_test_telegram_poll_lease_key(
+                "telegram_bot_token",
+                STARTUP_TEST_TELEGRAM_TOKEN,
+            );
+
+            let telegram_listener = tokio::net::TcpListener::bind(&telegram_addr)
+                .await
+                .with_context(|| format!("failed to bind fake telegram api on {telegram_addr}"))?;
+            let telegram_server = tokio::spawn({
+                let state = Arc::clone(&telegram_state);
+                async move {
+                    axum::serve(telegram_listener, fake_telegram_router(state))
+                        .await
+                        .expect("fake telegram api should serve");
+                }
+            });
+
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+            let mut leader_guest_id = None;
+            let mut leader_pid = None;
+            for attempt in 1..=30 {
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                let membranes = startup_test_membrane_guests(hotel_name)?;
+                for guest in &membranes {
+                    let Some(pid_text) = guest.active_pid.as_deref() else {
+                        continue;
+                    };
+                    let Ok(pid) = pid_text.parse::<u32>() else {
+                        continue;
+                    };
+                    if !pid_exists(pid) {
+                        startup_test_clear_guest_pid(hotel_name, &guest.guest_id)?;
+                    }
+                }
+                let membranes = startup_test_membrane_guests(hotel_name)?;
+                let live = membranes
+                    .iter()
+                    .filter_map(|guest| {
+                        guest.active_pid.as_deref().and_then(|pid_text| {
+                            pid_text
+                                .parse::<u32>()
+                                .ok()
+                                .filter(|pid| pid_exists(*pid))
+                                .map(|pid| (guest.guest_id.clone(), pid))
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if let [single] = live.as_slice() {
+                    let (guest_id, pid) = single;
+                    leader_guest_id = Some(guest_id.clone());
+                    leader_pid = Some(*pid);
+                    info!(
+                        "Startup telegram poll-lease smoke observed active poller [{}] at pid {} on attempt {}",
+                        guest_id, pid, attempt
+                    );
+                    break;
+                }
+            }
+
+            let leader_guest_id =
+                leader_guest_id.context("timed out waiting for a single live membrane poller")?;
+            let leader_pid =
+                leader_pid.context("timed out waiting for active membrane pid for poller smoke")?;
+
+            {
+                let mut updates = telegram_state.updates.lock().expect("updates lock");
+                updates.push_back(serde_json::json!({
+                    "update_id": 1,
+                    "message": {
+                        "message_id": 1,
+                        "text": "/ping",
+                        "chat": { "id": 777100 },
+                        "from": { "id": 42, "username": "startup_test" }
+                    }
+                }));
+            }
+
+            for attempt in 1..=20 {
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                let sent_messages = telegram_state
+                    .sent_messages
+                    .lock()
+                    .expect("sent messages lock")
+                    .clone();
+                let deleted_command_syncs = *telegram_state
+                    .deleted_command_syncs
+                    .lock()
+                    .expect("deleted command syncs lock");
+                let registered_commands_len = telegram_state
+                    .registered_commands
+                    .lock()
+                    .expect("registered commands lock")
+                    .len();
+                if sent_messages.len() >= 1 {
+                    let text = sent_messages[0]
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    if text != "pong" {
+                        telegram_server.abort();
+                        let _ = telegram_server.await;
+                        anyhow::bail!(
+                            "unexpected first telegram poll-lease reply on attempt {}: expected {:?}, got {:?}",
+                            attempt,
+                            "pong",
+                            text
+                        );
+                    }
+                    if deleted_command_syncs != 1 || registered_commands_len != 1 {
+                        telegram_server.abort();
+                        let _ = telegram_server.await;
+                        anyhow::bail!(
+                            "expected exactly one command sync before takeover, got delete={} set={}",
+                            deleted_command_syncs,
+                            registered_commands_len
+                        );
+                    }
+                    break;
+                }
+                if attempt == 20 {
+                    telegram_server.abort();
+                    let _ = telegram_server.await;
+                    anyhow::bail!("timed out waiting for first poll-lease /ping reply");
+                }
+            }
+
+            startup_test_set_guest_active(hotel_name, &leader_guest_id, false, None)?;
+            let mut leader_stopped = false;
+            for _ in 1..=8 {
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                let membranes = startup_test_membrane_guests(hotel_name)?;
+                let Some(leader) = membranes
+                    .iter()
+                    .find(|guest| guest.guest_id == leader_guest_id)
+                else {
+                    leader_stopped = true;
+                    break;
+                };
+                let Some(pid_text) = leader.active_pid.as_deref() else {
+                    leader_stopped = true;
+                    break;
+                };
+                let Ok(pid) = pid_text.parse::<u32>() else {
+                    leader_stopped = true;
+                    break;
+                };
+                if !pid_exists(pid) {
+                    leader_stopped = true;
+                    break;
+                }
+            }
+            if !leader_stopped {
+                startup_test_force_kill_pid(leader_pid)?;
+            }
+
+            let mut standby_guest_id = None;
+            for _attempt in 1..=30 {
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                let membranes = startup_test_membrane_guests(hotel_name)?;
+                for guest in &membranes {
+                    let Some(pid_text) = guest.active_pid.as_deref() else {
+                        continue;
+                    };
+                    let Ok(pid) = pid_text.parse::<u32>() else {
+                        continue;
+                    };
+                    if !pid_exists(pid) {
+                        startup_test_clear_guest_pid(hotel_name, &guest.guest_id)?;
+                    }
+                }
+                let membranes = startup_test_membrane_guests(hotel_name)?;
+                if let Some(leader) = membranes
+                    .iter()
+                    .find(|guest| guest.guest_id == leader_guest_id)
+                    .cloned()
+                {
+                    startup_test_set_guest_active(hotel_name, &leader.guest_id, false, None)?;
+                    if let Some(pid_text) = leader.active_pid.as_deref() {
+                        if let Ok(pid) = pid_text.parse::<u32>() {
+                            if pid_exists(pid) {
+                                startup_test_force_kill_pid(pid)?;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                let live = membranes
+                    .iter()
+                    .filter_map(|guest| {
+                        guest.active_pid.as_deref().and_then(|pid_text| {
+                            pid_text
+                                .parse::<u32>()
+                                .ok()
+                                .filter(|pid| pid_exists(*pid))
+                                .map(|_pid| guest.guest_id.clone())
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if live.len() != 1 || live[0] == leader_guest_id {
+                    continue;
+                }
+                let deleted_command_syncs = *telegram_state
+                    .deleted_command_syncs
+                    .lock()
+                    .expect("deleted command syncs lock");
+                let registered_commands_len = telegram_state
+                    .registered_commands
+                    .lock()
+                    .expect("registered commands lock")
+                    .len();
+                if deleted_command_syncs >= 2 && registered_commands_len >= 2 {
+                    standby_guest_id = Some(live[0].clone());
+                    break;
+                }
+            }
+            let standby_guest_id =
+                standby_guest_id.context("timed out waiting for standby membrane takeover")?;
+
+            {
+                let mut updates = telegram_state.updates.lock().expect("updates lock");
+                updates.push_back(serde_json::json!({
+                    "update_id": 2,
+                    "message": {
+                        "message_id": 2,
+                        "text": "/ping",
+                        "chat": { "id": 777101 },
+                        "from": { "id": 42, "username": "startup_test" }
+                    }
+                }));
+            }
+
+            for attempt in 1..=20 {
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                let sent_messages = telegram_state
+                    .sent_messages
+                    .lock()
+                    .expect("sent messages lock")
+                    .clone();
+                if sent_messages.len() >= 2 {
+                    let text = sent_messages[1]
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    if text != "pong" {
+                        telegram_server.abort();
+                        let _ = telegram_server.await;
+                        anyhow::bail!(
+                            "unexpected takeover telegram poll-lease reply on attempt {}: expected {:?}, got {:?}",
+                            attempt,
+                            "pong",
+                            text
+                        );
+                    }
+                    let get_updates_calls =
+                        telegram_state.get_updates_calls.load(Ordering::Relaxed);
+                    if get_updates_calls < 2 {
+                        telegram_server.abort();
+                        let _ = telegram_server.await;
+                        anyhow::bail!(
+                            "expected multiple Telegram getUpdates calls across takeover, got {}",
+                            get_updates_calls
+                        );
+                    }
+                    info!(
+                        "Startup telegram poll-lease smoke proved single-owner polling and standby takeover for lease [{}] from [{}] to [{}] via {}",
+                        poll_lease_key, leader_guest_id, standby_guest_id, telegram_api_base_url
+                    );
+                    telegram_server.abort();
+                    let _ = telegram_server.await;
+                    return Ok(());
+                }
+                if attempt == 20 {
+                    telegram_server.abort();
+                    let _ = telegram_server.await;
+                    anyhow::bail!("timed out waiting for standby takeover /ping reply");
+                }
+            }
+
+            unreachable!("telegram poll-lease smoke should return or bail inside the loop");
+        }
         StartupTest::TelegramRoundTrip => {
             let telegram_api_base_url = startup_test_telegram_api_base_url(hotel_name);
             let telegram_addr = format!("127.0.0.1:{}", startup_test_telegram_port(hotel_name));
@@ -1909,20 +2399,71 @@ async fn run_startup_test(
 
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
-            let expected_replies = [
+            let expected_text_replies = [
                 STARTUP_TEST_TELEGRAM_TEXT_REPLY,
                 STARTUP_TEST_TELEGRAM_PHOTO_REPLY,
-                STARTUP_TEST_TELEGRAM_VOICE_REPLY,
             ];
             for attempt in 1..=30 {
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                let registered_commands = telegram_state
+                    .registered_commands
+                    .lock()
+                    .expect("registered commands lock")
+                    .clone();
+                let deleted_command_syncs = *telegram_state
+                    .deleted_command_syncs
+                    .lock()
+                    .expect("deleted command syncs lock");
                 let sent_messages = telegram_state
                     .sent_messages
                     .lock()
                     .expect("sent messages lock")
                     .clone();
-                if sent_messages.len() >= expected_replies.len() {
-                    for (index, expected_text) in expected_replies.iter().enumerate() {
+                let sent_media = telegram_state
+                    .sent_media
+                    .lock()
+                    .expect("sent media lock")
+                    .clone();
+                if sent_messages.len() >= expected_text_replies.len() && !sent_media.is_empty() {
+                    if deleted_command_syncs == 0 {
+                        telegram_server.abort();
+                        gemini_server.abort();
+                        blob_server.abort();
+                        let _ = telegram_server.await;
+                        let _ = gemini_server.await;
+                        let _ = blob_server.await;
+                        anyhow::bail!("expected deleteMyCommands to run before setMyCommands");
+                    }
+
+                    let latest_registered_commands = registered_commands
+                        .last()
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    let command_names = latest_registered_commands
+                        .as_array()
+                        .map(|commands| {
+                            commands
+                                .iter()
+                                .filter_map(|command| {
+                                    command.get("command").and_then(serde_json::Value::as_str)
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    if !command_names.contains(&"help") || !command_names.contains(&"commands") {
+                        telegram_server.abort();
+                        gemini_server.abort();
+                        blob_server.abort();
+                        let _ = telegram_server.await;
+                        let _ = gemini_server.await;
+                        let _ = blob_server.await;
+                        anyhow::bail!(
+                            "expected setMyCommands to register help/commands, got {:?}",
+                            command_names
+                        );
+                    }
+
+                    for (index, expected_text) in expected_text_replies.iter().enumerate() {
                         let message = &sent_messages[index];
                         let text = message
                             .get("text")
@@ -1963,12 +2504,36 @@ async fn run_startup_test(
                         }
                     }
 
+                    let voice_delivery = sent_media.last().cloned().unwrap_or_default();
+                    let content_type = voice_delivery
+                        .get("content_type")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    let bytes_len = voice_delivery
+                        .get("bytes_len")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or_default();
+                    if !content_type.contains("multipart/form-data") || bytes_len == 0 {
+                        telegram_server.abort();
+                        gemini_server.abort();
+                        blob_server.abort();
+                        let _ = telegram_server.await;
+                        let _ = gemini_server.await;
+                        let _ = blob_server.await;
+                        anyhow::bail!(
+                            "expected Telegram voice delivery for {:?}, got content_type={:?} bytes_len={}",
+                            STARTUP_TEST_TELEGRAM_VOICE_REPLY,
+                            content_type,
+                            bytes_len
+                        );
+                    }
+
                     let gemini_requests = gemini_state
                         .requests
                         .lock()
                         .expect("fake gemini requests lock")
                         .clone();
-                    if gemini_requests.len() < expected_replies.len() {
+                    if gemini_requests.len() < 3 {
                         telegram_server.abort();
                         gemini_server.abort();
                         blob_server.abort();
@@ -1977,7 +2542,7 @@ async fn run_startup_test(
                         let _ = blob_server.await;
                         anyhow::bail!(
                             "expected {} fake Gemini requests, got {}",
-                            expected_replies.len(),
+                            3,
                             gemini_requests.len()
                         );
                     }
@@ -1985,8 +2550,8 @@ async fn run_startup_test(
                     assert_fake_gemini_media_request(&gemini_requests[2], "audio/ogg")?;
 
                     info!(
-                        "Startup telegram round-trip delivered {:?} through fake Telegram API and fake Gemini API on attempt {} via {} and {}",
-                        expected_replies, attempt, telegram_api_base_url, gemini_api_base_url
+                        "Startup telegram round-trip delivered {:?} plus voice media through fake Telegram API and fake Gemini API on attempt {} via {} and {}",
+                        expected_text_replies, attempt, telegram_api_base_url, gemini_api_base_url
                     );
                     telegram_server.abort();
                     gemini_server.abort();
@@ -2060,10 +2625,14 @@ fn pid_exists(pid: u32) -> bool {
         .arg("-p")
         .arg(pid.to_string())
         .arg("-o")
-        .arg("pid=")
+        .arg("stat=")
         .output()
         .map(|output| {
-            output.status.success() && !String::from_utf8_lossy(&output.stdout).trim().is_empty()
+            if !output.status.success() {
+                return false;
+            }
+            let stat = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            !stat.is_empty() && !stat.starts_with('Z')
         })
         .unwrap_or(false)
 }
@@ -2235,6 +2804,7 @@ async fn main() -> Result<()> {
 
     let effective_identity = agent_identity_record_for_profile(
         &effective_agent_profile,
+        &hotel_name,
         effective_agent_config.as_ref(),
     );
     graph_storage
@@ -2800,14 +3370,14 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentProfile, StartupTest, agent_profile_from_config, default_agent_profile_for_hotel,
-        default_guest_seed, default_hotel_record, enable_guest_test_overrides,
-        execution_reachability_for_hotel, extract_context_graph_entries, guest_seed_for_profile,
-        guest_supervision_enabled, hotel_base_port, local_capability_advertisements,
-        startup_test_gemini_base_url,
+        AgentProfile, StartupTest, agent_profile_from_config, deactivate_legacy_managed_guests,
+        default_agent_profile_for_hotel, default_guest_seed, default_hotel_record,
+        enable_guest_test_overrides, execution_reachability_for_hotel,
+        extract_context_graph_entries, guest_seed_for_profile, guest_supervision_enabled,
+        hotel_base_port, local_capability_advertisements, startup_test_gemini_base_url,
     };
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
-    use ansible_mesh_core::storage::GraphStorage;
+    use ansible_mesh_core::storage::{GraphStorage, GuestRecord};
 
     #[test]
     fn guest_supervision_defaults_disabled() {
@@ -3081,6 +3651,59 @@ mod tests {
         assert_eq!(profile.agent_key, "beacon");
         assert_eq!(profile.agent_id, "agent-beacon-01");
         assert_eq!(profile.persona_name, "Beacon");
+    }
+
+    #[test]
+    fn deactivate_legacy_managed_guests_disables_hotel_prefixed_hegemon_ids() {
+        let graph = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let hotel_name = "startup-test-hotel";
+        let profile = default_agent_profile_for_hotel(hotel_name);
+        let desired = guest_seed_for_profile(hotel_name, &profile);
+        let legacy = vec![
+            GuestRecord {
+                hotel_name: hotel_name.into(),
+                guest_id: format!("{hotel_name}:agent-core-jane"),
+                role: "agent".into(),
+                config_json: serde_json::json!({ "command": "target/debug/agent-core" })
+                    .to_string(),
+                is_active: true,
+                active_pid: None,
+            },
+            GuestRecord {
+                hotel_name: hotel_name.into(),
+                guest_id: format!("{hotel_name}:hegemon-gateway-jane"),
+                role: "hegemon".into(),
+                config_json: serde_json::json!({ "command": "target/debug/hegemon" }).to_string(),
+                is_active: true,
+                active_pid: None,
+            },
+        ];
+
+        graph
+            .seed_guests(hotel_name, &legacy)
+            .expect("seed legacy predecessor guests");
+        graph
+            .seed_guests(hotel_name, &desired)
+            .expect("seed desired guests");
+
+        deactivate_legacy_managed_guests(&graph, hotel_name, &profile, &desired)
+            .expect("deactivate legacy predecessor guests");
+
+        let stored = graph
+            .list_guests(hotel_name, false)
+            .expect("list guests after cleanup");
+
+        let legacy_agent = stored
+            .iter()
+            .find(|guest| guest.guest_id == format!("{hotel_name}:agent-core-jane"))
+            .expect("legacy agent guest should remain in graph");
+        assert!(!legacy_agent.is_active);
+
+        let legacy_hegemon = stored
+            .iter()
+            .find(|guest| guest.guest_id == format!("{hotel_name}:hegemon-gateway-jane"))
+            .expect("legacy hegemon predecessor guest should remain in graph");
+        assert!(!legacy_hegemon.is_active);
     }
 
     #[test]

@@ -2267,7 +2267,9 @@ impl AgentRuntime {
                 state.agent_profile.voice_response_policy.mode = new_mode;
             }
             let reply = match new_mode {
-                TtsMode::Off => "Voice response off. I'll reply with text.",
+                TtsMode::Off => {
+                    "Voice response off for text turns. Voice notes will still get voice-only replies."
+                }
                 TtsMode::Auto => "Voice response auto — I'll mirror your input modality.",
                 TtsMode::On => "Voice response on. I'll speak all replies.",
             };
