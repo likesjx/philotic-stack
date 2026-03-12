@@ -243,7 +243,8 @@ When Muninn is required by protocol for meaningful work:
 - once approval is given, state clearly that the turn is continuing on observed repo/runtime truth only
 
 Use the shared helper in [scripts/muninn_mcp.py](/Users/jaredlikes/code/philotic-stack/scripts/muninn_mcp.py).
-The `require` mode exists specifically to fail loudly when memory bootstrap is unavailable.
+The helper should attempt local Muninn recovery first during session bootstrap.
+The `bootstrap` and `require` modes exist specifically to fail loudly when memory bootstrap is unavailable or unrecoverable.
 
 ## 9. Parallel Workstreams
 

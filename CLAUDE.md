@@ -5,9 +5,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Every session MUST begin with these three steps:
 1.  **Read [AGENTS.md](file:///Users/jaredlikes/code/philotic-stack/AGENTS.md)**: Adopt the standing protocol.
 2.  **Verify Green Status**: Run `just check` and `just test` (or the relevant smoke) to ensure the baseline is stable before editing.
-3.  **Orient and Recall**: Run `just session-start` first. Use the `$muninn-memory-habit` and `$proposal-maintainer` mindset. Retrieve project context via Muninn and align your plan with the current `Disposition` of active architecture proposals and [docs/task.md](file:///Users/jaredlikes/code/philotic-stack/docs/task.md).
+3.  **Orient and Recall**: Run `just session-start` first. It should attempt to revive the local Muninn service if it is merely down. Then use the `$muninn-memory-habit` and `$proposal-maintainer` mindset. Retrieve project context via Muninn and align your plan with the current `Disposition` of active architecture proposals and [docs/task.md](file:///Users/jaredlikes/code/philotic-stack/docs/task.md).
 
-If `just session-start` fails, stop and alert the user/operator immediately. Do not continue with meaningful work until explicit approval is given to proceed without Muninn.
+If `just session-start` cannot recover Muninn, stop and alert the user/operator immediately. Do not continue with meaningful work until explicit approval is given to proceed without Muninn.
 
 ## Commands
 

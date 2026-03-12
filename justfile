@@ -18,7 +18,7 @@ engine-check:
 
 # Mandatory Muninn bootstrap gate for meaningful sessions.
 session-start:
-    python3 scripts/muninn_mcp.py require
+    python3 scripts/muninn_mcp.py bootstrap
 
 # Start the Hotel Manager (Ansible Host Daemon)
 start-ansible hotel:

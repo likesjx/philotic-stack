@@ -30,7 +30,7 @@ Do not reimplement the MCP handshake ad hoc unless you are intentionally porting
 
 Before meaningful work:
 
-- run `require`
+- run `bootstrap`
 - run `where-left-off`
 - run `recall`
 
@@ -43,7 +43,7 @@ After durable outcomes:
 
 The helper must be allowed to block.
 
-If `python3 scripts/muninn_mcp.py require` fails:
+If `python3 scripts/muninn_mcp.py bootstrap` fails:
 
 - alert the user/operator immediately
 - do not pretend retrieval already happened

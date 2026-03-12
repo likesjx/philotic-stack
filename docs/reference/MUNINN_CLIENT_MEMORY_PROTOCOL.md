@@ -62,9 +62,14 @@ When calling `muninn_recall`, bias the query around:
 - who am I talking to
 - what matters about this topic right now
 
-Before starting that sequence, clients should run a hard availability gate:
+Before starting that sequence, clients should run the shared bootstrap gate:
 
-- `python3 scripts/muninn_mcp.py require`
+- `python3 scripts/muninn_mcp.py bootstrap`
+
+That bootstrap should:
+
+- confirm Muninn is already ready, or
+- attempt to start the local Muninn service when it is merely down, then re-check readiness
 
 If that gate fails:
 
@@ -172,6 +177,7 @@ If you are wiring this into another cognitive client, implement these hooks:
 Examples:
 
 ```bash
+python3 scripts/muninn_mcp.py bootstrap
 python3 scripts/muninn_mcp.py require
 python3 scripts/muninn_mcp.py health
 python3 scripts/muninn_mcp.py where-left-off --limit 5

@@ -42,6 +42,7 @@ This proposal now has three concrete artifacts behind it:
 - a shared protocol reference in [MUNINN_CLIENT_MEMORY_PROTOCOL.md](/Users/jaredlikes/code/philotic-stack/docs/reference/MUNINN_CLIENT_MEMORY_PROTOCOL.md)
 - a shared helper in [muninn_mcp.py](/Users/jaredlikes/code/philotic-stack/scripts/muninn_mcp.py)
 - a shareable skill package in [SKILL.md](/Users/jaredlikes/code/philotic-stack/skills/muninn-memory-protocol/SKILL.md)
+- a bootstrap path that should attempt local Muninn recovery before requiring operator approval to continue without memory
 
 ## Core Recommendation
 

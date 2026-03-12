@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
+import pathlib
+import subprocess
 import sys
+import time
 import urllib.parse
 import urllib.request
 
@@ -14,6 +18,7 @@ REQUIRED_TOOLS = (
     "muninn_decide",
 )
 APPROVAL_REQUIRED_EXIT = 42
+DEFAULT_MUNINN_DIR = pathlib.Path.home() / "code" / "muninndb"
 
 
 class MuninnMcpClient:
@@ -106,6 +111,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("health", help="Check Muninn MCP connectivity and required tools")
     sub.add_parser(
+        "bootstrap",
+        help="Require Muninn readiness, attempting a local muninndb-server start first when the service is merely down",
+    )
+    sub.add_parser(
         "require",
         help="Fail loudly unless Muninn MCP is reachable and ready; intended for session bootstrap gating",
     )
@@ -194,6 +203,56 @@ def emit_approval_required(payload: dict) -> int:
     return APPROVAL_REQUIRED_EXIT
 
 
+def resolve_local_server_dir() -> pathlib.Path | None:
+    env_dir = os.environ.get("MUNINN_SERVER_DIR")
+    candidates = []
+    if env_dir:
+        candidates.append(pathlib.Path(env_dir).expanduser())
+    candidates.append(DEFAULT_MUNINN_DIR)
+
+    for candidate in candidates:
+        binary = candidate / "muninndb-server"
+        if binary.exists():
+            return candidate
+    return None
+
+
+def try_start_local_server() -> dict:
+    server_dir = resolve_local_server_dir()
+    if server_dir is None:
+        return {
+            "started": False,
+            "start_attempted": False,
+            "start_reason": "local muninndb-server binary not found",
+        }
+
+    binary = server_dir / "muninndb-server"
+    try:
+        subprocess.Popen(  # noqa: S603
+            [str(binary), "--daemon"],
+            cwd=server_dir,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - bootstrap should report the real failure plainly
+        return {
+            "started": False,
+            "start_attempted": True,
+            "start_reason": f"failed to start local muninndb-server: {exc}",
+            "server_dir": str(server_dir),
+            "server_binary": str(binary),
+        }
+
+    time.sleep(1.0)
+    return {
+        "started": True,
+        "start_attempted": True,
+        "server_dir": str(server_dir),
+        "server_binary": str(binary),
+    }
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
@@ -203,6 +262,30 @@ def main() -> int:
         json.dump(payload, sys.stdout, indent=2, sort_keys=True)
         sys.stdout.write("\n")
         return 0 if payload["status"] == "ready" else 1
+
+    if args.command == "bootstrap":
+        payload = health_payload(args.base_url)
+        if payload["status"] == "ready":
+            payload["start_attempted"] = False
+            payload["started"] = False
+            json.dump(payload, sys.stdout, indent=2, sort_keys=True)
+            sys.stdout.write("\n")
+            return 0
+
+        start_info = try_start_local_server()
+        if start_info.get("start_attempted"):
+            payload.update(start_info)
+            payload["status_before_start"] = payload["status"]
+
+        retry_payload = health_payload(args.base_url)
+        retry_payload.update(start_info)
+        if start_info.get("start_attempted"):
+            retry_payload["status_before_start"] = payload["status"]
+        if retry_payload["status"] != "ready":
+            return emit_approval_required(retry_payload)
+        json.dump(retry_payload, sys.stdout, indent=2, sort_keys=True)
+        sys.stdout.write("\n")
+        return 0
 
     if args.command == "require":
         payload = health_payload(args.base_url)

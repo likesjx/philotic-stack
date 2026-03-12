@@ -20,8 +20,8 @@ When Muninn MCP is configured and reachable, this habit is the MANDATORY BOOTSTR
 ## The Bootstrap Sequence
 
 At the start of every session (before responding to the user):
-1.  **Require Muninn**: run `python3 scripts/muninn_mcp.py require`
-2.  **If require fails**: alert the user/operator immediately and do not continue without explicit approval
+1.  **Bootstrap Muninn**: run `python3 scripts/muninn_mcp.py bootstrap`
+2.  **If bootstrap fails**: alert the user/operator immediately and do not continue without explicit approval
 3.  **Recall Self**: `muninn_recall(identity, operating_posture)`
 4.  **Recall User**: `muninn_recall(user_preferences, collaboration_style)`
 5.  **Recall Topic**: `muninn_where_left_off` + `muninn_recall(active_goal, architecture_decisions)`
@@ -29,7 +29,7 @@ At the start of every session (before responding to the user):
 
 ## Failure Rule
 
-If the shared helper or Muninn MCP is unavailable:
+If the shared helper or Muninn MCP is unavailable or cannot be recovered automatically:
 
 - say so immediately
 - do not imply memory retrieval occurred
@@ -73,7 +73,7 @@ Trigger recall:
 
 But before any recall attempt, the main thread should first verify the bootstrap gate with:
 
-- `python3 scripts/muninn_mcp.py require`
+- `python3 scripts/muninn_mcp.py bootstrap`
 
 If that gate fails, the main thread should not spawn recall subagents until the user/operator has explicitly approved proceeding without Muninn.
 
