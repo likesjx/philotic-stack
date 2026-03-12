@@ -46,7 +46,7 @@ Keep writes small:
 
 Use a small tag vocabulary only when it helps retrieval:
 
-- `flush-out`
+- `flesh-out`
 - `decision`
 - `reality-gap`
 - `validation`

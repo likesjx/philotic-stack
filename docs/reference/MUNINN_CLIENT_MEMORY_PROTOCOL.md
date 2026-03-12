@@ -132,7 +132,7 @@ Tags should stay few, stable, and retrieval-oriented.
 
 Recommended first tags:
 
-- `flush-out`
+- `flesh-out`
   - early idea worth revisiting
 - `decision`
   - durable architectural or workflow choice

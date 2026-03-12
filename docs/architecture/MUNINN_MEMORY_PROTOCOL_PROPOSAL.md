@@ -138,7 +138,7 @@ Tagging should remain minimal and experimental.
 
 Recommended first vocabulary:
 
-- `flush-out`
+- `flesh-out`
 - `decision`
 - `reality-gap`
 - `validation`

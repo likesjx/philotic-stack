@@ -112,7 +112,7 @@ Memory atomicity rules (enforced by the subagent):
 - Let clustering happen naturally — do not manually group.
 
 Recommended lightweight tags when helpful:
-- `flush-out`
+- `flesh-out`
 - `decision`
 - `reality-gap`
 - `validation`
