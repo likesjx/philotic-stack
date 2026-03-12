@@ -267,6 +267,7 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 - [x] Add `VoiceResponsePolicy` to `AgentProfile` so the agent has its own voice identity and TTS is policy-driven, not tool-driven.
 - [ ] Make the default local Jane/Aria voice UX honest: `mode=auto` should mirror voice-input turns with voice-only replies, while `/tts on` should escalate to voice+text delivery.
 - [ ] Route `voice.transcribe` results back into the normal agent reasoning loop before `voice.synthesize`, so voice turns stop parroting the transcript and instead speak the post-reasoning answer.
+- [x] Add a rebuild-first local watched-UAT workflow so stale materialized binaries and stale sockets do not masquerade as runtime regressions.
 - [ ] Define hotel CLI OAuth UX:
   - browser launch
   - temporary localhost callback listener
@@ -435,7 +436,7 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 - [ ] Review [VOICE_MACHINE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/VOICE_MACHINE_PROPOSAL.md).
 - [x] Telegram slash-command elevation (first slice): `/ping` handled in `membrane` before agent-core — `handle_membrane_command` short-circuits the `EmitTask` dispatch and replies directly.
 - [ ] Telegram slash-command elevation (next): `/new` resets session_id in membrane (start fresh conversation without round-trip); `/help` lists available commands from membrane directly.
-- [ ] Telegram bot command registration/UI: call Telegram `setMyCommands` (and related chat-scoped variants if needed) so supported slash commands show up in the Telegram client command UI instead of existing only as hidden transport behavior.
+- [x] Telegram bot command registration/UI: call Telegram `setMyCommands` from `membrane` startup so supported slash commands show up in the Telegram client command UI instead of existing only as hidden transport behavior.
 - [ ] Telegram approval card UX: include request IDs, tool/action names, args summaries, and resolution messages in a more native Telegram approval experience.
 - [x] Telegram streaming Layer 1: add typing indicator heartbeat to `membrane` — `ActiveTurn` map, `sendChatAction(typing)` on dispatch, 4-second refresh loop, cancel on `send_reply`.
 - [ ] Telegram streaming: add message length chunking to `membrane` — split at paragraph boundaries before `sendMessage`, shared `send_formatted_text` helper.

@@ -21,6 +21,26 @@ start-ansible hotel:
     cargo build --workspace
     cargo run -p ansible -- --hotel {{hotel}} --load-config mesh-config.json
 
+# Rebuild the local runtime binaries that the hotel materializes during watched UAT.
+build-runtime:
+    cargo build -p ansible -p agent-core -p membrane -p model-router
+
+# Kill local Philotic hotel/guest binaries from this checkout and clear stale sockets.
+kill-local-stack:
+    @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/ansible" || true
+    @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/membrane" || true
+    @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/agent-core" || true
+    @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/model-controller-gemini" || true
+    @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/model-controller-elevenlabs" || true
+    @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/tool-runner" || true
+    @rm -f /tmp/philotic-default.sock /tmp/philotic-aria-architect-hotel.sock /tmp/philotic-startup-test-hotel.sock
+
+# Rebuild first, then kill stale local runtime processes/sockets, then start one hotel cleanly.
+start-ansible-clean hotel:
+    just build-runtime
+    just kill-local-stack
+    cargo run -p ansible -- --hotel {{hotel}} --load-config mesh-config.json
+
 # Start the transitional Gemini OAuth flow through the hotel CLI
 gemini-oauth-start client_id project_id:
     @echo "Using GOOGLE_CLIENT_SECRET from env if needed by the OAuth client."
