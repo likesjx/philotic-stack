@@ -1107,6 +1107,14 @@ const TELEGRAM_MENU_COMMANDS: &[TelegramBotCommand] = &[
         description: "Resume the current session.",
     },
     TelegramBotCommand {
+        command: "role",
+        description: "Switch to a named role.",
+    },
+    TelegramBotCommand {
+        command: "back",
+        description: "Return to the orchestrator role.",
+    },
+    TelegramBotCommand {
         command: "approve",
         description: "Approve the pending action.",
     },
@@ -1131,6 +1139,8 @@ fn telegram_help_text() -> String {
         ));
     }
     help.push_str("\nNotes:\n");
+    help.push_str("/role expects a role name, for example /role developer.\n");
+    help.push_str("/back returns the session to the orchestrator role.\n");
     help.push_str("/approve and /deny can include a note.\n");
     help.push_str("/tts accepts optional modes like on, off, or auto.");
     help
@@ -1982,6 +1992,8 @@ mod tests {
         assert!(help.contains("/help"));
         assert!(help.contains("/commands"));
         assert!(help.contains("/status"));
+        assert!(help.contains("/role"));
+        assert!(help.contains("/back"));
         assert!(help.contains("/approve"));
     }
 
