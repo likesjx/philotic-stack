@@ -14,6 +14,7 @@ related_docs:
   - ARCHITECTURE_STATUS.md
   - INTER_HOTEL_ROUTING_PROPOSAL.md
   - PERIMETER_EGRESS_CONTROL_PROPOSAL.md
+  - MEMBRANE_EXTERNAL_AGENT_AND_EVENT_TRANSPORT_PROPOSAL.md
 task_refs:
   - docs/task.md
 proposal_id: hotel-perimeter-trust
@@ -135,6 +136,15 @@ This should be explicit enough that an operator can answer:
 - why they are trusted
 - what they are trusted to do
 - how to remove them
+
+External membranes should use the same trust grammar for outside principals and transport infrastructures:
+
+- external agent peer identities
+- relay inventories
+- trust classes for external principals
+- revocation and quarantine behavior
+
+That does not mean an external `A2A` peer or `Nostr` relay becomes a hotel member. It means perimeter trust should not invent one vocabulary for hotel peers and another totally unrelated vocabulary for membrane-edge trust if the enforcement questions are structurally the same.
 
 ## Enforcement Recommendation
 

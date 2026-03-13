@@ -14,6 +14,7 @@ related_docs:
   - ARCHITECTURE_STATUS.md
   - HOTEL_PERIMETER_TRUST_PROPOSAL.md
   - MEMBRANE_COMPONENT_PROPOSAL.md
+  - MEMBRANE_EXTERNAL_AGENT_AND_EVENT_TRANSPORT_PROPOSAL.md
   - CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md
 task_refs:
   - docs/task.md
@@ -106,6 +107,8 @@ Examples:
 Recommendation:
 
 - route through the perimeter egress boundary by default
+
+This includes outbound protocol-native delivery from membrane implementations such as Telegram today and potential `A2A` / `Nostr` membranes later. A transport-specific membrane may shape the request, but it should not silently self-authorize the network exit.
 
 ### 2. General HTTP / Tool Egress
 
