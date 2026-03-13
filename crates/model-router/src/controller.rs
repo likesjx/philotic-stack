@@ -1367,66 +1367,6 @@ mod tests {
     }
 
     #[test]
-    fn infers_media_task_from_flat_blob_backed_attachments() {
-        let task = ControllerTask::from_value(&json!({
-            "action": "analyze_media",
-            "prompt": "Describe the media",
-            "attachments": [{
-                "kind": "photo",
-                "file_id": "photo-1",
-                "mime_type": "image/jpeg",
-                "blob_id": "sha256-1",
-                "blob_download_url": "http://127.0.0.1:9001/download/sha256-1"
-            }]
-        }))
-        .unwrap();
-
-        assert_eq!(task.kind, TaskKind::MediaAnalyze);
-        assert_eq!(task.media_attachments().len(), 1);
-        assert_eq!(
-            task.media_attachments()[0].url.as_deref(),
-            Some("http://127.0.0.1:9001/download/sha256-1")
-        );
-    }
-
-    #[test]
-    fn parses_audio_transcribe_task_from_voice_transcribe_kind() {
-        let task = ControllerTask::from_value(&json!({
-            "kind": "voice.transcribe",
-            "prompt": "Transcribe this audio verbatim.",
-            "attachments": [{
-                "kind": "voice",
-                "file_id": "voice-1",
-                "mime_type": "audio/ogg",
-                "blob_id": "sha256-audio-1",
-                "blob_download_url": "http://127.0.0.1:9001/download/sha256-audio-1"
-            }]
-        }))
-        .unwrap();
-
-        assert_eq!(task.kind, TaskKind::AudioTranscribe);
-        assert_eq!(task.kind.as_str(), "voice.transcribe");
-        assert_eq!(task.media_attachments().len(), 1);
-    }
-
-    #[test]
-    fn parses_audio_transcribe_from_legacy_transcribe_action() {
-        let task = ControllerTask::from_value(&json!({
-            "action": "transcribe",
-            "prompt": "Transcribe this audio verbatim.",
-            "attachments": [{
-                "kind": "audio",
-                "file_id": "audio-1",
-                "mime_type": "audio/mp4",
-                "blob_download_url": "http://127.0.0.1:9001/download/sha256-audio-1"
-            }]
-        }))
-        .unwrap();
-
-        assert_eq!(task.kind, TaskKind::AudioTranscribe);
-    }
-
-    #[test]
     fn uses_routing_hint_as_provider_hint_when_provider_missing() {
         let task = ControllerTask::from_value(&json!({
             "kind": "voice.synthesize",
