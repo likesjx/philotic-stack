@@ -13,6 +13,7 @@ blobs/
 .env.local
 .env.*.local
 mesh-config.json
+mesh-config*.bak
 *.key
 *.pem
 *.p12
