@@ -43,6 +43,30 @@ Treat a worktree as the unit of an implementation conversation. See [docs/operat
 - One active conversation -> one sibling worktree.
 - Hot files: `ansible/src/main.rs`, `ansible/src/service/ipc.rs`, `agent-core/src/runtime.rs`, `membrane/src/main.rs`, `philotic-client/src/lib.rs`, `docs/task.md`.
 
+## Parallel Workstreams
+
+Treat a worktree as the unit of an implementation conversation.
+
+- one active implementation thread -> one `codex/<slug>` branch
+- one `codex/<slug>` branch -> one sibling worktree
+- do not continue multiple active implementation conversations in the same checkout
+
+Before touching hot runtime files in a worktree:
+
+```bash
+just workstream-status <slug>
+```
+
+Before opening a PR from a worktree:
+
+```bash
+just workstream-overlap <slug>
+```
+
+Hot files include `crates/ansible/src/main.rs`, `crates/ansible/src/service/ipc.rs`, `crates/agent-core/src/runtime.rs`, `crates/membrane/src/main.rs`, `crates/model-router/*`, `crates/philotic-client/src/lib.rs`, `crates/ansible/README.md`, `docs/task.md`, and `docs/architecture/MODEL_CONTROLLER_PROPOSAL.md`.
+
+See [docs/operations/parallel-worktree-runbook.md](docs/operations/parallel-worktree-runbook.md).
+
 ## Architecture
 
 The Philotic Stack is a distributed AI agent OS (Rust). Metaphor: **Hotel** (node) **materializes** AI **Guests** (processes). All state lives in a SQLite Context Graph owned by the hotel daemon.

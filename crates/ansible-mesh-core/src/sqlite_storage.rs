@@ -7,6 +7,7 @@
 use crate::event::{EventEnvelope, EventId, EventKind, EventPayload};
 use crate::graph::{AbstractSkillRecord, AbstractToolRecord, RoleIncarnationRecord};
 use crate::graph::{GraphEdge, GraphNode};
+use crate::graph::AbstractToolRecord;
 use crate::storage::{
     CursorStorage, EventStorage, GraphAdapter, GraphStorage, GuestRecord, HotelRecord,
     SecretRecord, SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,

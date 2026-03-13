@@ -3058,6 +3058,96 @@ impl AgentRuntime {
                 })
                 .await
             }
+            "agent.configure" => {
+                let args = &payload.arguments;
+                let config_path = match args.get("config_path").and_then(|v| v.as_str()) {
+                    Some(p) => p.to_string(),
+                    None => {
+                        return self
+                            .fail_active_turn(
+                                payload.session_id,
+                                payload.turn_id,
+                                "agent.configure: missing required argument 'config_path'".into(),
+                            )
+                            .await;
+                    }
+                };
+                let value = match args.get("value") {
+                    Some(v) => v.clone(),
+                    None => {
+                        return self
+                            .fail_active_turn(
+                                payload.session_id,
+                                payload.turn_id,
+                                "agent.configure: missing required argument 'value'".into(),
+                            )
+                            .await;
+                    }
+                };
+                let operation = args
+                    .get("operation")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("set")
+                    .to_string();
+
+                let (content, bindings_changed) = {
+                    let Some(state) = self.sessions.get_mut(&payload.session_id) else {
+                        return self
+                            .fail_active_turn(
+                                payload.session_id,
+                                payload.turn_id,
+                                "agent.configure: session not found".into(),
+                            )
+                            .await;
+                    };
+                    let bindings_before = state.bindings.clone();
+                    match state.apply_configure(&config_path, &value, &operation) {
+                        Ok(msg) => {
+                            let changed = state.bindings != bindings_before;
+                            (msg, changed)
+                        }
+                        Err(err) => {
+                            drop(state);
+                            return self
+                                .fail_active_turn(payload.session_id, payload.turn_id, err)
+                                .await;
+                        }
+                    }
+                };
+
+                // Rebuild tool assembly if bindings changed so the new toolset takes effect
+                // immediately within the same session.
+                if bindings_changed {
+                    if let Some(state) = self.sessions.get_mut(&payload.session_id) {
+                        state.rebuild_default_tool_assembly();
+                    }
+                }
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(content),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    tool_name: Some(payload.tool_name),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                })
+                .await
+            }
             other => {
                 self.fail_active_turn(
                     payload.session_id,

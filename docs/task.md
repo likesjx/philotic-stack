@@ -379,6 +379,82 @@ Seam IDs: `local-admin-capability-envelope`, `onnx-admin-fallback-path`
 - [ ] Build the first explicit parity matrix for OpenClaw capability vs Philotic owner/confidence/gap.
 - [ ] Identify the minimum migration-critical seams beyond simple feature demos.
 
+## New Project: Agent Loop Gap Closure
+
+- [x] Review [AGENT_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/AGENT_LOOP_PROPOSAL.md).
+- [x] Build real tool catalog with proper descriptions and schemas (Gap 3 — prerequisite for Gap 4).
+  - [x] Add `class: Option<String>` field to `ToolDefinition` in `agent-core`.
+  - [x] Create static `tool_catalog()` in `agent-core/src/catalog.rs` with real descriptions and schemas for `session.status`, `echo`, `workspace.list`, `workspace.read`.
+  - [x] Add `AbstractToolRecord` to `ansible-mesh-core/src/graph.rs` as the context graph entity.
+  - [x] Add `upsert_abstract_tool` / `get_abstract_tool` / `list_abstract_tools` to `GraphStorage` trait and `SqliteGraphStorage` impl.
+  - [x] Seed catalog into context graph at hotel startup via `seed_abstract_tool_catalog`.
+  - [x] Update both `default_tool_assembly_for_bindings` and `tool_assembly_from_allowed_incarnations` to look up from catalog before falling back to stubs.
+- [x] Implement `preapproved_tools` and `preapproved_classes` evaluation in `approval_policy_allows` (Gap 4a).
+  - [x] `tool_class()` and `tool_requires_approval()` added to `catalog.rs`.
+  - [x] `approval_policy_allows` evaluates all three conditions in order: `auto_approve_all`, `preapproved_tools`, `preapproved_classes`.
+  - [x] `handle_tool_call` enforces `approval_required` from `ToolPolicyAnnotation` before dispatch — agent-level gate independent of model intent.
+  - [x] Policy annotations derive `policy_class` and `approval_required` from catalog.
+  - [x] `agent.configure` tool: class `"config"`, `approval_required: true`. Handles `approval_policy.*`, `profile.*`, `bindings.*` paths with set/append/remove. Rebuilds tool assembly when bindings change.
+- [x] Inject operator steering notes from `/approve`/`/deny` back into the model prompt (Gap 4b).
+  - [x] `/approve <note>` re-submits to model with `[User approval steering]` prefix appended to turn context.
+  - [x] `/deny <note>` re-submits as a new model turn with `[User denied the proposed action. Do this instead]` prefix.
+  - [x] `/deny` without note fails the turn (existing behavior preserved).
+  - [x] `resume_turn_with_steering` appends the note to `active_turn.user_content`, increments iteration, rebuilds prompt, re-submits to model.
+- [x] Add `working_tool_history` to `WorkingTurn` and implement multi-turn tool re-entry loop with iteration cap (Gap 1).
+  - [x] `working_tool_history: Vec<(ToolCall, ToolResult)>` added to `WorkingTurn`; serialized into checkpoint and rehydrated from it.
+  - [x] `push_tool_history` and `build_reentry_prompt` added to `SessionState`.
+  - [x] `build_reentry_prompt` appends `[Tool call history]` section with numbered call/result pairs; directs model to continue or respond.
+  - [x] `handle_tool_result` rewritten: pairs result with `pending_tool_call`, pushes to history, checks `MAX_TOOL_ITERATIONS` (10), increments `iteration`, re-submits `generate_text` to model. Loop exits only on `Respond`, `Fail`, `RequestApproval`, or iteration cap.
+  - [x] `interpret_tool_result` (old early-close stub) no longer called.
+- [x] Add `MediaRoutingPolicy` to `AgentProfile` and make media action selection configurable per agent (Gap 2).
+
+## New Project: Agent Incarnation Model
+
+Model revised: three-kind taxonomy (conversational/worker/subagent) replaced with role incarnations + workers/subagents. See [AGENT_INCARNATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/AGENT_INCARNATION_PROPOSAL.md).
+
+### Skill Catalog + Toolset Profiles (prerequisite for role provisioning)
+- [ ] Add `AbstractSkillRecord` to `ansible-mesh-core/src/graph.rs` (parallel to `AbstractToolRecord`).
+- [ ] Add `upsert_abstract_skill` / `get_abstract_skill` / `list_abstract_skills` to `GraphStorage` trait and `SqliteGraphStorage`.
+- [ ] Add `ToolsetProfileRecord` to the context graph (`toolset_profile` node kind).
+- [ ] Add `upsert_toolset_profile` / `get_toolset_profile` / `list_toolset_profiles` to `GraphStorage`.
+- [ ] Seed built-in skill catalog and toolset profiles at hotel startup (`orchestrator`, `codex`, `browser`, `research`, `utility`).
+- [ ] Update session binding assembly to expand skill grants into `implied_tools` when building `tools_for_model`.
+
+### Role Incarnation Records
+- [ ] Add `RoleIncarnationRecord` and `TurnLoopConfig` to the context graph (`role_incarnation` node kind).
+- [ ] Add `upsert_role_incarnation` / `get_role_incarnation` / `list_role_incarnations` to `GraphStorage`.
+- [ ] Add `ConfigureRole` IPC action (orchestrator → hotel); hotel enforces orchestrator-only writes.
+- [ ] Seed session bindings from the role's `toolset_profile` when a role incarnation session is initialized.
+
+### Active Membrane Routing
+- [ ] Add `active_incarnation_id` to `SessionRecord` in the Context Graph.
+- [ ] Update IpcServer task routing to read `active_incarnation_id` before routing inbound agent tasks.
+- [ ] Default to orchestrator incarnation if active ID is unregistered; buffer inbound during materialization.
+
+### Handoff Skill + Membrane Switching
+- [ ] Implement `HandoffToRole { role_name, handoff_bundle }` and `HandoffBack { summary, return_to? }` IPC actions.
+- [ ] Define the first handoff skill shape: trigger patterns, context bundle assembly, cleanup steps.
+- [ ] Add `/role <name>` and `/back` slash commands for manual membrane switching.
+
+### Inactive TTL + On-Demand Rematerialization
+- [ ] Add `inactive_ttl_seconds` to `RoleIncarnationRecord`.
+- [ ] Extend supervisor loop TTL check: reclaim inactive non-membrane-owner role processes after TTL.
+- [ ] On rematerialization: hotel sends session snapshot to restore working memory from Tier 2.
+
+### Workers / Subagents
+- [ ] Implement `SpawnSubagent` IPC and async result routing back to parent incarnation.
+- [ ] Add `PHILOTIC_AGENT_MODE=subagent` one-shot runtime mode to `agent-core`.
+- [ ] Add `/abandon` slash command; deliver `FailTask` summary to parent on abandonment.
+
+### Memory
+- [ ] Add `session_facts` apartment type and `UpdateMemory` IPC with hotel-side rate/size enforcement.
+- [ ] Add Muninn tool surface (`memory.search`, `memory.store`) as hotel-mediated tools with auto-injection into prompt context.
+- [ ] Add `/memory show` and `/memory reset` slash commands.
+
+### Inter-Agent Communication
+- [ ] Add `known_peers` (local hotel, role=agent) to session snapshot.
+- [ ] Validate same-hotel peer task emission via existing `EmitTask` before designing `DelegateToPeer`.
+
 ## New Project: Philotic Agent Loop
 
 - [ ] Write a dedicated proposal for the Philotic loop architecture using Pi as the core turn-engine reference.
