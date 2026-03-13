@@ -16,6 +16,10 @@ check:
 engine-check:
     ./scripts/engine-check.sh
 
+# Install repo-local git hooks such as the deterministic pre-push secret check.
+install-git-hooks:
+    git config core.hooksPath .githooks
+
 # Mandatory Muninn bootstrap gate for meaningful sessions.
 session-start:
     python3 scripts/muninn_mcp.py bootstrap

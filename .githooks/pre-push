@@ -1,0 +1,37 @@
+#!/bin/sh
+set -eu
+
+REMOTE_NAME="${1:-origin}"
+
+COMMITS=""
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+    if [ -z "${local_sha}" ] || [ "${local_sha}" = "0000000000000000000000000000000000000000" ]; then
+        continue
+    fi
+
+    if [ -n "${remote_sha}" ] && [ "${remote_sha}" != "0000000000000000000000000000000000000000" ]; then
+        RANGE_COMMITS="$(git rev-list "${remote_sha}..${local_sha}")"
+    else
+        RANGE_COMMITS="$(git rev-list "${local_sha}" --not --remotes="${REMOTE_NAME}")"
+    fi
+
+    if [ -n "${RANGE_COMMITS}" ]; then
+        COMMITS="${COMMITS}
+${RANGE_COMMITS}"
+    fi
+done
+
+COMMITS="$(printf '%s\n' "${COMMITS}" | sed '/^$/d' | sort -u)"
+
+if [ -z "${COMMITS}" ]; then
+    exit 0
+fi
+
+ARGS=""
+for commit in ${COMMITS}; do
+    ARGS="${ARGS} --commit ${commit}"
+done
+
+# shellcheck disable=SC2086
+exec python3 scripts/secret-push-check.py ${ARGS}
