@@ -7,7 +7,7 @@
 //! - `IpcRequest` / `IpcResponse` serialization round-trips
 
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
-use ansible_mesh_core::graph::{RoleIncarnationRecord, TurnLoopConfig};
+use ansible_mesh_core::graph::{AbstractSkillRecord, RoleIncarnationRecord, TurnLoopConfig};
 use ansible_mesh_core::sqlite_storage::{
     SqliteCursorStorage, SqliteEventStorage, SqliteGraphStorage,
 };
@@ -831,6 +831,29 @@ fn graph_storage_lists_role_incarnations_by_agent() {
     let jane_roles = store.list_role_incarnations("agent-jane").unwrap();
     assert_eq!(jane_roles.len(), 2);
     assert!(jane_roles.iter().all(|role| role.agent_id == "agent-jane"));
+}
+
+#[test]
+fn graph_storage_abstract_skill_round_trip() {
+    let store = open_graph_storage();
+    let skill = AbstractSkillRecord {
+        skill_name: "handoff.to_role".into(),
+        description: "Hand off to a specialist role once the target is justified.".into(),
+        implied_tools: vec!["session.status".into()],
+    };
+
+    store.upsert_abstract_skill(&skill).unwrap();
+
+    let loaded = store
+        .get_abstract_skill("handoff.to_role")
+        .unwrap()
+        .expect("abstract skill should exist");
+    assert_eq!(loaded, skill);
+
+    let listed = store.list_abstract_skills().unwrap();
+    assert!(listed
+        .iter()
+        .any(|entry| entry.skill_name == "handoff.to_role"));
 }
 
 #[test]

@@ -388,6 +388,38 @@ fn format_role_command_reply(command: &SlashCommand, became_active: bool) -> Str
     }
 }
 
+fn format_roles_report(active_incarnation_id: Option<&str>, roles: &[serde_json::Value]) -> String {
+    let active_role_name = active_incarnation_id
+        .and_then(|guest_id| guest_id.rsplit(':').next())
+        .unwrap_or("orchestrator");
+
+    if roles.is_empty() {
+        return format!(
+            "Active role: {active_role_name}. No configured role incarnations were returned by the hotel."
+        );
+    }
+
+    let mut lines = vec![format!("Active role: {active_role_name}.")];
+    lines.push("Configured roles:".into());
+    for role in roles {
+        let role_name = role
+            .get("role_name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let guest_id = role
+            .get("guest_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let marker = if Some(guest_id) == active_incarnation_id || role_name == active_role_name {
+            "*"
+        } else {
+            "-"
+        };
+        lines.push(format!("{marker} {role_name}"));
+    }
+    lines.join("\n")
+}
+
 pub struct AgentRuntime {
     ipc_client: PhiloticClient,
     agent_id: String,
@@ -503,7 +535,7 @@ impl AgentRuntime {
             match command {
                 SlashCommand::Ping => {}
                 SlashCommand::Status | SlashCommand::Pause | SlashCommand::Resume => {}
-                SlashCommand::Role { .. } | SlashCommand::Back => {}
+                SlashCommand::Role { .. } | SlashCommand::Roles | SlashCommand::Back => {}
                 SlashCommand::ToolsAdd { .. }
                 | SlashCommand::ToolsClear
                 | SlashCommand::SkillsAdd { .. }
@@ -626,7 +658,7 @@ impl AgentRuntime {
                     )
                     .await
                 }
-                SlashCommand::Role { .. } | SlashCommand::Back => {
+                SlashCommand::Role { .. } | SlashCommand::Roles | SlashCommand::Back => {
                     self.handle_role_command(task_id, session_id, turn_id, chat_id, command)
                         .await
                 }
@@ -760,6 +792,14 @@ impl AgentRuntime {
 
         let model_req = ModelRequestPayload {
             action,
+            request_class: Some(
+                if capability == "text.generate" {
+                    "cognitive"
+                } else {
+                    "transform"
+                }
+                .to_string(),
+            ),
             session_id: session_id.clone(),
             turn_id,
             prompt,
@@ -1323,6 +1363,7 @@ impl AgentRuntime {
 
                 let model_req = ModelRequestPayload {
                     action: "generate_text".to_string(),
+                    request_class: Some("cognitive".to_string()),
                     session_id: session_id.clone(),
                     turn_id,
                     prompt,
@@ -1448,6 +1489,7 @@ impl AgentRuntime {
 
         let model_req = ModelRequestPayload {
             action: "generate_text".to_string(),
+            request_class: Some("cognitive".to_string()),
             session_id: session_id.clone(),
             turn_id,
             prompt: reentry.prompt,
@@ -1660,6 +1702,7 @@ impl AgentRuntime {
 
         let voice_task = serde_json::json!({
             "kind": "voice.synthesize",
+            "request_class": "synthesis",
             "provider": policy.provider,
             "spoken_text": spoken_text.unwrap_or_else(|| strip_markup(&display_text)),
             "voice_id": policy.voice_id,
@@ -1994,6 +2037,7 @@ impl AgentRuntime {
                 | SlashCommand::Pause
                 | SlashCommand::Resume
                 | SlashCommand::Role { .. }
+                | SlashCommand::Roles
                 | SlashCommand::Back
                 | SlashCommand::ToolsAdd { .. }
                 | SlashCommand::ToolsClear
@@ -2161,6 +2205,7 @@ impl AgentRuntime {
             | SlashCommand::Pause
             | SlashCommand::Resume
             | SlashCommand::Role { .. }
+            | SlashCommand::Roles
             | SlashCommand::Back
             | SlashCommand::ToolsAdd { .. }
             | SlashCommand::ToolsClear
@@ -2212,6 +2257,13 @@ impl AgentRuntime {
                     })
                     .await?
             }
+            SlashCommand::Roles => {
+                self.ipc_client
+                    .send_request(IpcRequest::ListRoleIncarnations {
+                        agent_id: self.agent_id.clone(),
+                    })
+                    .await?
+            }
             _ => unreachable!("handle_role_command only accepts role handoff commands"),
         };
 
@@ -2256,6 +2308,33 @@ impl AgentRuntime {
                 }),
                 became_active.then_some(handoff_guest_id),
             ),
+            IpcResponse::Standard { ok: true, data, .. }
+                if matches!(command, SlashCommand::Roles) =>
+            {
+                let roles = data
+                    .as_ref()
+                    .and_then(|value| value.get("roles"))
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let active_incarnation_id = self
+                    .sessions
+                    .get(&session_id)
+                    .and_then(|state| state.active_incarnation_id.clone());
+                (
+                    format_roles_report(active_incarnation_id.as_deref(), &roles),
+                    "role_list_reported",
+                    serde_json::json!({
+                        "session_id": session_id,
+                        "turn_id": command_turn_id,
+                        "chat_id": command_chat_id,
+                        "role_command": "list_roles",
+                        "role_count": roles.len(),
+                        "active_incarnation_id": active_incarnation_id,
+                    }),
+                    None,
+                )
+            }
             IpcResponse::Error(message) => (
                 format!("Couldn't switch roles: {message}"),
                 "role_handoff_failed",
@@ -2285,7 +2364,7 @@ impl AgentRuntime {
                 None,
             ),
             other => (
-                format!("Couldn't switch roles: unexpected hotel response {other:?}"),
+                format!("Couldn't handle role command: unexpected hotel response {other:?}"),
                 "role_handoff_failed",
                 serde_json::json!({
                     "session_id": session_id,
@@ -2436,6 +2515,7 @@ impl AgentRuntime {
 
         let model_req = ModelRequestPayload {
             action: "generate_text".to_string(),
+            request_class: Some("cognitive".to_string()),
             session_id: session_id.clone(),
             turn_id,
             prompt,
@@ -2739,6 +2819,7 @@ impl AgentRuntime {
                 SlashCommand::Ping
                 | SlashCommand::Tts { .. }
                 | SlashCommand::Role { .. }
+                | SlashCommand::Roles
                 | SlashCommand::Back
                 | SlashCommand::Approve { .. }
                 | SlashCommand::Deny { .. } => (
@@ -3113,8 +3194,8 @@ impl AgentRuntime {
 mod tests {
     use super::{
         DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE, extract_model_error, format_role_command_reply,
-        media_analysis_attachments, normalized_user_content, resolve_media_routing,
-        resolve_model_execution_target,
+        format_roles_report, media_analysis_attachments, normalized_user_content,
+        resolve_media_routing, resolve_model_execution_target,
     };
     use crate::commands::SlashCommand;
     use crate::r#loop::{ApprovalRequest, ToolCall};
@@ -3131,6 +3212,7 @@ mod tests {
     fn model_request_targets_agent_for_reply() {
         let request = ModelRequestPayload {
             action: "generate_text".to_string(),
+            request_class: Some("cognitive".into()),
             session_id: "sess-1".into(),
             turn_id: "turn-1".into(),
             prompt: "hello".into(),
@@ -3156,6 +3238,7 @@ mod tests {
         let json = serde_json::to_value(&request).expect("serialize request");
         assert_eq!(json["reply_role"], "agent");
         assert_eq!(json["final_reply_role"], "membrane");
+        assert_eq!(json["request_class"], "cognitive");
         assert_eq!(json["context"]["active_turn"]["text"], "hello");
         assert_eq!(
             json["context_projection"]["conversation_turn"]["conversation_turn_id"],
@@ -3726,5 +3809,23 @@ mod tests {
             format_role_command_reply(&SlashCommand::Back, false),
             "Switching back to orchestrator once it finishes materializing."
         );
+    }
+
+    #[test]
+    fn roles_report_marks_active_role() {
+        let roles = vec![
+            serde_json::json!({
+                "role_name": "orchestrator",
+                "guest_id": "agent-jane:orchestrator"
+            }),
+            serde_json::json!({
+                "role_name": "developer",
+                "guest_id": "agent-jane:developer"
+            }),
+        ];
+        let report = format_roles_report(Some("agent-jane:developer"), &roles);
+        assert!(report.contains("Active role: developer."));
+        assert!(report.contains("- orchestrator"));
+        assert!(report.contains("* developer"));
     }
 }

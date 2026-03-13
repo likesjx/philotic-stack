@@ -1,5 +1,5 @@
 use ansible_mesh_core::beacon::BeaconDaemon;
-use ansible_mesh_core::graph::AbstractToolRecord;
+use ansible_mesh_core::graph::{AbstractSkillRecord, AbstractToolRecord};
 use ansible_mesh_core::heartbeat::emit_heartbeat;
 use ansible_mesh_core::registry::{CapabilityAdvertisement, ExecutionReachability};
 use ansible_mesh_core::storage::{
@@ -94,6 +94,8 @@ enum Command {
 enum StartupTest {
     #[value(name = "text-roundtrip", alias = "text-round-trip")]
     TextRoundTrip,
+    #[value(name = "cognitive-roundtrip", alias = "cognitive-round-trip")]
+    CognitiveRoundTrip,
     #[value(name = "gemini-oauth-roundtrip", alias = "gemini-oauth")]
     GeminiOAuthRoundTrip,
     VoiceSample,
@@ -104,6 +106,7 @@ enum StartupTest {
 }
 
 const STARTUP_TEST_TEXT_REPLY: &str = "startup text smoke ok";
+const STARTUP_TEST_COGNITIVE_REPLY: &str = "startup cognitive smoke ok";
 const STARTUP_TEST_GEMINI_OAUTH_REPLY: &str = "oauth-guest-ok";
 const STARTUP_TEST_TELEGRAM_TOKEN: &str = "startup-test-telegram-token";
 const STARTUP_TEST_GEMINI_API_KEY: &str = "startup-test-gemini-key";
@@ -1012,6 +1015,36 @@ fn seed_abstract_tool_catalog(graph: &dyn GraphStorage) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Seed the built-in abstract skill catalog into the context graph.
+///
+/// These skills are prompt-facing posture records first; their implied tool
+/// grants stay intentionally narrow until the governed handoff and role
+/// provisioning layers are fully wired.
+fn seed_abstract_skill_catalog(graph: &dyn GraphStorage) -> anyhow::Result<()> {
+    let catalog = [
+        AbstractSkillRecord {
+            skill_name: "handoff.to_role".into(),
+            description: "Assess whether the current session should be handed off to a named specialist role, summarize the goal clearly, and only hand off once the target role is justified.".into(),
+            implied_tools: Vec::new(),
+        },
+        AbstractSkillRecord {
+            skill_name: "handoff.back".into(),
+            description: "Return a session from a specialist role back to the orchestrator with a concise summary of completed work, open questions, and the next recommended action.".into(),
+            implied_tools: Vec::new(),
+        },
+        AbstractSkillRecord {
+            skill_name: "role.governance".into(),
+            description: "Govern role definitions deliberately for the current agent identity, reasoning explicitly about purpose, capability posture, handoff behavior, and limits before proposing changes.".into(),
+            implied_tools: Vec::new(),
+        },
+    ];
+
+    for skill in &catalog {
+        graph.upsert_abstract_skill(skill)?;
+    }
+    Ok(())
+}
+
 fn enable_guest_test_overrides(
     graph: &dyn GraphStorage,
     hotel_name: &str,
@@ -1039,6 +1072,32 @@ fn enable_guest_test_overrides(
                 env.insert(
                     "PHILOTIC_MODEL_ROUTER_STUB_RESPONSE".into(),
                     serde_json::Value::String(STARTUP_TEST_TEXT_REPLY.into()),
+                );
+                guest.config_json = config.to_string();
+            }
+        }
+        StartupTest::CognitiveRoundTrip => {
+            graph.set_config_value(
+                "gemini_api_key",
+                &serde_json::Value::String(STARTUP_TEST_GEMINI_API_KEY.into()).to_string(),
+            )?;
+
+            for guest in &mut guests {
+                if guest.role != "model.gemini" {
+                    continue;
+                }
+
+                let mut config: serde_json::Value =
+                    serde_json::from_str(&guest.config_json).unwrap_or_default();
+                let env = config
+                    .as_object_mut()
+                    .and_then(|obj| obj.get_mut("env"))
+                    .and_then(serde_json::Value::as_object_mut)
+                    .context("guest config missing env object")?;
+                env.remove("PHILOTIC_MODEL_ROUTER_STUB_RESPONSE");
+                env.insert(
+                    "PHILOTIC_GEMINI_BASE_URL".into(),
+                    serde_json::Value::String(startup_test_gemini_base_url(hotel_name)),
                 );
                 guest.config_json = config.to_string();
             }
@@ -1208,11 +1267,15 @@ fn startup_test_gemini_base_url(hotel_name: &str) -> String {
 #[derive(Clone)]
 struct FakeGeminiOAuthState {
     expected_reply: String,
+    required_prompt_substrings: Vec<String>,
+    require_bearer_auth: bool,
 }
 
 fn spawn_fake_gemini_server(
     hotel_name: &str,
     expected_reply: String,
+    required_prompt_substrings: Vec<String>,
+    require_bearer_auth: bool,
 ) -> tokio::task::JoinHandle<()> {
     let bind_addr: SocketAddr = format!("127.0.0.1:{}", startup_test_gemini_port(hotel_name))
         .parse()
@@ -1220,7 +1283,11 @@ fn spawn_fake_gemini_server(
 
     let app = Router::new()
         .fallback(any(fake_gemini_handler))
-        .with_state(FakeGeminiOAuthState { expected_reply });
+        .with_state(FakeGeminiOAuthState {
+            expected_reply,
+            required_prompt_substrings,
+            require_bearer_auth,
+        });
 
     tokio::spawn(async move {
         let listener = match tokio::net::TcpListener::bind(bind_addr).await {
@@ -1264,45 +1331,56 @@ async fn fake_gemini_handler(
             .into_response();
     }
 
-    if request
+    let uses_api_key_query = request
         .uri()
         .query()
         .map(|query| query.contains("key="))
-        .unwrap_or(false)
-    {
+        .unwrap_or(false);
+
+    if state.require_bearer_auth {
+        if uses_api_key_query {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": { "message": "startup oauth smoke requires bearer auth, not api-key query auth" }
+                })),
+            )
+                .into_response();
+        }
+
+        let headers = request.headers();
+        let auth_header = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        if !auth_header.starts_with("Bearer ") || auth_header.trim() == "Bearer" {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": { "message": "missing bearer auth" }
+                })),
+            )
+                .into_response();
+        }
+
+        let project_header = headers
+            .get("x-goog-user-project")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        if project_header.trim().is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": { "message": "missing x-goog-user-project header" }
+                })),
+            )
+                .into_response();
+        }
+    } else if !uses_api_key_query {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": { "message": "startup oauth smoke requires bearer auth, not api-key query auth" }
-            })),
-        )
-            .into_response();
-    }
-
-    let headers = request.headers();
-    let auth_header = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-    if !auth_header.starts_with("Bearer ") || auth_header.trim() == "Bearer" {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({
-                "error": { "message": "missing bearer auth" }
-            })),
-        )
-            .into_response();
-    }
-
-    let project_header = headers
-        .get("x-goog-user-project")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-    if project_header.trim().is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": { "message": "missing x-goog-user-project header" }
+                "error": { "message": "startup cognitive smoke expected api-key query auth" }
             })),
         )
             .into_response();
@@ -1336,6 +1414,20 @@ async fn fake_gemini_handler(
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": { "message": "prompt did not contain expected startup reply token" }
+            })),
+        )
+            .into_response();
+    }
+
+    if let Some(missing) = state
+        .required_prompt_substrings
+        .iter()
+        .find(|needle| !prompt.contains(needle.as_str()))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": { "message": format!("prompt missing required startup marker {:?}", missing) }
             })),
         )
             .into_response();
@@ -1785,6 +1877,101 @@ async fn run_startup_test(
                 err
             );
         }
+        StartupTest::CognitiveRoundTrip => {
+            let expected_reply = text
+                .unwrap_or(STARTUP_TEST_COGNITIVE_REPLY)
+                .trim()
+                .to_string();
+            let user_content = format!("Reply with exactly: {}", expected_reply);
+
+            let fake_gemini = spawn_fake_gemini_server(
+                hotel_name,
+                expected_reply.clone(),
+                vec![
+                    "[Identity]".into(),
+                    "[Instructions]".into(),
+                    "[Memory]".into(),
+                    "[Active turn]".into(),
+                    user_content.clone(),
+                ],
+                false,
+            );
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+            let mut client = PhiloticClient::connect_at(
+                socket_path,
+                GuestIdentity {
+                    guest_id: "ansible-startup-test-client".into(),
+                    role: "ansible-startup-test".into(),
+                    supported_tools: Vec::new(),
+                },
+            )
+            .await?;
+
+            let response = client
+                .send_request(IpcRequest::EmitTask {
+                    target_node: local_node_id.clone(),
+                    target_role: "agent".into(),
+                    target_guest_id: None,
+                    task_json: serde_json::json!({
+                        "source": "startup-test",
+                        "session_id": "startup-test:cognitive-roundtrip",
+                        "turn_id": "startup-cognitive-turn-1",
+                        "chat_id": "startup-cognitive-chat",
+                        "content": user_content,
+                        "final_reply_to": local_node_id,
+                        "final_reply_role": "ansible-startup-test",
+                        "final_reply_guest_id": "ansible-startup-test-client"
+                    })
+                    .to_string(),
+                })
+                .await?;
+
+            match response {
+                IpcResponse::Standard { ok: true, .. } => {}
+                other => anyhow::bail!("unexpected startup test emit response: {other:?}"),
+            }
+
+            let reply =
+                tokio::time::timeout(tokio::time::Duration::from_secs(30), client.recv_task())
+                    .await
+                    .context("timed out waiting for cognitive startup reply")??;
+            fake_gemini.abort();
+
+            let IpcResponse::InboundTask { task_json, .. } = reply else {
+                anyhow::bail!("unexpected startup test envelope: {reply:?}");
+            };
+
+            let payload: serde_json::Value = serde_json::from_str(&task_json)
+                .context("failed to decode cognitive startup reply")?;
+            if let Some(message) = payload
+                .get("agent_action")
+                .and_then(|value| value.get("message"))
+                .and_then(serde_json::Value::as_str)
+            {
+                anyhow::bail!("startup cognitive round-trip failed: {message}");
+            }
+
+            let content = payload
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if content != expected_reply {
+                anyhow::bail!(
+                    "unexpected cognitive startup reply: expected {:?}, got {:?}",
+                    expected_reply,
+                    content
+                );
+            }
+
+            info!(
+                "Startup cognitive round-trip received {:?} through fake Gemini-backed structured context",
+                content
+            );
+            Ok(())
+        }
         StartupTest::GeminiOAuthRoundTrip => {
             let expected_reply = text
                 .unwrap_or(STARTUP_TEST_GEMINI_OAUTH_REPLY)
@@ -1792,7 +1979,8 @@ async fn run_startup_test(
                 .to_string();
             let prompt = format!("Reply with exactly: {}", expected_reply);
 
-            let fake_gemini = spawn_fake_gemini_server(hotel_name, expected_reply.clone());
+            let fake_gemini =
+                spawn_fake_gemini_server(hotel_name, expected_reply.clone(), Vec::new(), true);
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
             let mut client = PhiloticClient::connect_at(
@@ -2796,6 +2984,7 @@ async fn main() -> Result<()> {
     let mut hotel = reconcile_hotel_record(&graph_storage, &hotel_name)?;
 
     seed_abstract_tool_catalog(&graph_storage)?;
+    seed_abstract_skill_catalog(&graph_storage)?;
 
     if let Some(test) = startup_test {
         prepare_startup_test_binaries(test)?;
@@ -3003,12 +3192,21 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Abstracted Universal Materializer with trait-object storage
+    let materializer = Box::new(crate::service::guest_manager::LocalProcessMaterializer::new());
+    let guest_manager = Arc::new(crate::service::guest_manager::GuestManager::new(
+        hotel_name.clone(),
+        graph_arc.clone(),
+        materializer,
+    ));
+
     let ipc_server = IpcServer::new(
         socket_path,
         caps.node_id.clone(),
         dispatcher_tx.clone(),
         graph_arc.clone(),
     )
+    .with_materialization_requester(guest_manager.clone())
     .with_registry(daemon.registry());
     let ipc_inboxes = ipc_server.inboxes();
 
@@ -3042,14 +3240,6 @@ async fn main() -> Result<()> {
 
     // Give the front desk a moment to bind the UDS path before guests attempt to register.
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-
-    // Abstracted Universal Materializer with trait-object storage
-    let materializer = Box::new(crate::service::guest_manager::LocalProcessMaterializer::new());
-    let guest_manager = Arc::new(crate::service::guest_manager::GuestManager::new(
-        hotel_name.clone(),
-        graph_arc.clone(),
-        materializer,
-    ));
 
     if let Err(e) = guest_manager
         .materialize_all(shutdown_rx.resubscribe())

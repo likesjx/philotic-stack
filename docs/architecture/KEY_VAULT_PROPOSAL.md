@@ -1,3 +1,35 @@
+---
+title: "Key Vault Proposal"
+doc_type: proposal
+domain: operator-control-plane
+status: accepted-current-slice
+last_updated: 2026-03-12
+tags:
+  - vault
+  - secrets
+  - oauth
+  - control-plane
+  - active-seam
+related_docs:
+  - ARCHITECTURE_STATUS.md
+  - CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md
+  - MODEL_CONTROLLER_PROPOSAL.md
+  - PERIMETER_EGRESS_CONTROL_PROPOSAL.md
+task_refs:
+  - docs/task.md
+proposal_id: key-vault
+implements: []
+implemented_by:
+  - vault-secret-ref-slice
+  - keychain-root-key-slice
+active_seams:
+  - vault-secret-refs
+  - remote-vault-delegation
+source_of_truth_targets:
+  - ARCHITECTURE_STATUS.md
+  - ARCHITECTURE.md
+---
+
 # Key Vault Proposal
 
 ## Goal
@@ -65,7 +97,7 @@ Pin and prove the first design contract for:
 - encrypted secret storage plus role/guest-gated local secret fetch over hotel IPC
 - macOS Keychain-backed vault root key with env fallback only as a bootstrap path
 
-Linked task surface: [docs/task.md](/Users/jaredlikes/code/philotic-stack-model-controller-abstraction/docs/task.md)
+Linked task surface: [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md)
 
 ## Repo Truth Right Now
 

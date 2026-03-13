@@ -1,3 +1,22 @@
+---
+title: "Philotic Agent Loop Spec"
+doc_type: reference
+domain: runtime-sessions
+status: active
+last_updated: 2026-03-12
+tags:
+  - spec
+  - agent-loop
+  - runtime
+  - reference
+related_docs:
+  - ARCHITECTURE_STATUS.md
+  - AGENT_LOOP_PROPOSAL.md
+  - AGENT_LOOP_RESEARCH.md
+task_refs:
+  - docs/task.md
+---
+
 # Philotic Agent Loop Spec
 
 ## Scope

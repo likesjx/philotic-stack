@@ -1,3 +1,31 @@
+---
+title: "Proposal Organization Proposal"
+doc_type: proposal
+domain: workflow-docs
+status: accepted-current-slice
+last_updated: 2026-03-12
+tags:
+  - docs
+  - proposals
+  - organization
+  - domains
+related_docs:
+  - README.md
+  - DOMAIN_MAP.md
+  - DOC_TAGGING_FRONTMATTER_PROPOSAL.md
+  - AGENT_WORKFLOW_PROPOSAL.md
+task_refs:
+  - docs/task.md
+proposal_id: proposal-organization
+implements: []
+implemented_by:
+  - architecture-hub-and-domain-map-slice
+active_seams:
+  - active-proposal-frontmatter-rollout
+source_of_truth_targets:
+  - ARCHITECTURE_STATUS.md
+---
+
 # Proposal Organization Proposal
 
 ## Goal
@@ -6,7 +34,7 @@ Define the first lightweight structure for organizing a growing proposal set in 
 
 ## Disposition
 
-`proposed`
+`accepted for current slice`
 
 Track follow-on work in [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md).
 
@@ -87,8 +115,13 @@ Backlinks are there to show the local neighborhood, not to create a giant bidire
 ## Current Slice
 
 - pin the first organization strategy before proposal volume grows further
-- prefer flat filenames plus domain naming, tags, and backlinks over new folders for now
-- add a backlog item to revisit folders only if the flat architecture index becomes materially hard to use
+- keep proposal files flat in `docs/architecture/`
+- add a domain-oriented architecture hub and a separate living architecture-status snapshot
+- make the split explicit between:
+  - implemented/current truth
+  - deep reference
+  - proposal space
+- revisit folders only if the flat architecture index becomes materially hard to use even with the domain map
 
 ## Relationship To Other Proposals
 

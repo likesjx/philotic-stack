@@ -1,3 +1,33 @@
+---
+title: "Role Posture And Admin Proposal"
+doc_type: proposal
+domain: operator-control-plane
+status: proposed
+last_updated: 2026-03-12
+tags:
+  - roles
+  - admin
+  - posture
+  - elevation
+  - active-seam
+related_docs:
+  - ARCHITECTURE_STATUS.md
+  - AGENT_INCARNATION_PROPOSAL.md
+  - CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md
+  - LOCAL_ADMIN_FALLBACK_MODEL_PROPOSAL.md
+task_refs:
+  - docs/task.md
+proposal_id: role-posture-and-admin
+implements: []
+implemented_by: []
+active_seams:
+  - admin-posture-model
+  - session-admin-elevation
+source_of_truth_targets:
+  - ARCHITECTURE_STATUS.md
+  - ARCHITECTURE.md
+---
+
 # Role Posture And Admin Proposal
 
 ## Goal

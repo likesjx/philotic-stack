@@ -1,3 +1,32 @@
+---
+title: "Hotel Perimeter Trust Proposal"
+doc_type: proposal
+domain: operator-control-plane
+status: proposed
+last_updated: 2026-03-12
+tags:
+  - perimeter
+  - trust
+  - identity
+  - authorization
+  - active-seam
+related_docs:
+  - ARCHITECTURE_STATUS.md
+  - INTER_HOTEL_ROUTING_PROPOSAL.md
+  - PERIMETER_EGRESS_CONTROL_PROPOSAL.md
+task_refs:
+  - docs/task.md
+proposal_id: hotel-perimeter-trust
+implements: []
+implemented_by: []
+active_seams:
+  - hotel-membership-records
+  - perimeter-authz-policy
+source_of_truth_targets:
+  - ARCHITECTURE_STATUS.md
+  - ARCHITECTURE.md
+---
+
 # Hotel Perimeter Trust Proposal
 
 ## Goal

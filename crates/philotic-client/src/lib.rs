@@ -72,6 +72,16 @@ impl TaskErrorPayload {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct HandoffBundle {
+    pub goal: String,
+    pub context_excerpt: String,
+    pub session_id: String,
+    pub initiating_turn_id: String,
+    #[serde(default)]
+    pub return_to: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LeaseStatus {
@@ -168,6 +178,20 @@ pub enum IpcRequest {
     ReleaseTelegramPollLease {
         lease_key: String,
     },
+    HandoffToRole {
+        session_id: String,
+        role_name: String,
+        handoff_bundle: HandoffBundle,
+    },
+    HandoffBack {
+        session_id: String,
+        summary: String,
+        #[serde(default)]
+        return_to: Option<String>,
+    },
+    ListRoleIncarnations {
+        agent_id: String,
+    },
     QueryStatus {
         task_id: Uuid,
     },
@@ -212,6 +236,14 @@ pub enum IpcResponse {
     TelegramPollLeaseStatus {
         active: bool,
         lease: Option<LeaseEnvelope>,
+    },
+    HandoffAck {
+        handoff_guest_id: String,
+        became_active: bool,
+    },
+    HandoffBackAck {
+        handoff_guest_id: String,
+        became_active: bool,
     },
     InboundTask {
         source_node: String,

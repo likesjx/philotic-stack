@@ -23,6 +23,7 @@ This skill does not own:
 - choosing the verification strategy from scratch
 
 Use [$proposal-maintainer](../proposal-maintainer/SKILL.md) for generic proposal upkeep.
+Use [$architecture-docs-maintainer](../architecture-docs-maintainer/SKILL.md) when the slice changed architecture truth, active seams, frontmatter metadata, or docs entrypoints.
 Use [$verification-ladder](../verification-ladder/SKILL.md) when the main job is deciding validation depth.
 Use [$runtime-debugger](../runtime-debugger/SKILL.md) when the main job is finding a live runtime failure.
 
@@ -31,10 +32,14 @@ Use [$runtime-debugger](../runtime-debugger/SKILL.md) when the main job is findi
 1. Identify the slice boundary.
 2. Update the relevant Philotic proposal `Disposition`.
 3. Update `docs/task.md` for completed work and real follow-ups.
-4. Summarize the highest honest verification level.
-5. Record assumption-vs-reality gaps exposed by the slice.
-6. Commit and push one coherent slice.
-7. State the next seam.
+4. If architecture docs moved, run the `architecture-docs-maintainer` pass:
+   - update `ARCHITECTURE_STATUS.md` if current truth changed
+   - update `ARCHITECTURE.md` if durable reference changed
+   - ensure metadata/domains/links still align
+5. Summarize the highest honest verification level.
+6. Record assumption-vs-reality gaps exposed by the slice.
+7. Commit and push one coherent slice.
+8. State the next seam.
 
 ## Output Expectations
 

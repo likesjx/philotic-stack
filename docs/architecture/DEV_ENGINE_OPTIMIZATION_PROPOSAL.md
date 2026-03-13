@@ -1,3 +1,33 @@
+---
+title: "Philotic Dev Engine Optimization"
+doc_type: proposal
+domain: workflow-docs
+status: accepted-current-slice
+last_updated: 2026-03-12
+tags:
+  - workflow
+  - engine
+  - muninn
+  - bootstrap
+  - active-seam
+related_docs:
+  - ARCHITECTURE_STATUS.md
+  - AGENT_WORKFLOW_PROPOSAL.md
+  - DOC_TAGGING_FRONTMATTER_PROPOSAL.md
+task_refs:
+  - docs/task.md
+proposal_id: dev-engine-optimization
+implements: []
+implemented_by:
+  - engine-check-slice
+  - session-start-bootstrap-slice
+active_seams:
+  - engine-bootstrap-routine
+  - reality-gap-consolidation
+source_of_truth_targets:
+  - ARCHITECTURE_STATUS.md
+---
+
 # PROPOSAL: Philotic Dev Engine Optimization
 
 ## Goal

@@ -1,6 +1,7 @@
 use ansible_mesh_core::materializer::Materializer;
 use ansible_mesh_core::storage::GraphStorage;
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use rusqlite::types::ValueRef;
 use std::collections::HashMap;
 use std::process::{Command as ProcessCommand, Stdio};
@@ -191,6 +192,11 @@ pub struct GuestManager {
     materializer: Arc<Mutex<Box<dyn Materializer>>>,
 }
 
+#[async_trait]
+pub trait GuestMaterializationRequester: Send + Sync {
+    async fn ensure_guest_active(&self, guest_id: &str) -> Result<bool>;
+}
+
 impl GuestManager {
     pub fn new(
         hotel_name: impl Into<String>,
@@ -277,6 +283,60 @@ impl GuestManager {
         });
 
         Ok(())
+    }
+
+    pub async fn ensure_guest_active(&self, guest_id: &str) -> Result<bool> {
+        let Some(current_rec) =
+            Self::refresh_guest_record(self.graph.as_ref(), &self.hotel_name, guest_id)?
+        else {
+            return Ok(false);
+        };
+        if !current_rec.is_active {
+            return Ok(false);
+        }
+
+        let mut mat = self.materializer.lock().await;
+        if let Some(active_pid) = current_rec.active_pid.as_deref() {
+            let is_live = mat.check_status(&current_rec.guest_id, active_pid).await?;
+            if is_live {
+                return Ok(true);
+            }
+            warn!(
+                "On-demand materialization: Guest [{}] had stale PID [{}]. Reclaiming before respawn.",
+                current_rec.guest_id, active_pid
+            );
+            if let Err(err) = mat.reclaim_guest(&current_rec.guest_id).await {
+                warn!(
+                    "On-demand materialization: reclaim failed for [{}]: {}",
+                    current_rec.guest_id, err
+                );
+            }
+            Self::clear_guest_pid(self.graph.as_ref(), &self.hotel_name, &current_rec.guest_id);
+        }
+
+        let config: serde_json::Value =
+            serde_json::from_str(&current_rec.config_json).unwrap_or_default();
+        match mat.spawn_guest(&current_rec.guest_id, &config).await {
+            Ok(new_pid) => {
+                info!(
+                    "On-demand materialization: spawned Guest [{}] (PID {}).",
+                    current_rec.guest_id, new_pid
+                );
+                self.graph.set_guest_pid(
+                    &self.hotel_name,
+                    &current_rec.guest_id,
+                    Some(&new_pid),
+                )?;
+                Ok(true)
+            }
+            Err(err) => {
+                error!(
+                    "On-demand materialization: failed to spawn Guest [{}]: {}",
+                    current_rec.guest_id, err
+                );
+                Ok(false)
+            }
+        }
     }
 
     /// An infinite loop that reconciles the SQLite desired state with the active `Materializer` state.
@@ -388,6 +448,13 @@ impl GuestManager {
         }
 
         Ok(())
+    }
+}
+
+#[async_trait]
+impl GuestMaterializationRequester for GuestManager {
+    async fn ensure_guest_active(&self, guest_id: &str) -> Result<bool> {
+        Self::ensure_guest_active(self, guest_id).await
     }
 }
 
@@ -630,6 +697,26 @@ mod tests {
         }
 
         fn list_abstract_tools(&self) -> Result<Vec<ansible_mesh_core::graph::AbstractToolRecord>> {
+            Ok(vec![])
+        }
+
+        fn upsert_abstract_skill(
+            &self,
+            _skill: &ansible_mesh_core::graph::AbstractSkillRecord,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn get_abstract_skill(
+            &self,
+            _skill_name: &str,
+        ) -> Result<Option<ansible_mesh_core::graph::AbstractSkillRecord>> {
+            Ok(None)
+        }
+
+        fn list_abstract_skills(
+            &self,
+        ) -> Result<Vec<ansible_mesh_core::graph::AbstractSkillRecord>> {
             Ok(vec![])
         }
     }

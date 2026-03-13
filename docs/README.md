@@ -1,57 +1,51 @@
 # Philotic Stack — Documentation Index
 
-> **Last Updated:** 2026-03-10
+> **Last Updated:** 2026-03-12
 
 ---
 
-## Architecture Reference
+## Start Here
 
-Core reference documents describing the implemented system.
+Use these in order when you want the current architecture without archaeology:
 
 | Document | Description |
 | -------- | ----------- |
-| [ARCHITECTURE.md](architecture/ARCHITECTURE.md) | Full system design — hotel model, crates, IPC, mesh, storage, guest lifecycle |
-| [PORT_BLUEPRINT.md](architecture/PORT_BLUEPRINT.md) | Migration plan from legacy plugin model |
-| [CODEBASE_HEALTH.md](architecture/CODEBASE_HEALTH.md) | Static analysis and honest assessment of current codebase state (2026-03-10) |
-| [CONCURRENCY_STRATEGY.md](architecture/CONCURRENCY_STRATEGY.md) | Concurrency audit — current bottlenecks, prioritized parallelism strategy, canonical patterns |
+| [architecture/README.md](architecture/README.md) | Architecture hub, domain map, and doc update rules |
+| [architecture/ARCHITECTURE_STATUS.md](architecture/ARCHITECTURE_STATUS.md) | Single source of truth for what is implemented, transitional, and actively in flight |
+| [architecture/DOMAIN_MAP.md](architecture/DOMAIN_MAP.md) | Scope-first catalog of domains, active proposals, and adjacent docs |
+| [architecture/SEAM_REGISTRY.md](architecture/SEAM_REGISTRY.md) | Stable IDs for active seams across proposals and task tracking |
+| [architecture/ARCHITECTURE.md](architecture/ARCHITECTURE.md) | Deep architecture reference for runtime structure and major protocols |
+| [task.md](task.md) | Current work surface and sequencing |
+
+## Architecture Reference
+
+Core documents describing implemented or current-system truth.
+
+| Document | Description |
+| -------- | ----------- |
+| [architecture/ARCHITECTURE_STATUS.md](architecture/ARCHITECTURE_STATUS.md) | Current architecture snapshot: implemented behavior, transitional seams, active work |
+| [architecture/ARCHITECTURE.md](architecture/ARCHITECTURE.md) | Deep runtime design reference — hotel model, crates, IPC, mesh, storage, guest lifecycle |
+| [architecture/CODEBASE_HEALTH.md](architecture/CODEBASE_HEALTH.md) | Honest assessment of current codebase state |
+| [architecture/CONCURRENCY_STRATEGY.md](architecture/CONCURRENCY_STRATEGY.md) | Concurrency audit and prioritized strategy |
 
 ---
 
-## Architecture Proposals
+## Architecture Domains
 
-Design proposals for features in progress or planned. These are **not** reference docs — they describe intended future behavior.
+Domain-level organization for proposals and active design work lives in [architecture/README.md](architecture/README.md).
 
-| Document | Topic |
-| -------- | ----- |
-| [CONCURRENCY_PROPOSAL.md](architecture/CONCURRENCY_PROPOSAL.md) | 6-change concurrency plan — WAL, block_on fix, parallel boot/dispatch/updates |
-| [AGENT_INCARNATION_PROPOSAL.md](architecture/AGENT_INCARNATION_PROPOSAL.md) | Conversational/worker/subagent taxonomy, session ownership |
-| [AGENT_LOOP_PROPOSAL.md](architecture/AGENT_LOOP_PROPOSAL.md) | Multi-turn tool re-entry, media routing policy, approval granularity |
-| [AGENT_LOOP_RESEARCH.md](architecture/AGENT_LOOP_RESEARCH.md) | Research backing the agent loop proposal |
-| [AGENT_WORKFLOW_PROPOSAL.md](architecture/AGENT_WORKFLOW_PROPOSAL.md) | High-level agent workflow orchestration |
-| [APPROVAL_UX_PROPOSAL.md](architecture/APPROVAL_UX_PROPOSAL.md) | Human-in-the-loop approval flow design |
-| [FORKED_SESSIONS_PROPOSAL.md](architecture/FORKED_SESSIONS_PROPOSAL.md) | Session forking and delegation model |
-| [GUEST_BINARY_RESOLUTION_PROPOSAL.md](architecture/GUEST_BINARY_RESOLUTION_PROPOSAL.md) | How guest binaries are located and resolved |
-| [MEMBRANE_COMPONENT_PROPOSAL.md](architecture/MEMBRANE_COMPONENT_PROPOSAL.md) | Membrane as outside-world membrane — transport, guard, session binding |
-| [HEURISTIC_MIND_AND_CONTEXT_PAPER.md](architecture/HEURISTIC_MIND_AND_CONTEXT_PAPER.md) | Cognitive model and context structure theory |
-| [INTER_HOTEL_ROUTING_PROPOSAL.md](architecture/INTER_HOTEL_ROUTING_PROPOSAL.md) | Cross-hotel event routing and execution plane design |
-| [KEY_VAULT_PROPOSAL.md](architecture/KEY_VAULT_PROPOSAL.md) | Keychain-backed hotel vault root key |
-| [MODEL_CONTROLLER_PROPOSAL.md](architecture/MODEL_CONTROLLER_PROPOSAL.md) | Model controller abstraction, request/response envelope design |
-| [MUNINN_MEMORY_PROTOCOL_PROPOSAL.md](architecture/MUNINN_MEMORY_PROTOCOL_PROPOSAL.md) | Persistent cognitive memory protocol |
-| [NATIVE_OVERLAY_VPN_PROPOSAL.md](architecture/NATIVE_OVERLAY_VPN_PROPOSAL.md) | Native overlay to replace Tailscale/WireGuard underlay |
-| [PERSONALITY_AND_CONTEXT_PROPOSAL.md](architecture/PERSONALITY_AND_CONTEXT_PROPOSAL.md) | Agent identity, persona, and context projection |
-| [PHILOTIC_AGENT_LOOP_PROPOSAL.md](architecture/PHILOTIC_AGENT_LOOP_PROPOSAL.md) | Philotic-specific agent loop design |
-| [PHILOTIC_AGENT_LOOP_SPEC.md](architecture/PHILOTIC_AGENT_LOOP_SPEC.md) | Specification-level detail for the agent loop |
-| [RH_ANSIBLE_VPS_DEPLOYMENT_PROPOSAL.md](architecture/RH_ANSIBLE_VPS_DEPLOYMENT_PROPOSAL.md) | VPS deployment and hotel rendering via RH Ansible |
-| [RUNNER_ARTIFACT_BUILD_DISTRIBUTION_PROPOSAL.md](architecture/RUNNER_ARTIFACT_BUILD_DISTRIBUTION_PROPOSAL.md) | Build and distribution of guest runner artifacts |
-| [RUST_FORGE_PROPOSAL.md](architecture/RUST_FORGE_PROPOSAL.md) | Rust-native tooling and build infrastructure |
-| [SESSION_LOOP_PROPOSAL.md](architecture/SESSION_LOOP_PROPOSAL.md) | Session loop state machine |
-| [SLASH_COMMANDS_PROPOSAL.md](architecture/SLASH_COMMANDS_PROPOSAL.md) | Slash command dispatch system |
-| [TASK_RUNNER_PROPOSAL.md](architecture/TASK_RUNNER_PROPOSAL.md) | Task runner and tool assembly execution |
-| [TELEGRAM_INTEGRATION_PROPOSAL.md](architecture/TELEGRAM_INTEGRATION_PROPOSAL.md) | Telegram transport integration details |
-| [TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md](architecture/TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md) | Tool assembly, routing, and sandboxed execution |
-| [TOOL_MANAGEMENT_PLANE_PROPOSAL.md](architecture/TOOL_MANAGEMENT_PLANE_PROPOSAL.md) | Tool catalog and management plane |
-| [VOICE_MACHINE_PROPOSAL.md](architecture/VOICE_MACHINE_PROPOSAL.md) | Voice machine — audio delivery and session behavior |
-| [ZEROCLAW_TO_PHILOTIC_BRIDGE_PROPOSAL.md](architecture/ZEROCLAW_TO_PHILOTIC_BRIDGE_PROPOSAL.md) | Migration path from legacy ZeroClaw |
+These docs are proposal space, not automatic runtime truth:
+
+| Domain | Examples |
+| ----- | -------- |
+| Runtime and Sessions | [architecture/SESSION_LOOP_PROPOSAL.md](architecture/SESSION_LOOP_PROPOSAL.md), [architecture/AGENT_LOOP_PROPOSAL.md](architecture/AGENT_LOOP_PROPOSAL.md), [architecture/AGENT_INCARNATION_PROPOSAL.md](architecture/AGENT_INCARNATION_PROPOSAL.md) |
+| Membrane and Transport | [architecture/TELEGRAM_INTEGRATION_PROPOSAL.md](architecture/TELEGRAM_INTEGRATION_PROPOSAL.md), [architecture/TELEGRAM_POLL_LEASE_PROPOSAL.md](architecture/TELEGRAM_POLL_LEASE_PROPOSAL.md), [architecture/SLASH_COMMANDS_PROPOSAL.md](architecture/SLASH_COMMANDS_PROPOSAL.md) |
+| Mesh and Placement | [architecture/INTER_HOTEL_ROUTING_PROPOSAL.md](architecture/INTER_HOTEL_ROUTING_PROPOSAL.md), [architecture/NATIVE_OVERLAY_VPN_PROPOSAL.md](architecture/NATIVE_OVERLAY_VPN_PROPOSAL.md), [architecture/MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md](architecture/MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md) |
+| Memory and Context | [architecture/MUNINN_MEMORY_PROTOCOL_PROPOSAL.md](architecture/MUNINN_MEMORY_PROTOCOL_PROPOSAL.md), [architecture/PERSONALITY_AND_CONTEXT_PROPOSAL.md](architecture/PERSONALITY_AND_CONTEXT_PROPOSAL.md), [architecture/PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md](architecture/PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md) |
+| Tooling and Execution | [architecture/TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md](architecture/TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md), [architecture/TASK_RUNNER_PROPOSAL.md](architecture/TASK_RUNNER_PROPOSAL.md), [architecture/TOOL_MANAGEMENT_PLANE_PROPOSAL.md](architecture/TOOL_MANAGEMENT_PLANE_PROPOSAL.md) |
+| Operator and Control Plane | [architecture/ROLE_POSTURE_AND_ADMIN_PROPOSAL.md](architecture/ROLE_POSTURE_AND_ADMIN_PROPOSAL.md), [architecture/CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md](architecture/CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md), [architecture/PERIMETER_EGRESS_CONTROL_PROPOSAL.md](architecture/PERIMETER_EGRESS_CONTROL_PROPOSAL.md) |
+| Deployment and Distribution | [architecture/RH_ANSIBLE_VPS_DEPLOYMENT_PROPOSAL.md](architecture/RH_ANSIBLE_VPS_DEPLOYMENT_PROPOSAL.md), [architecture/GUEST_BINARY_RESOLUTION_PROPOSAL.md](architecture/GUEST_BINARY_RESOLUTION_PROPOSAL.md), [architecture/HOMEBREW_DISTRIBUTION_PROPOSAL.md](architecture/HOMEBREW_DISTRIBUTION_PROPOSAL.md) |
+| Migration and Historical Direction | [architecture/OPENCLAW_PARITY_MIGRATION_PROPOSAL.md](architecture/OPENCLAW_PARITY_MIGRATION_PROPOSAL.md), [architecture/ZEROCLAW_TO_PHILOTIC_BRIDGE_PROPOSAL.md](architecture/ZEROCLAW_TO_PHILOTIC_BRIDGE_PROPOSAL.md), [architecture/PORT_BLUEPRINT.md](architecture/PORT_BLUEPRINT.md) |
 
 ---
 
@@ -61,6 +55,15 @@ Design proposals for features in progress or planned. These are **not** referenc
 | -------- | ----------- |
 | [worktree-workflow.md](worktree-workflow.md) | Parallel workstream and worktree workflow guide |
 | [task.md](task.md) | Current task tracking |
+
+## Historical Docs
+
+| Document | Description |
+| -------- | ----------- |
+| [PHILOTIC-ARCHITECTURE.md](PHILOTIC-ARCHITECTURE.md) | Historical concept doc from earlier ZeroClaw/Philotic framing; do not treat as the current architecture source of truth |
+| [ARCHITECT_THOUGHTS_CONTEXT_GRAPH.md](ARCHITECT_THOUGHTS_CONTEXT_GRAPH.md) | Historical architect-thesis narrative from earlier ZeroClaw framing; useful for lineage, not current law |
+| [architecture/PORT_BLUEPRINT.md](architecture/PORT_BLUEPRINT.md) | Historical migration blueprint from an earlier port-planning phase |
+| [walkthrough.md](walkthrough.md) | Historical walkthrough of an earlier end-to-end materialization path |
 
 ---
 

@@ -1,3 +1,31 @@
+---
+title: "Router-Native Observability Proposal"
+doc_type: proposal
+domain: operator-control-plane
+status: proposed
+last_updated: 2026-03-12
+tags:
+  - observability
+  - router
+  - events
+  - listeners
+  - active-seam
+related_docs:
+  - ARCHITECTURE_STATUS.md
+  - ARCHITECTURE.md
+task_refs:
+  - docs/task.md
+proposal_id: router-native-observability
+implements: []
+implemented_by: []
+active_seams:
+  - observability-event-envelope
+  - attachable-observability-listeners
+source_of_truth_targets:
+  - ARCHITECTURE_STATUS.md
+  - ARCHITECTURE.md
+---
+
 # Router-Native Observability Proposal
 
 ## Goal

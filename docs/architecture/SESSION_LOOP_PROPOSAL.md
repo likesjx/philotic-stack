@@ -1,3 +1,34 @@
+---
+title: "Philotic Session Management and Agent Logic Proposal"
+doc_type: proposal
+domain: runtime-sessions
+status: implemented
+last_updated: 2026-03-12
+tags:
+  - sessions
+  - approvals
+  - checkpoints
+  - routing
+  - current-slice
+related_docs:
+  - ARCHITECTURE_STATUS.md
+  - ARCHITECTURE.md
+  - AGENT_LOOP_PROPOSAL.md
+  - APPROVAL_UX_PROPOSAL.md
+task_refs:
+  - docs/task.md
+proposal_id: session-loop
+implements: []
+implemented_by:
+  - session-checkpoint-approval-slice
+active_seams:
+  - session-leases
+  - session-compaction
+source_of_truth_targets:
+  - ARCHITECTURE_STATUS.md
+  - ARCHITECTURE.md
+---
+
 # Philotic Session Management and Agent Logic Proposal
 
 ## Goal
@@ -11,7 +42,7 @@ The key architectural decision is:
 - `membrane` and other edge guests own transport-specific bindings (`telegram chat -> philotic session`) and delivery UX, not reasoning.
 - `SyncApartment` remains the agent's checkpoint path back to the Context Graph, but it should be treated as snapshot sync, not as a fine-grained event stream.
 
-This keeps Philotic aligned with the hotel/guest model already described in [CLAUDE.md](/Users/jaredlikes/code/philotic-stack/CLAUDE.md) and [PHILOTIC-ARCHITECTURE.md](/Users/jaredlikes/code/philotic-stack/docs/PHILOTIC-ARCHITECTURE.md).
+This keeps Philotic aligned with the hotel/guest model already described in [CLAUDE.md](/Users/jaredlikes/code/philotic-stack/CLAUDE.md) and [ARCHITECTURE.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE.md).
 
 ## Disposition
 

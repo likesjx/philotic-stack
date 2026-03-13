@@ -1,3 +1,33 @@
+---
+title: "Memory Engine Abstraction Proposal"
+doc_type: proposal
+domain: memory-context
+status: proposed
+last_updated: 2026-03-12
+tags:
+  - memory
+  - engine
+  - abstraction
+  - muninn
+  - active-seam
+related_docs:
+  - ARCHITECTURE_STATUS.md
+  - PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md
+  - MUNINN_MEMORY_PROTOCOL_PROPOSAL.md
+  - AGENT_PLUGIN_HOOKS_PROPOSAL.md
+task_refs:
+  - docs/task.md
+proposal_id: memory-engine-abstraction
+implements: []
+implemented_by: []
+active_seams:
+  - memory-engine-contract
+  - graph-muninn-memory-dual-path
+source_of_truth_targets:
+  - ARCHITECTURE_STATUS.md
+  - ARCHITECTURE.md
+---
+
 # Memory Engine Abstraction Proposal
 
 ## Goal

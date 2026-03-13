@@ -1,3 +1,30 @@
+---
+title: "Homebrew Distribution"
+doc_type: proposal
+domain: deployment-distribution
+status: proposed
+last_updated: 2026-03-12
+tags:
+  - distribution
+  - homebrew
+  - release
+  - packaging
+  - active-seam
+related_docs:
+  - ARCHITECTURE_STATUS.md
+  - RH_ANSIBLE_VPS_DEPLOYMENT_PROPOSAL.md
+task_refs:
+  - docs/task.md
+proposal_id: homebrew-distribution
+implements: []
+implemented_by: []
+active_seams:
+  - public-cli-naming
+  - homebrew-release-pipeline
+source_of_truth_targets:
+  - ARCHITECTURE_STATUS.md
+---
+
 # PROPOSAL: Homebrew Distribution
 
 ## Goal

@@ -26,6 +26,48 @@ impl TaskKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum RequestClass {
+    #[default]
+    Cognitive,
+    Transform,
+    Synthesis,
+    Embedding,
+}
+
+impl RequestClass {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Cognitive => "cognitive",
+            Self::Transform => "transform",
+            Self::Synthesis => "synthesis",
+            Self::Embedding => "embedding",
+        }
+    }
+
+    fn infer_from_kind(kind: TaskKind) -> Self {
+        match kind {
+            TaskKind::TextGenerate => Self::Cognitive,
+            TaskKind::MediaAnalyze | TaskKind::AudioTranscribe => Self::Transform,
+            TaskKind::VoiceSynthesize => Self::Synthesis,
+        }
+    }
+
+    fn parse(value: Option<&Value>, kind: TaskKind) -> Result<Self> {
+        let Some(raw) = value.and_then(Value::as_str) else {
+            return Ok(Self::infer_from_kind(kind));
+        };
+
+        match raw {
+            "cognitive" => Ok(Self::Cognitive),
+            "transform" => Ok(Self::Transform),
+            "synthesis" => Ok(Self::Synthesis),
+            "embedding" => Ok(Self::Embedding),
+            other => bail!("unsupported request_class [{}]", other),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ResponseContract {
     pub modalities: Vec<String>,
     pub style: Option<String>,
@@ -106,6 +148,21 @@ pub struct ContextEnvelope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ConversationTurnProjection {
+    pub conversation_turn_id: Option<String>,
+    pub session_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub source: Option<String>,
+    pub active_incarnation_id: Option<String>,
+    pub trigger_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ContextProjectionEnvelope {
+    pub conversation_turn: Option<ConversationTurnProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AffordanceItem {
     pub id: Option<String>,
     pub name: Option<String>,
@@ -128,6 +185,7 @@ pub struct RoutingHints {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControllerTask {
     pub kind: TaskKind,
+    pub request_class: RequestClass,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub prompt: Option<String>,
@@ -140,6 +198,7 @@ pub struct ControllerTask {
     pub language_code: Option<String>,
     pub response_contract: ResponseContract,
     pub context: ContextEnvelope,
+    pub context_projection: ContextProjectionEnvelope,
     pub affordances: Affordances,
     pub routing_hints: RoutingHints,
     pub provider_options: Map<String, Value>,
@@ -149,6 +208,7 @@ impl ControllerTask {
     pub fn from_value(task: &Value) -> Result<Self> {
         let response_contract = parse_response_contract(task.get("response_contract"));
         let mut context = parse_context(task.get("context"));
+        let context_projection = parse_context_projection(task.get("context_projection"));
         let affordances = parse_affordances(task.get("affordances"));
         let routing_hints = parse_routing_hints(task.get("routing_hints"));
         let top_level_attachments = parse_attachments(task.get("attachments"));
@@ -182,6 +242,8 @@ impl ControllerTask {
             None => bail!("task is missing a recognized kind/prompt/text payload"),
         };
 
+        let request_class = RequestClass::parse(task.get("request_class"), kind)?;
+
         let provider_options = task
             .get("provider_options")
             .and_then(Value::as_object)
@@ -190,6 +252,7 @@ impl ControllerTask {
 
         let controller_task = Self {
             kind,
+            request_class,
             provider: task
                 .get("provider")
                 .and_then(Value::as_str)
@@ -236,6 +299,7 @@ impl ControllerTask {
                 .map(str::to_string),
             response_contract,
             context,
+            context_projection,
             affordances,
             routing_hints,
             provider_options,
@@ -255,8 +319,88 @@ impl ControllerTask {
         self.prompt.as_deref()
     }
 
+    pub fn is_cognitive(&self) -> bool {
+        self.request_class == RequestClass::Cognitive
+    }
+
+    pub fn composed_prompt_text(&self) -> Option<String> {
+        let mut sections = Vec::new();
+
+        if !self.context.identity.is_empty() {
+            let text = join_projection_items(&self.context.identity);
+            if !text.is_empty() {
+                sections.push(format!("[Identity]\n{text}"));
+            }
+        }
+
+        if let Some(active_incarnation_id) = self.active_incarnation_id() {
+            sections.push(format!(
+                "[Active incarnation]\nThe currently active role/incarnation is `{active_incarnation_id}`."
+            ));
+        }
+
+        if !self.context.instructions.is_empty() {
+            let text = join_projection_items(&self.context.instructions);
+            if !text.is_empty() {
+                sections.push(format!("[Instructions]\n{text}"));
+            }
+        }
+
+        if !self.context.memory.is_empty() {
+            let text = join_projection_items(&self.context.memory);
+            if !text.is_empty() {
+                sections.push(format!("[Memory]\n{text}"));
+            }
+        }
+
+        if !self.context.dialogue_window.is_empty() {
+            let dialogue = self
+                .context
+                .dialogue_window
+                .iter()
+                .filter_map(|turn| {
+                    let role = turn.role.as_deref().unwrap_or("unknown");
+                    turn.text_content().map(|text| format!("{role}: {text}"))
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !dialogue.is_empty() {
+                sections.push(format!("[Dialogue window]\n{dialogue}"));
+            }
+        }
+
+        if let Some(active_turn) = self.context.active_turn.as_ref() {
+            if let Some(text) = active_turn.text_content() {
+                let role = active_turn.role.as_deref().unwrap_or("user");
+                sections.push(format!("[Active turn]\n{role}: {text}"));
+            }
+        }
+
+        if let Some(prompt) = self
+            .prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        {
+            sections.push(format!("[Prompt]\n{prompt}"));
+        }
+
+        if sections.is_empty() {
+            None
+        } else {
+            Some(sections.join("\n\n"))
+        }
+    }
+
     pub fn media_prompt(&self) -> Option<&str> {
         self.prompt.as_deref()
+    }
+
+    pub fn active_incarnation_id(&self) -> Option<&str> {
+        self.context_projection
+            .conversation_turn
+            .as_ref()
+            .and_then(|turn| turn.active_incarnation_id.as_deref())
     }
 
     pub fn voice_text(&self) -> Option<&str> {
@@ -293,7 +437,7 @@ impl ControllerTask {
         match self.kind {
             TaskKind::TextGenerate => {
                 let prompt = self
-                    .prompt_text()
+                    .composed_prompt_text()
                     .context("text.generate task missing prompt")?;
                 if prompt.trim().is_empty() {
                     bail!("text.generate task prompt cannot be empty");
@@ -332,6 +476,42 @@ impl ControllerTask {
                 if text.trim().is_empty() {
                     bail!("voice.synthesize task text cannot be empty");
                 }
+            }
+        }
+
+        match self.request_class {
+            RequestClass::Cognitive => {
+                if self.kind != TaskKind::TextGenerate {
+                    bail!(
+                        "request_class [{}] is not currently supported for [{}]",
+                        self.request_class.as_str(),
+                        self.kind.as_str()
+                    );
+                }
+            }
+            RequestClass::Transform => {
+                if !matches!(
+                    self.kind,
+                    TaskKind::MediaAnalyze | TaskKind::AudioTranscribe
+                ) {
+                    bail!(
+                        "request_class [{}] is not currently supported for [{}]",
+                        self.request_class.as_str(),
+                        self.kind.as_str()
+                    );
+                }
+            }
+            RequestClass::Synthesis => {
+                if self.kind != TaskKind::VoiceSynthesize {
+                    bail!(
+                        "request_class [{}] is not currently supported for [{}]",
+                        self.request_class.as_str(),
+                        self.kind.as_str()
+                    );
+                }
+            }
+            RequestClass::Embedding => {
+                bail!("request_class [embedding] is not yet supported by model-router");
             }
         }
 
@@ -564,6 +744,55 @@ fn parse_affordances(value: Option<&Value>) -> Affordances {
         skills: parse_affordance_items(object.get("skills")),
         tools: parse_affordance_items(object.get("tools")),
     }
+}
+
+fn parse_context_projection(value: Option<&Value>) -> ContextProjectionEnvelope {
+    let Some(object) = value.and_then(Value::as_object) else {
+        return ContextProjectionEnvelope::default();
+    };
+
+    let conversation_turn = object
+        .get("conversation_turn")
+        .and_then(Value::as_object)
+        .map(|turn| ConversationTurnProjection {
+            conversation_turn_id: turn
+                .get("conversation_turn_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            session_id: turn
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            agent_id: turn
+                .get("agent_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            source: turn
+                .get("source")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            active_incarnation_id: turn
+                .get("active_incarnation_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            trigger_kind: turn
+                .get("trigger_kind")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        });
+
+    ContextProjectionEnvelope { conversation_turn }
+}
+
+fn join_projection_items(items: &[ProjectionItem]) -> String {
+    items
+        .iter()
+        .filter_map(|item| item.text.as_deref())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 fn parse_routing_hints(value: Option<&Value>) -> RoutingHints {
@@ -928,7 +1157,7 @@ async fn fetch_secret_string(
 mod tests {
     use super::{
         AudioArtifact, ControllerResponseEnvelope, ControllerTask, ProviderOutput,
-        ProviderRegistry, TaskKind, serialize_audio_artifact,
+        ProviderRegistry, RequestClass, TaskKind, serialize_audio_artifact,
     };
     use anyhow::Result;
     use async_trait::async_trait;
@@ -964,6 +1193,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(task.kind, TaskKind::TextGenerate);
+        assert_eq!(task.request_class, RequestClass::Cognitive);
         assert_eq!(task.prompt_text(), Some("hello"));
     }
 
@@ -979,6 +1209,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(task.kind, TaskKind::VoiceSynthesize);
+        assert_eq!(task.request_class, RequestClass::Synthesis);
         assert_eq!(task.voice_text(), Some("Speak now"));
         assert_eq!(task.display_text(), Some("Hi there"));
         assert_eq!(task.requested_voice(), Some("voice-123"));
@@ -1000,8 +1231,49 @@ mod tests {
         .unwrap();
 
         assert_eq!(task.kind, TaskKind::TextGenerate);
+        assert_eq!(task.request_class, RequestClass::Cognitive);
         assert_eq!(task.prompt_text(), Some("Summarize the deployment status."));
         assert_eq!(task.context.identity.len(), 1);
+        let composed = task
+            .composed_prompt_text()
+            .expect("structured task should compose a prompt");
+        assert!(composed.contains("[Identity]"));
+        assert!(composed.contains("You are Jane."));
+        assert!(composed.contains("[Active turn]"));
+        assert!(composed.contains("Summarize the deployment status."));
+    }
+
+    #[test]
+    fn composed_prompt_includes_active_incarnation_when_present() {
+        let task = ControllerTask::from_value(&json!({
+            "context": {
+                "identity": [{"text": "You are Jane."}],
+                "instructions": [{"text": "Session status: active.", "projection_kind": "session"}],
+                "memory": [{"text": "User prefers direct collaboration.", "projection_kind": "relationship"}],
+                "active_turn": {
+                    "role": "user",
+                    "text": "Status?"
+                }
+            },
+            "context_projection": {
+                "conversation_turn": {
+                    "conversation_turn_id": "turn-1",
+                    "agent_id": "agent-jane-01",
+                    "active_incarnation_id": "agent-jane:developer"
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(task.active_incarnation_id(), Some("agent-jane:developer"));
+        assert!(task.is_cognitive());
+        let composed = task
+            .composed_prompt_text()
+            .expect("structured task should compose a prompt");
+        assert!(composed.contains("[Active incarnation]"));
+        assert!(composed.contains("agent-jane:developer"));
+        assert!(composed.contains("[Instructions]"));
+        assert!(composed.contains("[Memory]"));
     }
 
     #[test]
@@ -1020,6 +1292,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(task.kind, TaskKind::MediaAnalyze);
+        assert_eq!(task.request_class, RequestClass::Transform);
         assert_eq!(task.media_attachments().len(), 1);
         assert_eq!(
             task.media_attachments()[0].url.as_deref(),
@@ -1043,6 +1316,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(task.kind, TaskKind::AudioTranscribe);
+        assert_eq!(task.request_class, RequestClass::Transform);
         assert_eq!(task.kind.as_str(), "voice.transcribe");
         assert_eq!(task.media_attachments().len(), 1);
     }
@@ -1062,6 +1336,34 @@ mod tests {
         .unwrap();
 
         assert_eq!(task.kind, TaskKind::AudioTranscribe);
+        assert_eq!(task.request_class, RequestClass::Transform);
+    }
+
+    #[test]
+    fn respects_explicit_request_class_on_text_tasks() {
+        let task = ControllerTask::from_value(&json!({
+            "kind": "text.generate",
+            "request_class": "cognitive",
+            "context": {
+                "active_turn": {"role": "user", "text": "hello"}
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(task.request_class, RequestClass::Cognitive);
+    }
+
+    #[test]
+    fn rejects_mismatched_request_class_for_task_kind() {
+        let err = ControllerTask::from_value(&json!({
+            "kind": "voice.synthesize",
+            "request_class": "cognitive",
+            "spoken_text": "hello",
+            "voice": "voice-1"
+        }))
+        .expect_err("mismatched request class should fail");
+
+        assert!(err.to_string().contains("request_class"));
     }
 
     #[test]

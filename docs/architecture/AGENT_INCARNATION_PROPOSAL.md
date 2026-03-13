@@ -14,6 +14,7 @@ related_docs:
   - ARCHITECTURE_STATUS.md
   - SESSION_LOOP_PROPOSAL.md
   - AGENT_LOOP_PROPOSAL.md
+  - GOVERNED_WORKFLOW_SKILLS_PROPOSAL.md
   - TELEGRAM_POLL_LEASE_PROPOSAL.md
 task_refs:
   - docs/task.md
@@ -55,10 +56,11 @@ The first runtime substrate for the incarnation model now exists:
 This slice is intentionally narrower than the full proposal:
 
 - role definitions exist, but `ConfigureRole` is not implemented yet
+- `abstract_skill` records now exist in the Context Graph with the first built-in handoff/governance skill seeds, but role skill posture is not assembled into sessions yet
 - active route selection exists, and unregistered active-incarnation targets now fall back to a live orchestrator when one is present
 - the first parked-delivery/on-demand materialization path exists for inbound agent tasks
 - basic `HandoffToRole` / `HandoffBack` IPC now exists, and active route ownership only flips after the target incarnation is live or registers after on-demand materialization
-- `/role <name>` and `/back` now exist as manual operator surfaces in `agent-core`, backed by the same hotel handoff/runtime contract
+- `/role <name>`, `/back`, and `/roles` now exist as manual operator surfaces in `agent-core`, backed by the same hotel handoff/runtime contract and hotel-backed role listing
 - handoff skill scaffolding, role-profile seeding, inactive TTL reclaim, and subagents remain future slices
 
 ## Linked Work Surface
@@ -75,6 +77,8 @@ An **agent** is an identity: soul, history, relationships, and shared memory. Th
 An **incarnation** is a long-lived, named role that the agent plays. Each incarnation has its own capability posture (toolset/skillset), its own role identity addendum layered on top of the base soul, and its own running session context (turn history, working memory). Multiple incarnations can be active concurrently. The **philotic membrane (membrane)** routes inbound user messages to exactly one incarnation at a time — the active one — but all incarnations can send outbound messages back through the membrane.
 
 Important boundary: role switching changes the current inbound route target, not the underlying membrane transport authority. A Telegram poller stays attached to the agent/home-hotel membrane authority even when the active routed incarnation changes from orchestrator to developer, architect, or another role.
+
+For broader workflow governance, including peer delegation and external cognitive peer handoff, see [GOVERNED_WORKFLOW_SKILLS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GOVERNED_WORKFLOW_SKILLS_PROPOSAL.md). This proposal stays focused on same-agent incarnation behavior.
 
 Important identity boundary: all role incarnations share the same base agent identity. A role addendum modifies posture, specialization, and stance; it does not create a second self. Philotic should treat roles as additive overlays on one continuous identity, not as sibling personas with shared storage.
 
@@ -218,6 +222,38 @@ A handoff skill specifies:
 - **Cleanup steps**: what the outgoing incarnation should do before yielding (flush working memory, update session facts, emit a user-facing status message)
 - **Target role**: which incarnation should receive the handoff
 
+### Delegate/execute split, adapted from OpenClaw
+
+The old OpenClaw `ansible` plugin used a useful split:
+
+- a **delegation-side skill/reference** to decide that work should be handed off and describe the contract
+- an **executor-side skill/reference** owned by the target capability/agent that actually performs the work
+
+That split is still valuable, but Philotic should adapt it to the stronger hotel/mesh foundation rather than copying the plugin literally.
+
+For Philotic role handoff, the recommended boundary is:
+
+- **handoff workflow skill** on the current active incarnation, usually orchestrator
+  - decides whether handoff is warranted
+  - chooses the target role
+  - assembles the required context bundle
+  - defines return conditions and cleanup
+- **role execution posture** on the receiving incarnation
+  - receives a `HandoffBundle`
+  - does the work under its own toolset/skillset/turn-loop policy
+  - returns via `HandoffBack` when complete
+
+Important difference from OpenClaw:
+
+- OpenClaw paired delegation/executor skill refs around a capability manifest because the plugin needed to coordinate behavior through shared Yjs state and prompt conventions.
+- Philotic already has a hotel, a context graph, materialization, and handoff IPC. So the generic workflow should stay **role-native**, not capability-manifest-native.
+
+That means the first handoff workflow should likely be:
+
+- one generic orchestrator-governed `handoff.to_role` workflow skill
+- informed by role metadata and session state
+- not one bespoke skill-pair manifest per role unless later evidence proves the generic workflow is too weak
+
 ### Handoff context bundle
 
 The handoff passes a structured bundle to the receiving incarnation:
@@ -238,7 +274,7 @@ The receiving incarnation gets: its own prior session history + the `HandoffBund
 
 ```
 orchestrator decides to hand off to developer
-  → invokes handoff.to_developer skill
+  → invokes handoff.to_role workflow skill
   → skill builds HandoffBundle from recent context
   → emits HandoffToRole IPC with bundle
   ↓
@@ -527,7 +563,8 @@ Dependencies are real and must be respected:
 
 5. **`active_incarnation_id` in session records + IpcServer routing update.** This is now implemented for inbound agent-task routing. Fallback to a live orchestrator when the active incarnation is unregistered is now implemented. The first parked-delivery/on-demand materialization path for configured inbound targets is now implemented. Broader buffered ownership transfer during handoff is still pending.
 
-6. **`HandoffToRole` / `HandoffBack` IPC + manual switching surface.** The first membrane switch protocol is now implemented at the IPC/runtime layer, and `/role <name>` + `/back` now ride that same hotel-owned contract. The handoff skill shape is still pending.
+6. **`HandoffToRole` / `HandoffBack` IPC + manual switching surface.** The first membrane switch protocol is now implemented at the IPC/runtime layer, `/role <name>` + `/back` ride that same hotel-owned contract, and `/roles` provides a hotel-backed configured-role view.
+7. **First `abstract_skill` scaffolding.** The Context Graph now has `AbstractSkillRecord` plus seeded handoff/governance skill entries. The actual handoff workflow contract and role skill posture assembly are still pending.
 
 7. **Inactive TTL + on-demand rematerialization.** Add TTL check to the supervisor loop. Restore session context from memory on rematerialization.
 

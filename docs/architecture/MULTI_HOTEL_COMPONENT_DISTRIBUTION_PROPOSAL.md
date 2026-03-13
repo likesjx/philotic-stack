@@ -1,3 +1,34 @@
+---
+title: "Multi-Hotel Component Distribution Proposal"
+doc_type: proposal
+domain: mesh-placement
+status: proposed
+last_updated: 2026-03-12
+tags:
+  - distribution
+  - routing
+  - mesh
+  - placement
+  - active-seam
+related_docs:
+  - ARCHITECTURE_STATUS.md
+  - INTER_HOTEL_ROUTING_PROPOSAL.md
+  - HOTEL_PERIMETER_TRUST_PROPOSAL.md
+task_refs:
+  - docs/task.md
+proposal_id: multi-hotel-component-distribution
+implements: []
+implemented_by: []
+active_seams:
+  - multi-hotel-route-consistency
+  - cross-host-distributed-validation
+  - remote-materialization-ceremony
+  - capacity-relief-placement
+source_of_truth_targets:
+  - ARCHITECTURE_STATUS.md
+  - ARCHITECTURE.md
+---
+
 # Multi-Hotel Component Distribution Proposal
 
 ## Goal
@@ -73,6 +104,109 @@ But a broader multi-hotel vertical slice is still open because:
 - broader routed component classes are not all using the same remote-capable path yet
 - inter-hotel ACK truth is still transitional
 - trust/perimeter policy is not closed enough for a serious cross-host split
+
+## Remote Materialization Ceremony
+
+When a hotel needs a component that is not currently live or routeable, the platform should treat that as an explicit ceremony rather than a lucky timeout cascade.
+
+Recommended flow:
+
+1. the requesting hotel publishes a **materialization intent**
+   - capability or component kind needed
+   - reason (`route-demand`, `prewarm`, `failover`, `capacity-relief`)
+   - requirements and placement hints
+   - the parked work reference, not the full user payload broadcast to everyone
+2. the control/placement plane determines the best target hotel by fitness
+3. the requesting hotel sends a **targeted materialization request** to the winning hotel
+4. the winning hotel decides locally whether it accepts the request and can materialize
+5. the winning hotel materializes the component locally and supervises it locally
+6. once the component is ready, the winning hotel publishes updated route/readiness metadata
+7. the requesting hotel releases the parked work onto the updated route
+
+Important boundary:
+
+- intents may be mesh-visible
+- the concrete materialization request should be point-to-point to the winner
+- readiness publication should happen before the parked request is released
+
+Otherwise the system stops being a placement plane and starts becoming a distributed rumor mill.
+
+### Materialization intent
+
+The first useful intent shape is:
+
+```json
+{
+  "intent_type": "remote_materialization",
+  "requesting_hotel": "hotel-a",
+  "component_kind": "agent-core",
+  "required_capability": "agent.session.orchestrator",
+  "reason": "route-demand",
+  "preferred_hotels": ["hotel-b", "hotel-c"],
+  "preferred_environment": "gpu",
+  "parked_work_ref": "turn:session-123:turn-44",
+  "requested_at": 1741810200
+}
+```
+
+This is intentionally a coordination record, not a full process spec serialized into UDP gossip.
+
+### Materialization request
+
+Once the winning target is chosen, the requesting hotel sends a targeted request to that hotel with the concrete requirements needed for local startup:
+
+- component kind / target role
+- environment constraints
+- configuration or artifact references
+- optional required lease scope
+- retention hint or idle policy
+- correlation id back to the parked work
+
+The target hotel still owns:
+
+- actual process spawn
+- local policy and admission checks
+- local supervision
+- local readiness reporting
+
+The requester does not get to spawn remote processes by sheer force of desire, which feels like a healthy boundary.
+
+## Capacity-Relief Placement
+
+One important variant is when a hotel is overloaded and wants help rather than when a single parked request is missing a destination.
+
+Recommended flow:
+
+1. stressed hotel publishes a **capacity-relief signal**
+2. candidate hotels publish offers or eligibility
+3. placement scoring chooses a winning target
+4. stressed hotel sends a targeted materialization request to that winner
+5. winner materializes and publishes readiness
+6. routing begins sending new work to the new target
+7. old capacity drains and retires according to policy
+
+The important operational rule is:
+
+- this should prefer **drain and retire**
+- not immediate panic kill
+
+Otherwise “scale-out” becomes a very energetic synonym for “drop work while moving it.”
+
+## Relationship To Leases
+
+Remote materialization and lease authority are related but not identical.
+
+- some components are routeable once ready and do not need an authority lease
+- some components, such as agents or Telegram pollers, are `singleton-scoped` and need an authority lease before they may act
+- a target hotel may materialize a standby candidate without yet granting acting authority
+
+This means:
+
+- materialization creates a candidate
+- readiness makes it routeable
+- lease authority, when required, makes it allowed to act
+
+That separation is the only reason the system can support both replicated capacity and custody-bearing runtimes without constantly confusing itself.
 
 ## Recommended Validation Ladder
 

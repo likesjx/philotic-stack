@@ -1111,6 +1111,10 @@ const TELEGRAM_MENU_COMMANDS: &[TelegramBotCommand] = &[
         description: "Switch to a named role.",
     },
     TelegramBotCommand {
+        command: "roles",
+        description: "List configured roles and active role.",
+    },
+    TelegramBotCommand {
         command: "back",
         description: "Return to the orchestrator role.",
     },
@@ -1140,6 +1144,7 @@ fn telegram_help_text() -> String {
     }
     help.push_str("\nNotes:\n");
     help.push_str("/role expects a role name, for example /role developer.\n");
+    help.push_str("/roles lists configured roles and highlights the active one.\n");
     help.push_str("/back returns the session to the orchestrator role.\n");
     help.push_str("/approve and /deny can include a note.\n");
     help.push_str("/tts accepts optional modes like on, off, or auto.");
@@ -1993,6 +1998,7 @@ mod tests {
         assert!(help.contains("/commands"));
         assert!(help.contains("/status"));
         assert!(help.contains("/role"));
+        assert!(help.contains("/roles"));
         assert!(help.contains("/back"));
         assert!(help.contains("/approve"));
     }

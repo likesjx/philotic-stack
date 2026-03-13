@@ -85,6 +85,9 @@ If one of these is intentionally missing, say which part is omitted and why.
 
 Architecture and process proposals in `docs/architecture/` should stay lightweight but active.
 
+Active architecture/process docs should also carry lightweight frontmatter metadata according to
+[DOC_TAGGING_FRONTMATTER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DOC_TAGGING_FRONTMATTER_PROPOSAL.md).
+
 Each active proposal should prefer this structure:
 
 - `Goal`
@@ -102,6 +105,44 @@ Recommended `Disposition` values:
 - `deferred`
 
 Update the disposition as each slice lands.
+
+### 4.1 Domains And Metadata
+
+Use domains as the primary scope organizer for active architecture/process docs.
+
+Controlled domain vocabulary:
+
+- `runtime-sessions`
+- `membrane-transport`
+- `mesh-placement`
+- `memory-context`
+- `tooling-execution`
+- `operator-control-plane`
+- `deployment-distribution`
+- `migration-parity`
+- `workflow-docs`
+
+Metadata discipline:
+
+- every active architecture/process doc should declare exactly one primary `domain`
+- use frontmatter to declare `doc_type`, `status`, `last_updated`, lightweight `tags`, and cross-links
+- use tags as retrieval aids, not as a second hidden taxonomy
+- if a doc appears to need multiple primary domains, name that as a seam explicitly instead of smearing ownership
+
+### 4.2 Source-Of-Truth Split
+
+Keep these document roles distinct:
+
+- [ARCHITECTURE_STATUS.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE_STATUS.md)
+  - current implemented truth, transitional choices, and active seams
+- [ARCHITECTURE.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE.md)
+  - durable architecture reference
+- proposal docs in `docs/architecture/`
+  - intended direction, accepted current slices, and deferred design
+- [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md)
+  - active execution surface
+
+Do not let one of these quietly impersonate another because it happens to be nearby and eloquent.
 
 ## 5. Standard Development Loop
 
@@ -147,9 +188,15 @@ Do not stop at unit tests when the change affects:
 When a durable architectural or workflow decision is made, update:
 
 - the relevant proposal/spec in `docs/architecture/`
+- [docs/architecture/ARCHITECTURE_STATUS.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE_STATUS.md) if current truth or active seams changed
+- [docs/architecture/ARCHITECTURE.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE.md) if the durable reference changed
 - [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md)
 
 Capture decisions during the work, not later if convenient.
+
+When active architecture/process docs are touched, use the repo-local
+[$architecture-docs-maintainer](skills/architecture-docs-maintainer/SKILL.md) skill to keep
+frontmatter, domains, and cross-links aligned.
 
 ### 5.5 Slice Close-Out
 
@@ -233,7 +280,21 @@ While working:
 - prefer the next reasonable action over broad exploratory questioning
 - pause when a decision has non-obvious architectural consequences
 
-### 8.1 Muninn Failure Rule
+### 8.1 SVE Refresh Shortcut
+
+Use `SVE refresh` as the canonical shorthand for refreshing an open session onto the current Philotic SVE process.
+
+Interpret `SVE refresh` as:
+
+- re-read [AGENTS.md](/Users/jaredlikes/code/philotic-stack/AGENTS.md)
+- re-read [docs/architecture/README.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/README.md)
+- re-read [docs/architecture/ARCHITECTURE_STATUS.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE_STATUS.md)
+- re-read [docs/architecture/DOC_TAGGING_FRONTMATTER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DOC_TAGGING_FRONTMATTER_PROPOSAL.md)
+- apply the current repo-local SVE skill/process stack before continuing
+
+For older open sessions that may not yet know this shorthand, the operator should use the explicit long form once and ask the agent to restate the refreshed protocol before continuing.
+
+### 8.2 Muninn Failure Rule
 
 When Muninn is required by protocol for meaningful work:
 
@@ -289,6 +350,7 @@ The repository contains specialized skills in `skills/` to standardize common wo
 | `philotic-slice-closeout` | Finalizing implementation slices (tasks, proposals, commits) |
 | `verification-ladder` | Deciding and reporting the honest validation level |
 | `proposal-maintainer` | Architecture/process proposal and spec hygiene |
+| `architecture-docs-maintainer` | Keeping architecture truth, domains, frontmatter, and cross-links aligned |
 | `muninn-memory-habit` | Establishing consistent retrieval/write-back habits |
 | `subagent-delegation` | Splitting large tasks into bounded sub-tasks |
 | `runtime-debugger` | Diagnosing live multi-process/multimodal stack failures |
@@ -301,6 +363,7 @@ The repository contains specialized skills in `skills/` to standardize common wo
 - Prefer `rg` for file and text search.
 - Use `apply_patch` for manual file edits.
 - Keep architecture docs and task tracking current when decisions shift.
+- Treat domains and frontmatter as standing architecture-doc metadata, not optional polish.
 - When changing runtime boundaries, prefer proving them with code and smokes before broadening the design story.
 
 ## 12. Key References

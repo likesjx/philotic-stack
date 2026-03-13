@@ -1,4 +1,25 @@
+---
+title: "The Philotic Web Architecture"
+doc_type: historical
+domain: migration-parity
+status: historical
+last_updated: 2026-03-12
+tags:
+  - historical
+  - zeroclaw
+  - migration
+  - architecture
+related_docs:
+  - docs/architecture/ARCHITECTURE_STATUS.md
+  - docs/architecture/ARCHITECTURE.md
+  - docs/architecture/DOMAIN_MAP.md
+---
+
 # The Philotic Web Architecture
+
+> **Historical Document:** This file captures an earlier ZeroClaw-to-Philotic architectural framing and should not be treated as the current source of truth.
+>
+> For current architecture truth, start with [docs/architecture/ARCHITECTURE_STATUS.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE_STATUS.md), [docs/architecture/DOMAIN_MAP.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DOMAIN_MAP.md), and [docs/architecture/ARCHITECTURE.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE.md).
 
 ZeroClaw utilizes a **Universal Materialization** architecture entirely decoupled by a mesh network (the _Philotic Web_). The core paradigm is simple: **ZeroClaw itself does nothing.** It is purely an empty host—a stargate—that spawns independent OS processes to perform work based on its assigned configuration.
 

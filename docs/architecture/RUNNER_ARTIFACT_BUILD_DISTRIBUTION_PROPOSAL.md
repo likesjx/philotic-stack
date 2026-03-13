@@ -1,3 +1,31 @@
+---
+title: "Philotic Runner Artifact Build and Distribution Proposal"
+doc_type: proposal
+domain: deployment-distribution
+status: deferred
+last_updated: 2026-03-12
+tags:
+  - runners
+  - artifacts
+  - build
+  - distribution
+  - active-seam
+related_docs:
+  - ARCHITECTURE_STATUS.md
+  - TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md
+  - RH_ANSIBLE_VPS_DEPLOYMENT_PROPOSAL.md
+task_refs:
+  - docs/task.md
+proposal_id: runner-artifact-build-distribution
+implements: []
+implemented_by: []
+active_seams:
+  - artifact-trust-contract
+  - runner-release-distribution
+source_of_truth_targets:
+  - ARCHITECTURE_STATUS.md
+---
+
 # Philotic Runner Artifact Build and Distribution Proposal
 
 ## Goal

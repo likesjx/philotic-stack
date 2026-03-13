@@ -5,7 +5,7 @@
 //! consume them as `Arc<dyn EventStorage>`, etc.
 
 use crate::event::{EventEnvelope, EventId, EventKind, EventPayload};
-use crate::graph::{AbstractToolRecord, RoleIncarnationRecord};
+use crate::graph::{AbstractSkillRecord, AbstractToolRecord, RoleIncarnationRecord};
 use crate::graph::{GraphEdge, GraphNode};
 use crate::storage::{
     CursorStorage, EventStorage, GraphAdapter, GraphStorage, GuestRecord, HotelRecord,
@@ -1197,7 +1197,9 @@ impl GraphStorage for SqliteGraphStorage {
         self.adapter
             .list_nodes_by_kind("role_incarnation")?
             .into_iter()
-            .map(|node| serde_json::from_value::<RoleIncarnationRecord>(node.data).map_err(Into::into))
+            .map(|node| {
+                serde_json::from_value::<RoleIncarnationRecord>(node.data).map_err(Into::into)
+            })
             .filter(|result| {
                 result
                     .as_ref()
@@ -1383,6 +1385,33 @@ impl GraphStorage for SqliteGraphStorage {
     fn list_abstract_tools(&self) -> Result<Vec<AbstractToolRecord>> {
         self.adapter
             .list_nodes_by_kind("abstract_tool")?
+            .into_iter()
+            .map(|node| serde_json::from_value(node.data).map_err(Into::into))
+            .collect()
+    }
+
+    fn upsert_abstract_skill(&self, skill: &AbstractSkillRecord) -> Result<()> {
+        self.adapter.upsert_node(&GraphNode {
+            node_key: format!("abstract_skill:{}", skill.skill_name),
+            kind: "abstract_skill".into(),
+            label: Some(skill.skill_name.clone()),
+            data: serde_json::to_value(skill)?,
+        })
+    }
+
+    fn get_abstract_skill(&self, skill_name: &str) -> Result<Option<AbstractSkillRecord>> {
+        match self
+            .adapter
+            .get_node(&format!("abstract_skill:{skill_name}"))?
+        {
+            Some(node) => Ok(Some(serde_json::from_value(node.data)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn list_abstract_skills(&self) -> Result<Vec<AbstractSkillRecord>> {
+        self.adapter
+            .list_nodes_by_kind("abstract_skill")?
             .into_iter()
             .map(|node| serde_json::from_value(node.data).map_err(Into::into))
             .collect()

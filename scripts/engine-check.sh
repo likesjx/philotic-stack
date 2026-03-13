@@ -59,11 +59,18 @@ printf '\n'
 check_file "AGENTS.md" "repo protocol is present"
 check_file "CLAUDE.md" "session bootstrap guide is present"
 check_file "scripts/muninn_mcp.py" "shared Muninn helper is present"
+check_file "scripts/docs-metadata-check.py" "docs metadata helper is present"
 check_file "scripts/codex-worktree.sh" "worktree helper is present"
 check_file "scripts/codex-workstream.sh" "workstream helper is present"
 check_file "skills/muninn-memory-habit/SKILL.md" "repo-local Muninn habit skill is present"
 check_file "skills/proposal-maintainer/SKILL.md" "repo-local proposal maintainer skill is present"
+check_file "skills/architecture-docs-maintainer/SKILL.md" "repo-local architecture docs maintainer skill is present"
 check_file "skills/verification-ladder/SKILL.md" "repo-local verification ladder skill is present"
+check_file "docs/architecture/README.md" "architecture docs hub is present"
+check_file "docs/architecture/DOMAIN_MAP.md" "architecture domain map is present"
+check_file "docs/architecture/SEAM_REGISTRY.md" "architecture seam registry is present"
+check_file "docs/architecture/ARCHITECTURE_STATUS.md" "architecture status source of truth is present"
+check_file "docs/architecture/DOC_TAGGING_FRONTMATTER_PROPOSAL.md" "docs metadata proposal is present"
 
 if command -v python3 >/dev/null 2>&1; then
   pass "python3 is available for helper scripts"
@@ -75,6 +82,12 @@ if python3 "${ROOT_DIR}/scripts/muninn_mcp.py" --base-url "$MUNINN_BASE_URL" boo
   pass "Muninn MCP helper passes recoverable bootstrap gate"
 else
   fail "Muninn MCP helper passes recoverable bootstrap gate"
+fi
+
+if python3 "${ROOT_DIR}/scripts/docs-metadata-check.py" >/dev/null; then
+  pass "docs metadata anchor set passes frontmatter checks"
+else
+  fail "docs metadata anchor set passes frontmatter checks"
 fi
 
 run_in_repo "cargo check workspace baseline" cargo check --workspace

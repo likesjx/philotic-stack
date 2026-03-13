@@ -5,6 +5,7 @@ pub enum SlashCommand {
     Pause,
     Resume,
     Role { role_name: String },
+    Roles,
     Back,
     ToolsAdd { tool: String },
     ToolsClear,
@@ -28,6 +29,7 @@ impl SlashCommand {
             Self::Pause => None,
             Self::Resume => None,
             Self::Role { .. } => None,
+            Self::Roles => None,
             Self::Back => None,
             Self::ToolsAdd { .. } => None,
             Self::ToolsClear => None,
@@ -65,6 +67,7 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         ["/role", role_name, ..] => Some(SlashCommand::Role {
             role_name: (*role_name).to_string(),
         }),
+        ["/roles", ..] => Some(SlashCommand::Roles),
         ["/back", ..] => Some(SlashCommand::Back),
         ["/tools", "add", tool, ..] => Some(SlashCommand::ToolsAdd {
             tool: (*tool).to_string(),
@@ -117,6 +120,7 @@ mod tests {
                 role_name: "developer".into()
             })
         );
+        assert_eq!(parse_slash_command("/roles"), Some(SlashCommand::Roles));
         assert_eq!(parse_slash_command("/back"), Some(SlashCommand::Back));
         assert_eq!(
             parse_slash_command("/tools add echo"),

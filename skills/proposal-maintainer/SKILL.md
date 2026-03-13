@@ -1,5 +1,5 @@
 name: proposal-maintainer
-description: HIGH PRIORITY. Use this skill to keep architecture and process proposals concise, current, and linked to active tasks. A proposal is not a static doc; it is an active plan. Trigger for disposition updates, task alignment, or removing stale certainty. Every meaningful decision should ripple into a proposal update.
+description: HIGH PRIORITY. Use this skill to keep architecture and process proposals concise, current, and linked to active tasks. A proposal is not a static doc; it is an active plan. Trigger for disposition updates, task alignment, or removing stale certainty. In Philotic, pair this with architecture-docs-maintainer when metadata, domains, or source-of-truth linkage also need upkeep.
 
 # Proposal Maintainer
 
@@ -22,6 +22,7 @@ This skill does not own:
 - runtime debugging or validation decisions
 
 Use `philotic-slice-closeout` when the main job is closing a Philotic implementation slice.
+Use [$architecture-docs-maintainer](../architecture-docs-maintainer/SKILL.md) in Philotic when the proposal edit also changes frontmatter, domain assignment, status-doc linkage, or docs index routing.
 Use [$verification-ladder](../verification-ladder/SKILL.md) when the main job is choosing or reporting validation depth.
 
 ## Workflow
@@ -31,6 +32,7 @@ Use [$verification-ladder](../verification-ladder/SKILL.md) when the main job is
 3. Tighten the recommendation and remove stale certainty.
 4. Align the document with implemented, accepted, deferred, or superseded reality.
 5. Link to the authoritative work surface.
+6. In Philotic, hand off to `architecture-docs-maintainer` if the proposal change also affects metadata, domains, source-of-truth docs, or task/status cross-links.
 
 ## Output Expectations
 

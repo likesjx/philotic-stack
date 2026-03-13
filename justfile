@@ -166,6 +166,10 @@ smoke-session-control:
 smoke-session-bindings:
     ./scripts/smoke-session-bindings-roundtrip.sh
 
+# Run the structured cognitive startup smoke
+smoke-cognitive:
+    bash scripts/smoke-cognitive-roundtrip.sh
+
 # Run the trusted vertical-slice verification suite
 verify-vertical-slice:
     cargo test -p philotic-client -- --nocapture

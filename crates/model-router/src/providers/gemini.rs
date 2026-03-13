@@ -254,12 +254,12 @@ impl ModelProvider for GeminiProvider {
         let payload = match task.kind {
             TaskKind::TextGenerate => {
                 let prompt = task
-                    .prompt_text()
+                    .composed_prompt_text()
                     .context("Gemini text task missing prompt")?;
                 if task.wants_channel("spoken_text") {
-                    Self::structured_text_request_payload(prompt)
+                    Self::structured_text_request_payload(&prompt)
                 } else {
-                    Self::request_payload(prompt)
+                    Self::request_payload(&prompt)
                 }
             }
             TaskKind::MediaAnalyze | TaskKind::AudioTranscribe => {
@@ -304,7 +304,7 @@ impl ModelProvider for GeminiProvider {
 mod tests {
     use super::{GeminiAuth, GeminiProvider};
     use crate::controller::{
-        AttachmentInput, ContextEnvelope, ControllerTask, RoutingHints, TaskKind,
+        AttachmentInput, ContextEnvelope, ControllerTask, RequestClass, RoutingHints, TaskKind,
     };
 
     #[test]
@@ -458,6 +458,7 @@ mod tests {
         );
         let task = ControllerTask {
             kind: TaskKind::MediaAnalyze,
+            request_class: RequestClass::Transform,
             provider: None,
             model: None,
             prompt: Some("Describe this media".into()),
@@ -480,6 +481,7 @@ mod tests {
                 }],
                 ..Default::default()
             },
+            context_projection: Default::default(),
             affordances: Default::default(),
             routing_hints: RoutingHints::default(),
             provider_options: Default::default(),
@@ -497,6 +499,7 @@ mod tests {
         );
         let task = ControllerTask {
             kind: TaskKind::AudioTranscribe,
+            request_class: RequestClass::Transform,
             provider: None,
             model: None,
             prompt: Some("Transcribe this audio verbatim.".into()),
@@ -519,6 +522,7 @@ mod tests {
                 }],
                 ..Default::default()
             },
+            context_projection: Default::default(),
             affordances: Default::default(),
             routing_hints: RoutingHints::default(),
             provider_options: Default::default(),

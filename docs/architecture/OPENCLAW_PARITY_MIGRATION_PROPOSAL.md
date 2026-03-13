@@ -1,3 +1,31 @@
+---
+title: "OpenClaw Parity And Migration Proposal"
+doc_type: proposal
+domain: migration-parity
+status: proposed
+last_updated: 2026-03-12
+tags:
+  - parity
+  - migration
+  - openclaw
+  - evaluation
+  - active-seam
+related_docs:
+  - ARCHITECTURE_STATUS.md
+  - ZEROCLAW_TO_PHILOTIC_BRIDGE_PROPOSAL.md
+  - PERSONALITY_AND_CONTEXT_PROPOSAL.md
+task_refs:
+  - docs/task.md
+proposal_id: openclaw-parity-migration
+implements: []
+implemented_by: []
+active_seams:
+  - parity-matrix
+  - migration-readiness-gates
+source_of_truth_targets:
+  - ARCHITECTURE_STATUS.md
+---
+
 # OpenClaw Parity And Migration Proposal
 
 ## Goal

@@ -1,3 +1,33 @@
+---
+title: "Control Plane Admin Surface Proposal"
+doc_type: proposal
+domain: operator-control-plane
+status: proposed
+last_updated: 2026-03-12
+tags:
+  - admin
+  - control-plane
+  - cli
+  - tui
+  - active-seam
+related_docs:
+  - ARCHITECTURE_STATUS.md
+  - ROLE_POSTURE_AND_ADMIN_PROPOSAL.md
+  - LOCAL_ADMIN_FALLBACK_MODEL_PROPOSAL.md
+  - PERIMETER_EGRESS_CONTROL_PROPOSAL.md
+task_refs:
+  - docs/task.md
+proposal_id: control-plane-admin-surface
+implements: []
+implemented_by: []
+active_seams:
+  - cli-tui-admin-surface
+  - action-grant-contract
+source_of_truth_targets:
+  - ARCHITECTURE_STATUS.md
+  - ARCHITECTURE.md
+---
+
 # Control Plane Admin Surface Proposal
 
 ## Goal

@@ -6,7 +6,9 @@
 //! pluggable deployment-time decision.
 
 use crate::event::EventEnvelope;
-use crate::graph::{AbstractToolRecord, GraphEdge, GraphNode, RoleIncarnationRecord};
+use crate::graph::{
+    AbstractSkillRecord, AbstractToolRecord, GraphEdge, GraphNode, RoleIncarnationRecord,
+};
 use crate::NodeCapabilities;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -255,6 +257,15 @@ pub trait GraphStorage: Send + Sync {
 
     /// List all abstract tool definitions in the catalog.
     fn list_abstract_tools(&self) -> Result<Vec<AbstractToolRecord>>;
+
+    /// Upsert a shared abstract skill definition into the context graph.
+    fn upsert_abstract_skill(&self, skill: &AbstractSkillRecord) -> Result<()>;
+
+    /// Load a single abstract skill definition by name, or `None` if not cataloged.
+    fn get_abstract_skill(&self, skill_name: &str) -> Result<Option<AbstractSkillRecord>>;
+
+    /// List all abstract skill definitions in the catalog.
+    fn list_abstract_skills(&self) -> Result<Vec<AbstractSkillRecord>>;
 }
 
 /// Generic graph persistence contract.

@@ -1,3 +1,33 @@
+---
+title: "Local Admin Fallback Model Proposal"
+doc_type: proposal
+domain: operator-control-plane
+status: proposed
+last_updated: 2026-03-12
+tags:
+  - admin
+  - local-model
+  - onnx
+  - fallback
+  - active-seam
+related_docs:
+  - ARCHITECTURE_STATUS.md
+  - ROLE_POSTURE_AND_ADMIN_PROPOSAL.md
+  - CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md
+  - MEMORY_ENGINE_ABSTRACTION_PROPOSAL.md
+task_refs:
+  - docs/task.md
+proposal_id: local-admin-fallback-model
+implements: []
+implemented_by: []
+active_seams:
+  - local-admin-capability-envelope
+  - onnx-admin-fallback-path
+source_of_truth_targets:
+  - ARCHITECTURE_STATUS.md
+  - ARCHITECTURE.md
+---
+
 # Local Admin Fallback Model Proposal
 
 ## Goal

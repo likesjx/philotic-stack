@@ -1,3 +1,32 @@
+---
+title: "Philotic Agent Workflow Proposal"
+doc_type: proposal
+domain: workflow-docs
+status: accepted-current-slice
+last_updated: 2026-03-12
+tags:
+  - workflow
+  - slices
+  - verification
+  - docs
+related_docs:
+  - README.md
+  - DOC_TAGGING_FRONTMATTER_PROPOSAL.md
+  - ARCHITECTURE_STATUS.md
+task_refs:
+  - docs/task.md
+proposal_id: agent-workflow
+implements: []
+implemented_by:
+  - repo-agents-protocol
+  - verify-vertical-slice
+active_seams:
+  - proposal-disposition-rollout
+  - watched-live-recipe
+source_of_truth_targets:
+  - ARCHITECTURE_STATUS.md
+---
+
 # Philotic Agent Workflow Proposal
 
 ## Goal

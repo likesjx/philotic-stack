@@ -79,11 +79,12 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 Seam IDs: `role-incarnation-records`, `active-membrane-routing`, `handoff-skill`
 
 ### Skill Catalog + Toolset Profiles (prerequisite for role provisioning)
-- [ ] Add `AbstractSkillRecord` to `ansible-mesh-core/src/graph.rs` (parallel to `AbstractToolRecord`).
-- [ ] Add `upsert_abstract_skill` / `get_abstract_skill` / `list_abstract_skills` to `GraphStorage` trait and `SqliteGraphStorage`.
+- [x] Add `AbstractSkillRecord` to `ansible-mesh-core/src/graph.rs` (parallel to `AbstractToolRecord`).
+- [x] Add `upsert_abstract_skill` / `get_abstract_skill` / `list_abstract_skills` to `GraphStorage` trait and `SqliteGraphStorage`.
 - [ ] Add `ToolsetProfileRecord` to the context graph (`toolset_profile` node kind).
 - [ ] Add `upsert_toolset_profile` / `get_toolset_profile` / `list_toolset_profiles` to `GraphStorage`.
-- [ ] Seed built-in skill catalog and toolset profiles at hotel startup (`orchestrator`, `codex`, `browser`, `research`, `utility`).
+- [x] Seed the first built-in handoff/governance abstract skills at hotel startup.
+- [ ] Expand the built-in skill catalog and toolset profiles at hotel startup (`orchestrator`, `codex`, `browser`, `research`, `utility`).
 - [ ] Update session binding assembly to expand skill grants into `implied_tools` when building `tools_for_model`.
 
 ### Role Incarnation Records
@@ -102,9 +103,19 @@ Seam IDs: `role-incarnation-records`, `active-membrane-routing`, `handoff-skill`
 
 ### Handoff Skill + Membrane Switching
 - [x] Implement `HandoffToRole { role_name, handoff_bundle }` and `HandoffBack { summary, return_to? }` IPC actions.
-- [ ] Define the first handoff skill shape: trigger patterns, context bundle assembly, cleanup steps.
+- [ ] Define the first generic orchestrator-owned `handoff.to_role` workflow skill: trigger patterns, target-role selection, context bundle assembly, return conditions, and cleanup steps.
+- [ ] Decide what role metadata the generic handoff workflow reads so we do not regress into per-role bespoke skill-pair manifests unless the generic approach proves too weak.
 - [x] Add `/role <name>` and `/back` slash commands for manual membrane switching.
-- [ ] Add `/roles` or equivalent status surface so operators can inspect configured roles and the active routed incarnation without guessing.
+- [x] Add `/roles` or equivalent status surface so operators can inspect configured roles and the active routed incarnation without guessing.
+
+### Governed Workflow Skills
+- [x] Write [GOVERNED_WORKFLOW_SKILLS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GOVERNED_WORKFLOW_SKILLS_PROPOSAL.md).
+- [ ] Define the first `WorkflowSkillRecord` boundary and decide when it should supersede plain `AbstractSkillRecord` for governed flows.
+- [ ] Specify target-boundary classes and rules for:
+  - same-agent role handoff
+  - peer Philotic agent delegation
+  - external cognitive peer handoff (Claude Code, Codex, similar)
+- [ ] Define bounded context packaging and return contracts for peer/external workflows so they do not quietly inherit same-identity handoff assumptions.
 
 ### Inactive TTL + On-Demand Rematerialization
 - [ ] Add `inactive_ttl_seconds` to `RoleIncarnationRecord`.
@@ -165,33 +176,50 @@ Seam IDs: `context-engine-contract`, `deterministic-context-assembly`, `memory-e
 
 - [ ] Review [PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md).
 - [ ] Review [MEMORY_ENGINE_ABSTRACTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMORY_ENGINE_ABSTRACTION_PROPOSAL.md).
-- [ ] Define the first context-engine contract for deterministic turn context assembly.
-- [ ] Lock the canonical vocabulary for context assembly scope:
+- [x] Define the first context-engine contract for deterministic turn context assembly.
+- [x] Lock the canonical vocabulary for context assembly scope:
   - `conversation turn` for the external exchange boundary
   - `cognitive step` for internal reasoning/action within that boundary
 - [ ] Define the first memory-engine contract for `search`, `store`, and provenance.
-- [ ] Define the first five context layers with owner, authority, mutability, and projection budget:
+- [x] Define the first five context layers with owner, authority, mutability, and projection budget:
   - identity
   - relationship
   - session
   - working
   - knowledge
-- [ ] Publish the first compact layer contract table for:
+- [x] Publish the first compact layer contract table for:
   - canonical owner
   - authority level
   - refresh timing
   - promotion target
-- [ ] Define the first mutability classes for context layers:
+- [x] Define the first mutability classes for context layers:
   - `static_for_turn`
   - `refreshable`
   - `live_local`
-- [ ] Define the first concrete context-engine payload shapes:
+- [x] Define the first concrete context-engine payload shapes:
   - `ConversationTurnScope`
   - `CognitiveStepScope`
   - `LayerContribution`
   - `ContextProjection`
   - `LayerPayload`
-- [ ] Prove one current context path and one current memory path behind those abstractions.
+- [x] Prove one current context path and one current memory path behind those abstractions.
+- [x] Thread the first structured `ContextProjection` path from `agent-core` into outbound model requests and through `model-router` prompt composition.
+- [x] Carry session `active_incarnation_id` through the canonical snapshot, context projection, and model-router prompt composition so agent identity and active role posture stop being silently conflated.
+- [ ] Review [MEMORY_RELATION_LIFECYCLE_WHITEPAPER.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMORY_RELATION_LIFECYCLE_WHITEPAPER.md).
+- [ ] Define the first memory-formation contract:
+  - candidate capture checkpoints
+  - candidate payload shape
+  - admission/promotion authority
+- [ ] Define the first provisional relation-layer contract:
+  - relation sources
+  - relation lifetimes
+  - confidence/authority semantics
+  - promotion vs decay rules
+- [ ] Define the first sleep/consolidation cycle contract:
+  - reinforce
+  - merge
+  - weaken
+  - archive/forget
 
 ## New Project: Admin Role And Surfaces
 
@@ -246,7 +274,7 @@ Seam IDs: `agent-hook-registry`, `transcription-hook-extraction`
   - `checkpoint.after_tool`
   - `checkpoint.before_reply`
   - `conversation_turn.end`
-- [ ] Define the first concrete hook payload/result shapes:
+- [x] Define the first concrete hook payload/result shapes:
   - `HookRequest`
   - `HookResult`
   - `RefreshRequest`
@@ -415,6 +443,12 @@ Seam IDs: `structured-model-envelope`, `hotel-gemini-oauth-flow`
   - `sound.generate`
   - `music.generate`
   - `response.generate`
+- [x] Add `request_class` to the canonical model-controller envelope and define the first legal classes:
+  - `cognitive`
+  - `transform`
+  - `synthesis`
+  - `embedding`
+- [x] Define which envelope fields are expected vs usually avoided for each request class so embeddings/transforms do not inherit cognitive baggage by accident.
 - [x] Propose the first structured model request envelope split:
   - `response_contract`
   - `context`
@@ -422,6 +456,11 @@ Seam IDs: `structured-model-envelope`, `hotel-gemini-oauth-flow`
   - `routing_hints`
   - `provider_options`
 - [x] Implement the first compatibility-first structured model envelope seam in `model-router`.
+- [x] Thread `request_class` through the current live model request paths:
+  - `text.generate` agent reasoning -> `cognitive`
+  - `media.analyze` / `voice.transcribe` -> `transform`
+  - `voice.synthesize` -> `synthesis`
+- [x] Add and run a startup-driven cognitive smoke that proves the structured cognitive prompt path reaches the fake Gemini provider envelope.
 - [x] Propose the first structured model response envelope split:
   - `result`
   - `artifacts`

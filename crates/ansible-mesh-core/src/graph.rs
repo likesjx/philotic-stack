@@ -68,6 +68,19 @@ pub struct AbstractToolRecord {
     pub class: String,
 }
 
+/// A system-wide shared skill definition stored in the context graph.
+///
+/// Node kind: `abstract_skill`. Node key: `abstract_skill:{skill_name}`.
+/// Skills provide model-facing posture hints and can imply tool grants when a
+/// role or session activates them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AbstractSkillRecord {
+    pub skill_name: String,
+    pub description: String,
+    #[serde(default)]
+    pub implied_tools: Vec<String>,
+}
+
 /// Per-role runtime loop controls for a role incarnation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct TurnLoopConfig {

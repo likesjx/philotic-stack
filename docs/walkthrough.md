@@ -1,4 +1,25 @@
+---
+title: "Philotic Stack Universal Materialization Walkthrough"
+doc_type: historical
+domain: migration-parity
+status: historical
+last_updated: 2026-03-12
+tags:
+  - historical
+  - walkthrough
+  - materialization
+  - telegram
+related_docs:
+  - docs/architecture/ARCHITECTURE_STATUS.md
+  - docs/architecture/ARCHITECTURE.md
+  - docs/PHILOTIC-ARCHITECTURE.md
+---
+
 # Philotic Stack Universal Materialization Walkthrough
+
+> **Historical Walkthrough:** This file describes an earlier end-to-end walkthrough and should not be treated as the current architecture or validation source of truth.
+>
+> For current runtime truth, start with [docs/architecture/ARCHITECTURE_STATUS.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE_STATUS.md) and [docs/architecture/ARCHITECTURE.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE.md).
 
 ## What Was Accomplished
 

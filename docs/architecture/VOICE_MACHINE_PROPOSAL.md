@@ -1,3 +1,33 @@
+---
+title: "Philotic Voice Machine Proposal"
+doc_type: proposal
+domain: membrane-transport
+status: accepted-current-slice
+last_updated: 2026-03-12
+tags:
+  - voice
+  - media
+  - transcription
+  - tts
+  - active-seam
+related_docs:
+  - ARCHITECTURE_STATUS.md
+  - AGENT_LOOP_PROPOSAL.md
+  - TELEGRAM_INTEGRATION_PROPOSAL.md
+task_refs:
+  - docs/task.md
+proposal_id: voice-machine
+implements: []
+implemented_by:
+  - policy-driven-voice-ingress-egress-slice
+active_seams:
+  - voice-transcribe-reentry
+  - dedicated-voice-machine-component
+source_of_truth_targets:
+  - ARCHITECTURE_STATUS.md
+  - ARCHITECTURE.md
+---
+
 # Philotic Voice Machine Proposal
 
 ## Goal

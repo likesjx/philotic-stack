@@ -78,10 +78,16 @@ pub struct InboundTaskPayload {
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelRequestPayload {
     pub action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_class: Option<String>,
     pub session_id: String,
     pub turn_id: String,
     pub prompt: String,
     pub user_content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_projection: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<TransportAttachment>,
     pub tools_for_model: Vec<ToolDefinition>,
