@@ -12,6 +12,8 @@ tags:
   - active-seam
 related_docs:
   - AGENT_INCARNATION_PROPOSAL.md
+  - ROLE_ACTIVATION_AND_SUBAGENT_CONTRACTS_PROPOSAL.md
+  - ROLE_CONTEXT_SHIFT_AND_DELEGATED_SUBAGENTS_WHITEPAPER.md
   - RUNTIME_AUTHORITY_LEASES_PROPOSAL.md
   - MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md
   - CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md
@@ -90,6 +92,12 @@ What is still missing:
 - explicit peer-delegation and external-cognitive-peer variants
 - invocation/runtime enforcement beyond current handoff IPC
 
+Important design shift:
+
+- same-identity role handoff is now best understood as governed context shift first
+- separate concurrent role processes remain allowed, but are not the default semantic assumption
+- delegated subagents, not peer roles, should usually carry bounded parallel labor
+
 ## Why This Needs Its Own Proposal
 
 This concern is no longer just about role incarnation.
@@ -119,6 +127,8 @@ Properties:
 - same memory ownership
 - same home-hotel/runtime authority
 - different role posture and turn-loop policy
+- usually a context-shift or posture-activation workflow, not a full identity transfer
+- may materialize or wake a separate role process when isolation or background execution requires it
 
 This is the first implementation target.
 
@@ -233,6 +243,8 @@ Keep these boundaries explicit:
   - remain separate from workflow description
 
 Workflow skills should not become a stealth control plane. They describe and govern invocation; they do not replace hotel authority.
+
+For same-identity role handoff, they also should not quietly become a stealth process-materialization doctrine. The workflow decides and packages; the runtime chooses whether the target role is activated in-place, woken, or materialized.
 
 ## First Recommended Implementation Order
 

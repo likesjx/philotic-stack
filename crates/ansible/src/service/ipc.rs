@@ -1684,6 +1684,34 @@ impl IpcServer {
                     ),
                 }
             }
+            IpcRequest::SpawnSubagent {
+                session_id,
+                delegation,
+            } => {
+                let Some(identity) = current_identity.as_ref() else {
+                    return IpcResponse::error(
+                        "spawn_subagent",
+                        "SUBAGENT_UNREGISTERED",
+                        "guest must register before spawning a subagent",
+                    );
+                };
+                if identity.role != "agent" {
+                    return IpcResponse::error(
+                        "spawn_subagent",
+                        "SUBAGENT_FORBIDDEN",
+                        "only agent guests may request subagent delegation",
+                    );
+                }
+
+                IpcResponse::error(
+                    "spawn_subagent",
+                    "SUBAGENT_NOT_IMPLEMENTED",
+                    format!(
+                        "Subagent delegation contract is defined for session [{}] and kind [{}], but runtime spawning is not implemented yet.",
+                        session_id, delegation.subagent_kind
+                    ),
+                )
+            }
             IpcRequest::ListRoleIncarnations { agent_id } => {
                 match graph.list_role_incarnations(&agent_id) {
                     Ok(roles) => IpcResponse::success(
@@ -2136,6 +2164,39 @@ impl IpcServer {
             .get("bindings")
             .cloned()
             .unwrap_or_else(|| serde_json::json!({}));
+        let role_activation = session
+            .active_incarnation_id
+            .as_deref()
+            .and_then(|active_incarnation_id| {
+                let agent_id = session.primary_agent_id.as_deref()?;
+                let roles = graph.list_role_incarnations(agent_id).ok()?;
+                let role_record = roles
+                    .into_iter()
+                    .find(|role| role.guest_id == active_incarnation_id)?;
+                let effective_skillset = bindings
+                    .get("effective_skillset")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                Some(serde_json::json!({
+                    "role_name": role_record.role_name,
+                    "active_incarnation_id": active_incarnation_id,
+                    "activation_reason": "session_active_incarnation",
+                    "requested_by": "hotel_runtime",
+                    "role_addendum": role_record.role_identity_addendum,
+                    "toolset_profile_ref": role_record.toolset_profile,
+                    "effective_skillset": effective_skillset,
+                    "working_memory_policy": "role_local",
+                    "memory_projection_policy": "shared_identity_role_scoped",
+                }))
+            })
+            .unwrap_or(serde_json::Value::Null);
         let registered_runners = load_tool_runner_registry(graph)?;
         let tool_runners = live_tool_runners(inboxes).await;
         let live_model_subscribers = live_role_subscribers(inboxes, "model.").await;
@@ -2166,6 +2227,7 @@ impl IpcServer {
             "agent_id": session.primary_agent_id,
             "source": session.channel_kind,
             "active_incarnation_id": session.active_incarnation_id,
+            "role_activation": role_activation,
             "agent_profile": agent_profile,
             "status": session.status,
             "summary": session.summary_json,
@@ -3141,7 +3203,10 @@ mod tests {
         SessionParticipantRecord, SessionRecord, SessionTurnRecord,
     };
     use base64::Engine;
-    use philotic_client::{GuestIdentity, PhiloticClient};
+    use philotic_client::{
+        GuestIdentity, PhiloticClient, SubagentCompletionContract, SubagentContextPacket,
+        SubagentDelegation,
+    };
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{LazyLock, Mutex as StdMutex};
@@ -4097,6 +4162,17 @@ mod tests {
                     session_id: "sess-handoff-live".into(),
                     initiating_turn_id: "turn-1".into(),
                     return_to: Some("orchestrator".into()),
+                    handoff_reason: Some("manual_role_switch".into()),
+                    active_goal: Some("implement the fix".into()),
+                    active_constraints: vec!["same_identity_role_handoff".into()],
+                    relevant_session_facts: vec!["session_status=active".into()],
+                    working_summary: Some(
+                        "phase=waiting_model, iteration=1, pending_tool=false, pending_approval=false"
+                            .into(),
+                    ),
+                    suggested_memory_refs: Vec::new(),
+                    expected_return_mode: Some("stay_active_until_manual_return".into()),
+                    cleanup_actions: vec!["switch_active_role".into()],
                 },
             })
             .await
@@ -4133,6 +4209,14 @@ mod tests {
                     serde_json::from_str(&task_json).expect("handoff payload should decode");
                 assert_eq!(payload["action"], "handoff_bundle");
                 assert_eq!(payload["handoff_bundle"]["goal"], "implement the fix");
+                assert_eq!(
+                    payload["handoff_bundle"]["handoff_reason"],
+                    "manual_role_switch"
+                );
+                assert_eq!(
+                    payload["handoff_bundle"]["expected_return_mode"],
+                    "stay_active_until_manual_return"
+                );
             }
             other => panic!("unexpected developer inbound response: {other:?}"),
         }
@@ -4248,6 +4332,17 @@ mod tests {
                     session_id: "sess-handoff-park".into(),
                     initiating_turn_id: "turn-1".into(),
                     return_to: Some("orchestrator".into()),
+                    handoff_reason: Some("manual_role_switch".into()),
+                    active_goal: Some("implement later".into()),
+                    active_constraints: vec!["same_identity_role_handoff".into()],
+                    relevant_session_facts: vec!["session_status=active".into()],
+                    working_summary: Some(
+                        "phase=waiting_model, iteration=1, pending_tool=false, pending_approval=false"
+                            .into(),
+                    ),
+                    suggested_memory_refs: Vec::new(),
+                    expected_return_mode: Some("stay_active_until_manual_return".into()),
+                    cleanup_actions: vec!["switch_active_role".into()],
                 },
             })
             .await
@@ -4293,6 +4388,10 @@ mod tests {
                     serde_json::from_str(&task_json).expect("handoff payload should decode");
                 assert_eq!(payload["action"], "handoff_bundle");
                 assert_eq!(payload["handoff_bundle"]["goal"], "implement later");
+                assert_eq!(
+                    payload["handoff_bundle"]["expected_return_mode"],
+                    "stay_active_until_manual_return"
+                );
             }
             other => panic!("unexpected developer inbound response: {other:?}"),
         }
@@ -4305,6 +4404,94 @@ mod tests {
             session_after.active_incarnation_id.as_deref(),
             Some("agent-jane:developer")
         );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_subagent_returns_structured_not_implemented_error() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-ansible-01",
+            dispatcher_tx,
+            graph,
+        );
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane:developer".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("agent connect");
+
+        let response = agent
+            .send_request(IpcRequest::SpawnSubagent {
+                session_id: "sess-subagent-1".into(),
+                delegation: SubagentDelegation {
+                    parent_agent_id: "agent-jane-01".into(),
+                    parent_role: "developer".into(),
+                    subagent_kind: "research_worker".into(),
+                    goal: "Read files and report risks.".into(),
+                    context_packet: SubagentContextPacket {
+                        summary: "Bounded file review requested by parent role.".into(),
+                        session_facts: vec!["session_status=active".into()],
+                        constraints: vec!["subagent_lightweight_default".into()],
+                        memory_refs: Vec::new(),
+                    },
+                    allowed_tools: vec!["workspace.read".into()],
+                    allowed_skills: vec!["research".into()],
+                    memory_allowance: Some("none_by_default".into()),
+                    writeback_allowance: Some("summary_only_parent_mediated".into()),
+                    iteration_budget: Some(6),
+                    ttl_seconds: Some(900),
+                    completion_contract: SubagentCompletionContract {
+                        summary_required: true,
+                        artifact_refs_expected: false,
+                        failure_summary_required: true,
+                        requires_parent_ack: true,
+                    },
+                },
+            })
+            .await
+            .expect("spawn subagent request");
+
+        match response {
+            IpcResponse::Standard {
+                ok,
+                code,
+                corr_id,
+                message,
+                ..
+            } => {
+                assert!(!ok);
+                assert_eq!(corr_id, "spawn_subagent");
+                assert_eq!(code, "SUBAGENT_NOT_IMPLEMENTED");
+                assert!(message.contains("research_worker"));
+            }
+            other => panic!("unexpected spawn_subagent response: {other:?}"),
+        }
 
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
@@ -4783,6 +4970,17 @@ mod tests {
                 completed_at: Some(2),
             })
             .expect("turn should seed");
+        graph_store
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-jane-01".into(),
+                role_name: "developer".into(),
+                guest_id: "agent-jane:developer".into(),
+                toolset_profile: "codex".into(),
+                role_identity_addendum: Some("Focus on implementation and code changes.".into()),
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig::default(),
+            })
+            .expect("developer role should seed");
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");
@@ -4819,6 +5017,12 @@ mod tests {
                 assert_eq!(snapshot["session_id"], "sess-1");
                 assert_eq!(snapshot["source"], "telegram");
                 assert_eq!(snapshot["active_incarnation_id"], "agent-jane:developer");
+                assert_eq!(snapshot["role_activation"]["role_name"], "developer");
+                assert_eq!(snapshot["role_activation"]["toolset_profile_ref"], "codex");
+                assert_eq!(
+                    snapshot["role_activation"]["role_addendum"],
+                    "Focus on implementation and code changes."
+                );
                 assert_eq!(snapshot["agent_profile"]["soul_text"], "Soul anchor");
                 assert_eq!(
                     snapshot["agent_profile"]["identity_text"],

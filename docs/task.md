@@ -28,6 +28,25 @@ Seam IDs: `session-leases`
 - [x] Persist session timeline/progress events while keeping the IPC plane general.
 - [x] Support recovery flows at the session layer.
 - [x] Support approval flows at the session layer.
+- [ ] Define the canonical compact session envelope so session compaction targets:
+  - live status and pending work
+  - active role/incarnation
+  - bounded local working memory
+  - bounded recent-turn/control window
+  - compact session-local facts only
+- [ ] Define the first `CompactSessionEnvelope` shape:
+  - `session_identity`
+  - `live_status`
+  - `active_role`
+  - `working_state`
+  - `recent_local_window`
+  - `session_facts`
+  - `checkpoint_metadata`
+- [ ] Explicitly keep durable continuity out of the session envelope by default:
+  - autobiographical memory
+  - durable user relationship memory
+  - general long-term topic memory
+  - transcript archives
 
 ### WI 2: Agent Logic
 
@@ -39,6 +58,13 @@ Seam IDs: `session-compaction`
 - [x] Keep local working turn state in the agent during execution.
 - [x] Use `SyncApartment` as periodic derived snapshot/checkpoint sync back to the Context Graph, not as canonical session ownership.
 - [ ] Add compaction/checkpoint policy so apartment sync stays structured and reasonably small.
+- [ ] Make compaction preserve live session actuality rather than transcript bulk:
+  - active commitments
+  - unresolved tool/approval state
+  - role-local working state still in play
+  - smallest recent-turn window needed for coherence
+  - session-local facts still live in this session
+- [ ] Make compaction target `CompactSessionEnvelope` explicitly instead of freeform transcript summaries.
 - [x] Add slash-command short-circuiting for deterministic agent/system commands before the normal model loop.
 - [x] Add approval interrupts with explicit history and a pre-approval runtime path.
 - [ ] Extend the shared cross-component task error envelope beyond the current model/TTS path so tool-runner, membrane, and other routed components return structured failures instead of silent fallback strings.
@@ -74,7 +100,7 @@ Seam IDs: `session-compaction`
 
 ## New Project: Agent Incarnation Model
 
-Model revised: three-kind taxonomy (conversational/worker/subagent) replaced with role incarnations + workers/subagents. See [AGENT_INCARNATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/AGENT_INCARNATION_PROPOSAL.md).
+Model revised: same-self role incarnations now default to context shifts with shared durable memory, while spawned subagents remain the default path for delegated parallel labor. See [AGENT_INCARNATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/AGENT_INCARNATION_PROPOSAL.md) and [ROLE_CONTEXT_SHIFT_AND_DELEGATED_SUBAGENTS_WHITEPAPER.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ROLE_CONTEXT_SHIFT_AND_DELEGATED_SUBAGENTS_WHITEPAPER.md).
 
 Seam IDs: `role-incarnation-records`, `active-membrane-routing`, `handoff-skill`
 
@@ -93,6 +119,24 @@ Seam IDs: `role-incarnation-records`, `active-membrane-routing`, `handoff-skill`
 - [ ] Add `ConfigureRole` IPC action (orchestrator → hotel); hotel enforces orchestrator-only writes for the same agent identity.
 - [ ] Define the first rigid orchestrator-only role-governance workflow skill for create/update, including required reasoning about purpose, toolset, skillset, handoff posture, and limits.
 - [ ] Seed session bindings from the role's `toolset_profile` when a role incarnation session is initialized.
+- [ ] Define the canonical shared-self role contract:
+  - base identity and durable memory remain shared
+  - role addendum is additive
+  - working memory is role-local
+  - effective toolset and skillset are role-scoped overlays
+- [x] Define the first compatibility-first `RoleActivation` contract and thread it through hotel snapshot -> `SessionState` -> context projection:
+  - activation reason
+  - requested_by
+  - role addendum
+  - toolset profile reference
+  - effective skillset
+  - working memory policy
+  - memory projection policy
+- [ ] Expand `RoleActivation` beyond the first compatibility slice:
+  - base identity reference
+  - explicit skillset profile reference
+  - richer activation requester semantics
+  - tighter role activation policy ownership
 
 ### Active Membrane Routing
 - [x] Add `active_incarnation_id` to `SessionRecord` in the Context Graph.
@@ -100,11 +144,26 @@ Seam IDs: `role-incarnation-records`, `active-membrane-routing`, `handoff-skill`
 - [x] Default to orchestrator incarnation if active ID is unregistered.
 - [x] Park inbound agent tasks and request on-demand materialization when a configured active role is missing locally.
 - [ ] Buffer inbound during explicit handoff/materialization before switching active route ownership.
+- [ ] Define when same-identity handoff should activate a role in-place versus waking or materializing a separate role process.
 
 ### Handoff Skill + Membrane Switching
 - [x] Implement `HandoffToRole { role_name, handoff_bundle }` and `HandoffBack { summary, return_to? }` IPC actions.
-- [ ] Define the first generic orchestrator-owned `handoff.to_role` workflow skill: trigger patterns, target-role selection, context bundle assembly, return conditions, and cleanup steps.
+- [ ] Define the first generic orchestrator-owned `handoff.to_role` workflow skill: trigger patterns, target-role selection, context bundle assembly, role-local cleanup steps, return conditions, and context-shift semantics.
 - [ ] Decide what role metadata the generic handoff workflow reads so we do not regress into per-role bespoke skill-pair manifests unless the generic approach proves too weak.
+- [x] Define the first compatibility-first `SameIdentityHandoffPacket` through the existing `HandoffBundle` wire path:
+  - handoff_reason
+  - active_goal
+  - active_constraints
+  - relevant_session_facts
+  - working_summary
+  - suggested_memory_refs
+  - expected_return_mode
+  - cleanup_actions
+- [ ] Expand `SameIdentityHandoffPacket` into its fuller contract:
+  - from_role / to_role
+  - tighter session-fact ownership
+  - workflow-owned assembly rules
+  - explicit return-mode semantics beyond the current compatibility slice
 - [x] Add `/role <name>` and `/back` slash commands for manual membrane switching.
 - [x] Add `/roles` or equivalent status surface so operators can inspect configured roles and the active routed incarnation without guessing.
 
@@ -112,7 +171,7 @@ Seam IDs: `role-incarnation-records`, `active-membrane-routing`, `handoff-skill`
 - [x] Write [GOVERNED_WORKFLOW_SKILLS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GOVERNED_WORKFLOW_SKILLS_PROPOSAL.md).
 - [ ] Define the first `WorkflowSkillRecord` boundary and decide when it should supersede plain `AbstractSkillRecord` for governed flows.
 - [ ] Specify target-boundary classes and rules for:
-  - same-agent role handoff
+  - same-agent role handoff / context shift
   - peer Philotic agent delegation
   - external cognitive peer handoff (Claude Code, Codex, similar)
 - [ ] Define bounded context packaging and return contracts for peer/external workflows so they do not quietly inherit same-identity handoff assumptions.
@@ -121,11 +180,35 @@ Seam IDs: `role-incarnation-records`, `active-membrane-routing`, `handoff-skill`
 - [ ] Add `inactive_ttl_seconds` to `RoleIncarnationRecord`.
 - [ ] Extend supervisor loop TTL check: reclaim inactive non-membrane-owner role processes after TTL.
 - [ ] On rematerialization: hotel sends session snapshot to restore working memory from Tier 2.
+- [ ] Keep concurrent role materialization explicitly conditional; do not let TTL/rematerialization policy silently become the default role ontology.
 
 ### Workers / Subagents
-- [ ] Implement `SpawnSubagent` IPC and async result routing back to parent incarnation.
+- [ ] Implement `SpawnSubagent` execution and async result routing back to parent incarnation.
+- [x] Thread the first compatibility-first `SpawnSubagent` request boundary through shared IPC with explicit structured `SUBAGENT_NOT_IMPLEMENTED` hotel rejection.
 - [ ] Add `PHILOTIC_AGENT_MODE=subagent` one-shot runtime mode to `agent-core`.
 - [ ] Add `/abandon` slash command; deliver `FailTask` summary to parent on abandonment.
+- [x] Define the first compatibility-first `SubagentDelegation` contract and parent-side builder:
+  - parent role
+  - goal
+  - context packet
+  - allowed tools
+  - allowed skills
+  - memory allowance
+  - write-back allowance
+  - iteration budget
+  - ttl
+  - completion contract
+- [ ] Expand `SubagentDelegation` beyond the compatibility-first slice:
+  - explicit parent turn/task provenance
+  - workflow-owned context-packet assembly rules
+  - richer completion artifact semantics
+  - tighter policy ownership for memory and write-back rights
+- [ ] Define delegation policy inputs that determine spawned subagent tool access, skill access, memory allowance, and write-back rights.
+- [ ] Make subagents explicitly lightweight by default:
+  - bounded mission packet
+  - no direct membrane ownership
+  - little or no durable memory by default
+  - report-back contract to the parent role
 
 ### Memory
 - [ ] Add `session_facts` apartment type and `UpdateMemory` IPC with hotel-side rate/size enforcement.
@@ -803,6 +886,11 @@ Seam IDs: `wider-client-adoption`, `philotic-native-memory-integration`
 - [ ] Perimeter egress control (`egress-policy-object`): define the canonical outbound egress policy object and finding schema.
 - [ ] Perimeter egress inventory (`outbound-classification`): classify current direct outbound HTTP paths into perimeter-controlled, temporary exceptions, and future violations.
 - [ ] Perimeter egress first implementation: route one non-model outbound HTTP path through a perimeter-controlled boundary while keeping model/provider egress as an explicit exception for now.
+- [ ] Review [MEMBRANE_EXTERNAL_AGENT_AND_EVENT_TRANSPORT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMBRANE_EXTERNAL_AGENT_AND_EVENT_TRANSPORT_PROPOSAL.md).
+- [ ] External membrane transport contract (`a2a-membrane-contract`, `nostr-membrane-contract`): define the first normalized inbound/outbound envelope and session-binding inputs for `A2A` / `Nostr` membranes.
+- [ ] External principal trust records (`transport-edge-trust-gates`): define the first shared trust record for external agent peers, pubkeys, and relays, including trust classes, allowed capability classes, quarantine state, and policy refs.
+- [ ] Membrane sentinel findings (`membrane-sentinel-checks`): define the first `SentinelFinding` schema and enforcement modes (`allow`, `allow_audit`, `deny`, `quarantine`, `require_review`) for membrane-edge auth, replay, schema, attachment, capability, destination, and anomaly checks.
+- [ ] External membrane v1 choice: choose one narrow first transport slice (`membrane.nostr` addressed-event/DM mode or one trusted-peer `membrane.a2a` slice) instead of proving both at once.
 - [ ] Approval UX evolution (`session-preapproval-ux`): add `/preapprove`, `/approval status`, `/approval reset`, and richer session policy editing for constrained transports like Telegram.
 - [ ] Review [TELEGRAM_INTEGRATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_INTEGRATION_PROPOSAL.md).
 - [ ] Review [TELEGRAM_POLL_LEASE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_POLL_LEASE_PROPOSAL.md).
@@ -825,7 +913,8 @@ Seam IDs: `wider-client-adoption`, `philotic-native-memory-integration`
 - [x] Telegram streaming Layer 2 membrane: handle `action = "turn_event"` in `InboundTask` dispatch — maintain or cancel typing heartbeat per event type; stop typing on `waiting_approval`.
 - [ ] Telegram streaming partial reply: add `action = "partial_reply"` signal from `agent-core` once model-router supports chunked output; implement edit-based progressive delivery in `membrane`.
 - [ ] Voice machine design: define STT, TTS, speech-to-speech, transcript generation, and media artifact/session handling.
-- [ ] Nostr communication-plane investigation: evaluate Nostr as a decentralized/event-native transport, with security and privacy-first scrutiny before any implementation.
+- [ ] Nostr communication-plane investigation (`nostr-membrane-contract`): evaluate Nostr as a decentralized/event-native membrane with relay trust classes, addressed-event gating, signature verification, replay defense, and perimeter/sentinel integration before any implementation.
+- [ ] A2A membrane investigation (`a2a-membrane-contract`): evaluate `A2A` as an external agent interoperability membrane with explicit peer trust records, bounded capability exposure, approval semantics for privileged actions, and no inheritance of internal mesh trust.
 - [ ] Tool runner lifecycle policy (`runner-materialization-policy`): define idle retention, sleep/teardown timing, wake-up thresholds, and environment-specific materialization rules for routed tools.
 - [ ] Runner artifact plane: define builder trust, sandboxing, testing, signing, release, and distribution policy for executable tool runners.
 - [ ] Memory consolidation / dreaming: define how short-term session state becomes long-term memory, including sleep/dream cycles, compaction, and candidate memory backends such as `scryper/miniminddb`.

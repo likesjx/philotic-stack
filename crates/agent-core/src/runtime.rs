@@ -2232,13 +2232,33 @@ impl AgentRuntime {
     ) -> Result<()> {
         let response = match &command {
             SlashCommand::Role { role_name } => {
-                let handoff_bundle = HandoffBundle {
-                    goal: format!("Switch active role to {role_name} for this session."),
-                    context_excerpt: "Manual role switch requested by user slash command.".into(),
-                    session_id: session_id.clone(),
-                    initiating_turn_id: command_turn_id.clone(),
-                    return_to: Some("orchestrator".into()),
-                };
+                let handoff_bundle = self
+                    .sessions
+                    .get(&session_id)
+                    .map(|state| {
+                        state.build_same_identity_handoff_bundle(
+                            role_name,
+                            &command_turn_id,
+                            "manual_role_switch",
+                            Some("orchestrator".into()),
+                        )
+                    })
+                    .unwrap_or_else(|| HandoffBundle {
+                        goal: format!("Switch active role to {role_name} for this session."),
+                        context_excerpt: "Manual role switch requested by user slash command."
+                            .into(),
+                        session_id: session_id.clone(),
+                        initiating_turn_id: command_turn_id.clone(),
+                        return_to: Some("orchestrator".into()),
+                        handoff_reason: Some("manual_role_switch".into()),
+                        active_goal: None,
+                        active_constraints: vec!["same_identity_role_handoff".into()],
+                        relevant_session_facts: Vec::new(),
+                        working_summary: None,
+                        suggested_memory_refs: Vec::new(),
+                        expected_return_mode: Some("stay_active_until_manual_return".into()),
+                        cleanup_actions: vec!["switch_active_role".into()],
+                    });
                 self.ipc_client
                     .send_request(IpcRequest::HandoffToRole {
                         session_id: session_id.clone(),

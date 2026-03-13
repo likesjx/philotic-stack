@@ -3,7 +3,7 @@ title: "Philotic Session Management and Agent Logic Proposal"
 doc_type: proposal
 domain: runtime-sessions
 status: implemented
-last_updated: 2026-03-12
+last_updated: 2026-03-13
 tags:
   - sessions
   - approvals
@@ -55,6 +55,79 @@ Remaining related work lives in [task.md](/Users/jaredlikes/code/philotic-stack/
 - `WI 1: Session Management`
 - `WI 2: Agent Logic`
 - `Deferred Design Threads`
+
+## Session As Live Coordination Envelope
+
+Philotic sessions should stay thinner than the old transcript-heavy continuity vessels used by systems like OpenClaw.
+
+The important split is:
+
+- `session` owns live present-tense coordination truth
+- `working memory` is the hottest inner layer of that truth
+- `memory` owns durable continuity across sessions
+
+So a session is **not** just immediate working memory, and it is **not** the main long-term continuity container either.
+
+### What belongs in session
+
+Session should own the things that answer "what is happening now in this conversation/workstream?":
+
+- participants and bindings
+- conversation/exchange identity
+- active role/incarnation for this session
+- pending approvals, denials, and interrupts
+- active delegated work and return paths
+- current turn status
+- local working memory needed to continue the present exchange
+- a bounded recent-turn/control window needed for local continuity
+- compact session facts that are still live for this session
+
+### What should not be the session's job
+
+Session should not be the main owner of:
+
+- durable autobiographical memory
+- durable user relationship memory
+- general long-term topic memory
+- giant transcript archives carried forward out of habit
+- every historical detail that might someday be relevant
+
+Those belong in memory engines and context projection, not in the live session envelope.
+
+### Session compaction target
+
+Compaction should therefore preserve:
+
+- active commitments and unresolved work
+- pending tool or approval state
+- role-local working state that is still live
+- the smallest recent-turn window needed for local coherence
+- compact session facts worth carrying forward inside this same session
+
+Compaction should aggressively avoid preserving:
+
+- stale exploratory residue
+- fully-resolved tool chatter
+- old turns whose value is now durable memory rather than session actuality
+- duplicated information already promoted into memory summaries or durable records
+
+### Cross-session rule
+
+Separate conversations should still get separate sessions even if memory recall can map them to overlapping durable context.
+
+Memory answers:
+
+- what is relevant
+- what was learned before
+- what continuity might matter
+
+Session answers:
+
+- what is active now
+- what is pending now
+- what this current conversation presently means
+
+If Philotic lets memory replace session boundaries entirely, it will eventually ask durable memory to impersonate live coordination truth, which is a wonderfully efficient way to build confusion.
 
 ## What ZeroClaw Actually Gives Us
 
@@ -199,6 +272,83 @@ In practice:
   - compact recent-context window if needed
 
 This is simpler and safer than trying to make `SyncApartment` a JSON patch protocol on day one.
+
+### Recommended compact session contents
+
+The first compact session payload should converge on these fields:
+
+- `session_identity`
+  - `session_id`, channel/session key, primary agent, participants
+- `live_status`
+  - turn status, approval state, active waits, active delegated tasks
+- `active_role`
+  - current role/incarnation and role-local posture refs
+- `working_state`
+  - active goal, active constraints, current hypotheses, pending tool/result state
+- `recent_local_window`
+  - bounded recent turn/control history for coherence
+- `session_facts`
+  - compact still-live facts for this session only
+
+Everything else should justify itself before joining the payload instead of squatting there because transcripts are cheap and context windows are apparently free in fairy tales.
+
+### `CompactSessionEnvelope`
+
+The first explicit compaction target should be a named structured payload.
+
+Recommended first shape:
+
+- `session_identity`
+  - `session_id`
+  - `session_kind`
+  - `primary_agent_id`
+  - `channel_kind`
+  - `channel_session_key`
+  - `participants`
+- `live_status`
+  - `session_status`
+  - `current_turn_status`
+  - `approval_state`
+  - `active_waits`
+  - `active_delegations`
+- `active_role`
+  - `role_name`
+  - `active_incarnation_id`
+  - `role_addendum_ref`
+  - `toolset_profile_ref`
+  - `skillset_profile_ref`
+- `working_state`
+  - `active_goal`
+  - `active_constraints`
+  - `current_hypotheses`
+  - `pending_tool_call`
+  - `pending_tool_results`
+  - `pending_return_contract`
+- `recent_local_window`
+  - bounded ordered turn/control entries still needed for local coherence
+- `session_facts`
+  - compact still-live facts and commitments for this session only
+- `checkpoint_metadata`
+  - `captured_at`
+  - `captured_by`
+  - `compaction_version`
+  - `source_turn_ids`
+
+### Envelope rules
+
+- `CompactSessionEnvelope` is session-local, not a memory artifact
+- it should preserve live coordination truth, not durable continuity
+- it should be cheap enough to checkpoint and restore without becoming a second transcript archive
+- fields should prefer structured state over long freeform blobs
+
+### Compaction policy implications
+
+When compacting into `CompactSessionEnvelope`:
+
+- summarize only what is still live
+- convert resolved activity into event history or memory write-back rather than keeping it hot in session
+- preserve the minimum bounded local window needed for coherent continuation
+- keep role-local working state explicit so posture switches and rematerialization can restore without guessing
 
 ## Session Binding Rules
 

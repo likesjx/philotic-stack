@@ -1,5 +1,8 @@
 use crate::catalog::{tool_catalog, tool_class, tool_requires_approval};
 use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
+use philotic_client::{
+    HandoffBundle, SubagentCompletionContract, SubagentContextPacket, SubagentDelegation,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -130,6 +133,8 @@ pub struct ContextProjection {
     pub conversation_turn: ConversationTurnScope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_step: Option<CognitiveStepScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_activation: Option<RoleActivation>,
     pub current_user_message: String,
     #[serde(default)]
     pub layers: Vec<LayerPayload>,
@@ -194,6 +199,26 @@ pub struct HookResult {
     pub promotion_actions: Vec<PromotionAction>,
     #[serde(default)]
     pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RoleActivation {
+    pub role_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_incarnation_id: Option<String>,
+    pub activation_reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_addendum: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolset_profile_ref: Option<String>,
+    #[serde(default)]
+    pub effective_skillset: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_memory_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_projection_policy: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -573,6 +598,7 @@ pub struct SessionState {
     pub agent_id: String,
     pub source: String,
     pub active_incarnation_id: Option<String>,
+    pub role_activation: Option<RoleActivation>,
     pub agent_profile: AgentProfile,
     pub status: String,
     pub approval_policy: ApprovalPolicy,
@@ -591,6 +617,7 @@ impl SessionState {
             agent_id,
             source,
             active_incarnation_id: None,
+            role_activation: None,
             agent_profile: AgentProfile::default(),
             status: "active".into(),
             approval_policy: ApprovalPolicy::default(),
@@ -1329,6 +1356,7 @@ impl SessionState {
                 started_at: None,
             },
             active_step,
+            role_activation: self.role_activation.clone(),
             current_user_message: user_content.to_string(),
             budget: ContextBudget {
                 included_sections: layers.len(),
@@ -1513,6 +1541,21 @@ impl SessionState {
             ));
         }
 
+        if let Some(role_activation) = self.role_activation.as_ref() {
+            lines.push(format!(
+                "Active role posture: {}.",
+                role_activation.role_name
+            ));
+            if let Some(role_addendum) = role_activation
+                .role_addendum
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+            {
+                lines.push(format!("Role addendum: {role_addendum}"));
+            }
+        }
+
         lines.join("\n")
     }
 
@@ -1624,6 +1667,36 @@ impl SessionState {
         if let Some(active_incarnation_id) = self.active_incarnation_id.as_deref() {
             envelope.push_str(&format!("Active incarnation: {}.\n", active_incarnation_id));
         }
+        if let Some(role_activation) = self.role_activation.as_ref() {
+            envelope.push_str(&format!("Active role: {}.\n", role_activation.role_name));
+            envelope.push_str(&format!(
+                "Role activation reason: {}.\n",
+                role_activation.activation_reason
+            ));
+            if let Some(toolset_profile_ref) = role_activation.toolset_profile_ref.as_deref() {
+                envelope.push_str(&format!("Role toolset profile: {}.\n", toolset_profile_ref));
+            }
+            if !role_activation.effective_skillset.is_empty() {
+                envelope.push_str(&format!(
+                    "Role skillset posture: {}.\n",
+                    role_activation.effective_skillset.join(", ")
+                ));
+            }
+            if let Some(working_memory_policy) = role_activation.working_memory_policy.as_deref() {
+                envelope.push_str(&format!(
+                    "Role working-memory policy: {}.\n",
+                    working_memory_policy
+                ));
+            }
+            if let Some(memory_projection_policy) =
+                role_activation.memory_projection_policy.as_deref()
+            {
+                envelope.push_str(&format!(
+                    "Role memory projection policy: {}.\n",
+                    memory_projection_policy
+                ));
+            }
+        }
         if !self.bindings.effective_toolset.is_empty() {
             envelope.push_str(&format!(
                 "Effective tools: {}.\n",
@@ -1689,6 +1762,137 @@ impl SessionState {
         lines.join("\n")
     }
 
+    pub fn build_same_identity_handoff_bundle(
+        &self,
+        target_role: &str,
+        initiating_turn_id: &str,
+        handoff_reason: &str,
+        return_to: Option<String>,
+    ) -> HandoffBundle {
+        let active_goal = self
+            .active_turn
+            .as_ref()
+            .map(|turn| turn.user_content.clone())
+            .filter(|text| !text.trim().is_empty())
+            .or_else(|| {
+                let summary = self.summary_text();
+                (!summary.is_empty()).then_some(summary)
+            });
+        let working_summary = self.active_turn.as_ref().map(|turn| {
+            format!(
+                "phase={}, iteration={}, pending_tool={}, pending_approval={}",
+                turn.phase.as_str(),
+                turn.iteration,
+                turn.pending_tool_call.is_some(),
+                turn.pending_approval.is_some()
+            )
+        });
+
+        let mut relevant_session_facts = vec![format!("session_status={}", self.status)];
+        if let Some(active_incarnation_id) = self.active_incarnation_id.as_deref() {
+            relevant_session_facts.push(format!("active_incarnation_id={active_incarnation_id}"));
+        }
+        if let Some(workspace) = self.bindings.effective_workspace_ref.as_deref() {
+            relevant_session_facts.push(format!("workspace={workspace}"));
+        }
+        if self.approval_policy.auto_approve_all {
+            relevant_session_facts.push("approval=preapproved".into());
+        }
+
+        HandoffBundle {
+            goal: format!("Switch active role to {target_role} for this session."),
+            context_excerpt: format!(
+                "Same-identity role handoff requested. Current summary: {}",
+                self.summary_text()
+            ),
+            session_id: self.session_id.clone(),
+            initiating_turn_id: initiating_turn_id.to_string(),
+            return_to,
+            handoff_reason: Some(handoff_reason.to_string()),
+            active_goal,
+            active_constraints: vec![
+                format!("transport_source={}", self.source),
+                "same_identity_role_handoff".into(),
+            ],
+            relevant_session_facts,
+            working_summary,
+            suggested_memory_refs: Vec::new(),
+            expected_return_mode: Some("stay_active_until_manual_return".into()),
+            cleanup_actions: vec![
+                "persist_role_local_working_state".into(),
+                "switch_active_role".into(),
+            ],
+        }
+    }
+
+    pub fn build_subagent_delegation(
+        &self,
+        goal: &str,
+        subagent_kind: &str,
+        allowed_tools: Vec<String>,
+        allowed_skills: Vec<String>,
+    ) -> SubagentDelegation {
+        let parent_role = self
+            .role_activation
+            .as_ref()
+            .map(|activation| activation.role_name.clone())
+            .unwrap_or_else(|| "orchestrator".to_string());
+        let summary = self
+            .active_turn
+            .as_ref()
+            .map(|turn| {
+                format!(
+                    "Delegated from session turn {} while parent is handling: {}",
+                    turn.turn_id, turn.user_content
+                )
+            })
+            .unwrap_or_else(|| "Delegated from current session state.".to_string());
+
+        let mut session_facts = vec![format!("session_status={}", self.status)];
+        if let Some(active_incarnation_id) = self.active_incarnation_id.as_deref() {
+            session_facts.push(format!("active_incarnation_id={active_incarnation_id}"));
+        }
+        if let Some(workspace) = self.bindings.effective_workspace_ref.as_deref() {
+            session_facts.push(format!("workspace={workspace}"));
+        }
+
+        let mut constraints = vec![
+            "subagent_lightweight_default".to_string(),
+            "no_membrane_ownership".to_string(),
+        ];
+        if self.approval_policy.auto_approve_all {
+            constraints.push("parent_session_preapproved".to_string());
+        }
+        if self.role_activation.is_some() {
+            constraints.push("delegated_from_active_role".to_string());
+        }
+
+        SubagentDelegation {
+            parent_agent_id: self.agent_id.clone(),
+            parent_role,
+            subagent_kind: subagent_kind.to_string(),
+            goal: goal.to_string(),
+            context_packet: SubagentContextPacket {
+                summary,
+                session_facts,
+                constraints,
+                memory_refs: Vec::new(),
+            },
+            allowed_tools,
+            allowed_skills,
+            memory_allowance: Some("none_by_default".into()),
+            writeback_allowance: Some("summary_only_parent_mediated".into()),
+            iteration_budget: Some(6),
+            ttl_seconds: Some(900),
+            completion_contract: SubagentCompletionContract {
+                summary_required: true,
+                artifact_refs_expected: false,
+                failure_summary_required: true,
+                requires_parent_ack: true,
+            },
+        }
+    }
+
     pub fn model_request_payloads(
         &self,
         user_content: &str,
@@ -1730,6 +1934,7 @@ impl SessionState {
             "agent_id": self.agent_id,
             "source": self.source,
             "active_incarnation_id": self.active_incarnation_id,
+            "role_activation": self.role_activation,
             "agent_profile": self.agent_profile,
             "status": self.status,
             "approval_policy": self.approval_policy,
@@ -1791,6 +1996,10 @@ impl SessionState {
             .get("active_incarnation_id")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
+        let role_activation = checkpoint
+            .get("role_activation")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<RoleActivation>(value).ok());
         let agent_profile = checkpoint
             .get("agent_profile")
             .cloned()
@@ -1937,6 +2146,7 @@ impl SessionState {
             agent_id,
             source,
             active_incarnation_id,
+            role_activation,
             agent_profile,
             status,
             approval_policy,
@@ -2400,9 +2610,9 @@ mod tests {
     use super::{
         ApprovalPolicy, ComponentExecutionRoute, ComponentRouteAssembly, ComponentRouteBinding,
         ContextAuthority, ContextLayerId, ContextMutability, HookRequest, HookResult,
-        PromotionAction, RefreshRequest, SessionBindings, SessionState, TaskRunnerBaseConfig,
-        ToolRunnerIncarnationBinding, TransportReplyTargetBinding, TtsMode, VoiceResponsePolicy,
-        WorkingTurn, default_tool_assembly_for_bindings, merge_session_index,
+        PromotionAction, RefreshRequest, RoleActivation, SessionBindings, SessionState,
+        TaskRunnerBaseConfig, ToolRunnerIncarnationBinding, TransportReplyTargetBinding, TtsMode,
+        VoiceResponsePolicy, WorkingTurn, default_tool_assembly_for_bindings, merge_session_index,
         session_checkpoint_memory_type,
     };
     use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
@@ -2537,6 +2747,17 @@ mod tests {
             "agent_id": "agent-jane-01",
             "source": "telegram",
             "active_incarnation_id": "agent-jane:developer",
+            "role_activation": {
+                "role_name": "developer",
+                "active_incarnation_id": "agent-jane:developer",
+                "activation_reason": "session_active_incarnation",
+                "requested_by": "hotel_runtime",
+                "role_addendum": "Focus on implementation and code changes.",
+                "toolset_profile_ref": "codex",
+                "effective_skillset": ["planning"],
+                "working_memory_policy": "role_local",
+                "memory_projection_policy": "shared_identity_role_scoped"
+            },
             "status": "paused",
             "approval_policy": {
                 "auto_approve_all": true
@@ -2584,6 +2805,20 @@ mod tests {
         assert_eq!(
             state.active_incarnation_id.as_deref(),
             Some("agent-jane:developer")
+        );
+        assert_eq!(
+            state
+                .role_activation
+                .as_ref()
+                .map(|role| role.role_name.as_str()),
+            Some("developer")
+        );
+        assert_eq!(
+            state
+                .role_activation
+                .as_ref()
+                .and_then(|role| role.toolset_profile_ref.as_deref()),
+            Some("codex")
         );
         assert_eq!(
             state.approval_policy,
@@ -2898,6 +3133,17 @@ mod tests {
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.status = "paused".into();
         state.active_incarnation_id = Some("agent-jane:developer".into());
+        state.role_activation = Some(RoleActivation {
+            role_name: "developer".into(),
+            active_incarnation_id: Some("agent-jane:developer".into()),
+            activation_reason: "session_active_incarnation".into(),
+            requested_by: Some("hotel_runtime".into()),
+            role_addendum: Some("Focus on implementation and code changes.".into()),
+            toolset_profile_ref: Some("codex".into()),
+            effective_skillset: vec!["planning".into()],
+            working_memory_policy: Some("role_local".into()),
+            memory_projection_policy: Some("shared_identity_role_scoped".into()),
+        });
         state.agent_profile.identity_text = Some("Identity anchor: Jane".into());
         state.agent_profile.user_context_text =
             Some("User anchor: Jared prefers direct collaboration.".into());
@@ -2951,6 +3197,13 @@ mod tests {
             Some("waiting_model")
         );
         assert_eq!(projection.layers.len(), 5);
+        assert_eq!(
+            projection
+                .role_activation
+                .as_ref()
+                .map(|role| role.role_name.as_str()),
+            Some("developer")
+        );
         assert!(
             projection
                 .layers
@@ -3001,6 +3254,171 @@ mod tests {
         assert!(prompt.contains("[Session projection]"));
         assert!(prompt.contains("[Working projection]"));
         assert!(prompt.contains("Active conversation turn: turn-ctx-2."));
+    }
+
+    #[test]
+    fn role_activation_projects_addendum_and_toolset_into_prompt() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.active_incarnation_id = Some("agent-jane:developer".into());
+        state.role_activation = Some(RoleActivation {
+            role_name: "developer".into(),
+            active_incarnation_id: Some("agent-jane:developer".into()),
+            activation_reason: "session_active_incarnation".into(),
+            requested_by: Some("hotel_runtime".into()),
+            role_addendum: Some("Focus on implementation and code changes.".into()),
+            toolset_profile_ref: Some("codex".into()),
+            effective_skillset: vec!["planning".into(), "implementation".into()],
+            working_memory_policy: Some("role_local".into()),
+            memory_projection_policy: Some("shared_identity_role_scoped".into()),
+        });
+
+        let prompt = state.build_prompt("status");
+        assert!(prompt.contains("Active role posture: developer."));
+        assert!(prompt.contains("Role addendum: Focus on implementation and code changes."));
+        assert!(prompt.contains("Role toolset profile: codex."));
+        assert!(prompt.contains("Role skillset posture: planning, implementation."));
+        assert!(prompt.contains("Role working-memory policy: role_local."));
+    }
+
+    #[test]
+    fn same_identity_handoff_bundle_carries_live_session_context() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.status = "paused".into();
+        state.active_incarnation_id = Some("agent-jane:developer".into());
+        state.bindings.effective_workspace_ref = Some("workspace://main".into());
+        state.role_activation = Some(RoleActivation {
+            role_name: "developer".into(),
+            active_incarnation_id: Some("agent-jane:developer".into()),
+            activation_reason: "session_active_incarnation".into(),
+            requested_by: Some("hotel_runtime".into()),
+            role_addendum: Some("Focus on implementation and code changes.".into()),
+            toolset_profile_ref: Some("codex".into()),
+            effective_skillset: vec!["planning".into()],
+            working_memory_policy: Some("role_local".into()),
+            memory_projection_policy: Some("shared_identity_role_scoped".into()),
+        });
+        state.start_turn(WorkingTurn {
+            task_id: Uuid::nil(),
+            turn_id: "turn-handoff-1".into(),
+            chat_id: "123".into(),
+            user_content: "implement the fix".into(),
+            final_reply_to: "local-ansible-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase: TurnPhase::WaitingModel,
+            iteration: 2,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            pending_text_reply: None,
+            had_voice_input: false,
+            awaiting_transcription_reentry: false,
+        });
+
+        let bundle = state.build_same_identity_handoff_bundle(
+            "architect",
+            "turn-handoff-1",
+            "manual_role_switch",
+            Some("orchestrator".into()),
+        );
+
+        assert_eq!(bundle.handoff_reason.as_deref(), Some("manual_role_switch"));
+        assert_eq!(bundle.active_goal.as_deref(), Some("implement the fix"));
+        assert!(
+            bundle
+                .relevant_session_facts
+                .contains(&"session_status=paused".to_string())
+        );
+        assert!(
+            bundle
+                .relevant_session_facts
+                .contains(&"workspace=workspace://main".to_string())
+        );
+        assert_eq!(
+            bundle.expected_return_mode.as_deref(),
+            Some("stay_active_until_manual_return")
+        );
+        assert!(
+            bundle
+                .cleanup_actions
+                .contains(&"persist_role_local_working_state".to_string())
+        );
+    }
+
+    #[test]
+    fn subagent_delegation_builder_is_lightweight_and_role_scoped() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.status = "active".into();
+        state.active_incarnation_id = Some("agent-jane:developer".into());
+        state.bindings.effective_workspace_ref = Some("workspace://main".into());
+        state.role_activation = Some(RoleActivation {
+            role_name: "developer".into(),
+            active_incarnation_id: Some("agent-jane:developer".into()),
+            activation_reason: "session_active_incarnation".into(),
+            requested_by: Some("hotel_runtime".into()),
+            role_addendum: Some("Focus on implementation and code changes.".into()),
+            toolset_profile_ref: Some("codex".into()),
+            effective_skillset: vec!["implementation".into()],
+            working_memory_policy: Some("role_local".into()),
+            memory_projection_policy: Some("shared_identity_role_scoped".into()),
+        });
+        state.start_turn(WorkingTurn {
+            task_id: Uuid::nil(),
+            turn_id: "turn-subagent-1".into(),
+            chat_id: "123".into(),
+            user_content: "break this into a small worker task".into(),
+            final_reply_to: "local-ansible-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase: TurnPhase::WaitingModel,
+            iteration: 1,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            pending_text_reply: None,
+            had_voice_input: false,
+            awaiting_transcription_reentry: false,
+        });
+
+        let delegation = state.build_subagent_delegation(
+            "Read the files and summarize risks.",
+            "research_worker",
+            vec!["workspace.read".into()],
+            vec!["research".into()],
+        );
+
+        assert_eq!(delegation.parent_agent_id, "agent-jane-01");
+        assert_eq!(delegation.parent_role, "developer");
+        assert_eq!(delegation.subagent_kind, "research_worker");
+        assert_eq!(delegation.goal, "Read the files and summarize risks.");
+        assert_eq!(delegation.allowed_tools, vec!["workspace.read"]);
+        assert_eq!(delegation.allowed_skills, vec!["research"]);
+        assert_eq!(
+            delegation.memory_allowance.as_deref(),
+            Some("none_by_default")
+        );
+        assert_eq!(
+            delegation.writeback_allowance.as_deref(),
+            Some("summary_only_parent_mediated")
+        );
+        assert!(
+            delegation
+                .context_packet
+                .session_facts
+                .contains(&"workspace=workspace://main".to_string())
+        );
+        assert!(
+            delegation
+                .context_packet
+                .constraints
+                .contains(&"subagent_lightweight_default".to_string())
+        );
+        assert!(delegation.completion_contract.summary_required);
+        assert!(delegation.completion_contract.failure_summary_required);
+        assert!(delegation.completion_contract.requires_parent_ack);
     }
 
     #[test]
@@ -3056,6 +3474,17 @@ mod tests {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.active_incarnation_id = Some("agent-jane:developer".into());
+        state.role_activation = Some(RoleActivation {
+            role_name: "developer".into(),
+            active_incarnation_id: Some("agent-jane:developer".into()),
+            activation_reason: "session_active_incarnation".into(),
+            requested_by: Some("hotel_runtime".into()),
+            role_addendum: Some("Focus on implementation and code changes.".into()),
+            toolset_profile_ref: Some("codex".into()),
+            effective_skillset: vec!["planning".into()],
+            working_memory_policy: Some("role_local".into()),
+            memory_projection_policy: Some("shared_identity_role_scoped".into()),
+        });
 
         let projection = state.build_context_projection("status");
         let context = state.model_context_from_projection(&projection);
@@ -3067,7 +3496,10 @@ mod tests {
             item["projection_kind"] == "session"
                 && item["text"]
                     .as_str()
-                    .map(|text| text.contains("Active incarnation: agent-jane:developer."))
+                    .map(|text| {
+                        text.contains("Active incarnation: agent-jane:developer.")
+                            && text.contains("Role toolset profile: codex.")
+                    })
                     .unwrap_or(false)
         }));
     }

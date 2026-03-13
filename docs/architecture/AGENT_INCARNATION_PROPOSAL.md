@@ -3,7 +3,7 @@ title: "Agent Incarnation Model Proposal"
 doc_type: proposal
 domain: runtime-sessions
 status: accepted-current-slice
-last_updated: 2026-03-12
+last_updated: 2026-03-13
 tags:
   - incarnations
   - roles
@@ -15,6 +15,8 @@ related_docs:
   - SESSION_LOOP_PROPOSAL.md
   - AGENT_LOOP_PROPOSAL.md
   - GOVERNED_WORKFLOW_SKILLS_PROPOSAL.md
+  - ROLE_ACTIVATION_AND_SUBAGENT_CONTRACTS_PROPOSAL.md
+  - ROLE_CONTEXT_SHIFT_AND_DELEGATED_SUBAGENTS_WHITEPAPER.md
   - TELEGRAM_POLL_LEASE_PROPOSAL.md
 task_refs:
   - docs/task.md
@@ -38,7 +40,7 @@ source_of_truth_targets:
 
 ## Goal
 
-Define a first-class incarnation model for agents so that a single agent identity can operate as multiple concurrent role incarnations with distinct capability postures, separate running contexts, and controlled ownership of the communication plane. Establish the right primitives for role provisioning, membrane routing, memory sharing, handoff, and ephemeral task delegation.
+Define a first-class incarnation model for agents so that a single agent identity can operate through multiple named role postures with distinct capability filters, role-local working contexts, and controlled ownership of the communication plane. Establish the right primitives for role provisioning, membrane routing, shared memory, context-shift handoff, and ephemeral task delegation.
 
 ## Disposition
 
@@ -63,6 +65,13 @@ This slice is intentionally narrower than the full proposal:
 - `/role <name>`, `/back`, and `/roles` now exist as manual operator surfaces in `agent-core`, backed by the same hotel handoff/runtime contract and hotel-backed role listing
 - handoff skill scaffolding, role-profile seeding, inactive TTL reclaim, and subagents remain future slices
 
+Important design shift:
+
+- current runtime substrate can materialize separate role processes when needed
+- preferred semantics now treat same-identity role handoff as context shift first
+- delegated subagents are the default path for parallel labor
+- concurrent role materialization is now considered conditional rather than the default ontology
+
 ## Linked Work Surface
 
 [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md) — Agent Logic, Personality and Context sections.
@@ -74,7 +83,7 @@ This slice is intentionally narrower than the full proposal:
 
 An **agent** is an identity: soul, history, relationships, and shared memory. That identity is singular and continuous — it does not fork.
 
-An **incarnation** is a long-lived, named role that the agent plays. Each incarnation has its own capability posture (toolset/skillset), its own role identity addendum layered on top of the base soul, and its own running session context (turn history, working memory). Multiple incarnations can be active concurrently. The **philotic membrane (membrane)** routes inbound user messages to exactly one incarnation at a time — the active one — but all incarnations can send outbound messages back through the membrane.
+An **incarnation** is a long-lived, named role that the agent plays. Each incarnation has its own capability posture (toolset/skillset), its own role identity addendum layered on top of the base soul, and its own role-local working context. By default, activating an incarnation means shifting the active role posture and context projection of the same self. Separate concurrent role processes remain allowed when runtime pressure justifies them, but they are no longer the preferred default interpretation. The **philotic membrane (membrane)** routes inbound user messages to exactly one active role posture at a time.
 
 Important boundary: role switching changes the current inbound route target, not the underlying membrane transport authority. A Telegram poller stays attached to the agent/home-hotel membrane authority even when the active routed incarnation changes from orchestrator to developer, architect, or another role.
 
@@ -82,7 +91,7 @@ For broader workflow governance, including peer delegation and external cognitiv
 
 Important identity boundary: all role incarnations share the same base agent identity. A role addendum modifies posture, specialization, and stance; it does not create a second self. Philotic should treat roles as additive overlays on one continuous identity, not as sibling personas with shared storage.
 
-**Workers and subagents** are a separate, ephemeral category: short-lived task delegates that have no access to the communication plane. Their results bubble up to the incarnation that spawned them.
+**Workers and subagents** are a separate, ephemeral category: short-lived task delegates that have no access to the communication plane. Their results bubble up to the active role/incarnation that spawned them.
 
 The analogy: an agent is a person. Their role incarnations are the hats they wear — developer, architect, researcher. Switching hats doesn't change who they are or what they know. A worker is more like a contractor they've hired for a specific job.
 
@@ -102,6 +111,7 @@ They vary by:
 - role addendum
 - toolset and skillset posture
 - turn-loop posture
+- working memory
 - handoff behavior
 
 The rule is deliberately strict:
@@ -118,17 +128,17 @@ This matters for both prompt construction and control-plane policy. If a role re
 
 ### Category 1: Role Incarnations
 
-Long-lived, named, provisioned through the orchestrator. Each is a persistent process on the hotel.
+Long-lived, named, provisioned through the orchestrator. By default each is a role posture of the same self, with separate materialized hotel processes available when concurrency or isolation actually requires them.
 
 **Properties:**
 - **Identity**: shares the base agent soul, identity, user relationship layer, and durable memory ownership + carries a `role_identity_addendum` (extra posture/directive text specific to this role)
-- **Context**: own session — separate turn history, working memory, active turn state
+- **Context**: role-local working memory and active turn posture; may also carry role-local recent-turn state when materialized separately
 - **Toolset**: defined by a named `toolset_profile` (see Role Provisioning)
 - **Skillset**: defined by a named skill set in the profile
 - **Turn loop config**: per-role — iteration cap, approval policy, model selection, context window policy
 - **Memory**: full read/write access to the shared agent memory layer (same as all other incarnations)
-- **Membrane**: can own inbound routing; can always send outbound
-- **Lifetime**: long-lived, supervised by the hotel, auto-respawned on crash. Subject to **inactive TTL** — if a role has no active session and no pending tasks for longer than its configured idle TTL, the hotel may reclaim the process. The role definition persists in the Context Graph; it is rematerialized on-demand when it next receives a handoff or inbound task.
+- **Membrane**: active role posture can own inbound routing; outbound behavior remains governed by the active session/runtime path
+- **Lifetime**: role definitions are durable; materialized role processes are optional and may be supervised, reclaimed, and rematerialized on-demand when used
 - **Provisioning**: created and configured via the `agent.configure_role` tool, available to the orchestrator incarnation
 
 **Example: Aria's role incarnations**
@@ -143,14 +153,15 @@ aria:env-engineer     ← infrastructure and deployment tools
 
 ### Category 2: Workers / Subagents
 
-Ephemeral task delegates. Spawned by any incarnation for a specific, bounded task.
+Ephemeral task delegates. Spawned by any active role/incarnation for a specific, bounded task.
 
 **Properties:**
 - **No membrane access**: never own inbound routing; never send directly to the user
 - **Results bubble up**: all outputs are delivered back to the spawning incarnation as task results
-- **Toolset**: explicitly enumerated at spawn time — no profile lookup
+- **Toolset**: explicitly enumerated at spawn time or derived from delegation policy — no automatic full-profile inheritance
 - **Context**: receives a context snapshot passed by the spawner at spawn time; no persistent history
-- **Memory**: no direct memory access by default; may receive a memory excerpt in the context snapshot
+- **Skillset**: explicitly enumerated at spawn time or derived from delegation policy
+- **Memory**: no direct durable-memory access by default; may receive a memory excerpt in the context snapshot
 - **Lifetime**: ephemeral — exits after emitting a result or hitting TTL. Caller-configurable TTL with a hard maximum (suggested: 30 minutes). No auto-respawn; failure delivers `FailTask` to the parent.
 - **From the loop's perspective**: spawning a worker looks like calling a slow tool — `WaitingTool` phase, result re-enters the model loop as a tool result
 
@@ -185,9 +196,9 @@ This is intentionally a routing decision, not a membrane-election decision. The 
 
 ### Concurrent roles
 
-Multiple role incarnations can be running concurrently. The `active_incarnation_id` governs inbound only. Any incarnation can emit outbound to membrane at any time (e.g. a developer role sending a progress update while the orchestrator owns inbound).
+Multiple role incarnations **may** be running concurrently when the runtime deliberately materializes them. The `active_incarnation_id` governs inbound only. Concurrent materialization should be justified by background work, isolation, or placement pressure rather than assumed as the default meaning of a role.
 
-This means a user may receive messages from multiple incarnations interleaved. Membrane should label the sender (role name) in the delivery context so the user has visibility into which role is speaking.
+When concurrent role processes do exist, a user may receive messages from multiple incarnations interleaved. Membrane should label the sender (role name) in the delivery context so the user has visibility into which role is speaking.
 
 ### Membrane switching
 
@@ -213,6 +224,14 @@ Those belong to the agent/home-hotel membrane boundary, not the currently active
 ## Handoff Skill
 
 Handoff is not a raw IPC call — it is a **defined skill** that incarnations invoke to signal and execute a role transition. This makes handoff parametric, introspectable, and extensible.
+
+For same-identity role transitions, the default semantic meaning is now:
+
+- gather and package the right context
+- clean up the outgoing role-local working state
+- activate a different role posture of the same self
+
+That may be implemented by in-place context shift or by activating/materializing a distinct role process when needed.
 
 ### What a handoff skill defines
 

@@ -3,7 +3,7 @@ title: "Role Posture And Admin Proposal"
 doc_type: proposal
 domain: operator-control-plane
 status: proposed
-last_updated: 2026-03-12
+last_updated: 2026-03-13
 tags:
   - roles
   - admin
@@ -13,6 +13,7 @@ tags:
 related_docs:
   - ARCHITECTURE_STATUS.md
   - AGENT_INCARNATION_PROPOSAL.md
+  - ROLE_CONTEXT_SHIFT_AND_DELEGATED_SUBAGENTS_WHITEPAPER.md
   - CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md
   - LOCAL_ADMIN_FALLBACK_MODEL_PROPOSAL.md
 task_refs:
@@ -76,8 +77,15 @@ This keeps “admin-capable” distinct from “permanently admin-authoritative.
 ### Specialist/worker roles
 
 - capability-specific
-- can be materialized or handed off to as needed
+- specialist roles are additive postures of the same self and should usually activate via context shift
 - should not redefine the meaning of conversational ownership
+
+Important distinction:
+
+- specialist **roles** are same-self postures with shared durable memory
+- **workers/subagents** are bounded delegated execution units
+
+Those are related, but they are not the same category wearing different hats because the naming budget ran out.
 
 ## Why This Matters
 
@@ -100,3 +108,8 @@ Make the role posture explicit in:
 - session elevation rules
 
 and treat admin authority as first-class rather than as “whatever role happens to have the scary tools.”
+
+Also keep the split honest:
+
+- role activation narrows focus for one self
+- subagent spawning distributes labor under bounded delegation

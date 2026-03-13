@@ -80,6 +80,68 @@ pub struct HandoffBundle {
     pub initiating_turn_id: String,
     #[serde(default)]
     pub return_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_goal: Option<String>,
+    #[serde(default)]
+    pub active_constraints: Vec<String>,
+    #[serde(default)]
+    pub relevant_session_facts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_summary: Option<String>,
+    #[serde(default)]
+    pub suggested_memory_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_return_mode: Option<String>,
+    #[serde(default)]
+    pub cleanup_actions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SubagentContextPacket {
+    pub summary: String,
+    #[serde(default)]
+    pub session_facts: Vec<String>,
+    #[serde(default)]
+    pub constraints: Vec<String>,
+    #[serde(default)]
+    pub memory_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SubagentCompletionContract {
+    #[serde(default)]
+    pub summary_required: bool,
+    #[serde(default)]
+    pub artifact_refs_expected: bool,
+    #[serde(default)]
+    pub failure_summary_required: bool,
+    #[serde(default)]
+    pub requires_parent_ack: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SubagentDelegation {
+    pub parent_agent_id: String,
+    pub parent_role: String,
+    pub subagent_kind: String,
+    pub goal: String,
+    pub context_packet: SubagentContextPacket,
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    #[serde(default)]
+    pub allowed_skills: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_allowance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writeback_allowance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iteration_budget: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_seconds: Option<u64>,
+    #[serde(default)]
+    pub completion_contract: SubagentCompletionContract,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,6 +250,10 @@ pub enum IpcRequest {
         summary: String,
         #[serde(default)]
         return_to: Option<String>,
+    },
+    SpawnSubagent {
+        session_id: String,
+        delegation: SubagentDelegation,
     },
     ListRoleIncarnations {
         agent_id: String,
