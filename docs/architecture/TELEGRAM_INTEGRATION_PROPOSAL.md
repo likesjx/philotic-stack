@@ -1,3 +1,34 @@
+---
+title: "Philotic Telegram Integration Proposal"
+doc_type: proposal
+domain: membrane-transport
+status: accepted-current-slice
+last_updated: 2026-03-12
+tags:
+  - telegram
+  - membrane
+  - transport
+  - multimodal
+  - current-slice
+related_docs:
+  - ARCHITECTURE_STATUS.md
+  - TELEGRAM_POLL_LEASE_PROPOSAL.md
+  - MEMBRANE_COMPONENT_PROPOSAL.md
+  - SLASH_COMMANDS_PROPOSAL.md
+task_refs:
+  - docs/task.md
+proposal_id: telegram-integration
+implements: []
+implemented_by:
+  - telegram-normalized-ingress-slice
+  - telegram-media-startup-smoke-slice
+active_seams:
+  - webhook-security-contract
+  - watched-live-telegram-validation
+source_of_truth_targets:
+  - ARCHITECTURE_STATUS.md
+---
+
 # Philotic Telegram Integration Proposal
 
 ## Goal
@@ -14,6 +45,8 @@ Define Telegram as a real outside-world transport boundary for Philotic, with ex
 This proposal is intentionally security-first. Telegram can be the outside-world interface, but that only helps if the outside world is not also our unauthenticated load tester.
 
 This proposal assumes the broader membrane boundary defined in [MEMBRANE_COMPONENT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMBRANE_COMPONENT_PROPOSAL.md): Telegram is one membrane implementation, not the definition of membrane itself.
+
+Telegram poller ownership is defined separately in [TELEGRAM_POLL_LEASE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_POLL_LEASE_PROPOSAL.md), because "how Telegram updates are normalized" and "who may hold the one real polling cursor" are adjacent but not the same authority question.
 
 ## Core Recommendation
 

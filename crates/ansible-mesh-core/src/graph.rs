@@ -68,6 +68,49 @@ pub struct AbstractToolRecord {
     pub class: String,
 }
 
+/// A system-wide shared skill definition stored in the context graph.
+///
+/// Node kind: `abstract_skill`. Node key: `abstract_skill:{skill_name}`.
+/// Skills provide model-facing posture hints and can imply tool grants when a
+/// role or session activates them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AbstractSkillRecord {
+    pub skill_name: String,
+    pub description: String,
+    #[serde(default)]
+    pub implied_tools: Vec<String>,
+}
+
+/// Per-role runtime loop controls for a role incarnation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct TurnLoopConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iteration_cap: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window_policy: Option<String>,
+}
+
+/// A long-lived named role incarnation for an agent.
+///
+/// Node kind: `role_incarnation`. Node key: `role_incarnation:{agent_id}:{role_name}`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoleIncarnationRecord {
+    pub agent_id: String,
+    pub role_name: String,
+    pub guest_id: String,
+    pub toolset_profile: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_identity_addendum: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inactive_ttl_seconds: Option<u64>,
+    #[serde(default)]
+    pub turn_loop_config: TurnLoopConfig,
+}
+
 /// A dedicated namespace for an agent's memory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryApartment {

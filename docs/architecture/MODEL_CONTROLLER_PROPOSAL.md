@@ -1,3 +1,36 @@
+---
+title: "Model Controller Proposal"
+doc_type: proposal
+domain: tooling-execution
+status: accepted-current-slice
+last_updated: 2026-03-12
+tags:
+  - model-controller
+  - models
+  - oauth
+  - voice
+  - active-seam
+related_docs:
+  - ARCHITECTURE_STATUS.md
+  - TASK_RUNNER_PROPOSAL.md
+  - VOICE_MACHINE_PROPOSAL.md
+  - KEY_VAULT_PROPOSAL.md
+task_refs:
+  - docs/task.md
+proposal_id: model-controller
+implements: []
+implemented_by:
+  - structured-model-envelope-slice
+  - gemini-oauth-guest-path-slice
+  - voice-synthesize-envelope-slice
+active_seams:
+  - structured-model-envelope
+  - hotel-gemini-oauth-flow
+source_of_truth_targets:
+  - ARCHITECTURE_STATUS.md
+  - ARCHITECTURE.md
+---
+
 # Model Controller Proposal
 
 ## Goal
@@ -13,9 +46,12 @@ Define a capability-addressed model-controller boundary for Philotic that can:
 
 Model-controller requests should stay capability-addressed and provider-neutral at the API edge, while provider-specific options live in explicit extension fields.
 
+They should also distinguish between the capability being requested and the kind of execution contract the request needs.
+
 For the current direction:
 
 - keep capability routing as the stable interface layer
+- add a `request_class` field so the envelope can distinguish cognitive, transform, synthesis, and embedding work without splitting the controller boundary too early
 - let model-controller implementations handle provider API invocation only
 - treat ElevenLabs as an audio-capability provider surface, not just a single `voice.synthesize` endpoint
 - treat native multimodal voice-capable models as a separate response path, not as disguised ElevenLabs TTS
@@ -40,8 +76,18 @@ Pin and prove the first design contract for:
 - a hotel-side Gemini OAuth validation path that proves stored auth can call a real Gemini model
 - a structured model request envelope that separates context layers from routing hints and provider options
 - a structured model response envelope with explicit response channels for optimization-oriented outputs
+- a first `request_class` split so cognitive calls can carry agent context and affordances without forcing every model call to pretend it is part of the reasoning loop
 
-Linked task surface: [docs/task.md](/Users/jaredlikes/code/philotic-stack-model-controller-abstraction/docs/task.md)
+Current confidence for the implemented structured-envelope slice:
+
+- `test-green`
+  - `cargo test -p model-router -- --nocapture`
+  - `cargo test -p agent-core -- --nocapture`
+- `smoke-green` for the structured cognitive path
+  - `bash scripts/smoke-cognitive-roundtrip.sh`
+- not yet `watched-live-green` for end-to-end role/context projection in a live session
+
+Linked task surface: [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md)
 
 ## Capability Surface
 
@@ -57,13 +103,40 @@ The model-controller API should be structured around capabilities such as:
 
 `response.generate` is the important escape hatch for multimodal models that can emit text and audio directly. It should not be forced through the `voice.synthesize` path, because that would collapse native model audio into a fake TTS abstraction.
 
+Capability names alone are not enough to express what kind of execution contract a task needs. A `text.generate` request used for agent reasoning is not the same species of work as an embedding request or a narrow transform request, even when all of them happen to call a model.
+
+## Request Classes
+
+Keep one model-controller boundary, but introduce an explicit `request_class` field inside the request envelope.
+
+Recommended initial values:
+
+- `cognitive`
+  - agent reasoning calls that may use role posture, session context, tools, skills, and richer result channels
+- `transform`
+  - content interpretation or conversion calls such as transcription or media analysis, usually with narrow task-local instructions
+- `synthesis`
+  - artifact generation calls such as TTS, where the main output is an audio or media artifact rather than reasoning state
+- `embedding`
+  - vectorization/indexing calls where conversation-turn context is usually irrelevant
+
+Recommended rule:
+
+- `capability` answers: what does the caller want done?
+- `request_class` answers: what kind of execution contract does this call require?
+
+Do not create a separate cognitive process boundary yet unless runtime or operational pressure proves it is necessary. Separate the API contract first.
+
 ## Structured Request Envelope
 
 Model-controller requests should move toward one canonical envelope with separate concerns for:
 
 - `capability`
+- `request_class`
 - `response_contract`
 - `context`
+- `context_projection`
+- `affordances`
 - `routing_hints`
 - `provider_options`
 
@@ -72,6 +145,7 @@ Recommended shape:
 ```json
 {
   "capability": "text.generate",
+  "request_class": "cognitive",
   "response_contract": {
     "modalities": ["text"],
     "style": "assistant_reply"
@@ -108,6 +182,8 @@ This gives the system a stable capability-facing request while preserving struct
 
 If everything becomes one giant prompt string, Philotic loses the ability to reason about what can be cached, dropped, summarized, or projected differently per model.
 
+If everything becomes one giant cognitive envelope, Philotic also loses the ability to optimize transform, synthesis, and embedding work according to their actual needs.
+
 Important invariant:
 
 - structured envelopes must degrade cleanly to a minimal prompt-response path
@@ -119,6 +195,7 @@ The minimum honest request for `text.generate` should be able to look like:
 ```json
 {
   "capability": "text.generate",
+  "request_class": "cognitive",
   "context": {
     "active_turn": {
       "text": "Hello"
@@ -131,11 +208,90 @@ Everything else should be additive:
 
 - `response_contract` only when extra output channels are desired
 - `identity`, `memory`, and `dialogue_window` only when they are relevant
+- `context_projection` only when the caller wants structured provenance/debuggability or model-side projection-aware behavior
 - `affordances` only when skills or tools matter for this turn
 - `routing_hints` only when selection needs steering
 - `provider_options` only when provider-specific behavior is actually needed
 
 If a simple prompt-response turn has to impersonate a fully dressed orchestration request, the schema has become more ceremonial than useful.
+
+## Field Expectations By Request Class
+
+Not every request class should carry the same fields.
+
+### `cognitive`
+
+Expected fields:
+
+- `capability`
+- `request_class`
+- `context`
+- optional `context_projection`
+- optional `affordances`
+- optional `response_contract`
+- optional `routing_hints`
+- optional `provider_options`
+
+This is the class that should be allowed to carry:
+
+- identity / relationship / session / working / knowledge context
+- active role posture
+- tool and skill affordances
+- richer result channels such as `working_memory_delta`
+
+### `transform`
+
+Expected fields:
+
+- `capability`
+- `request_class`
+- task-local prompt or instructions
+- relevant attachments or inputs
+- optional `routing_hints`
+- optional `provider_options`
+
+Usually avoid:
+
+- full conversation-turn context
+- tools/skills
+- cognitive result channels
+
+### `synthesis`
+
+Expected fields:
+
+- `capability`
+- `request_class`
+- source text or source artifact
+- output/style options
+- optional `response_contract`
+- optional `routing_hints`
+- optional `provider_options`
+
+Usually avoid:
+
+- agent identity and relationship context
+- tool/skill affordances
+- working-memory-oriented result fields
+
+### `embedding`
+
+Expected fields:
+
+- `capability`
+- `request_class`
+- input text or batch inputs
+- embedding/model options
+- optional `routing_hints`
+- optional `provider_options`
+
+Usually avoid:
+
+- conversation-turn context
+- affordances
+- response channels oriented around assistant replies
+
+This split unlocks class-specific caching, routing, policy, and observability without fragmenting the controller boundary prematurely.
 
 ## Structured Response Envelope
 

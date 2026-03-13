@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Philotic Web Incarnation - Interactive Documentation</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Share+Tech+Mono&display=swap');
+  
+  body, html {
+    margin: 0; padding: 0;
+    background-color: #050510;
+    color: #0ff;
+    font-family: 'Share Tech Mono', monospace;
+    overflow: hidden;
+    width: 100vw; height: 100vh;
+    display: flex;
+  }
+  
+  /* Left Panel - Visualization */
+  #viz-container {
+    flex: 1;
+    position: relative;
+    overflow: hidden;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+  }
+  
+  /* Right Panel - Documentation */
+  #doc-panel {
+    width: 380px;
+    background: rgba(0, 5, 15, 0.95);
+    border-left: 2px solid #0ff;
+    padding: 30px;
+    display: flex;
+    flex-direction: column;
+    z-index: 100;
+    box-shadow: -10px 0 30px rgba(0,255,255,0.1);
+  }
+  
+  .header-logo {
+    font-family: 'Orbitron', sans-serif; font-size: 28px; font-weight: 900;
+    color: #fff; text-shadow: 0 0 10px #0ff;
+    margin-bottom: 5px;
+  }
+  .header-sub {
+    font-size: 14px; color: #888; margin-bottom: 30px; border-bottom: 1px solid #333; padding-bottom: 20px;
+  }
+  
+  #step-indicator {
+    font-family: 'Orbitron', sans-serif; font-size: 14px; color: #f0f; font-weight: bold; margin-bottom: 10px;
+  }
+  #doc-title {
+    font-family: 'Orbitron', sans-serif; font-size: 22px; color: #0ff; margin-bottom: 20px;
+  }
+  #doc-desc {
+    font-size: 16px; line-height: 1.6; flex: 1; color: #ddd;
+  }
+  .doc-highlight { color: #f0f; font-weight: bold; }
+  
+  .controls { display: flex; gap: 10px; margin-top: 20px; }
+  button {
+    background: transparent; border: 1px solid #0ff; color: #0ff;
+    padding: 12px; cursor: pointer; font-family: 'Orbitron', sans-serif; font-weight: bold; font-size: 14px;
+    transition: all 0.3s; flex: 1; border-radius: 4px;
+  }
+  button:hover:not(:disabled) { background: rgba(0,255,255,0.2); box-shadow: 0 0 10px #0ff; }
+  button:disabled { border-color: #333; color: #555; cursor: not-allowed; }
+  
+  /* Cyber Grid */
+  .grid-container {
+    position: absolute; width: 200vw; height: 200vh;
+    background-image: 
+      linear-gradient(0deg, transparent 24%, rgba(0, 255, 255, 0.15) 25%, rgba(0, 255, 255, 0.15) 26%, transparent 27%, transparent 74%, rgba(0, 255, 255, 0.15) 75%, rgba(0, 255, 255, 0.15) 76%, transparent 77%, transparent),
+      linear-gradient(90deg, transparent 24%, rgba(0, 255, 255, 0.15) 25%, rgba(0, 255, 255, 0.15) 26%, transparent 27%, transparent 74%, rgba(0, 255, 255, 0.15) 75%, rgba(0, 255, 255, 0.15) 76%, transparent 77%, transparent);
+    background-size: 80px 80px;
+    transform: perspective(600px) rotateX(75deg) translateY(-100px) translateZ(-200px);
+    animation: grid-move 4s linear infinite;
+    z-index: 0;
+  }
+  @keyframes grid-move {
+    from { transform: perspective(600px) rotateX(75deg) translateY(0) translateZ(-200px); }
+    to { transform: perspective(600px) rotateX(75deg) translateY(80px) translateZ(-200px); }
+  }
+
+  .scene {
+    position: absolute; width: 100%; height: 100%;
+    opacity: 0; transition: opacity 1.5s ease-in-out;
+    display: none; justify-content: center; align-items: center; flex-direction: column;
+  }
+  .active { opacity: 1; z-index: 10; display: flex; }
+  
+  /* Scene 1: Hotel */
+  .hotel {
+    position: relative; width: 250px; height: 400px;
+    background: linear-gradient(180deg, #111, #001f3f);
+    border: 3px solid #0ff; border-radius: 20px 20px 0 0;
+    box-shadow: 0 0 50px rgba(0,255,255,0.4), inset 0 0 30px rgba(0,255,255,0.2);
+    display: flex; flex-direction: column; align-items: center;
+    transform: scale(0.1); opacity: 0; transition: all 1.5s ease-out;
+  }
+  .hotel.built { transform: scale(1); opacity: 1; }
+  
+  .hotel-sign {
+    margin-top: 20px; font-family: 'Orbitron', sans-serif; font-size: 24px; font-weight: 900;
+    color: #f0f; text-shadow: 0 0 10px #f0f, 0 0 20px #f0f;
+    opacity: 0; transition: opacity 1s 1s; text-align: center;
+  }
+  .hotel.built .hotel-sign { opacity: 1; }
+
+  /* Scene 1: Mesh */
+  .mesh-ring {
+    position: absolute; border: 2px solid rgba(255,0,255,0.5);
+    border-radius: 50%; width: 10px; height: 10px;
+    top: 50%; left: 50%; transform: translate(-50%, -50%);
+    display: none;
+  }
+  .mesh-ring.pinging { display: block; animation: ping 3s infinite; }
+  @keyframes ping {
+    0% { width: 10px; height: 10px; opacity: 1; }
+    100% { width: 800px; height: 800px; opacity: 0; }
+  }
+
+  .mesh-node {
+    position: absolute; width: 60px; height: 80px;
+    background: #001f3f; border: 2px solid #0ff; border-radius: 10px; box-shadow: 0 0 20px #0ff;
+    opacity: 0; transition: opacity 1s; display: flex; flex-direction: column; align-items: center;
+  }
+  .node-label { margin-top: -20px; font-size: 12px; font-weight: bold; text-shadow: 0 0 5px #0ff; background: #050510; padding: 0 5px; }
+  .mesh-line {
+    position: absolute; height: 3px; background: #0ff; box-shadow: 0 0 10px #0ff;
+    transform-origin: left; width: 0; top: 50%; left: 50%; transition: width 1s ease-in-out;
+  }
+
+  /* Scene 2: Interior */
+  .hotel-interior {
+    width: 80%; height: 75%; border: 2px solid rgba(0,255,255,0.5); border-radius: 30px;
+    background: rgba(0,10,20,0.8); backdrop-filter: blur(10px);
+    display: flex; flex-direction: column; align-items: center; padding: 20px;
+    transform: scale(0.8); opacity: 0; transition: all 1.5s ease-out;
+  }
+  .scene.active .hotel-interior { transform: scale(1); opacity: 1; }
+  
+  .router {
+    width: 140px; height: 140px; background: radial-gradient(circle, #f0f 20%, #300 80%);
+    border-radius: 50%; border: 4px solid #f0f; box-shadow: 0 0 50px #f0f, inset 0 0 20px #fff;
+    display: flex; justify-content: center; align-items: center; text-align: center;
+    font-family: 'Orbitron', sans-serif; font-weight: 900; color: #fff; font-size: 18px;
+    margin-top: 30px; margin-bottom: 50px;
+    animation: pulse 2s infinite alternate; transition: all 1s; z-index: 10;
+  }
+  @keyframes pulse { from { transform: scale(1); } to { transform: scale(1.05); box-shadow: 0 0 60px #f0f; } }
+
+  .membranes { display: flex; justify-content: space-around; width: 100%; gap: 20px; }
+  
+  .membrane {
+    width: 220px; height: 260px; border: 2px dashed #0ff; border-radius: 15px;
+    position: relative; display: flex; flex-direction: column; align-items: center; justify-content: flex-end;
+    padding-bottom: 30px; background: rgba(0,255,255,0.05);
+  }
+  .membrane-label {
+    position: absolute; top: -15px; background: #050510; padding: 0 10px; color: #0ff; border: 1px solid #0ff; border-radius: 10px; font-weight: bold;
+  }
+
+  .agent {
+    width: 80px; height: 90px; background: #333; border: 2px solid #555; border-radius: 20px;
+    position: relative; transition: all 1s; opacity: 0.3;
+    display: flex; flex-direction: column; align-items: center; z-index: 5;
+  }
+  .agent.awake {
+    opacity: 1; background: #002244; border-color: #0ff; box-shadow: 0 0 30px rgba(0,255,255,0.6);
+  }
+  .agent.operative {
+    transform: translateY(-250px) scale(0.3); opacity: 0; transition: transform 2s, opacity 2s;
+  }
+  
+  .eyes { display: flex; gap: 15px; margin-top: 25px; }
+  .eye { width: 14px; height: 6px; background: #111; border-radius: 50%; transition: all 0.5s; box-shadow: 0 0 5px rgba(0,0,0,0); }
+  .agent.awake .eye { background: #0ff; height: 14px; box-shadow: 0 0 10px #0ff; }
+  
+  .mouth { width: 20px; height: 4px; background: #111; margin-top: 15px; border-radius: 2px; transition: all 0.5s; }
+  .agent.ready .mouth { background: #0ff; border-radius: 50%; height: 10px; width: 20px; box-shadow: 0 0 10px #0ff; }
+  
+  .badge {
+    position: absolute; top: -30px; right: -20px; width: 40px; height: 40px; background: #f0f;
+    border: 2px solid #fff; border-radius: 50%; display: flex; justify-content: center; align-items: center;
+    box-shadow: 0 0 15px #f0f; color: #fff; font-weight: bold; font-family: 'Orbitron', monospace; font-size: 10px;
+    opacity: 0; transition: opacity 0.5s, transform 0.5s; transform: translateY(10px) rotate(-15deg);
+  }
+  .agent.ready .badge { opacity: 1; transform: translateY(0) rotate(10deg); }
+  
+  .speech {
+    position: absolute; top: -70px; background: rgba(255,255,255,0.95); color: #000;
+    padding: 10px 15px; border-radius: 10px; font-size: 14px; font-weight: bold; font-family: sans-serif;
+    opacity: 0; transition: opacity 0.3s; box-shadow: 0 5px 15px rgba(0,0,0,0.5); white-space: nowrap; z-index: 20;
+  }
+  .speech::after {
+    content: ''; position: absolute; bottom: -10px; left: 50%; transform: translateX(-50%);
+    border-width: 10px 10px 0; border-style: solid; border-color: rgba(255,255,255,0.95) transparent transparent transparent;
+  }
+
+  .data-stream {
+    position: absolute; width: 6px; background: #0ff; box-shadow: 0 0 15px #0ff; z-index: 4;
+    transform-origin: bottom; transform: scaleY(0); transition: transform 0.5s; left: 50%; margin-left: -3px;
+  }
+
+</style>
+</head>
+<body>
+
+<div id="viz-container">
+  <div class="grid-container"></div>
+  
+  <!-- Scene 1: Exterior -->
+  <div class="scene" id="scene1">
+    <div class="hotel" id="main-hotel">
+      <div class="hotel-sign">HOTEL<br>ANSIBLE</div>
+    </div>
+    <div class="mesh-ring" id="ring"></div>
+    <div id="mesh-nodes-container"></div>
+  </div>
+
+  <!-- Scene 2: Interior -->
+  <div class="scene" id="scene2">
+    <div class="hotel-interior">
+      <div class="router" id="router">ROUTER</div>
+      <div class="membranes">
+        <div class="membrane"><div class="membrane-label">Apartment: Agent</div>
+          <div class="data-stream" id="stream1" style="bottom: 150px; height: 200px;"></div>
+          <div class="agent" id="agent1">
+            <div class="speech" id="sp1">Sleeping...</div>
+            <div class="badge" id="badge1">ROLE</div>
+            <div class="eyes"><div class="eye"></div><div class="eye"></div></div>
+            <div class="mouth"></div>
+          </div>
+        </div>
+        <div class="membrane"><div class="membrane-label">Apartment: Model</div>
+          <div class="agent awake" id="agent2" style="opacity:0.6;">
+            <div class="eyes"><div class="eye"></div><div class="eye"></div></div>
+            <div class="mouth"></div>
+          </div>
+        </div>
+        <div class="membrane"><div class="membrane-label">Apartment: Tool Runner</div>
+          <div class="agent" style="opacity:0.4;"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="doc-panel">
+  <div class="header-logo">PHILOTIC</div>
+  <div class="header-sub">ARCHITECTURE INTERACTIVE</div>
+  
+  <div id="step-indicator">Step 0 / 6</div>
+  <div id="doc-title">System Inactive</div>
+  <div id="doc-desc">Click right arrow to begin the step-by-step interactive walkthrough of the Philotic System boot sequence and role handoff.</div>
+  
+  <div class="controls">
+    <button id="btn-prev" disabled>&lt; Prev</button>
+    <button id="btn-next">Next &gt;</button>
+  </div>
+</div>
+
+<script>
+  let currentStep = 0;
+  
+  const docs = [
+    {
+      title: "System Inactive",
+      desc: "Welcome to the Philotic Web Incarnation.<br><br>This documentation tool walks through the core architectural boundaries visually.<br><br>Click Next to materialize the daemon."
+    },
+    {
+      title: "1. The Ansible Daemon",
+      desc: "In the Philotic framework, one <span class='doc-highlight'>hotel daemon</span> on each host acts as the absolute runtime authority.<br><br>It strictly owns guest materialization, local storage, and graph context. It is the monolith that powers the framework."
+    },
+    {
+      title: "2. The Mesh Overlay",
+      desc: "The local Hotel establishes <span class='doc-highlight'>WebRTC connections</span> to federated Ansible hubs (like Hotel Vibe or Hotel Memory).<br><br>Through this overlay, Mesh-visible state is synced via defined synchronization routines without leaking internal boundaries."
+    },
+    {
+      title: "3. Internal Boundaries",
+      desc: "Zooming inside the Hotel.<br><br>The Hotel contains a central <span class='doc-highlight'>Router</span> managing IPC.<br><br>It surrounds this router with isolated <span class='doc-highlight'>Guest Membranes</span> (Agent, Model, Runner) which operate with strict separation of concerns."
+    },
+    {
+      title: "4. Waking the Agent",
+      desc: "A guest <span class='doc-highlight'>Agent</span> powers on. <br><br>Crucially, inside its apartment, it has absolutely no intrinsic memory. It wakes up in complete isolation, decoupled from the core database."
+    },
+    {
+      title: "5. Context Fetch",
+      desc: "The agent pings the central <span class='doc-highlight'>Router</span>.<br><br>It requests its current Turn state, Context, and session graph configuration. The router validates authority and serves the required state safely."
+    },
+    {
+      title: "6. Role Materialization",
+      desc: "With the Context validated and loaded, the Agent accepts its exact execution role.<br><br>It then <span class='doc-highlight'>materializes into the active stream</span>, handing off its local isolated awareness to the global execution task."
+    }
+  ];
+
+  const agent1 = document.getElementById('agent1');
+  const router = document.getElementById('router');
+  const sp1 = document.getElementById('sp1');
+  const ring = document.getElementById('ring');
+  const meshContainer = document.getElementById('mesh-nodes-container');
+
+  // Utility to clear UI for reset
+  function clearMesh() {
+    ring.classList.remove('pinging');
+    meshContainer.innerHTML = '';
+  }
+
+  function renderStep(step) {
+    // Update Documentation side
+    document.getElementById('step-indicator').innerText = `Step ${step} / 6`;
+    document.getElementById('doc-title').innerHTML = docs[step].title;
+    document.getElementById('doc-desc').innerHTML = docs[step].desc;
+    
+    document.getElementById('btn-prev').disabled = (step === 0);
+    document.getElementById('btn-next').disabled = (step === 6);
+
+    // Run Visual Triggers based on state
+    if (step === 0) {
+      document.getElementById('scene1').classList.add('active');
+      document.getElementById('scene2').classList.remove('active');
+      document.getElementById('main-hotel').classList.remove('built');
+      clearMesh();
+    }
+    else if (step === 1) {
+      document.getElementById('scene1').classList.add('active');
+      document.getElementById('scene2').classList.remove('active');
+      document.getElementById('main-hotel').classList.add('built');
+      clearMesh();
+    }
+    else if (step === 2) {
+      document.getElementById('scene1').classList.add('active');
+      document.getElementById('scene2').classList.remove('active');
+      document.getElementById('main-hotel').classList.add('built');
+      ring.classList.add('pinging');
+      
+      meshContainer.innerHTML = '';
+      const nodes = [
+        { deg: 30, r: 300, name: 'HOTEL VIBE' },
+        { deg: 150, r: 300, name: 'HOTEL ALPHA' },
+        { deg: 270, r: 250, name: 'HOTEL MEMORY' }
+      ];
+      nodes.forEach((n, i) => {
+        let x = Math.cos(n.deg * Math.PI / 180) * n.r;
+        let y = Math.sin(n.deg * Math.PI / 180) * n.r;
+        let node = document.createElement('div');
+        node.className = 'mesh-node';
+        node.style.left = `calc(50% + ${x - 30}px)`;
+        node.style.top = `calc(50% + ${y - 40}px)`;
+        node.innerHTML = `<div class="node-label">${n.name}</div>`;
+        meshContainer.appendChild(node);
+        setTimeout(() => { if (currentStep === 2) node.style.opacity = 1; }, i * 300 + 400);
+
+        let line = document.createElement('div');
+        line.className = 'mesh-line';
+        line.style.transform = `rotate(${n.deg}deg)`;
+        meshContainer.appendChild(line);
+        setTimeout(() => { if (currentStep === 2) line.style.width = `${n.r}px`; }, i * 300);
+      });
+    }
+    else if (step === 3) {
+      document.getElementById('scene1').classList.remove('active');
+      document.getElementById('scene2').classList.add('active');
+      
+      agent1.classList.remove('awake', 'ready', 'operative');
+      document.getElementById('stream1').style.transform = 'scaleY(0)';
+      sp1.style.opacity = 0;
+      router.style.transform = 'scale(1)'; router.style.boxShadow = '0 0 50px #f0f, inset 0 0 20px #fff';
+      router.innerHTML = "ROUTER";
+    }
+    else if (step === 4) {
+      document.getElementById('scene2').classList.add('active');
+      agent1.classList.add('awake');
+      agent1.classList.remove('ready', 'operative');
+      document.getElementById('stream1').style.transform = 'scaleY(0)';
+      
+      sp1.style.opacity = 1;
+      sp1.innerText = "Yawn... Context missing.";
+      router.style.transform = 'scale(1)'; router.style.boxShadow = '0 0 50px #f0f, inset 0 0 20px #fff';
+      router.innerHTML = "ROUTER";
+    }
+    else if (step === 5) {
+      agent1.classList.add('awake');
+      agent1.classList.remove('ready', 'operative');
+      sp1.style.opacity = 1; sp1.innerText = "Pinging Router for Context...";
+      
+      document.getElementById('stream1').style.transform = 'scaleY(1)'; 
+      router.style.boxShadow = '0 0 120px #f0f, inset 0 0 40px #fff';
+      router.style.transform = 'scale(1.15)';
+      router.innerHTML = "ROUTER";
+      
+      setTimeout(() => {
+        if (currentStep !== 5) return;
+        sp1.innerText = "Received! Turn state parsed.";
+        router.style.transform = 'scale(1)';
+        router.style.boxShadow = '0 0 50px #f0f, inset 0 0 20px #fff';
+      }, 1500);
+    }
+    else if (step === 6) {
+      sp1.style.opacity = 0;
+      document.getElementById('stream1').style.transform = 'scaleY(0)'; 
+      
+      agent1.classList.add('ready');
+      agent1.classList.remove('operative');
+      
+      setTimeout(() => {
+        if (currentStep !== 6) return;
+        agent1.classList.add('operative');
+        router.style.transform = 'scale(1.4)';
+        router.innerHTML = "ROUTING<br>ACTIVE";
+        router.style.boxShadow = '0 0 150px #f0f, inset 0 0 50px #fff';
+      }, 1000);
+    }
+  }
+
+  document.getElementById('btn-prev').addEventListener('click', () => {
+    if (currentStep > 0) { currentStep--; renderStep(currentStep); }
+  });
+  
+  document.getElementById('btn-next').addEventListener('click', () => {
+    if (currentStep < 6) { currentStep++; renderStep(currentStep); }
+  });
+
+  // Init
+  renderStep(0);
+</script>
+</body>
+</html>

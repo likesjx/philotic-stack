@@ -7,11 +7,11 @@ use crate::protocol::{
     ToolExecutionPayload, TransportAttachment, TurnEventPayload,
 };
 use crate::session::{
-    MediaRoutingPolicy, SessionState, ToolExecutionRoute, TtsMode, VoiceResponsePolicy, WorkingTurn,
-    merge_session_index,
+    MediaRoutingPolicy, SessionState, ToolExecutionRoute, TtsMode, VoiceResponsePolicy,
+    WorkingTurn, merge_session_index,
 };
 use anyhow::Result;
-use philotic_client::{IpcRequest, IpcResponse, PhiloticClient, is_ipc_disconnect};
+use philotic_client::{HandoffBundle, IpcRequest, IpcResponse, PhiloticClient, is_ipc_disconnect};
 use std::collections::HashMap;
 use std::time::Duration;
 use tracing::{error, info, warn};
@@ -19,12 +19,56 @@ use uuid::Uuid;
 
 pub const DEFAULT_AGENT_ID: &str = "agent-jane-01";
 const DEFAULT_REPLY_ROLE: &str = "membrane";
-const LOCAL_NODE: &str = "local-ansible-01";
 const DEFAULT_TEXT_MODEL_ROLE: &str = "model.gemini";
 const DEFAULT_VOICE_MODEL_ROLE: &str = "model.elevenlabs";
 /// Maximum model round-trips per turn. Exhausting this budget fails the turn with a
 /// clear error rather than looping indefinitely.
 const MAX_TOOL_ITERATIONS: u32 = 10;
+
+fn local_node_id() -> String {
+    std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-ansible-01".to_string())
+}
+
+#[cfg(test)]
+const LOCAL_NODE: &str = "local-ansible-01";
+
+fn extract_model_error(task: &InboundTaskPayload) -> Option<String> {
+    if let Some(error) = task.error.as_ref() {
+        return Some(error.display_message());
+    }
+
+    let agent_action = task.agent_action.as_ref()?;
+    let mut parts = Vec::new();
+
+    if let Some(message) = agent_action
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+    {
+        parts.push(message.to_string());
+    }
+
+    if let Some(error) = agent_action
+        .get("model_result")
+        .and_then(|mr| mr.get("error"))
+        .and_then(serde_json::Value::as_object)
+    {
+        if let Some(kind) = error.get("kind").and_then(serde_json::Value::as_str) {
+            parts.push(format!("kind={kind}"));
+        }
+        if let Some(provider) = error.get("provider").and_then(serde_json::Value::as_str) {
+            parts.push(format!("provider={provider}"));
+        }
+        if let Some(message) = error.get("message").and_then(serde_json::Value::as_str) {
+            parts.push(message.to_string());
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" | "))
+    }
+}
 
 fn implementation_to_model_role(implementation: &str) -> String {
     let normalized = implementation
@@ -53,7 +97,7 @@ fn resolve_model_execution_target(
         .map(implementation_to_model_role)
         .unwrap_or_else(|| fallback_role.into());
 
-    (LOCAL_NODE.into(), target_role, None)
+    (local_node_id(), target_role, None)
 }
 
 fn normalized_user_content(task: &InboundTaskPayload) -> Option<String> {
@@ -185,16 +229,34 @@ pub(crate) fn strip_markup(text: &str) -> String {
         }
 
         // ATX headings: # Heading → Heading
-        let line = if let Some(rest) = trimmed.strip_prefix("######").or_else(|| trimmed.strip_prefix("#####")).or_else(|| trimmed.strip_prefix("####")).or_else(|| trimmed.strip_prefix("###")).or_else(|| trimmed.strip_prefix("##")).or_else(|| trimmed.strip_prefix('#')) {
+        let line = if let Some(rest) = trimmed
+            .strip_prefix("######")
+            .or_else(|| trimmed.strip_prefix("#####"))
+            .or_else(|| trimmed.strip_prefix("####"))
+            .or_else(|| trimmed.strip_prefix("###"))
+            .or_else(|| trimmed.strip_prefix("##"))
+            .or_else(|| trimmed.strip_prefix('#'))
+        {
             rest.trim().to_string()
         } else {
             trimmed.to_string()
         };
 
         // List items: - item or * item or 1. item
-        let line = if let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")).or_else(|| line.strip_prefix("• ")) {
+        let line = if let Some(rest) = line
+            .strip_prefix("- ")
+            .or_else(|| line.strip_prefix("* "))
+            .or_else(|| line.strip_prefix("• "))
+        {
             rest.to_string()
-        } else if line.len() > 2 && line.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) && line.contains(". ") {
+        } else if line.len() > 2
+            && line
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false)
+            && line.contains(". ")
+        {
             line.splitn(2, ". ").nth(1).unwrap_or(&line).to_string()
         } else {
             line
@@ -306,6 +368,58 @@ fn resolve_media_routing(
     })
 }
 
+fn format_role_command_reply(command: &SlashCommand, became_active: bool) -> String {
+    match command {
+        SlashCommand::Role { role_name } => {
+            if became_active {
+                format!("Switched to role {role_name}.")
+            } else {
+                format!("Switching to role {role_name} once it finishes materializing.")
+            }
+        }
+        SlashCommand::Back => {
+            if became_active {
+                "Switched back to orchestrator.".into()
+            } else {
+                "Switching back to orchestrator once it finishes materializing.".into()
+            }
+        }
+        _ => "Role command completed.".into(),
+    }
+}
+
+fn format_roles_report(active_incarnation_id: Option<&str>, roles: &[serde_json::Value]) -> String {
+    let active_role_name = active_incarnation_id
+        .and_then(|guest_id| guest_id.rsplit(':').next())
+        .unwrap_or("orchestrator");
+
+    if roles.is_empty() {
+        return format!(
+            "Active role: {active_role_name}. No configured role incarnations were returned by the hotel."
+        );
+    }
+
+    let mut lines = vec![format!("Active role: {active_role_name}.")];
+    lines.push("Configured roles:".into());
+    for role in roles {
+        let role_name = role
+            .get("role_name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let guest_id = role
+            .get("guest_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let marker = if Some(guest_id) == active_incarnation_id || role_name == active_role_name {
+            "*"
+        } else {
+            "-"
+        };
+        lines.push(format!("{marker} {role_name}"));
+    }
+    lines.join("\n")
+}
+
 pub struct AgentRuntime {
     ipc_client: PhiloticClient,
     agent_id: String,
@@ -331,7 +445,10 @@ impl AgentRuntime {
                     task_id,
                     task_json,
                 })) => {
-                    info!("Jane received task [{}] from [{}]", task_id, source_node);
+                    info!(
+                        "Agent [{}] received task [{}] from [{}]",
+                        self.agent_id, task_id, source_node
+                    );
 
                     match serde_json::from_str::<InboundTaskPayload>(&task_json) {
                         Ok(task) if task.is_model_response() => {
@@ -380,10 +497,11 @@ impl AgentRuntime {
         let session_id = task.session_id_or_default(&self.agent_id);
         let turn_id = task.turn_id.clone().unwrap_or_else(|| task_id.to_string());
         let chat_id = task.chat_id.clone().unwrap_or_default();
+        let local_node = local_node_id();
         let inbound_final_reply_to = task
             .final_reply_to
             .clone()
-            .unwrap_or_else(|| LOCAL_NODE.to_string());
+            .unwrap_or_else(|| local_node.clone());
         let inbound_final_reply_role = task
             .final_reply_role
             .clone()
@@ -402,7 +520,7 @@ impl AgentRuntime {
                 inbound_final_reply_guest_id,
             );
             let target = state.resolved_transport_reply_target(
-                LOCAL_NODE.to_string(),
+                local_node,
                 DEFAULT_REPLY_ROLE.to_string(),
                 None,
             );
@@ -417,6 +535,7 @@ impl AgentRuntime {
             match command {
                 SlashCommand::Ping => {}
                 SlashCommand::Status | SlashCommand::Pause | SlashCommand::Resume => {}
+                SlashCommand::Role { .. } | SlashCommand::Roles | SlashCommand::Back => {}
                 SlashCommand::ToolsAdd { .. }
                 | SlashCommand::ToolsClear
                 | SlashCommand::SkillsAdd { .. }
@@ -444,12 +563,25 @@ impl AgentRuntime {
             }
         }
 
-        let had_voice_input = task.message_kind.as_deref()
+        let had_voice_input = task
+            .message_kind
+            .as_deref()
             .map(|k| matches!(k, "voice" | "audio"))
             .unwrap_or(false)
-            || task.attachments.iter().any(|a| matches!(a.kind.as_str(), "voice" | "audio"));
+            || task
+                .attachments
+                .iter()
+                .any(|a| matches!(a.kind.as_str(), "voice" | "audio"));
 
-        let (checkpoint_memory_type, checkpoint_json, index_state, model_prompt, tools_for_model) = {
+        let (
+            checkpoint_memory_type,
+            checkpoint_json,
+            index_state,
+            model_prompt,
+            model_context,
+            context_projection,
+            tools_for_model,
+        ) = {
             let state = self
                 .sessions
                 .get_mut(&session_id)
@@ -469,15 +601,20 @@ impl AgentRuntime {
                 working_tool_history: Vec::new(),
                 pending_text_reply: None,
                 had_voice_input,
+                awaiting_transcription_reentry: false,
             });
             state.set_active_turn_phase(TurnPhase::LoadingContext);
 
             let tools_for_model = state.project_tools_for_turn(&content);
+            let (model_prompt, model_context, context_projection) =
+                state.model_request_payloads(&content, &tools_for_model);
             (
                 state.checkpoint_memory_type(),
                 state.checkpoint_json(),
                 state.clone(),
-                state.build_prompt_with_tools(&content, &tools_for_model),
+                model_prompt,
+                model_context,
+                context_projection,
                 tools_for_model,
             )
         };
@@ -521,6 +658,10 @@ impl AgentRuntime {
                     )
                     .await
                 }
+                SlashCommand::Role { .. } | SlashCommand::Roles | SlashCommand::Back => {
+                    self.handle_role_command(task_id, session_id, turn_id, chat_id, command)
+                        .await
+                }
                 SlashCommand::Approve { .. } | SlashCommand::Deny { .. } => Ok(()),
             };
         }
@@ -539,6 +680,18 @@ impl AgentRuntime {
                 )
                 .await;
         }
+
+        let media_policy = self
+            .sessions
+            .get(&session_id)
+            .map(|s| s.agent_profile.media_routing_policy.clone())
+            .unwrap_or_default();
+        let media_attachments = media_analysis_attachments(&task);
+        let media_routing = resolve_media_routing(&media_policy, media_attachments);
+        let awaiting_transcription_reentry = media_routing
+            .as_ref()
+            .map(|routing| routing.action == "transcribe")
+            .unwrap_or(false);
 
         let _ = self
             .ipc_client
@@ -561,6 +714,7 @@ impl AgentRuntime {
                 .expect("active turn should still exist after context build");
             state.bump_active_turn_iteration();
             state.set_active_turn_phase(TurnPhase::WaitingModel);
+            state.set_active_turn_awaiting_transcription_reentry(awaiting_transcription_reentry);
             (
                 state.checkpoint_memory_type(),
                 state.checkpoint_json(),
@@ -572,15 +726,6 @@ impl AgentRuntime {
             .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
             .await?;
         self.sync_session_index(&index_state).await?;
-
-        let media_policy = self
-            .sessions
-            .get(&session_id)
-            .map(|s| s.agent_profile.media_routing_policy.clone())
-            .unwrap_or_default();
-
-        let media_attachments = media_analysis_attachments(&task);
-        let media_routing = resolve_media_routing(&media_policy, media_attachments);
 
         let (action, prompt, attachments, tools_for_model, capability) =
             if let Some(routing) = media_routing {
@@ -647,15 +792,25 @@ impl AgentRuntime {
 
         let model_req = ModelRequestPayload {
             action,
+            request_class: Some(
+                if capability == "text.generate" {
+                    "cognitive"
+                } else {
+                    "transform"
+                }
+                .to_string(),
+            ),
             session_id: session_id.clone(),
             turn_id,
             prompt,
             user_content: content,
+            context: Some(model_context),
+            context_projection: Some(context_projection),
             attachments,
             tools_for_model,
             response_contract: Some(serde_json::json!({ "channels": ["spoken_text"] })),
             chat_id,
-            reply_to: LOCAL_NODE.to_string(),
+            reply_to: local_node_id(),
             reply_role: "agent".into(),
             final_reply_to,
             final_reply_role,
@@ -696,9 +851,45 @@ impl AgentRuntime {
             .unwrap_or(false);
 
         if waiting_voice {
+            if let Some(model_error) = extract_model_error(&task) {
+                warn!(
+                    "Session [{}] voice synthesis failed before audio delivery: {}",
+                    session_id, model_error
+                );
+                let voice_policy = self
+                    .sessions
+                    .get(&session_id)
+                    .map(|s| s.agent_profile.voice_response_policy.clone())
+                    .unwrap_or_default();
+
+                if !voice_policy.fallback_to_text {
+                    return self
+                        .fail_active_turn(
+                            session_id,
+                            turn_id,
+                            format!("Voice synthesis failed: {}", model_error),
+                        )
+                        .await;
+                }
+            }
+
             let raw_content = task.content.unwrap_or_default();
             return self
                 .handle_voice_synthesis_response(session_id, turn_id, raw_content)
+                .await;
+        }
+
+        if let Some(model_error) = extract_model_error(&task) {
+            warn!(
+                "Session [{}] model request failed before turn completion: {}",
+                session_id, model_error
+            );
+            return self
+                .fail_active_turn(
+                    session_id,
+                    turn_id,
+                    format!("Model failed: {}", model_error),
+                )
                 .await;
         }
 
@@ -716,7 +907,36 @@ impl AgentRuntime {
             .filter(|s| !s.trim().is_empty())
             .map(str::to_string);
 
+        let awaiting_transcription_reentry = self
+            .sessions
+            .get(&session_id)
+            .map(|state| state.active_turn_awaiting_transcription_reentry())
+            .unwrap_or(false);
+
         let action = interpret_model_payload(task.agent_action.as_ref(), task.content.as_deref());
+        if awaiting_transcription_reentry {
+            return match action {
+                AgentAction::Respond { content } => {
+                    self.reenter_turn_after_transcription(session_id, turn_id, content)
+                        .await
+                }
+                AgentAction::Fail { message } => {
+                    self.fail_active_turn(session_id, turn_id, message).await
+                }
+                other => {
+                    self.fail_active_turn(
+                        session_id,
+                        turn_id,
+                        format!(
+                            "voice.transcribe returned unexpected action {:?}; expected transcript text",
+                            other
+                        ),
+                    )
+                    .await
+                }
+            };
+        }
+
         match action {
             AgentAction::Respond { content } => {
                 self.complete_agent_response(session_id, turn_id, content, spoken_text)
@@ -856,7 +1076,11 @@ impl AgentRuntime {
             .await?;
 
         let _ = self
-            .emit_turn_event(&session_id, "waiting_approval", Some(approval.reason.clone()))
+            .emit_turn_event(
+                &session_id,
+                "waiting_approval",
+                Some(approval.reason.clone()),
+            )
             .await;
 
         let reply_payload = FinalReplyPayload {
@@ -911,10 +1135,7 @@ impl AgentRuntime {
                             "Tool '{}' requires approval before execution.",
                             tool_call.tool_name
                         ),
-                        approved_response: format!(
-                            "Executing {}.",
-                            tool_call.tool_name
-                        ),
+                        approved_response: format!("Executing {}.", tool_call.tool_name),
                     };
                     !state.approval_policy_allows(&synthetic, Some(&tool_call))
                 } else {
@@ -1023,7 +1244,7 @@ impl AgentRuntime {
                     max_read_bytes: None,
                     max_search_results: None,
                 }),
-            reply_to: LOCAL_NODE.to_string(),
+            reply_to: local_node_id(),
             reply_role: "agent".into(),
             final_reply_to,
             final_reply_role,
@@ -1079,11 +1300,7 @@ impl AgentRuntime {
             state.push_tool_history(tool_call, tool_result.clone());
             state.clear_pending_tool_call();
 
-            let iteration = state
-                .active_turn
-                .as_ref()
-                .map(|t| t.iteration)
-                .unwrap_or(0);
+            let iteration = state.active_turn.as_ref().map(|t| t.iteration).unwrap_or(0);
 
             if iteration >= MAX_TOOL_ITERATIONS {
                 Err(format!(
@@ -1113,7 +1330,9 @@ impl AgentRuntime {
                             state.clone(),
                         ))
                     }
-                    None => Err("Active turn vanished before re-entry prompt could be built".into()),
+                    None => {
+                        Err("Active turn vanished before re-entry prompt could be built".into())
+                    }
                 }
             }
         };
@@ -1138,19 +1357,24 @@ impl AgentRuntime {
                     .await?;
                 self.sync_session_index(&index_state).await?;
 
-                let _ = self.emit_turn_event(&session_id, "waiting_tool", None).await;
+                let _ = self
+                    .emit_turn_event(&session_id, "waiting_tool", None)
+                    .await;
 
                 let model_req = ModelRequestPayload {
                     action: "generate_text".to_string(),
+                    request_class: Some("cognitive".to_string()),
                     session_id: session_id.clone(),
                     turn_id,
                     prompt,
                     user_content,
+                    context: None,
+                    context_projection: None,
                     attachments: Vec::new(),
                     tools_for_model,
                     response_contract: None,
                     chat_id,
-                    reply_to: LOCAL_NODE.to_string(),
+                    reply_to: local_node_id(),
                     reply_role: "agent".into(),
                     final_reply_to,
                     final_reply_role,
@@ -1185,6 +1409,125 @@ impl AgentRuntime {
                 Ok(())
             }
         }
+    }
+
+    async fn reenter_turn_after_transcription(
+        &mut self,
+        session_id: String,
+        turn_id: String,
+        transcript: String,
+    ) -> Result<()> {
+        let transcript = transcript.trim().to_string();
+        if transcript.is_empty() {
+            return self
+                .fail_active_turn(
+                    session_id,
+                    turn_id,
+                    "Voice transcription returned an empty transcript".into(),
+                )
+                .await;
+        }
+
+        let (reentry, checkpoint_memory_type, checkpoint_json, index_state) = {
+            let Some(state) = self.sessions.get_mut(&session_id) else {
+                warn!(
+                    "Received transcription re-entry for unknown session {}",
+                    session_id
+                );
+                return Ok(());
+            };
+            let Some(reentry) = state.prepare_transcription_reentry(&transcript) else {
+                return self
+                    .fail_active_turn(
+                        session_id,
+                        turn_id,
+                        "Voice transcription returned an empty transcript".into(),
+                    )
+                    .await;
+            };
+            (
+                reentry,
+                state.checkpoint_memory_type(),
+                state.checkpoint_json(),
+                state.clone(),
+            )
+        };
+
+        self.ipc_client
+            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
+            .await?;
+        self.sync_session_index(&index_state).await?;
+
+        let _ = self
+            .ipc_client
+            .send_request(IpcRequest::UpdateTask {
+                task_id: reentry.task_id,
+                state: "waiting_model".into(),
+                payload: serde_json::json!({
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "chat_id": reentry.chat_id,
+                    "content": reentry.user_content,
+                }),
+            })
+            .await?;
+
+        let (context, context_projection) = self
+            .sessions
+            .get(&session_id)
+            .map(|state| {
+                let projection = state.build_context_projection(&reentry.user_content);
+                (
+                    Some(state.model_context_from_projection(&projection)),
+                    Some(
+                        serde_json::to_value(&projection)
+                            .expect("context projection should serialize"),
+                    ),
+                )
+            })
+            .unwrap_or((None, None));
+
+        let model_req = ModelRequestPayload {
+            action: "generate_text".to_string(),
+            request_class: Some("cognitive".to_string()),
+            session_id: session_id.clone(),
+            turn_id,
+            prompt: reentry.prompt,
+            user_content: reentry.user_content.clone(),
+            context,
+            context_projection,
+            attachments: Vec::new(),
+            tools_for_model: reentry.tools_for_model,
+            response_contract: Some(serde_json::json!({ "channels": ["spoken_text"] })),
+            chat_id: reentry.chat_id,
+            reply_to: local_node_id(),
+            reply_role: "agent".into(),
+            final_reply_to: reentry.final_reply_to,
+            final_reply_role: reentry.final_reply_role,
+            final_reply_guest_id: reentry.final_reply_guest_id,
+        };
+
+        let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
+            self.sessions.get(&session_id),
+            "text.generate",
+            DEFAULT_TEXT_MODEL_ROLE,
+        );
+
+        info!(
+            "Session [{}] re-entering normal reasoning after voice transcription",
+            session_id
+        );
+
+        self.ipc_client
+            .send_request(IpcRequest::EmitTask {
+                target_node,
+                target_role,
+                target_guest_id,
+                task_json: serde_json::to_string(&model_req)?,
+            })
+            .await?;
+
+        Ok(())
     }
 
     /// Emit a turn lifecycle event back to the transport (membrane) so it can update delivery UX
@@ -1274,14 +1617,25 @@ impl AgentRuntime {
         spoken_text: Option<String>,
         policy: VoiceResponsePolicy,
     ) -> Result<()> {
-        let (task_id, chat_id, final_reply_to, final_reply_role, final_reply_guest_id,
-             checkpoint_memory_type, checkpoint_json, index_state) = {
+        let (
+            task_id,
+            chat_id,
+            final_reply_to,
+            final_reply_role,
+            final_reply_guest_id,
+            checkpoint_memory_type,
+            checkpoint_json,
+            index_state,
+        ) = {
             let Some(state) = self.sessions.get_mut(&session_id) else {
                 warn!("start_voice_synthesis: unknown session {}", session_id);
                 return Ok(());
             };
             let Some(active_turn) = state.active_turn.as_ref() else {
-                warn!("start_voice_synthesis: no active turn for session {}", session_id);
+                warn!(
+                    "start_voice_synthesis: no active turn for session {}",
+                    session_id
+                );
                 return Ok(());
             };
             let task_id = active_turn.task_id;
@@ -1292,7 +1646,11 @@ impl AgentRuntime {
             state.set_pending_text_reply(display_text.clone());
             state.set_active_turn_phase(TurnPhase::WaitingVoice);
             (
-                task_id, chat_id, final_reply_to, final_reply_role, final_reply_guest_id,
+                task_id,
+                chat_id,
+                final_reply_to,
+                final_reply_role,
+                final_reply_guest_id,
                 state.checkpoint_memory_type(),
                 state.checkpoint_json(),
                 state.clone(),
@@ -1331,16 +1689,29 @@ impl AgentRuntime {
             policy.voice_id.as_deref(),
         );
 
+        let provider_options = if let Some(speed_percent) = policy.speed_percent {
+            let speed = f64::from(speed_percent) / 100.0;
+            serde_json::json!({
+                "voice_settings": {
+                    "speed": speed
+                }
+            })
+        } else {
+            serde_json::json!({})
+        };
+
         let voice_task = serde_json::json!({
             "kind": "voice.synthesize",
+            "request_class": "synthesis",
             "provider": policy.provider,
             "spoken_text": spoken_text.unwrap_or_else(|| strip_markup(&display_text)),
             "voice_id": policy.voice_id,
             "model": policy.model,
+            "provider_options": provider_options,
             "session_id": session_id,
             "turn_id": turn_id,
             "chat_id": chat_id,
-            "reply_to": LOCAL_NODE,
+            "reply_to": local_node_id(),
             "reply_role": "agent",
             "final_reply_to": final_reply_to,
             "final_reply_role": final_reply_role,
@@ -1665,6 +2036,9 @@ impl AgentRuntime {
                 | SlashCommand::Status
                 | SlashCommand::Pause
                 | SlashCommand::Resume
+                | SlashCommand::Role { .. }
+                | SlashCommand::Roles
+                | SlashCommand::Back
                 | SlashCommand::ToolsAdd { .. }
                 | SlashCommand::ToolsClear
                 | SlashCommand::SkillsAdd { .. }
@@ -1830,6 +2204,9 @@ impl AgentRuntime {
             | SlashCommand::Status
             | SlashCommand::Pause
             | SlashCommand::Resume
+            | SlashCommand::Role { .. }
+            | SlashCommand::Roles
+            | SlashCommand::Back
             | SlashCommand::ToolsAdd { .. }
             | SlashCommand::ToolsClear
             | SlashCommand::SkillsAdd { .. }
@@ -1843,6 +2220,216 @@ impl AgentRuntime {
         }
 
         Ok(())
+    }
+
+    async fn handle_role_command(
+        &mut self,
+        command_task_id: Uuid,
+        session_id: String,
+        command_turn_id: String,
+        command_chat_id: String,
+        command: SlashCommand,
+    ) -> Result<()> {
+        let response = match &command {
+            SlashCommand::Role { role_name } => {
+                let handoff_bundle = self
+                    .sessions
+                    .get(&session_id)
+                    .map(|state| {
+                        state.build_same_identity_handoff_bundle(
+                            role_name,
+                            &command_turn_id,
+                            "manual_role_switch",
+                            Some("orchestrator".into()),
+                        )
+                    })
+                    .unwrap_or_else(|| HandoffBundle {
+                        goal: format!("Switch active role to {role_name} for this session."),
+                        context_excerpt: "Manual role switch requested by user slash command."
+                            .into(),
+                        session_id: session_id.clone(),
+                        initiating_turn_id: command_turn_id.clone(),
+                        return_to: Some("orchestrator".into()),
+                        handoff_reason: Some("manual_role_switch".into()),
+                        active_goal: None,
+                        active_constraints: vec!["same_identity_role_handoff".into()],
+                        relevant_session_facts: Vec::new(),
+                        working_summary: None,
+                        suggested_memory_refs: Vec::new(),
+                        expected_return_mode: Some("stay_active_until_manual_return".into()),
+                        cleanup_actions: vec!["switch_active_role".into()],
+                    });
+                self.ipc_client
+                    .send_request(IpcRequest::HandoffToRole {
+                        session_id: session_id.clone(),
+                        role_name: role_name.clone(),
+                        handoff_bundle,
+                    })
+                    .await?
+            }
+            SlashCommand::Back => {
+                self.ipc_client
+                    .send_request(IpcRequest::HandoffBack {
+                        session_id: session_id.clone(),
+                        summary: "Manual return to orchestrator requested by user slash command."
+                            .into(),
+                        return_to: None,
+                    })
+                    .await?
+            }
+            SlashCommand::Roles => {
+                self.ipc_client
+                    .send_request(IpcRequest::ListRoleIncarnations {
+                        agent_id: self.agent_id.clone(),
+                    })
+                    .await?
+            }
+            _ => unreachable!("handle_role_command only accepts role handoff commands"),
+        };
+
+        let (reply_content, update_state, payload, next_active_incarnation) = match response {
+            IpcResponse::HandoffAck {
+                handoff_guest_id,
+                became_active,
+            } => (
+                format_role_command_reply(&command, became_active),
+                if became_active {
+                    "role_handoff_completed"
+                } else {
+                    "role_handoff_materializing"
+                },
+                serde_json::json!({
+                    "session_id": session_id,
+                    "turn_id": command_turn_id,
+                    "chat_id": command_chat_id,
+                    "role_command": "handoff_to_role",
+                    "handoff_guest_id": handoff_guest_id,
+                    "became_active": became_active,
+                }),
+                became_active.then_some(handoff_guest_id),
+            ),
+            IpcResponse::HandoffBackAck {
+                handoff_guest_id,
+                became_active,
+            } => (
+                format_role_command_reply(&command, became_active),
+                if became_active {
+                    "role_handoff_completed"
+                } else {
+                    "role_handoff_materializing"
+                },
+                serde_json::json!({
+                    "session_id": session_id,
+                    "turn_id": command_turn_id,
+                    "chat_id": command_chat_id,
+                    "role_command": "handoff_back",
+                    "handoff_guest_id": handoff_guest_id,
+                    "became_active": became_active,
+                }),
+                became_active.then_some(handoff_guest_id),
+            ),
+            IpcResponse::Standard { ok: true, data, .. }
+                if matches!(command, SlashCommand::Roles) =>
+            {
+                let roles = data
+                    .as_ref()
+                    .and_then(|value| value.get("roles"))
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let active_incarnation_id = self
+                    .sessions
+                    .get(&session_id)
+                    .and_then(|state| state.active_incarnation_id.clone());
+                (
+                    format_roles_report(active_incarnation_id.as_deref(), &roles),
+                    "role_list_reported",
+                    serde_json::json!({
+                        "session_id": session_id,
+                        "turn_id": command_turn_id,
+                        "chat_id": command_chat_id,
+                        "role_command": "list_roles",
+                        "role_count": roles.len(),
+                        "active_incarnation_id": active_incarnation_id,
+                    }),
+                    None,
+                )
+            }
+            IpcResponse::Error(message) => (
+                format!("Couldn't switch roles: {message}"),
+                "role_handoff_failed",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "turn_id": command_turn_id,
+                    "chat_id": command_chat_id,
+                    "error": message,
+                }),
+                None,
+            ),
+            IpcResponse::Standard {
+                ok: false,
+                code,
+                message,
+                ..
+            } => (
+                format!("Couldn't switch roles: {message} ({code})"),
+                "role_handoff_failed",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "turn_id": command_turn_id,
+                    "chat_id": command_chat_id,
+                    "error_code": code,
+                    "error": message,
+                }),
+                None,
+            ),
+            other => (
+                format!("Couldn't handle role command: unexpected hotel response {other:?}"),
+                "role_handoff_failed",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "turn_id": command_turn_id,
+                    "chat_id": command_chat_id,
+                    "error": format!("unexpected hotel response: {other:?}"),
+                }),
+                None,
+            ),
+        };
+
+        if let Some(active_incarnation_id) = next_active_incarnation {
+            if let Some(state) = self.sessions.get_mut(&session_id) {
+                state.active_incarnation_id = Some(active_incarnation_id);
+            }
+        }
+
+        let (checkpoint_memory_type, checkpoint_json, index_state) = {
+            let Some(state) = self.sessions.get(&session_id) else {
+                warn!("Received role command for unknown session {}", session_id);
+                return Ok(());
+            };
+            (
+                state.checkpoint_memory_type(),
+                state.checkpoint_json(),
+                state.clone(),
+            )
+        };
+
+        self.ipc_client
+            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
+            .await?;
+        self.sync_session_index(&index_state).await?;
+
+        let _ = self
+            .ipc_client
+            .send_request(IpcRequest::UpdateTask {
+                task_id: command_task_id,
+                state: update_state.into(),
+                payload,
+            })
+            .await?;
+
+        self.complete_local_command(session_id, command_turn_id, reply_content)
+            .await
     }
 
     async fn resume_turn_with_steering(
@@ -1931,17 +2518,35 @@ impl AgentRuntime {
             .map(|state| state.tool_assembly.tools_for_model.clone())
             .unwrap_or_default();
 
+        let (context, context_projection) = self
+            .sessions
+            .get(&session_id)
+            .map(|state| {
+                let projection = state.build_context_projection(&user_content);
+                (
+                    Some(state.model_context_from_projection(&projection)),
+                    Some(
+                        serde_json::to_value(&projection)
+                            .expect("context projection should serialize"),
+                    ),
+                )
+            })
+            .unwrap_or((None, None));
+
         let model_req = ModelRequestPayload {
             action: "generate_text".to_string(),
+            request_class: Some("cognitive".to_string()),
             session_id: session_id.clone(),
             turn_id,
             prompt,
             user_content,
+            context,
+            context_projection,
             attachments: Vec::new(),
             tools_for_model,
             response_contract: None,
             chat_id,
-            reply_to: LOCAL_NODE.to_string(),
+            reply_to: local_node_id(),
             reply_role: "agent".into(),
             final_reply_to,
             final_reply_role,
@@ -1997,7 +2602,9 @@ impl AgentRuntime {
                 state.agent_profile.voice_response_policy.mode = new_mode;
             }
             let reply = match new_mode {
-                TtsMode::Off => "Voice response off. I'll reply with text.",
+                TtsMode::Off => {
+                    "Voice response off for text turns. Voice notes will still get voice-only replies."
+                }
                 TtsMode::Auto => "Voice response auto — I'll mirror your input modality.",
                 TtsMode::On => "Voice response on. I'll speak all replies.",
             };
@@ -2231,6 +2838,9 @@ impl AgentRuntime {
                 }
                 SlashCommand::Ping
                 | SlashCommand::Tts { .. }
+                | SlashCommand::Role { .. }
+                | SlashCommand::Roles
+                | SlashCommand::Back
                 | SlashCommand::Approve { .. }
                 | SlashCommand::Deny { .. } => (
                     "Unsupported session control command.".to_string(),
@@ -2345,6 +2955,7 @@ impl AgentRuntime {
                     command: None,
                     callback_data: None,
                     raw_transport_event: None,
+                    error: None,
                     tool_name: Some(payload.tool_name),
                     arguments: None,
                     final_reply_to: Some(payload.final_reply_to),
@@ -2385,7 +2996,7 @@ impl AgentRuntime {
                     .unwrap_or("set")
                     .to_string();
 
-                let (content, bindings_changed) = {
+                let configure_result = {
                     let Some(state) = self.sessions.get_mut(&payload.session_id) else {
                         return self
                             .fail_active_turn(
@@ -2399,14 +3010,17 @@ impl AgentRuntime {
                     match state.apply_configure(&config_path, &value, &operation) {
                         Ok(msg) => {
                             let changed = state.bindings != bindings_before;
-                            (msg, changed)
+                            Ok((msg, changed))
                         }
-                        Err(err) => {
-                            drop(state);
-                            return self
-                                .fail_active_turn(payload.session_id, payload.turn_id, err)
-                                .await;
-                        }
+                        Err(err) => Err(err),
+                    }
+                };
+                let (content, bindings_changed) = match configure_result {
+                    Ok(result) => result,
+                    Err(err) => {
+                        return self
+                            .fail_active_turn(payload.session_id, payload.turn_id, err)
+                            .await;
                     }
                 };
 
@@ -2435,6 +3049,7 @@ impl AgentRuntime {
                     command: None,
                     callback_data: None,
                     raw_transport_event: None,
+                    error: None,
                     tool_name: Some(payload.tool_name),
                     arguments: None,
                     final_reply_to: Some(payload.final_reply_to),
@@ -2598,9 +3213,11 @@ impl AgentRuntime {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE, media_analysis_attachments, normalized_user_content,
+        DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE, extract_model_error, format_role_command_reply,
+        format_roles_report, media_analysis_attachments, normalized_user_content,
         resolve_media_routing, resolve_model_execution_target,
     };
+    use crate::commands::SlashCommand;
     use crate::r#loop::{ApprovalRequest, ToolCall};
     use crate::protocol::{
         FinalReplyPayload, InboundTaskPayload, ModelRequestPayload, TransportAttachment,
@@ -2609,15 +3226,24 @@ mod tests {
         ApprovalPolicy, ComponentExecutionRoute, ComponentRouteAssembly, ComponentRouteBinding,
         SessionState,
     };
+    use philotic_client::TaskErrorPayload;
 
     #[test]
     fn model_request_targets_agent_for_reply() {
         let request = ModelRequestPayload {
             action: "generate_text".to_string(),
+            request_class: Some("cognitive".into()),
             session_id: "sess-1".into(),
             turn_id: "turn-1".into(),
             prompt: "hello".into(),
             user_content: "hello".into(),
+            context: Some(serde_json::json!({
+                "identity": [{"text": "You are Jane."}],
+                "active_turn": {"role": "user", "text": "hello"}
+            })),
+            context_projection: Some(serde_json::json!({
+                "conversation_turn": {"conversation_turn_id": "turn-1"}
+            })),
             attachments: Vec::new(),
             tools_for_model: Vec::new(),
             response_contract: None,
@@ -2632,6 +3258,12 @@ mod tests {
         let json = serde_json::to_value(&request).expect("serialize request");
         assert_eq!(json["reply_role"], "agent");
         assert_eq!(json["final_reply_role"], "membrane");
+        assert_eq!(json["request_class"], "cognitive");
+        assert_eq!(json["context"]["active_turn"]["text"], "hello");
+        assert_eq!(
+            json["context_projection"]["conversation_turn"]["conversation_turn_id"],
+            "turn-1"
+        );
     }
 
     #[test]
@@ -2723,6 +3355,60 @@ mod tests {
     }
 
     #[test]
+    fn extract_model_error_reads_structured_error_envelope() {
+        let payload = InboundTaskPayload {
+            agent_action: Some(serde_json::json!({
+                "kind": "fail",
+                "message": "Provider invocation failed: missing voice",
+                "model_result": {
+                    "error": {
+                        "kind": "provider_failure",
+                        "provider": "elevenlabs",
+                        "message": "voice.synthesize task is missing voice override"
+                    }
+                }
+            })),
+            action: None,
+            source: None,
+            session_id: None,
+            turn_id: None,
+            transport: None,
+            chat_id: None,
+            thread_id: None,
+            sender_id: None,
+            sender_username: None,
+            message_kind: None,
+            content: None,
+            attachments: Vec::new(),
+            command: None,
+            callback_data: None,
+            raw_transport_event: None,
+            tool_name: None,
+            arguments: None,
+            final_reply_to: None,
+            final_reply_role: None,
+            final_reply_guest_id: None,
+            error: Some(TaskErrorPayload {
+                kind: "provider_failure".into(),
+                message: "Provider invocation failed: missing voice".into(),
+                code: Some("ELEVENLABS_MISSING_VOICE".into()),
+                component: Some("model-router".into()),
+                provider: Some("elevenlabs".into()),
+                capability: Some("voice.synthesize".into()),
+                retryable: Some(false),
+            }),
+        };
+
+        let error = extract_model_error(&payload).expect("structured error should be extracted");
+        assert!(error.contains("Provider invocation failed"));
+        assert!(error.contains("kind=provider_failure"));
+        assert!(error.contains("code=ELEVENLABS_MISSING_VOICE"));
+        assert!(error.contains("component=model-router"));
+        assert!(error.contains("provider=elevenlabs"));
+        assert!(error.contains("capability=voice.synthesize"));
+    }
+
+    #[test]
     fn bound_tool_execution_allows_listed_tools() {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
@@ -2758,11 +3444,14 @@ mod tests {
             preapproved_classes: Vec::new(),
         };
 
-        assert!(state.approval_policy_allows(&ApprovalRequest {
-            approval_id: Some("appr-1".into()),
-            reason: "deploy the thing".into(),
-            approved_response: "Approved: deploy the thing".into(),
-        }, None));
+        assert!(state.approval_policy_allows(
+            &ApprovalRequest {
+                approval_id: Some("appr-1".into()),
+                reason: "deploy the thing".into(),
+                approved_response: "Approved: deploy the thing".into(),
+            },
+            None
+        ));
     }
 
     #[test]
@@ -2854,6 +3543,7 @@ mod tests {
             final_reply_to: None,
             final_reply_role: None,
             final_reply_guest_id: None,
+            error: None,
         };
 
         assert_eq!(normalized_user_content(&task), Some("caption text".into()));
@@ -2893,6 +3583,7 @@ mod tests {
             final_reply_to: None,
             final_reply_role: None,
             final_reply_guest_id: None,
+            error: None,
         };
 
         assert_eq!(
@@ -2928,6 +3619,7 @@ mod tests {
             final_reply_to: None,
             final_reply_role: None,
             final_reply_guest_id: None,
+            error: None,
         };
 
         assert_eq!(
@@ -2994,6 +3686,7 @@ mod tests {
             final_reply_to: None,
             final_reply_role: None,
             final_reply_guest_id: None,
+            error: None,
         };
 
         let attachments = media_analysis_attachments(&task);
@@ -3042,7 +3735,8 @@ mod tests {
         };
         let atts = vec![blob_backed_attachment("voice")];
         let routing = resolve_media_routing(&policy, atts);
-        let r = routing.expect("should produce routing for blob-backed voice with transcribe policy");
+        let r =
+            routing.expect("should produce routing for blob-backed voice with transcribe policy");
         assert_eq!(r.action, "transcribe");
         assert_eq!(r.capability, "voice.transcribe");
     }
@@ -3105,5 +3799,53 @@ mod tests {
         let atts = vec![blob_backed_attachment("photo")];
         let r = resolve_media_routing(&policy, atts).unwrap();
         assert!(!r.strip_tools);
+    }
+
+    #[test]
+    fn role_command_reply_text_distinguishes_active_and_materializing() {
+        assert_eq!(
+            format_role_command_reply(
+                &SlashCommand::Role {
+                    role_name: "developer".into()
+                },
+                true
+            ),
+            "Switched to role developer."
+        );
+        assert_eq!(
+            format_role_command_reply(
+                &SlashCommand::Role {
+                    role_name: "developer".into()
+                },
+                false
+            ),
+            "Switching to role developer once it finishes materializing."
+        );
+        assert_eq!(
+            format_role_command_reply(&SlashCommand::Back, true),
+            "Switched back to orchestrator."
+        );
+        assert_eq!(
+            format_role_command_reply(&SlashCommand::Back, false),
+            "Switching back to orchestrator once it finishes materializing."
+        );
+    }
+
+    #[test]
+    fn roles_report_marks_active_role() {
+        let roles = vec![
+            serde_json::json!({
+                "role_name": "orchestrator",
+                "guest_id": "agent-jane:orchestrator"
+            }),
+            serde_json::json!({
+                "role_name": "developer",
+                "guest_id": "agent-jane:developer"
+            }),
+        ];
+        let report = format_roles_report(Some("agent-jane:developer"), &roles);
+        assert!(report.contains("Active role: developer."));
+        assert!(report.contains("- orchestrator"));
+        assert!(report.contains("* developer"));
     }
 }

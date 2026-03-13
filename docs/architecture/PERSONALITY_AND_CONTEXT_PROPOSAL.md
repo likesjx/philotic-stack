@@ -1,3 +1,34 @@
+---
+title: "Philotic Personality and Context Proposal"
+doc_type: proposal
+domain: memory-context
+status: accepted-current-slice
+last_updated: 2026-03-12
+tags:
+  - personality
+  - context
+  - identity
+  - projection
+  - active-seam
+related_docs:
+  - ARCHITECTURE_STATUS.md
+  - PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md
+  - ZEROCLAW_TO_PHILOTIC_BRIDGE_PROPOSAL.md
+task_refs:
+  - docs/task.md
+proposal_id: personality-and-context
+implements: []
+implemented_by:
+  - turn-time-projection-slice
+  - imported-jane-profile-slice
+active_seams:
+  - structured-context-layers
+  - legacy-workspace-import
+source_of_truth_targets:
+  - ARCHITECTURE_STATUS.md
+  - ARCHITECTURE.md
+---
+
 # Philotic Personality and Context Proposal
 
 ## Goal
@@ -96,6 +127,12 @@ The key rule is:
 - memory context defines what is important to recall now
 - session context defines what is happening right now
 
+Role-incarnation implication:
+
+- role posture is layered on top of identity; it is not a substitute for identity
+- role addenda should be projected after base identity/user layers and before current task/session context
+- context management must preserve one canonical agent identity layer even when multiple role incarnations are active
+
 If those layers are merged carelessly, personality becomes generic, memory becomes noisy, and the session prompt becomes a sentimental landfill.
 
 ## Source, Model, Projection
@@ -187,6 +224,8 @@ It should capture:
 - visual/representation details later if needed
 
 This is the closest analogue to `IDENTITY.md`.
+
+Identity is agent-level canonical state, not role-local state. Role incarnations may add specialized stance text, but that text should not replace the underlying self-model.
 
 Identity is not the same thing as soul:
 

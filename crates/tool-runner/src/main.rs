@@ -8,6 +8,10 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 use tracing::{info, warn};
 
+fn local_node_id() -> String {
+    std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-ansible-01".to_string())
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {}
@@ -495,10 +499,11 @@ async fn main() -> Result<()> {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default()
                     .to_string();
+                let local_node_id = local_node_id();
                 let reply_to = task
                     .get("reply_to")
                     .and_then(serde_json::Value::as_str)
-                    .unwrap_or("local-ansible-01")
+                    .unwrap_or(&local_node_id)
                     .to_string();
                 let reply_role = task
                     .get("reply_role")
@@ -508,7 +513,7 @@ async fn main() -> Result<()> {
                 let final_reply_to = task
                     .get("final_reply_to")
                     .and_then(serde_json::Value::as_str)
-                    .unwrap_or("local-ansible-01")
+                    .unwrap_or(&local_node_id)
                     .to_string();
                 let final_reply_role = task
                     .get("final_reply_role")

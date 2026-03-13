@@ -4,6 +4,9 @@ pub enum SlashCommand {
     Status,
     Pause,
     Resume,
+    Role { role_name: String },
+    Roles,
+    Back,
     ToolsAdd { tool: String },
     ToolsClear,
     SkillsAdd { skill: String },
@@ -25,6 +28,9 @@ impl SlashCommand {
             Self::Status => None,
             Self::Pause => None,
             Self::Resume => None,
+            Self::Role { .. } => None,
+            Self::Roles => None,
+            Self::Back => None,
             Self::ToolsAdd { .. } => None,
             Self::ToolsClear => None,
             Self::SkillsAdd { .. } => None,
@@ -58,6 +64,11 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         ["/status", ..] => Some(SlashCommand::Status),
         ["/pause", ..] => Some(SlashCommand::Pause),
         ["/resume", ..] => Some(SlashCommand::Resume),
+        ["/role", role_name, ..] => Some(SlashCommand::Role {
+            role_name: (*role_name).to_string(),
+        }),
+        ["/roles", ..] => Some(SlashCommand::Roles),
+        ["/back", ..] => Some(SlashCommand::Back),
         ["/tools", "add", tool, ..] => Some(SlashCommand::ToolsAdd {
             tool: (*tool).to_string(),
         }),
@@ -80,7 +91,9 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         ["/approval", "status", ..] => Some(SlashCommand::ApprovalStatus),
         ["/approval", "reset", ..] => Some(SlashCommand::ApprovalReset),
         ["/tts"] => Some(SlashCommand::Tts { mode: None }),
-        ["/tts", mode, ..] => Some(SlashCommand::Tts { mode: Some((*mode).to_string()) }),
+        ["/tts", mode, ..] => Some(SlashCommand::Tts {
+            mode: Some((*mode).to_string()),
+        }),
         _ => None,
     }
 }
@@ -101,6 +114,14 @@ mod tests {
         assert_eq!(parse_slash_command("/status"), Some(SlashCommand::Status));
         assert_eq!(parse_slash_command("/pause"), Some(SlashCommand::Pause));
         assert_eq!(parse_slash_command("/resume"), Some(SlashCommand::Resume));
+        assert_eq!(
+            parse_slash_command("/role developer"),
+            Some(SlashCommand::Role {
+                role_name: "developer".into()
+            })
+        );
+        assert_eq!(parse_slash_command("/roles"), Some(SlashCommand::Roles));
+        assert_eq!(parse_slash_command("/back"), Some(SlashCommand::Back));
         assert_eq!(
             parse_slash_command("/tools add echo"),
             Some(SlashCommand::ToolsAdd {
@@ -163,10 +184,28 @@ mod tests {
             parse_slash_command("/approval reset"),
             Some(SlashCommand::ApprovalReset)
         );
-        assert_eq!(parse_slash_command("/tts"), Some(SlashCommand::Tts { mode: None }));
-        assert_eq!(parse_slash_command("/tts on"), Some(SlashCommand::Tts { mode: Some("on".into()) }));
-        assert_eq!(parse_slash_command("/tts off"), Some(SlashCommand::Tts { mode: Some("off".into()) }));
-        assert_eq!(parse_slash_command("/tts auto"), Some(SlashCommand::Tts { mode: Some("auto".into()) }));
+        assert_eq!(
+            parse_slash_command("/tts"),
+            Some(SlashCommand::Tts { mode: None })
+        );
+        assert_eq!(
+            parse_slash_command("/tts on"),
+            Some(SlashCommand::Tts {
+                mode: Some("on".into())
+            })
+        );
+        assert_eq!(
+            parse_slash_command("/tts off"),
+            Some(SlashCommand::Tts {
+                mode: Some("off".into())
+            })
+        );
+        assert_eq!(
+            parse_slash_command("/tts auto"),
+            Some(SlashCommand::Tts {
+                mode: Some("auto".into())
+            })
+        );
     }
 
     #[test]
@@ -209,6 +248,9 @@ mod tests {
         assert!(deny_bare.steering_note().is_none());
 
         let deny_steered = parse_slash_command("/deny try a different approach").unwrap();
-        assert_eq!(deny_steered.steering_note(), Some("try a different approach"));
+        assert_eq!(
+            deny_steered.steering_note(),
+            Some("try a different approach")
+        );
     }
 }

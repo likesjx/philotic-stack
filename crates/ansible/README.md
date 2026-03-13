@@ -77,6 +77,14 @@ Current inter-hotel transport split:
 
 Current startup self-tests include `--test text-roundtrip`, `--test gemini-oauth-roundtrip`, `--test telegram-roundtrip`, and `--test voice-sample`.
 
+For watched local UAT, prefer rebuilding the materialized guest binaries first and clearing old local processes/sockets. The repo now provides:
+
+- `just build-runtime`
+- `just kill-local-stack`
+- `just start-ansible-clean <hotel>`
+
+That avoids the particular comedy where tests pass on fresh libraries but the hotel is still materializing yesterday's binaries.
+
 ## Architecture Reference
 
 See [docs/architecture/ARCHITECTURE.md](../../docs/architecture/ARCHITECTURE.md).

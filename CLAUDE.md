@@ -1,33 +1,47 @@
-# CLAUDE.md
-
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## 🚀 Session Bootstrap
+
+Every session MUST begin with these three steps:
+1.  **Read [AGENTS.md](file:///Users/jaredlikes/code/philotic-stack/AGENTS.md)**: Adopt the standing protocol.
+2.  **Verify Green Status**: Run `just check` and `just test` (or the relevant smoke) to ensure the baseline is stable before editing.
+3.  **Orient and Recall**: Run `just session-start` first. It should attempt to revive the local Muninn service if it is merely down. Then use the `$muninn-memory-habit` and `$proposal-maintainer` mindset. Retrieve project context via Muninn and align your plan with the current `Disposition` of active architecture proposals and [docs/task.md](file:///Users/jaredlikes/code/philotic-stack/docs/task.md).
+
+If `just session-start` cannot recover Muninn, stop and alert the user/operator immediately. Do not continue with meaningful work until explicit approval is given to proceed without Muninn.
 
 ## Commands
 
 ```bash
-# Build
+# Build & Check
 just build                  # cargo build --workspace
-just check                  # cargo check --workspace (faster, no artifacts)
+just check                  # cargo check --workspace (faster)
 just format                 # cargo fmt --all
+just session-start          # require Muninn bootstrap before meaningful work
 
 # Test
 just test                   # cargo test --workspace
 cargo test -p <crate>       # test a single crate
-cargo test <test_name>      # run a specific test by name
 
-# Run
-just start-ansible          # build + start hotel daemon (requires mesh-config.json)
+# Run (requires mesh-config.json)
+just start-ansible          # build + start hotel daemon
 just start-gateway          # cargo run -p membrane
 just start-agent            # cargo run -p agent-core
-just start-model            # cargo run -p model-router
+just start-model            # cargo run -p model-router (Gemini/ElevenLabs)
 
 # Parallel workstreams
-just workstream-start <slug>    # create the sibling worktree and print the checklist
-just workstream-status <slug>   # show git status + changed files + hot-file overlap
-just workstream-overlap <slug>  # show only risky overlap vs origin/main
+just workstream-start <slug>    # create sibling worktree
+just workstream-status <slug>   # show git status + hot-file overlap
+just workstream-overlap <slug>  # show risky overlap vs origin/main
 ```
 
-The hotel daemon requires `mesh-config.json` in the project root — copy from `mesh-config.example.json` and fill in credentials before running.
+The hotel daemon requires `mesh-config.json` in root — copy from `mesh-config.example.json`.
+
+## Parallel Workstreams
+
+Treat a worktree as the unit of an implementation conversation. See [docs/operations/parallel-worktree-runbook.md](docs/operations/parallel-worktree-runbook.md).
+
+- One active conversation -> one sibling worktree.
+- Hot files: `ansible/src/main.rs`, `ansible/src/service/ipc.rs`, `agent-core/src/runtime.rs`, `membrane/src/main.rs`, `philotic-client/src/lib.rs`, `docs/task.md`.
 
 ## Parallel Workstreams
 
@@ -55,63 +69,43 @@ See [docs/operations/parallel-worktree-runbook.md](docs/operations/parallel-work
 
 ## Architecture
 
-The Philotic Stack is a distributed AI agent OS built in Rust. The metaphor: a **hotel** is a node that **materializes** AI **guests** (processes). All state lives in a SQLite Context Graph owned by the hotel daemon.
+The Philotic Stack is a distributed AI agent OS (Rust). Metaphor: **Hotel** (node) **materializes** AI **Guests** (processes). All state lives in a SQLite Context Graph owned by the hotel daemon.
 
-### Crate Dependency Order
+### Crate Map
 
-```
-ansible-mesh-core       (shared primitives — everything else depends on this)
-philotic-client         (guest SDK — IPC client only, no hotel internals)
-ansible                 (hotel daemon — imports both above)
-membrane / agent-core / model-router / robot-kit  (guests — import philotic-client)
-```
+- `ansible-mesh-core`: Shared primitives, storage traits, mesh types.
+- `philotic-client`: Guest SDK (IPC client).
+- `ansible`: Hotel daemon (orchestrator).
+- `membrane`: Telegram/external protocol gateway guest.
+- `agent-core`: Persona/agent cognitive loop guest.
+- `model-router`: Model provider routing guest (Gemini/ElevenLabs).
+- `tool-runner`: Seeded/inactive tool execution guest.
 
-### Communication Layers
+### Communication
 
-- **Intra-hotel (UDS):** All guest↔hotel communication uses Unix Domain Sockets at `/tmp/philotic-ansible.sock` (overridable via `PHILOTIC_HOTEL_SOCKET`). Protocol is newline-framed JSON using `IpcRequest` / `IpcResponse` from `philotic-client`.
-- **Inter-hotel (UDP):** Cross-machine communication uses `BeaconMessage` envelopes on port 8999. HMAC-PSK auth is opt-in via `PHILOTIC_ENABLE_RUST_AUTH=1`.
-- **Blob store (HTTP):** Large payloads served content-addressed over HTTP on port 9001.
+- **Intra-hotel (IPC/UDS):** Over `/tmp/philotic-ansible.sock`. Newline-framed JSON (`IpcRequest` / `IpcResponse`).
+- **Inter-hotel (Mesh/UDP):** `BeaconMessage` on port 8999 (HMAC-PSK optional).
+- **Blob store (HTTP):** Large payloads over :9001.
 
-### Storage Abstractions (`ansible-mesh-core/src/storage.rs`)
+### Storage Traits
 
-Three pluggable traits — all consumers hold `Arc<dyn XxxStorage>`:
+All consumers hold `Arc<dyn XxxStorage>`:
 
-| Trait | SQLite Impl | Backs |
-|---|---|---|
-| `EventStorage` | `SqliteEventStorage` | `mesh_events` — durable append-only event ledger |
-| `CursorStorage` | `SqliteCursorStorage` | `mesh_cursors` — per-node ACK cursors |
-| `GraphStorage` | `SqliteGraphStorage` | `node_config`, `materialized_guests`, `memory_apartments` |
+| Trait | Target |
+|---|---|
+| `GraphStorage` | `node_config`, `guests`, `apartments` |
+| `EventStorage` | `mesh_events` — append-only event ledger |
+| `CursorStorage` | `mesh_cursors` — per-node ACK cursors |
 
-To add a new backend, implement the three traits and inject at startup in `ansible/src/main.rs`.
+### Conventions
 
-### Guest Lifecycle
+- **Guest Lifecycle**: Hotel reads `materialized_guests`, `GuestManager` spawns/supervises as subprocesses. Respawn 5s.
+- **Memory Consistency**: Optimistic / Last-Writer-Wins (LWW).
+- **Diagnostics**: [docs/philotic-architecture-diagram.html](docs/philotic-architecture-diagram.html) (interactive diagram).
 
-1. `ansible` reads `materialized_guests` (where `is_active=1`) from the Context Graph on boot.
-2. `GuestManager` + `LocalProcessMaterializer` spawn each guest as an OS subprocess.
-3. A supervisor loop runs every 5s — dead guests are auto-respawned; inactive guests are reclaimed.
-4. Each guest calls `PhiloticClient::connect()` which registers over UDS; the hotel tracks the live PID.
+## Reference Docs
 
-### Key Environment Variables
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `PHILOTIC_HOTEL_SOCKET` | `/tmp/philotic-ansible.sock` | IPC socket path |
-| `PHILOTIC_MESH_PSK` | `INSECURE_DEV_DEFAULT_PSK` | UDP mesh auth key |
-| `PHILOTIC_HOTEL_PORT` | `9000` | IPC listen port |
-| `PHILOTIC_ENABLE_RUST_AUTH` | `0` | `1` = enforce HMAC on mesh |
-| `PHILOTIC_ENABLE_RUST_DISPATCHER` | `0` | `1` = start outbound UDP dispatcher |
-| `PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE` | `0` | `1` = start durable event ledger writer |
-
-### Notable Conventions
-
-- `BeaconMessage` is the UDP envelope; `MsgType` identifies payload semantics. Payload is `Vec<u8>` (JSON, MsgPack, or CBOR).
-- Memory apartment writes are **optimistic / LWW** — guests call `SyncApartment` IPC and the hotel resolves conflicts on upsert.
-- The legacy ZeroClaw reference clone has been removed from this repo. Consult the original `zeroclaw` repository separately if needed.
-- The `robot-kit` crate is a separate embedded robotics HAL concern, not part of the hotel/guest model.
-
-### Reference Docs
-
-- `docs/architecture/ARCHITECTURE.md` — full system design and data flows
-- `docs/architecture/PORT_BLUEPRINT.md` — migration plan from legacy plugin model
-- `crates/ansible/README.md` — hotel daemon service inventory
-- `crates/ansible-mesh-core/README.md` — module-by-module primitive reference
+- `docs/architecture/ARCHITECTURE.md` — system design & data flows
+- `docs/architecture/PORT_BLUEPRINT.md` — migration blueprint
+- `README.md` — status overview & diagram gallery
+- `AGENTS.md` — standing protocol for coding agents

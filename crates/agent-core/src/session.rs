@@ -1,14 +1,224 @@
 use crate::catalog::{tool_catalog, tool_class, tool_requires_approval};
 use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
+use philotic_client::{
+    HandoffBundle, SubagentCompletionContract, SubagentContextPacket, SubagentDelegation,
+};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use uuid::Uuid;
+
+fn local_node_id() -> String {
+    std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-ansible-01".to_string())
+}
+
+fn local_agent_id() -> String {
+    std::env::var("PHILOTIC_AGENT_ID").unwrap_or_else(|_| "agent-jane-01".to_string())
+}
 
 #[derive(Debug, Clone)]
 pub struct TurnRecord {
     pub turn_id: String,
     pub user_content: String,
     pub assistant_content: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextLayerId {
+    Identity,
+    Relationship,
+    Session,
+    Working,
+    Knowledge,
+}
+
+impl ContextLayerId {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Identity => "identity",
+            Self::Relationship => "relationship",
+            Self::Session => "session",
+            Self::Working => "working",
+            Self::Knowledge => "knowledge",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextAuthority {
+    Authoritative,
+    Advisory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextMutability {
+    StaticForTurn,
+    Refreshable,
+    LiveLocal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationTurnScope {
+    pub conversation_turn_id: String,
+    pub session_id: String,
+    pub agent_id: String,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_incarnation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_user_id: Option<String>,
+    pub trigger_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CognitiveStepScope {
+    pub conversation_turn_id: String,
+    pub cognitive_step_id: String,
+    pub step_kind: String,
+    pub iteration: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LayerContribution {
+    pub contribution_id: String,
+    pub layer_id: ContextLayerId,
+    pub source_id: String,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    pub authority: ContextAuthority,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_cost: Option<usize>,
+    #[serde(default)]
+    pub provenance: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LayerPayload {
+    pub layer_id: ContextLayerId,
+    pub owner: String,
+    pub authority: ContextAuthority,
+    pub mutability: ContextMutability,
+    pub rendered_content: String,
+    #[serde(default)]
+    pub source_refs: Vec<String>,
+    pub refreshable: bool,
+    pub promotion_hint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ContextBudget {
+    #[serde(default)]
+    pub included_sections: usize,
+    #[serde(default)]
+    pub trimmed_sections: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextProjection {
+    pub conversation_turn: ConversationTurnScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_step: Option<CognitiveStepScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_activation: Option<RoleActivation>,
+    pub current_user_message: String,
+    #[serde(default)]
+    pub layers: Vec<LayerPayload>,
+    #[serde(default)]
+    pub contributions: Vec<LayerContribution>,
+    #[serde(default)]
+    pub budget: ContextBudget,
+    #[serde(default)]
+    pub refresh_plan: Vec<String>,
+    #[serde(default)]
+    pub provenance_trace: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefreshRequest {
+    #[serde(default)]
+    pub layer_ids: Vec<ContextLayerId>,
+    pub reason: String,
+    pub target_checkpoint: String,
+    pub urgency: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromotionAction {
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concept: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<String>,
+    pub reason: String,
+    #[serde(default)]
+    pub source_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookRequest {
+    pub hook_name: String,
+    pub scope: String,
+    pub checkpoint: String,
+    pub conversation_turn: ConversationTurnScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cognitive_step: Option<CognitiveStepScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_projection: Option<ContextProjection>,
+    #[serde(default)]
+    pub inputs: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookResult {
+    pub status: String,
+    #[serde(default)]
+    pub updates: Value,
+    #[serde(default)]
+    pub emitted_contributions: Vec<LayerContribution>,
+    #[serde(default)]
+    pub refresh_requests: Vec<RefreshRequest>,
+    #[serde(default)]
+    pub promotion_actions: Vec<PromotionAction>,
+    #[serde(default)]
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RoleActivation {
+    pub role_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_incarnation_id: Option<String>,
+    pub activation_reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_addendum: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolset_profile_ref: Option<String>,
+    #[serde(default)]
+    pub effective_skillset: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_memory_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_projection_policy: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +242,21 @@ pub struct WorkingTurn {
     /// Stashed text content while waiting for voice synthesis to complete.
     pub pending_text_reply: Option<String>,
     pub had_voice_input: bool,
+    /// True when a voice transcription result should be routed back into the
+    /// normal reasoning loop instead of finalized as the assistant reply.
+    pub awaiting_transcription_reentry: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelReentryPlan {
+    pub task_id: Uuid,
+    pub user_content: String,
+    pub prompt: String,
+    pub chat_id: String,
+    pub final_reply_to: String,
+    pub final_reply_role: String,
+    pub final_reply_guest_id: Option<String>,
+    pub tools_for_model: Vec<ToolDefinition>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -121,6 +346,10 @@ pub struct VoiceResponsePolicy {
     /// Provider model override (e.g. "eleven_multilingual_v2").
     #[serde(default)]
     pub model: Option<String>,
+    /// Speech speed as a percentage of normal rate. `100` means provider default speed.
+    /// Lower values slow the voice down; higher values speed it up.
+    #[serde(default)]
+    pub speed_percent: Option<u16>,
     /// When mode is `On`, also deliver the text alongside the audio as a caption.
     /// Ignored for `Auto` (no caption when mirroring voice input).
     #[serde(default = "default_true")]
@@ -134,7 +363,7 @@ impl VoiceResponsePolicy {
     /// Returns true if voice synthesis should fire for this turn.
     pub fn is_active(&self, had_voice_input: bool) -> bool {
         match self.mode {
-            TtsMode::Off => false,
+            TtsMode::Off => had_voice_input,
             TtsMode::On => true,
             TtsMode::Auto => had_voice_input,
         }
@@ -157,6 +386,7 @@ impl Default for VoiceResponsePolicy {
             provider: None,
             voice_id: None,
             model: None,
+            speed_percent: None,
             send_text_caption: true,
             fallback_to_text: true,
         }
@@ -355,11 +585,20 @@ fn default_selection_mode() -> String {
     "preferred".into()
 }
 
+fn first_line_summary(text: &str) -> String {
+    text.lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| line.trim().to_string())
+        .unwrap_or_else(|| "empty".into())
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionState {
     pub session_id: String,
     pub agent_id: String,
     pub source: String,
+    pub active_incarnation_id: Option<String>,
+    pub role_activation: Option<RoleActivation>,
     pub agent_profile: AgentProfile,
     pub status: String,
     pub approval_policy: ApprovalPolicy,
@@ -377,6 +616,8 @@ impl SessionState {
             session_id,
             agent_id,
             source,
+            active_incarnation_id: None,
+            role_activation: None,
             agent_profile: AgentProfile::default(),
             status: "active".into(),
             approval_policy: ApprovalPolicy::default(),
@@ -438,6 +679,62 @@ impl SessionState {
         self.active_turn.as_mut()?.pending_text_reply.take()
     }
 
+    pub fn set_active_turn_awaiting_transcription_reentry(&mut self, awaiting: bool) {
+        if let Some(turn) = self.active_turn.as_mut() {
+            turn.awaiting_transcription_reentry = awaiting;
+        }
+    }
+
+    pub fn active_turn_awaiting_transcription_reentry(&self) -> bool {
+        self.active_turn
+            .as_ref()
+            .map(|turn| turn.awaiting_transcription_reentry)
+            .unwrap_or(false)
+    }
+
+    pub fn prepare_transcription_reentry(&mut self, transcript: &str) -> Option<ModelReentryPlan> {
+        let normalized = transcript.trim();
+        if normalized.is_empty() {
+            return None;
+        }
+
+        let (
+            task_id,
+            chat_id,
+            final_reply_to,
+            final_reply_role,
+            final_reply_guest_id,
+            user_content,
+        ) = {
+            let active_turn = self.active_turn.as_mut()?;
+            active_turn.user_content = normalized.to_string();
+            active_turn.iteration += 1;
+            active_turn.phase = TurnPhase::WaitingModel;
+            active_turn.awaiting_transcription_reentry = false;
+            (
+                active_turn.task_id,
+                active_turn.chat_id.clone(),
+                active_turn.final_reply_to.clone(),
+                active_turn.final_reply_role.clone(),
+                active_turn.final_reply_guest_id.clone(),
+                active_turn.user_content.clone(),
+            )
+        };
+
+        let tools_for_model = self.project_tools_for_turn(&user_content);
+        let prompt = self.build_prompt_with_tools(&user_content, &tools_for_model);
+        Some(ModelReentryPlan {
+            task_id,
+            user_content,
+            prompt,
+            chat_id,
+            final_reply_to,
+            final_reply_role,
+            final_reply_guest_id,
+            tools_for_model,
+        })
+    }
+
     pub fn complete_active_turn(&mut self, assistant_content: String) -> Option<WorkingTurn> {
         let turn = self.active_turn.take()?;
         self.recent_turns.push(TurnRecord {
@@ -462,16 +759,29 @@ impl SessionState {
     /// Pass `tool` as the pending `ToolCall` so class-based approval can be evaluated.
     /// When `tool` is `None` (e.g. a free-form model approval request with no associated
     /// tool), only `auto_approve_all` is checked.
-    pub fn approval_policy_allows(&self, _approval: &ApprovalRequest, tool: Option<&ToolCall>) -> bool {
+    pub fn approval_policy_allows(
+        &self,
+        _approval: &ApprovalRequest,
+        tool: Option<&ToolCall>,
+    ) -> bool {
         if self.approval_policy.auto_approve_all {
             return true;
         }
         if let Some(tool) = tool {
-            if self.approval_policy.preapproved_tools.contains(&tool.tool_name) {
+            if self
+                .approval_policy
+                .preapproved_tools
+                .contains(&tool.tool_name)
+            {
                 return true;
             }
             if let Some(class) = tool_class(&tool.tool_name) {
-                if self.approval_policy.preapproved_classes.iter().any(|c| c == class) {
+                if self
+                    .approval_policy
+                    .preapproved_classes
+                    .iter()
+                    .any(|c| c == class)
+                {
                     return true;
                 }
             }
@@ -511,8 +821,12 @@ impl SessionState {
                     .as_str()
                     .ok_or("approval_policy.preapproved_tools requires a string value")?
                     .to_string();
-                apply_string_list_op(&mut self.approval_policy.preapproved_tools, &item, operation)
-                    .map(|_| format!("{operation} '{item}' in approval_policy.preapproved_tools."))
+                apply_string_list_op(
+                    &mut self.approval_policy.preapproved_tools,
+                    &item,
+                    operation,
+                )
+                .map(|_| format!("{operation} '{item}' in approval_policy.preapproved_tools."))
             }
             "approval_policy.preapproved_classes" => {
                 let item = value
@@ -524,9 +838,7 @@ impl SessionState {
                     &item,
                     operation,
                 )
-                .map(|_| {
-                    format!("{operation} '{item}' in approval_policy.preapproved_classes.")
-                })
+                .map(|_| format!("{operation} '{item}' in approval_policy.preapproved_classes."))
             }
             // ── Agent profile ────────────────────────────────────────────────────
             "profile.persona_name" => {
@@ -591,11 +903,13 @@ impl SessionState {
                 apply_string_list_op(&mut self.bindings.effective_skillset, &item, operation)
                     .map(|_| format!("{operation} '{item}' in bindings.effective_skillset."))
             }
-            other => Err(format!("Unknown config path: '{other}'. Supported paths: \
+            other => Err(format!(
+                "Unknown config path: '{other}'. Supported paths: \
                 approval_policy.auto_approve_all, approval_policy.preapproved_tools, \
                 approval_policy.preapproved_classes, profile.persona_name, profile.soul_text, \
                 profile.identity_text, profile.user_context_text, profile.memory_summary, \
-                bindings.effective_toolset, bindings.effective_skillset")),
+                bindings.effective_toolset, bindings.effective_skillset"
+            )),
         }
     }
 
@@ -931,19 +1245,263 @@ impl SessionState {
         user_content: &str,
         projected_tools: &[ToolDefinition],
     ) -> String {
+        let projection = self.build_context_projection_with_tools(user_content, projected_tools);
+        self.render_prompt_from_projection(&projection)
+    }
+
+    pub fn build_context_projection(&self, user_content: &str) -> ContextProjection {
+        let projected_tools = self.project_tools_for_turn(user_content);
+        self.build_context_projection_with_tools(user_content, &projected_tools)
+    }
+
+    pub fn build_context_projection_with_tools(
+        &self,
+        user_content: &str,
+        projected_tools: &[ToolDefinition],
+    ) -> ContextProjection {
+        let turn_id = self
+            .active_turn
+            .as_ref()
+            .map(|turn| turn.turn_id.clone())
+            .unwrap_or_else(|| format!("conversation-turn:{}", self.session_id));
+        let active_step = self.active_turn.as_ref().map(|turn| CognitiveStepScope {
+            conversation_turn_id: turn.turn_id.clone(),
+            cognitive_step_id: format!("{}:{}", turn.turn_id, turn.phase.as_str()),
+            step_kind: turn.phase.as_str().to_string(),
+            iteration: turn.iteration,
+            checkpoint: Some("cognitive_step.context_build".into()),
+            started_at: None,
+        });
+
+        let identity = self.project_agent_self();
+        let relationship = self.project_user(user_content);
+        let knowledge = self.project_knowledge(user_content, projected_tools);
+        let working = self.project_working_state();
+        let session = self.project_session_context(projected_tools);
+
+        let mut layers = Vec::new();
+        let mut contributions = Vec::new();
+
+        self.push_layer(
+            &mut layers,
+            &mut contributions,
+            ContextLayerId::Identity,
+            "graph:agent_profile",
+            ContextAuthority::Authoritative,
+            ContextMutability::StaticForTurn,
+            identity,
+            vec![
+                "agent_profile.identity_text".into(),
+                "agent_profile.soul_text".into(),
+            ],
+            "graph_candidate",
+        );
+        self.push_layer(
+            &mut layers,
+            &mut contributions,
+            ContextLayerId::Relationship,
+            "graph+memory:relationship_projection",
+            ContextAuthority::Advisory,
+            ContextMutability::Refreshable,
+            relationship,
+            vec![
+                "agent_profile.user_context_text".into(),
+                "recent_turns".into(),
+            ],
+            "memory_candidate",
+        );
+        self.push_layer(
+            &mut layers,
+            &mut contributions,
+            ContextLayerId::Session,
+            "graph:session_snapshot",
+            ContextAuthority::Authoritative,
+            ContextMutability::Refreshable,
+            session,
+            vec!["approval_policy".into(), "bindings".into(), "status".into()],
+            "graph_candidate",
+        );
+        self.push_layer(
+            &mut layers,
+            &mut contributions,
+            ContextLayerId::Working,
+            "agent_core:working_turn",
+            ContextAuthority::Authoritative,
+            ContextMutability::LiveLocal,
+            working,
+            vec!["active_turn".into(), "working_tool_history".into()],
+            "checkpoint_only",
+        );
+        self.push_layer(
+            &mut layers,
+            &mut contributions,
+            ContextLayerId::Knowledge,
+            "memory+session:knowledge_projection",
+            ContextAuthority::Advisory,
+            ContextMutability::Refreshable,
+            knowledge,
+            vec!["recent_turns".into(), "agent_profile.memory_summary".into()],
+            "memory_candidate",
+        );
+
+        ContextProjection {
+            conversation_turn: ConversationTurnScope {
+                conversation_turn_id: turn_id,
+                session_id: self.session_id.clone(),
+                agent_id: self.agent_id.clone(),
+                source: self.source.clone(),
+                active_incarnation_id: self.active_incarnation_id.clone(),
+                primary_user_id: None,
+                trigger_kind: "user_message".into(),
+                started_at: None,
+            },
+            active_step,
+            role_activation: self.role_activation.clone(),
+            current_user_message: user_content.to_string(),
+            budget: ContextBudget {
+                included_sections: layers.len(),
+                trimmed_sections: 0,
+            },
+            refresh_plan: vec![
+                "checkpoint.before_model".into(),
+                "checkpoint.after_model".into(),
+                "checkpoint.after_tool".into(),
+                "checkpoint.before_reply".into(),
+            ],
+            provenance_trace: contributions
+                .iter()
+                .map(|item| format!("{}<= {}", item.layer_id.as_str(), item.source_id))
+                .collect(),
+            layers,
+            contributions,
+        }
+    }
+
+    fn render_prompt_from_projection(&self, projection: &ContextProjection) -> String {
         let mut prompt = String::new();
-        prompt.push_str("\n[Agent self projection]\n");
-        prompt.push_str(&self.project_agent_self());
-
-        prompt.push_str("\n\n[User projection]\n");
-        prompt.push_str(&self.project_user(user_content));
-
-        prompt.push_str("\n\n[Knowledge projection]\n");
-        prompt.push_str(&self.project_knowledge(user_content, projected_tools));
-
+        for layer in &projection.layers {
+            let title = match layer.layer_id {
+                ContextLayerId::Identity => "Agent self projection",
+                ContextLayerId::Relationship => "User projection",
+                ContextLayerId::Session => "Session projection",
+                ContextLayerId::Working => "Working projection",
+                ContextLayerId::Knowledge => "Knowledge projection",
+            };
+            prompt.push_str(&format!("\n[{title}]\n"));
+            prompt.push_str(&layer.rendered_content);
+            prompt.push('\n');
+        }
         prompt.push_str("\n[Current user message]\n");
-        prompt.push_str(user_content);
+        prompt.push_str(&projection.current_user_message);
         prompt
+    }
+
+    pub fn model_context_from_projection(&self, projection: &ContextProjection) -> Value {
+        let identity = projection
+            .layers
+            .iter()
+            .filter(|layer| layer.layer_id == ContextLayerId::Identity)
+            .map(|layer| projection_item(&layer.rendered_content, &layer.owner, "identity"))
+            .collect::<Vec<_>>();
+        let instructions = projection
+            .layers
+            .iter()
+            .filter(|layer| {
+                matches!(
+                    layer.layer_id,
+                    ContextLayerId::Session | ContextLayerId::Working
+                )
+            })
+            .map(|layer| {
+                let kind = match layer.layer_id {
+                    ContextLayerId::Session => "session",
+                    ContextLayerId::Working => "working",
+                    _ => "instruction",
+                };
+                projection_item(&layer.rendered_content, &layer.owner, kind)
+            })
+            .collect::<Vec<_>>();
+        let memory = projection
+            .layers
+            .iter()
+            .filter(|layer| {
+                matches!(
+                    layer.layer_id,
+                    ContextLayerId::Relationship | ContextLayerId::Knowledge
+                )
+            })
+            .map(|layer| {
+                let kind = match layer.layer_id {
+                    ContextLayerId::Relationship => "relationship",
+                    ContextLayerId::Knowledge => "knowledge",
+                    _ => "memory",
+                };
+                projection_item(&layer.rendered_content, &layer.owner, kind)
+            })
+            .collect::<Vec<_>>();
+
+        let mut dialogue_window = Vec::new();
+        for turn in &self.recent_turns {
+            dialogue_window.push(json!({
+                "role": "user",
+                "text": turn.user_content,
+            }));
+            if let Some(reply) = turn.assistant_content.as_deref() {
+                dialogue_window.push(json!({
+                    "role": "assistant",
+                    "text": reply,
+                }));
+            }
+        }
+
+        json!({
+            "instructions": instructions,
+            "identity": identity,
+            "memory": memory,
+            "dialogue_window": dialogue_window,
+            "active_turn": {
+                "role": "user",
+                "text": projection.current_user_message,
+            },
+        })
+    }
+
+    fn push_layer(
+        &self,
+        layers: &mut Vec<LayerPayload>,
+        contributions: &mut Vec<LayerContribution>,
+        layer_id: ContextLayerId,
+        source_id: &str,
+        authority: ContextAuthority,
+        mutability: ContextMutability,
+        rendered_content: String,
+        source_refs: Vec<String>,
+        promotion_hint: &str,
+    ) {
+        let contribution_id = format!("{}:{}", layer_id.as_str(), contributions.len() + 1);
+        contributions.push(LayerContribution {
+            contribution_id,
+            layer_id: layer_id.clone(),
+            source_id: source_id.to_string(),
+            summary: Some(first_line_summary(&rendered_content)),
+            content: rendered_content.clone(),
+            authority: authority.clone(),
+            confidence: None,
+            freshness: None,
+            budget_cost: Some(rendered_content.len()),
+            provenance: source_refs.clone(),
+            expires_at: None,
+        });
+        layers.push(LayerPayload {
+            layer_id,
+            owner: source_id.to_string(),
+            authority,
+            mutability: mutability.clone(),
+            refreshable: !matches!(mutability, ContextMutability::StaticForTurn),
+            rendered_content,
+            source_refs,
+            promotion_hint: promotion_hint.into(),
+        });
     }
 
     pub fn project_agent_self(&self) -> String {
@@ -981,6 +1539,21 @@ impl SessionState {
                 "Current skill posture: {}.",
                 self.bindings.effective_skillset.join(", ")
             ));
+        }
+
+        if let Some(role_activation) = self.role_activation.as_ref() {
+            lines.push(format!(
+                "Active role posture: {}.",
+                role_activation.role_name
+            ));
+            if let Some(role_addendum) = role_activation
+                .role_addendum
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+            {
+                lines.push(format!("Role addendum: {role_addendum}"));
+            }
         }
 
         lines.join("\n")
@@ -1029,7 +1602,7 @@ impl SessionState {
     pub fn project_knowledge(
         &self,
         _user_content: &str,
-        projected_tools: &[ToolDefinition],
+        _projected_tools: &[ToolDefinition],
     ) -> String {
         let mut sections = Vec::new();
 
@@ -1071,9 +1644,59 @@ impl SessionState {
             );
         }
         sections.push(policy.trim_end().to_string());
+        if !self.summary_text().is_empty() {
+            sections.push(format!("[Recent summary]\n{}.", self.summary_text()));
+        }
 
+        if let Some(memory_summary) = self
+            .agent_profile
+            .memory_summary
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            sections.push(format!("[Memory seed]\n{memory_summary}"));
+        }
+
+        sections.join("\n\n")
+    }
+
+    fn project_session_context(&self, projected_tools: &[ToolDefinition]) -> String {
         let mut envelope = String::from("[Session envelope]\n");
         envelope.push_str(&format!("Session status: {}.\n", self.status));
+        if let Some(active_incarnation_id) = self.active_incarnation_id.as_deref() {
+            envelope.push_str(&format!("Active incarnation: {}.\n", active_incarnation_id));
+        }
+        if let Some(role_activation) = self.role_activation.as_ref() {
+            envelope.push_str(&format!("Active role: {}.\n", role_activation.role_name));
+            envelope.push_str(&format!(
+                "Role activation reason: {}.\n",
+                role_activation.activation_reason
+            ));
+            if let Some(toolset_profile_ref) = role_activation.toolset_profile_ref.as_deref() {
+                envelope.push_str(&format!("Role toolset profile: {}.\n", toolset_profile_ref));
+            }
+            if !role_activation.effective_skillset.is_empty() {
+                envelope.push_str(&format!(
+                    "Role skillset posture: {}.\n",
+                    role_activation.effective_skillset.join(", ")
+                ));
+            }
+            if let Some(working_memory_policy) = role_activation.working_memory_policy.as_deref() {
+                envelope.push_str(&format!(
+                    "Role working-memory policy: {}.\n",
+                    working_memory_policy
+                ));
+            }
+            if let Some(memory_projection_policy) =
+                role_activation.memory_projection_policy.as_deref()
+            {
+                envelope.push_str(&format!(
+                    "Role memory projection policy: {}.\n",
+                    memory_projection_policy
+                ));
+            }
+        }
         if !self.bindings.effective_toolset.is_empty() {
             envelope.push_str(&format!(
                 "Effective tools: {}.\n",
@@ -1109,19 +1732,178 @@ impl SessionState {
         if !self.summary_text().is_empty() {
             envelope.push_str(&format!("Recent summary: {}.\n", self.summary_text()));
         }
-        sections.push(envelope.trim_end().to_string());
+        envelope.trim_end().to_string()
+    }
 
-        if let Some(memory_summary) = self
-            .agent_profile
-            .memory_summary
-            .as_deref()
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-        {
-            sections.push(format!("[Memory seed]\n{memory_summary}"));
+    fn project_working_state(&self) -> String {
+        let Some(turn) = self.active_turn.as_ref() else {
+            return "No active local working state is currently pinned.".into();
+        };
+
+        let mut lines = vec![
+            format!("Active conversation turn: {}.", turn.turn_id),
+            format!("Current phase: {}.", turn.phase.as_str()),
+            format!("Cognitive step iteration: {}.", turn.iteration),
+        ];
+
+        if !turn.working_tool_history.is_empty() {
+            lines.push(format!(
+                "Tool history entries in local working state: {}.",
+                turn.working_tool_history.len()
+            ));
+        }
+        if turn.pending_tool_call.is_some() {
+            lines.push("A tool call is pending.".into());
+        }
+        if turn.pending_approval.is_some() {
+            lines.push("An approval request is pending.".into());
         }
 
-        sections.join("\n\n")
+        lines.join("\n")
+    }
+
+    pub fn build_same_identity_handoff_bundle(
+        &self,
+        target_role: &str,
+        initiating_turn_id: &str,
+        handoff_reason: &str,
+        return_to: Option<String>,
+    ) -> HandoffBundle {
+        let active_goal = self
+            .active_turn
+            .as_ref()
+            .map(|turn| turn.user_content.clone())
+            .filter(|text| !text.trim().is_empty())
+            .or_else(|| {
+                let summary = self.summary_text();
+                (!summary.is_empty()).then_some(summary)
+            });
+        let working_summary = self.active_turn.as_ref().map(|turn| {
+            format!(
+                "phase={}, iteration={}, pending_tool={}, pending_approval={}",
+                turn.phase.as_str(),
+                turn.iteration,
+                turn.pending_tool_call.is_some(),
+                turn.pending_approval.is_some()
+            )
+        });
+
+        let mut relevant_session_facts = vec![format!("session_status={}", self.status)];
+        if let Some(active_incarnation_id) = self.active_incarnation_id.as_deref() {
+            relevant_session_facts.push(format!("active_incarnation_id={active_incarnation_id}"));
+        }
+        if let Some(workspace) = self.bindings.effective_workspace_ref.as_deref() {
+            relevant_session_facts.push(format!("workspace={workspace}"));
+        }
+        if self.approval_policy.auto_approve_all {
+            relevant_session_facts.push("approval=preapproved".into());
+        }
+
+        HandoffBundle {
+            goal: format!("Switch active role to {target_role} for this session."),
+            context_excerpt: format!(
+                "Same-identity role handoff requested. Current summary: {}",
+                self.summary_text()
+            ),
+            session_id: self.session_id.clone(),
+            initiating_turn_id: initiating_turn_id.to_string(),
+            return_to,
+            handoff_reason: Some(handoff_reason.to_string()),
+            active_goal,
+            active_constraints: vec![
+                format!("transport_source={}", self.source),
+                "same_identity_role_handoff".into(),
+            ],
+            relevant_session_facts,
+            working_summary,
+            suggested_memory_refs: Vec::new(),
+            expected_return_mode: Some("stay_active_until_manual_return".into()),
+            cleanup_actions: vec![
+                "persist_role_local_working_state".into(),
+                "switch_active_role".into(),
+            ],
+        }
+    }
+
+    pub fn build_subagent_delegation(
+        &self,
+        goal: &str,
+        subagent_kind: &str,
+        allowed_tools: Vec<String>,
+        allowed_skills: Vec<String>,
+    ) -> SubagentDelegation {
+        let parent_role = self
+            .role_activation
+            .as_ref()
+            .map(|activation| activation.role_name.clone())
+            .unwrap_or_else(|| "orchestrator".to_string());
+        let summary = self
+            .active_turn
+            .as_ref()
+            .map(|turn| {
+                format!(
+                    "Delegated from session turn {} while parent is handling: {}",
+                    turn.turn_id, turn.user_content
+                )
+            })
+            .unwrap_or_else(|| "Delegated from current session state.".to_string());
+
+        let mut session_facts = vec![format!("session_status={}", self.status)];
+        if let Some(active_incarnation_id) = self.active_incarnation_id.as_deref() {
+            session_facts.push(format!("active_incarnation_id={active_incarnation_id}"));
+        }
+        if let Some(workspace) = self.bindings.effective_workspace_ref.as_deref() {
+            session_facts.push(format!("workspace={workspace}"));
+        }
+
+        let mut constraints = vec![
+            "subagent_lightweight_default".to_string(),
+            "no_membrane_ownership".to_string(),
+        ];
+        if self.approval_policy.auto_approve_all {
+            constraints.push("parent_session_preapproved".to_string());
+        }
+        if self.role_activation.is_some() {
+            constraints.push("delegated_from_active_role".to_string());
+        }
+
+        SubagentDelegation {
+            parent_agent_id: self.agent_id.clone(),
+            parent_role,
+            subagent_kind: subagent_kind.to_string(),
+            goal: goal.to_string(),
+            context_packet: SubagentContextPacket {
+                summary,
+                session_facts,
+                constraints,
+                memory_refs: Vec::new(),
+            },
+            allowed_tools,
+            allowed_skills,
+            memory_allowance: Some("none_by_default".into()),
+            writeback_allowance: Some("summary_only_parent_mediated".into()),
+            iteration_budget: Some(6),
+            ttl_seconds: Some(900),
+            completion_contract: SubagentCompletionContract {
+                summary_required: true,
+                artifact_refs_expected: false,
+                failure_summary_required: true,
+                requires_parent_ack: true,
+            },
+        }
+    }
+
+    pub fn model_request_payloads(
+        &self,
+        user_content: &str,
+        projected_tools: &[ToolDefinition],
+    ) -> (String, Value, Value) {
+        let projection = self.build_context_projection_with_tools(user_content, projected_tools);
+        let prompt = self.render_prompt_from_projection(&projection);
+        let context = self.model_context_from_projection(&projection);
+        let context_projection =
+            serde_json::to_value(&projection).expect("context projection should serialize");
+        (prompt, context, context_projection)
     }
 
     pub fn checkpoint_json(&self) -> serde_json::Value {
@@ -1141,6 +1923,9 @@ impl SessionState {
                 "working_tool_history": turn.working_tool_history.iter().map(|(call, result)| {
                     json!({ "call": call, "result": result })
                 }).collect::<Vec<_>>(),
+                "pending_text_reply": turn.pending_text_reply,
+                "had_voice_input": turn.had_voice_input,
+                "awaiting_transcription_reentry": turn.awaiting_transcription_reentry,
             })
         });
 
@@ -1148,6 +1933,8 @@ impl SessionState {
             "session_id": self.session_id,
             "agent_id": self.agent_id,
             "source": self.source,
+            "active_incarnation_id": self.active_incarnation_id,
+            "role_activation": self.role_activation,
             "agent_profile": self.agent_profile,
             "status": self.status,
             "approval_policy": self.approval_policy,
@@ -1194,16 +1981,25 @@ impl SessionState {
 
     pub fn from_checkpoint(checkpoint: &serde_json::Value) -> Option<Self> {
         let session_id = checkpoint.get("session_id")?.as_str()?.to_string();
+        let local_agent_id = local_agent_id();
         let agent_id = checkpoint
             .get("agent_id")
             .and_then(serde_json::Value::as_str)
-            .unwrap_or("agent-jane-01")
+            .unwrap_or(local_agent_id.as_str())
             .to_string();
         let source = checkpoint
             .get("source")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("unknown")
             .to_string();
+        let active_incarnation_id = checkpoint
+            .get("active_incarnation_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let role_activation = checkpoint
+            .get("role_activation")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<RoleActivation>(value).ok());
         let agent_profile = checkpoint
             .get("agent_profile")
             .cloned()
@@ -1259,6 +2055,7 @@ impl SessionState {
             if turn.is_null() {
                 return None;
             }
+            let local_node_id = local_node_id();
 
             let task_id = turn
                 .get("task_id")
@@ -1282,7 +2079,7 @@ impl SessionState {
                 final_reply_to: turn
                     .get("final_reply_to")
                     .and_then(serde_json::Value::as_str)
-                    .unwrap_or("local-ansible-01")
+                    .unwrap_or(local_node_id.as_str())
                     .to_string(),
                 final_reply_role: turn
                     .get("final_reply_role")
@@ -1317,10 +2114,9 @@ impl SessionState {
                         entries
                             .iter()
                             .filter_map(|entry| {
-                                let call = serde_json::from_value::<ToolCall>(
-                                    entry.get("call")?.clone(),
-                                )
-                                .ok()?;
+                                let call =
+                                    serde_json::from_value::<ToolCall>(entry.get("call")?.clone())
+                                        .ok()?;
                                 let result = serde_json::from_value::<ToolResult>(
                                     entry.get("result")?.clone(),
                                 )
@@ -1330,8 +2126,18 @@ impl SessionState {
                             .collect()
                     })
                     .unwrap_or_default(),
-                pending_text_reply: None,
-                had_voice_input: false,
+                pending_text_reply: turn
+                    .get("pending_text_reply")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                had_voice_input: turn
+                    .get("had_voice_input")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                awaiting_transcription_reentry: turn
+                    .get("awaiting_transcription_reentry")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
             })
         });
 
@@ -1339,6 +2145,8 @@ impl SessionState {
             session_id,
             agent_id,
             source,
+            active_incarnation_id,
+            role_activation,
             agent_profile,
             status,
             approval_policy,
@@ -1432,15 +2240,19 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
     let tools_for_model = toolset
         .iter()
         .map(|tool_name| {
-            catalog.get(tool_name.as_str()).cloned().unwrap_or_else(|| ToolDefinition {
-                tool_name: tool_name.clone(),
-                description: format!("Execute the {} tool.", tool_name),
-                input_schema: json!({ "type": "object" }),
-                class: None,
-            })
+            catalog
+                .get(tool_name.as_str())
+                .cloned()
+                .unwrap_or_else(|| ToolDefinition {
+                    tool_name: tool_name.clone(),
+                    description: format!("Execute the {} tool.", tool_name),
+                    input_schema: json!({ "type": "object" }),
+                    class: None,
+                })
         })
         .collect::<Vec<_>>();
 
+    let local_node_id = local_node_id();
     let execution_routes = toolset
         .iter()
         .map(|tool_name| {
@@ -1454,11 +2266,7 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
             (
                 tool_name.clone(),
                 ToolExecutionRoute {
-                    target_node: if execution_mode == "local_agent" {
-                        "agent-jane-01".into()
-                    } else {
-                        "local-ansible-01".into()
-                    },
+                    target_node: local_node_id.clone(),
                     target_role: if execution_mode == "local_agent" {
                         "agent".into()
                     } else {
@@ -1473,7 +2281,7 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
                     hotel_id: if execution_mode == "local_agent" {
                         None
                     } else {
-                        Some("local-ansible-01".into())
+                        Some(local_node_id.clone())
                     },
                     environment_id: None,
                     task_runner_kind: task_runner_kind_for_tool(tool_name),
@@ -1595,12 +2403,15 @@ fn tool_assembly_from_allowed_incarnations(bindings: &SessionBindings) -> ToolAs
     let tools_for_model = visible_tools
         .iter()
         .map(|tool_name| {
-            catalog.get(tool_name.as_str()).cloned().unwrap_or_else(|| ToolDefinition {
-                tool_name: tool_name.clone(),
-                description: format!("Execute the {} tool.", tool_name),
-                input_schema: json!({ "type": "object" }),
-                class: None,
-            })
+            catalog
+                .get(tool_name.as_str())
+                .cloned()
+                .unwrap_or_else(|| ToolDefinition {
+                    tool_name: tool_name.clone(),
+                    description: format!("Execute the {} tool.", tool_name),
+                    input_schema: json!({ "type": "object" }),
+                    class: None,
+                })
         })
         .collect::<Vec<_>>();
 
@@ -1655,7 +2466,7 @@ fn select_incarnation_route(
             .target_node
             .clone()
             .or_else(|| selected.hotel_id.clone())
-            .unwrap_or_else(|| "local-ansible-01".into()),
+            .unwrap_or_else(local_node_id),
         target_role: selected
             .target_role
             .clone()
@@ -1688,8 +2499,9 @@ fn compare_incarnation_bindings(
             right_live.cmp(&left_live)
         })
         .then_with(|| {
-            let left_local = left.hotel_id.as_deref() == Some("local-ansible-01");
-            let right_local = right.hotel_id.as_deref() == Some("local-ansible-01");
+            let local_node_id = local_node_id();
+            let left_local = left.hotel_id.as_deref() == Some(local_node_id.as_str());
+            let right_local = right.hotel_id.as_deref() == Some(local_node_id.as_str());
             right_local.cmp(&left_local)
         })
         .then_with(|| left.incarnation_id.cmp(&right.incarnation_id))
@@ -1736,14 +2548,15 @@ fn selection_reason_for_binding(
         format!("preferred_environment_{suffix}")
     } else if bindings.preferred_hotel_id.as_deref() == binding.hotel_id.as_deref() {
         format!("preferred_hotel_{suffix}")
-    } else if binding.availability_state == "live"
-        && binding.hotel_id.as_deref() == Some("local-ansible-01")
-    {
-        "live_local_fallback".into()
-    } else if binding.availability_state == "live" {
-        "live_allowed_incarnation".into()
     } else {
-        "allowed_incarnation_requires_materialization".into()
+        let local_node_id = local_node_id();
+        if binding.hotel_id.as_deref() == Some(local_node_id.as_str()) {
+            "live_local_fallback".into()
+        } else if binding.availability_state == "live" {
+            "live_allowed_incarnation".into()
+        } else {
+            "allowed_incarnation_requires_materialization".into()
+        }
     };
 
     let used_preference = binding_preference_rank(bindings, binding) > 0;
@@ -1752,6 +2565,14 @@ fn selection_reason_for_binding(
     } else {
         binding.selection_hint.clone().unwrap_or(computed)
     }
+}
+
+fn projection_item(text: &str, source_ref: &str, projection_kind: &str) -> Value {
+    json!({
+        "text": text,
+        "source_ref": source_ref,
+        "projection_kind": projection_kind,
+    })
 }
 
 fn current_unix_ts() -> u64 {
@@ -1775,21 +2596,26 @@ fn apply_string_list_op(list: &mut Vec<String>, item: &str, operation: &str) -> 
         "remove" => {
             list.retain(|x| x != item);
         }
-        other => return Err(format!("Unknown operation '{other}'. Use 'set', 'append', or 'remove'.")),
+        other => {
+            return Err(format!(
+                "Unknown operation '{other}'. Use 'set', 'append', or 'remove'."
+            ));
+        }
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
     use super::{
         ApprovalPolicy, ComponentExecutionRoute, ComponentRouteAssembly, ComponentRouteBinding,
-        SessionBindings, SessionState, TaskRunnerBaseConfig, ToolRunnerIncarnationBinding,
-        TransportReplyTargetBinding, WorkingTurn, default_tool_assembly_for_bindings,
-        merge_session_index,
+        ContextAuthority, ContextLayerId, ContextMutability, HookRequest, HookResult,
+        PromotionAction, RefreshRequest, RoleActivation, SessionBindings, SessionState,
+        TaskRunnerBaseConfig, ToolRunnerIncarnationBinding, TransportReplyTargetBinding, TtsMode,
+        VoiceResponsePolicy, WorkingTurn, default_tool_assembly_for_bindings, merge_session_index,
         session_checkpoint_memory_type,
     };
+    use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
     use uuid::Uuid;
 
     #[test]
@@ -1809,8 +2635,9 @@ mod tests {
             pending_tool_call: None,
             pending_approval: None,
             working_tool_history: Vec::new(),
-            pending_text_reply: None,
-            had_voice_input: false,
+            pending_text_reply: Some("hello back".into()),
+            had_voice_input: true,
+            awaiting_transcription_reentry: true,
         });
 
         let checkpoint = state.checkpoint_json();
@@ -1818,11 +2645,38 @@ mod tests {
         assert_eq!(checkpoint["active_turn"]["turn_id"], "turn-1");
         assert_eq!(checkpoint["active_turn"]["phase"], "queued");
         assert_eq!(
+            checkpoint["active_turn"]["pending_text_reply"],
+            "hello back"
+        );
+        assert_eq!(checkpoint["active_turn"]["had_voice_input"], true);
+        assert_eq!(
+            checkpoint["active_turn"]["awaiting_transcription_reentry"],
+            true
+        );
+        assert_eq!(
             checkpoint["active_turn"]["final_reply_guest_id"],
             "membrane-telegram-01"
         );
         assert!(checkpoint["component_route_assembly"].is_object());
         assert!(checkpoint["tool_assembly"].is_object());
+    }
+
+    #[test]
+    fn tts_off_still_mirrors_voice_input_without_caption() {
+        let policy = VoiceResponsePolicy {
+            mode: TtsMode::Off,
+            ..Default::default()
+        };
+
+        assert!(!policy.is_active(false), "plain text should stay text-only");
+        assert!(
+            policy.is_active(true),
+            "voice input should still get a voice reply"
+        );
+        assert!(
+            !policy.caption_enabled(),
+            "off mode should not attach text captions"
+        );
     }
 
     #[test]
@@ -1877,6 +2731,7 @@ mod tests {
             working_tool_history: Vec::new(),
             pending_text_reply: None,
             had_voice_input: false,
+            awaiting_transcription_reentry: false,
         });
 
         state.complete_active_turn("hi".into());
@@ -1891,6 +2746,18 @@ mod tests {
             "session_id": "sess-1",
             "agent_id": "agent-jane-01",
             "source": "telegram",
+            "active_incarnation_id": "agent-jane:developer",
+            "role_activation": {
+                "role_name": "developer",
+                "active_incarnation_id": "agent-jane:developer",
+                "activation_reason": "session_active_incarnation",
+                "requested_by": "hotel_runtime",
+                "role_addendum": "Focus on implementation and code changes.",
+                "toolset_profile_ref": "codex",
+                "effective_skillset": ["planning"],
+                "working_memory_policy": "role_local",
+                "memory_projection_policy": "shared_identity_role_scoped"
+            },
             "status": "paused",
             "approval_policy": {
                 "auto_approve_all": true
@@ -1935,6 +2802,24 @@ mod tests {
         let state = SessionState::from_checkpoint(&checkpoint).expect("rehydrate state");
         assert_eq!(state.session_id, "sess-1");
         assert_eq!(state.status, "paused");
+        assert_eq!(
+            state.active_incarnation_id.as_deref(),
+            Some("agent-jane:developer")
+        );
+        assert_eq!(
+            state
+                .role_activation
+                .as_ref()
+                .map(|role| role.role_name.as_str()),
+            Some("developer")
+        );
+        assert_eq!(
+            state
+                .role_activation
+                .as_ref()
+                .and_then(|role| role.toolset_profile_ref.as_deref()),
+            Some("codex")
+        );
         assert_eq!(
             state.approval_policy,
             ApprovalPolicy {
@@ -2006,11 +2891,14 @@ mod tests {
             preapproved_classes: Vec::new(),
         };
 
-        assert!(state.approval_policy_allows(&ApprovalRequest {
-            approval_id: Some("appr-2".into()),
-            reason: "deploy the thing".into(),
-            approved_response: "Approved: deploy the thing".into(),
-        }, None));
+        assert!(state.approval_policy_allows(
+            &ApprovalRequest {
+                approval_id: Some("appr-2".into()),
+                reason: "deploy the thing".into(),
+                approved_response: "Approved: deploy the thing".into(),
+            },
+            None
+        ));
     }
 
     #[test]
@@ -2027,8 +2915,14 @@ mod tests {
             reason: "use echo".into(),
             approved_response: "ok".into(),
         };
-        let echo_call = ToolCall { tool_name: "echo".into(), arguments: serde_json::json!({}) };
-        let other_call = ToolCall { tool_name: "workspace.read".into(), arguments: serde_json::json!({}) };
+        let echo_call = ToolCall {
+            tool_name: "echo".into(),
+            arguments: serde_json::json!({}),
+        };
+        let other_call = ToolCall {
+            tool_name: "workspace.read".into(),
+            arguments: serde_json::json!({}),
+        };
 
         assert!(state.approval_policy_allows(&approval, Some(&echo_call)));
         assert!(!state.approval_policy_allows(&approval, Some(&other_call)));
@@ -2049,8 +2943,14 @@ mod tests {
             reason: "read file".into(),
             approved_response: "ok".into(),
         };
-        let workspace_call = ToolCall { tool_name: "workspace.read".into(), arguments: serde_json::json!({}) };
-        let config_call = ToolCall { tool_name: "agent.configure".into(), arguments: serde_json::json!({}) };
+        let workspace_call = ToolCall {
+            tool_name: "workspace.read".into(),
+            arguments: serde_json::json!({}),
+        };
+        let config_call = ToolCall {
+            tool_name: "agent.configure".into(),
+            arguments: serde_json::json!({}),
+        };
 
         assert!(state.approval_policy_allows(&approval, Some(&workspace_call)));
         assert!(!state.approval_policy_allows(&approval, Some(&config_call)));
@@ -2077,7 +2977,12 @@ mod tests {
             "append",
         );
         assert!(result.is_ok());
-        assert!(state.approval_policy.preapproved_tools.contains(&"echo".to_string()));
+        assert!(
+            state
+                .approval_policy
+                .preapproved_tools
+                .contains(&"echo".to_string())
+        );
 
         // Append a class to preapproved_classes
         let result = state.apply_configure(
@@ -2086,7 +2991,12 @@ mod tests {
             "append",
         );
         assert!(result.is_ok());
-        assert!(state.approval_policy.preapproved_classes.contains(&"workspace".to_string()));
+        assert!(
+            state
+                .approval_policy
+                .preapproved_classes
+                .contains(&"workspace".to_string())
+        );
 
         // Remove the tool
         let result = state.apply_configure(
@@ -2095,7 +3005,12 @@ mod tests {
             "remove",
         );
         assert!(result.is_ok());
-        assert!(!state.approval_policy.preapproved_tools.contains(&"echo".to_string()));
+        assert!(
+            !state
+                .approval_policy
+                .preapproved_tools
+                .contains(&"echo".to_string())
+        );
 
         // Set auto_approve_all
         let result = state.apply_configure(
@@ -2134,8 +3049,7 @@ mod tests {
 
     #[test]
     fn policy_annotation_uses_catalog_class_and_approval_required() {
-        let state =
-            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        let state = SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         // agent.configure is local_agent so it only appears if in effective_toolset
         let mut bindings = state.bindings.clone();
         bindings.effective_toolset = vec!["agent.configure".into(), "echo".into()];
@@ -2189,8 +3103,9 @@ mod tests {
         assert!(prompt.contains("Effective tools: echo."));
         assert!(prompt.contains("Workspace: workspace://main."));
         assert!(
-            prompt
-                .contains("Delivery target: local-ansible-01 / membrane guest=membrane-telegram-01.")
+            prompt.contains(
+                "Delivery target: local-ansible-01 / membrane guest=membrane-telegram-01."
+            )
         );
     }
 
@@ -2210,6 +3125,383 @@ mod tests {
         assert!(prompt.contains("Soul anchor: sharp, warm, witty."));
         assert!(prompt.contains("User anchor: Jared prefers direct collaboration."));
         assert!(prompt.contains("Memory seed: architecture matters."));
+    }
+
+    #[test]
+    fn context_projection_carries_conversation_turn_and_layer_metadata() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.status = "paused".into();
+        state.active_incarnation_id = Some("agent-jane:developer".into());
+        state.role_activation = Some(RoleActivation {
+            role_name: "developer".into(),
+            active_incarnation_id: Some("agent-jane:developer".into()),
+            activation_reason: "session_active_incarnation".into(),
+            requested_by: Some("hotel_runtime".into()),
+            role_addendum: Some("Focus on implementation and code changes.".into()),
+            toolset_profile_ref: Some("codex".into()),
+            effective_skillset: vec!["planning".into()],
+            working_memory_policy: Some("role_local".into()),
+            memory_projection_policy: Some("shared_identity_role_scoped".into()),
+        });
+        state.agent_profile.identity_text = Some("Identity anchor: Jane".into());
+        state.agent_profile.user_context_text =
+            Some("User anchor: Jared prefers direct collaboration.".into());
+        state.agent_profile.memory_summary = Some("Memory seed: architecture matters.".into());
+        state.start_turn(WorkingTurn {
+            task_id: Uuid::nil(),
+            turn_id: "turn-ctx-1".into(),
+            chat_id: "123".into(),
+            user_content: "status".into(),
+            final_reply_to: "local-ansible-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase: TurnPhase::WaitingModel,
+            iteration: 2,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: vec![(
+                ToolCall {
+                    tool_name: "echo".into(),
+                    arguments: serde_json::json!({"text": "hello"}),
+                },
+                ToolResult {
+                    tool_name: "echo".into(),
+                    content: "hello".into(),
+                },
+            )],
+            pending_text_reply: None,
+            had_voice_input: false,
+            awaiting_transcription_reentry: false,
+        });
+
+        let projection = state.build_context_projection("status");
+        assert_eq!(
+            projection.conversation_turn.conversation_turn_id,
+            "turn-ctx-1"
+        );
+        assert_eq!(projection.conversation_turn.session_id, "sess-1");
+        assert_eq!(
+            projection
+                .conversation_turn
+                .active_incarnation_id
+                .as_deref(),
+            Some("agent-jane:developer")
+        );
+        assert_eq!(projection.conversation_turn.trigger_kind, "user_message");
+        assert_eq!(
+            projection
+                .active_step
+                .as_ref()
+                .map(|step| step.step_kind.as_str()),
+            Some("waiting_model")
+        );
+        assert_eq!(projection.layers.len(), 5);
+        assert_eq!(
+            projection
+                .role_activation
+                .as_ref()
+                .map(|role| role.role_name.as_str()),
+            Some("developer")
+        );
+        assert!(
+            projection
+                .layers
+                .iter()
+                .any(|layer| layer.layer_id == ContextLayerId::Working
+                    && layer.mutability == ContextMutability::LiveLocal)
+        );
+        assert!(
+            projection
+                .contributions
+                .iter()
+                .any(
+                    |contribution| contribution.layer_id == ContextLayerId::Session
+                        && contribution.authority == ContextAuthority::Authoritative
+                )
+        );
+        assert!(
+            projection
+                .refresh_plan
+                .contains(&"checkpoint.after_model".to_string())
+        );
+    }
+
+    #[test]
+    fn prompt_renders_session_and_working_sections_from_projection() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.status = "paused".into();
+        state.start_turn(WorkingTurn {
+            task_id: Uuid::nil(),
+            turn_id: "turn-ctx-2".into(),
+            chat_id: "123".into(),
+            user_content: "status".into(),
+            final_reply_to: "local-ansible-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase: TurnPhase::WaitingModel,
+            iteration: 1,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            pending_text_reply: None,
+            had_voice_input: false,
+            awaiting_transcription_reentry: false,
+        });
+
+        let prompt = state.build_prompt("status");
+        assert!(prompt.contains("[Session projection]"));
+        assert!(prompt.contains("[Working projection]"));
+        assert!(prompt.contains("Active conversation turn: turn-ctx-2."));
+    }
+
+    #[test]
+    fn role_activation_projects_addendum_and_toolset_into_prompt() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.active_incarnation_id = Some("agent-jane:developer".into());
+        state.role_activation = Some(RoleActivation {
+            role_name: "developer".into(),
+            active_incarnation_id: Some("agent-jane:developer".into()),
+            activation_reason: "session_active_incarnation".into(),
+            requested_by: Some("hotel_runtime".into()),
+            role_addendum: Some("Focus on implementation and code changes.".into()),
+            toolset_profile_ref: Some("codex".into()),
+            effective_skillset: vec!["planning".into(), "implementation".into()],
+            working_memory_policy: Some("role_local".into()),
+            memory_projection_policy: Some("shared_identity_role_scoped".into()),
+        });
+
+        let prompt = state.build_prompt("status");
+        assert!(prompt.contains("Active role posture: developer."));
+        assert!(prompt.contains("Role addendum: Focus on implementation and code changes."));
+        assert!(prompt.contains("Role toolset profile: codex."));
+        assert!(prompt.contains("Role skillset posture: planning, implementation."));
+        assert!(prompt.contains("Role working-memory policy: role_local."));
+    }
+
+    #[test]
+    fn same_identity_handoff_bundle_carries_live_session_context() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.status = "paused".into();
+        state.active_incarnation_id = Some("agent-jane:developer".into());
+        state.bindings.effective_workspace_ref = Some("workspace://main".into());
+        state.role_activation = Some(RoleActivation {
+            role_name: "developer".into(),
+            active_incarnation_id: Some("agent-jane:developer".into()),
+            activation_reason: "session_active_incarnation".into(),
+            requested_by: Some("hotel_runtime".into()),
+            role_addendum: Some("Focus on implementation and code changes.".into()),
+            toolset_profile_ref: Some("codex".into()),
+            effective_skillset: vec!["planning".into()],
+            working_memory_policy: Some("role_local".into()),
+            memory_projection_policy: Some("shared_identity_role_scoped".into()),
+        });
+        state.start_turn(WorkingTurn {
+            task_id: Uuid::nil(),
+            turn_id: "turn-handoff-1".into(),
+            chat_id: "123".into(),
+            user_content: "implement the fix".into(),
+            final_reply_to: "local-ansible-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase: TurnPhase::WaitingModel,
+            iteration: 2,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            pending_text_reply: None,
+            had_voice_input: false,
+            awaiting_transcription_reentry: false,
+        });
+
+        let bundle = state.build_same_identity_handoff_bundle(
+            "architect",
+            "turn-handoff-1",
+            "manual_role_switch",
+            Some("orchestrator".into()),
+        );
+
+        assert_eq!(bundle.handoff_reason.as_deref(), Some("manual_role_switch"));
+        assert_eq!(bundle.active_goal.as_deref(), Some("implement the fix"));
+        assert!(
+            bundle
+                .relevant_session_facts
+                .contains(&"session_status=paused".to_string())
+        );
+        assert!(
+            bundle
+                .relevant_session_facts
+                .contains(&"workspace=workspace://main".to_string())
+        );
+        assert_eq!(
+            bundle.expected_return_mode.as_deref(),
+            Some("stay_active_until_manual_return")
+        );
+        assert!(
+            bundle
+                .cleanup_actions
+                .contains(&"persist_role_local_working_state".to_string())
+        );
+    }
+
+    #[test]
+    fn subagent_delegation_builder_is_lightweight_and_role_scoped() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.status = "active".into();
+        state.active_incarnation_id = Some("agent-jane:developer".into());
+        state.bindings.effective_workspace_ref = Some("workspace://main".into());
+        state.role_activation = Some(RoleActivation {
+            role_name: "developer".into(),
+            active_incarnation_id: Some("agent-jane:developer".into()),
+            activation_reason: "session_active_incarnation".into(),
+            requested_by: Some("hotel_runtime".into()),
+            role_addendum: Some("Focus on implementation and code changes.".into()),
+            toolset_profile_ref: Some("codex".into()),
+            effective_skillset: vec!["implementation".into()],
+            working_memory_policy: Some("role_local".into()),
+            memory_projection_policy: Some("shared_identity_role_scoped".into()),
+        });
+        state.start_turn(WorkingTurn {
+            task_id: Uuid::nil(),
+            turn_id: "turn-subagent-1".into(),
+            chat_id: "123".into(),
+            user_content: "break this into a small worker task".into(),
+            final_reply_to: "local-ansible-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase: TurnPhase::WaitingModel,
+            iteration: 1,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            pending_text_reply: None,
+            had_voice_input: false,
+            awaiting_transcription_reentry: false,
+        });
+
+        let delegation = state.build_subagent_delegation(
+            "Read the files and summarize risks.",
+            "research_worker",
+            vec!["workspace.read".into()],
+            vec!["research".into()],
+        );
+
+        assert_eq!(delegation.parent_agent_id, "agent-jane-01");
+        assert_eq!(delegation.parent_role, "developer");
+        assert_eq!(delegation.subagent_kind, "research_worker");
+        assert_eq!(delegation.goal, "Read the files and summarize risks.");
+        assert_eq!(delegation.allowed_tools, vec!["workspace.read"]);
+        assert_eq!(delegation.allowed_skills, vec!["research"]);
+        assert_eq!(
+            delegation.memory_allowance.as_deref(),
+            Some("none_by_default")
+        );
+        assert_eq!(
+            delegation.writeback_allowance.as_deref(),
+            Some("summary_only_parent_mediated")
+        );
+        assert!(
+            delegation
+                .context_packet
+                .session_facts
+                .contains(&"workspace=workspace://main".to_string())
+        );
+        assert!(
+            delegation
+                .context_packet
+                .constraints
+                .contains(&"subagent_lightweight_default".to_string())
+        );
+        assert!(delegation.completion_contract.summary_required);
+        assert!(delegation.completion_contract.failure_summary_required);
+        assert!(delegation.completion_contract.requires_parent_ack);
+    }
+
+    #[test]
+    fn hook_payload_types_round_trip_through_json() {
+        let state = SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        let projection = state.build_context_projection("status");
+        let request = HookRequest {
+            hook_name: "context.build".into(),
+            scope: "conversation_turn".into(),
+            checkpoint: "conversation_turn.start".into(),
+            conversation_turn: projection.conversation_turn.clone(),
+            cognitive_step: projection.active_step.clone(),
+            context_projection: Some(projection.clone()),
+            inputs: serde_json::json!({"mode": "default"}),
+        };
+        let result = HookResult {
+            status: "applied".into(),
+            updates: serde_json::json!({"ok": true}),
+            emitted_contributions: projection.contributions.clone(),
+            refresh_requests: vec![RefreshRequest {
+                layer_ids: vec![ContextLayerId::Knowledge],
+                reason: "tool result changed topic salience".into(),
+                target_checkpoint: "checkpoint.after_tool".into(),
+                urgency: "next_checkpoint".into(),
+            }],
+            promotion_actions: vec![PromotionAction {
+                target: "memory".into(),
+                concept: Some("decision".into()),
+                summary: Some("Stored a durable preference".into()),
+                content: "User prefers direct collaboration.".into(),
+                confidence: Some("high".into()),
+                reason: "stable collaboration preference".into(),
+                source_refs: vec!["relationship".into()],
+            }],
+            diagnostics: vec!["context.build applied".into()],
+        };
+
+        let request_json = serde_json::to_value(&request).expect("hook request should serialize");
+        let result_json = serde_json::to_value(&result).expect("hook result should serialize");
+        let restored_request: HookRequest =
+            serde_json::from_value(request_json).expect("hook request should deserialize");
+        let restored_result: HookResult =
+            serde_json::from_value(result_json).expect("hook result should deserialize");
+
+        assert_eq!(restored_request.hook_name, "context.build");
+        assert_eq!(restored_result.status, "applied");
+        assert_eq!(restored_result.refresh_requests.len(), 1);
+        assert_eq!(restored_result.promotion_actions[0].target, "memory");
+    }
+
+    #[test]
+    fn model_context_carries_active_incarnation_in_session_instructions() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.active_incarnation_id = Some("agent-jane:developer".into());
+        state.role_activation = Some(RoleActivation {
+            role_name: "developer".into(),
+            active_incarnation_id: Some("agent-jane:developer".into()),
+            activation_reason: "session_active_incarnation".into(),
+            requested_by: Some("hotel_runtime".into()),
+            role_addendum: Some("Focus on implementation and code changes.".into()),
+            toolset_profile_ref: Some("codex".into()),
+            effective_skillset: vec!["planning".into()],
+            working_memory_policy: Some("role_local".into()),
+            memory_projection_policy: Some("shared_identity_role_scoped".into()),
+        });
+
+        let projection = state.build_context_projection("status");
+        let context = state.model_context_from_projection(&projection);
+        let instructions = context["instructions"]
+            .as_array()
+            .expect("instructions should be an array");
+
+        assert!(instructions.iter().any(|item| {
+            item["projection_kind"] == "session"
+                && item["text"]
+                    .as_str()
+                    .map(|text| {
+                        text.contains("Active incarnation: agent-jane:developer.")
+                            && text.contains("Role toolset profile: codex.")
+                    })
+                    .unwrap_or(false)
+        }));
     }
 
     #[test]
@@ -2242,7 +3534,9 @@ mod tests {
         assert!(text.contains("Workspace: workspace://main."));
         assert!(text.contains("Component routes: text.generate [legacy] impl=gemini-flash."));
         assert!(
-            text.contains("Delivery target: local-ansible-01 / membrane guest=membrane-telegram-01.")
+            text.contains(
+                "Delivery target: local-ansible-01 / membrane guest=membrane-telegram-01."
+            )
         );
     }
 
@@ -2534,6 +3828,7 @@ mod tests {
             working_tool_history: Vec::new(),
             pending_text_reply: None,
             had_voice_input: false,
+            awaiting_transcription_reentry: false,
         });
         let index = merge_session_index(None, &first);
         assert_eq!(index["active_sessions"].as_array().unwrap().len(), 1);
@@ -2572,25 +3867,39 @@ mod tests {
             working_tool_history: Vec::new(),
             pending_text_reply: None,
             had_voice_input: false,
+            awaiting_transcription_reentry: true,
         });
 
         state.push_tool_history(
-            ToolCall { tool_name: "workspace.list".into(), arguments: serde_json::json!({}) },
-            ToolResult { tool_name: "workspace.list".into(), content: "main.rs\nlib.rs".into() },
+            ToolCall {
+                tool_name: "workspace.list".into(),
+                arguments: serde_json::json!({}),
+            },
+            ToolResult {
+                tool_name: "workspace.list".into(),
+                content: "main.rs\nlib.rs".into(),
+            },
         );
 
         assert_eq!(
-            state.active_turn.as_ref().unwrap().working_tool_history.len(),
+            state
+                .active_turn
+                .as_ref()
+                .unwrap()
+                .working_tool_history
+                .len(),
             1
         );
 
         // Round-trip through checkpoint
         let checkpoint = state.checkpoint_json();
         let restored = SessionState::from_checkpoint(&checkpoint).unwrap();
-        let history = &restored.active_turn.unwrap().working_tool_history;
+        let active_turn = restored.active_turn.unwrap();
+        let history = &active_turn.working_tool_history;
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].0.tool_name, "workspace.list");
         assert_eq!(history[0].1.content, "main.rs\nlib.rs");
+        assert!(active_turn.awaiting_transcription_reentry);
     }
 
     #[test]
@@ -2612,6 +3921,7 @@ mod tests {
             working_tool_history: Vec::new(),
             pending_text_reply: None,
             had_voice_input: false,
+            awaiting_transcription_reentry: false,
         });
 
         state.push_tool_history(
@@ -2626,9 +3936,18 @@ mod tests {
         );
 
         let prompt = state.build_reentry_prompt().unwrap();
-        assert!(prompt.contains("[Tool call history]"), "prompt should contain history section");
-        assert!(prompt.contains("workspace.read"), "prompt should name the tool");
-        assert!(prompt.contains("# Philotic Stack"), "prompt should contain result content");
+        assert!(
+            prompt.contains("[Tool call history]"),
+            "prompt should contain history section"
+        );
+        assert!(
+            prompt.contains("workspace.read"),
+            "prompt should name the tool"
+        );
+        assert!(
+            prompt.contains("# Philotic Stack"),
+            "prompt should contain result content"
+        );
         assert!(prompt.contains("Call 1:"), "prompt should number the calls");
     }
 
@@ -2636,5 +3955,52 @@ mod tests {
     fn reentry_prompt_returns_none_without_active_turn() {
         let state = SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         assert!(state.build_reentry_prompt().is_none());
+    }
+
+    #[test]
+    fn prepare_transcription_reentry_turns_transcript_into_normal_user_turn() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.start_turn(WorkingTurn {
+            task_id: Uuid::nil(),
+            turn_id: "turn-voice-1".into(),
+            chat_id: "123".into(),
+            user_content: "User sent a Telegram voice message.".into(),
+            final_reply_to: "local-ansible-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase: TurnPhase::Thinking,
+            iteration: 1,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            pending_text_reply: None,
+            had_voice_input: true,
+            awaiting_transcription_reentry: true,
+        });
+
+        let reentry = state
+            .prepare_transcription_reentry("Please review the current architecture.")
+            .expect("transcript should produce a re-entry plan");
+
+        assert_eq!(
+            reentry.user_content,
+            "Please review the current architecture."
+        );
+        assert!(
+            reentry
+                .prompt
+                .contains("Please review the current architecture."),
+            "prompt should be rebuilt from the transcript"
+        );
+
+        let active_turn = state.active_turn.as_ref().expect("turn should still exist");
+        assert_eq!(
+            active_turn.user_content,
+            "Please review the current architecture."
+        );
+        assert_eq!(active_turn.phase, TurnPhase::WaitingModel);
+        assert_eq!(active_turn.iteration, 2);
+        assert!(!active_turn.awaiting_transcription_reentry);
     }
 }

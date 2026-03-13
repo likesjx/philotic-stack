@@ -1,4 +1,25 @@
+---
+title: "Philotic Web Port Blueprint"
+doc_type: historical
+domain: migration-parity
+status: historical
+last_updated: 2026-03-12
+tags:
+  - historical
+  - migration
+  - blueprint
+  - port
+related_docs:
+  - ARCHITECTURE_STATUS.md
+  - OPENCLAW_PARITY_MIGRATION_PROPOSAL.md
+  - ZEROCLAW_TO_PHILOTIC_BRIDGE_PROPOSAL.md
+---
+
 # Philotic Web Port Blueprint
+
+> **Historical Blueprint:** This document captures an earlier port-planning model and should be treated as migration history, not as the current architecture source of truth.
+>
+> For current architecture and migration direction, start with [ARCHITECTURE_STATUS.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE_STATUS.md), [OPENCLAW_PARITY_MIGRATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OPENCLAW_PARITY_MIGRATION_PROPOSAL.md), and [ZEROCLAW_TO_PHILOTIC_BRIDGE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ZEROCLAW_TO_PHILOTIC_BRIDGE_PROPOSAL.md).
 
 Status: Proposed  
 Date: 2026-03-05  

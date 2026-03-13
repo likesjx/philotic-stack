@@ -1,12 +1,24 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
+import pathlib
+import subprocess
 import sys
+import time
 import urllib.parse
 import urllib.request
 
 
 DEFAULT_BASE_URL = "http://localhost:8750/mcp"
+REQUIRED_TOOLS = (
+    "muninn_where_left_off",
+    "muninn_recall",
+    "muninn_remember",
+    "muninn_decide",
+)
+APPROVAL_REQUIRED_EXIT = 42
+DEFAULT_MUNINN_DIR = pathlib.Path.home() / "code" / "muninndb"
 
 
 class MuninnMcpClient:
@@ -97,6 +109,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="Muninn MCP base URL")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    sub.add_parser("health", help="Check Muninn MCP connectivity and required tools")
+    sub.add_parser(
+        "bootstrap",
+        help="Require Muninn readiness, attempting a local muninndb-server start first when the service is merely down",
+    )
+    sub.add_parser(
+        "require",
+        help="Fail loudly unless Muninn MCP is reachable and ready; intended for session bootstrap gating",
+    )
     sub.add_parser("tools", help="List available Muninn tools")
 
     where = sub.add_parser("where-left-off", help="Retrieve recent active memory")
@@ -127,9 +148,152 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def extract_tool_names(result: dict) -> list[str]:
+    tools = (
+        result.get("result", {})
+        .get("tools", [])
+    )
+    names: list[str] = []
+    for tool in tools:
+        name = tool.get("name")
+        if isinstance(name, str) and name:
+            names.append(name)
+    return names
+
+
+def health_payload(base_url: str) -> dict:
+    payload = {
+        "base_url": base_url,
+        "reachable": False,
+        "required_tools_present": False,
+        "missing_tools": [],
+        "available_tools": [],
+        "approval_required": False,
+        "status": "unreachable",
+    }
+
+    client = MuninnMcpClient(base_url)
+    try:
+        client.connect()
+        payload["reachable"] = True
+        tools_result = client.tools_list()
+        names = extract_tool_names(tools_result)
+        payload["available_tools"] = names
+        missing = [tool for tool in REQUIRED_TOOLS if tool not in names]
+        payload["missing_tools"] = missing
+        payload["required_tools_present"] = not missing
+        payload["status"] = "ready" if not missing else "missing_tools"
+        payload["approval_required"] = bool(missing)
+        return payload
+    except Exception as exc:  # noqa: BLE001 - helper should surface hard failure plainly
+        payload["error"] = str(exc)
+        payload["approval_required"] = True
+        return payload
+    finally:
+        client.close()
+
+
+def emit_approval_required(payload: dict) -> int:
+    message = (
+        "MUNINN BLOCKER: Muninn MCP is unavailable or incomplete. "
+        "Operator approval is required before continuing without memory."
+    )
+    print(message, file=sys.stderr)
+    print(json.dumps(payload, indent=2, sort_keys=True), file=sys.stderr)
+    return APPROVAL_REQUIRED_EXIT
+
+
+def resolve_local_server_dir() -> pathlib.Path | None:
+    env_dir = os.environ.get("MUNINN_SERVER_DIR")
+    candidates = []
+    if env_dir:
+        candidates.append(pathlib.Path(env_dir).expanduser())
+    candidates.append(DEFAULT_MUNINN_DIR)
+
+    for candidate in candidates:
+        binary = candidate / "muninndb-server"
+        if binary.exists():
+            return candidate
+    return None
+
+
+def try_start_local_server() -> dict:
+    server_dir = resolve_local_server_dir()
+    if server_dir is None:
+        return {
+            "started": False,
+            "start_attempted": False,
+            "start_reason": "local muninndb-server binary not found",
+        }
+
+    binary = server_dir / "muninndb-server"
+    try:
+        subprocess.Popen(  # noqa: S603
+            [str(binary), "--daemon"],
+            cwd=server_dir,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - bootstrap should report the real failure plainly
+        return {
+            "started": False,
+            "start_attempted": True,
+            "start_reason": f"failed to start local muninndb-server: {exc}",
+            "server_dir": str(server_dir),
+            "server_binary": str(binary),
+        }
+
+    time.sleep(1.0)
+    return {
+        "started": True,
+        "start_attempted": True,
+        "server_dir": str(server_dir),
+        "server_binary": str(binary),
+    }
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+
+    if args.command == "health":
+        payload = health_payload(args.base_url)
+        json.dump(payload, sys.stdout, indent=2, sort_keys=True)
+        sys.stdout.write("\n")
+        return 0 if payload["status"] == "ready" else 1
+
+    if args.command == "bootstrap":
+        payload = health_payload(args.base_url)
+        if payload["status"] == "ready":
+            payload["start_attempted"] = False
+            payload["started"] = False
+            json.dump(payload, sys.stdout, indent=2, sort_keys=True)
+            sys.stdout.write("\n")
+            return 0
+
+        start_info = try_start_local_server()
+        if start_info.get("start_attempted"):
+            payload.update(start_info)
+            payload["status_before_start"] = payload["status"]
+
+        retry_payload = health_payload(args.base_url)
+        retry_payload.update(start_info)
+        if start_info.get("start_attempted"):
+            retry_payload["status_before_start"] = payload["status"]
+        if retry_payload["status"] != "ready":
+            return emit_approval_required(retry_payload)
+        json.dump(retry_payload, sys.stdout, indent=2, sort_keys=True)
+        sys.stdout.write("\n")
+        return 0
+
+    if args.command == "require":
+        payload = health_payload(args.base_url)
+        if payload["status"] != "ready":
+            return emit_approval_required(payload)
+        json.dump(payload, sys.stdout, indent=2, sort_keys=True)
+        sys.stdout.write("\n")
+        return 0
 
     client = MuninnMcpClient(args.base_url)
     client.connect()

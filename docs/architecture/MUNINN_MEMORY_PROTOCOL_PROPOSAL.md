@@ -1,3 +1,32 @@
+---
+title: "Muninn Memory Protocol Proposal"
+doc_type: proposal
+domain: memory-context
+status: accepted-current-slice
+last_updated: 2026-03-12
+tags:
+  - muninn
+  - memory
+  - protocol
+  - continuity
+  - active-seam
+related_docs:
+  - ARCHITECTURE_STATUS.md
+  - MUNINN_CLIENT_MEMORY_PROTOCOL.md
+  - AGENT_WORKFLOW_PROPOSAL.md
+task_refs:
+  - docs/task.md
+proposal_id: muninn-memory-protocol
+implements: []
+implemented_by:
+  - muninn-helper-and-skill-slice
+active_seams:
+  - wider-client-adoption
+  - philotic-native-memory-integration
+source_of_truth_targets:
+  - ARCHITECTURE_STATUS.md
+---
+
 # Muninn Memory Protocol Proposal
 
 ## Goal
@@ -31,6 +60,8 @@ Still pending:
 - Philotic-native integration
 - automatic helper usage in every client runtime
 - retrieval quality and behavior evaluation over time
+- hard fail/approval-gate behavior in every client when Muninn bootstrap is unavailable
+- validate whether short atomic memories plus a lightweight tag vocabulary actually improve retrieval quality enough to justify deeper agent-memory use
 
 Observed reality gap:
 
@@ -41,6 +72,7 @@ This proposal now has three concrete artifacts behind it:
 - a shared protocol reference in [MUNINN_CLIENT_MEMORY_PROTOCOL.md](/Users/jaredlikes/code/philotic-stack/docs/reference/MUNINN_CLIENT_MEMORY_PROTOCOL.md)
 - a shared helper in [muninn_mcp.py](/Users/jaredlikes/code/philotic-stack/scripts/muninn_mcp.py)
 - a shareable skill package in [SKILL.md](/Users/jaredlikes/code/philotic-stack/skills/muninn-memory-protocol/SKILL.md)
+- a bootstrap path that should attempt local Muninn recovery before requiring operator approval to continue without memory
 
 ## Core Recommendation
 
@@ -117,6 +149,34 @@ Bad write-back candidates:
 - low-signal pleasantries
 - raw transcript dumps
 - implementation noise with no durable value
+
+### Size Discipline
+
+Muninn memories should stay short enough to remain crisp retrieval artifacts rather than miniature documents.
+
+Recommended starting policy:
+
+- `remember`: 1-3 sentences, ideally under ~300 characters, hard ceiling ~500
+- `decide`: concise rationale, ideally under ~500 characters, hard ceiling ~800
+
+If this feels too small for a thought, that is usually a sign the thought should be split into several atomic memories instead.
+
+### Tag Discipline
+
+Tagging should remain minimal and experimental.
+
+Recommended first vocabulary:
+
+- `flesh-out`
+- `decision`
+- `reality-gap`
+- `validation`
+- `follow-up`
+- `operator-preference`
+
+The experiment is not “can we invent a better taxonomy.”
+
+The experiment is whether a small number of tags improves retrieval enough to help continuity without creating tagging theater.
 
 ## Shared Client Contract
 
@@ -223,6 +283,7 @@ This experiment is working if we observe:
 - better user-fit behavior
 - reduced repetition
 - useful retrieval without excessive token overhead
+- better recall from short atomic memories and a small stable tag vocabulary
 
 It is not working if:
 
@@ -230,6 +291,8 @@ It is not working if:
 - write-back becomes ritual noise
 - clients ignore the helper because it is too awkward
 - recalled memory frequently conflicts with observed truth and causes confusion
+- memories become long-form note fragments instead of atomic retrieval units
+- tag sprawl turns retrieval into taxonomy maintenance
 
 ## Near-Term Next Steps
 
@@ -245,6 +308,7 @@ Implement Muninn adoption in this order:
 1. Shared helper first
 - one small transport client
 - no client-specific assumptions in the transport layer
+- include a hard availability gate that fails loudly and requires operator approval before continuing without Muninn
 
 2. Shared protocol second
 - one plain-language instruction contract

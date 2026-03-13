@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::io::ErrorKind;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tracing::{debug, info};
 use uuid::Uuid;
@@ -14,6 +14,171 @@ pub struct GuestIdentity {
     pub role: String,
     #[serde(default)]
     pub supported_tools: Vec<String>,
+}
+
+/// Shared cross-component task failure envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TaskErrorPayload {
+    pub kind: String,
+    pub message: String,
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub component: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub capability: Option<String>,
+    #[serde(default)]
+    pub retryable: Option<bool>,
+}
+
+impl TaskErrorPayload {
+    pub fn provider_failure(
+        component: impl Into<String>,
+        capability: Option<&str>,
+        provider: Option<&str>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: "provider_failure".into(),
+            message: message.into(),
+            code: None,
+            component: Some(component.into()),
+            provider: provider.map(str::to_string),
+            capability: capability.map(str::to_string),
+            retryable: None,
+        }
+    }
+
+    pub fn display_message(&self) -> String {
+        let mut parts = vec![self.message.clone(), format!("kind={}", self.kind)];
+        if let Some(code) = self.code.as_deref() {
+            parts.push(format!("code={code}"));
+        }
+        if let Some(component) = self.component.as_deref() {
+            parts.push(format!("component={component}"));
+        }
+        if let Some(provider) = self.provider.as_deref() {
+            parts.push(format!("provider={provider}"));
+        }
+        if let Some(capability) = self.capability.as_deref() {
+            parts.push(format!("capability={capability}"));
+        }
+        if let Some(retryable) = self.retryable {
+            parts.push(format!("retryable={retryable}"));
+        }
+        parts.join(" | ")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct HandoffBundle {
+    pub goal: String,
+    pub context_excerpt: String,
+    pub session_id: String,
+    pub initiating_turn_id: String,
+    #[serde(default)]
+    pub return_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_goal: Option<String>,
+    #[serde(default)]
+    pub active_constraints: Vec<String>,
+    #[serde(default)]
+    pub relevant_session_facts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_summary: Option<String>,
+    #[serde(default)]
+    pub suggested_memory_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_return_mode: Option<String>,
+    #[serde(default)]
+    pub cleanup_actions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SubagentContextPacket {
+    pub summary: String,
+    #[serde(default)]
+    pub session_facts: Vec<String>,
+    #[serde(default)]
+    pub constraints: Vec<String>,
+    #[serde(default)]
+    pub memory_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SubagentCompletionContract {
+    #[serde(default)]
+    pub summary_required: bool,
+    #[serde(default)]
+    pub artifact_refs_expected: bool,
+    #[serde(default)]
+    pub failure_summary_required: bool,
+    #[serde(default)]
+    pub requires_parent_ack: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SubagentDelegation {
+    pub parent_agent_id: String,
+    pub parent_role: String,
+    pub subagent_kind: String,
+    pub goal: String,
+    pub context_packet: SubagentContextPacket,
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    #[serde(default)]
+    pub allowed_skills: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_allowance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writeback_allowance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iteration_budget: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_seconds: Option<u64>,
+    #[serde(default)]
+    pub completion_contract: SubagentCompletionContract,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaseStatus {
+    Active,
+    Releasing,
+    Expired,
+    Revoked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseEnvelope {
+    pub lease_type: String,
+    pub lease_scope: String,
+    pub authority_hotel: String,
+    #[serde(default)]
+    pub authority_component: Option<String>,
+    pub owner_guest_id: String,
+    #[serde(default)]
+    pub owner_hotel: Option<String>,
+    #[serde(default)]
+    pub owner_component_type: Option<String>,
+    pub lease_epoch: u64,
+    pub lease_expires_at: u64,
+    pub last_heartbeat_at: u64,
+    pub status: LeaseStatus,
+    #[serde(default)]
+    pub delegated_from: Option<String>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+impl LeaseEnvelope {
+    pub fn is_active(&self) -> bool {
+        matches!(self.status, LeaseStatus::Active)
+    }
 }
 
 /// Represents the types of operations a Guest can perform locally over IPC to the Ansible Hotel.
@@ -60,6 +225,39 @@ pub enum IpcRequest {
     SubscribeInbox {
         role: String,
     },
+    AcquireTelegramPollLease {
+        lease_key: String,
+        agent_id: String,
+    },
+    GetTelegramPollLeaseOwner {
+        lease_key: String,
+    },
+    RenewTelegramPollLease {
+        lease_key: String,
+        agent_id: String,
+        lease_epoch: u64,
+    },
+    ReleaseTelegramPollLease {
+        lease_key: String,
+    },
+    HandoffToRole {
+        session_id: String,
+        role_name: String,
+        handoff_bundle: HandoffBundle,
+    },
+    HandoffBack {
+        session_id: String,
+        summary: String,
+        #[serde(default)]
+        return_to: Option<String>,
+    },
+    SpawnSubagent {
+        session_id: String,
+        delegation: SubagentDelegation,
+    },
+    ListRoleIncarnations {
+        agent_id: String,
+    },
     QueryStatus {
         task_id: Uuid,
     },
@@ -96,6 +294,22 @@ pub enum IpcResponse {
     SecretData {
         secret_ref: String,
         value_json: Option<String>,
+    },
+    TelegramPollLease {
+        granted: bool,
+        lease: Option<LeaseEnvelope>,
+    },
+    TelegramPollLeaseStatus {
+        active: bool,
+        lease: Option<LeaseEnvelope>,
+    },
+    HandoffAck {
+        handoff_guest_id: String,
+        became_active: bool,
+    },
+    HandoffBackAck {
+        handoff_guest_id: String,
+        became_active: bool,
     },
     InboundTask {
         source_node: String,
@@ -157,6 +371,7 @@ pub struct PhiloticClient {
     stream: UnixStream,
     _identity: GuestIdentity,
     pending_push: VecDeque<IpcResponse>,
+    read_buf: Vec<u8>,
 }
 
 pub fn is_ipc_disconnect(err: &anyhow::Error) -> bool {
@@ -192,18 +407,41 @@ impl PhiloticClient {
     }
 
     async fn read_frame(&mut self) -> Result<Vec<u8>> {
-        let mut len_buf = [0u8; 4];
-        self.stream
-            .read_exact(&mut len_buf)
-            .await
-            .context("Failed to receive IPC frame header")?;
-        let len = u32::from_be_bytes(len_buf) as usize;
-        let mut buf = vec![0u8; len];
-        self.stream
-            .read_exact(&mut buf)
-            .await
-            .context("Failed to receive IPC frame payload")?;
-        Ok(buf)
+        loop {
+            if self.read_buf.len() >= 4 {
+                let len = u32::from_be_bytes([
+                    self.read_buf[0],
+                    self.read_buf[1],
+                    self.read_buf[2],
+                    self.read_buf[3],
+                ]) as usize;
+                let frame_len = 4 + len;
+                if self.read_buf.len() >= frame_len {
+                    let payload = self.read_buf[4..frame_len].to_vec();
+                    self.read_buf.drain(..frame_len);
+                    return Ok(payload);
+                }
+            }
+
+            self.stream
+                .readable()
+                .await
+                .context("Failed to wait for IPC frame bytes")?;
+
+            let mut chunk = [0u8; 8192];
+            match self.stream.try_read(&mut chunk) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "IPC stream closed while receiving frame",
+                    ))
+                    .context("Failed to receive IPC frame payload");
+                }
+                Ok(n) => self.read_buf.extend_from_slice(&chunk[..n]),
+                Err(err) if err.kind() == ErrorKind::WouldBlock => continue,
+                Err(err) => return Err(err).context("Failed to receive IPC frame payload"),
+            }
+        }
     }
 
     fn socket_path() -> String {
@@ -228,6 +466,7 @@ impl PhiloticClient {
             stream,
             _identity: identity.clone(),
             pending_push: VecDeque::new(),
+            read_buf: Vec::new(),
         };
 
         info!("Registering as Materialized Guest: {:?}", identity);
@@ -346,6 +585,66 @@ mod tests {
 
     fn test_socket_path() -> String {
         format!("/tmp/pc-{}.sock", Uuid::new_v4().simple())
+    }
+
+    #[test]
+    fn task_error_payload_formats_for_logs_and_fallbacks() {
+        let payload = TaskErrorPayload {
+            kind: "provider_failure".into(),
+            message: "Voice synthesis failed".into(),
+            code: Some("ELEVENLABS_BAD_RESPONSE".into()),
+            component: Some("model-router".into()),
+            provider: Some("elevenlabs".into()),
+            capability: Some("voice.synthesize".into()),
+            retryable: Some(false),
+        };
+
+        let rendered = payload.display_message();
+        assert!(rendered.contains("Voice synthesis failed"));
+        assert!(rendered.contains("kind=provider_failure"));
+        assert!(rendered.contains("code=ELEVENLABS_BAD_RESPONSE"));
+        assert!(rendered.contains("component=model-router"));
+        assert!(rendered.contains("provider=elevenlabs"));
+        assert!(rendered.contains("capability=voice.synthesize"));
+        assert!(rendered.contains("retryable=false"));
+    }
+
+    #[test]
+    fn telegram_poll_lease_response_roundtrips_with_envelope() {
+        let response = IpcResponse::TelegramPollLease {
+            granted: true,
+            lease: Some(LeaseEnvelope {
+                lease_type: "telegram_poll".into(),
+                lease_scope: "telegram:bot-token:abcd".into(),
+                authority_hotel: "hotel-alpha".into(),
+                authority_component: Some("ansible".into()),
+                owner_guest_id: "membrane-telegram-01".into(),
+                owner_hotel: Some("hotel-alpha".into()),
+                owner_component_type: Some("membrane".into()),
+                lease_epoch: 7,
+                lease_expires_at: 1234,
+                last_heartbeat_at: 1222,
+                status: LeaseStatus::Active,
+                delegated_from: None,
+                metadata: serde_json::json!({ "agent_id": "agent-jane-01" }),
+            }),
+        };
+
+        let bytes = serde_json::to_vec(&response).expect("serialize lease response");
+        let decoded: IpcResponse =
+            serde_json::from_slice(&bytes).expect("deserialize lease response");
+
+        match decoded {
+            IpcResponse::TelegramPollLease {
+                granted: true,
+                lease: Some(lease),
+            } => {
+                assert_eq!(lease.lease_epoch, 7);
+                assert_eq!(lease.owner_guest_id, "membrane-telegram-01");
+                assert_eq!(lease.metadata["agent_id"], "agent-jane-01");
+            }
+            other => panic!("unexpected decoded response: {other:?}"),
+        }
     }
 
     async fn read_frame(stream: &mut tokio::net::UnixStream) -> Vec<u8> {
@@ -541,6 +840,89 @@ mod tests {
                 let payload: serde_json::Value =
                     serde_json::from_str(&task_json).expect("decode pushed task");
                 assert_eq!(payload["content"], "pushed first");
+            }
+            other => panic!("unexpected pushed response: {other:?}"),
+        }
+
+        server.await.expect("join server");
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn recv_task_survives_select_cancellation_after_partial_frame_read() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+
+        let server = tokio::spawn({
+            let socket_path = socket_path.clone();
+            async move {
+                let (mut stream, _) = listener.accept().await.expect("accept client");
+                let buf = read_frame(&mut stream).await;
+                let _req: IpcRequest = serde_json::from_slice(&buf).expect("decode register");
+                write_frame(
+                    &mut stream,
+                    &serde_json::to_vec(&IpcResponse::success("reg", None)).unwrap(),
+                )
+                .await;
+
+                let payload = serde_json::to_vec(&IpcResponse::InboundTask {
+                    source_node: "local-ansible-01".into(),
+                    task_id: Uuid::nil(),
+                    task_json: serde_json::json!({
+                        "action": "send_reply",
+                        "content": "partial frame survives cancellation",
+                    })
+                    .to_string(),
+                })
+                .unwrap();
+                let len = u32::try_from(payload.len()).expect("frame length");
+                let header = len.to_be_bytes();
+
+                stream.write_all(&header).await.expect("write frame header");
+                stream
+                    .write_all(&payload[..8])
+                    .await
+                    .expect("write partial payload");
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                stream
+                    .write_all(&payload[8..])
+                    .await
+                    .expect("write remaining payload");
+
+                let _ = std::fs::remove_file(&socket_path);
+            }
+        });
+
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let identity = GuestIdentity {
+            guest_id: "guest-test-3".into(),
+            role: "test".into(),
+            supported_tools: Vec::new(),
+        };
+        let mut client = PhiloticClient::connect(identity)
+            .await
+            .expect("connect client");
+
+        tokio::select! {
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(10)) => {}
+            result = client.recv_task() => panic!("recv_task completed too early: {result:?}"),
+        }
+
+        let pushed = client.recv_task().await.expect("receive preserved push");
+        match pushed {
+            IpcResponse::InboundTask { task_json, .. } => {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("decode pushed task");
+                assert_eq!(payload["content"], "partial frame survives cancellation");
             }
             other => panic!("unexpected pushed response: {other:?}"),
         }

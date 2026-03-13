@@ -1,3 +1,32 @@
+---
+title: "ZeroClaw to Philotic Bridge Proposal"
+doc_type: proposal
+domain: migration-parity
+status: accepted-current-slice
+last_updated: 2026-03-12
+tags:
+  - bridge
+  - migration
+  - openclaw
+  - identity
+  - active-seam
+related_docs:
+  - ARCHITECTURE_STATUS.md
+  - OPENCLAW_PARITY_MIGRATION_PROPOSAL.md
+  - PERSONALITY_AND_CONTEXT_PROPOSAL.md
+task_refs:
+  - docs/task.md
+proposal_id: zeroclaw-to-philotic-bridge
+implements: []
+implemented_by:
+  - imported-workspace-compatibility-slice
+active_seams:
+  - legacy-agent-import
+  - recognizable-identity-continuity
+source_of_truth_targets:
+  - ARCHITECTURE_STATUS.md
+---
+
 # ZeroClaw to Philotic Bridge Proposal
 
 ## Goal

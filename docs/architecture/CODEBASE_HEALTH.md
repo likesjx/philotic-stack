@@ -88,7 +88,7 @@ The `tool-runner` binary is registered in the hotel config seeding path with the
 `webrtc_guest.rs` imports the `webrtc` crate and defines the `WebRtcGuest` struct with connection setup scaffolding, but the ICE/signaling lifecycle is incomplete. It's listed in the Port Road Map as planned — it's actually in-progress but not yet usable.
 
 ### 7. Branch sprawl risk
-Two `codex/*` branches are active simultaneously (`membrane-membrane-slice`, `model-controller-abstraction`). The `CLAUDE.md` worktree discipline is good. Keep it — each branch should reach a merge decision before a third is opened.
+Multiple `codex/*` workstreams have been active in parallel. The `CLAUDE.md` worktree discipline is good. Keep it — each branch should reach a merge decision before a third is opened.
 
 ---
 

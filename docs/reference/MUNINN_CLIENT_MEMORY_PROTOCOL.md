@@ -62,6 +62,21 @@ When calling `muninn_recall`, bias the query around:
 - who am I talking to
 - what matters about this topic right now
 
+Before starting that sequence, clients should run the shared bootstrap gate:
+
+- `python3 scripts/muninn_mcp.py bootstrap`
+
+That bootstrap should:
+
+- confirm Muninn is already ready, or
+- attempt to start the local Muninn service when it is merely down, then re-check readiness
+
+If that gate fails:
+
+- the client must alert the user/operator immediately
+- the client must not pretend retrieval occurred
+- the client must obtain explicit approval before continuing without Muninn
+
 ## When To Write Back
 
 Write after:
@@ -91,6 +106,51 @@ Bad:
 - whole transcripts
 - noisy logs
 - multiple unrelated concepts in one write
+
+## Memory Size Guidance
+
+Keep memories short.
+
+Recommended limits:
+
+- `remember`
+  - target: 1-3 sentences
+  - soft target: under ~300 characters when possible
+  - hard ceiling: under ~500 characters
+- `decide`
+  - concise rationale, still short
+  - soft target: under ~500 characters
+  - hard ceiling: under ~800 characters
+
+If a memory wants to become a paragraph, it probably wants to become multiple memories instead.
+
+Muninn is an experiment in useful continuity, not an excuse to re-host longform notes under a new brand.
+
+## Lightweight Tag Strategy
+
+Tags should stay few, stable, and retrieval-oriented.
+
+Recommended first tags:
+
+- `flesh-out`
+  - early idea worth revisiting
+- `decision`
+  - durable architectural or workflow choice
+- `reality-gap`
+  - mismatch between assumption and observed truth
+- `validation`
+  - test, smoke, or watched-live outcome
+- `follow-up`
+  - explicitly actionable next seam
+- `operator-preference`
+  - stable user/operator workflow preference
+
+Guidance:
+
+- use `concept` as the main semantic anchor
+- use tags only for cross-cutting retrieval modes
+- do not create a decorative taxonomy
+- if a tag does not help retrieval, do not invent it
 
 ## Preferred Tool Usage
 
@@ -162,6 +222,9 @@ If you are wiring this into another cognitive client, implement these hooks:
 Examples:
 
 ```bash
+python3 scripts/muninn_mcp.py bootstrap
+python3 scripts/muninn_mcp.py require
+python3 scripts/muninn_mcp.py health
 python3 scripts/muninn_mcp.py where-left-off --limit 5
 python3 scripts/muninn_mcp.py recall --context "philotic memory protocol" --context "jared collaboration preferences" --limit 5
 python3 scripts/muninn_mcp.py remember --concept "decision" --content "Use helper-backed Muninn retrieval by default for meaningful work." --summary "Default Muninn habit"

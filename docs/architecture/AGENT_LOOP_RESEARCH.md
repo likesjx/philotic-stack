@@ -1,3 +1,22 @@
+---
+title: "Agent Loop Research Notes"
+doc_type: reference
+domain: runtime-sessions
+status: active
+last_updated: 2026-03-12
+tags:
+  - research
+  - agent-loop
+  - references
+  - runtime
+related_docs:
+  - ARCHITECTURE_STATUS.md
+  - AGENT_LOOP_PROPOSAL.md
+  - PHILOTIC_AGENT_LOOP_SPEC.md
+task_refs:
+  - docs/task.md
+---
+
 # Agent Loop Research Notes
 
 ## Goal

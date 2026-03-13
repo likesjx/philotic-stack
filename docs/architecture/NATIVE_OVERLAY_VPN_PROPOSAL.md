@@ -9,6 +9,7 @@ Define what it would take for Philotic hotels to provide their own secure overla
 - Separate the network into:
   - a **control plane** for gossip, liveness, capability advertisement, and lightweight coordination
   - a **data plane** for routed hotel-to-hotel execution traffic
+- keep the native overlay/VPN implementation as its own process rather than burying all network substrate concerns inside arbitrary hotels
 - Keep UDP for the control plane.
 - Move routed execution off raw UDP datagrams and onto negotiated point-to-point transports owned by hotel towers.
 - Treat host VPNs such as Tailscale/WireGuard as transitional underlay, not as the long-term identity or transport contract.

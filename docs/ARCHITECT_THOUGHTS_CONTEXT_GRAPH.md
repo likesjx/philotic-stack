@@ -1,6 +1,27 @@
+---
+title: "ZeroClaw: The Architect's Thesis on the Context Graph & Philotic Web"
+doc_type: historical
+domain: migration-parity
+status: historical
+last_updated: 2026-03-12
+tags:
+  - historical
+  - zeroclaw
+  - philotic-web
+  - context-graph
+related_docs:
+  - docs/architecture/ARCHITECTURE_STATUS.md
+  - docs/architecture/ARCHITECTURE.md
+  - docs/PHILOTIC-ARCHITECTURE.md
+---
+
 # ZeroClaw: The Architect's Thesis on the Context Graph & Philotic Web
 
 *Compiled by Aria the Architect, 2026-03-05*
+
+> **Historical Document:** This file captures an earlier ZeroClaw-era architectural thesis and should not be treated as current Philotic architecture truth.
+>
+> For current architecture truth, start with [docs/architecture/ARCHITECTURE_STATUS.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE_STATUS.md), [docs/architecture/DOMAIN_MAP.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DOMAIN_MAP.md), and [docs/architecture/ARCHITECTURE.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE.md).
 
 This document outlines the architectural synthesis of the ZeroClaw mesh, specifically focusing on the transition from a flat, node-bound execution environment to a deeply relational, dynamically materializing graph system.
 

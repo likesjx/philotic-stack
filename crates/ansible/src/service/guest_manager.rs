@@ -1,6 +1,7 @@
 use ansible_mesh_core::materializer::Materializer;
 use ansible_mesh_core::storage::GraphStorage;
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use rusqlite::types::ValueRef;
 use std::collections::HashMap;
 use std::process::{Command as ProcessCommand, Stdio};
@@ -30,11 +31,16 @@ impl LocalProcessMaterializer {
             .arg("-p")
             .arg(pid.to_string())
             .arg("-o")
-            .arg("pid=")
-            .stdout(Stdio::null())
+            .arg("stat=")
             .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
+            .output()
+            .map(|output| {
+                if !output.status.success() {
+                    return false;
+                }
+                let stat = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                !stat.is_empty() && !stat.starts_with('Z')
+            })
             .unwrap_or(false)
     }
 
@@ -186,6 +192,11 @@ pub struct GuestManager {
     materializer: Arc<Mutex<Box<dyn Materializer>>>,
 }
 
+#[async_trait]
+pub trait GuestMaterializationRequester: Send + Sync {
+    async fn ensure_guest_active(&self, guest_id: &str) -> Result<bool>;
+}
+
 impl GuestManager {
     pub fn new(
         hotel_name: impl Into<String>,
@@ -201,6 +212,17 @@ impl GuestManager {
 
     fn clear_guest_pid(graph: &dyn GraphStorage, hotel_name: &str, guest_id: &str) {
         let _ = graph.set_guest_pid(hotel_name, guest_id, None);
+    }
+
+    fn refresh_guest_record(
+        graph: &dyn GraphStorage,
+        hotel_name: &str,
+        guest_id: &str,
+    ) -> Result<Option<ansible_mesh_core::storage::GuestRecord>> {
+        Ok(graph
+            .list_guests(hotel_name, false)?
+            .into_iter()
+            .find(|guest| guest.guest_id == guest_id))
     }
 
     /// Read all `is_active=1` Guests from the Graph, reclaim orphans, and invoke the underlying `Materializer`.
@@ -263,6 +285,60 @@ impl GuestManager {
         Ok(())
     }
 
+    pub async fn ensure_guest_active(&self, guest_id: &str) -> Result<bool> {
+        let Some(current_rec) =
+            Self::refresh_guest_record(self.graph.as_ref(), &self.hotel_name, guest_id)?
+        else {
+            return Ok(false);
+        };
+        if !current_rec.is_active {
+            return Ok(false);
+        }
+
+        let mut mat = self.materializer.lock().await;
+        if let Some(active_pid) = current_rec.active_pid.as_deref() {
+            let is_live = mat.check_status(&current_rec.guest_id, active_pid).await?;
+            if is_live {
+                return Ok(true);
+            }
+            warn!(
+                "On-demand materialization: Guest [{}] had stale PID [{}]. Reclaiming before respawn.",
+                current_rec.guest_id, active_pid
+            );
+            if let Err(err) = mat.reclaim_guest(&current_rec.guest_id).await {
+                warn!(
+                    "On-demand materialization: reclaim failed for [{}]: {}",
+                    current_rec.guest_id, err
+                );
+            }
+            Self::clear_guest_pid(self.graph.as_ref(), &self.hotel_name, &current_rec.guest_id);
+        }
+
+        let config: serde_json::Value =
+            serde_json::from_str(&current_rec.config_json).unwrap_or_default();
+        match mat.spawn_guest(&current_rec.guest_id, &config).await {
+            Ok(new_pid) => {
+                info!(
+                    "On-demand materialization: spawned Guest [{}] (PID {}).",
+                    current_rec.guest_id, new_pid
+                );
+                self.graph.set_guest_pid(
+                    &self.hotel_name,
+                    &current_rec.guest_id,
+                    Some(&new_pid),
+                )?;
+                Ok(true)
+            }
+            Err(err) => {
+                error!(
+                    "On-demand materialization: failed to spawn Guest [{}]: {}",
+                    current_rec.guest_id, err
+                );
+                Ok(false)
+            }
+        }
+    }
+
     /// An infinite loop that reconciles the SQLite desired state with the active `Materializer` state.
     pub async fn supervise_guests(self: Arc<Self>, mut shutdown_rx: broadcast::Receiver<()>) {
         info!("Started Guest Supervisor Reconciliation Loop");
@@ -288,35 +364,69 @@ impl GuestManager {
         let all_guests = self.graph.list_guests(&self.hotel_name, false)?;
 
         for rec in all_guests {
-            let config: serde_json::Value =
-                serde_json::from_str(&rec.config_json).unwrap_or_default();
-
             let mut mat = self.materializer.lock().await;
 
             if rec.is_active {
-                // Until guests publish a durable health signal or heartbeat, an assigned PID is
-                // the strongest local source of truth we have for "already materialized".
-                // Startup ghost reclamation clears stale rows before the supervisor begins.
-                if rec.active_pid.is_none() {
+                let mut should_spawn = rec.active_pid.is_none();
+                if let Some(active_pid) = rec.active_pid.as_deref() {
+                    let is_live = mat.check_status(&rec.guest_id, active_pid).await?;
+                    if !is_live {
+                        warn!(
+                            "Supervisor: Guest [{}] is marked active but PID [{}] is dead/stale. Reclaiming and respawning.",
+                            rec.guest_id, active_pid
+                        );
+                        if let Err(e) = mat.reclaim_guest(&rec.guest_id).await {
+                            warn!(
+                                "Supervisor: reclaim during stale active guest cleanup failed for [{}]: {}",
+                                rec.guest_id, e
+                            );
+                        }
+                        Self::clear_guest_pid(self.graph.as_ref(), &self.hotel_name, &rec.guest_id);
+                        should_spawn = true;
+                    }
+                }
+
+                if should_spawn {
+                    let Some(current_rec) = Self::refresh_guest_record(
+                        self.graph.as_ref(),
+                        &self.hotel_name,
+                        &rec.guest_id,
+                    )?
+                    else {
+                        info!(
+                            "Supervisor: Guest [{}] disappeared from desired state before respawn. Skipping stale snapshot respawn.",
+                            rec.guest_id
+                        );
+                        continue;
+                    };
+                    if !current_rec.is_active {
+                        info!(
+                            "Supervisor: Guest [{}] is no longer active in desired state before respawn. Skipping.",
+                            rec.guest_id
+                        );
+                        continue;
+                    }
+                    let config: serde_json::Value =
+                        serde_json::from_str(&current_rec.config_json).unwrap_or_default();
                     info!(
                         "Supervisor: Guest [{}] is marked active but has no ID. Spawning...",
-                        rec.guest_id
+                        current_rec.guest_id
                     );
-                    match mat.spawn_guest(&rec.guest_id, &config).await {
+                    match mat.spawn_guest(&current_rec.guest_id, &config).await {
                         Ok(new_pid) => {
                             info!(
                                 "Supervisor: ✨ Spawned missing Guest [{}] (ID: {})",
-                                rec.guest_id, new_pid
+                                current_rec.guest_id, new_pid
                             );
                             let _ = self.graph.set_guest_pid(
                                 &self.hotel_name,
-                                &rec.guest_id,
+                                &current_rec.guest_id,
                                 Some(&new_pid),
                             );
                         }
                         Err(e) => error!(
                             "Supervisor: ❌ Failed to spawn missing Guest [{}]: {}",
-                            rec.guest_id, e
+                            current_rec.guest_id, e
                         ),
                     }
                 }
@@ -341,10 +451,18 @@ impl GuestManager {
     }
 }
 
+#[async_trait]
+impl GuestMaterializationRequester for GuestManager {
+    async fn ensure_guest_active(&self, guest_id: &str) -> Result<bool> {
+        Self::ensure_guest_active(self, guest_id).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ansible_mesh_core::NodeCapabilities;
+    use ansible_mesh_core::graph::RoleIncarnationRecord;
     use ansible_mesh_core::storage::{
         GuestRecord, SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,
     };
@@ -357,12 +475,24 @@ mod tests {
     #[derive(Default)]
     struct TestGraphStorage {
         guests: StdMutex<Vec<GuestRecord>>,
+        list_guests_calls: AtomicUsize,
+        clear_guests_on_second_list: bool,
     }
 
     impl TestGraphStorage {
         fn with_guests(guests: Vec<GuestRecord>) -> Self {
             Self {
                 guests: StdMutex::new(guests),
+                list_guests_calls: AtomicUsize::new(0),
+                clear_guests_on_second_list: false,
+            }
+        }
+
+        fn with_guests_cleared_on_second_list(guests: Vec<GuestRecord>) -> Self {
+            Self {
+                guests: StdMutex::new(guests),
+                list_guests_calls: AtomicUsize::new(0),
+                clear_guests_on_second_list: true,
             }
         }
     }
@@ -415,6 +545,10 @@ mod tests {
         }
 
         fn list_guests(&self, hotel_name: &str, active_only: bool) -> Result<Vec<GuestRecord>> {
+            let call_index = self.list_guests_calls.fetch_add(1, Ordering::SeqCst);
+            if self.clear_guests_on_second_list && call_index >= 1 {
+                self.guests.lock().unwrap().clear();
+            }
             let guests = self.guests.lock().unwrap();
             if active_only {
                 Ok(guests
@@ -486,6 +620,22 @@ mod tests {
             Ok(None)
         }
 
+        fn upsert_role_incarnation(&self, _role: &RoleIncarnationRecord) -> Result<()> {
+            Ok(())
+        }
+
+        fn get_role_incarnation(
+            &self,
+            _agent_id: &str,
+            _role_name: &str,
+        ) -> Result<Option<RoleIncarnationRecord>> {
+            Ok(None)
+        }
+
+        fn list_role_incarnations(&self, _agent_id: &str) -> Result<Vec<RoleIncarnationRecord>> {
+            Ok(vec![])
+        }
+
         fn upsert_session_participant(
             &self,
             _participant: &SessionParticipantRecord,
@@ -546,9 +696,27 @@ mod tests {
             Ok(None)
         }
 
-        fn list_abstract_tools(
+        fn list_abstract_tools(&self) -> Result<Vec<ansible_mesh_core::graph::AbstractToolRecord>> {
+            Ok(vec![])
+        }
+
+        fn upsert_abstract_skill(
             &self,
-        ) -> Result<Vec<ansible_mesh_core::graph::AbstractToolRecord>> {
+            _skill: &ansible_mesh_core::graph::AbstractSkillRecord,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn get_abstract_skill(
+            &self,
+            _skill_name: &str,
+        ) -> Result<Option<ansible_mesh_core::graph::AbstractSkillRecord>> {
+            Ok(None)
+        }
+
+        fn list_abstract_skills(
+            &self,
+        ) -> Result<Vec<ansible_mesh_core::graph::AbstractSkillRecord>> {
             Ok(vec![])
         }
     }
@@ -674,7 +842,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_all_does_not_respawn_active_guest_just_because_status_check_disagrees() {
+    async fn reconcile_all_respawns_active_guest_when_status_check_disagrees() {
         let pid = "424242".to_string();
         let graph: Arc<dyn GraphStorage> =
             Arc::new(TestGraphStorage::with_guests(vec![GuestRecord {
@@ -688,6 +856,37 @@ mod tests {
 
         let mock = MockMaterializer::new(HashMap::from([(pid.clone(), false)]));
         let spawn_count = mock.spawn_count.clone();
+        let reclaim_count = mock.reclaim_count.clone();
+        let manager = GuestManager::new("test-hotel", graph.clone(), Box::new(mock));
+
+        manager
+            .reconcile_all()
+            .await
+            .expect("reconcile should succeed");
+
+        assert_eq!(spawn_count.load(Ordering::SeqCst), 1);
+        assert_eq!(reclaim_count.load(Ordering::SeqCst), 1);
+        let guests = graph.list_guests("test-hotel", false).expect("list guests");
+        assert_eq!(guests[0].active_pid.as_deref(), Some("spawned-1"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_all_skips_respawn_when_guest_was_removed_after_snapshot() {
+        let pid = "424243".to_string();
+        let graph = Arc::new(TestGraphStorage::with_guests_cleared_on_second_list(vec![
+            GuestRecord {
+                hotel_name: "test-hotel".into(),
+                guest_id: "guest-3".into(),
+                role: "membrane".into(),
+                config_json: json!({ "command": "target/debug/membrane" }).to_string(),
+                is_active: true,
+                active_pid: Some(pid.clone()),
+            },
+        ]));
+
+        let mock = MockMaterializer::new(HashMap::from([(pid.clone(), false)]));
+        let spawn_count = mock.spawn_count.clone();
+        let reclaim_count = mock.reclaim_count.clone();
         let manager = GuestManager::new("test-hotel", graph.clone(), Box::new(mock));
 
         manager
@@ -696,7 +895,8 @@ mod tests {
             .expect("reconcile should succeed");
 
         assert_eq!(spawn_count.load(Ordering::SeqCst), 0);
+        assert_eq!(reclaim_count.load(Ordering::SeqCst), 1);
         let guests = graph.list_guests("test-hotel", false).expect("list guests");
-        assert_eq!(guests[0].active_pid.as_deref(), Some(pid.as_str()));
+        assert!(guests.is_empty());
     }
 }

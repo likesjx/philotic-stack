@@ -1,3 +1,35 @@
+---
+title: "Key Vault Proposal"
+doc_type: proposal
+domain: operator-control-plane
+status: accepted-current-slice
+last_updated: 2026-03-12
+tags:
+  - vault
+  - secrets
+  - oauth
+  - control-plane
+  - active-seam
+related_docs:
+  - ARCHITECTURE_STATUS.md
+  - CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md
+  - MODEL_CONTROLLER_PROPOSAL.md
+  - PERIMETER_EGRESS_CONTROL_PROPOSAL.md
+task_refs:
+  - docs/task.md
+proposal_id: key-vault
+implements: []
+implemented_by:
+  - vault-secret-ref-slice
+  - keychain-root-key-slice
+active_seams:
+  - vault-secret-refs
+  - remote-vault-delegation
+source_of_truth_targets:
+  - ARCHITECTURE_STATUS.md
+  - ARCHITECTURE.md
+---
+
 # Key Vault Proposal
 
 ## Goal
@@ -31,6 +63,26 @@ The context graph should not remain the long-term home for raw values like:
 
 That was acceptable for the current bootstrap slice, but it is not an acceptable final authority boundary.
 
+## Security Posture
+
+Treat secret material like money.
+
+That means:
+
+- minimize who can see it
+- minimize how long it exists in plaintext
+- audit every meaningful operation
+- assume accidental exposure is a real financial and operational risk, not an abstract hygiene issue
+
+In particular:
+
+- admin credentials are higher-trust than ordinary provider tokens
+- model-facing components should not receive admin credentials
+- LLM context should never contain raw secret values
+- secret-bearing operations should prefer explicit control-plane flows over conversational improvisation
+
+If a design leaves a raw key in prompt context, chat history, or model-visible tool output, the design is wrong even if the demo works.
+
 ## Disposition
 
 Accepted for current slice.
@@ -45,7 +97,7 @@ Pin and prove the first design contract for:
 - encrypted secret storage plus role/guest-gated local secret fetch over hotel IPC
 - macOS Keychain-backed vault root key with env fallback only as a bootstrap path
 
-Linked task surface: [docs/task.md](/Users/jaredlikes/code/philotic-stack-model-controller-abstraction/docs/task.md)
+Linked task surface: [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md)
 
 ## Repo Truth Right Now
 
@@ -106,6 +158,76 @@ Example:
 - `gemini_auth_ref = secret://hotel/default/gemini/oauth-refresh`
 - `telegram_bot_token_ref = secret://membrane/telegram/bot-token`
 
+## Mesh Visibility Recommendation
+
+Vault state should be mesh-visible at the metadata layer, not at the secret-material layer.
+
+Recommended mesh-visible fields:
+
+- `secret_ref`
+- `secret_kind`
+- `secret_class`
+- `provider`
+- `scope`
+- `state`
+- `version`
+- rotation / health metadata
+- owning hotel
+
+Recommended non-exposed fields:
+
+- plaintext secret values
+- wrapped ciphertext for routine mesh consumption
+- admin key material
+- provider-root secret payloads
+
+The mesh should be able to answer:
+
+- does this hotel have the required secret?
+- what state is it in?
+- which hotel owns it?
+- does rotation or repair appear necessary?
+
+The mesh should not act like a gossip bus for the money itself.
+
+### First mesh-visible metadata record
+
+The first implementation should make the metadata shape explicit enough that it can be advertised or queried consistently across hotels.
+
+Suggested record shape:
+
+```json
+{
+  "secret_ref": "secret://hotel/default/gemini/oauth-refresh",
+  "owning_hotel": "default",
+  "secret_kind": "gemini_oauth_refresh",
+  "secret_class": "provider-root",
+  "provider": "gemini",
+  "scope": "hotel",
+  "state": "active",
+  "version": 3,
+  "last_rotated_at": 1741782000,
+  "health_status": "healthy",
+  "needs_rotation": false
+}
+```
+
+Recommended first fields:
+
+- `secret_ref`
+- `owning_hotel`
+- `secret_kind`
+- `secret_class`
+- optional `provider`
+- `scope`
+- `state`
+- `version`
+- optional `last_rotated_at`
+- `health_status`
+- `needs_rotation`
+
+This is enough for mesh-wide admin inspection and routing decisions without exposing secret material.
+
 ## Encryption Recommendation
 
 Use envelope encryption.
@@ -156,6 +278,60 @@ Access rules:
 - local-only delivery by default
 - auditable reads
 - optional operator approval for especially sensitive reads
+
+### Secret classes
+
+Not all secrets deserve the same exposure policy.
+
+Recommended first classes:
+
+- `provider-runtime`
+  - example: short-lived Gemini access token
+  - may be vended to a narrowly authorized local runtime guest
+- `provider-root`
+  - example: OAuth refresh token, long-lived API key
+  - hotel/vault only unless there is no safer bounded alternative
+- `admin`
+  - example: operator signing keys, vault recovery material, destructive-control credentials
+  - never exposed to model-facing components
+  - never placed in prompt context
+  - should require stronger admin-only workflows, stronger audit, and ideally staged or dual-control handling
+- `transport`
+  - example: mesh PSKs, webhook secrets, signing keys
+  - only to the components that terminate or establish the transport boundary
+
+The crucial rule is that admin secrets are not just “another config value with a scary name.”
+They are a separate authority class.
+
+### Model boundary
+
+Model-facing components should receive only the smallest capability-specific secret material they absolutely need.
+
+Examples:
+
+- a model controller may receive a short-lived provider access token
+- a membrane may receive a Telegram bot token if it must terminate the Telegram boundary
+- an agent should receive references and capability outcomes, not raw admin credentials
+
+Strong rule:
+
+- no admin key material to the model
+- no vault recovery material to the model
+- no plaintext secret echo in model-visible error messages, traces, or logs
+
+If a model needs to initiate an admin action, it should request a hotel-owned control-plane operation and receive a structured result, not the key itself.
+
+### Remote ownership rule
+
+Secrets should remain owned by the hotel that stores them unless there is an explicit replication or delegation design.
+
+Recommended rule:
+
+- remote hotels may inspect mesh-visible metadata if policy allows
+- remote hotels may request delegated admin actions against the owning hotel
+- remote hotels should not receive raw secret material by default
+
+This keeps mesh-wide administration possible without quietly turning every trusted hotel into a copy of every other hotel’s treasury.
 
 Current implementation note:
 
@@ -230,6 +406,113 @@ Telegram is still useful for:
 - approving or denying rotation
 - launching a secure operator mini app
 - monitoring vault events
+
+The admin/control implication should be explicit:
+
+- Telegram via `membrane` may initiate or broker secret administration
+- Telegram via `membrane` should not own vault mutation authority
+- secret add/rotate flows belong to the hotel control plane and vault, with `membrane` acting as the outside-world entry point only
+
+If a hotel has no `membrane`, that should not block vault administration.
+
+`membrane` is one operator entrypoint, not the admin prerequisite.
+
+## Admin Key Management Recommendation
+
+Admin keys should be managed as a distinct control-plane concern, not folded into ordinary runtime secret handling.
+
+Recommended rules:
+
+- admin keys stay in the vault or hardware-backed store
+- admin actions should use signing, approval, or delegated control-plane operations rather than raw key release whenever possible
+- the hotel should expose admin operations as capability requests, not as “give me the key”
+- recovery or export paths should be exceptional, audited, and ideally require stronger ceremony than normal runtime secret access
+
+Examples of admin-key uses that should stay hotel-owned:
+
+- signing membership or invite actions for trusted hotels
+- rotating mesh trust material
+- approving destructive or perimeter-changing actions
+- vault recovery or break-glass operations
+
+This keeps the system from committing the deeply ironic mistake of making the most improvisational component the holder of the highest-trust credentials.
+
+## Remote Administration Recommendation
+
+Remote vault administration should use delegation, not direct remote secret fetch.
+
+Recommended shape:
+
+1. operator enters through any trusted admin surface
+   - membrane when present
+   - CLI
+   - TUI
+   - future web/app
+2. the local hotel verifies operator/session/admin posture
+3. if the target secret lives on another hotel, the local hotel requests a delegated admin action from the owning hotel
+4. the owning hotel validates trust, grant scope, and action class
+5. the owning hotel performs the mutation locally and returns only structured outcome data
+
+This means a hotel without `membrane` is still fully administrable, and a hotel with `membrane` is not uniquely privileged to own vault operations.
+
+### First remote delegation envelope
+
+The first delegated admin request should also be explicit enough to become a canonical control-plane message rather than an ad hoc cross-hotel favor.
+
+Suggested request shape:
+
+```json
+{
+  "request_id": "req_01...",
+  "source_hotel": "aria-architect-hotel",
+  "target_hotel": "default",
+  "principal_id": "operator:likesjx",
+  "session_id": "telegram:7898847424:agent-aria-01",
+  "grant_id": "grant_01...",
+  "action_class": "vault.secret.rotate",
+  "action_target": "provider:gemini",
+  "payload": {
+    "secret_ref": "secret://hotel/default/gemini/oauth-refresh"
+  }
+}
+```
+
+Suggested response shape:
+
+```json
+{
+  "request_id": "req_01...",
+  "ok": true,
+  "status": "completed",
+  "result": {
+    "secret_ref": "secret://hotel/default/gemini/oauth-refresh",
+    "version": 4,
+    "state": "active"
+  },
+  "error": null
+}
+```
+
+Recommended first fields:
+
+- `request_id`
+- `source_hotel`
+- `target_hotel`
+- `principal_id`
+- `session_id`
+- `grant_id`
+- `action_class`
+- optional `action_target`
+- structured `payload`
+
+The owning hotel should validate:
+
+- perimeter trust
+- delegated action class
+- principal/session/grant consistency
+- local policy on the target hotel
+
+Only then should it execute the mutation locally.
 
 ## Safe Telegram Onboarding Path
 
@@ -387,3 +670,12 @@ Implement in this order:
 5. add operator audit log for secret actions
 6. define Telegram Mini App onboarding and rotation flow
 7. only after that, implement Telegram-driven secret add/rotate UX
+
+## Relationship To Other Proposals
+
+- [AGENT_CONTEXT_MANAGEMENT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/AGENT_CONTEXT_MANAGEMENT_PROPOSAL.md)
+  - ordinary profile/context mutation must stay separate from secret mutation
+- [CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md)
+  - admin surfaces should invoke hotel-owned secret operations without surfacing raw key material to model-facing roles
+- [HOTEL_PERIMETER_TRUST_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/HOTEL_PERIMETER_TRUST_PROPOSAL.md)
+  - perimeter membership and trust operations will eventually depend on higher-trust admin key material

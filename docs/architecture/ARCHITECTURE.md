@@ -1,11 +1,40 @@
+---
+title: "Philotic Stack Architecture Reference"
+doc_type: reference
+domain: runtime-sessions
+status: active
+last_updated: 2026-03-12
+tags:
+  - runtime
+  - reference
+  - hotel
+  - ipc
+  - mesh
+related_docs:
+  - README.md
+  - ARCHITECTURE_STATUS.md
+  - PORT_BLUEPRINT.md
+task_refs:
+  - docs/task.md
+tracks_domains:
+  - runtime-sessions
+  - membrane-transport
+  - mesh-placement
+  - tooling-execution
+  - deployment-distribution
+---
+
 # Philotic Stack — Architecture Reference
 
-> **Status:** Living Document | **Last Updated:** 2026-03-10
+> **Status:** Living Document | **Last Updated:** 2026-03-12
 
 This document describes the full runtime architecture of the Philotic Stack —
 a distributed AI agent operating system built in Rust. It covers the hotel
 model, all crates, all in-process components, the IPC and mesh transports,
 storage abstractions, and state synchronization.
+
+This is a durable reference, not the live work queue. For current implemented
+status and active seams, use [ARCHITECTURE_STATUS.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE_STATUS.md).
 
 ---
 
@@ -18,9 +47,9 @@ storage abstractions, and state synchronization.
 5. [Guest Binaries](#5-guest-binaries)
 6. [Client SDK — `crates/philotic-client`](#6-client-sdk--cratesphilotic-client)
 7. [Intra-Hotel IPC (Unix Domain Sockets)](#7-intra-hotel-ipc-unix-domain-sockets)
-8. [Inter-Hotel Mesh (UDP / OTA)](#8-inter-hotel-mesh-udp--ota)
+8. [Inter-Hotel Mesh (Control Plane) and Execution Transport (Data Plane)](#8-inter-hotel-mesh-control-plane-and-execution-transport-data-plane)
 9. [Storage Layer — Traits and Implementations](#9-storage-layer--traits-and-implementations)
-10. [State Synchronization & Optimistic Writes](#10-state-synchronization--optimistic-writes)
+10. [Session Authority And Derived State Sync](#10-session-authority-and-derived-state-sync)
 11. [Guest Lifecycle — Materialization & Supervision](#11-guest-lifecycle--materialization--supervision)
 12. [Security Model](#12-security-model)
 13. [Environment Flags](#13-environment-flags)
@@ -46,9 +75,9 @@ storage abstractions, and state synchronization.
            │  │model-router │◄──────►└────────────────────┘ │
            │  └─────────────┘                               │
            └──────────────────────────────────────────────┘
-                        │  UDP Mesh (BeaconMessage)
-           ┌────────────▼─────────────────────────────────┐
-           │              REMOTE HOTEL                     │
+                 │ UDP control plane / TCP execution plane
+           ┌─────▼────────────────────────────────────────┐
+           │              REMOTE HOTEL                    │
            └──────────────────────────────────────────────┘
 ```
 
@@ -56,8 +85,9 @@ storage abstractions, and state synchronization.
 
 - One canonical `ansible` hotel daemon per machine.
 - All in-machine communication uses **Unix Domain Sockets** (IPC).
-- All cross-machine communication uses **UDP BeaconMessages** (OTA mesh).
+- Cross-machine coordination uses **UDP BeaconMessages** on the control plane plus a framed point-to-point execution transport for routed work.
 - The Context Graph SQLite DB is the canonical source of truth for all hotel state.
+- Canonical session truth lives in the graph; apartment sync is a derived recovery/checkpoint path, not a competing session authority.
 - Storage engines are fully pluggable via trait objects (`Arc<dyn GraphStorage>`).
 
 ---
@@ -97,12 +127,13 @@ main()
   ├─ Open SqliteGraphStorage ("ansible_context.db")
   ├─ Optionally seed config from JSON file
   ├─ Load or bootstrap NodeCapabilities
-  ├─ Bind BeaconDaemon (UDP mesh, port 8999)
+  ├─ Bind BeaconDaemon (UDP control plane, port 8999)
   ├─ Start BlobService (HTTP, port 9001)
+  ├─ Start execution-plane listener (default dev layout: base + 2)
   ├─ Materialize all active guests (GuestManager)
   ├─ Start Guest Supervisor loop (reconcile every 5s)
   ├─ Start IpcServer (UDS, /tmp/ansible.sock)
-  ├─ [Flag] Start Outbound Mesh Dispatcher (UDP)
+  ├─ [Flag] Start Outbound Mesh Dispatcher
   ├─ [Flag] Start Task Lifecycle Ledger Writer
   └─ Enter main inbox loop (BeaconMessage dispatch)
 ```
@@ -114,7 +145,7 @@ main()
 | `IpcServer`       | `service/ipc.rs`             | Unix Domain Socket server. Routes IPC requests from guests to hotel logic.                         |
 | `GuestManager`    | `service/guest_manager.rs`   | Materializes and supervises guest OS processes. Consumes `Arc<dyn GraphStorage>`.                  |
 | `BlobService`     | `service/blob.rs`            | HTTP server for large payload upload/download via content-addressed SHA-256 IDs.                   |
-| `mesh_dispatcher` | `service/mesh_dispatcher.rs` | Outbound OTA dispatcher. Polls the EventLedger and sends UDP BeaconMessage batches to peer hotels. |
+| `mesh_dispatcher` | `service/mesh_dispatcher.rs` | Outbound routed-task dispatcher. Polls the EventLedger and sends framed `BeaconMessage` batches to peer hotels over the execution plane. |
 | `webrtc_guest`    | `service/webrtc_guest.rs`    | WebRTC transceiver for ephemeral P2P data channels, bypassing the mesh ledger.                     |
 
 ### 3.3 `graph.rs` — Legacy ContextGraph
@@ -139,7 +170,7 @@ All shared types, traits, and utilities live here. Every other crate depends on 
 | `sqlite_storage` | SQLite implementations: `SqliteEventStorage`, `SqliteCursorStorage`, `SqliteGraphStorage` |
 | `ledger`         | `EventLedger` — original concrete event log (still used by `mesh_dispatcher`)             |
 | `cursor`         | `CursorTracker` — original concrete cursor table                                          |
-| `beacon`         | `BeaconDaemon` — the UDP server/client for the OTA mesh                                   |
+| `beacon`         | `BeaconDaemon` — the UDP server/client for control-plane mesh traffic                     |
 | `authz`          | HMAC-PSK validation with 5-minute replay window                                           |
 | `graph`          | In-memory `MemoryApartment` types                                                         |
 | `graph_tools`    | `ContextGraphInvoker` — tool bridge for `memory.read@1` / `memory.write@1`                |
@@ -234,26 +265,31 @@ main()
 
 `PhiloticClient` is the SDK that every guest uses to talk to its hotel's IPC layer.
 
-### IPC Message Types
+### IPC Message Families
 
-```rust
-// Requests (guest → hotel)
-enum IpcRequest {
-  Register(GuestIdentity),
-  PublishEvent(EventEnvelope),
-  Heartbeat,
-  SyncApartment { agent_id, memory_type, content },
-}
+The IPC surface has evolved well beyond the original minimal register/publish
+shape. The important current families are:
 
-// Responses (hotel → guest)
-enum IpcResponse {
-  Registered,
-  EventAccepted { seq: u64 },
-  HeartbeatAck,
-  ApartmentUpdate { agent_id, memory_type, canonical_content },
-  Error(String),
-}
-```
+- guest lifecycle and liveness:
+  - `Register`
+  - `Heartbeat`
+- routed work and result flow:
+  - `EmitTask`
+  - `UpdateTask`
+  - `AckEvent`
+- session and runtime coordination:
+  - session snapshot/config requests
+  - approval/session status updates
+  - Telegram poll-lease acquire/renew/release
+- recovery and derived state sync:
+  - `SyncApartment`
+  - push-style `ApartmentUpdate`
+- secret/config access:
+  - `GetConfig`
+  - `GetSecret`
+
+Use the actual types in code as canonical contract truth. This section is a
+family-level reference so it does not quietly freeze an obsolete enum snapshot.
 
 ### Key Methods
 
@@ -264,7 +300,10 @@ PhiloticClient::connect(port: u16) -> Result<Self>
 // Publish an event into the hotel's ledger
 client.publish_event(env: EventEnvelope) -> Result<u64>
 
-// Optimistic apartment write (fire-and-forget, CRDT LWW)
+// Read current runtime/session/config state
+client.send_request(IpcRequest::GetConfig { ... }) -> Result<IpcResponse>
+
+// Derived recovery/checkpoint sync
 client.sync_apartment(agent_id, memory_type, content_json) -> Result<()>
 ```
 
@@ -404,7 +443,7 @@ trait GraphStorage: Send + Sync {
 | --------------- | --------------------- | ----------------------------------------------------------------------------- |
 | `EventStorage`  | `SqliteEventStorage`  | `mesh_events`                                                                 |
 | `CursorStorage` | `SqliteCursorStorage` | `mesh_cursors`                                                                |
-| `GraphStorage`  | `SqliteGraphStorage`  | `node_config`, `materialized_guests`, `agent_identities`, `memory_apartments` |
+| `GraphStorage`  | `SqliteGraphStorage`  | `node_config`, `materialized_guests`, `agent_identities`, `memory_apartments`, session graph entities, route/identity records |
 
 ### 9.3 Adding a New Storage Backend
 
@@ -426,17 +465,33 @@ To plug in PebbleDB, RocksDB, or Postgres:
 
 ---
 
-## 10. State Synchronization & Optimistic Writes
+## 10. Session Authority And Derived State Sync
 
-### 10.1 Memory Apartments
+### 10.1 Canonical Session Truth
 
-Each agent has typed memory "apartments" (`short`, `long`, `episodic`, `semantic`).
-These are stored in the `memory_apartments` table in the Context Graph.
+Philotic session truth is graph-owned.
 
-The hotel is the **canonical source of truth**. Guests hold a local hot-path
-RAM copy for fast cognitive loops.
+That includes:
 
-### 10.2 Optimistic Write Flow
+- session identity and bindings
+- participants
+- turns
+- session events/timeline
+- approval/session status
+- route-affecting metadata
+
+Apartment state still exists, but it is not the canonical session envelope.
+
+### 10.2 Memory Apartments As Derived Recovery State
+
+Each agent still has typed memory "apartments" (`short`, `long`, `episodic`,
+`semantic`) stored in the Context Graph.
+
+The hotel is the durable owner of those records, while guests may hold a local
+hot-path RAM copy for cognitive loops and checkpoint it back through
+`SyncApartment`.
+
+### 10.3 Optimistic Apartment Write Flow
 
 ```
 Guest cognitive loop
@@ -455,7 +510,7 @@ Guest cognitive loop
   └─ Continue loop immediately (no waiting)
 ```
 
-### 10.3 Conflict Resolution (LWW)
+### 10.4 Conflict Resolution (LWW)
 
 The current implementation uses **Last-Writer-Wins** — the most recent
 `sync_apartment` call wins. The hotel performs an atomic delete+insert
@@ -464,7 +519,7 @@ within a single SQLite transaction.
 > **Future:** Vector clocks / Hybrid Logical Clocks (HLC) for precise
 > causal ordering across multi-hotel apartment mirrors.
 
-### 10.4 Hotel-to-Guest Push (ApartmentUpdate)
+### 10.5 Hotel-to-Guest Push (ApartmentUpdate)
 
 When the hotel detects a canonical state that differs from a guest's
 optimistic write (e.g., a conflict resolution from a remote hotel sync),
@@ -562,11 +617,19 @@ Default is `INSECURE_DEV_DEFAULT_PSK` — override before production.
 | Phase                         | Status      | Description                                            |
 | ----------------------------- | ----------- | ------------------------------------------------------ |
 | Guest Supervisor              | ✅ Complete | Reconciliation loop, ghost detection, auto-respawn     |
-| OTA Mesh Queueing             | ✅ Complete | Durable event ledger, cursor-tracked UDP dispatcher    |
-| Bidirectional State Sync      | ✅ Complete | `SyncApartment` IPC, LWW apartment upsert              |
+| Control Plane Mesh            | ✅ Complete | Durable event ledger, cursor-tracked control-plane gossip |
+| Execution Plane               | ✅ Complete | Point-to-point framed transport for routed work        |
+| Session Graph Model           | ✅ Complete | Graph-owned sessions, participants, turns, and events  |
+| Derived Apartment Sync        | ✅ Complete | `SyncApartment` IPC, LWW apartment upsert              |
 | Database Agnosticism          | ✅ Complete | `EventStorage`, `CursorStorage`, `GraphStorage` traits |
 | Task Lifecycle Engine         | 🔲 Planned  | State machine with invariants (PORT-BP-004)            |
 | Auth Exchange                 | 🔲 Planned  | Invite/ticket validation (PORT-BP-006)                 |
 | Scaling / Performance Monitor | 🔲 Planned  | Process scale-out/in based on machine metrics          |
 | WebRTC P2P Data Channels      | 🔶 In Progress | Signal/SDP types exist; `WebRtcGuest` started but ICE/lifecycle incomplete |
 | Multi-Hotel Parity Tests      | 🔲 Planned  | Shadow mode + chaos tests (PORT-BP-009)                |
+
+### Current Transitional Notes
+
+- control-plane peer discovery and execution-plane addressing are still carrying transitional local-development assumptions in some paths
+- apartment sync remains a derived checkpoint path and should not be confused with canonical session truth
+- role incarnation routing direction is established, but the full graph-backed role/toolset/handoff system is still a live implementation seam
