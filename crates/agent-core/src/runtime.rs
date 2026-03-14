@@ -560,6 +560,7 @@ impl AgentRuntime {
                 | SlashCommand::ApprovalStatus
                 | SlashCommand::ApprovalReset => {}
                 SlashCommand::Tts { .. } => {}
+                SlashCommand::Abandon { .. } => {}
             }
         }
 
@@ -663,6 +664,10 @@ impl AgentRuntime {
                         .await
                 }
                 SlashCommand::Approve { .. } | SlashCommand::Deny { .. } => Ok(()),
+                SlashCommand::Abandon { reason } => {
+                    self.handle_abandon_command(session_id, turn_id, reason)
+                        .await
+                }
             };
         }
 
@@ -2048,6 +2053,7 @@ impl AgentRuntime {
                 | SlashCommand::PreapproveThisSession
                 | SlashCommand::ApprovalStatus
                 | SlashCommand::ApprovalReset
+                | SlashCommand::Abandon { .. }
                 | SlashCommand::Tts { .. } => {}
             }
             (
@@ -2216,6 +2222,7 @@ impl AgentRuntime {
             | SlashCommand::PreapproveThisSession
             | SlashCommand::ApprovalStatus
             | SlashCommand::ApprovalReset
+            | SlashCommand::Abandon { .. }
             | SlashCommand::Tts { .. } => {}
         }
 
@@ -2570,6 +2577,57 @@ impl AgentRuntime {
         Ok(())
     }
 
+    /// Handle `/abandon [reason]`.
+    ///
+    /// If `PHILOTIC_PARENT_GUEST_ID` is set (this process is a subagent worker),
+    /// fires a `FireSubagentHook(TurnCompleted, { completed: false })` to the hotel
+    /// so the parent agent receives the failure notification.
+    /// Always completes the local turn with an abandonment acknowledgement.
+    async fn handle_abandon_command(
+        &mut self,
+        session_id: String,
+        turn_id: String,
+        reason: Option<String>,
+    ) -> Result<()> {
+        let reason_text = reason
+            .as_deref()
+            .unwrap_or("operator requested abandonment");
+
+        // If we're running as a subagent, notify the parent via the hook channel.
+        if let Ok(worker_id) = std::env::var("PHILOTIC_AGENT_ID") {
+            if std::env::var("PHILOTIC_PARENT_GUEST_ID").is_ok() {
+                let hook_result = self
+                    .ipc_client
+                    .send_request(IpcRequest::FireSubagentHook {
+                        subagent_guest_id: worker_id.clone(),
+                        hook_kind: philotic_client::HookKind::TurnCompleted,
+                        payload: serde_json::json!({
+                            "completed": false,
+                            "error": reason_text,
+                        }),
+                    })
+                    .await;
+                match hook_result {
+                    Ok(_) => info!(
+                        agent_id = %worker_id,
+                        "Abandon: failure hook fired to parent."
+                    ),
+                    Err(e) => warn!(
+                        agent_id = %worker_id,
+                        "Abandon: failed to fire failure hook: {}", e
+                    ),
+                }
+            }
+        }
+
+        let ack = if let Some(r) = reason.as_deref() {
+            format!("Abandoned: {r}")
+        } else {
+            "Abandoned.".into()
+        };
+        self.complete_local_command(session_id, turn_id, ack).await
+    }
+
     async fn handle_session_control_command(
         &mut self,
         command_task_id: Uuid,
@@ -2842,7 +2900,8 @@ impl AgentRuntime {
                 | SlashCommand::Roles
                 | SlashCommand::Back
                 | SlashCommand::Approve { .. }
-                | SlashCommand::Deny { .. } => (
+                | SlashCommand::Deny { .. }
+                | SlashCommand::Abandon { .. } => (
                     "Unsupported session control command.".to_string(),
                     "session_control_unsupported",
                     serde_json::json!({
