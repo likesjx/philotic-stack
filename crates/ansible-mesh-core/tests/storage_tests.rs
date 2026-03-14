@@ -7,7 +7,9 @@
 //! - `IpcRequest` / `IpcResponse` serialization round-trips
 
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
-use ansible_mesh_core::graph::{AbstractSkillRecord, RoleIncarnationRecord, TurnLoopConfig};
+use ansible_mesh_core::graph::{
+    AbstractSkillRecord, RoleIncarnationRecord, ToolsetProfileRecord, TurnLoopConfig,
+};
 use ansible_mesh_core::sqlite_storage::{
     SqliteCursorStorage, SqliteEventStorage, SqliteGraphStorage,
 };
@@ -855,6 +857,31 @@ fn graph_storage_abstract_skill_round_trip() {
     assert!(listed
         .iter()
         .any(|entry| entry.skill_name == "handoff.to_role"));
+}
+
+#[test]
+fn graph_storage_toolset_profile_round_trip() {
+    let store = open_graph_storage();
+    let profile = ToolsetProfileRecord {
+        profile_name: "orchestrator".into(),
+        allowed_tools: vec!["session.status".into(), "echo".into()],
+        allowed_classes: vec!["session".into()],
+        allowed_skills: vec!["handoff.to_role".into()],
+        description: Some("Core orchestrator profile.".into()),
+    };
+
+    store.upsert_toolset_profile(&profile).unwrap();
+
+    let loaded = store
+        .get_toolset_profile("orchestrator")
+        .unwrap()
+        .expect("toolset profile should exist");
+    assert_eq!(loaded, profile);
+
+    let listed = store.list_toolset_profiles().unwrap();
+    assert!(listed
+        .iter()
+        .any(|p| p.profile_name == "orchestrator"));
 }
 
 #[test]

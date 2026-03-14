@@ -7,6 +7,7 @@
 use crate::event::{EventEnvelope, EventId, EventKind, EventPayload};
 use crate::graph::{
     AbstractSkillRecord, AbstractToolRecord, GraphEdge, GraphNode, RoleIncarnationRecord,
+    ToolsetProfileRecord,
 };
 use crate::storage::{
     CursorStorage, EventStorage, GraphAdapter, GraphStorage, GuestRecord, HotelRecord,
@@ -1435,6 +1436,36 @@ impl GraphStorage for SqliteGraphStorage {
     fn list_abstract_skills(&self) -> Result<Vec<AbstractSkillRecord>> {
         self.adapter
             .list_nodes_by_kind("abstract_skill")?
+            .into_iter()
+            .map(|node| serde_json::from_value(node.data).map_err(Into::into))
+            .collect()
+    }
+
+    fn upsert_toolset_profile(&self, profile: &ToolsetProfileRecord) -> Result<()> {
+        self.adapter.upsert_node(&GraphNode {
+            node_key: format!("toolset_profile:{}", profile.profile_name),
+            kind: "toolset_profile".into(),
+            label: Some(profile.profile_name.clone()),
+            data: serde_json::to_value(profile)?,
+        })
+    }
+
+    fn get_toolset_profile(
+        &self,
+        profile_name: &str,
+    ) -> Result<Option<ToolsetProfileRecord>> {
+        match self
+            .adapter
+            .get_node(&format!("toolset_profile:{profile_name}"))?
+        {
+            Some(node) => Ok(Some(serde_json::from_value(node.data)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn list_toolset_profiles(&self) -> Result<Vec<ToolsetProfileRecord>> {
+        self.adapter
+            .list_nodes_by_kind("toolset_profile")?
             .into_iter()
             .map(|node| serde_json::from_value(node.data).map_err(Into::into))
             .collect()

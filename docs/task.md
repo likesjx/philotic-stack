@@ -107,8 +107,8 @@ Seam IDs: `role-incarnation-records`, `active-membrane-routing`, `handoff-skill`
 ### Skill Catalog + Toolset Profiles (prerequisite for role provisioning)
 - [x] Add `AbstractSkillRecord` to `ansible-mesh-core/src/graph.rs` (parallel to `AbstractToolRecord`).
 - [x] Add `upsert_abstract_skill` / `get_abstract_skill` / `list_abstract_skills` to `GraphStorage` trait and `SqliteGraphStorage`.
-- [ ] Add `ToolsetProfileRecord` to the context graph (`toolset_profile` node kind).
-- [ ] Add `upsert_toolset_profile` / `get_toolset_profile` / `list_toolset_profiles` to `GraphStorage`.
+- [x] Add `ToolsetProfileRecord` to the context graph (`toolset_profile` node kind).
+- [x] Add `upsert_toolset_profile` / `get_toolset_profile` / `list_toolset_profiles` to `GraphStorage` trait and `SqliteGraphStorage` impl.
 - [x] Seed the first built-in handoff/governance abstract skills at hotel startup.
 - [ ] Expand the built-in skill catalog and toolset profiles at hotel startup (`orchestrator`, `codex`, `browser`, `research`, `utility`).
 - [ ] Update session binding assembly to expand skill grants into `implied_tools` when building `tools_for_model`.
@@ -189,7 +189,7 @@ Seam IDs: `role-incarnation-records`, `active-membrane-routing`, `handoff-skill`
 - [x] Add `skill.register` IPC handler in hotel (`RegisterSkill` → Layer 1 validate → `AbstractSkillRecord` persist → `SkillRegistered` response) (Block F).
 - [x] Add `skill.register` and `subagent.spawn` tools to abstract tool catalog + `is_local_agent_tool()` + `execute_local_agent_tool()` IPC dispatch (Block F).
 - [x] Fix subagent spawn path: add `PHILOTIC_AGENT_ID` to worker env in `config_json`; add `set_guest_active` to `GraphStorage`; deactivate guest on `ReleaseSubagent` to stop supervisor respawn loop. (`PHILOTIC_AGENT_MODE=subagent` superseded by the `agent-worker` binary split in Block E.)
-- [ ] Add `/abandon` slash command; deliver `FailTask` summary to parent on abandonment.
+- [x] Add `/abandon` slash command; fires `FireSubagentHook(TurnCompleted, completed=false)` when `PHILOTIC_PARENT_GUEST_ID` is set; handles all 4 match sites in runtime.rs.
 - [x] Define the first compatibility-first `SubagentDelegation` contract and parent-side builder:
   - parent role
   - goal
@@ -416,10 +416,10 @@ Seam IDs: `local-admin-capability-envelope`, `onnx-admin-fallback-path`
 Model revised: three-kind taxonomy (conversational/worker/subagent) replaced with role incarnations + workers/subagents. See [AGENT_INCARNATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/AGENT_INCARNATION_PROPOSAL.md).
 
 ### Skill Catalog + Toolset Profiles (prerequisite for role provisioning)
-- [ ] Add `AbstractSkillRecord` to `ansible-mesh-core/src/graph.rs` (parallel to `AbstractToolRecord`).
-- [ ] Add `upsert_abstract_skill` / `get_abstract_skill` / `list_abstract_skills` to `GraphStorage` trait and `SqliteGraphStorage`.
-- [ ] Add `ToolsetProfileRecord` to the context graph (`toolset_profile` node kind).
-- [ ] Add `upsert_toolset_profile` / `get_toolset_profile` / `list_toolset_profiles` to `GraphStorage`.
+- [x] Add `AbstractSkillRecord` to `ansible-mesh-core/src/graph.rs` (parallel to `AbstractToolRecord`).
+- [x] Add `upsert_abstract_skill` / `get_abstract_skill` / `list_abstract_skills` to `GraphStorage` trait and `SqliteGraphStorage`.
+- [x] Add `ToolsetProfileRecord` to the context graph (`toolset_profile` node kind).
+- [x] Add `upsert_toolset_profile` / `get_toolset_profile` / `list_toolset_profiles` to `GraphStorage` trait and `SqliteGraphStorage` impl.
 - [ ] Seed built-in skill catalog and toolset profiles at hotel startup (`orchestrator`, `codex`, `browser`, `research`, `utility`).
 - [ ] Update session binding assembly to expand skill grants into `implied_tools` when building `tools_for_model`.
 
@@ -447,7 +447,7 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 ### Workers / Subagents
 - [x] Implement `SpawnSubagent` IPC and async result routing back to parent incarnation (see main Workers section above).
 - [x] Fix subagent spawn path (see main Workers section above).
-- [ ] Add `/abandon` slash command; deliver `FailTask` summary to parent on abandonment.
+- [x] Add `/abandon` slash command (see main Workers section above).
 
 ### Memory
 - [ ] Add `session_facts` apartment type and `UpdateMemory` IPC with hotel-side rate/size enforcement.

@@ -730,6 +730,26 @@ mod tests {
         ) -> Result<Vec<ansible_mesh_core::graph::AbstractSkillRecord>> {
             Ok(vec![])
         }
+
+        fn upsert_toolset_profile(
+            &self,
+            _profile: &ansible_mesh_core::graph::ToolsetProfileRecord,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn get_toolset_profile(
+            &self,
+            _profile_name: &str,
+        ) -> Result<Option<ansible_mesh_core::graph::ToolsetProfileRecord>> {
+            Ok(None)
+        }
+
+        fn list_toolset_profiles(
+            &self,
+        ) -> Result<Vec<ansible_mesh_core::graph::ToolsetProfileRecord>> {
+            Ok(vec![])
+        }
     }
 
     struct MockMaterializer {

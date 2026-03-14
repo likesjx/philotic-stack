@@ -4041,6 +4041,26 @@ mod tests {
         ) -> anyhow::Result<Vec<ansible_mesh_core::graph::AbstractSkillRecord>> {
             Ok(vec![])
         }
+
+        fn upsert_toolset_profile(
+            &self,
+            _profile: &ansible_mesh_core::graph::ToolsetProfileRecord,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn get_toolset_profile(
+            &self,
+            _profile_name: &str,
+        ) -> anyhow::Result<Option<ansible_mesh_core::graph::ToolsetProfileRecord>> {
+            Ok(None)
+        }
+
+        fn list_toolset_profiles(
+            &self,
+        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::ToolsetProfileRecord>> {
+            Ok(vec![])
+        }
     }
 
     fn test_socket_path() -> String {

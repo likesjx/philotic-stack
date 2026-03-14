@@ -115,6 +115,26 @@ pub struct AbstractSkillRecord {
     pub field_sources: serde_json::Value,
 }
 
+/// A named bundle of allowed tools, tool classes, and skills granted to a role.
+///
+/// Node kind: `toolset_profile`. Node key: `toolset_profile:{profile_name}`.
+/// `RoleIncarnationRecord.toolset_profile` holds this name as a reference.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ToolsetProfileRecord {
+    pub profile_name: String,
+    /// Explicit tool names granted by this profile.
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    /// Tool class names granted by this profile (e.g. "session", "utility").
+    #[serde(default)]
+    pub allowed_classes: Vec<String>,
+    /// Skill names whose `implied_tools` are transitively granted.
+    #[serde(default)]
+    pub allowed_skills: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
 /// Per-role runtime loop controls for a role incarnation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct TurnLoopConfig {

@@ -8,6 +8,7 @@
 use crate::event::EventEnvelope;
 use crate::graph::{
     AbstractSkillRecord, AbstractToolRecord, GraphEdge, GraphNode, RoleIncarnationRecord,
+    ToolsetProfileRecord,
 };
 use crate::NodeCapabilities;
 use anyhow::Result;
@@ -269,6 +270,20 @@ pub trait GraphStorage: Send + Sync {
 
     /// List all abstract skill definitions in the catalog.
     fn list_abstract_skills(&self) -> Result<Vec<AbstractSkillRecord>>;
+
+    // ── Toolset profiles (role provisioning bundles) ─────────────────────
+
+    /// Upsert a named toolset profile into the context graph.
+    fn upsert_toolset_profile(&self, profile: &ToolsetProfileRecord) -> Result<()>;
+
+    /// Load a single toolset profile by name, or `None` if not found.
+    fn get_toolset_profile(
+        &self,
+        profile_name: &str,
+    ) -> Result<Option<ToolsetProfileRecord>>;
+
+    /// List all toolset profiles in the context graph.
+    fn list_toolset_profiles(&self) -> Result<Vec<ToolsetProfileRecord>>;
 }
 
 /// Generic graph persistence contract.
