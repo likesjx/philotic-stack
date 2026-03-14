@@ -118,7 +118,7 @@ Seam IDs: `role-incarnation-records`, `active-membrane-routing`, `handoff-skill`
 - [x] Add `upsert_role_incarnation` / `get_role_incarnation` / `list_role_incarnations` to `GraphStorage`.
 - [x] Add `ConfigureRole` IPC action (orchestrator → hotel); hotel enforces orchestrator-only writes for the same agent identity.
 - [x] Define the first rigid orchestrator-only role-governance workflow skill for create/update, including required reasoning about purpose, toolset, skillset, handoff posture, and limits.
-- [ ] Seed session bindings from the role's `toolset_profile` when a role incarnation session is initialized.
+- [x] Seed session bindings from the role's `toolset_profile` when a role incarnation session is initialized.
 - [ ] Define the canonical shared-self role contract:
   - base identity and durable memory remain shared
   - role addendum is additive
@@ -132,7 +132,7 @@ Seam IDs: `role-incarnation-records`, `active-membrane-routing`, `handoff-skill`
   - effective skillset
   - working memory policy
   - memory projection policy
-- [ ] Expand `RoleActivation` beyond the first compatibility slice:
+- [x] Expand `RoleActivation` beyond the first compatibility slice:
   - base identity reference
   - explicit skillset profile reference
   - richer activation requester semantics

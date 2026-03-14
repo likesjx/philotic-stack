@@ -212,7 +212,15 @@ pub struct RoleActivation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_addendum: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_identity_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_requester_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_policy_owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub toolset_profile_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skillset_profile_ref: Option<String>,
     #[serde(default)]
     pub effective_skillset: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3176,6 +3184,7 @@ mod tests {
             effective_skillset: vec!["planning".into()],
             working_memory_policy: Some("role_local".into()),
             memory_projection_policy: Some("shared_identity_role_scoped".into()),
+            ..Default::default()
         });
         state.agent_profile.identity_text = Some("Identity anchor: Jane".into());
         state.agent_profile.user_context_text =
@@ -3304,6 +3313,7 @@ mod tests {
             effective_skillset: vec!["planning".into(), "implementation".into()],
             working_memory_policy: Some("role_local".into()),
             memory_projection_policy: Some("shared_identity_role_scoped".into()),
+            ..Default::default()
         });
 
         let prompt = state.build_prompt("status");
@@ -3331,6 +3341,7 @@ mod tests {
             effective_skillset: vec!["planning".into()],
             working_memory_policy: Some("role_local".into()),
             memory_projection_policy: Some("shared_identity_role_scoped".into()),
+            ..Default::default()
         });
         state.start_turn(WorkingTurn {
             task_id: Uuid::nil(),
@@ -3397,6 +3408,7 @@ mod tests {
             effective_skillset: vec!["implementation".into()],
             working_memory_policy: Some("role_local".into()),
             memory_projection_policy: Some("shared_identity_role_scoped".into()),
+            ..Default::default()
         });
         state.start_turn(WorkingTurn {
             task_id: Uuid::nil(),
@@ -3517,6 +3529,7 @@ mod tests {
             effective_skillset: vec!["planning".into()],
             working_memory_policy: Some("role_local".into()),
             memory_projection_policy: Some("shared_identity_role_scoped".into()),
+            ..Default::default()
         });
 
         let projection = state.build_context_projection("status");
