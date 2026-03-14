@@ -2340,11 +2340,23 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
 }
 
 fn default_visible_toolset(bindings: &SessionBindings) -> Vec<String> {
-    if bindings.effective_toolset.is_empty() {
+    let mut toolset = if bindings.effective_toolset.is_empty() {
         vec!["echo".to_string()]
     } else {
         bindings.effective_toolset.clone()
+    };
+
+    // Expand skill grants: merge implied tools from each active skill.
+    for skill in &bindings.effective_skillset {
+        for &implied in crate::catalog::skill_implied_tools(skill) {
+            let implied = implied.to_string();
+            if !toolset.contains(&implied) {
+                toolset.push(implied);
+            }
+        }
     }
+
+    toolset
 }
 
 fn is_local_agent_tool(tool_name: &str) -> bool {

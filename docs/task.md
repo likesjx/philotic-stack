@@ -111,7 +111,7 @@ Seam IDs: `role-incarnation-records`, `active-membrane-routing`, `handoff-skill`
 - [x] Add `upsert_toolset_profile` / `get_toolset_profile` / `list_toolset_profiles` to `GraphStorage` trait and `SqliteGraphStorage` impl.
 - [x] Seed the first built-in handoff/governance abstract skills at hotel startup.
 - [x] Seed built-in toolset profiles at hotel startup: `orchestrator`, `codex`, `research`, `utility` via `seed_toolset_profiles`.
-- [ ] Update session binding assembly to expand skill grants into `implied_tools` when building `tools_for_model`.
+- [x] Update session binding assembly to expand skill grants into `implied_tools` when building `tools_for_model`.
 
 ### Role Incarnation Records
 - [x] Add `RoleIncarnationRecord` and `TurnLoopConfig` to the context graph (`role_incarnation` node kind).
@@ -421,7 +421,7 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 - [x] Add `ToolsetProfileRecord` to the context graph (`toolset_profile` node kind).
 - [x] Add `upsert_toolset_profile` / `get_toolset_profile` / `list_toolset_profiles` to `GraphStorage` trait and `SqliteGraphStorage` impl.
 - [x] Seed built-in toolset profiles at hotel startup (see main section above).
-- [ ] Update session binding assembly to expand skill grants into `implied_tools` when building `tools_for_model`.
+- [x] Update session binding assembly to expand skill grants into `implied_tools` when building `tools_for_model`.
 
 ### Role Incarnation Records
 - [ ] Add `RoleIncarnationRecord` and `TurnLoopConfig` to the context graph (`role_incarnation` node kind).

@@ -24,6 +24,20 @@ pub fn tool_catalog() -> &'static HashMap<String, ToolDefinition> {
     TOOL_CATALOG.get_or_init(build_catalog)
 }
 
+/// Returns the static list of tool names implied by a built-in skill.
+///
+/// When `effective_skillset` contains a skill name, all tools in this list
+/// are merged into the visible toolset during assembly. Returns an empty slice
+/// for unknown or zero-implied-tool skills.
+pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
+    match skill_name {
+        "handoff.to_role" => &["session.status"],
+        "handoff.back" => &["session.status"],
+        "role.governance" => &["session.status", "agent.configure"],
+        _ => &[],
+    }
+}
+
 /// Returns the approval/projection class for a tool name, or `None` if the tool
 /// is not in the built-in catalog.
 pub fn tool_class(tool_name: &str) -> Option<&'static str> {
