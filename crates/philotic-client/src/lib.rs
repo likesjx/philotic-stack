@@ -427,6 +427,25 @@ pub enum IpcRequest {
         memory_type: String,
         content_json: serde_json::Value,
     },
+    /// Create or update a role incarnation definition (orchestrator only)
+    ConfigureRole {
+        agent_id: String,
+        role_name: String,
+        guest_id: String,
+        toolset_profile: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role_identity_addendum: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inactive_ttl_seconds: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        iteration_cap: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approval_policy: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_profile: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_window_policy: Option<String>,
+    },
 }
 
 /// Represents the canonical response from the local Ansible back to the Guest via IPC.
@@ -487,6 +506,10 @@ pub enum IpcResponse {
         source_node: String,
         task_id: Uuid,
         task_json: String,
+    },
+    /// Response to [`IpcRequest::ConfigureRole`].
+    ConfigureRoleOk {
+        role_name: String,
     },
     Error(String),
     Standard {

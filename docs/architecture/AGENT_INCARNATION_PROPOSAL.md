@@ -57,7 +57,7 @@ The first runtime substrate for the incarnation model now exists:
 
 This slice is intentionally narrower than the full proposal:
 
-- role definitions exist, but `ConfigureRole` is not implemented yet
+- role definitions exist and `ConfigureRole` is implemented
 - `abstract_skill` records now exist in the Context Graph with the first built-in handoff/governance skill seeds, but role skill posture is not assembled into sessions yet
 - active route selection exists, and unregistered active-incarnation targets now fall back to a live orchestrator when one is present
 - the first parked-delivery/on-demand materialization path exists for inbound agent tasks

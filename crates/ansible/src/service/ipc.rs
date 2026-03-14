@@ -2254,6 +2254,74 @@ impl IpcServer {
                     )
                 }
             }
+            IpcRequest::ConfigureRole {
+                agent_id,
+                role_name,
+                guest_id,
+                toolset_profile,
+                role_identity_addendum,
+                inactive_ttl_seconds,
+                iteration_cap,
+                approval_policy,
+                model_profile,
+                context_window_policy,
+            } => {
+                let Some(identity) = current_identity.as_ref() else {
+                    return IpcResponse::error(
+                        "configure_role",
+                        "CONFIGURE_UNREGISTERED",
+                        "guest must register before configuring roles",
+                    );
+                };
+                if identity.role != "orchestrator" {
+                    return IpcResponse::error(
+                        "configure_role",
+                        "CONFIGURE_FORBIDDEN",
+                        "only orchestrator guests may configure role incarnations",
+                    );
+                }
+                if !identity.guest_id.starts_with(&agent_id) {
+                    return IpcResponse::error(
+                        "configure_role",
+                        "CONFIGURE_FORBIDDEN",
+                        "orchestrator guests may only configure roles for their own agent identity",
+                    );
+                }
+                
+                let record = ansible_mesh_core::graph::RoleIncarnationRecord {
+                    agent_id: agent_id.clone(),
+                    role_name: role_name.clone(),
+                    guest_id,
+                    toolset_profile,
+                    role_identity_addendum,
+                    inactive_ttl_seconds,
+                    turn_loop_config: ansible_mesh_core::graph::TurnLoopConfig {
+                        iteration_cap,
+                        approval_policy,
+                        model_profile,
+                        context_window_policy,
+                    },
+                };
+
+                if let Err(e) = graph.upsert_role_incarnation(&record) {
+                    warn!("Failed to persist role config [{}]: {}", role_name, e);
+                    return IpcResponse::error(
+                        "configure_role",
+                        "ROLE_PERSIST_FAILED",
+                        format!("Failed to persist role config: {e}"),
+                    );
+                }
+
+                info!(
+                    agent_id = %agent_id,
+                    role_name = %role_name,
+                    "Role incarnation configured via IPC"
+                );
+
+                IpcResponse::ConfigureRoleOk {
+                    role_name,
+                }
+            }
             IpcRequest::RegisterSkill {
                 skill_name,
                 description,
@@ -8314,6 +8382,131 @@ mod tests {
         let (active, lease) = expect_telegram_poll_status(status);
         assert!(!active);
         assert!(lease.is_none());
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn configure_role_persists_config_successfully() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _) = mpsc::channel(8);
+        let graph: Arc<dyn ansible_mesh_core::storage::GraphStorage> = Arc::new(TestGraphStorage);
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-ansible-01",
+            dispatcher_tx,
+            graph,
+        );
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut orchestrator = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane-01:orchestrator".into(),
+            role: "orchestrator".into(),
+            supported_tools: vec![],
+        })
+        .await
+        .expect("orchestrator connect");
+
+        let resp = orchestrator
+            .send_request(IpcRequest::ConfigureRole {
+                agent_id: "agent-jane-01".into(),
+                role_name: "developer".into(),
+                guest_id: "agent-jane-01:developer".into(),
+                toolset_profile: "developer".into(),
+                role_identity_addendum: Some("Addendum".into()),
+                inactive_ttl_seconds: Some(60),
+                iteration_cap: Some(10),
+                approval_policy: Some("auto".into()),
+                model_profile: Some("fast".into()),
+                context_window_policy: Some("standard".into()),
+            })
+            .await
+            .expect("configure request");
+
+        match resp {
+            IpcResponse::ConfigureRoleOk { role_name } => assert_eq!(role_name, "developer"),
+            other => panic!("expected ConfigureRoleOk, got {:?}", other),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn configure_role_forbids_configuring_other_identities() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _) = mpsc::channel(8);
+        let graph: Arc<dyn ansible_mesh_core::storage::GraphStorage> = Arc::new(TestGraphStorage);
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-ansible-01",
+            dispatcher_tx,
+            graph,
+        );
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut orchestrator = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane-01:orchestrator".into(),
+            role: "orchestrator".into(),
+            supported_tools: vec![],
+        })
+        .await
+        .expect("orchestrator connect");
+
+        let resp = orchestrator
+            .send_request(IpcRequest::ConfigureRole {
+                agent_id: "agent-bob-01".into(), // Different agent!
+                role_name: "developer".into(),
+                guest_id: "agent-bob-01:developer".into(),
+                toolset_profile: "developer".into(),
+                role_identity_addendum: None,
+                inactive_ttl_seconds: None,
+                iteration_cap: None,
+                approval_policy: None,
+                model_profile: None,
+                context_window_policy: None,
+            })
+            .await
+            .expect("configure request");
+
+        match resp {
+            IpcResponse::Standard { ok, code, .. } => {
+                assert!(!ok);
+                assert_eq!(code, "CONFIGURE_FORBIDDEN");
+            }
+            other => panic!("expected Error, got {:?}", other),
+        }
 
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
