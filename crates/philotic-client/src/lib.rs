@@ -121,6 +121,92 @@ pub struct SubagentCompletionContract {
     pub requires_parent_ack: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookKind {
+    Progress,
+    TurnStarted,
+    ToolCall,
+    TurnCompleted,
+    ApprovalNeeded,
+}
+
+/// Where a hook event is routed when it fires.
+/// The delegation skill owns this decision — infrastructure does not hardcode it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+pub enum HookRoute {
+    /// Deliver to the persona agent that spawned this subagent (default).
+    PersonaAgent,
+    /// Deliver to any currently active role with this name on the mesh.
+    Role { role_name: String },
+    /// Do not deliver; fire locally for side-effects only (requires `handler_skill`).
+    Discard,
+}
+
+impl Default for HookRoute {
+    fn default() -> Self {
+        Self::PersonaAgent
+    }
+}
+
+/// A single hook subscription declared by the delegation skill.
+/// If a hook is listed here it fires. If it is not listed it does not fire.
+/// Every subscription must resolve to a valid handler — either a route that
+/// can respond, or an explicit local `handler_skill` for Discard routes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookSubscription {
+    pub hook_kind: HookKind,
+    #[serde(default)]
+    pub route: HookRoute,
+    /// Skill ID of the local handler to invoke, required when `route` is Discard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handler_skill: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdleBehavior {
+    Terminate,
+    NotifyPersona,
+    AutoRenew,
+}
+
+impl Default for IdleBehavior {
+    fn default() -> Self {
+        Self::Terminate
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentLeaseTerms {
+    pub ttl_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renewal_interval_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_lifetime_seconds: Option<u64>,
+    pub idle_behavior: IdleBehavior,
+}
+
+impl Default for SubagentLeaseTerms {
+    fn default() -> Self {
+        Self {
+            ttl_seconds: 300,
+            renewal_interval_seconds: None,
+            max_lifetime_seconds: None,
+            idle_behavior: IdleBehavior::Terminate,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SpawnSubagentDelta {
+    pub requested_ttl: u64,
+    pub confirmed_ttl: u64,
+    pub requested_max_lifetime: Option<u64>,
+    pub confirmed_max_lifetime: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SubagentDelegation {
     pub parent_agent_id: String,
@@ -142,6 +228,18 @@ pub struct SubagentDelegation {
     pub ttl_seconds: Option<u64>,
     #[serde(default)]
     pub completion_contract: SubagentCompletionContract,
+    #[serde(default)]
+    pub lease_terms: SubagentLeaseTerms,
+    /// Declared hook subscriptions — only hooks listed here will fire.
+    /// Each subscription owns its own routing decision.
+    #[serde(default)]
+    pub hook_subscriptions: Vec<HookSubscription>,
+    /// Where to route the `subagent.complete` event. Defaults to PersonaAgent.
+    #[serde(default)]
+    pub completion_route: HookRoute,
+    /// Where to route the `subagent.failed` event. Defaults to PersonaAgent.
+    #[serde(default)]
+    pub failure_route: HookRoute,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -255,6 +353,57 @@ pub enum IpcRequest {
         session_id: String,
         delegation: SubagentDelegation,
     },
+    AssignSubagentTask {
+        subagent_guest_id: String,
+        lease_epoch: u64,
+        delegation: SubagentDelegation,
+    },
+    RenewSubagentLease {
+        subagent_guest_id: String,
+        lease_epoch: u64,
+    },
+    ReleaseSubagent {
+        subagent_guest_id: String,
+    },
+    FireSubagentHook {
+        subagent_guest_id: String,
+        hook_kind: HookKind,
+        payload: serde_json::Value,
+    },
+    AcceptSubagentLease {
+        subagent_guest_id: String,
+    },
+    AbortSubagentSpawn {
+        subagent_guest_id: String,
+    },
+    /// Register a delegation skill with the hotel.
+    ///
+    /// The hotel validates the skill definition via Layer 1 validation and writes
+    /// it to the context graph as an `abstract_skill` node. Returns
+    /// [`IpcResponse::SkillRegistered`] on success (even if validation fails —
+    /// the registration always writes; the state reflects the validation outcome).
+    RegisterSkill {
+        skill_name: String,
+        description: String,
+        /// The subagent worker kind (e.g. `"agent-worker"`).
+        subagent_kind: String,
+        /// High-level goal statement for this skill.
+        goal: String,
+        #[serde(default)]
+        allowed_tools: Vec<String>,
+        #[serde(default)]
+        allowed_classes: Vec<String>,
+        #[serde(default)]
+        hook_subscriptions: Vec<HookSubscription>,
+        #[serde(default)]
+        completion_route: HookRoute,
+        #[serde(default)]
+        failure_route: HookRoute,
+        #[serde(default)]
+        idle_behavior: IdleBehavior,
+        #[serde(default)]
+        lease_terms: SubagentLeaseTerms,
+    },
     ListRoleIncarnations {
         agent_id: String,
     },
@@ -310,6 +459,29 @@ pub enum IpcResponse {
     HandoffBackAck {
         handoff_guest_id: String,
         became_active: bool,
+    },
+    SpawnSubagentOk {
+        subagent_guest_id: String,
+        confirmed_lease: LeaseEnvelope,
+    },
+    SpawnSubagentProposal {
+        subagent_guest_id: String,
+        confirmed_lease: LeaseEnvelope,
+        delta: SpawnSubagentDelta,
+    },
+    SubagentLeaseRenewed {
+        subagent_guest_id: String,
+        new_epoch: u64,
+        expires_at: u64,
+    },
+    /// Response to [`IpcRequest::RegisterSkill`].
+    SkillRegistered {
+        skill_name: String,
+        /// `"validated"` | `"invalid"` | `"draft"` depending on Layer 1 outcome.
+        validation_state: String,
+        /// Human-readable summary of any validation errors; empty on success.
+        #[serde(default)]
+        validation_errors: Vec<String>,
     },
     InboundTask {
         source_node: String,

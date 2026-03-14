@@ -959,6 +959,28 @@ impl GraphStorage for SqliteGraphStorage {
         Ok(())
     }
 
+    fn set_guest_active(&self, hotel_name: &str, guest_id: &str, active: bool) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE materialized_guests SET is_active = ?1 WHERE hotel_name = ?2 AND guest_id = ?3",
+            params![active, hotel_name, guest_id],
+        )?;
+        drop(conn);
+
+        let guest_key = Self::guest_node_key(hotel_name, guest_id);
+        if let Some(node) = self.adapter.get_node(&guest_key)? {
+            let mut guest: GuestRecord = serde_json::from_value(node.data)?;
+            guest.is_active = active;
+            self.adapter.upsert_node(&GraphNode {
+                node_key: guest_key,
+                kind: "guest".into(),
+                label: Some(guest.guest_id.clone()),
+                data: serde_json::to_value(guest)?,
+            })?;
+        }
+        Ok(())
+    }
+
     fn seed_guests(&self, hotel_name: &str, guests: &[GuestRecord]) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         for g in guests {

@@ -183,9 +183,12 @@ Seam IDs: `role-incarnation-records`, `active-membrane-routing`, `handoff-skill`
 - [ ] Keep concurrent role materialization explicitly conditional; do not let TTL/rematerialization policy silently become the default role ontology.
 
 ### Workers / Subagents
-- [ ] Implement `SpawnSubagent` execution and async result routing back to parent incarnation.
+- [x] Implement `SpawnSubagent` execution and async result routing back to parent incarnation (Block D — lease + hook registries; `SpawnSubagentOk`/`SpawnSubagentProposal` responses).
 - [x] Thread the first compatibility-first `SpawnSubagent` request boundary through shared IPC with explicit structured `SUBAGENT_NOT_IMPLEMENTED` hotel rejection.
-- [ ] Add `PHILOTIC_AGENT_MODE=subagent` one-shot runtime mode to `agent-core`.
+- [x] Split `agent-core` into lib + `agent-core` (persona) + `agent-worker` (subagent worker) binaries; define `AgentDriver` trait (Block E).
+- [x] Add `skill.register` IPC handler in hotel (`RegisterSkill` → Layer 1 validate → `AbstractSkillRecord` persist → `SkillRegistered` response) (Block F).
+- [x] Add `skill.register` and `subagent.spawn` tools to abstract tool catalog + `is_local_agent_tool()` + `execute_local_agent_tool()` IPC dispatch (Block F).
+- [x] Fix subagent spawn path: add `PHILOTIC_AGENT_ID` to worker env in `config_json`; add `set_guest_active` to `GraphStorage`; deactivate guest on `ReleaseSubagent` to stop supervisor respawn loop. (`PHILOTIC_AGENT_MODE=subagent` superseded by the `agent-worker` binary split in Block E.)
 - [ ] Add `/abandon` slash command; deliver `FailTask` summary to parent on abandonment.
 - [x] Define the first compatibility-first `SubagentDelegation` contract and parent-side builder:
   - parent role
@@ -442,8 +445,8 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 - [ ] On rematerialization: hotel sends session snapshot to restore working memory from Tier 2.
 
 ### Workers / Subagents
-- [ ] Implement `SpawnSubagent` IPC and async result routing back to parent incarnation.
-- [ ] Add `PHILOTIC_AGENT_MODE=subagent` one-shot runtime mode to `agent-core`.
+- [x] Implement `SpawnSubagent` IPC and async result routing back to parent incarnation (see main Workers section above).
+- [x] Fix subagent spawn path (see main Workers section above).
 - [ ] Add `/abandon` slash command; deliver `FailTask` summary to parent on abandonment.
 
 ### Memory

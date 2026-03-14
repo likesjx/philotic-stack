@@ -840,6 +840,7 @@ fn graph_storage_abstract_skill_round_trip() {
         skill_name: "handoff.to_role".into(),
         description: "Hand off to a specialist role once the target is justified.".into(),
         implied_tools: vec!["session.status".into()],
+        ..Default::default()
     };
 
     store.upsert_abstract_skill(&skill).unwrap();

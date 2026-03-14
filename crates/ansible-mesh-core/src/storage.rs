@@ -200,6 +200,9 @@ pub trait GraphStorage: Send + Sync {
     /// Update the `active_pid` column for a guest.
     fn set_guest_pid(&self, hotel_name: &str, guest_id: &str, pid: Option<&str>) -> Result<()>;
 
+    /// Update the `is_active` flag for a guest (e.g. mark released subagents inactive).
+    fn set_guest_active(&self, hotel_name: &str, guest_id: &str, active: bool) -> Result<()>;
+
     /// Bulk-insert or replace guest rows (used during initial seeding).
     fn seed_guests(&self, hotel_name: &str, guests: &[GuestRecord]) -> Result<()>;
 

@@ -131,6 +131,97 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
     );
 
     m.insert(
+        "skill.register".into(),
+        ToolDefinition {
+            tool_name: "skill.register".into(),
+            description: "Registers a new delegation skill in the hotel's shared skill catalog. \
+                          A delegation skill defines a reusable subagent role with a goal template, \
+                          allowed tools, and lifecycle configuration. The hotel validates the skill \
+                          structurally and returns the validation outcome. Once registered, the skill \
+                          can be referenced by name when spawning subagents."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "skill_name": {
+                        "type": "string",
+                        "description": "Stable identifier for the skill. Lowercase alphanumeric, \
+                                        hyphens, and underscores only. Max 64 characters."
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Human-readable description of what the skill does. Max 2048 characters."
+                    },
+                    "subagent_kind": {
+                        "type": "string",
+                        "description": "The role name of the subagent worker this skill delegates to \
+                                        (e.g., 'agent-worker')."
+                    },
+                    "goal": {
+                        "type": "string",
+                        "description": "Goal template injected into the subagent context when this \
+                                        skill is invoked. May include placeholders."
+                    },
+                    "allowed_tools": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional list of tool IDs the subagent is permitted to use."
+                    },
+                    "allowed_classes": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional list of tool class names the subagent may use \
+                                        (e.g., 'utility', 'workspace')."
+                    }
+                },
+                "required": ["skill_name", "description", "subagent_kind", "goal"]
+            }),
+            class: Some("capability".into()),
+        },
+    );
+
+    m.insert(
+        "subagent.spawn".into(),
+        ToolDefinition {
+            tool_name: "subagent.spawn".into(),
+            description: "Spawns a new subagent worker in the hotel. The subagent runs \
+                          independently with its own lease and model turn budget. Use this to \
+                          delegate a discrete, self-contained task to a worker process. The hotel \
+                          responds with the subagent's guest ID and confirmed lease details."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "goal": {
+                        "type": "string",
+                        "description": "The mission goal text delivered to the subagent."
+                    },
+                    "subagent_kind": {
+                        "type": "string",
+                        "description": "The worker role to spawn. Defaults to 'agent-worker'."
+                    },
+                    "context_summary": {
+                        "type": "string",
+                        "description": "Optional context summary paragraph handed to the subagent \
+                                        as background knowledge."
+                    },
+                    "allowed_tools": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional list of tool IDs the subagent may use."
+                    },
+                    "iteration_budget": {
+                        "type": "integer",
+                        "description": "Maximum model-turn iterations for the subagent. Defaults to 5."
+                    }
+                },
+                "required": ["goal"]
+            }),
+            class: Some("capability".into()),
+        },
+    );
+
+    m.insert(
         "agent.configure".into(),
         ToolDefinition {
             tool_name: "agent.configure".into(),

@@ -14,6 +14,7 @@ related_docs:
   - DOMAIN_MAP.md
   - ARCHITECTURE_STATUS.md
   - DOC_TAGGING_FRONTMATTER_PROPOSAL.md
+  - GLOSSARY.md
 task_refs:
   - docs/task.md
 ---

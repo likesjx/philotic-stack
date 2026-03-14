@@ -2,7 +2,7 @@
 title: "Governed Workflow Skills Proposal"
 doc_type: proposal
 domain: runtime-sessions
-status: proposed
+status: accepted — current slice
 last_updated: 2026-03-13
 tags:
   - workflows
@@ -18,6 +18,7 @@ related_docs:
   - MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md
   - CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md
   - ARCHITECTURE_STATUS.md
+  - SKILL_LIFECYCLE_PROPOSAL.md
 task_refs:
   - docs/task.md
 proposal_id: governed-workflow-skills
@@ -74,7 +75,7 @@ It should stay generic and role-native by default. Do not jump straight to one b
 
 ## Disposition
 
-`proposed`
+`accepted — current slice`
 
 ## Current Slice
 
@@ -84,13 +85,22 @@ The graph now has the first `AbstractSkillRecord` substrate plus seeded entries 
 - `handoff.back`
 - `role.governance`
 
+The lifecycle and validation model for delegation skills is now fully defined in [SKILL_LIFECYCLE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SKILL_LIFECYCLE_PROPOSAL.md). That document owns: the `draft → validated → registered → active → deprecated / invalid / suspended` state machine, the three validation layers, `HookKind`, `IdleBehavior`, `SubagentLeaseTerms`, the updated required `SubagentDelegation` fields, new IPC verbs and responses, the field sourcing map, and the `skill-creator` meta-skill and tool contracts.
+
+`WorkflowSkillRecord` now gains:
+
+- `validation_state: SkillValidationState` — current position in the lifecycle state machine
+- `field_sources: HashMap<String, String>` — sourcing map snapshot recording which source type resolved each field at registration time
+- `source_snapshot: SkillSourceSnapshot` — frozen `mesh_catalog_version`, `hotel_policy_version`, `registered_at`, and `registered_by` captured at the moment of registration
+
 What is still missing:
 
-- a dedicated `WorkflowSkillRecord`
-- governed lifecycle metadata for workflow skills
-- role metadata inputs for target selection
+- a dedicated full `WorkflowSkillRecord` persisted separately from `AbstractSkillRecord` (currently lifecycle fields extend the shared record)
+- role metadata inputs for target selection in `handoff.to_role`
 - explicit peer-delegation and external-cognitive-peer variants
 - invocation/runtime enforcement beyond current handoff IPC
+- Layer 2 mesh-capability validation wired in hotel
+- `skill-creator` meta-skill materialization and authorization gate enforcement
 
 Important design shift:
 

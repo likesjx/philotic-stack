@@ -592,6 +592,19 @@ fn first_line_summary(text: &str) -> String {
         .unwrap_or_else(|| "empty".into())
 }
 
+/// Lightweight tracking record for a subagent spawned during this session.
+///
+/// Persisted in [`SessionState::active_subagents`] on every successful
+/// `subagent.spawn` so subsequent tools (`subagent.release`, `subagent.abort`,
+/// `subagent.list`) can reference the guest by ID without re-querying the hotel.
+#[derive(Debug, Clone)]
+pub struct SpawnedSubagentRef {
+    pub guest_id: String,
+    pub kind: String,
+    pub lease_epoch: u64,
+    pub lease_expires_at: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionState {
     pub session_id: String,
@@ -607,6 +620,8 @@ pub struct SessionState {
     pub tool_assembly: ToolAssembly,
     pub recent_turns: Vec<TurnRecord>,
     pub active_turn: Option<WorkingTurn>,
+    /// Subagents spawned during this session that have not yet been released or aborted.
+    pub active_subagents: Vec<SpawnedSubagentRef>,
 }
 
 impl SessionState {
@@ -626,6 +641,7 @@ impl SessionState {
             bindings,
             recent_turns: Vec::new(),
             active_turn: None,
+            active_subagents: Vec::new(),
         }
     }
 
@@ -1890,6 +1906,7 @@ impl SessionState {
                 failure_summary_required: true,
                 requires_parent_ack: true,
             },
+            ..Default::default()
         }
     }
 
@@ -2155,6 +2172,7 @@ impl SessionState {
             tool_assembly,
             recent_turns,
             active_turn,
+            active_subagents: Vec::new(),
         })
     }
 }
@@ -2330,7 +2348,10 @@ fn default_visible_toolset(bindings: &SessionBindings) -> Vec<String> {
 }
 
 fn is_local_agent_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "session.status" | "agent.configure")
+    matches!(
+        tool_name,
+        "session.status" | "agent.configure" | "skill.register" | "subagent.spawn"
+    )
 }
 
 fn is_pinned_tool(tool_name: &str) -> bool {
