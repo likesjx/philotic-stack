@@ -2845,20 +2845,49 @@ impl IpcServer {
             .cloned()
             .unwrap_or(serde_json::Value::Null);
 
-        let bindings = session
+        let mut bindings = session
             .summary_json
             .get("bindings")
             .cloned()
             .unwrap_or_else(|| serde_json::json!({}));
-        let role_activation = session
+
+        let active_role_record = session
             .active_incarnation_id
             .as_deref()
             .and_then(|active_incarnation_id| {
                 let agent_id = session.primary_agent_id.as_deref()?;
                 let roles = graph.list_role_incarnations(agent_id).ok()?;
-                let role_record = roles
+                roles
                     .into_iter()
-                    .find(|role| role.guest_id == active_incarnation_id)?;
+                    .find(|role| role.guest_id == active_incarnation_id)
+            });
+
+        if let Some(role_record) = &active_role_record {
+            let is_unseeded = bindings.get("effective_toolset").is_none()
+                && bindings.get("effective_skillset").is_none();
+            if is_unseeded {
+                if let Ok(Some(profile)) = graph.get_toolset_profile(&role_record.toolset_profile) {
+                    if let Some(obj) = bindings.as_object_mut() {
+                        obj.insert(
+                            "effective_toolset".to_string(),
+                            serde_json::json!(profile.allowed_tools),
+                        );
+                        obj.insert(
+                            "effective_skillset".to_string(),
+                            serde_json::json!(profile.allowed_skills),
+                        );
+                    } else {
+                        bindings = serde_json::json!({
+                            "effective_toolset": profile.allowed_tools,
+                            "effective_skillset": profile.allowed_skills,
+                        });
+                    }
+                }
+            }
+        }
+
+        let role_activation = active_role_record
+            .and_then(|role_record| {
                 let effective_skillset = bindings
                     .get("effective_skillset")
                     .and_then(serde_json::Value::as_array)
@@ -2872,7 +2901,7 @@ impl IpcServer {
                     .unwrap_or_default();
                 Some(serde_json::json!({
                     "role_name": role_record.role_name,
-                    "active_incarnation_id": active_incarnation_id,
+                    "active_incarnation_id": role_record.guest_id.clone(),
                     "activation_reason": "session_active_incarnation",
                     "requested_by": "hotel_runtime",
                     "role_addendum": role_record.role_identity_addendum,

@@ -427,7 +427,7 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 - [ ] Add `RoleIncarnationRecord` and `TurnLoopConfig` to the context graph (`role_incarnation` node kind).
 - [ ] Add `upsert_role_incarnation` / `get_role_incarnation` / `list_role_incarnations` to `GraphStorage`.
 - [x] Add `ConfigureRole` IPC action (orchestrator → hotel); hotel enforces orchestrator-only writes.
-- [ ] Seed session bindings from the role's `toolset_profile` when a role incarnation session is initialized.
+- [x] Seed session bindings from the role's `toolset_profile` when a role incarnation session is initialized.
 
 ### Active Membrane Routing
 - [ ] Add `active_incarnation_id` to `SessionRecord` in the Context Graph.
