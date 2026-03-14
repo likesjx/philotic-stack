@@ -1,5 +1,5 @@
 use ansible_mesh_core::beacon::BeaconDaemon;
-use ansible_mesh_core::graph::{AbstractSkillRecord, AbstractToolRecord};
+use ansible_mesh_core::graph::{AbstractSkillRecord, AbstractToolRecord, ToolsetProfileRecord};
 use ansible_mesh_core::heartbeat::emit_heartbeat;
 use ansible_mesh_core::registry::{CapabilityAdvertisement, ExecutionReachability};
 use ansible_mesh_core::storage::{
@@ -1044,6 +1044,61 @@ fn seed_abstract_skill_catalog(graph: &dyn GraphStorage) -> anyhow::Result<()> {
 
     for skill in &catalog {
         graph.upsert_abstract_skill(skill)?;
+    }
+    Ok(())
+}
+
+fn seed_toolset_profiles(graph: &dyn GraphStorage) -> anyhow::Result<()> {
+    let profiles = [
+        ToolsetProfileRecord {
+            profile_name: "orchestrator".into(),
+            allowed_tools: vec![
+                "session.status".into(),
+                "echo".into(),
+                "agent.configure".into(),
+                "skill.register".into(),
+                "subagent.spawn".into(),
+                "workspace.list".into(),
+                "workspace.read".into(),
+            ],
+            allowed_classes: vec!["session".into(), "utility".into(), "config".into()],
+            allowed_skills: vec![
+                "handoff.to_role".into(),
+                "handoff.back".into(),
+                "role.governance".into(),
+            ],
+            description: Some("Default orchestrator role profile.".into()),
+        },
+        ToolsetProfileRecord {
+            profile_name: "codex".into(),
+            allowed_tools: vec![
+                "session.status".into(),
+                "echo".into(),
+                "workspace.list".into(),
+                "workspace.read".into(),
+            ],
+            allowed_classes: vec!["session".into(), "utility".into(), "workspace".into()],
+            allowed_skills: vec!["handoff.back".into()],
+            description: Some("Codex specialist role profile — workspace read access.".into()),
+        },
+        ToolsetProfileRecord {
+            profile_name: "research".into(),
+            allowed_tools: vec!["session.status".into(), "echo".into()],
+            allowed_classes: vec!["session".into(), "utility".into()],
+            allowed_skills: vec!["handoff.back".into()],
+            description: Some("Research specialist role profile — minimal tool surface.".into()),
+        },
+        ToolsetProfileRecord {
+            profile_name: "utility".into(),
+            allowed_tools: vec!["session.status".into(), "echo".into()],
+            allowed_classes: vec!["session".into(), "utility".into()],
+            allowed_skills: Vec::new(),
+            description: Some("Bare utility profile — session and echo only.".into()),
+        },
+    ];
+
+    for profile in &profiles {
+        graph.upsert_toolset_profile(profile)?;
     }
     Ok(())
 }
@@ -2988,6 +3043,7 @@ async fn main() -> Result<()> {
 
     seed_abstract_tool_catalog(&graph_storage)?;
     seed_abstract_skill_catalog(&graph_storage)?;
+    seed_toolset_profiles(&graph_storage)?;
 
     if let Some(test) = startup_test {
         prepare_startup_test_binaries(test)?;
