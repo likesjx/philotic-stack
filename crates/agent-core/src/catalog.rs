@@ -33,7 +33,7 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
     match skill_name {
         "handoff.to_role" => &["session.status"],
         "handoff.back" => &["session.status"],
-        "role.governance" => &["session.status", "agent.configure"],
+        "role.governance" => &["session.status", "agent.configure", "role.configure"],
         _ => &[],
     }
 }
@@ -274,6 +274,66 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                 "required": ["config_path", "value"]
             }),
             class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "role.configure".into(),
+        ToolDefinition {
+            tool_name: "role.configure".into(),
+            description: "Create or update a role incarnation for the current agent identity. \
+                          Requires reasoning about: purpose, toolset, skillset, handoff posture, \
+                          and limits (TTL, iteration caps). Only the orchestrator can use this tool."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "role_name": {
+                        "type": "string",
+                        "description": "The name of the role (e.g. 'developer', 'researcher')."
+                    },
+                    "toolset_profile": {
+                        "type": "string",
+                        "description": "The profile name determining default tools/skills (e.g. 'codex', 'research', 'utility')."
+                    },
+                    "role_identity_addendum": {
+                        "type": "string",
+                        "description": "Additive persona/identity instructions for this specific role."
+                    },
+                    "inactive_ttl_seconds": {
+                        "type": "integer",
+                        "description": "Seconds of inactivity before the role is suspended/terminated."
+                    },
+                    "iteration_cap": {
+                        "type": "integer",
+                        "description": "Maximum model-turn iterations allowed for this role before it must return or stop."
+                    },
+                    "approval_policy": {
+                        "type": "string",
+                        "description": "Stringified JSON describing the approval policy structure."
+                    },
+                    "model_profile": {
+                        "type": "string",
+                        "description": "Stringified JSON describing model preferences (provider, temperature)."
+                    },
+                    "context_window_policy": {
+                        "type": "string",
+                        "description": "Stringified JSON describing context packaging rules."
+                    },
+                    "reasoning": {
+                        "type": "object",
+                        "description": "Required reasoning for this role's existence, purpose, and capability posture.",
+                        "properties": {
+                            "purpose": { "type": "string" },
+                            "toolset_rationale": { "type": "string" },
+                            "handoff_posture_and_limits": { "type": "string" }
+                        },
+                        "required": ["purpose", "toolset_rationale", "handoff_posture_and_limits"]
+                    }
+                },
+                "required": ["role_name", "toolset_profile", "reasoning"]
+            }),
+            class: Some("capability".into()),
         },
     );
 

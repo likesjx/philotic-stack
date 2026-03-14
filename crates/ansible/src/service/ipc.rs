@@ -3520,7 +3520,10 @@ fn remote_available_capacity(advertisement: &CapabilityAdvertisement) -> i64 {
 }
 
 fn is_local_agent_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "session.status")
+    matches!(
+        tool_name,
+        "session.status" | "agent.configure" | "skill.register" | "subagent.spawn" | "role.configure"
+    )
 }
 
 fn is_pinned_tool(tool_name: &str) -> bool {

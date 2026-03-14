@@ -3117,6 +3117,102 @@ impl AgentRuntime {
                 })
                 .await
             }
+            "role.configure" => {
+                let args = &payload.arguments;
+
+                macro_rules! require_str_arg {
+                    ($key:literal) => {
+                        match args.get($key).and_then(|v| v.as_str()) {
+                            Some(s) => s.to_string(),
+                            None => {
+                                return self
+                                    .fail_active_turn(
+                                        payload.session_id,
+                                        payload.turn_id,
+                                        format!(
+                                            "role.configure: missing required argument '{}'",
+                                            $key
+                                        ),
+                                    )
+                                    .await;
+                            }
+                        }
+                    };
+                }
+
+                let role_name = require_str_arg!("role_name");
+                let toolset_profile = require_str_arg!("toolset_profile");
+
+                if let None = args.get("reasoning").and_then(|v| v.as_object()) {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "role.configure: missing required object argument 'reasoning'".into(),
+                        )
+                        .await;
+                }
+
+                let role_identity_addendum = args.get("role_identity_addendum").and_then(|v| v.as_str()).map(str::to_string);
+                let inactive_ttl_seconds = args.get("inactive_ttl_seconds").and_then(|v| v.as_u64());
+                let iteration_cap = args.get("iteration_cap").and_then(|v| v.as_u64()).map(|v| v as u32);
+                let approval_policy = args.get("approval_policy").and_then(|v| v.as_str()).map(str::to_string);
+                let model_profile = args.get("model_profile").and_then(|v| v.as_str()).map(str::to_string);
+                let context_window_policy = args.get("context_window_policy").and_then(|v| v.as_str()).map(str::to_string);
+
+                let req = IpcRequest::ConfigureRole {
+                    agent_id: self.agent_id.clone(),
+                    role_name: role_name.clone(),
+                    guest_id: format!("{}:{}", self.agent_id, role_name),
+                    toolset_profile,
+                    role_identity_addendum,
+                    inactive_ttl_seconds,
+                    iteration_cap,
+                    approval_policy,
+                    model_profile,
+                    context_window_policy,
+                };
+
+                let content = match self.ipc_client.send_request(req).await {
+                    Ok(IpcResponse::ConfigureRoleOk { role_name: name }) => {
+                        format!("Successfully configured role incarnation for '{}'.", name)
+                    }
+                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                        format!("role.configure failed [{code}]: {message}")
+                    }
+                    Ok(IpcResponse::Error(msg)) => {
+                        format!("role.configure IPC error: {msg}")
+                    }
+                    Ok(_) => "role.configure: unexpected hotel response.".to_string(),
+                    Err(e) => format!("role.configure: IPC transport error — {e}"),
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(content),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: None,
+                    tool_name: Some(payload.tool_name),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                })
+                .await
+            }
             "skill.register" => {
                 let args = &payload.arguments;
 

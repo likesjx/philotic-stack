@@ -1024,20 +1024,20 @@ fn seed_abstract_skill_catalog(graph: &dyn GraphStorage) -> anyhow::Result<()> {
     let catalog = [
         AbstractSkillRecord {
             skill_name: "handoff.to_role".into(),
-            description: "Assess whether the current session should be handed off to a named specialist role, summarize the goal clearly, and only hand off once the target role is justified.".into(),
-            implied_tools: Vec::new(),
+            description: "Handoff to a specialist role cleanly, explicitly transferring context, goals, and known constraints so the target can start work immediately without thrashing.".into(),
+            implied_tools: vec!["session.status".into()],
             ..Default::default()
         },
         AbstractSkillRecord {
             skill_name: "handoff.back".into(),
             description: "Return a session from a specialist role back to the orchestrator with a concise summary of completed work, open questions, and the next recommended action.".into(),
-            implied_tools: Vec::new(),
+            implied_tools: vec!["session.status".into()],
             ..Default::default()
         },
         AbstractSkillRecord {
             skill_name: "role.governance".into(),
             description: "Govern role definitions deliberately for the current agent identity, reasoning explicitly about purpose, capability posture, handoff behavior, and limits before proposing changes.".into(),
-            implied_tools: Vec::new(),
+            implied_tools: vec!["session.status".into(), "agent.configure".into(), "role.configure".into()],
             ..Default::default()
         },
     ];
