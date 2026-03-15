@@ -1,30 +1,78 @@
 name: Release
 
-# Triggers on semver tags: v0.1.0, v1.2.3, etc.
-# What this workflow does:
-#   1. Builds release binaries for darwin-arm64, darwin-x86_64, and linux-x86_64
-#   2. Creates a GitHub Release with binaries and SHA256 checksums
-#   3. Opens a PR on likesjx/homebrew-philotic to bump the formula version
+# Tag convention:
+#   v1.0.0              → stable release   — must be tagged from main
+#   v1.0.0-alpha.1      → alpha pre-release — must be tagged from develop
+#   v1.0.0-beta.1       → beta pre-release  — must be tagged from develop
+#   v1.0.0-rc.1         → release candidate — must be tagged from develop
+#
+# What each tag type does:
+#   stable:     build → GitHub Release → bump Homebrew tap
+#   pre-release: build → GitHub Release (marked pre-release) → tap unchanged
 #
 # Prerequisites (one-time setup):
 #   - Create a GitHub PAT with `repo` scope on likesjx/homebrew-philotic
 #   - Add it as a secret named TAP_GITHUB_TOKEN on this repo
 #
-# To cut a release:
-#   git tag v0.1.0 && git push origin v0.1.0
+# To cut a pre-release (from develop):
+#   git tag v0.2.0-alpha.1 && git push origin v0.2.0-alpha.1
+#
+# To cut a stable release (from main):
+#   git tag v0.2.0 && git push origin v0.2.0
 
 on:
   push:
     tags:
-      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+"           # stable:     v1.0.0
+      - "v[0-9]+.[0-9]+.[0-9]+-alpha.*"   # alpha:      v1.0.0-alpha.1
+      - "v[0-9]+.[0-9]+.[0-9]+-beta.*"    # beta:       v1.0.0-beta.1
+      - "v[0-9]+.[0-9]+.[0-9]+-rc.*"      # candidate:  v1.0.0-rc.1
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # ── Guard: enforce branch discipline ────────────────────────────────────────
+  # Stable tags must come from main. Pre-release tags must come from develop.
+  validate-branch:
+    name: Validate tag source branch
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check branch for tag
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          IS_PRERELEASE=false
+          [[ "$TAG" == *-alpha* || "$TAG" == *-beta* || "$TAG" == *-rc* ]] && IS_PRERELEASE=true
+
+          # Find which branches contain this tag's commit
+          BRANCHES=$(git branch -r --contains "$GITHUB_SHA" | sed 's|origin/||' | tr -d ' ')
+
+          if [ "$IS_PRERELEASE" = "false" ]; then
+            if echo "$BRANCHES" | grep -qx "main"; then
+              echo "✓ Stable tag $TAG is on main — OK"
+            else
+              echo "✗ Stable tag $TAG must be tagged from main."
+              echo "  Branches containing this commit: $BRANCHES"
+              exit 1
+            fi
+          else
+            if echo "$BRANCHES" | grep -qx "develop"; then
+              echo "✓ Pre-release tag $TAG is on develop — OK"
+            else
+              echo "✗ Pre-release tag $TAG must be tagged from develop."
+              echo "  Branches containing this commit: $BRANCHES"
+              exit 1
+            fi
+          fi
+
   # ── Build native binaries ────────────────────────────────────────────────────
   build:
     name: Build ${{ matrix.target }}
+    needs: validate-branch
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -58,8 +106,8 @@ jobs:
           key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ matrix.target }}-cargo-
 
-      # Build the operator CLI and hotel daemon
       # NOTE: update binary names here after ansible → aiua rename
+      # NOTE: add -p philotic-web once that crate exists
       - name: Build binaries
         run: |
           cargo build --release --target ${{ matrix.target }} \
@@ -72,24 +120,20 @@ jobs:
       - name: Package binaries
         shell: bash
         run: |
-          STAGING="philotic-${{ github.ref_name }}-${{ matrix.artifact }}"
+          TAG="${GITHUB_REF_NAME}"
+          STAGING="philotic-${TAG}-${{ matrix.artifact }}"
           mkdir -p "$STAGING"
 
-          # Copy built binaries
-          # NOTE: update binary names after rename
           for bin in ansible agent-core membrane model-router tool-runner; do
             [ -f "target/${{ matrix.target }}/release/$bin" ] && \
               cp "target/${{ matrix.target }}/release/$bin" "$STAGING/"
           done
 
-          # Include example config
           [ -f mesh-config.example.json ] && cp mesh-config.example.json "$STAGING/"
 
           tar czf "$STAGING.tar.gz" "$STAGING"
           sha256sum "$STAGING.tar.gz" > "$STAGING.tar.gz.sha256" 2>/dev/null || \
             shasum -a 256 "$STAGING.tar.gz" > "$STAGING.tar.gz.sha256"
-
-          echo "STAGING=$STAGING" >> $GITHUB_ENV
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
@@ -106,9 +150,22 @@ jobs:
     runs-on: ubuntu-22.04
     outputs:
       source_sha256: ${{ steps.source.outputs.sha256 }}
+      is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Release metadata
+        id: meta
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [[ "$TAG" == *-alpha* || "$TAG" == *-beta* || "$TAG" == *-rc* ]]; then
+            echo "is_prerelease=true" >> $GITHUB_OUTPUT
+            echo "channel=$(echo $TAG | grep -oP '(alpha|beta|rc)')" >> $GITHUB_OUTPUT
+          else
+            echo "is_prerelease=false" >> $GITHUB_OUTPUT
+            echo "channel=stable" >> $GITHUB_OUTPUT
+          fi
 
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
@@ -124,12 +181,12 @@ jobs:
             > "philotic-stack-$VERSION.tar.gz"
           SHA=$(sha256sum "philotic-stack-$VERSION.tar.gz" | cut -d' ' -f1)
           echo "sha256=$SHA" >> $GITHUB_OUTPUT
-          echo "version=$VERSION" >> $GITHUB_ENV
 
       - name: Collect release assets
         run: |
+          VERSION="${GITHUB_REF_NAME#v}"
           mkdir -p release-assets
-          cp "philotic-stack-${{ env.version }}.tar.gz" release-assets/
+          cp "philotic-stack-$VERSION.tar.gz" release-assets/
           find artifacts -name "*.tar.gz" -o -name "*.sha256" | \
             xargs -I{} cp {} release-assets/
 
@@ -139,16 +196,21 @@ jobs:
           files: release-assets/*
           generate_release_notes: true
           draft: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ steps.meta.outputs.is_prerelease }}
+          name: >-
+            ${{ steps.meta.outputs.is_prerelease
+              && format('{0} ({1})', github.ref_name, steps.meta.outputs.channel)
+              || github.ref_name }}
 
-  # ── Update Homebrew tap ──────────────────────────────────────────────────────
+  # ── Update Homebrew tap (stable releases only) ───────────────────────────────
   update-tap:
     name: Bump Homebrew formulae
     needs: release
+    # Only runs for stable releases — pre-release tags skip this entirely
+    if: needs.release.outputs.is_prerelease == 'false'
     runs-on: ubuntu-22.04
 
     steps:
-      # Bump aiua formula
       # NOTE: once philotic-web crate exists, add a second step for it
       - name: Bump aiua formula
         uses: mislav/bump-homebrew-formula-action@v3
