@@ -29,7 +29,6 @@ implements:
   - memory-engine-abstraction
 supersedes:
   - memory-engine-abstraction
-  - muninn-memory-protocol
 active_seams:
   - memory-core-sdk
   - memory-vault-topology
@@ -182,7 +181,9 @@ The practical consequence: Phase 1 ships MemoryEngine. An agent can remember, re
 
 ### The Thin Barrier: memory-core SDK
 
-The `memory-core` module is a typed client that sits between agent-core and MuninnDB. It is a translation layer, not a middleware. The name reflects that this is an abstraction over the memory substrate — MuninnDB is the primary (and likely sole) backend, but it is not a first-class name in the Philotic Stack's own interface surface.
+`memory-core` is a new crate in the workspace — a peer to `agent-core`, not a module inside it. One instance materializes per hotel (singleton within a hotel, like how the hotel daemon is singular). It is a managed guest, supervised by GuestManager and declared in `materialized_guests`, with its own IPC surface for agents that need to read or write memory.
+
+The crate is a typed client that sits between agent-core and MuninnDB. It is a translation layer, not a middleware. The name reflects that this is an abstraction over the memory substrate — MuninnDB is the primary (and likely sole) backend, but it is not a first-class name in the Philotic Stack's own interface surface.
 
 **What it does:**
 - Translates Philotic domain types to MuninnDB API calls (REST initially, MBP when validated)
@@ -224,15 +225,39 @@ In a multi-hotel deployment, each vault has a single **authoritative instance** 
 
 ### Memory Formation Pipeline
 
-Not every interaction becomes a durable memory. The pipeline models the neuroscience of encoding — sensory input passes through attentional filters before reaching long-term storage:
+Not every interaction becomes a durable memory. The pipeline models the neuroscience of encoding — sensory input passes through attentional filters before reaching long-term storage.
+
+#### What is and is not memory-eligible
+
+The reasoning path to get to a response — intermediate steps, hypotheses considered and rejected, chain-of-thought — is not memory-eligible. It is high-volume, low-signal, and the outcome supersedes it. What the agent *thought about* dies with the turn. What the agent *concluded, resolved, or observed about itself* is a memory candidate.
+
+Specifically, these things that arise *inside* a turn have durable cognitive value:
+- A **resolved contradiction** — the resolution is worth storing as a belief update; the deliberation path is not
+- A **metacognitive observation** — "I struggled with this class of question" is a `cognitive:meta` engram candidate
+- A **working hypothesis that solidified** — a belief formed mid-turn (e.g., about user preferences) is L1-eligible at turn-end
+- A **rejected approach with a reason** — has durable value for future turns
+
+This means the Attend step is not a separate LLM call over the full reasoning trace. It is a structured extraction from the turn's *outcomes*: what changed, what was decided, what was observed. That is a much smaller and cheaper operation.
+
+#### Relation lifetimes and working turn
+
+Turn-local relational structure — provisional associations, contradictions-in-flight, co-occurrence signals that arise during a single reasoning step — lives in `agent-core`'s `WorkingTurn` state, not in memory-core. It does not touch MuninnDB. At turn-end, anything that changed the agent's knowledge or beliefs is extracted by the Attend step and becomes an L2 write. The rest is discarded with the turn.
+
+This gives clean lifetime semantics:
+- **turn-local** → `WorkingTurn` in agent-core, never enters memory-core
+- **session-local** → L2 session vault
+- **candidate-durable** → L2 with selective promotion at session end
+- **durable** → L0 or L1
+
+#### Pipeline
 
 1. **Perceive** — agent-core turn loop captures raw turn content (sensory input)
-2. **Attend** — post-turn, identify memorable content: new facts, decisions, preferences, emotional valence (attentional filter)
+2. **Attend** — at turn-end, extract cognitive outcomes from `WorkingTurn`: resolved contradictions, solidified beliefs, metacognitive observations, rejected approaches with reasons. Not the reasoning path — only what changed.
 3. **Encode** — determine scope (L0/L1/L2), apply tags from lens conventions (encoding with context)
 4. **Consolidate** — memory-core checks for existing engrams with similar content (MuninnDB contradiction detection), resolves conflicts
 5. **Store** — `remember()` with vault routing + lens auto-tags (long-term potentiation)
 6. **Propagate** — emit `EventEnvelope(MemoryOp)` for L0 engrams (systems consolidation)
-7. **Associate** — create links to related engrams (Hebbian auto-linking — aggressive, never wait for confirmation)
+7. **Associate** — create links to related engrams (MuninnDB-internal Hebbian auto-linking)
 
 **Session-end promotion (synaptic → systems consolidation):** When a session ends, durable findings promote to L0 (user facts) or L1 (agent self-learnings). Task-specific context stays in the session vault and decays aggressively. This mirrors how the brain's hippocampus hands off consolidated memories to the cortex during rest.
 
@@ -552,7 +577,7 @@ memory:
 
 **MEMORY_ENGINE_ABSTRACTION_PROPOSAL** — This proposal implements and supersedes it. The abstraction boundary it called for (`search` / `store` / `explain`) is realized here as the MemoryEngine contract with richer semantics (remember, activate, link, traverse, subscribe, lens). The core insight — that memory should not collapse into one provider — is preserved through the capability boundary, even though MuninnDB is the intended first (and likely primary) backend.
 
-**MUNINN_MEMORY_PROTOCOL_PROPOSAL** — This proposal supersedes the protocol-level design. The MCP-based helper and skill remain valid for the SVE development cycle. The production path replaces MCP with direct MBP/REST integration via the memory-core SDK. The observations about retrieval quality, atomic memory granularity, and client bootstrap remain relevant and inform the memory formation pipeline design.
+**MUNINN_MEMORY_PROTOCOL_PROPOSAL** — This proposal does not supersede the SVE tooling or the MCP-based development habit. Those remain active and independent — they are how coding agents and operators interact with Muninn during the SVE development cycle, and that work has already surpassed expectations. This proposal defines the production Philotic-native integration path: a typed memory-core SDK, MuninnDB running as a hotel guest, and the full vault/stratum/lens/consolidation architecture as a first-class runtime concern. The two tracks coexist. The observations from SVE usage — retrieval quality, atomic memory granularity, the value of write-local recall — directly informed the design here and will continue to inform Phase 1 implementation.
 
 **PLUGGABLE_CONTEXT_ENGINE_PROPOSAL** — The Context Graph remains pluggable behind `Arc<dyn GraphStorage>`. This proposal does not change that. It separates cognitive memory out of the Context Graph entirely, clarifying the boundary between management-plane state and cognitive content.
 
@@ -637,4 +662,4 @@ MBP transport, materialization sync, and embedding integration.
 2. **Vault migration wire format** — When an agent's authoritative vault moves between MuninnDB instances, what is the checkpoint format? Implementation decision for coding agents.
 3. **Multi-user vault topology** — If an agent serves multiple users simultaneously, the access-tag approach (private/shared/team) is the starting point. Whether this eventually requires physical vault partitioning (separate `user:{user_id}` vaults with cross-vault fan-out) vs. tag-based filtering within a shared vault is a runtime scaling decision.
 4. **Consolidation observability surface** — What metrics does the consolidation subsystem expose? Engrams scanned/pruned/merged/promoted is the minimum. Whether this feeds into the platform's existing observability stack or needs its own dashboard is TBD.
-5. **Encoding decision logic** — The memory formation pipeline's "Attend" step (what is worth remembering?) is the most consequential runtime decision. The architecture places the decision point but does not prescribe the logic. This is likely LLM-driven and will need its own iteration cycle.
+5. **Encoding decision logic** — The Attend step extracts cognitive outcomes from `WorkingTurn` state at turn-end: resolved contradictions, solidified beliefs, metacognitive observations, rejected approaches. It operates on outcomes, not on the reasoning path. This is a structured extraction from a bounded state object, not a full-context LLM pass. The exact extraction logic — heuristic rules, lightweight model call, or a hybrid — is an implementation decision for Phase 1, but the input surface is well-defined.

@@ -11,7 +11,7 @@ Usage:
 
 Conventions:
   - Worktree bootstrap delegates to scripts/codex-worktree.sh
-  - compare-ref defaults to origin/main
+  - compare-ref defaults to origin/develop
   - hot files are the runtime/docs paths most likely to cause expensive merge drift
 EOF
 }
@@ -65,7 +65,7 @@ print_header() {
 
 cmd_start() {
     local slug=${1:-}
-    local base_ref=${2:-main}
+    local base_ref=${2:-develop}
     [ -n "${slug}" ] || die "missing slug"
 
     "$(repo_root)/scripts/codex-worktree.sh" create "${slug}" "${base_ref}"
@@ -79,7 +79,7 @@ Workstream bootstrap:
   slug:        ${slug}
   branch:      $(branch_name "${slug}")
   worktree:    ${path}
-  compare-ref: origin/main
+  compare-ref: origin/develop
 
 Recommended next steps:
   cd ${path}
@@ -88,14 +88,15 @@ Recommended next steps:
 
 Rules:
   - Keep one active implementation thread per worktree.
-  - Merge or rebase from origin/main before touching hot runtime files.
+  - Merge or rebase from origin/develop before touching hot runtime files.
+  - PRs target develop, not main. main is releases only.
   - Run just workstream-overlap ${slug} before opening a PR.
 EOF
 }
 
 cmd_status() {
     local slug=${1:-}
-    local compare_ref=${2:-origin/main}
+    local compare_ref=${2:-origin/develop}
     [ -n "${slug}" ] || die "missing slug"
 
     local path
@@ -120,7 +121,7 @@ cmd_status() {
 
 cmd_overlap() {
     local slug=${1:-}
-    local compare_ref=${2:-origin/main}
+    local compare_ref=${2:-origin/develop}
     [ -n "${slug}" ] || die "missing slug"
 
     local path changed overlap_file hot_file_list

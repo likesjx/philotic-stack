@@ -103,15 +103,15 @@ worktree-create slug base="main":
     ./scripts/codex-worktree.sh create {{slug}} {{base}}
 
 # Bootstrap an implementation workstream with a dedicated sibling worktree and checklist.
-workstream-start slug base="main":
+workstream-start slug base="develop":
     ./scripts/codex-workstream.sh start {{slug}} {{base}}
 
 # Show git status plus hot-file overlap for an active workstream.
-workstream-status slug compare_ref="origin/main":
+workstream-status slug compare_ref="origin/develop":
     ./scripts/codex-workstream.sh status {{slug}} {{compare_ref}}
 
 # Show only hot-file overlap for an active workstream.
-workstream-overlap slug compare_ref="origin/main":
+workstream-overlap slug compare_ref="origin/develop":
     ./scripts/codex-workstream.sh overlap {{slug}} {{compare_ref}}
 
 # List registered git worktrees for this repo.
