@@ -1202,6 +1202,14 @@ const TELEGRAM_MENU_COMMANDS: &[TelegramBotCommand] = &[
         command: "new",
         description: "Start a fresh conversation.",
     },
+    TelegramBotCommand {
+        command: "preapprove",
+        description: "Pre-approve a tool or class for this session.",
+    },
+    TelegramBotCommand {
+        command: "approval",
+        description: "Show or reset session approval policy (status / reset).",
+    },
 ];
 
 const TELEGRAM_MAX_COMMANDS: usize = 100;
@@ -1220,7 +1228,11 @@ fn telegram_help_text() -> String {
     help.push_str("/back returns the session to the orchestrator role.\n");
     help.push_str("/approve and /deny can include a note.\n");
     help.push_str("/tts accepts optional modes like on, off, or auto.\n");
-    help.push_str("/new starts a fresh conversation with a new session ID.");
+    help.push_str("/new starts a fresh conversation with a new session ID.\n");
+    help.push_str("/preapprove <tool|class> adds a tool name or class to the session pre-approve list.\n");
+    help.push_str("/preapprove this-session pre-approves all tools for this session.\n");
+    help.push_str("/approval status shows the current session approval policy.\n");
+    help.push_str("/approval reset clears session-scoped pre-approvals.");
     help
 }
 
