@@ -83,7 +83,7 @@ status and active seams, use [ARCHITECTURE_STATUS.md](/Users/jaredlikes/code/phi
 
 **Key design constraints:**
 
-- One canonical `ansible` hotel daemon per machine.
+- One canonical `aiua` hotel daemon per machine.
 - All in-machine communication uses **Unix Domain Sockets** (IPC).
 - Cross-machine coordination uses **UDP BeaconMessages** on the control plane plus a framed point-to-point execution transport for routed work.
 - The Context Graph SQLite DB is the canonical source of truth for all hotel state.
@@ -96,11 +96,11 @@ status and active seams, use [ARCHITECTURE_STATUS.md](/Users/jaredlikes/code/phi
 
 | Crate               | Role                                                         |
 | ------------------- | ------------------------------------------------------------ |
-| `ansible`           | Hotel daemon — orchestration and service host                |
+| `aiua`           | Hotel daemon — orchestration and service host                |
 | `ansible-mesh-core` | Shared primitives, traits, mesh types, storage               |
 | `philotic-client`   | Guest SDK — IPC client for guests to talk to the hotel       |
 | `membrane`           | Telegram/gateway guest binary                                |
-| `agent-core`        | Persona/agent guest binary                                   |
+| `philote`        | Persona/agent guest binary                                   |
 | `model-router`      | Model controller SDK + provider binaries (Gemini, ElevenLabs)|
 | `tool-runner`       | Workspace tool executor guest (inactive — not yet spawned)   |
 | `robot-kit`         | Embedded robotics HAL (separate concern, not hotel/guest)    |
@@ -113,7 +113,7 @@ The `legacy-zeroclaw` submodule was removed from this repository. Historical ref
 
 ## 3. The Hotel — `crates/ansible`
 
-The `ansible` daemon is the authoritative runtime process for a hotel node.
+The `aiua` daemon is the authoritative runtime process for a hotel node.
 It starts first, owns the Context Graph database, and materializes all guest
 processes.
 
@@ -124,7 +124,7 @@ main()
   │
   ├─ Parse CLI args (--load-config flag)
   ├─ Read PHILOTIC_* env flags (feature gates)
-  ├─ Open SqliteGraphStorage ("ansible_context.db")
+  ├─ Open SqliteGraphStorage ("aiua_context.db")
   ├─ Optionally seed config from JSON file
   ├─ Load or bootstrap NodeCapabilities
   ├─ Bind BeaconDaemon (UDP control plane, port 8999)
@@ -236,7 +236,7 @@ the hotel exclusively over the IPC UDS socket using `PhiloticClient`.
 | Binary                      | Crate                 | Role identity                    | Purpose                                                    |
 | --------------------------- | --------------------- | -------------------------------- | ---------------------------------------------------------- |
 | `membrane`                   | `crates/membrane`      | `membrane-telegram-01`            | Telegram gateway, ingress/egress for external messages     |
-| `agent-core`                | `crates/agent-core`   | `agent-jane-01`                  | Persona runtime, long-running reasoning loop               |
+| `philote`                | `crates/agent-core`   | `agent-jane-01`                  | Persona runtime, long-running reasoning loop               |
 | `model-controller-gemini`   | `crates/model-router` | `model-controller-gemini-01`     | Gemini provider controller; role `model.gemini`            |
 | `model-controller-elevenlabs` | `crates/model-router` | `model-controller-elevenlabs-01` | ElevenLabs TTS controller; role `model.elevenlabs`         |
 | `tool-runner`               | `crates/tool-runner`  | `{hotel}:tool-runner`            | Workspace tool executor (inactive — seeded but not spawned)|
@@ -312,7 +312,7 @@ client.sync_apartment(agent_id, memory_type, content_json) -> Result<()>
 ## 7. Intra-Hotel IPC (Unix Domain Sockets)
 
 All communication between guests and the hotel daemon uses a **Unix Domain Socket**
-at `/tmp/philotic-ansible.sock` (overridable via `PHILOTIC_HOTEL_SOCKET`). The protocol is newline-delimited JSON
+at `/tmp/philotic-aiua.sock` (overridable via `PHILOTIC_HOTEL_SOCKET`). The protocol is newline-delimited JSON
 over a persistent stream connection.
 
 ```
@@ -601,7 +601,7 @@ Default is `INSECURE_DEV_DEFAULT_PSK` — override before production.
 
 | Variable                              | Default                          | Effect                                              |
 | ------------------------------------- | -------------------------------- | --------------------------------------------------- |
-| `PHILOTIC_HOTEL_SOCKET`               | `/tmp/philotic-ansible.sock`     | IPC Unix domain socket path                         |
+| `PHILOTIC_HOTEL_SOCKET`               | `/tmp/philotic-aiua.sock`     | IPC Unix domain socket path                         |
 | `PHILOTIC_MESH_PSK`                   | `INSECURE_DEV_DEFAULT_PSK`       | Shared mesh authentication key                      |
 | `PHILOTIC_HOTEL_PORT`                 | `9000`                           | IPC listen port                                     |
 | `PHILOTIC_BIN_DIR`                    | (none — uses `PATH`)             | Directory where guest binaries are resolved         |

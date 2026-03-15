@@ -240,7 +240,7 @@ mod tests {
             lease_type: "telegram_poll".into(),
             lease_scope: scope.into(),
             authority_hotel: "hotel-a".into(),
-            authority_component: Some("ansible".into()),
+            authority_component: Some("aiua".into()),
             owner_guest_id: owner.into(),
             owner_hotel: Some("hotel-a".into()),
             owner_component_type: Some("membrane".into()),

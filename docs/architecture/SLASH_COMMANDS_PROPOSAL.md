@@ -47,7 +47,7 @@ Examples:
 - `/approve`
 - `/deny`
 
-These should execute in `membrane`, `ansible`, or another runtime service depending on ownership.
+These should execute in `membrane`, `aiua`, or another runtime service depending on ownership.
 
 ### 2. Agent Commands
 
@@ -61,7 +61,7 @@ Examples:
 - `/skills`
 - `/workspace`
 
-These should execute inside `agent-core` and may update checkpoints or session metadata, but they should not invoke `model-router`.
+These should execute inside `philote` and may update checkpoints or session metadata, but they should not invoke `model-router`.
 
 ### 3. Agent-Assisted Commands
 
@@ -73,7 +73,7 @@ Examples:
 - `/summarize <artifact>`
 - `/search <query>`
 
-These should enter `agent-core` with structured intent and arguments, then proceed through the normal reasoning path.
+These should enter `philote` with structured intent and arguments, then proceed through the normal reasoning path.
 
 ## Ownership Model
 
@@ -83,11 +83,11 @@ Recommended execution ownership:
   - transport-local UX commands
   - transport help text
   - future command autocomplete/help menus
-- `ansible`
+- `aiua`
   - generalized session/runtime commands
   - session lifecycle transitions
   - lease/materialization/debug control
-- `agent-core`
+- `philote`
   - agent-local deterministic commands
   - commands that inspect current cognitive/session state
 - `model-router`
@@ -162,7 +162,7 @@ That keeps traceability consistent while still allowing short-circuit execution.
 
 ### `/ping`
 
-- handled directly by `agent-core`
+- handled directly by `philote`
 - no model call
 - writes session checkpoints as normal
 - completes the current task immediately
@@ -184,7 +184,7 @@ Why:
 
 - deterministic
 - no network dependency on model providers
-- still exercises real `ansible` and `agent-core` binaries
+- still exercises real `aiua` and `philote` binaries
 - validates the short-circuit command path
 
 This should become the standard local smoke flow before we rely on full model-backed round trips.

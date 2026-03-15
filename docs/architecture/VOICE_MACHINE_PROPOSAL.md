@@ -40,7 +40,7 @@ Define a dedicated voice/media interface component for Philotic that can handle:
 - transcript generation
 - media session routing
 
-without turning `agent-core` into an audio pipeline with opinions.
+without turning `philote` into an audio pipeline with opinions.
 
 ## Disposition
 

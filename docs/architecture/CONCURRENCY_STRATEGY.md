@@ -30,7 +30,7 @@ These are the actual bottlenecks, ordered by impact.
 
 ### 1. Guest materialization on boot — SEQUENTIAL `for` loop
 
-**File:** `crates/ansible/src/service/guest_manager.rs` — `materialize_all()`
+**File:** `crates/aiua/src/service/guest_manager.rs` — `materialize_all()`
 
 ```rust
 for rec in guest_records {
@@ -47,7 +47,7 @@ Each guest is spawned one at a time. Guests are independent OS processes with no
 
 ### 2. Mesh dispatcher peer fan-out — SEQUENTIAL `for` loop
 
-**File:** `crates/ansible/src/service/mesh_dispatcher.rs` — tick loop
+**File:** `crates/aiua/src/service/mesh_dispatcher.rs` — tick loop
 
 ```rust
 for (target_node_id, target_addr) in &targets {
@@ -101,7 +101,7 @@ This is a one-line-per-connection change with no API impact. WAL allows multiple
 
 ### 5. Main inbox loop — sequential per-message dispatch
 
-**File:** `crates/ansible/src/main.rs`
+**File:** `crates/aiua/src/main.rs`
 
 ```rust
 while let Some(msg) = inbox_rx.recv().await {
@@ -135,7 +135,7 @@ These calls block a Tokio worker thread inside a sync `ToolInvoker` impl. On a r
 
 ### 7. Guest supervision reconciliation — SEQUENTIAL `for` loop
 
-**File:** `crates/ansible/src/service/guest_manager.rs` — `reconcile_all()`
+**File:** `crates/aiua/src/service/guest_manager.rs` — `reconcile_all()`
 
 ```rust
 for rec in all_guests {

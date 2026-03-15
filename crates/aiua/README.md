@@ -1,6 +1,6 @@
-# `ansible` — Philotic Hotel Daemon
+# `aiua` — Philotic Hotel Daemon
 
-The `ansible` binary is the authoritative runtime process for a Philotic hotel node.
+The `aiua` binary is the authoritative runtime process for a Philotic hotel node.
 It is the first process that starts, owns the Context Graph database, materializes
 all guest processes, and acts as the routing hub for every interaction inside the hotel.
 
@@ -8,7 +8,7 @@ all guest processes, and acts as the routing hub for every interaction inside th
 
 | Area                      | Detail                                                                           |
 | ------------------------- | -------------------------------------------------------------------------------- |
-| **Boot orchestration**    | Reads `ansible_context.db`, bootstraps `NodeCapabilities`, seeds demo guests     |
+| **Boot orchestration**    | Reads `aiua_context.db`, bootstraps `NodeCapabilities`, seeds demo guests     |
 | **Guest materialization** | Spawns all `is_active=1` guests from the DB via `GuestManager`                   |
 | **Guest supervision**     | Reconciliation loop every 5s — resurrects dead processes, reclaims inactive ones |
 | **IPC server**            | Unix Domain Socket at `/tmp/ansible.sock` — handles all guest↔hotel messages     |
@@ -41,30 +41,30 @@ all guest processes, and acts as the routing hub for every interaction inside th
 
 ```bash
 # Standard start
-cargo run -p ansible
+cargo run -p aiua
 
 # Load initial config
-cargo run -p ansible -- --load-config path/to/config.json
+cargo run -p aiua -- --load-config path/to/config.json
 
 # Start the transitional Gemini OAuth flow
-cargo run -p ansible -- auth google start --provider gemini --client-id YOUR_CLIENT_ID --project-id YOUR_GCP_PROJECT
+cargo run -p aiua -- auth google start --provider gemini --client-id YOUR_CLIENT_ID --project-id YOUR_GCP_PROJECT
 
 # Validate the stored Gemini OAuth path with a real Gemini call
-cargo run -p ansible -- auth google validate --provider gemini
+cargo run -p aiua -- auth google validate --provider gemini
 
 # Run the startup text model-controller smoke through the hotel
-cargo run -p ansible -- --hotel startup-test-hotel --load-config mesh-config.json --test text-roundtrip --test-text "hello model controller"
+cargo run -p aiua -- --hotel startup-test-hotel --load-config mesh-config.json --test text-roundtrip --test-text "hello model controller"
 
 # Run the startup Gemini OAuth smoke through the materialized model-controller guest.
 # This harness seeds a temporary vaulted bearer token and talks to a local fake Gemini endpoint,
 # so it proves the guest-path OAuth contract without depending on live Google.
-cargo run -p ansible -- --hotel startup-test-hotel --test gemini-oauth-roundtrip --test-text "oauth-guest-ok"
+cargo run -p aiua -- --hotel startup-test-hotel --test gemini-oauth-roundtrip --test-text "oauth-guest-ok"
 
 # Run the startup voice sample through the hotel
-cargo run -p ansible -- --hotel startup-test-hotel --load-config mesh-config.json --test voice-sample --test-output /tmp/ansible-startup-voice-sample.mp3 --test-text "Hello from the startup voice test."
+cargo run -p aiua -- --hotel startup-test-hotel --load-config mesh-config.json --test voice-sample --test-output /tmp/aiua-startup-voice-sample.mp3 --test-text "Hello from the startup voice test."
 
 # Run the startup Telegram controller smoke through the hotel
-cargo run -p ansible -- --hotel startup-test-hotel --test telegram-roundtrip --test-text "hello telegram controller"
+cargo run -p aiua -- --hotel startup-test-hotel --test telegram-roundtrip --test-text "hello telegram controller"
 ```
 
 On macOS, the hotel now uses a Keychain-backed vault root key automatically and creates one on first use if needed. `PHILOTIC_VAULT_MASTER_KEY` remains a bootstrap fallback for non-macOS environments or explicit operator override. `PHILOTIC_VAULT_KEY_ID` can scope the Keychain item label when you want separate local vault roots.

@@ -84,7 +84,7 @@ Examples:
 - canonical session state in the context graph
 - derived recovery checkpoints in apartments
 - live routing state in the hotel runtime
-- session-local working state inside `agent-core`
+- session-local working state inside `philote`
 
 If two places appear to own the same thing, the agent should stop and resolve the boundary before piling on more behavior.
 

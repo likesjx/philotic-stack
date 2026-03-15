@@ -32,7 +32,7 @@ source_of_truth_targets:
 
 ## Goal
 
-Define a clean boundary for how Philotic assembles context for a `conversation turn` so context sources, retrieval strategies, and ranking policies can evolve without turning `agent-core` into one giant opinionated glue pile.
+Define a clean boundary for how Philotic assembles context for a `conversation turn` so context sources, retrieval strategies, and ranking policies can evolve without turning `philote` into one giant opinionated glue pile.
 
 ## Disposition
 
@@ -47,14 +47,14 @@ Prove the first typed context projection path without pretending the full contex
 - coin `conversation turn` as the externally meaningful exchange boundary
 - coin `cognitive step` as the internal reasoning/action boundary within a conversation turn
 - define the first five context layers and their ownership model
-- introduce typed `ContextProjection` / `LayerContribution` / `LayerPayload` structures in `agent-core`
+- introduce typed `ContextProjection` / `LayerContribution` / `LayerPayload` structures in `philote`
 - thread the first structured context path into outbound model requests and through `model-router`
 - keep the broader context-engine contract transitional while the full provider/hook architecture is still pending
 
 Current confidence for this slice:
 
 - `test-green`
-  - `cargo test -p agent-core -- --nocapture`
+  - `cargo test -p philote -- --nocapture`
   - `cargo test -p model-router -- --nocapture`
 - `smoke-green` for the current cognitive request path
   - `bash scripts/smoke-cognitive-roundtrip.sh`
@@ -68,7 +68,7 @@ That engine should:
 
 - collect candidate context from canonical sources
 - rank, filter, and budget that context deterministically
-- expose a stable turn-ready context payload to `agent-core`
+- expose a stable turn-ready context payload to `philote`
 - allow multiple implementations behind one contract
 
 The engine should reason in two scopes:
@@ -99,7 +99,7 @@ Philotic is accumulating multiple context sources:
 - tool and capability state
 - future external retrieval engines
 
-If `agent-core` owns all of that assembly directly, it becomes impossible to change context strategy without changing the cognitive loop itself.
+If `philote` owns all of that assembly directly, it becomes impossible to change context strategy without changing the cognitive loop itself.
 
 It also becomes too easy to let one ambiguous word, `turn`, quietly mean both:
 
@@ -118,7 +118,7 @@ The context engine should own:
 - deterministic inclusion/exclusion rules
 - provenance metadata for debugging
 
-`agent-core` should consume:
+`philote` should consume:
 
 - a bounded, ordered context payload
 - not a pile of half-ranked raw records
@@ -129,7 +129,7 @@ Instead, it should compose from the current owners of truth:
 
 - Philotic context graph for durable identity, session, and structural relationship state
 - memory engines such as Muninn for recalled salience, episodic continuity, and learned preferences
-- `agent-core` for ephemeral working state inside the active conversation turn
+- `philote` for ephemeral working state inside the active conversation turn
 
 ## First Context Layers
 
@@ -140,7 +140,7 @@ The first contract should explicitly model five layers.
 | `identity` | Philotic context graph | authoritative | `static_for_turn` | conversation-turn start unless explicitly reconfigured | graph-backed profile/config only |
 | `relationship` | graph + memory engine | mixed | `refreshable` | conversation-turn start, then when the relationship frame changes materially | memory first, graph only for durable stable facts |
 | `session` | Philotic context graph | authoritative for current runtime truth | `refreshable` | conversation-turn start and named checkpoints | graph-backed session/event state |
-| `working` | `agent-core` | authoritative only inside the active conversation turn | `live_local` | every relevant cognitive step | checkpoint summary only, never raw scratch |
+| `working` | `philote` | authoritative only inside the active conversation turn | `live_local` | every relevant cognitive step | checkpoint summary only, never raw scratch |
 | `knowledge` | graph + memory engine | mixed, mostly advisory | `refreshable` | conversation-turn start plus retrieval checkpoints after meaningfully new information | memory summary, graph links/facts when stable enough |
 
 ### 1. Identity Layer
@@ -167,7 +167,7 @@ The first contract should explicitly model five layers.
 
 ### 4. Working Layer
 
-- canonical owner: `agent-core`
+- canonical owner: `philote`
 - purpose: active scratch state, tool history, local hypotheses, pending subgoals
 - authority: authoritative only inside the current conversation turn
 - mutability: `live_local`
@@ -189,7 +189,7 @@ The first context-engine contract should classify layer refresh policy explicitl
 - `refreshable`
   - recomputed at named checkpoints within the turn
 - `live_local`
-  - changes continuously inside `agent-core` during cognitive steps
+  - changes continuously inside `philote` during cognitive steps
 
 This prevents the usual architectural comedy where everything is declared dynamic and nothing is actually explainable.
 
@@ -317,7 +317,7 @@ Recommended first path:
 - `relationship` + `knowledge`
   - sourced from Muninn recall using the current triad prompts
 - `working`
-  - remains local to `agent-core` and is surfaced only through checkpoint summaries
+  - remains local to `philote` and is surfaced only through checkpoint summaries
 
 That split proves the boundary without forcing Philotic to solve all long-term memory metaphysics before it can assemble one decent turn.
 

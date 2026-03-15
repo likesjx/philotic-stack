@@ -24,55 +24,55 @@ install-git-hooks:
 session-start:
     python3 scripts/muninn_mcp.py bootstrap
 
-# Start the Hotel Manager (Ansible Host Daemon)
-start-ansible hotel:
+# Start the Hotel Manager (Aiua Host Daemon)
+start-aiua hotel:
     cargo build --workspace
-    cargo run -p ansible -- --hotel {{hotel}} --load-config mesh-config.json
+    cargo run -p aiua -- --hotel {{hotel}} --load-config mesh-config.json
 
 # Rebuild the local runtime binaries that the hotel materializes during watched UAT.
 build-runtime:
-    cargo build -p ansible -p agent-core -p membrane -p model-router
+    cargo build -p aiua -p philote -p membrane -p model-router
 
 # Kill local Philotic hotel/guest binaries from this checkout and clear stale sockets.
 kill-local-stack:
-    @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/ansible" || true
+    @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/aiua" || true
     @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/membrane" || true
-    @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/agent-core" || true
+    @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/philote" || true
     @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/model-controller-gemini" || true
     @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/model-controller-elevenlabs" || true
     @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/tool-runner" || true
     @rm -f /tmp/philotic-default.sock /tmp/philotic-aria-architect-hotel.sock /tmp/philotic-startup-test-hotel.sock
 
 # Rebuild first, then kill stale local runtime processes/sockets, then start one hotel cleanly.
-start-ansible-clean hotel:
+start-aiua-clean hotel:
     just build-runtime
     just kill-local-stack
-    cargo run -p ansible -- --hotel {{hotel}} --load-config mesh-config.json
+    cargo run -p aiua -- --hotel {{hotel}} --load-config mesh-config.json
 
 # Start the transitional Gemini OAuth flow through the hotel CLI
 gemini-oauth-start client_id project_id:
     @echo "Using GOOGLE_CLIENT_SECRET from env if needed by the OAuth client."
     @echo "On macOS, the hotel will use or create a Keychain-backed vault root key automatically."
     @echo "PHILOTIC_VAULT_MASTER_KEY remains a fallback for non-macOS or explicit override cases."
-    cargo run -p ansible -- auth google start --provider gemini --client-id {{client_id}} --project-id {{project_id}}
+    cargo run -p aiua -- auth google start --provider gemini --client-id {{client_id}} --project-id {{project_id}}
 
 # Validate that stored Gemini OAuth auth can call a real Gemini model
 gemini-oauth-validate:
-    cargo run -p ansible -- auth google validate --provider gemini
+    cargo run -p aiua -- auth google validate --provider gemini
 
-# Start the local UAT stack. Ansible will materialize the gateway, agent, model, and tool guests.
-start-ansible-uat:
+# Start the local UAT stack. Aiua will materialize the gateway, agent, model, and tool guests.
+start-aiua-uat:
     @echo "Starting UAT stack on hotel 'local-telegram' using mesh-config.json..."
     @echo "If you are testing Telegram, make sure only one Telegram poller is running for this bot token."
-    cargo run -p ansible -- --hotel local-telegram --load-config mesh-config.json
+    cargo run -p aiua -- --hotel local-telegram --load-config mesh-config.json
 
 # Start the Gateway (Telegram Membrane)
 start-gateway:
     cargo run -p membrane
 
-# Start the Persona (Agent Core)
+# Start the Persona (Philote)
 start-agent:
-    cargo run -p agent-core
+    cargo run -p philote
 
 # Start the Mind (Model Router)
 start-model:
@@ -87,11 +87,11 @@ start:
     @echo "Starting the Philotic Stack..."
     @echo "To run these properly, you should run the individual start-* commands in separate panes."
 
-# Check the status of the local mesh (pings the Ansible host daemon)
+# Check the status of the local mesh (pings the Aiua host daemon)
 status:
     @echo "Checking Philotic Stack local status..."
-    @# Ping the Ansible daemon port or check processes.
-    @ps aux | grep -v grep | grep "cargo run -p ansible" || echo "Ansible daemon is not running."
+    @# Ping the Aiua daemon port or check processes.
+    @ps aux | grep -v grep | grep "cargo run -p aiua" || echo "Aiua daemon is not running."
     @ps aux | grep -v grep | grep "cargo run -p membrane" || echo "Membrane gateway is not running."
 
 # Format code
@@ -103,15 +103,15 @@ worktree-create slug base="main":
     ./scripts/codex-worktree.sh create {{slug}} {{base}}
 
 # Bootstrap an implementation workstream with a dedicated sibling worktree and checklist.
-workstream-start slug base="main":
+workstream-start slug base="develop":
     ./scripts/codex-workstream.sh start {{slug}} {{base}}
 
 # Show git status plus hot-file overlap for an active workstream.
-workstream-status slug compare_ref="origin/main":
+workstream-status slug compare_ref="origin/develop":
     ./scripts/codex-workstream.sh status {{slug}} {{compare_ref}}
 
 # Show only hot-file overlap for an active workstream.
-workstream-overlap slug compare_ref="origin/main":
+workstream-overlap slug compare_ref="origin/develop":
     ./scripts/codex-workstream.sh overlap {{slug}} {{compare_ref}}
 
 # List registered git worktrees for this repo.
@@ -181,8 +181,8 @@ smoke-cognitive:
 # Run the trusted vertical-slice verification suite
 verify-vertical-slice:
     cargo test -p philotic-client -- --nocapture
-    cargo test -p agent-core -- --nocapture
-    cargo test -p ansible -- --nocapture
+    cargo test -p philote -- --nocapture
+    cargo test -p aiua -- --nocapture
     ./scripts/smoke-routed-tool-roundtrip.sh
     ./scripts/smoke-approval-roundtrip.sh
     ./scripts/smoke-session-control-roundtrip.sh

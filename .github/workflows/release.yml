@@ -1,0 +1,231 @@
+name: Release
+
+# Tag convention:
+#   v1.0.0              → stable release   — must be tagged from main
+#   v1.0.0-alpha.1      → alpha pre-release — must be tagged from develop
+#   v1.0.0-beta.1       → beta pre-release  — must be tagged from develop
+#   v1.0.0-rc.1         → release candidate — must be tagged from develop
+#
+# What each tag type does:
+#   stable:     build → GitHub Release → bump Homebrew tap
+#   pre-release: build → GitHub Release (marked pre-release) → tap unchanged
+#
+# Prerequisites (one-time setup):
+#   - Create a GitHub PAT with `repo` scope on likesjx/homebrew-philotic
+#   - Add it as a secret named TAP_GITHUB_TOKEN on this repo
+#
+# To cut a pre-release (from develop):
+#   git tag v0.2.0-alpha.1 && git push origin v0.2.0-alpha.1
+#
+# To cut a stable release (from main):
+#   git tag v0.2.0 && git push origin v0.2.0
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"           # stable:     v1.0.0
+      - "v[0-9]+.[0-9]+.[0-9]+-alpha.*"   # alpha:      v1.0.0-alpha.1
+      - "v[0-9]+.[0-9]+.[0-9]+-beta.*"    # beta:       v1.0.0-beta.1
+      - "v[0-9]+.[0-9]+.[0-9]+-rc.*"      # candidate:  v1.0.0-rc.1
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Guard: enforce branch discipline ────────────────────────────────────────
+  # Stable tags must come from main. Pre-release tags must come from develop.
+  validate-branch:
+    name: Validate tag source branch
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check branch for tag
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          IS_PRERELEASE=false
+          [[ "$TAG" == *-alpha* || "$TAG" == *-beta* || "$TAG" == *-rc* ]] && IS_PRERELEASE=true
+
+          # Find which branches contain this tag's commit
+          BRANCHES=$(git branch -r --contains "$GITHUB_SHA" | sed 's|origin/||' | tr -d ' ')
+
+          if [ "$IS_PRERELEASE" = "false" ]; then
+            if echo "$BRANCHES" | grep -qx "main"; then
+              echo "✓ Stable tag $TAG is on main — OK"
+            else
+              echo "✗ Stable tag $TAG must be tagged from main."
+              echo "  Branches containing this commit: $BRANCHES"
+              exit 1
+            fi
+          else
+            if echo "$BRANCHES" | grep -qx "develop"; then
+              echo "✓ Pre-release tag $TAG is on develop — OK"
+            else
+              echo "✗ Pre-release tag $TAG must be tagged from develop."
+              echo "  Branches containing this commit: $BRANCHES"
+              exit 1
+            fi
+          fi
+
+  # ── Build native binaries ────────────────────────────────────────────────────
+  build:
+    name: Build ${{ matrix.target }}
+    needs: validate-branch
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            artifact: darwin-arm64
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            artifact: darwin-x86_64
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            artifact: linux-x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ matrix.target }}-cargo-
+
+      # NOTE: update binary names here after ansible → aiua rename
+      # NOTE: add -p philotic-web once that crate exists
+      - name: Build binaries
+        run: |
+          cargo build --release --target ${{ matrix.target }} \
+            -p ansible \
+            -p agent-core \
+            -p membrane \
+            -p model-router \
+            -p tool-runner
+
+      - name: Package binaries
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          STAGING="philotic-${TAG}-${{ matrix.artifact }}"
+          mkdir -p "$STAGING"
+
+          for bin in ansible agent-core membrane model-router tool-runner; do
+            [ -f "target/${{ matrix.target }}/release/$bin" ] && \
+              cp "target/${{ matrix.target }}/release/$bin" "$STAGING/"
+          done
+
+          [ -f mesh-config.example.json ] && cp mesh-config.example.json "$STAGING/"
+
+          tar czf "$STAGING.tar.gz" "$STAGING"
+          sha256sum "$STAGING.tar.gz" > "$STAGING.tar.gz.sha256" 2>/dev/null || \
+            shasum -a 256 "$STAGING.tar.gz" > "$STAGING.tar.gz.sha256"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            philotic-${{ github.ref_name }}-${{ matrix.artifact }}.tar.gz
+            philotic-${{ github.ref_name }}-${{ matrix.artifact }}.tar.gz.sha256
+
+  # ── Create GitHub Release ────────────────────────────────────────────────────
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-22.04
+    outputs:
+      source_sha256: ${{ steps.source.outputs.sha256 }}
+      is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Release metadata
+        id: meta
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [[ "$TAG" == *-alpha* || "$TAG" == *-beta* || "$TAG" == *-rc* ]]; then
+            echo "is_prerelease=true" >> $GITHUB_OUTPUT
+            echo "channel=$(echo $TAG | grep -oP '(alpha|beta|rc)')" >> $GITHUB_OUTPUT
+          else
+            echo "is_prerelease=false" >> $GITHUB_OUTPUT
+            echo "channel=stable" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create source archive
+        id: source
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          PREFIX="philotic-stack-$VERSION"
+          git archive --format=tar.gz --prefix="$PREFIX/" HEAD \
+            > "philotic-stack-$VERSION.tar.gz"
+          SHA=$(sha256sum "philotic-stack-$VERSION.tar.gz" | cut -d' ' -f1)
+          echo "sha256=$SHA" >> $GITHUB_OUTPUT
+
+      - name: Collect release assets
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p release-assets
+          cp "philotic-stack-$VERSION.tar.gz" release-assets/
+          find artifacts -name "*.tar.gz" -o -name "*.sha256" | \
+            xargs -I{} cp {} release-assets/
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ steps.meta.outputs.is_prerelease }}
+          name: >-
+            ${{ steps.meta.outputs.is_prerelease
+              && format('{0} ({1})', github.ref_name, steps.meta.outputs.channel)
+              || github.ref_name }}
+
+  # ── Update Homebrew tap (stable releases only) ───────────────────────────────
+  update-tap:
+    name: Bump Homebrew formulae
+    needs: release
+    # Only runs for stable releases — pre-release tags skip this entirely
+    if: needs.release.outputs.is_prerelease == 'false'
+    runs-on: ubuntu-22.04
+
+    steps:
+      # NOTE: once philotic-web crate exists, add a second step for it
+      - name: Bump aiua formula
+        uses: mislav/bump-homebrew-formula-action@v3
+        with:
+          formula-name: aiua
+          formula-path: Formula/aiua.rb
+          homebrew-tap: likesjx/homebrew-philotic
+          base-branch: main
+          tag-name: ${{ github.ref_name }}
+          download-url: >-
+            https://github.com/likesjx/philotic-stack/archive/refs/tags/${{ github.ref_name }}.tar.gz
+          download-sha256: ${{ needs.release.outputs.source_sha256 }}
+          commit-message: |
+            aiua {{version}}
+
+            Release: https://github.com/likesjx/philotic-stack/releases/tag/{{tag}}
+        env:
+          COMMITTER_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}

@@ -26,13 +26,13 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 /// The IPC role the worker registers under.
-const WORKER_ROLE: &str = "agent-worker";
+const WORKER_ROLE: &str = "philote-worker";
 
 /// Default model role used when the delegation does not specify an implementation.
 const DEFAULT_MODEL_ROLE: &str = "model";
 
 fn local_node_id() -> String {
-    std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-ansible-01".to_string())
+    std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string())
 }
 
 fn worker_guest_id() -> String {
@@ -40,7 +40,7 @@ fn worker_guest_id() -> String {
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "agent-worker-01".to_string())
+        .unwrap_or_else(|| "philote-worker-01".to_string())
 }
 
 // ── WorkerRuntime ─────────────────────────────────────────────────────────────

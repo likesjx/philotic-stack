@@ -12,7 +12,7 @@ cp mesh-config.example.json mesh-config.json
 # Edit mesh-config.json with your API keys and node identity
 
 # 2. Start the hotel daemon (materializes all guests automatically)
-cargo run -p ansible -- --load-config mesh-config.json
+cargo run -p aiua -- --load-config mesh-config.json
 ```
 
 ## Architecture Diagrams
@@ -33,11 +33,11 @@ Interactive HTML version (with hover tooltips): [`docs/philotic-architecture-dia
 
 | Crate                                                     | Role                                                       |
 | --------------------------------------------------------- | ---------------------------------------------------------- |
-| [`ansible`](crates/ansible/README.md)                     | Hotel daemon — guest materialization, IPC, mesh routing    |
+| [`aiua`](crates/aiua/README.md)                     | Hotel daemon — guest materialization, IPC, mesh routing    |
 | [`ansible-mesh-core`](crates/ansible-mesh-core/README.md) | Core primitives, traits, event types, storage abstractions |
 | [`philotic-client`](crates/philotic-client/README.md)     | Guest SDK — IPC client for hotel communication             |
 | [`membrane`](crates/membrane/README.md)                     | Telegram/external protocol gateway guest                   |
-| [`agent-core`](crates/agent-core/README.md)               | Persona/agent cognitive loop guest                         |
+| [`philote`](crates/philote/README.md)               | Persona/agent cognitive loop guest                         |
 | [`model-router`](crates/model-router/README.md)           | LLM model provider routing guest                           |
 
 ## Key Design Principles

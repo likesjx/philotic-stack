@@ -31,7 +31,7 @@ Define exactly what must be ported from the current OpenClaw Ansible plugin mode
 
 ## 2. Architecture Direction
 
-1. Each hotel runs one authoritative `ansible` daemon.
+1. Each hotel runs one authoritative `aiua` daemon.
 2. Inside a hotel, all components communicate through local IPC.
 3. Between hotels, all communication is event-based over the mesh.
 4. Shared coordination metadata remains separate from data-plane payload flow.

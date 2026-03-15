@@ -5,9 +5,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_DIR="$(mktemp -d)"
 HOTEL_NAME="jane-smoke-$$"
 export PHILOTIC_AGENT_ID="agent-jane-01"
-export PHILOTIC_NODE_ID="${HOTEL_NAME}-ansible-01"
-export PHILOTIC_TARGET_NODE="${HOTEL_NAME}-ansible-01"
-export PHILOTIC_FINAL_REPLY_TO="${HOTEL_NAME}-ansible-01"
+export PHILOTIC_NODE_ID="${HOTEL_NAME}-aiua-01"
+export PHILOTIC_TARGET_NODE="${HOTEL_NAME}-aiua-01"
+export PHILOTIC_FINAL_REPLY_TO="${HOTEL_NAME}-aiua-01"
 SOCKET_PATH="/tmp/philotic-${HOTEL_NAME}.sock"
 MODEL_REPLY="${PHILOTIC_SMOKE_EXPECTED_REPLY:-pong}"
 
@@ -15,8 +15,8 @@ cleanup() {
   local exit_code=$?
   set +e
   if [[ ${exit_code} -ne 0 ]]; then
-    echo "Smoke test failed. ansible log:"
-    [[ -f "${TMP_DIR}/ansible.log" ]] && cat "${TMP_DIR}/ansible.log"
+    echo "Smoke test failed. aiua log:"
+    [[ -f "${TMP_DIR}/aiua.log" ]] && cat "${TMP_DIR}/aiua.log"
     echo "Smoke test failed. agent log:"
     [[ -f "${TMP_DIR}/agent.log" ]] && cat "${TMP_DIR}/agent.log"
     echo "Smoke test failed. model log:"
@@ -35,12 +35,12 @@ cleanup() {
 trap cleanup EXIT
 
 echo "Building smoke-test binaries..."
-cargo build -p ansible -p agent-core -p philotic-client --example smoke_driver >/dev/null
+cargo build -p aiua -p philote -p philotic-client --example smoke_driver >/dev/null
 
-echo "Starting ansible in ${TMP_DIR}..."
+echo "Starting aiua in ${TMP_DIR}..."
 (
   cd "${TMP_DIR}"
-  PHILOTIC_SMOKE_MODE=1 "${ROOT_DIR}/target/debug/ansible" --hotel "${HOTEL_NAME}" >"${TMP_DIR}/ansible.log" 2>&1
+  PHILOTIC_SMOKE_MODE=1 "${ROOT_DIR}/target/debug/aiua" --hotel "${HOTEL_NAME}" >"${TMP_DIR}/aiua.log" 2>&1
 ) &
 ANSIBLE_PID=$!
 
@@ -52,14 +52,14 @@ for _ in {1..50}; do
 done
 
 if [[ ! -S "${SOCKET_PATH}" ]]; then
-  echo "ansible socket did not appear; log follows:"
-  cat "${TMP_DIR}/ansible.log"
+  echo "aiua socket did not appear; log follows:"
+  cat "${TMP_DIR}/aiua.log"
   exit 1
 fi
 
-echo "Starting agent-core..."
+echo "Starting philote..."
 PHILOTIC_HOTEL_SOCKET="${SOCKET_PATH}" \
-  "${ROOT_DIR}/target/debug/agent-core" >"${TMP_DIR}/agent.log" 2>&1 &
+  "${ROOT_DIR}/target/debug/philote" >"${TMP_DIR}/agent.log" 2>&1 &
 AGENT_PID=$!
 
 sleep 1

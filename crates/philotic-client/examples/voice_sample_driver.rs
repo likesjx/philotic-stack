@@ -5,8 +5,8 @@ use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
 use serde_json::{Map, Value, json};
 use tokio::time::{Duration, timeout};
 
-const DEFAULT_SOCKET: &str = "/tmp/philotic-ansible.sock";
-const DEFAULT_TARGET_NODE: &str = "local-ansible-01";
+const DEFAULT_SOCKET: &str = "/tmp/philotic-aiua.sock";
+const DEFAULT_TARGET_NODE: &str = "local-aiua-01";
 const DEFAULT_TARGET_ROLE: &str = "model.elevenlabs";
 const DEFAULT_REPLY_ROLE: &str = "voice.sample";
 const DEFAULT_OUTPUT_PATH: &str = "/tmp/philotic-voice-sample.mp3";

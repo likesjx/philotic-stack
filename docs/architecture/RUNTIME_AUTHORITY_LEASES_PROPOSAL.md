@@ -98,7 +98,7 @@ Accepted for current slice.
 Current repo truth for this slice:
 
 - `philotic-client` now defines a shared `LeaseEnvelope` and `LeaseStatus`
-- `ansible` now has a central runtime lease registry/provider with shared acquire, renew, release, inspect, and observer-hook vocabulary
+- `aiua` now has a central runtime lease registry/provider with shared acquire, renew, release, inspect, and observer-hook vocabulary
 - Telegram poll lease now uses that shared lease abstraction instead of a private ad hoc registry shape
 - the startup dual-membrane poll-lease smoke is green again under the shared abstraction after tightening stale-owner detection and startup handoff behavior
 - the proposal now carries the first explicit boundary contract separating lease authority from materialization, supervision, routing, and vault access
@@ -283,7 +283,7 @@ Recommended responsibilities:
 - epoch increment on ownership change
 - optional watcher notification hooks
 
-This is usually `ansible`, but the pattern should care about the role, not the binary name.
+This is usually `aiua`, but the pattern should care about the role, not the binary name.
 
 At the implementation level, this can start as:
 
@@ -555,9 +555,9 @@ The current proposals already show the same lease archetype in two different sco
 
 | Archetype field / behavior | Session lease | Telegram poll lease | Comparison note |
 | --- | --- | --- | --- |
-| Canonical grantor | `ansible` session authority | `ansible` poll authority | same control-plane owner shape |
+| Canonical grantor | `aiua` session authority | `aiua` poll authority | same control-plane owner shape |
 | Scoped resource | one `session_id` / active turn domain | one Telegram bot token / poll cursor domain | both are narrow scoped runtime authority |
-| Current owner | active `agent-core` turn worker | active `membrane` poller | different component families, same single-owner idea |
+| Current owner | active `philote` turn worker | active `membrane` poller | different component families, same single-owner idea |
 | Renewal | heartbeat-style renewal is proposed | renewal is implemented | same contract, different maturity |
 | Expiry | expired lease allows requeue or recovery | expired lease allows takeover by another poller | same safety mechanism, different operational consequence |
 | Fencing epoch | implied by single active owner semantics, not yet surfaced as strongly | explicit epoch/fencing is implemented | session lease should likely adopt more explicit fencing language |
@@ -579,7 +579,7 @@ Mapped to the shared structure:
 
 - session lease
   - provider: hotel/session authority
-  - holder: active `agent-core` worker
+  - holder: active `philote` worker
   - observers: session recovery, queue/requeue logic, admin/session inspection
 - Telegram poll lease
   - provider: hotel/membrane authority

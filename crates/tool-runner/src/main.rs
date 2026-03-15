@@ -9,7 +9,7 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 fn local_node_id() -> String {
-    std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-ansible-01".to_string())
+    std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string())
 }
 
 #[derive(Parser, Debug)]

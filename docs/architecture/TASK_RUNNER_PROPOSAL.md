@@ -34,7 +34,7 @@ source_of_truth_targets:
 
 ## Goal
 
-Define the execution model for filesystem- and shell-oriented work that must happen in a real environment rather than inside `agent-core`.
+Define the execution model for filesystem- and shell-oriented work that must happen in a real environment rather than inside `philote`.
 
 This proposal assumes:
 
@@ -391,7 +391,7 @@ runner_id = "task-runner-workspace-01"
 incarnation_id = "task-runner-workspace-01"
 family = "workspace"
 profile = "readonly"
-hotel_id = "local-ansible-01"
+hotel_id = "local-aiua-01"
 environment_id = "workspace://main"
 workspace_root = "/srv/philotic/workspaces/main"
 allowed_tools = ["workspace.list", "workspace.read", "workspace.search"]
@@ -423,7 +423,7 @@ runner_id = "task-runner-shell-dev-01"
 incarnation_id = "task-runner-shell-dev-01"
 family = "shell"
 profile = "dev_exec"
-hotel_id = "local-ansible-01"
+hotel_id = "local-aiua-01"
 environment_id = "env://devbox"
 workspace_root = "/srv/philotic/workspaces/main"
 allowed_tools = ["shell.exec"]

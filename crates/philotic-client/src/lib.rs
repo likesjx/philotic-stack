@@ -51,6 +51,57 @@ impl TaskErrorPayload {
         }
     }
 
+    /// A tool execution failure originating inside agent-core local dispatch.
+    pub fn tool_execution(
+        tool_name: impl Into<String>,
+        message: impl Into<String>,
+        code: Option<&str>,
+    ) -> Self {
+        let tool_name = tool_name.into();
+        Self {
+            kind: "tool_execution_failure".into(),
+            message: message.into(),
+            code: code.map(str::to_string),
+            component: Some("philote".into()),
+            capability: Some(tool_name),
+            provider: None,
+            retryable: Some(false),
+        }
+    }
+
+    /// A failure returned by the hotel IPC layer (error code + message from hotel).
+    pub fn ipc_failure(
+        component: impl Into<String>,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: "ipc_failure".into(),
+            message: message.into(),
+            code: Some(code.into()),
+            component: Some(component.into()),
+            provider: None,
+            capability: None,
+            retryable: Some(true),
+        }
+    }
+
+    /// A transport-level failure (socket error, serialization failure, etc.).
+    pub fn transport_error(
+        component: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: "transport_error".into(),
+            message: message.into(),
+            code: None,
+            component: Some(component.into()),
+            provider: None,
+            capability: None,
+            retryable: Some(true),
+        }
+    }
+
     pub fn display_message(&self) -> String {
         let mut parts = vec![self.message.clone(), format!("kind={}", self.kind)];
         if let Some(code) = self.code.as_deref() {
@@ -82,16 +133,24 @@ pub struct HandoffBundle {
     pub return_to: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff_reason: Option<String>,
+    /// The role handing off (e.g. "orchestrator", "developer"). None = orchestrator base.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_role: Option<String>,
+    /// The role receiving the handoff. Always set for same-identity role handoffs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_goal: Option<String>,
     #[serde(default)]
     pub active_constraints: Vec<String>,
+    /// Session-local facts still live at handoff time. Owned by the workflow, not the operator.
     #[serde(default)]
     pub relevant_session_facts: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_summary: Option<String>,
     #[serde(default)]
     pub suggested_memory_refs: Vec<String>,
+    /// One of: "required" (target must hand back), "optional", "none".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_return_mode: Option<String>,
     #[serde(default)]
@@ -385,7 +444,7 @@ pub enum IpcRequest {
     RegisterSkill {
         skill_name: String,
         description: String,
-        /// The subagent worker kind (e.g. `"agent-worker"`).
+        /// The subagent worker kind (e.g. `"philote-worker"`).
         subagent_kind: String,
         /// High-level goal statement for this skill.
         goal: String,
@@ -641,11 +700,11 @@ impl PhiloticClient {
 
     fn socket_path() -> String {
         std::env::var("PHILOTIC_HOTEL_SOCKET")
-            .unwrap_or_else(|_| "/tmp/philotic-ansible.sock".to_string())
+            .unwrap_or_else(|_| "/tmp/philotic-aiua.sock".to_string())
     }
 
     /// Connect to the local Ansible daemon automatically, driven by environment variables.
-    /// Default Hotel socket is `/tmp/philotic-ansible.sock` unless `PHILOTIC_HOTEL_SOCKET` is specified.
+    /// Default Hotel socket is `/tmp/philotic-aiua.sock` unless `PHILOTIC_HOTEL_SOCKET` is specified.
     pub async fn connect_at(socket_path: impl AsRef<str>, identity: GuestIdentity) -> Result<Self> {
         let socket_path = socket_path.as_ref().to_string();
         let stream = UnixStream::connect(&socket_path)
@@ -682,7 +741,7 @@ impl PhiloticClient {
     }
 
     /// Connect to the local Ansible daemon automatically, driven by environment variables.
-    /// Default Hotel socket is `/tmp/philotic-ansible.sock` unless `PHILOTIC_HOTEL_SOCKET` is specified.
+    /// Default Hotel socket is `/tmp/philotic-aiua.sock` unless `PHILOTIC_HOTEL_SOCKET` is specified.
     pub async fn connect(identity: GuestIdentity) -> Result<Self> {
         Self::connect_at(Self::socket_path(), identity).await
     }
@@ -812,7 +871,7 @@ mod tests {
                 lease_type: "telegram_poll".into(),
                 lease_scope: "telegram:bot-token:abcd".into(),
                 authority_hotel: "hotel-alpha".into(),
-                authority_component: Some("ansible".into()),
+                authority_component: Some("aiua".into()),
                 owner_guest_id: "membrane-telegram-01".into(),
                 owner_hotel: Some("hotel-alpha".into()),
                 owner_component_type: Some("membrane".into()),
@@ -976,7 +1035,7 @@ mod tests {
                 write_frame(
                     &mut stream,
                     &serde_json::to_vec(&IpcResponse::InboundTask {
-                        source_node: "local-ansible-01".into(),
+                        source_node: "local-aiua-01".into(),
                         task_id: Uuid::nil(),
                         task_json: serde_json::json!({
                             "action": "send_reply",
@@ -1067,7 +1126,7 @@ mod tests {
                 .await;
 
                 let payload = serde_json::to_vec(&IpcResponse::InboundTask {
-                    source_node: "local-ansible-01".into(),
+                    source_node: "local-aiua-01".into(),
                     task_id: Uuid::nil(),
                     task_json: serde_json::json!({
                         "action": "send_reply",

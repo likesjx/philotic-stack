@@ -32,7 +32,7 @@ source_of_truth_targets:
 
 ## Goal
 
-Define the plugin/hook boundaries `agent-core` should expose so new context engines, memory engines, local models, and control-plane behaviors can be integrated without repeatedly cutting into the main turn loop.
+Define the plugin/hook boundaries `philote` should expose so new context engines, memory engines, local models, and control-plane behaviors can be integrated without repeatedly cutting into the main turn loop.
 
 ## Disposition
 
@@ -47,12 +47,12 @@ Define the first hook vocabulary and payload shapes so hook integration can grow
 - align hook timing to `conversation turn` and `cognitive step`
 - define explicit checkpoints instead of generic callback soup
 - separate context collection, refresh, promotion, and post-processing responsibilities
-- land the first typed `HookRequest` / `HookResult` / `RefreshRequest` / `PromotionAction` payloads in `agent-core`
+- land the first typed `HookRequest` / `HookResult` / `RefreshRequest` / `PromotionAction` payloads in `philote`
 - keep the first hook registry itself for a later seam
 
 ## Core Recommendation
 
-Treat `agent-core` as a host for bounded extension hooks, not as the permanent owner of every new runtime concern.
+Treat `philote` as a host for bounded extension hooks, not as the permanent owner of every new runtime concern.
 
 The first hook families should cover:
 
@@ -78,7 +78,7 @@ But the contracts themselves should stay canonical to avoid rediscovering ambigu
 
 ## Why This Matters
 
-Philotic is already plugin-shaped at the system level, but `agent-core` still absorbs too much behavior directly.
+Philotic is already plugin-shaped at the system level, but `philote` still absorbs too much behavior directly.
 
 Without hooks:
 

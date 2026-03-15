@@ -34,14 +34,14 @@ source_of_truth_targets:
 
 ## Goal
 
-Close four concrete gaps in the current `agent-core` loop that prevent it from functioning as a real agentic runtime: the one-shot tool loop, hardcoded media routing, placeholder tool definitions, and coarse approval granularity.
+Close four concrete gaps in the current `philote` loop that prevent it from functioning as a real agentic runtime: the one-shot tool loop, hardcoded media routing, placeholder tool definitions, and coarse approval granularity.
 
 ## Disposition
 
 `complete — all four gaps closed`
 
 ### Completed
-- **Gap 3 — Real Tool Catalog** — `catalog.rs` in `agent-core` with proper descriptions and schemas for `session.status`, `echo`, `workspace.list`, `workspace.read`. `ToolDefinition` gained `class: Option<String>`. Hotel startup seeds the catalog into the context graph as `AbstractToolRecord` nodes. Both `default_tool_assembly_for_bindings` and `tool_assembly_from_allowed_incarnations` look up from the catalog before falling back to stubs.
+- **Gap 3 — Real Tool Catalog** — `catalog.rs` in `philote` with proper descriptions and schemas for `session.status`, `echo`, `workspace.list`, `workspace.read`. `ToolDefinition` gained `class: Option<String>`. Hotel startup seeds the catalog into the context graph as `AbstractToolRecord` nodes. Both `default_tool_assembly_for_bindings` and `tool_assembly_from_allowed_incarnations` look up from the catalog before falling back to stubs.
 - **Gap 2 — Configurable Media Routing** — `MediaRoutingPolicy` landed in `AgentProfile`. Per-kind action overrides (`voice_action`, `image_action`, `document_action`) route to distinct capabilities (`voice.transcribe`, `image.describe`, `media.analyze`). `strip_tools_on_media` and `forward_media_to_model` are configurable. `TaskKind::AudioTranscribe` added to model-router; Gemini handles it via the same inline-bytes path.
 
 ### Extended (beyond original Gap 2 scope)
@@ -128,7 +128,7 @@ The model has no real schema or description to reason about. Tool selection is h
 
 ### Recommendation
 
-Define a **static tool catalog** in `agent-core` with proper definitions for all currently known tools:
+Define a **static tool catalog** in `philote` with proper definitions for all currently known tools:
 
 | Tool | Description | Schema |
 |---|---|---|
@@ -212,4 +212,4 @@ Deferred from first slice:
 
 - Should the iteration cap be per-session configurable, or a hard compile-time constant?
 - Should working tool history be preserved across approval interrupts (i.e., if approval is requested mid-loop, does the tool history survive)?
-- Should the tool catalog live entirely in `agent-core` or be provided partly by the hotel IPC snapshot (so hotel can inject custom tool definitions from tool-runner guests)?
+- Should the tool catalog live entirely in `philote` or be provided partly by the hotel IPC snapshot (so hotel can inject custom tool definitions from tool-runner guests)?

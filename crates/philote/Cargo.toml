@@ -1,5 +1,5 @@
 [package]
-name = "agent-core"
+name = "philote"
 version = "0.1.0"
 edition = "2024"
 
@@ -8,11 +8,11 @@ name = "agent_core"
 path = "src/lib.rs"
 
 [[bin]]
-name = "agent-core"
+name = "philote"
 path = "src/main.rs"
 
 [[bin]]
-name = "agent-worker"
+name = "philote-worker"
 path = "src/bin/agent_worker.rs"
 
 [dependencies]

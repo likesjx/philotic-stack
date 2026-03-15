@@ -44,7 +44,7 @@ That is much better than waiting for the perfect theory of synthetic personhood 
 
 ## Disposition
 
-Accepted for the current slice. A minimal bridge is now in place for `vps-jane`: legacy workspace files are seeded into the canonical Philotic agent identity bundle and exposed to `agent-core` through the canonical session snapshot.
+Accepted for the current slice. A minimal bridge is now in place for `vps-jane`: legacy workspace files are seeded into the canonical Philotic agent identity bundle and exposed to `philote` through the canonical session snapshot.
 
 This project should follow the current personality/context work and provide the migration path from legacy ZeroClaw/OpenClaw agent definitions into Philotic-native session and runtime architecture.
 
@@ -243,7 +243,7 @@ The current bridge slice is intentionally narrow:
    - `MEMORY.md`
 3. store them as a compatibility bundle in the context graph
 4. expose that bundle through the canonical session snapshot
-5. let `agent-core` project from those imported sources
+5. let `philote` project from those imported sources
 
 This is enough to give Jane a recognizable shadow without yet importing full OpenClaw manifests or dynamic memory behavior.
 
@@ -254,7 +254,7 @@ The recommended next implementation slice is:
 1. add importer scaffolding for one OpenClaw agent
 2. ingest `SOUL.md`, `IDENTITY.md`, `USER.md`, and `MEMORY.md`
 3. add compatibility fields to the Philotic agent profile or session bootstrap path
-4. refactor `agent-core` prompt assembly to use explicit layers
+4. refactor `philote` prompt assembly to use explicit layers
 5. materialize the imported agent in Philotic and verify identity continuity
 
 ## Longer-Term Evolution

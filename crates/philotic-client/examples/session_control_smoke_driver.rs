@@ -70,7 +70,7 @@ async fn main() -> Result<()> {
     .with_context(|| format!("failed to connect session control smoke driver to {socket_path}"))?;
 
     let target_node =
-        std::env::var("PHILOTIC_TARGET_NODE").unwrap_or_else(|_| "local-ansible-01".to_string());
+        std::env::var("PHILOTIC_TARGET_NODE").unwrap_or_else(|_| "local-aiua-01".to_string());
 
     emit_and_expect(
         &mut client,

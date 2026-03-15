@@ -63,13 +63,13 @@ For the first coherent slice:
 - keep polling as the default production ingress
 - design webhook ingress now, but gate it behind a stricter security contract than polling
 - raise Telegram-native control behavior into `membrane`
-- normalize Telegram updates into a transport-neutral envelope before handing them to `agent-core`
-- keep `agent-core` transport-agnostic and focused on cognition
+- normalize Telegram updates into a transport-neutral envelope before handing them to `philote`
+- keep `philote` transport-agnostic and focused on cognition
 
 In other words:
 
 - `membrane` owns Telegram semantics
-- `agent-core` owns the conversational/agent loop
+- `philote` owns the conversational/agent loop
 - the context graph owns durable session truth
 
 ## Disposition
@@ -92,7 +92,7 @@ Current repo truth:
   - captioned media messages
   - attachment-only media/file messages
   - `callback_query`
-- it emits a normalized inbound transport envelope into `agent-core` with:
+- it emits a normalized inbound transport envelope into `philote` with:
   - `transport`
   - `session_id`
   - `turn_id`
@@ -112,9 +112,9 @@ Current repo truth:
 
 That is a useful membrane slice, but it is not yet a richer Telegram controller:
 
-- slash commands still execute in `agent-core`
+- slash commands still execute in `philote`
 - attachment handling now resolves `file_id` values through Telegram `getFile`, downloads bytes, and uploads them into the hotel blob service
-- blob-backed Telegram attachments now have an initial downstream path through `agent-core` and `model-router` as `media.analyze`, so supported photos, audio/voice notes, and documents can reach Gemini for first-pass interpretation
+- blob-backed Telegram attachments now have an initial downstream path through `philote` and `model-router` as `media.analyze`, so supported photos, audio/voice notes, and documents can reach Gemini for first-pass interpretation
 - membrane/agent identity is now guest-configurable, so separate hotels can materialize separate Telegram pollers and separate agent identities without hardcoding Jane everywhere
 - specialized voice transcription, richer vision workflows, and watched live validation of the blob-backed media path are still follow-on work
 - polling still does not cover the full Telegram update surface beyond `message` and `callback_query`
@@ -231,7 +231,7 @@ Why this matters for webhook work:
 
 - multimodal updates will arrive with more shapes than a text field
 - callback queries, commands, media, and topic/thread metadata need a stable normalized envelope
-- extending this one field at a time encourages partial transport truth scattered across `membrane` and `agent-core`
+- extending this one field at a time encourages partial transport truth scattered across `membrane` and `philote`
 
 Disposition:
 
@@ -316,7 +316,7 @@ Telegram's own docs recommend `secret_token`, and the Bot API includes it specif
 - streaming/draft behavior
 - approval-card formatting
 
-`agent-core` should own:
+`philote` should own:
 
 - conversational reasoning
 - tool/approval orchestration
@@ -367,7 +367,7 @@ Observed tradeoff:
 Recommendation:
 
 - near-term: keep model output transport-neutral and let `membrane` translate a supported Markdown subset into Telegram-safe HTML
-- medium-term: define an outbound rich-text contract above Telegram so `membrane` can project to explicit Telegram entities without teaching `agent-core` transport-specific markup trivia
+- medium-term: define an outbound rich-text contract above Telegram so `membrane` can project to explicit Telegram entities without teaching `philote` transport-specific markup trivia
 - respect Telegram-specific limits when projecting:
   - normal message text length after formatting parse
   - caption length limits for media messages
@@ -422,9 +422,9 @@ The user sees nothing until the full reply is ready. No typing indicator. No par
 
 ### Design principle
 
-Keep canonical turn state in the context graph. Let `membrane` project partial progress into Telegram delivery UX. Do not leak Telegram-specific draft/edit behavior into `agent-core`.
+Keep canonical turn state in the context graph. Let `membrane` project partial progress into Telegram delivery UX. Do not leak Telegram-specific draft/edit behavior into `philote`.
 
-`agent-core` should emit turn lifecycle signals. `membrane` should own the projection of those signals into Telegram-native UX behaviors.
+`philote` should emit turn lifecycle signals. `membrane` should own the projection of those signals into Telegram-native UX behaviors.
 
 ### Layer 1: Typing indicator (no protocol changes required)
 
@@ -434,12 +434,12 @@ Telegram's `sendChatAction` with `action = "typing"` shows a typing indicator to
 
 Implementation:
 
-1. When `membrane` emits a task to `agent-core`, record the active turn in a local in-memory map keyed by `(chat_id, thread_id)`.
-2. Immediately send `sendChatAction(chat_id, "typing")` before dispatching to `agent-core`.
+1. When `membrane` emits a task to `philote`, record the active turn in a local in-memory map keyed by `(chat_id, thread_id)`.
+2. Immediately send `sendChatAction(chat_id, "typing")` before dispatching to `philote`.
 3. Spawn a background tokio task that re-sends `sendChatAction(chat_id, "typing")` every 4 seconds while the turn is active.
 4. When the final reply `InboundTask` arrives, cancel the typing refresh task and deliver the reply.
 
-This requires no IPC protocol changes and no changes to `agent-core`. The turn map is internal to `membrane`.
+This requires no IPC protocol changes and no changes to `philote`. The turn map is internal to `membrane`.
 
 Action variants by turn phase (future extension, same pattern):
 
@@ -454,7 +454,7 @@ Action variants by turn phase (future extension, same pattern):
 
 Progressive delivery simulates streaming by sending an initial placeholder message and then editing it in place as content arrives. Telegram supports editing messages via `editMessageText`.
 
-This requires `agent-core` to emit intermediate partial reply signals back to `membrane` over IPC.
+This requires `philote` to emit intermediate partial reply signals back to `membrane` over IPC.
 
 Proposed IPC protocol extension:
 
@@ -482,7 +482,7 @@ Constraints:
 
 ### Layer 3: Turn lifecycle signals
 
-For the typing indicator to accurately reflect what is happening, `agent-core` should emit structured turn lifecycle events rather than just final replies.
+For the typing indicator to accurately reflect what is happening, `philote` should emit structured turn lifecycle events rather than just final replies.
 
 Proposed lifecycle events:
 
@@ -510,7 +510,7 @@ Proposed lifecycle events:
 
 Near-term: implement typing indicator and final reply with no lifecycle events (Layer 1 only).
 Medium-term: add `turn.partial_reply` / `turn.final_reply` distinction (Layer 2).
-Long-term: add full lifecycle events when `agent-core` has a proper turn state machine (Layer 3).
+Long-term: add full lifecycle events when `philote` has a proper turn state machine (Layer 3).
 
 ### Interruption handling
 
@@ -521,23 +521,23 @@ Three options:
 **Option A: Queue and process sequentially (recommended near-term)**
 
 - Accept the new message normally.
-- Do not dispatch it to `agent-core` until the active turn for that `(chat_id, thread_id)` completes.
+- Do not dispatch it to `philote` until the active turn for that `(chat_id, thread_id)` completes.
 - The typing indicator naturally covers both turns from the user's perspective.
 - Simple to implement with a per-session pending queue in `membrane`.
 
 **Option B: Cancel and restart**
 
-- When a new message arrives during an active turn: signal `agent-core` to abandon the current turn, then dispatch the new message immediately.
-- Requires a `CancelTurn` IPC request type and `agent-core` to support graceful cancellation.
+- When a new message arrives during an active turn: signal `philote` to abandon the current turn, then dispatch the new message immediately.
+- Requires a `CancelTurn` IPC request type and `philote` to support graceful cancellation.
 - More complex but more responsive for long-running turns.
-- Not recommended until `agent-core` has a proper cancellation boundary.
+- Not recommended until `philote` has a proper cancellation boundary.
 
 **Option C: Reject and notify**
 
 - Reject the new message with a transport-level reply ("I'm still thinking about your last message...").
 - Simple but poor UX; not recommended.
 
-Recommended default: Option A (queue). Add Option B (cancel) when `agent-core` has a cancellation mechanism.
+Recommended default: Option A (queue). Add Option B (cancel) when `philote` has a cancellation mechanism.
 
 ### Thread and chat scoping
 
@@ -651,7 +651,7 @@ The typing heartbeat task itself should be cancellation-safe. Use a `Cancellatio
 
 #### Scope boundary
 
-`agent-core` emits turn lifecycle events. `membrane` maps them to Telegram UX behaviors. `agent-core` does not know or care about Telegram-specific typing actions, message IDs, or edit behavior.
+`philote` emits turn lifecycle events. `membrane` maps them to Telegram UX behaviors. `philote` does not know or care about Telegram-specific typing actions, message IDs, or edit behavior.
 
 ### Implementation order
 

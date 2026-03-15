@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 fn local_node_id() -> String {
-    std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-ansible-01".to_string())
+    std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string())
 }
 
 fn local_agent_id() -> String {
@@ -818,7 +818,30 @@ impl SessionState {
     }
 
     pub fn reset_approval_policy(&mut self) {
-        self.approval_policy = ApprovalPolicy::default();
+        self.approval_policy.preapproved_tools.clear();
+        self.approval_policy.preapproved_classes.clear();
+    }
+
+    /// Known approval class names that can be pre-approved by class rather than by tool name.
+    const APPROVAL_CLASSES: &'static [&'static str] =
+        &["session", "workspace", "utility", "capability", "config", "handoff"];
+
+    /// Preapprove a tool name or class name for this session.
+    ///
+    /// Returns a human-readable confirmation string. If `name` matches a known class name it is
+    /// added to `preapproved_classes`; otherwise it is added to `preapproved_tools`.
+    pub fn preapprove_by_name(&mut self, name: &str) -> String {
+        if Self::APPROVAL_CLASSES.contains(&name) {
+            if !self.approval_policy.preapproved_classes.contains(&name.to_string()) {
+                self.approval_policy.preapproved_classes.push(name.to_string());
+            }
+            format!("Preapproved: `{name}` (class)")
+        } else {
+            if !self.approval_policy.preapproved_tools.contains(&name.to_string()) {
+                self.approval_policy.preapproved_tools.push(name.to_string());
+            }
+            format!("Preapproved: `{name}` (tool)")
+        }
     }
 
     /// Apply a configuration change from the `agent.configure` tool.
@@ -1150,29 +1173,22 @@ impl SessionState {
     }
 
     pub fn approval_policy_status_text(&self) -> String {
-        if self.approval_policy.auto_approve_all {
-            return "Approval policy: pre-approved for this session.".into();
-        }
-
-        let mut parts = Vec::new();
-        if !self.approval_policy.preapproved_tools.is_empty() {
-            parts.push(format!(
-                "tools={}",
-                self.approval_policy.preapproved_tools.join(", ")
-            ));
-        }
-        if !self.approval_policy.preapproved_classes.is_empty() {
-            parts.push(format!(
-                "classes={}",
-                self.approval_policy.preapproved_classes.join(", ")
-            ));
-        }
-
-        if parts.is_empty() {
-            "Approval policy: no pre-approvals configured.".into()
+        let tools = if self.approval_policy.preapproved_tools.is_empty() {
+            "none".to_string()
         } else {
-            format!("Approval policy: {}.", parts.join(" | "))
-        }
+            self.approval_policy.preapproved_tools.join(", ")
+        };
+        let classes = if self.approval_policy.preapproved_classes.is_empty() {
+            "none".to_string()
+        } else {
+            self.approval_policy.preapproved_classes.join(", ")
+        };
+        format!(
+            "Approval policy:\n- auto_approve_all: {}\n- preapproved_tools: {}\n- preapproved_classes: {}\n\nCommands: /preapprove <tool|class>  /preapprove this-session  /approval reset",
+            self.approval_policy.auto_approve_all,
+            tools,
+            classes,
+        )
     }
 
     pub fn session_status_text(&self) -> String {
@@ -1823,6 +1839,12 @@ impl SessionState {
             relevant_session_facts.push("approval=preapproved".into());
         }
 
+        let from_role = self
+            .role_activation
+            .as_ref()
+            .map(|r| r.role_name.clone())
+            .or_else(|| Some("orchestrator".into()));
+
         HandoffBundle {
             goal: format!("Switch active role to {target_role} for this session."),
             context_excerpt: format!(
@@ -1833,6 +1855,8 @@ impl SessionState {
             initiating_turn_id: initiating_turn_id.to_string(),
             return_to,
             handoff_reason: Some(handoff_reason.to_string()),
+            from_role,
+            to_role: Some(target_role.to_string()),
             active_goal,
             active_constraints: vec![
                 format!("transport_source={}", self.source),
@@ -1841,7 +1865,7 @@ impl SessionState {
             relevant_session_facts,
             working_summary,
             suggested_memory_refs: Vec::new(),
-            expected_return_mode: Some("stay_active_until_manual_return".into()),
+            expected_return_mode: Some("required".into()),
             cleanup_actions: vec![
                 "persist_role_local_working_state".into(),
                 "switch_active_role".into(),
@@ -2674,7 +2698,7 @@ mod tests {
             turn_id: "turn-1".into(),
             chat_id: "123".into(),
             user_content: "hello".into(),
-            final_reply_to: "local-ansible-01".into(),
+            final_reply_to: "local-aiua-01".into(),
             final_reply_role: "membrane".into(),
             final_reply_guest_id: Some("membrane-telegram-01".into()),
             phase: TurnPhase::Queued,
@@ -2768,7 +2792,7 @@ mod tests {
             turn_id: "turn-1".into(),
             chat_id: "123".into(),
             user_content: "hello".into(),
-            final_reply_to: "local-ansible-01".into(),
+            final_reply_to: "local-aiua-01".into(),
             final_reply_role: "membrane".into(),
             final_reply_guest_id: None,
             phase: TurnPhase::Queued,
@@ -2814,7 +2838,7 @@ mod tests {
                 "effective_skillset": ["planning"],
                 "effective_workspace_ref": "workspace://main",
                 "transport_reply_target": {
-                    "target_node": "local-ansible-01",
+                    "target_node": "local-aiua-01",
                     "target_role": "membrane",
                     "target_guest_id": "membrane-telegram-01"
                 },
@@ -2825,7 +2849,7 @@ mod tests {
                 "task_id": Uuid::nil().to_string(),
                 "chat_id": "123",
                 "user_content": "status?",
-                "final_reply_to": "local-ansible-01",
+                "final_reply_to": "local-aiua-01",
                 "final_reply_role": "membrane",
                 "phase": "waiting_model",
                 "iteration": 1,
@@ -2882,7 +2906,7 @@ mod tests {
                 effective_skillset: vec!["planning".into()],
                 effective_workspace_ref: Some("workspace://main".into()),
                 transport_reply_target: Some(TransportReplyTargetBinding {
-                    target_node: "local-ansible-01".into(),
+                    target_node: "local-aiua-01".into(),
                     target_role: "membrane".into(),
                     target_guest_id: Some("membrane-telegram-01".into()),
                 }),
@@ -3131,7 +3155,7 @@ mod tests {
             effective_skillset: vec!["planning".into()],
             effective_workspace_ref: Some("workspace://main".into()),
             transport_reply_target: Some(TransportReplyTargetBinding {
-                target_node: "local-ansible-01".into(),
+                target_node: "local-aiua-01".into(),
                 target_role: "membrane".into(),
                 target_guest_id: Some("membrane-telegram-01".into()),
             }),
@@ -3151,7 +3175,7 @@ mod tests {
         assert!(prompt.contains("Workspace: workspace://main."));
         assert!(
             prompt.contains(
-                "Delivery target: local-ansible-01 / membrane guest=membrane-telegram-01."
+                "Delivery target: local-aiua-01 / membrane guest=membrane-telegram-01."
             )
         );
     }
@@ -3201,7 +3225,7 @@ mod tests {
             turn_id: "turn-ctx-1".into(),
             chat_id: "123".into(),
             user_content: "status".into(),
-            final_reply_to: "local-ansible-01".into(),
+            final_reply_to: "local-aiua-01".into(),
             final_reply_role: "membrane".into(),
             final_reply_guest_id: None,
             phase: TurnPhase::WaitingModel,
@@ -3285,7 +3309,7 @@ mod tests {
             turn_id: "turn-ctx-2".into(),
             chat_id: "123".into(),
             user_content: "status".into(),
-            final_reply_to: "local-ansible-01".into(),
+            final_reply_to: "local-aiua-01".into(),
             final_reply_role: "membrane".into(),
             final_reply_guest_id: None,
             phase: TurnPhase::WaitingModel,
@@ -3354,7 +3378,7 @@ mod tests {
             turn_id: "turn-handoff-1".into(),
             chat_id: "123".into(),
             user_content: "implement the fix".into(),
-            final_reply_to: "local-ansible-01".into(),
+            final_reply_to: "local-aiua-01".into(),
             final_reply_role: "membrane".into(),
             final_reply_guest_id: None,
             phase: TurnPhase::WaitingModel,
@@ -3386,10 +3410,9 @@ mod tests {
                 .relevant_session_facts
                 .contains(&"workspace=workspace://main".to_string())
         );
-        assert_eq!(
-            bundle.expected_return_mode.as_deref(),
-            Some("stay_active_until_manual_return")
-        );
+        assert_eq!(bundle.expected_return_mode.as_deref(), Some("required"));
+        assert_eq!(bundle.from_role.as_deref(), Some("developer"));
+        assert_eq!(bundle.to_role.as_deref(), Some("architect"));
         assert!(
             bundle
                 .cleanup_actions
@@ -3421,7 +3444,7 @@ mod tests {
             turn_id: "turn-subagent-1".into(),
             chat_id: "123".into(),
             user_content: "break this into a small worker task".into(),
-            final_reply_to: "local-ansible-01".into(),
+            final_reply_to: "local-aiua-01".into(),
             final_reply_role: "membrane".into(),
             final_reply_guest_id: None,
             phase: TurnPhase::WaitingModel,
@@ -3559,10 +3582,10 @@ mod tests {
     #[test]
     fn status_text_reports_when_no_preapproval_exists() {
         let state = SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
-        assert_eq!(
-            state.approval_policy_status_text(),
-            "Approval policy: no pre-approvals configured."
-        );
+        let text = state.approval_policy_status_text();
+        assert!(text.contains("auto_approve_all: false"));
+        assert!(text.contains("preapproved_tools: none"));
+        assert!(text.contains("preapproved_classes: none"));
     }
 
     #[test]
@@ -3575,7 +3598,7 @@ mod tests {
         state.bindings.effective_workspace_ref = Some("workspace://main".into());
         state.bindings.effective_model_controller = Some("gemini-flash".into());
         state.bindings.transport_reply_target = Some(TransportReplyTargetBinding {
-            target_node: "local-ansible-01".into(),
+            target_node: "local-aiua-01".into(),
             target_role: "membrane".into(),
             target_guest_id: Some("membrane-telegram-01".into()),
         });
@@ -3587,7 +3610,7 @@ mod tests {
         assert!(text.contains("Component routes: text.generate [legacy] impl=gemini-flash."));
         assert!(
             text.contains(
-                "Delivery target: local-ansible-01 / membrane guest=membrane-telegram-01."
+                "Delivery target: local-aiua-01 / membrane guest=membrane-telegram-01."
             )
         );
     }
@@ -3601,7 +3624,7 @@ mod tests {
             selection_mode: "preferred".into(),
             implementation: Some("gemini".into()),
             incarnation: Some("model-controller-gemini-01".into()),
-            preferred_hotel_id: Some("local-ansible-01".into()),
+            preferred_hotel_id: Some("local-aiua-01".into()),
             preferred_environment_id: Some("env://local".into()),
         });
 
@@ -3616,7 +3639,7 @@ mod tests {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.set_transport_reply_target(
-            "local-ansible-01",
+            "local-aiua-01",
             "membrane",
             Some("membrane-telegram-01".into()),
         );
@@ -3627,7 +3650,7 @@ mod tests {
             Some("fallback-guest".into()),
         );
 
-        assert_eq!(target.target_node, "local-ansible-01");
+        assert_eq!(target.target_node, "local-aiua-01");
         assert_eq!(target.target_role, "membrane");
         assert_eq!(
             target.target_guest_id.as_deref(),
@@ -3678,9 +3701,9 @@ mod tests {
             ToolRunnerIncarnationBinding {
                 incarnation_id: "tool-echo-local".into(),
                 runner_id: Some("tool-runner-local".into()),
-                hotel_id: Some("local-ansible-01".into()),
+                hotel_id: Some("local-aiua-01".into()),
                 environment_id: Some("env://local".into()),
-                target_node: Some("local-ansible-01".into()),
+                target_node: Some("local-aiua-01".into()),
                 target_role: Some("tool.echo".into()),
                 supported_tools: vec!["echo".into()],
                 execution_mode: "capability".into(),
@@ -3695,7 +3718,7 @@ mod tests {
             .resolve_tool_route("echo")
             .expect("echo route should be assembled");
         assert_eq!(route.incarnation_id.as_deref(), Some("tool-echo-local"));
-        assert_eq!(route.hotel_id.as_deref(), Some("local-ansible-01"));
+        assert_eq!(route.hotel_id.as_deref(), Some("local-aiua-01"));
         assert_eq!(
             route.selection_reason.as_deref(),
             Some("local_live_preferred")
@@ -3711,9 +3734,9 @@ mod tests {
             ToolRunnerIncarnationBinding {
                 incarnation_id: "tool-echo-local".into(),
                 runner_id: Some("tool-runner-local".into()),
-                hotel_id: Some("local-ansible-01".into()),
+                hotel_id: Some("local-aiua-01".into()),
                 environment_id: Some("env://local".into()),
-                target_node: Some("local-ansible-01".into()),
+                target_node: Some("local-aiua-01".into()),
                 target_role: Some("tool.echo".into()),
                 supported_tools: vec!["echo".into()],
                 execution_mode: "capability".into(),
@@ -3870,7 +3893,7 @@ mod tests {
             turn_id: "turn-1".into(),
             chat_id: "123".into(),
             user_content: "hello".into(),
-            final_reply_to: "local-ansible-01".into(),
+            final_reply_to: "local-aiua-01".into(),
             final_reply_role: "membrane".into(),
             final_reply_guest_id: None,
             phase: TurnPhase::Queued,
@@ -3909,7 +3932,7 @@ mod tests {
             turn_id: "turn-1".into(),
             chat_id: "123".into(),
             user_content: "list workspace files".into(),
-            final_reply_to: "local-ansible-01".into(),
+            final_reply_to: "local-aiua-01".into(),
             final_reply_role: "membrane".into(),
             final_reply_guest_id: None,
             phase: TurnPhase::WaitingTool,
@@ -3963,7 +3986,7 @@ mod tests {
             turn_id: "turn-1".into(),
             chat_id: "123".into(),
             user_content: "read the README".into(),
-            final_reply_to: "local-ansible-01".into(),
+            final_reply_to: "local-aiua-01".into(),
             final_reply_role: "membrane".into(),
             final_reply_guest_id: None,
             phase: TurnPhase::WaitingTool,
@@ -4018,7 +4041,7 @@ mod tests {
             turn_id: "turn-voice-1".into(),
             chat_id: "123".into(),
             user_content: "User sent a Telegram voice message.".into(),
-            final_reply_to: "local-ansible-01".into(),
+            final_reply_to: "local-aiua-01".into(),
             final_reply_role: "membrane".into(),
             final_reply_guest_id: None,
             phase: TurnPhase::Thinking,

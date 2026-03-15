@@ -1,8 +1,8 @@
 [workspace]
 members = [
-    "crates/ansible",
+    "crates/aiua",
     "crates/membrane",
-    "crates/agent-core",
+    "crates/philote",
     "crates/model-router",
     "crates/tool-runner",
     "crates/philotic-client",

@@ -62,7 +62,7 @@ More precisely:
 
 This keeps Philotic aligned with the existing ownership rules:
 
-- the agent-home `ansible` owns stable membrane transport authority for that agent/token
+- the agent-home `aiua` owns stable membrane transport authority for that agent/token
 - `membrane` owns transport execution
 - Telegram's update cursor is treated as single-writer state
 
@@ -76,8 +76,8 @@ Current active work should be tracked in [docs/task.md](/Users/jaredlikes/code/p
 
 Current repo truth:
 
-- `ansible` now owns a local hotel runtime poll-lease registry keyed by token fingerprint
-- `ansible` now serves that lease through the shared runtime-authority lease abstraction (`LeaseEnvelope` + central provider/observer registry) rather than a Telegram-only in-memory shape
+- `aiua` now owns a local hotel runtime poll-lease registry keyed by token fingerprint
+- `aiua` now serves that lease through the shared runtime-authority lease abstraction (`LeaseEnvelope` + central provider/observer registry) rather than a Telegram-only in-memory shape
 - `membrane` fingerprints the Telegram bot token, requests a lease for a specific `agent_id`, and fails closed if the lease is denied
 - agent identity now carries `authority_hotel`, and lease acquisition is denied when the current hotel is not that agent's home authority
 - explicit delegated remote polling is now possible as a transitional contract when the agent identity bundle lists the current hotel in `telegram_poll_delegate_hotels`

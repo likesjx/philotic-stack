@@ -23,9 +23,9 @@ just test                   # cargo test --workspace
 cargo test -p <crate>       # test a single crate
 
 # Run (requires mesh-config.json)
-just start-ansible          # build + start hotel daemon
+just start-aiua             # build + start hotel daemon
 just start-gateway          # cargo run -p membrane
-just start-agent            # cargo run -p agent-core
+just start-agent            # cargo run -p philote
 just start-model            # cargo run -p model-router (Gemini/ElevenLabs)
 
 # Parallel workstreams
@@ -63,7 +63,7 @@ Before opening a PR from a worktree:
 just workstream-overlap <slug>
 ```
 
-Hot files include `crates/ansible/src/main.rs`, `crates/ansible/src/service/ipc.rs`, `crates/agent-core/src/runtime.rs`, `crates/membrane/src/main.rs`, `crates/model-router/*`, `crates/philotic-client/src/lib.rs`, `crates/ansible/README.md`, `docs/task.md`.
+Hot files include `crates/aiua/src/main.rs`, `crates/aiua/src/service/ipc.rs`, `crates/philote/src/runtime.rs`, `crates/membrane/src/main.rs`, `crates/model-router/*`, `crates/philotic-client/src/lib.rs`, `crates/aiua/README.md`, `docs/task.md`.
 
 ## Architecture
 
@@ -73,15 +73,15 @@ The Philotic Stack is a distributed AI agent OS (Rust). Metaphor: **Hotel** (nod
 
 - `ansible-mesh-core`: Shared primitives, storage traits, mesh types.
 - `philotic-client`: Guest SDK (IPC client).
-- `ansible`: Hotel daemon (orchestrator).
+- `aiua`: Hotel daemon (orchestrator).
 - `membrane`: Telegram/external protocol gateway guest.
-- `agent-core`: Persona/agent cognitive loop guest.
+- `philote`: Persona/agent cognitive loop guest.
 - `model-router`: Model provider routing guest (Gemini/ElevenLabs).
 - `tool-runner`: Seeded/inactive tool execution guest.
 
 ### Communication
 
-- **Intra-hotel (IPC/UDS):** Over `/tmp/philotic-ansible.sock`. Newline-framed JSON (`IpcRequest` / `IpcResponse`).
+- **Intra-hotel (IPC/UDS):** Over `/tmp/philotic-aiua.sock`. Newline-framed JSON (`IpcRequest` / `IpcResponse`).
 - **Inter-hotel (Mesh/UDP):** `BeaconMessage` on port 8999 (HMAC-PSK optional).
 - **Blob store (HTTP):** Large payloads over :9001.
 

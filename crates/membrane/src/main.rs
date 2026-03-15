@@ -15,7 +15,7 @@ const TELEGRAM_POLL_TIMEOUT_SECS: u64 = 10;
 const TELEGRAM_POLL_LEASE_RENEW_INTERVAL_SECS: u64 = 20;
 
 fn local_node_id() -> String {
-    std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-ansible-01".to_string())
+    std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string())
 }
 
 fn local_guest_id() -> String {
@@ -719,12 +719,54 @@ async fn send_telegram_text(
     }
 }
 
+/// Splits `text` at `\n\n` paragraph boundaries so each chunk fits within `limit` bytes.
+/// Falls back to `\n` line breaks, then hard-splits at `limit` if no breaks are found.
+fn split_at_paragraph_boundary(text: &str, limit: usize) -> Vec<String> {
+    if text.len() <= limit {
+        return vec![text.to_string()];
+    }
+    let mut chunks = Vec::new();
+    let mut remaining = text;
+    while remaining.len() > limit {
+        let split_at = if let Some(pos) = remaining[..limit].rfind("\n\n") {
+            pos + 2
+        } else if let Some(pos) = remaining[..limit].rfind('\n') {
+            pos + 1
+        } else {
+            limit
+        };
+        chunks.push(remaining[..split_at].to_string());
+        remaining = &remaining[split_at..];
+    }
+    if !remaining.is_empty() {
+        chunks.push(remaining.to_string());
+    }
+    chunks
+}
+
+/// Sends `text` to a Telegram chat, splitting into multiple messages if it exceeds the
+/// 4096-character limit. Splits at paragraph boundaries when possible.
+async fn send_formatted_text(
+    http_client: &reqwest::Client,
+    tg_base: &str,
+    chat_id: &str,
+    thread_id: Option<&str>,
+    text: &str,
+) {
+    const TELEGRAM_MSG_LIMIT: usize = 4096;
+    for chunk in split_at_paragraph_boundary(text, TELEGRAM_MSG_LIMIT) {
+        send_telegram_text(http_client, tg_base, chat_id, thread_id, &chunk).await;
+    }
+}
+
 /// Commands handled entirely within membrane, before the envelope reaches agent-core.
 /// Returns `true` if the command was handled locally (caller should skip the EmitTask).
 async fn handle_membrane_command(
     http_client: &reqwest::Client,
     tg_base: &str,
     envelope: &TelegramMessageEnvelope,
+    session_id_overrides: &mut HashMap<String, String>,
+    agent_id: &str,
 ) -> bool {
     let Some(command) = envelope.command.as_deref() else {
         return false;
@@ -753,6 +795,32 @@ async fn handle_membrane_command(
                 &envelope.chat_id,
                 envelope.thread_id.as_deref(),
                 "pong",
+            )
+            .await;
+            true
+        }
+        "/new" => {
+            info!("Membrane handling /new for chat [{}]", envelope.chat_id);
+            let epoch_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let new_session_id = match envelope.thread_id.as_deref() {
+                Some(tid) => format!("telegram:{}:{}:{}:{}", envelope.chat_id, tid, epoch_ms, agent_id),
+                None => format!("telegram:{}:{}:{}", envelope.chat_id, epoch_ms, agent_id),
+            };
+            let session_key = format!(
+                "{}:{}",
+                envelope.chat_id,
+                envelope.thread_id.as_deref().unwrap_or("")
+            );
+            session_id_overrides.insert(session_key, new_session_id);
+            send_telegram_text(
+                http_client,
+                tg_base,
+                &envelope.chat_id,
+                envelope.thread_id.as_deref(),
+                "Started a new conversation.",
             )
             .await;
             true
@@ -1130,6 +1198,18 @@ const TELEGRAM_MENU_COMMANDS: &[TelegramBotCommand] = &[
         command: "tts",
         description: "Set text-to-speech mode.",
     },
+    TelegramBotCommand {
+        command: "new",
+        description: "Start a fresh conversation.",
+    },
+    TelegramBotCommand {
+        command: "preapprove",
+        description: "Pre-approve a tool or class for this session.",
+    },
+    TelegramBotCommand {
+        command: "approval",
+        description: "Show or reset session approval policy (status / reset).",
+    },
 ];
 
 const TELEGRAM_MAX_COMMANDS: usize = 100;
@@ -1147,7 +1227,12 @@ fn telegram_help_text() -> String {
     help.push_str("/roles lists configured roles and highlights the active one.\n");
     help.push_str("/back returns the session to the orchestrator role.\n");
     help.push_str("/approve and /deny can include a note.\n");
-    help.push_str("/tts accepts optional modes like on, off, or auto.");
+    help.push_str("/tts accepts optional modes like on, off, or auto.\n");
+    help.push_str("/new starts a fresh conversation with a new session ID.\n");
+    help.push_str("/preapprove <tool|class> adds a tool name or class to the session pre-approve list.\n");
+    help.push_str("/preapprove this-session pre-approves all tools for this session.\n");
+    help.push_str("/approval status shows the current session approval policy.\n");
+    help.push_str("/approval reset clears session-scoped pre-approvals.");
     help
 }
 
@@ -1482,6 +1567,8 @@ async fn main() -> Result<()> {
     let mut offset: i64 = 0;
     // session_id → ActiveTurn for in-flight agent turns.
     let mut active_turns: HashMap<String, ActiveTurn> = HashMap::new();
+    // (chat_id:thread_id) → overridden session_id, set by /new.
+    let mut session_id_overrides: HashMap<String, String> = HashMap::new();
 
     info!("Starting Telegram long-polling loop...");
 
@@ -1518,6 +1605,17 @@ async fn main() -> Result<()> {
                                                     envelope.attachments,
                                                 ).await;
                                             }
+
+                                            // Apply any active /new session override for this chat.
+                                            let session_key = format!(
+                                                "{}:{}",
+                                                envelope.chat_id,
+                                                envelope.thread_id.as_deref().unwrap_or("")
+                                            );
+                                            if let Some(sid) = session_id_overrides.get(&session_key) {
+                                                envelope.session_id = sid.clone();
+                                            }
+
                                             info!(
                                                 "Received Telegram {} message from chat [{}]{}: {}",
                                                 envelope.message_kind,
@@ -1536,6 +1634,8 @@ async fn main() -> Result<()> {
                                                 &http_client,
                                                 &tg_base,
                                                 &envelope,
+                                                &mut session_id_overrides,
+                                                &target_agent_id,
                                             )
                                             .await
                                             {
@@ -1677,12 +1777,14 @@ async fn main() -> Result<()> {
                                 }
 
                                 let content = task.get("content").and_then(|c| c.as_str()).unwrap_or_default().to_string();
+                                let thread_id = task.get("thread_id").and_then(|v| v.as_str()).map(str::to_string);
                                 let audio_artifact_json = task.get("audio_artifact").and_then(|a| a.as_str()).map(str::to_string);
                                 let send_text_caption = task.get("send_text_caption").and_then(|v| v.as_bool()).unwrap_or(false);
 
                                 if !chat_id.is_empty() {
                                     let http_client_clone = http_client.clone();
                                     let tg_base_clone = tg_base.clone();
+                                    let thread_id_clone = thread_id.clone();
 
                                     tokio::spawn(async move {
                                         // Voice path: send audio first, then optional text caption.
@@ -1722,33 +1824,24 @@ async fn main() -> Result<()> {
 
                                             // Also send text as a follow-up caption if requested.
                                             if send_text_caption && !content.is_empty() {
-                                                let formatted = telegram_format_text(&content);
-                                                let send_url = format!("{}sendMessage", tg_base_clone);
-                                                let payload = json!({
-                                                    "chat_id": chat_id,
-                                                    "text": formatted.text,
-                                                    "parse_mode": formatted.parse_mode,
-                                                    "disable_web_page_preview": true
-                                                });
-                                                if let Err(e) = http_client_clone.post(&send_url).json(&payload).send().await {
-                                                    error!("Failed to send text caption after audio: {}", e);
-                                                }
+                                                send_formatted_text(
+                                                    &http_client_clone,
+                                                    &tg_base_clone,
+                                                    &chat_id,
+                                                    thread_id_clone.as_deref(),
+                                                    &content,
+                                                ).await;
                                             }
                                         } else if !content.is_empty() {
                                             // Text-only path.
-                                            let formatted = telegram_format_text(&content);
-                                            let send_url = format!("{}sendMessage", tg_base_clone);
-                                            let payload = json!({
-                                                "chat_id": chat_id,
-                                                "text": formatted.text,
-                                                "parse_mode": formatted.parse_mode,
-                                                "disable_web_page_preview": true
-                                            });
                                             info!("Sending final response back to Telegram Chat [{}]...", chat_id);
-                                            match http_client_clone.post(&send_url).json(&payload).send().await {
-                                                Ok(_) => info!("Telegram Response Sent Successfully!"),
-                                                Err(e) => error!("Failed to send Telegram Response: {}", e),
-                                            }
+                                            send_formatted_text(
+                                                &http_client_clone,
+                                                &tg_base_clone,
+                                                &chat_id,
+                                                thread_id_clone.as_deref(),
+                                                &content,
+                                            ).await;
                                         }
                                     });
                                 } else {
@@ -2067,5 +2160,45 @@ mod tests {
         assert!(left.starts_with("telegram:telegram_bot_token:"));
         assert_ne!(left, different);
         assert!(!left.contains("abc123:secret"));
+    }
+
+    #[test]
+    fn split_at_paragraph_boundary_short_text_passthrough() {
+        let chunks = super::split_at_paragraph_boundary("hello world", 4096);
+        assert_eq!(chunks, vec!["hello world"]);
+    }
+
+    #[test]
+    fn split_at_paragraph_boundary_splits_long_text_at_double_newline() {
+        let para_a = "a".repeat(3000);
+        let para_b = "b".repeat(3000);
+        let text = format!("{}\n\n{}", para_a, para_b);
+        let chunks = super::split_at_paragraph_boundary(&text, 4096);
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].starts_with('a'));
+        assert!(chunks[1].starts_with('b'));
+    }
+
+    #[test]
+    fn split_at_paragraph_boundary_hard_splits_when_no_breaks() {
+        let text = "x".repeat(5000);
+        let chunks = super::split_at_paragraph_boundary(&text, 4096);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), 4096);
+        assert_eq!(chunks[1].len(), 904);
+    }
+
+    #[test]
+    fn help_text_includes_new_command() {
+        let help = super::telegram_help_text();
+        assert!(help.contains("/new"), "help text should mention /new");
+    }
+
+    #[test]
+    fn menu_commands_include_new() {
+        let has_new = super::TELEGRAM_MENU_COMMANDS
+            .iter()
+            .any(|c| c.command == "new");
+        assert!(has_new, "TELEGRAM_MENU_COMMANDS should include 'new'");
     }
 }

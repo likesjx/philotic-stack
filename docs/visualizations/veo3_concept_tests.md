@@ -2,7 +2,7 @@
 
 To ensure these test generations perfectly capture the **true "FEEL" of the Philotic System**—a distributed, boundary-aware AI operating system built on distinct runtime authority, mesh routing, and stateful tracking—we need prompts that force Veo 3.1 to translate complex software architecture into hyper-detailed, physical metaphors.
 
-Below are the deeply expanded, directorial-level prompts for the three distinct visual styles. Each prompt describes the exact same 8-second sequence: **The Canonical Hotel Daemon (`ansible`) materializing and violently/smoothly establishing WebRTC mesh connections across the void to remote hotels.**
+Below are the deeply expanded, directorial-level prompts for the three distinct visual styles. Each prompt describes the exact same 8-second sequence: **The Canonical Hotel Daemon (`aiua`) materializing and violently/smoothly establishing WebRTC mesh connections across the void to remote hotels.**
 
 ---
 

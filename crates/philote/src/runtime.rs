@@ -11,7 +11,7 @@ use crate::session::{
     WorkingTurn, merge_session_index,
 };
 use anyhow::Result;
-use philotic_client::{HandoffBundle, IpcRequest, IpcResponse, PhiloticClient, is_ipc_disconnect};
+use philotic_client::{HandoffBundle, IpcRequest, IpcResponse, PhiloticClient, TaskErrorPayload, is_ipc_disconnect};
 use std::collections::HashMap;
 use std::time::Duration;
 use tracing::{error, info, warn};
@@ -26,11 +26,11 @@ const DEFAULT_VOICE_MODEL_ROLE: &str = "model.elevenlabs";
 const MAX_TOOL_ITERATIONS: u32 = 10;
 
 fn local_node_id() -> String {
-    std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-ansible-01".to_string())
+    std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string())
 }
 
 #[cfg(test)]
-const LOCAL_NODE: &str = "local-ansible-01";
+const LOCAL_NODE: &str = "local-aiua-01";
 
 fn extract_model_error(task: &InboundTaskPayload) -> Option<String> {
     if let Some(error) = task.error.as_ref() {
@@ -479,7 +479,7 @@ impl AgentRuntime {
                 }
                 Ok(Err(err)) => {
                     if is_ipc_disconnect(&err) {
-                        info!("Hotel IPC disconnected; agent-core exiting.");
+                        info!("Hotel IPC disconnected; philote exiting.");
                         return Ok(());
                     }
                     warn!("IPC Recv error: {}", err);
@@ -562,6 +562,7 @@ impl AgentRuntime {
                         .await;
                 }
                 SlashCommand::PreapproveThisSession
+                | SlashCommand::Preapprove { .. }
                 | SlashCommand::ApprovalStatus
                 | SlashCommand::ApprovalReset => {}
                 SlashCommand::Tts { .. } => {}
@@ -651,6 +652,7 @@ impl AgentRuntime {
                     .await
                 }
                 SlashCommand::PreapproveThisSession
+                | SlashCommand::Preapprove { .. }
                 | SlashCommand::ApprovalStatus
                 | SlashCommand::ApprovalReset => {
                     self.handle_session_control_command(
@@ -2056,6 +2058,7 @@ impl AgentRuntime {
                 | SlashCommand::WorkspaceSet { .. }
                 | SlashCommand::WorkspaceClear
                 | SlashCommand::PreapproveThisSession
+                | SlashCommand::Preapprove { .. }
                 | SlashCommand::ApprovalStatus
                 | SlashCommand::ApprovalReset
                 | SlashCommand::Abandon { .. }
@@ -2225,6 +2228,7 @@ impl AgentRuntime {
             | SlashCommand::WorkspaceSet { .. }
             | SlashCommand::WorkspaceClear
             | SlashCommand::PreapproveThisSession
+            | SlashCommand::Preapprove { .. }
             | SlashCommand::ApprovalStatus
             | SlashCommand::ApprovalReset
             | SlashCommand::Abandon { .. }
@@ -2263,12 +2267,14 @@ impl AgentRuntime {
                         initiating_turn_id: command_turn_id.clone(),
                         return_to: Some("orchestrator".into()),
                         handoff_reason: Some("manual_role_switch".into()),
+                        from_role: Some("orchestrator".into()),
+                        to_role: Some(role_name.clone()),
                         active_goal: None,
                         active_constraints: vec!["same_identity_role_handoff".into()],
                         relevant_session_facts: Vec::new(),
                         working_summary: None,
                         suggested_memory_refs: Vec::new(),
-                        expected_return_mode: Some("stay_active_until_manual_return".into()),
+                        expected_return_mode: Some("required".into()),
                         cleanup_actions: vec!["switch_active_role".into()],
                     });
                 self.ipc_client
@@ -2875,6 +2881,20 @@ impl AgentRuntime {
                         }),
                     )
                 }
+                SlashCommand::Preapprove { name } => {
+                    let reply = state.preapprove_by_name(name.as_str());
+                    (
+                        reply,
+                        "session_policy_updated",
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "turn_id": command_turn_id,
+                            "chat_id": command_chat_id,
+                            "approval_policy": state.approval_policy,
+                            "action": "approval_policy_update",
+                        }),
+                    )
+                }
                 SlashCommand::ApprovalStatus => (
                     state.approval_policy_status_text(),
                     "session_policy_reported",
@@ -3178,18 +3198,26 @@ impl AgentRuntime {
                     context_window_policy,
                 };
 
-                let content = match self.ipc_client.send_request(req).await {
+                let (content, tool_err) = match self.ipc_client.send_request(req).await {
                     Ok(IpcResponse::ConfigureRoleOk { role_name: name }) => {
-                        format!("Successfully configured role incarnation for '{}'.", name)
+                        (format!("Successfully configured role incarnation for '{}'.", name), None)
                     }
                     Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
-                        format!("role.configure failed [{code}]: {message}")
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
                     }
                     Ok(IpcResponse::Error(msg)) => {
-                        format!("role.configure IPC error: {msg}")
+                        let e = TaskErrorPayload::ipc_failure("aiua", "IPC_ERROR", msg);
+                        (e.display_message(), Some(e))
                     }
-                    Ok(_) => "role.configure: unexpected hotel response.".to_string(),
-                    Err(e) => format!("role.configure: IPC transport error — {e}"),
+                    Ok(_) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", "UNEXPECTED_RESPONSE", "role.configure: unexpected hotel response");
+                        (e.display_message(), Some(e))
+                    }
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error("philote", format!("role.configure: IPC transport error — {e}"));
+                        (err.display_message(), Some(err))
+                    }
                 };
 
                 self.handle_tool_result(InboundTaskPayload {
@@ -3209,7 +3237,7 @@ impl AgentRuntime {
                     command: None,
                     callback_data: None,
                     raw_transport_event: None,
-                    error: None,
+                    error: tool_err,
                     tool_name: Some(payload.tool_name),
                     arguments: None,
                     final_reply_to: Some(payload.final_reply_to),
@@ -3276,17 +3304,14 @@ impl AgentRuntime {
                     })
                     .await;
 
-                let content = match response {
+                let (content, tool_err) = match response {
                     Ok(IpcResponse::SkillRegistered {
                         skill_name: name,
                         validation_state,
                         validation_errors,
                     }) => {
-                        if validation_errors.is_empty() {
-                            format!(
-                                "Skill '{}' registered (state: {}).",
-                                name, validation_state
-                            )
+                        let msg = if validation_errors.is_empty() {
+                            format!("Skill '{}' registered (state: {}).", name, validation_state)
                         } else {
                             format!(
                                 "Skill '{}' registered with state '{}'. Validation issues:\n{}",
@@ -3298,16 +3323,25 @@ impl AgentRuntime {
                                     .collect::<Vec<_>>()
                                     .join("\n")
                             )
-                        }
+                        };
+                        (msg, None)
                     }
                     Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
-                        format!("skill.register failed [{code}]: {message}")
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
                     }
                     Ok(IpcResponse::Error(msg)) => {
-                        format!("skill.register IPC error: {msg}")
+                        let e = TaskErrorPayload::ipc_failure("aiua", "IPC_ERROR", msg);
+                        (e.display_message(), Some(e))
                     }
-                    Ok(_) => "skill.register: unexpected hotel response.".to_string(),
-                    Err(e) => format!("skill.register: IPC transport error — {e}"),
+                    Ok(_) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", "UNEXPECTED_RESPONSE", "skill.register: unexpected hotel response");
+                        (e.display_message(), Some(e))
+                    }
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error("philote", format!("skill.register: IPC transport error — {e}"));
+                        (err.display_message(), Some(err))
+                    }
                 };
 
                 self.handle_tool_result(InboundTaskPayload {
@@ -3327,7 +3361,7 @@ impl AgentRuntime {
                     command:             None,
                     callback_data:       None,
                     raw_transport_event: None,
-                    error:               None,
+                    error: tool_err,
                     tool_name:           Some(payload.tool_name),
                     arguments:           None,
                     final_reply_to:      Some(payload.final_reply_to),
@@ -3355,7 +3389,7 @@ impl AgentRuntime {
                 let subagent_kind = args
                     .get("subagent_kind")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("agent-worker")
+                    .unwrap_or("philote-worker")
                     .to_string();
                 let context_summary = args
                     .get("context_summary")
@@ -3398,39 +3432,47 @@ impl AgentRuntime {
                     })
                     .await;
 
-                let content = match response {
+                let (content, tool_err) = match response {
                     Ok(IpcResponse::SpawnSubagentOk {
                         subagent_guest_id,
                         confirmed_lease,
                     }) => {
-                        format!(
+                        (format!(
                             "Subagent spawned.\nGuest ID: {}\nLease expires at: {} (epoch {})",
                             subagent_guest_id,
                             confirmed_lease.lease_expires_at,
                             confirmed_lease.lease_epoch,
-                        )
+                        ), None)
                     }
                     Ok(IpcResponse::SpawnSubagentProposal {
                         subagent_guest_id,
                         confirmed_lease,
                         delta,
                     }) => {
-                        format!(
+                        (format!(
                             "Subagent spawned (TTL adjusted: {}s → {}s).\nGuest ID: {}\nLease expires at: {}",
                             delta.requested_ttl,
                             delta.confirmed_ttl,
                             subagent_guest_id,
                             confirmed_lease.lease_expires_at,
-                        )
+                        ), None)
                     }
                     Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
-                        format!("subagent.spawn failed [{code}]: {message}")
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
                     }
                     Ok(IpcResponse::Error(msg)) => {
-                        format!("subagent.spawn IPC error: {msg}")
+                        let e = TaskErrorPayload::ipc_failure("aiua", "IPC_ERROR", msg);
+                        (e.display_message(), Some(e))
                     }
-                    Ok(_) => "subagent.spawn: unexpected hotel response.".to_string(),
-                    Err(e) => format!("subagent.spawn: IPC transport error — {e}"),
+                    Ok(_) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", "UNEXPECTED_RESPONSE", "subagent.spawn: unexpected hotel response");
+                        (e.display_message(), Some(e))
+                    }
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error("philote", format!("subagent.spawn: IPC transport error — {e}"));
+                        (err.display_message(), Some(err))
+                    }
                 };
 
                 self.handle_tool_result(InboundTaskPayload {
@@ -3450,7 +3492,7 @@ impl AgentRuntime {
                     command:             None,
                     callback_data:       None,
                     raw_transport_event: None,
-                    error:               None,
+                    error: tool_err,
                     tool_name:           Some(payload.tool_name),
                     arguments:           None,
                     final_reply_to:      Some(payload.final_reply_to),
@@ -3513,19 +3555,28 @@ impl AgentRuntime {
                     })
                     .unwrap_or_default();
 
+                let from_role = self
+                    .sessions
+                    .get(&payload.session_id)
+                    .and_then(|s| s.role_activation.as_ref())
+                    .map(|r| r.role_name.clone())
+                    .or_else(|| Some("orchestrator".into()));
+
                 let handoff_bundle = HandoffBundle {
                     goal: active_goal.clone().unwrap_or_else(|| reason.clone()),
                     context_excerpt: context_summary,
                     session_id: payload.session_id.clone(),
                     initiating_turn_id: payload.turn_id.clone(),
                     handoff_reason: Some(reason),
+                    from_role,
+                    to_role: Some(role_name.clone()),
                     active_goal,
                     expected_return_mode,
                     cleanup_actions,
                     ..Default::default()
                 };
 
-                let content = match self
+                let (content, tool_err) = match self
                     .ipc_client
                     .send_request(IpcRequest::HandoffToRole {
                         session_id: payload.session_id.clone(),
@@ -3535,13 +3586,20 @@ impl AgentRuntime {
                     .await
                 {
                     Ok(IpcResponse::HandoffAck { handoff_guest_id, .. }) => {
-                        format!("Handed off to role '{role_name}' (guest {handoff_guest_id}).")
+                        (format!("Handed off to role '{role_name}' (guest {handoff_guest_id})."), None)
                     }
                     Ok(IpcResponse::Error(msg)) => {
-                        format!("handoff.to_role failed: {msg}")
+                        let e = TaskErrorPayload::tool_execution("handoff.to_role", msg, Some("HANDOFF_REJECTED"));
+                        (e.display_message(), Some(e))
                     }
-                    Ok(_) => "handoff.to_role: unexpected hotel response.".to_string(),
-                    Err(e) => format!("handoff.to_role: IPC transport error — {e}"),
+                    Ok(_) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", "UNEXPECTED_RESPONSE", "handoff.to_role: unexpected hotel response");
+                        (e.display_message(), Some(e))
+                    }
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error("philote", format!("handoff.to_role: IPC transport error — {e}"));
+                        (err.display_message(), Some(err))
+                    }
                 };
 
                 self.handle_tool_result(InboundTaskPayload {
@@ -3561,7 +3619,7 @@ impl AgentRuntime {
                     command:              None,
                     callback_data:        None,
                     raw_transport_event:  None,
-                    error:                None,
+                    error:                tool_err,
                     tool_name:            Some(payload.tool_name),
                     arguments:            None,
                     final_reply_to:       Some(payload.final_reply_to),
@@ -3593,7 +3651,7 @@ impl AgentRuntime {
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
 
-                let content = match self
+                let (content, tool_err) = match self
                     .ipc_client
                     .send_request(IpcRequest::HandoffBack {
                         session_id: payload.session_id.clone(),
@@ -3603,13 +3661,20 @@ impl AgentRuntime {
                     .await
                 {
                     Ok(IpcResponse::HandoffBackAck { handoff_guest_id, .. }) => {
-                        format!("Returned control (from guest {handoff_guest_id}). Summary: {summary}")
+                        (format!("Returned control (from guest {handoff_guest_id}). Summary: {summary}"), None)
                     }
                     Ok(IpcResponse::Error(msg)) => {
-                        format!("handoff.back failed: {msg}")
+                        let e = TaskErrorPayload::tool_execution("handoff.back", msg, Some("HANDOFF_BACK_REJECTED"));
+                        (e.display_message(), Some(e))
                     }
-                    Ok(_) => "handoff.back: unexpected hotel response.".to_string(),
-                    Err(e) => format!("handoff.back: IPC transport error — {e}"),
+                    Ok(_) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", "UNEXPECTED_RESPONSE", "handoff.back: unexpected hotel response");
+                        (e.display_message(), Some(e))
+                    }
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error("philote", format!("handoff.back: IPC transport error — {e}"));
+                        (err.display_message(), Some(err))
+                    }
                 };
 
                 self.handle_tool_result(InboundTaskPayload {
@@ -3629,7 +3694,7 @@ impl AgentRuntime {
                     command:              None,
                     callback_data:        None,
                     raw_transport_event:  None,
-                    error:                None,
+                    error:                tool_err,
                     tool_name:            Some(payload.tool_name),
                     arguments:            None,
                     final_reply_to:       Some(payload.final_reply_to),
@@ -3808,7 +3873,6 @@ mod tests {
         SessionState,
     };
     use philotic_client::TaskErrorPayload;
-
     #[test]
     fn model_request_targets_agent_for_reply() {
         let request = ModelRequestPayload {

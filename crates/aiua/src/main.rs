@@ -245,7 +245,7 @@ fn default_hotel_record(hotel_name: &str) -> HotelRecord {
     HotelRecord {
         hotel_name: hotel_name.to_string(),
         capabilities: NodeCapabilities {
-            node_id: format!("{safe_name}-ansible-01"),
+            node_id: format!("{safe_name}-aiua-01"),
             roles: vec![NodeRole::AnsibleNode, NodeRole::Other("membrane".into())],
             models: vec![],
             tools: vec![],
@@ -565,10 +565,10 @@ fn guest_seed_for_profile(hotel_name: &str, profile: &AgentProfile) -> Vec<Guest
         },
         GuestRecord {
             hotel_name: hotel_name.to_string(),
-            guest_id: format!("{hotel_name}:agent-core-{}", profile.agent_key),
+            guest_id: format!("{hotel_name}:philote-{}", profile.agent_key),
             role: "agent".into(),
             config_json: serde_json::json!({
-                "command": "agent-core",
+                "command": "philote",
                 "args": [],
                 "env": {
                     "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
@@ -867,8 +867,8 @@ fn deactivate_legacy_managed_guests(
         .map(|guest| guest.guest_id.as_str())
         .collect::<std::collections::HashSet<_>>();
     let legacy_guest_ids = [
-        format!("agent-core-{}", profile.agent_key),
-        format!("{hotel_name}:agent-core-{}", profile.agent_key),
+        format!("philote-{}", profile.agent_key),
+        format!("{hotel_name}:philote-{}", profile.agent_key),
         format!("hegemon-gateway-{}", profile.agent_key),
         format!("{hotel_name}:hegemon-gateway-{}", profile.agent_key),
         "hegemon-gateway".to_string(),
@@ -889,7 +889,7 @@ fn deactivate_legacy_managed_guests(
                 .guest_id
                 .strip_prefix(&format!("{hotel_name}:"))
                 .is_some_and(|suffix| {
-                    suffix.starts_with("agent-core-")
+                    suffix.starts_with("philote-")
                         || suffix.starts_with("hegemon-gateway")
                         || suffix.starts_with("model-router-")
                 });
@@ -1764,7 +1764,7 @@ fn startup_test_telegram_poll_lease_key(token_key: &str, token: &str) -> String 
 }
 
 fn startup_test_membrane_guests(hotel_name: &str) -> Result<Vec<GuestRecord>> {
-    let graph = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open("ansible_context.db")?;
+    let graph = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open("aiua_context.db")?;
     let mut membranes = graph
         .list_guests(hotel_name, false)?
         .into_iter()
@@ -1780,8 +1780,8 @@ fn startup_test_set_guest_active(
     is_active: bool,
     active_pid: Option<&str>,
 ) -> Result<()> {
-    let conn = rusqlite::Connection::open("ansible_context.db")
-        .context("failed to open ansible_context.db for startup guest update")?;
+    let conn = rusqlite::Connection::open("aiua_context.db")
+        .context("failed to open aiua_context.db for startup guest update")?;
     conn.execute(
         "UPDATE materialized_guests SET is_active = ?1, active_pid = ?2 WHERE hotel_name = ?3 AND guest_id = ?4",
         rusqlite::params![is_active, active_pid, hotel_name, guest_id],
@@ -1791,8 +1791,8 @@ fn startup_test_set_guest_active(
 }
 
 fn startup_test_clear_guest_pid(hotel_name: &str, guest_id: &str) -> Result<()> {
-    let conn = rusqlite::Connection::open("ansible_context.db")
-        .context("failed to open ansible_context.db for startup guest pid clear")?;
+    let conn = rusqlite::Connection::open("aiua_context.db")
+        .context("failed to open aiua_context.db for startup guest pid clear")?;
     conn.execute(
         "UPDATE materialized_guests SET active_pid = NULL WHERE hotel_name = ?1 AND guest_id = ?2",
         rusqlite::params![hotel_name, guest_id],
@@ -1819,7 +1819,7 @@ fn prepare_startup_test_binaries(_test: StartupTest) -> Result<()> {
             "-p",
             "membrane",
             "-p",
-            "agent-core",
+            "philote",
             "-p",
             "tool-runner",
             "-p",
@@ -1855,8 +1855,8 @@ async fn run_startup_test(
             let mut client = PhiloticClient::connect_at(
                 socket_path,
                 GuestIdentity {
-                    guest_id: "ansible-startup-test-client".into(),
-                    role: "ansible-startup-test".into(),
+                    guest_id: "aiua-startup-test-client".into(),
+                    role: "aiua-startup-test".into(),
                     supported_tools: Vec::new(),
                 },
             )
@@ -1876,8 +1876,8 @@ async fn run_startup_test(
                             "chat_id": "startup-test-chat",
                             "content": text,
                             "final_reply_to": local_node_id,
-                            "final_reply_role": "ansible-startup-test",
-                            "final_reply_guest_id": "ansible-startup-test-client"
+                            "final_reply_role": "aiua-startup-test",
+                            "final_reply_guest_id": "aiua-startup-test-client"
                         })
                         .to_string(),
                     })
@@ -1965,8 +1965,8 @@ async fn run_startup_test(
             let mut client = PhiloticClient::connect_at(
                 socket_path,
                 GuestIdentity {
-                    guest_id: "ansible-startup-test-client".into(),
-                    role: "ansible-startup-test".into(),
+                    guest_id: "aiua-startup-test-client".into(),
+                    role: "aiua-startup-test".into(),
                     supported_tools: Vec::new(),
                 },
             )
@@ -1984,8 +1984,8 @@ async fn run_startup_test(
                         "chat_id": "startup-cognitive-chat",
                         "content": user_content,
                         "final_reply_to": local_node_id,
-                        "final_reply_role": "ansible-startup-test",
-                        "final_reply_guest_id": "ansible-startup-test-client"
+                        "final_reply_role": "aiua-startup-test",
+                        "final_reply_guest_id": "aiua-startup-test-client"
                     })
                     .to_string(),
                 })
@@ -2050,8 +2050,8 @@ async fn run_startup_test(
             let mut client = PhiloticClient::connect_at(
                 socket_path,
                 GuestIdentity {
-                    guest_id: "ansible-startup-test-client".into(),
-                    role: "ansible-startup-test".into(),
+                    guest_id: "aiua-startup-test-client".into(),
+                    role: "aiua-startup-test".into(),
                     supported_tools: Vec::new(),
                 },
             )
@@ -2074,10 +2074,10 @@ async fn run_startup_test(
                         "turn_id": "startup-test-turn-1",
                         "chat_id": "startup-test-chat",
                         "reply_to": local_node_id.clone(),
-                        "reply_role": "ansible-startup-test",
+                        "reply_role": "aiua-startup-test",
                         "final_reply_to": local_node_id.clone(),
-                        "final_reply_role": "ansible-startup-test",
-                        "final_reply_guest_id": "ansible-startup-test-client"
+                        "final_reply_role": "aiua-startup-test",
+                        "final_reply_guest_id": "aiua-startup-test-client"
                     })
                     .to_string(),
                 })
@@ -2145,7 +2145,7 @@ async fn run_startup_test(
         StartupTest::VoiceSample => {
             let output_path = output
                 .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("tmp/voice-samples/ansible-startup-sample.mp3"));
+                .unwrap_or_else(|| PathBuf::from("tmp/voice-samples/aiua-startup-sample.mp3"));
             let text = text
                 .unwrap_or("Hello from Philotic. This is an ansible startup voice test.")
                 .to_string();
@@ -2155,8 +2155,8 @@ async fn run_startup_test(
             let mut client = PhiloticClient::connect_at(
                 socket_path,
                 GuestIdentity {
-                    guest_id: "ansible-startup-test-client".into(),
-                    role: "ansible-startup-test".into(),
+                    guest_id: "aiua-startup-test-client".into(),
+                    role: "aiua-startup-test".into(),
                     supported_tools: Vec::new(),
                 },
             )
@@ -2174,9 +2174,9 @@ async fn run_startup_test(
                         "chat_id": "startup-test-chat",
                         "text": text,
                         "reply_to": local_node_id.clone(),
-                        "reply_role": "ansible-startup-test",
+                        "reply_role": "aiua-startup-test",
                         "final_reply_to": local_node_id.clone(),
-                        "final_reply_role": "ansible-startup-test"
+                        "final_reply_role": "aiua-startup-test"
                     })
                     .to_string(),
                 })
@@ -2979,7 +2979,7 @@ async fn main() -> Result<()> {
     info!("---------------------");
 
     // Initialize the always-on Context Graph DB via the abstract storage trait
-    let db_path = Path::new("ansible_context.db");
+    let db_path = Path::new("aiua_context.db");
     let graph_storage = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open(db_path)?;
 
     let hotel_name = args.hotel.clone();
@@ -3646,7 +3646,7 @@ mod tests {
     fn default_hotel_record_is_deterministic_and_namespaced() {
         let hotel = default_hotel_record("alpha-hotel");
         assert_eq!(hotel.hotel_name, "alpha-hotel");
-        assert_eq!(hotel.capabilities.node_id, "alpha-hotel-ansible-01");
+        assert_eq!(hotel.capabilities.node_id, "alpha-hotel-aiua-01");
         assert_eq!(hotel.ipc_socket_path, "/tmp/philotic-alpha-hotel.sock");
         assert_eq!(hotel.mesh_port, hotel_base_port("alpha-hotel"));
         assert_eq!(hotel.blob_port, hotel.mesh_port + 1);
@@ -3917,9 +3917,9 @@ mod tests {
         let legacy = vec![
             GuestRecord {
                 hotel_name: hotel_name.into(),
-                guest_id: format!("{hotel_name}:agent-core-jane"),
+                guest_id: format!("{hotel_name}:philote-jane"),
                 role: "agent".into(),
-                config_json: serde_json::json!({ "command": "target/debug/agent-core" })
+                config_json: serde_json::json!({ "command": "target/debug/philote" })
                     .to_string(),
                 is_active: true,
                 active_pid: None,
@@ -3952,7 +3952,7 @@ mod tests {
 
         let legacy_agent = stored
             .iter()
-            .find(|guest| guest.guest_id == format!("{hotel_name}:agent-core-jane"))
+            .find(|guest| guest.guest_id == format!("{hotel_name}:philote-jane"))
             .expect("legacy agent guest should remain in graph");
         assert!(!legacy_agent.is_active);
 

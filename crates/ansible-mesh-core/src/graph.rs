@@ -183,3 +183,85 @@ pub struct MemoryEntry {
     #[serde(default)]
     pub links: Vec<GraphRelationship>,
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CompactSessionEnvelope — canonical bounded session snapshot for handoff,
+// rematerialization, and compaction. Explicitly excludes durable continuity
+// (autobiographical memory, long-term topic memory, transcript archives).
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// A single compacted turn entry — enough for context coherence without bulk.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct CompactTurnEntry {
+    pub turn_id: String,
+    /// One-line summary of the user request or trigger.
+    pub user_summary: String,
+    /// Brief labels for tool calls made (e.g. ["workspace.read", "echo"]).
+    #[serde(default)]
+    pub tool_calls: Vec<String>,
+    /// Outcome: "completed", "approval_required", "failed", "abandoned".
+    pub outcome: String,
+}
+
+/// Metadata recorded at compaction time.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct CompactCheckpointMeta {
+    /// Unix epoch seconds when this envelope was produced.
+    pub compacted_at: u64,
+    /// Monotonically incremented each time the session is compacted.
+    pub compaction_version: u32,
+    /// How many raw turns were folded into this snapshot.
+    pub prior_turn_count: u32,
+    /// Component that produced this snapshot (e.g. "agent-core", "hotel").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub produced_by: Option<String>,
+}
+
+/// Canonical bounded session snapshot.
+///
+/// Designed to be small enough to fit in a single model context window entry
+/// and large enough to reconstruct coherent working state after rematerialization
+/// or role handoff. Durable continuity (autobiographical memory, relationship
+/// memory, long-term topic memory, transcript archives) is explicitly excluded
+/// and must be sourced from Muninn or apartment storage separately.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct CompactSessionEnvelope {
+    // ── Identity ──────────────────────────────────────────────────────────
+    pub session_id: String,
+    pub session_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_agent_id: Option<String>,
+
+    // ── Active role / incarnation ─────────────────────────────────────────
+    /// Role name currently active (e.g. "developer", "orchestrator").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_role: Option<String>,
+    /// Guest ID of the active incarnation process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_incarnation_id: Option<String>,
+
+    // ── Live status ───────────────────────────────────────────────────────
+    /// One of: "active", "waiting_approval", "waiting_tool", "paused", "closed".
+    pub live_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_owner_component_id: Option<String>,
+
+    // ── Working state (role-local, not durable) ───────────────────────────
+    /// Freeform JSON: active_goal, pending_items, current_plan fragment, etc.
+    #[serde(default)]
+    pub working_state: Value,
+
+    // ── Bounded recent-turn window ────────────────────────────────────────
+    /// Last N turns needed for coherence. Not a transcript — summaries only.
+    #[serde(default)]
+    pub recent_turns: Vec<CompactTurnEntry>,
+
+    // ── Session-local facts (still live in this session) ─────────────────
+    /// Short key=value or plain-text facts relevant only to this session.
+    /// Cleared on session close. NOT durable memory.
+    #[serde(default)]
+    pub session_facts: Vec<String>,
+
+    // ── Checkpoint metadata ───────────────────────────────────────────────
+    pub checkpoint_metadata: CompactCheckpointMeta,
+}

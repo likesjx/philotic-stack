@@ -27,7 +27,7 @@ Options:
 
 Requirements:
   - A Philotic hotel must already be running and reachable via PHILOTIC_HOTEL_SOCKET
-    or the default /tmp/philotic-ansible.sock.
+    or the default /tmp/philotic-aiua.sock.
   - The model-controller guest must be materialized for the target role.
   - ElevenLabs audio passthrough must be enabled for that guest
     (PHILOTIC_MODEL_CONTROLLER_INLINE_AUDIO=1).
@@ -76,10 +76,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-SOCKET_PATH="${PHILOTIC_HOTEL_SOCKET:-/tmp/philotic-ansible.sock}"
+SOCKET_PATH="${PHILOTIC_HOTEL_SOCKET:-/tmp/philotic-aiua.sock}"
 if [[ ! -S "${SOCKET_PATH}" ]]; then
   echo "Hotel socket not found at ${SOCKET_PATH}" >&2
-  echo "Start ansible first, or set PHILOTIC_HOTEL_SOCKET to the correct socket." >&2
+  echo "Start aiua first, or set PHILOTIC_HOTEL_SOCKET to the correct socket." >&2
   exit 1
 fi
 
