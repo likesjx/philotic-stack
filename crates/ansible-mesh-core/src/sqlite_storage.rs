@@ -590,6 +590,10 @@ impl SqliteGraphStorage {
             [],
         );
         let _ = conn.execute(
+            "ALTER TABLE materialized_guests ADD COLUMN last_active_at INTEGER",
+            [],
+        );
+        let _ = conn.execute(
             "ALTER TABLE hotels ADD COLUMN execution_port INTEGER NOT NULL DEFAULT 0",
             [],
         );
@@ -917,9 +921,9 @@ impl GraphStorage for SqliteGraphStorage {
 
         let conn = self.conn.lock().unwrap();
         let sql = if active_only {
-            "SELECT hotel_name, guest_id, role, config_json, is_active, active_pid FROM materialized_guests WHERE hotel_name = ?1 AND is_active = 1"
+            "SELECT hotel_name, guest_id, role, config_json, is_active, active_pid, last_active_at FROM materialized_guests WHERE hotel_name = ?1 AND is_active = 1"
         } else {
-            "SELECT hotel_name, guest_id, role, config_json, is_active, active_pid FROM materialized_guests WHERE hotel_name = ?1"
+            "SELECT hotel_name, guest_id, role, config_json, is_active, active_pid, last_active_at FROM materialized_guests WHERE hotel_name = ?1"
         };
         let mut stmt = conn.prepare(sql)?;
         let mut rows = stmt.query(params![hotel_name])?;
@@ -933,6 +937,7 @@ impl GraphStorage for SqliteGraphStorage {
                 config_json: row.get(3)?,
                 is_active: row.get(4)?,
                 active_pid: row.get(5).unwrap_or(None),
+                last_active_at: row.get(6).unwrap_or(None),
             });
         }
         Ok(out)
@@ -979,6 +984,15 @@ impl GraphStorage for SqliteGraphStorage {
                 data: serde_json::to_value(guest)?,
             })?;
         }
+        Ok(())
+    }
+
+    fn set_guest_last_active(&self, hotel_name: &str, guest_id: &str, epoch: u64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE materialized_guests SET last_active_at = ?1 WHERE hotel_name = ?2 AND guest_id = ?3",
+            params![epoch as i64, hotel_name, guest_id],
+        )?;
         Ok(())
     }
 
@@ -1228,6 +1242,25 @@ impl GraphStorage for SqliteGraphStorage {
                 result
                     .as_ref()
                     .map(|role| role.agent_id == agent_id)
+                    .unwrap_or(true)
+            })
+            .collect()
+    }
+
+    fn list_role_incarnations_by_guest_id(
+        &self,
+        guest_id: &str,
+    ) -> Result<Vec<RoleIncarnationRecord>> {
+        self.adapter
+            .list_nodes_by_kind("role_incarnation")?
+            .into_iter()
+            .map(|node| {
+                serde_json::from_value::<RoleIncarnationRecord>(node.data).map_err(Into::into)
+            })
+            .filter(|result| {
+                result
+                    .as_ref()
+                    .map(|role| role.guest_id == guest_id)
                     .unwrap_or(true)
             })
             .collect()

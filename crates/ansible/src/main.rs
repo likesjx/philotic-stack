@@ -561,6 +561,7 @@ fn guest_seed_for_profile(hotel_name: &str, profile: &AgentProfile) -> Vec<Guest
             .to_string(),
             is_active: true,
             active_pid: None,
+            last_active_at: None,
         },
         GuestRecord {
             hotel_name: hotel_name.to_string(),
@@ -578,6 +579,7 @@ fn guest_seed_for_profile(hotel_name: &str, profile: &AgentProfile) -> Vec<Guest
             .to_string(),
             is_active: true,
             active_pid: None,
+            last_active_at: None,
         },
         GuestRecord {
             hotel_name: hotel_name.to_string(),
@@ -594,6 +596,7 @@ fn guest_seed_for_profile(hotel_name: &str, profile: &AgentProfile) -> Vec<Guest
             role: "model".into(),
             is_active: true,
             active_pid: None,
+            last_active_at: None,
         },
         GuestRecord {
             hotel_name: hotel_name.to_string(),
@@ -610,6 +613,7 @@ fn guest_seed_for_profile(hotel_name: &str, profile: &AgentProfile) -> Vec<Guest
             .to_string(),
             is_active: true,
             active_pid: None,
+            last_active_at: None,
         },
         GuestRecord {
             hotel_name: hotel_name.to_string(),
@@ -628,6 +632,7 @@ fn guest_seed_for_profile(hotel_name: &str, profile: &AgentProfile) -> Vec<Guest
             // without a hard failure. Activate when tool-runner crate exists.
             is_active: false,
             active_pid: None,
+            last_active_at: None,
         },
     ]
 }
@@ -1309,6 +1314,7 @@ fn enable_guest_test_overrides(
                     .to_string(),
                     is_active: true,
                     active_pid: None,
+                    last_active_at: None,
                 });
             }
         }
@@ -3917,6 +3923,7 @@ mod tests {
                     .to_string(),
                 is_active: true,
                 active_pid: None,
+            last_active_at: None,
             },
             GuestRecord {
                 hotel_name: hotel_name.into(),
@@ -3925,6 +3932,7 @@ mod tests {
                 config_json: serde_json::json!({ "command": "target/debug/hegemon" }).to_string(),
                 is_active: true,
                 active_pid: None,
+            last_active_at: None,
             },
         ];
 

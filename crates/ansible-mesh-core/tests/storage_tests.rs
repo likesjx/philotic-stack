@@ -513,6 +513,7 @@ fn sample_guest(id: &str, active: bool) -> GuestRecord {
         config_json: r#"{"command":"agent-core"}"#.into(),
         is_active: active,
         active_pid: None,
+        last_active_at: None,
     }
 }
 

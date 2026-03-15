@@ -656,6 +656,7 @@ impl IpcServer {
             config_json: config_json.to_string(),
             is_active: true,
             active_pid: None,
+            last_active_at: None,
         };
         if let Err(e) = graph.seed_guests(local_node_id, &[guest_record]) {
             return IpcResponse::error(
@@ -4151,6 +4152,22 @@ mod tests {
             Ok(vec![])
         }
 
+        fn list_role_incarnations_by_guest_id(
+            &self,
+            _guest_id: &str,
+        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::RoleIncarnationRecord>> {
+            Ok(vec![])
+        }
+
+        fn set_guest_last_active(
+            &self,
+            _hotel_name: &str,
+            _guest_id: &str,
+            _epoch: u64,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
         fn upsert_toolset_profile(
             &self,
             _profile: &ansible_mesh_core::graph::ToolsetProfileRecord,
@@ -4732,7 +4749,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
-            })
+})
             .expect("seed local hotel");
         graph_store
             .seed_guests(
@@ -4744,7 +4761,8 @@ mod tests {
                     config_json: "{}".into(),
                     is_active: true,
                     active_pid: None,
-                }],
+                    last_active_at: None,
+}],
             )
             .expect("seed developer guest");
         graph_store
@@ -5007,7 +5025,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
-            })
+})
             .expect("seed local hotel");
         graph_store
             .seed_guests(
@@ -5019,7 +5037,8 @@ mod tests {
                     config_json: "{}".into(),
                     is_active: true,
                     active_pid: None,
-                }],
+                    last_active_at: None,
+}],
             )
             .expect("seed developer guest");
         graph_store
@@ -5797,6 +5816,118 @@ mod tests {
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
         }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn session_snapshot_seeds_bindings_from_toolset_profile_on_fresh_role_session() {
+        let _guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
+        let server = IpcServer::new(socket_path.clone(), "local-ansible-01", dispatcher_tx, graph);
+
+        // Seed profile with known allowed_tools and allowed_skills.
+        graph_store
+            .upsert_toolset_profile(&ansible_mesh_core::graph::ToolsetProfileRecord {
+                profile_name: "codex".into(),
+                allowed_tools: vec!["session.status".into(), "workspace.read".into()],
+                allowed_classes: vec!["session".into()],
+                allowed_skills: vec!["handoff.back".into()],
+                description: None,
+            })
+            .expect("toolset profile should seed");
+        graph_store
+            .upsert_agent_identity(&AgentIdentityRecord {
+                agent_id: "agent-jane-01".into(),
+                persona_name: "Jane".into(),
+                authority_hotel: "local-hotel".into(),
+                bundle_json: serde_json::json!({}),
+            })
+            .expect("agent identity");
+        // Session with active_incarnation_id but NO bindings in summary_json.
+        graph_store
+            .upsert_session(&SessionRecord {
+                session_id: "sess-seed".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: Some("agent-jane:codex".into()),
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("456".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 2,
+            })
+            .expect("session");
+        graph_store
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-jane-01".into(),
+                role_name: "codex".into(),
+                guest_id: "agent-jane:codex".into(),
+                toolset_profile: "codex".into(),
+                role_identity_addendum: None,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig::default(),
+            })
+            .expect("role incarnation");
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe { std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path); }
+
+        let mut agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local-2".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("connect");
+
+        let response = agent
+            .send_request(IpcRequest::GetConfig {
+                key: "__session_snapshot__:sess-seed".into(),
+            })
+            .await
+            .expect("snapshot request");
+
+        match response {
+            IpcResponse::ConfigData { value_json: Some(vj), .. } => {
+                let snap: serde_json::Value =
+                    serde_json::from_str(&vj).expect("decode snapshot");
+                let toolset = snap["bindings"]["effective_toolset"]
+                    .as_array()
+                    .expect("effective_toolset should be an array");
+                assert!(
+                    toolset.iter().any(|t| t == "session.status"),
+                    "expected session.status in effective_toolset, got {toolset:?}"
+                );
+                assert!(
+                    toolset.iter().any(|t| t == "workspace.read"),
+                    "expected workspace.read in effective_toolset, got {toolset:?}"
+                );
+                let skillset = snap["bindings"]["effective_skillset"]
+                    .as_array()
+                    .expect("effective_skillset should be an array");
+                assert!(
+                    skillset.iter().any(|s| s == "handoff.back"),
+                    "expected handoff.back in effective_skillset, got {skillset:?}"
+                );
+                assert_eq!(snap["role_activation"]["toolset_profile_ref"], "codex");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        unsafe { std::env::remove_var("PHILOTIC_HOTEL_SOCKET"); }
         server_task.abort();
         let _ = server_task.await;
         if Path::new(&socket_path).exists() {
@@ -7767,7 +7898,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
-            })
+})
             .expect("seed local hotel");
         graph_store
             .upsert_agent_identity(&AgentIdentityRecord {
@@ -7888,7 +8019,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
-            })
+})
             .expect("seed local hotel");
         graph_store
             .upsert_agent_identity(&AgentIdentityRecord {
@@ -7974,7 +8105,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
-            })
+})
             .expect("seed local hotel");
         graph_store
             .upsert_agent_identity(&AgentIdentityRecord {
@@ -8056,7 +8187,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
-            })
+})
             .expect("seed local hotel");
         graph_store
             .upsert_agent_identity(&AgentIdentityRecord {
@@ -8148,7 +8279,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
-            })
+})
             .expect("seed local hotel");
         graph_store
             .upsert_agent_identity(&AgentIdentityRecord {
@@ -8247,7 +8378,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
-            })
+})
             .expect("seed local hotel");
         graph_store
             .upsert_agent_identity(&AgentIdentityRecord {
@@ -8352,7 +8483,7 @@ mod tests {
                 execution_port: 9002,
                 ipc_socket_path: socket_path.clone(),
                 active_pid: None,
-            })
+})
             .expect("seed local hotel");
         graph_store
             .upsert_agent_identity(&AgentIdentityRecord {
@@ -8372,6 +8503,7 @@ mod tests {
                     config_json: serde_json::json!({ "command": "membrane" }).to_string(),
                     is_active: true,
                     active_pid: Some(std::process::id().to_string()),
+                    last_active_at: None,
                 }],
             )
             .expect("seed membrane guest");

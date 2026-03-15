@@ -177,8 +177,8 @@ Seam IDs: `role-incarnation-records`, `active-membrane-routing`, `handoff-skill`
 - [ ] Define bounded context packaging and return contracts for peer/external workflows so they do not quietly inherit same-identity handoff assumptions.
 
 ### Inactive TTL + On-Demand Rematerialization
-- [ ] Add `inactive_ttl_seconds` to `RoleIncarnationRecord`.
-- [ ] Extend supervisor loop TTL check: reclaim inactive non-membrane-owner role processes after TTL.
+- [x] Add `inactive_ttl_seconds` to `RoleIncarnationRecord`.
+- [x] Extend supervisor loop TTL check: reclaim inactive non-membrane-owner role processes after TTL.
 - [ ] On rematerialization: hotel sends session snapshot to restore working memory from Tier 2.
 - [ ] Keep concurrent role materialization explicitly conditional; do not let TTL/rematerialization policy silently become the default role ontology.
 
@@ -440,8 +440,8 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 - [ ] Add `/role <name>` and `/back` slash commands for manual membrane switching.
 
 ### Inactive TTL + On-Demand Rematerialization
-- [ ] Add `inactive_ttl_seconds` to `RoleIncarnationRecord`.
-- [ ] Extend supervisor loop TTL check: reclaim inactive non-membrane-owner role processes after TTL.
+- [x] Add `inactive_ttl_seconds` to `RoleIncarnationRecord`.
+- [x] Extend supervisor loop TTL check: reclaim inactive non-membrane-owner role processes after TTL.
 - [ ] On rematerialization: hotel sends session snapshot to restore working memory from Tier 2.
 
 ### Workers / Subagents

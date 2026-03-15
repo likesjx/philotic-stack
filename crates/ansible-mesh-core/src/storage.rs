@@ -63,6 +63,9 @@ pub struct GuestRecord {
     pub config_json: String,
     pub is_active: bool,
     pub active_pid: Option<String>,
+    /// Unix epoch (seconds) of the last time this guest was activated or spawned.
+    /// Used by the supervisor TTL check for role incarnation guests.
+    pub last_active_at: Option<u64>,
 }
 
 /// A named hotel runtime record stored in the Context Graph.
@@ -204,6 +207,9 @@ pub trait GraphStorage: Send + Sync {
     /// Update the `is_active` flag for a guest (e.g. mark released subagents inactive).
     fn set_guest_active(&self, hotel_name: &str, guest_id: &str, active: bool) -> Result<()>;
 
+    /// Stamp the last-active time for a guest (Unix epoch seconds).
+    fn set_guest_last_active(&self, hotel_name: &str, guest_id: &str, epoch: u64) -> Result<()>;
+
     /// Bulk-insert or replace guest rows (used during initial seeding).
     fn seed_guests(&self, hotel_name: &str, guests: &[GuestRecord]) -> Result<()>;
 
@@ -235,6 +241,13 @@ pub trait GraphStorage: Send + Sync {
         role_name: &str,
     ) -> Result<Option<RoleIncarnationRecord>>;
     fn list_role_incarnations(&self, agent_id: &str) -> Result<Vec<RoleIncarnationRecord>>;
+
+    /// Find any role incarnation records whose `guest_id` matches the given value.
+    /// Used by the supervisor to check TTL without knowing the owning agent_id.
+    fn list_role_incarnations_by_guest_id(
+        &self,
+        guest_id: &str,
+    ) -> Result<Vec<RoleIncarnationRecord>>;
     fn upsert_session_participant(&self, participant: &SessionParticipantRecord) -> Result<()>;
     fn list_session_participants(&self, session_id: &str) -> Result<Vec<SessionParticipantRecord>>;
     fn upsert_session_turn(&self, turn: &SessionTurnRecord) -> Result<()>;

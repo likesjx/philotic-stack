@@ -367,6 +367,44 @@ impl GuestManager {
             let mut mat = self.materializer.lock().await;
 
             if rec.is_active {
+                // TTL check: if this guest is a role incarnation with inactive_ttl_seconds set,
+                // and it has been idle longer than that TTL, deactivate it rather than respawning.
+                // Non-membrane-owner role guests only — membrane-owner guests are never reclaimed by TTL.
+                let ttl_expired = {
+                    let role_incarnations = self.graph.list_role_incarnations_by_guest_id(&rec.guest_id).unwrap_or_default();
+                    if let Some(role_rec) = role_incarnations.first() {
+                        if let Some(ttl_secs) = role_rec.inactive_ttl_seconds {
+                            if let Some(last_active) = rec.last_active_at {
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                now.saturating_sub(last_active) > ttl_secs
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                };
+                if ttl_expired {
+                    info!(
+                        "Supervisor: Guest [{}] has exceeded its role TTL. Deactivating.",
+                        rec.guest_id
+                    );
+                    let _ = self.graph.set_guest_active(&self.hotel_name, &rec.guest_id, false);
+                    if let Some(pid) = rec.active_pid.as_deref() {
+                        let mut mat = self.materializer.lock().await;
+                        let _ = mat.reclaim_guest(&rec.guest_id).await;
+                        drop(mat);
+                    }
+                    Self::clear_guest_pid(self.graph.as_ref(), &self.hotel_name, &rec.guest_id);
+                    continue;
+                }
+
                 let mut should_spawn = rec.active_pid.is_none();
                 if let Some(active_pid) = rec.active_pid.as_deref() {
                     let is_live = mat.check_status(&rec.guest_id, active_pid).await?;
@@ -422,6 +460,15 @@ impl GuestManager {
                                 &self.hotel_name,
                                 &current_rec.guest_id,
                                 Some(&new_pid),
+                            );
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            let _ = self.graph.set_guest_last_active(
+                                &self.hotel_name,
+                                &current_rec.guest_id,
+                                now,
                             );
                         }
                         Err(e) => error!(
@@ -584,6 +631,29 @@ mod tests {
                 rec.is_active = active;
             }
             Ok(())
+        }
+
+        fn set_guest_last_active(
+            &self,
+            hotel_name: &str,
+            guest_id: &str,
+            epoch: u64,
+        ) -> Result<()> {
+            let mut guests = self.guests.lock().unwrap();
+            if let Some(rec) = guests
+                .iter_mut()
+                .find(|g| g.hotel_name == hotel_name && g.guest_id == guest_id)
+            {
+                rec.last_active_at = Some(epoch);
+            }
+            Ok(())
+        }
+
+        fn list_role_incarnations_by_guest_id(
+            &self,
+            _guest_id: &str,
+        ) -> Result<Vec<ansible_mesh_core::graph::RoleIncarnationRecord>> {
+            Ok(vec![])
         }
 
         fn seed_guests(&self, _hotel_name: &str, guests: &[GuestRecord]) -> Result<()> {
@@ -853,6 +923,7 @@ mod tests {
                 config_json: json!({ "command": "target/debug/agent-core" }).to_string(),
                 is_active: true,
                 active_pid: Some(pid.clone()),
+                last_active_at: None,
             }]));
 
         let mock = MockMaterializer::new(HashMap::from([(pid.clone(), true)]));
@@ -883,6 +954,7 @@ mod tests {
                 config_json: json!({ "command": "target/debug/membrane" }).to_string(),
                 is_active: true,
                 active_pid: Some(pid.clone()),
+                last_active_at: None,
             }]));
 
         let mock = MockMaterializer::new(HashMap::from([(pid.clone(), false)]));
@@ -912,6 +984,7 @@ mod tests {
                 config_json: json!({ "command": "target/debug/membrane" }).to_string(),
                 is_active: true,
                 active_pid: Some(pid.clone()),
+                last_active_at: None,
             },
         ]));
 
