@@ -1,6 +1,6 @@
-# `agent-core` — Persona Agent Guest
+# `philote` — Persona Agent Guest
 
-`agent-core` is a materialized guest process that runs a persistent AI agent
+`philote` is a materialized guest process that runs a persistent AI agent
 (persona) within a hotel. It represents the cognitive loop of a named agent identity.
 
 ## Responsibilities
@@ -28,5 +28,5 @@ client.sync_apartment(
 Spawned automatically by `GuestManager`. For development:
 
 ```bash
-cargo run -p agent-core -- --ansible-port 9000
+cargo run -p philote -- --ansible-port 9000
 ```

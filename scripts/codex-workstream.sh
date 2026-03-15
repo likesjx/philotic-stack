@@ -42,9 +42,9 @@ require_worktree() {
 
 hot_file_patterns() {
     cat <<'EOF'
-crates/ansible/src/main.rs
-crates/ansible/src/service/ipc.rs
-crates/agent-core/src/runtime.rs
+crates/aiua/src/main.rs
+crates/aiua/src/service/ipc.rs
+crates/philote/src/runtime.rs
 crates/membrane/src/main.rs
 crates/model-router/src/main.rs
 crates/model-router/src/runtime.rs
@@ -52,7 +52,7 @@ crates/model-router/src/controller.rs
 crates/model-router/src/providers/gemini.rs
 crates/model-router/src/providers/elevenlabs.rs
 crates/philotic-client/src/lib.rs
-crates/ansible/README.md
+crates/aiua/README.md
 docs/task.md
 docs/architecture/MODEL_CONTROLLER_PROPOSAL.md
 EOF

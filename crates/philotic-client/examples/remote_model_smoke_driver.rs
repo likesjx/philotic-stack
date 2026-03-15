@@ -83,7 +83,7 @@ async fn main() -> Result<()> {
     let remote_hotel_id = std::env::var("PHILOTIC_REMOTE_HOTEL_ID")
         .unwrap_or_else(|_| "aria-architect-hotel".to_string());
     let expected_remote_node = std::env::var("PHILOTIC_REMOTE_NODE_ID")
-        .unwrap_or_else(|_| "aria-architect-hotel-ansible-01".to_string());
+        .unwrap_or_else(|_| "aria-architect-hotel-aiua-01".to_string());
     let expected_remote_incarnation = std::env::var("PHILOTIC_REMOTE_MODEL_INCID")
         .unwrap_or_else(|_| "aria-architect-hotel:model-controller-gemini".to_string());
     let expected_reply = std::env::var("PHILOTIC_SMOKE_EXPECTED_REPLY")
@@ -117,7 +117,7 @@ async fn main() -> Result<()> {
 
     let response = client
         .send_request(IpcRequest::EmitTask {
-            target_node: "local-ansible-01".into(),
+            target_node: "local-aiua-01".into(),
             target_role: "agent".into(),
             target_guest_id: None,
             task_json: serde_json::json!({
@@ -126,7 +126,7 @@ async fn main() -> Result<()> {
                 "turn_id": turn_id,
                 "chat_id": chat_id,
                 "content": content,
-                "final_reply_to": "local-ansible-01",
+                "final_reply_to": "local-aiua-01",
                 "final_reply_role": "membrane",
                 "final_reply_guest_id": "remote-model-smoke-membrane"
             })

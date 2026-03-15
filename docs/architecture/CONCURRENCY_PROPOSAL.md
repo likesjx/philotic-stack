@@ -70,7 +70,7 @@ All callers of `invoke` are already in async contexts. The trait definition chan
 
 ## Change 3: Parallel Guest Materialization
 
-**File:** `crates/ansible/src/service/guest_manager.rs` — `materialize_all()`
+**File:** `crates/aiua/src/service/guest_manager.rs` — `materialize_all()`
 
 **Problem:** Guests are booted sequentially:
 
@@ -110,7 +110,7 @@ The ghost reclamation phase (the `if let Some(pid)` check before spawn) can also
 
 ## Change 4: Parallel Mesh Dispatcher Fan-Out
 
-**File:** `crates/ansible/src/service/mesh_dispatcher.rs` — tick loop
+**File:** `crates/aiua/src/service/mesh_dispatcher.rs` — tick loop
 
 **Problem:** On each tick, the dispatcher fans out to all known peer hotels sequentially:
 
@@ -185,7 +185,7 @@ The `process_update` function should encapsulate the current inline logic: `tele
 
 ## Change 6: Inbox Loop — Spawn Slow Message Handlers
 
-**File:** `crates/ansible/src/main.rs` — main inbox loop
+**File:** `crates/aiua/src/main.rs` — main inbox loop
 
 **Problem:** The hotel's main inbox processes one `BeaconMessage` at a time:
 

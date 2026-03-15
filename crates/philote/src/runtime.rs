@@ -26,11 +26,11 @@ const DEFAULT_VOICE_MODEL_ROLE: &str = "model.elevenlabs";
 const MAX_TOOL_ITERATIONS: u32 = 10;
 
 fn local_node_id() -> String {
-    std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-ansible-01".to_string())
+    std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string())
 }
 
 #[cfg(test)]
-const LOCAL_NODE: &str = "local-ansible-01";
+const LOCAL_NODE: &str = "local-aiua-01";
 
 fn extract_model_error(task: &InboundTaskPayload) -> Option<String> {
     if let Some(error) = task.error.as_ref() {
@@ -479,7 +479,7 @@ impl AgentRuntime {
                 }
                 Ok(Err(err)) => {
                     if is_ipc_disconnect(&err) {
-                        info!("Hotel IPC disconnected; agent-core exiting.");
+                        info!("Hotel IPC disconnected; philote exiting.");
                         return Ok(());
                     }
                     warn!("IPC Recv error: {}", err);
@@ -3203,19 +3203,19 @@ impl AgentRuntime {
                         (format!("Successfully configured role incarnation for '{}'.", name), None)
                     }
                     Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
-                        let e = TaskErrorPayload::ipc_failure("ansible", &*code, message);
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
                         (e.display_message(), Some(e))
                     }
                     Ok(IpcResponse::Error(msg)) => {
-                        let e = TaskErrorPayload::ipc_failure("ansible", "IPC_ERROR", msg);
+                        let e = TaskErrorPayload::ipc_failure("aiua", "IPC_ERROR", msg);
                         (e.display_message(), Some(e))
                     }
                     Ok(_) => {
-                        let e = TaskErrorPayload::ipc_failure("ansible", "UNEXPECTED_RESPONSE", "role.configure: unexpected hotel response");
+                        let e = TaskErrorPayload::ipc_failure("aiua", "UNEXPECTED_RESPONSE", "role.configure: unexpected hotel response");
                         (e.display_message(), Some(e))
                     }
                     Err(e) => {
-                        let err = TaskErrorPayload::transport_error("agent-core", format!("role.configure: IPC transport error — {e}"));
+                        let err = TaskErrorPayload::transport_error("philote", format!("role.configure: IPC transport error — {e}"));
                         (err.display_message(), Some(err))
                     }
                 };
@@ -3327,19 +3327,19 @@ impl AgentRuntime {
                         (msg, None)
                     }
                     Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
-                        let e = TaskErrorPayload::ipc_failure("ansible", &*code, message);
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
                         (e.display_message(), Some(e))
                     }
                     Ok(IpcResponse::Error(msg)) => {
-                        let e = TaskErrorPayload::ipc_failure("ansible", "IPC_ERROR", msg);
+                        let e = TaskErrorPayload::ipc_failure("aiua", "IPC_ERROR", msg);
                         (e.display_message(), Some(e))
                     }
                     Ok(_) => {
-                        let e = TaskErrorPayload::ipc_failure("ansible", "UNEXPECTED_RESPONSE", "skill.register: unexpected hotel response");
+                        let e = TaskErrorPayload::ipc_failure("aiua", "UNEXPECTED_RESPONSE", "skill.register: unexpected hotel response");
                         (e.display_message(), Some(e))
                     }
                     Err(e) => {
-                        let err = TaskErrorPayload::transport_error("agent-core", format!("skill.register: IPC transport error — {e}"));
+                        let err = TaskErrorPayload::transport_error("philote", format!("skill.register: IPC transport error — {e}"));
                         (err.display_message(), Some(err))
                     }
                 };
@@ -3389,7 +3389,7 @@ impl AgentRuntime {
                 let subagent_kind = args
                     .get("subagent_kind")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("agent-worker")
+                    .unwrap_or("philote-worker")
                     .to_string();
                 let context_summary = args
                     .get("context_summary")
@@ -3458,19 +3458,19 @@ impl AgentRuntime {
                         ), None)
                     }
                     Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
-                        let e = TaskErrorPayload::ipc_failure("ansible", &*code, message);
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
                         (e.display_message(), Some(e))
                     }
                     Ok(IpcResponse::Error(msg)) => {
-                        let e = TaskErrorPayload::ipc_failure("ansible", "IPC_ERROR", msg);
+                        let e = TaskErrorPayload::ipc_failure("aiua", "IPC_ERROR", msg);
                         (e.display_message(), Some(e))
                     }
                     Ok(_) => {
-                        let e = TaskErrorPayload::ipc_failure("ansible", "UNEXPECTED_RESPONSE", "subagent.spawn: unexpected hotel response");
+                        let e = TaskErrorPayload::ipc_failure("aiua", "UNEXPECTED_RESPONSE", "subagent.spawn: unexpected hotel response");
                         (e.display_message(), Some(e))
                     }
                     Err(e) => {
-                        let err = TaskErrorPayload::transport_error("agent-core", format!("subagent.spawn: IPC transport error — {e}"));
+                        let err = TaskErrorPayload::transport_error("philote", format!("subagent.spawn: IPC transport error — {e}"));
                         (err.display_message(), Some(err))
                     }
                 };
@@ -3593,11 +3593,11 @@ impl AgentRuntime {
                         (e.display_message(), Some(e))
                     }
                     Ok(_) => {
-                        let e = TaskErrorPayload::ipc_failure("ansible", "UNEXPECTED_RESPONSE", "handoff.to_role: unexpected hotel response");
+                        let e = TaskErrorPayload::ipc_failure("aiua", "UNEXPECTED_RESPONSE", "handoff.to_role: unexpected hotel response");
                         (e.display_message(), Some(e))
                     }
                     Err(e) => {
-                        let err = TaskErrorPayload::transport_error("agent-core", format!("handoff.to_role: IPC transport error — {e}"));
+                        let err = TaskErrorPayload::transport_error("philote", format!("handoff.to_role: IPC transport error — {e}"));
                         (err.display_message(), Some(err))
                     }
                 };
@@ -3668,11 +3668,11 @@ impl AgentRuntime {
                         (e.display_message(), Some(e))
                     }
                     Ok(_) => {
-                        let e = TaskErrorPayload::ipc_failure("ansible", "UNEXPECTED_RESPONSE", "handoff.back: unexpected hotel response");
+                        let e = TaskErrorPayload::ipc_failure("aiua", "UNEXPECTED_RESPONSE", "handoff.back: unexpected hotel response");
                         (e.display_message(), Some(e))
                     }
                     Err(e) => {
-                        let err = TaskErrorPayload::transport_error("agent-core", format!("handoff.back: IPC transport error — {e}"));
+                        let err = TaskErrorPayload::transport_error("philote", format!("handoff.back: IPC transport error — {e}"));
                         (err.display_message(), Some(err))
                     }
                 };

@@ -35,7 +35,7 @@ Implemented so far:
 - `membrane` is now explicitly documented as a component type rather than synonymous with Telegram
 - the current generic `role = "membrane"` reply path is explicitly marked transitional
 - the hotel IPC layer now supports optional guest-specific local delivery within a shared role
-- `agent-core`, `model-router`, and `membrane` now carry an optional `final_reply_guest_id` so a turn can preserve its owning membrane incarnation while keeping role-based fallback
+- `philote`, `model-router`, and `membrane` now carry an optional `final_reply_guest_id` so a turn can preserve its owning membrane incarnation while keeping role-based fallback
 - session bindings now persist the transport reply target so new turns inherit their owning membrane target from session state rather than only from inbound payload scaffolding
 
 Track follow-on work in [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md).
@@ -56,7 +56,7 @@ If we keep one generic reply role forever, multiple membranes will either:
 
 - all receive the same outbound reply
 - need hidden side-routing logic
-- or force more transport awareness back into `agent-core`
+- or force more transport awareness back into `philote`
 
 All three are boundary smell.
 
@@ -183,7 +183,7 @@ A membrane should be able to ask the hotel to:
 
 - fetch component config and secrets
 - resolve or create a session binding
-- emit normalized inbound work toward `agent-core` or another target
+- emit normalized inbound work toward `philote` or another target
 - receive outbound events intended for its session bindings
 - record transport events or delivery outcomes when needed
 
@@ -241,10 +241,10 @@ Instead, outbound routing should resolve to the membrane implementation that own
 Recommended direction:
 
 - session binding records the owning membrane component/incarnation or routable transport target
-- `agent-core` emits transport-agnostic outbound events
+- `philote` emits transport-agnostic outbound events
 - the hotel routes those events to the correct membrane implementation
 
-This avoids teaching `agent-core` whether a session belongs to Telegram, WhatsApp, or a constrained HTTPS listener.
+This avoids teaching `philote` whether a session belongs to Telegram, WhatsApp, or a constrained HTTPS listener.
 
 ## Why The Current Generic Role Is Transitional
 

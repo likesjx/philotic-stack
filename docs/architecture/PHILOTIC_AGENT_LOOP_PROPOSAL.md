@@ -61,12 +61,12 @@ The best combined design basis is:
 
 ## Core Recommendation
 
-Philotic should implement a **Pi-style turn engine inside `agent-core`**, but wrap it in **Philotic session durability and turn state management**.
+Philotic should implement a **Pi-style turn engine inside `philote`**, but wrap it in **Philotic session durability and turn state management**.
 
 That means:
 
-- `agent-core` owns the in-turn loop
-- `ansible` owns canonical session and turn durability
+- `philote` owns the in-turn loop
+- `aiua` owns canonical session and turn durability
 - checkpoints happen between super-steps
 - approvals are real interrupts
 - tools/results are first-class records, not just text
@@ -297,4 +297,4 @@ It should:
 - use **checkpointed super-steps**
 - use **real approval interrupts**
 
-This is the point where the agent project becomes its own system rather than "some extra logic in `agent-core`."
+This is the point where the agent project becomes its own system rather than "some extra logic in `philote`."

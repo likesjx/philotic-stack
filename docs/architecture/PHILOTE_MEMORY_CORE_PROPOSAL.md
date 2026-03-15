@@ -181,7 +181,7 @@ The practical consequence: Phase 1 ships MemoryEngine. An agent can remember, re
 
 ### The Thin Barrier: memory-core SDK
 
-`memory-core` is a new crate in the workspace — a peer to `agent-core`, not a module inside it. One instance materializes per hotel (singleton within a hotel, like how the hotel daemon is singular). It is a managed guest, supervised by GuestManager and declared in `materialized_guests`, with its own IPC surface for agents that need to read or write memory.
+`memory-core` is a new crate in the workspace — a peer to `philote`, not a module inside it. One instance materializes per hotel (singleton within a hotel, like how the hotel daemon is singular). It is a managed guest, supervised by GuestManager and declared in `materialized_guests`, with its own IPC surface for agents that need to read or write memory.
 
 The crate is a typed client that sits between agent-core and MuninnDB. It is a translation layer, not a middleware. The name reflects that this is an abstraction over the memory substrate — MuninnDB is the primary (and likely sole) backend, but it is not a first-class name in the Philotic Stack's own interface surface.
 
@@ -241,7 +241,7 @@ This means the Attend step is not a separate LLM call over the full reasoning tr
 
 #### Relation lifetimes and working turn
 
-Turn-local relational structure — provisional associations, contradictions-in-flight, co-occurrence signals that arise during a single reasoning step — lives in `agent-core`'s `WorkingTurn` state, not in memory-core. It does not touch MuninnDB. At turn-end, anything that changed the agent's knowledge or beliefs is extracted by the Attend step and becomes an L2 write. The rest is discarded with the turn.
+Turn-local relational structure — provisional associations, contradictions-in-flight, co-occurrence signals that arise during a single reasoning step — lives in `philote`'s `WorkingTurn` state, not in memory-core. It does not touch MuninnDB. At turn-end, anything that changed the agent's knowledge or beliefs is extracted by the Attend step and becomes an L2 write. The rest is discarded with the turn.
 
 This gives clean lifetime semantics:
 - **turn-local** → `WorkingTurn` in agent-core, never enters memory-core
@@ -552,7 +552,7 @@ memory:
 
 - Cognitive memory workload (what the agent knows, believes, remembers) moves from `sync_apartment` / `get_apartment` to MuninnDB vaults
 - `MemoryApartment` and `MemoryEntry` types in `graph.rs` are retired for cognitive use
-- LWW memory storage in `ansible_context.db` is replaced by vault-backed engrams
+- LWW memory storage in `aiua_context.db` is replaced by vault-backed engrams
 
 ### What Gets Added
 

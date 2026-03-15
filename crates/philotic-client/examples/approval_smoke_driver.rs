@@ -13,7 +13,7 @@ async fn main() -> Result<()> {
     let approval_request = std::env::var("PHILOTIC_SMOKE_APPROVAL_REQUEST")
         .unwrap_or_else(|_| "need approval deploy the thing".to_string());
     let target_node =
-        std::env::var("PHILOTIC_TARGET_NODE").unwrap_or_else(|_| "local-ansible-01".to_string());
+        std::env::var("PHILOTIC_TARGET_NODE").unwrap_or_else(|_| "local-aiua-01".to_string());
     let final_reply_to =
         std::env::var("PHILOTIC_FINAL_REPLY_TO").unwrap_or_else(|_| target_node.clone());
     let expected_wait = std::env::var("PHILOTIC_SMOKE_EXPECTED_WAIT").unwrap_or_else(|_| {

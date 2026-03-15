@@ -16,8 +16,8 @@ When usage elsewhere drifts from those definitions, fix the usage — not the gl
 
 Philotic is a distributed AI agent operating system built around:
 
-- `ansible` as the hotel daemon and canonical context owner
-- materialized guest processes such as `membrane`, `agent-core`, `model-router`, and tool runners
+- `aiua` as the hotel daemon and canonical context owner
+- materialized guest processes such as `membrane`, `philote`, `model-router`, and tool runners
 - a graph-backed context and session model
 - explicit runtime boundaries between cognition, routing, execution, and persistence
 
@@ -34,7 +34,7 @@ Examples:
 - canonical session state in the context graph
 - derived recovery checkpoints in apartments
 - live routing/materialization state in the hotel runtime
-- local working turn state inside `agent-core`
+- local working turn state inside `philote`
 
 If two places appear to own the same thing, stop and resolve the boundary before extending behavior.
 

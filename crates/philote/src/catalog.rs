@@ -1,4 +1,4 @@
-//! Static tool catalog for agent-core.
+//! Static tool catalog for philote.
 //!
 //! Defines the canonical set of built-in tool definitions with real descriptions
 //! and input schemas. Used by `default_tool_assembly_for_bindings` instead of
@@ -166,7 +166,7 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     "subagent_kind": {
                         "type": "string",
                         "description": "The role name of the subagent worker this skill delegates to \
-                                        (e.g., 'agent-worker')."
+                                        (e.g., 'philote-worker')."
                     },
                     "goal": {
                         "type": "string",
@@ -209,7 +209,7 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     },
                     "subagent_kind": {
                         "type": "string",
-                        "description": "The worker role to spawn. Defaults to 'agent-worker'."
+                        "description": "The worker role to spawn. Defaults to 'philote-worker'."
                     },
                     "context_summary": {
                         "type": "string",

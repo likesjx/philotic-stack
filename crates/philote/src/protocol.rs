@@ -402,7 +402,7 @@ mod tests {
             execution_mode: "pinned".into(),
             runner_id: Some("task-runner-workspace-01".into()),
             incarnation_id: Some("task-runner-workspace-01".into()),
-            hotel_id: Some("local-ansible-01".into()),
+            hotel_id: Some("local-aiua-01".into()),
             environment_id: Some("workspace://main".into()),
             task_runner_kind: Some("workspace".into()),
             task_runner_config: Some(TaskRunnerBaseConfig {
@@ -419,9 +419,9 @@ mod tests {
                 max_read_bytes: Some(4096),
                 max_search_results: Some(25),
             }),
-            reply_to: "local-ansible-01".into(),
+            reply_to: "local-aiua-01".into(),
             reply_role: "agent".into(),
-            final_reply_to: "local-ansible-01".into(),
+            final_reply_to: "local-aiua-01".into(),
             final_reply_role: "membrane".into(),
             final_reply_guest_id: None,
         };

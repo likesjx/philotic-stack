@@ -25,8 +25,8 @@ main()
 
 ## Integration Points
 
-- Talks to `ansible` hotel via local IPC (UDS/UDP loopback)
-- May publish events for `agent-core` or `model-router` via the hotel
+- Talks to `aiua` hotel via local IPC (UDS/UDP loopback)
+- May publish events for `philote` or `model-router` via the hotel
 - Uses `client.sync_apartment()` to persist conversation state
 
 ## Running

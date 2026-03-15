@@ -69,9 +69,9 @@ These docs are proposal space, not automatic runtime truth:
 
 ## Quick Reference
 
-- **IPC socket:** `/tmp/philotic-ansible.sock` (env: `PHILOTIC_HOTEL_SOCKET`)
+- **IPC socket:** `/tmp/philotic-aiua.sock` (env: `PHILOTIC_HOTEL_SOCKET`)
 - **Mesh UDP port:** `8999`
 - **Blob HTTP port:** `9001`
 - **Execution TCP port:** `mesh_port + 2`
-- **Context DB:** `ansible_context.db` (SQLite)
+- **Context DB:** `aiua_context.db` (SQLite)
 - **Guest supervisor interval:** 5 seconds

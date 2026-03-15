@@ -148,7 +148,7 @@ Mesh-visible records should prefer a small common envelope:
   "record_type": "telegram_poll_lease",
   "record_id": "telegram:bot-token-ref:sha256:abcd",
   "owning_hotel": "hotel-alpha",
-  "canonical_writer": "ansible",
+  "canonical_writer": "aiua",
   "state": "active",
   "version": 7,
   "updated_at": 1741809600,

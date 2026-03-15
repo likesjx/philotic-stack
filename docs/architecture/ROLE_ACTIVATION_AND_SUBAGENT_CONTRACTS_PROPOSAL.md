@@ -21,8 +21,8 @@ task_refs:
 proposal_id: role-activation-subagent-contracts
 implements: []
 implemented_by:
-  - ../../crates/agent-core/src/session.rs
-  - ../../crates/ansible/src/service/ipc.rs
+  - ../../crates/philote/src/session.rs
+  - ../../crates/aiua/src/service/ipc.rs
 active_seams:
   - role-activation-contract
   - same-identity-handoff-packet
@@ -58,12 +58,12 @@ The first three should be implemented before Philotic broadens concurrent role m
 The first compatibility-first `RoleActivation` substrate now exists:
 
 - hotel session snapshots now include a transitional `role_activation` object derived from the active role incarnation record
-- `agent-core` hydrates that object into `SessionState`
+- `philote` hydrates that object into `SessionState`
 - context projection now carries `role_activation`
 - prompt/session projection now renders role addendum, toolset profile, and effective skillset posture from the typed activation object
 - manual same-identity role handoff now carries a richer compatibility-first packet through the existing `HandoffBundle` wire contract
 - the shared IPC surface now includes a first compatibility-first `SubagentDelegation` contract plus `SpawnSubagent` request shape
-- `agent-core` can now build a lightweight default delegation packet from live session state
+- `philote` can now build a lightweight default delegation packet from live session state
 - hotel IPC now returns an explicit structured `SUBAGENT_NOT_IMPLEMENTED` response for `SpawnSubagent` instead of pretending the boundary exists only spiritually
 
 This slice is intentionally narrower than the full proposal:

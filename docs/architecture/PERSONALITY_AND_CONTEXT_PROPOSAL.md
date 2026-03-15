@@ -47,7 +47,7 @@ This proposal focuses on:
 
 ## Disposition
 
-Accepted for the current slice. Initial turn-time projection scaffolding is implemented in `agent-core`, and the canonical session snapshot now carries a graph-backed imported Jane profile seeded from the legacy `vps-jane` workspace. The runtime is still using compatibility text inputs rather than richer heuristic memory projection.
+Accepted for the current slice. Initial turn-time projection scaffolding is implemented in `philote`, and the canonical session snapshot now carries a graph-backed imported Jane profile seeded from the legacy `vps-jane` workspace. The runtime is still using compatibility text inputs rather than richer heuristic memory projection.
 
 Research basis:
 
@@ -58,7 +58,7 @@ Track follow-on work in [task.md](/Users/jaredlikes/code/philotic-stack/docs/tas
 
 ## Current Slice
 
-Land the first honest projection boundary in `agent-core` and feed it with one imported Jane profile:
+Land the first honest projection boundary in `philote` and feed it with one imported Jane profile:
 
 - refactor prompt assembly around:
   - `project_agent_self`
@@ -118,7 +118,7 @@ The practical projection layers for the first implementation should be:
 4. memory context
 5. session context
 
-That should replace the current flatter prompt assembly path in `agent-core`.
+That should replace the current flatter prompt assembly path in `philote`.
 
 The key rule is:
 
@@ -451,7 +451,7 @@ The design target is:
 
 Near-term implementation order:
 
-1. define explicit prompt assembly layers in `agent-core`
+1. define explicit prompt assembly layers in `philote`
 2. add support for:
    - `soul_text`
    - `identity_text`

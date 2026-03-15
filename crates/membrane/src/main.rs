@@ -15,7 +15,7 @@ const TELEGRAM_POLL_TIMEOUT_SECS: u64 = 10;
 const TELEGRAM_POLL_LEASE_RENEW_INTERVAL_SECS: u64 = 20;
 
 fn local_node_id() -> String {
-    std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-ansible-01".to_string())
+    std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string())
 }
 
 fn local_guest_id() -> String {

@@ -13,10 +13,10 @@ cleanup() {
   local exit_code=$?
   set +e
   if [[ ${exit_code} -ne 0 ]]; then
-    echo "Remote-model smoke failed. source ansible log:"
-    [[ -f "${TMP_DIR}/source-ansible.log" ]] && cat "${TMP_DIR}/source-ansible.log"
-    echo "Remote-model smoke failed. remote ansible log:"
-    [[ -f "${TMP_DIR}/remote-ansible.log" ]] && cat "${TMP_DIR}/remote-ansible.log"
+    echo "Remote-model smoke failed. source aiua log:"
+    [[ -f "${TMP_DIR}/source-aiua.log" ]] && cat "${TMP_DIR}/source-aiua.log"
+    echo "Remote-model smoke failed. remote aiua log:"
+    [[ -f "${TMP_DIR}/remote-aiua.log" ]] && cat "${TMP_DIR}/remote-aiua.log"
   fi
   [[ -n "${SOURCE_ANSIBLE_PID:-}" ]] && kill "${SOURCE_ANSIBLE_PID}" >/dev/null 2>&1
   [[ -n "${REMOTE_ANSIBLE_PID:-}" ]] && kill "${REMOTE_ANSIBLE_PID}" >/dev/null 2>&1
@@ -30,8 +30,8 @@ trap cleanup EXIT
 
 echo "Building remote-model smoke binaries..."
 cargo build \
-  -p ansible --bin ansible \
-  -p agent-core --bin agent-core \
+  -p aiua --bin aiua \
+  -p philote --bin philote \
   -p model-router --bin model-controller-gemini \
   -p model-router --bin model-controller-elevenlabs \
   -p tool-runner --bin tool-runner \
@@ -48,7 +48,7 @@ echo "Starting remote hotel [${REMOTE_HOTEL}] with guest supervision..."
   PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE=1 \
   PHILOTIC_ENABLE_GUEST_SUPERVISOR=1 \
   PHILOTIC_MODEL_ROUTER_STUB_RESPONSE="${EXPECTED_REPLY}" \
-  "${ROOT_DIR}/target/debug/ansible" --hotel "${REMOTE_HOTEL}" >"${TMP_DIR}/remote-ansible.log" 2>&1
+  "${ROOT_DIR}/target/debug/aiua" --hotel "${REMOTE_HOTEL}" >"${TMP_DIR}/remote-aiua.log" 2>&1
 ) &
 REMOTE_ANSIBLE_PID=$!
 
@@ -70,7 +70,7 @@ echo "Starting source hotel [${SOURCE_HOTEL}]..."
   RUST_LOG=info \
   PHILOTIC_ENABLE_RUST_DISPATCHER=1 \
   PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE=1 \
-  "${ROOT_DIR}/target/debug/ansible" --hotel "${SOURCE_HOTEL}" >"${TMP_DIR}/source-ansible.log" 2>&1
+  "${ROOT_DIR}/target/debug/aiua" --hotel "${SOURCE_HOTEL}" >"${TMP_DIR}/source-aiua.log" 2>&1
 ) &
 SOURCE_ANSIBLE_PID=$!
 
@@ -89,7 +89,7 @@ fi
 sleep 2
 
 echo "Disabling live local model on source hotel so remote placement can actually happen..."
-SOURCE_DB="${TMP_DIR}/ansible_context.db"
+SOURCE_DB="${TMP_DIR}/aiua_context.db"
 SOURCE_MODEL_GUEST="${SOURCE_HOTEL}:model-controller-gemini"
 SOURCE_MODEL_PID=""
 
@@ -112,7 +112,7 @@ sleep 2
 echo "Driving remote-model round-trip..."
 PHILOTIC_HOTEL_SOCKET="${SOURCE_SOCKET}" \
 PHILOTIC_REMOTE_HOTEL_ID="${REMOTE_HOTEL}" \
-PHILOTIC_REMOTE_NODE_ID="${REMOTE_HOTEL}-ansible-01" \
+PHILOTIC_REMOTE_NODE_ID="${REMOTE_HOTEL}-aiua-01" \
 PHILOTIC_REMOTE_MODEL_INCID="${REMOTE_HOTEL}:model-controller-gemini" \
 PHILOTIC_SMOKE_EXPECTED_REPLY="${EXPECTED_REPLY}" \
   cargo run -q -p philotic-client --example remote_model_smoke_driver

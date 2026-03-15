@@ -82,7 +82,7 @@ Current confidence for the implemented structured-envelope slice:
 
 - `test-green`
   - `cargo test -p model-router -- --nocapture`
-  - `cargo test -p agent-core -- --nocapture`
+  - `cargo test -p philote -- --nocapture`
 - `smoke-green` for the structured cognitive path
   - `bash scripts/smoke-cognitive-roundtrip.sh`
 - not yet `watched-live-green` for end-to-end role/context projection in a live session

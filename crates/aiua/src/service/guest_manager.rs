@@ -129,7 +129,7 @@ impl Materializer for LocalProcessMaterializer {
         // NOTE: In the trait-abstracted world, the GuestManager passes the PID
         // to reclaim_guest. For now, LocalProcessMaterializer opens a throwaway
         // connection for backwards compatibility until the caller is fully refactored.
-        if let Ok(local_graph) = crate::graph::ContextGraph::open("ansible_context.db") {
+        if let Ok(local_graph) = crate::graph::ContextGraph::open("aiua_context.db") {
             let conn = local_graph.conn.lock().unwrap();
             let mut stmt =
                 conn.prepare("SELECT active_pid FROM materialized_guests WHERE guest_id = ?")?;
@@ -920,7 +920,7 @@ mod tests {
                 hotel_name: "test-hotel".into(),
                 guest_id: "guest-1".into(),
                 role: "agent".into(),
-                config_json: json!({ "command": "target/debug/agent-core" }).to_string(),
+                config_json: json!({ "command": "target/debug/philote" }).to_string(),
                 is_active: true,
                 active_pid: Some(pid.clone()),
                 last_active_at: None,

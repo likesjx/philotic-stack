@@ -62,7 +62,7 @@ impl TaskErrorPayload {
             kind: "tool_execution_failure".into(),
             message: message.into(),
             code: code.map(str::to_string),
-            component: Some("agent-core".into()),
+            component: Some("philote".into()),
             capability: Some(tool_name),
             provider: None,
             retryable: Some(false),
@@ -444,7 +444,7 @@ pub enum IpcRequest {
     RegisterSkill {
         skill_name: String,
         description: String,
-        /// The subagent worker kind (e.g. `"agent-worker"`).
+        /// The subagent worker kind (e.g. `"philote-worker"`).
         subagent_kind: String,
         /// High-level goal statement for this skill.
         goal: String,
@@ -700,11 +700,11 @@ impl PhiloticClient {
 
     fn socket_path() -> String {
         std::env::var("PHILOTIC_HOTEL_SOCKET")
-            .unwrap_or_else(|_| "/tmp/philotic-ansible.sock".to_string())
+            .unwrap_or_else(|_| "/tmp/philotic-aiua.sock".to_string())
     }
 
     /// Connect to the local Ansible daemon automatically, driven by environment variables.
-    /// Default Hotel socket is `/tmp/philotic-ansible.sock` unless `PHILOTIC_HOTEL_SOCKET` is specified.
+    /// Default Hotel socket is `/tmp/philotic-aiua.sock` unless `PHILOTIC_HOTEL_SOCKET` is specified.
     pub async fn connect_at(socket_path: impl AsRef<str>, identity: GuestIdentity) -> Result<Self> {
         let socket_path = socket_path.as_ref().to_string();
         let stream = UnixStream::connect(&socket_path)
@@ -741,7 +741,7 @@ impl PhiloticClient {
     }
 
     /// Connect to the local Ansible daemon automatically, driven by environment variables.
-    /// Default Hotel socket is `/tmp/philotic-ansible.sock` unless `PHILOTIC_HOTEL_SOCKET` is specified.
+    /// Default Hotel socket is `/tmp/philotic-aiua.sock` unless `PHILOTIC_HOTEL_SOCKET` is specified.
     pub async fn connect(identity: GuestIdentity) -> Result<Self> {
         Self::connect_at(Self::socket_path(), identity).await
     }
@@ -871,7 +871,7 @@ mod tests {
                 lease_type: "telegram_poll".into(),
                 lease_scope: "telegram:bot-token:abcd".into(),
                 authority_hotel: "hotel-alpha".into(),
-                authority_component: Some("ansible".into()),
+                authority_component: Some("aiua".into()),
                 owner_guest_id: "membrane-telegram-01".into(),
                 owner_hotel: Some("hotel-alpha".into()),
                 owner_component_type: Some("membrane".into()),
@@ -1035,7 +1035,7 @@ mod tests {
                 write_frame(
                     &mut stream,
                     &serde_json::to_vec(&IpcResponse::InboundTask {
-                        source_node: "local-ansible-01".into(),
+                        source_node: "local-aiua-01".into(),
                         task_id: Uuid::nil(),
                         task_json: serde_json::json!({
                             "action": "send_reply",
@@ -1126,7 +1126,7 @@ mod tests {
                 .await;
 
                 let payload = serde_json::to_vec(&IpcResponse::InboundTask {
-                    source_node: "local-ansible-01".into(),
+                    source_node: "local-aiua-01".into(),
                     task_id: Uuid::nil(),
                     task_json: serde_json::json!({
                         "action": "send_reply",

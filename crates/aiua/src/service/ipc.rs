@@ -209,7 +209,7 @@ impl IpcServer {
             lease_type: "telegram_poll".into(),
             lease_scope: lease_key.to_string(),
             authority_hotel: authority_hotel.to_string(),
-            authority_component: Some("ansible".into()),
+            authority_component: Some("aiua".into()),
             owner_guest_id: owner_guest_id.to_string(),
             owner_hotel: Some(authority_hotel.to_string()),
             owner_component_type: Some("membrane".into()),
@@ -606,10 +606,10 @@ impl IpcServer {
             lease_type: "subagent".into(),
             lease_scope: Self::subagent_lease_scope(subagent_guest_id),
             authority_hotel: local_node_id.to_string(),
-            authority_component: Some("ansible".into()),
+            authority_component: Some("aiua".into()),
             owner_guest_id: subagent_guest_id.to_string(),
             owner_hotel: Some(local_node_id.to_string()),
-            owner_component_type: Some("agent-worker".into()),
+            owner_component_type: Some("philote-worker".into()),
             lease_epoch: 0,
             lease_expires_at: 0,
             last_heartbeat_at: 0,
@@ -641,7 +641,7 @@ impl IpcServer {
         // 1. Register the subagent guest in the context graph so the materializer
         //    can spawn and supervise it.
         let config_json = serde_json::json!({
-            "command": "agent-worker",
+            "command": "philote-worker",
             "env": {
                 "PHILOTIC_AGENT_ID":        &subagent_guest_id,
                 "PHILOTIC_SESSION_ID":      session_id,
@@ -2550,7 +2550,7 @@ impl IpcServer {
             summary_json["bindings"] = bindings.clone();
             if payload.get("tool_assembly").is_none() {
                 summary_json["tool_assembly"] =
-                    compose_tool_assembly(bindings, &[], &[], &[], "local-ansible-01");
+                    compose_tool_assembly(bindings, &[], &[], &[], "local-aiua-01");
             }
             session.summary_json = summary_json;
         }
@@ -2741,7 +2741,7 @@ impl IpcServer {
         if let Some(tool_assembly) = payload.get("tool_assembly").cloned().or_else(|| {
             payload
                 .get("bindings")
-                .map(|bindings| compose_tool_assembly(bindings, &[], &[], &[], "local-ansible-01"))
+                .map(|bindings| compose_tool_assembly(bindings, &[], &[], &[], "local-aiua-01"))
         }) {
             let _ = graph.append_session_event(&SessionEventRecord {
                 event_id: Uuid::new_v4().to_string(),
@@ -3772,7 +3772,7 @@ fn compose_tool_assembly_from_incarnations(
                 (
                     tool_name.to_string(),
                     serde_json::json!({
-                        "target_node": incarnation.target_node.clone().or_else(|| incarnation.hotel_id.clone()).unwrap_or_else(|| "local-ansible-01".into()),
+                        "target_node": incarnation.target_node.clone().or_else(|| incarnation.hotel_id.clone()).unwrap_or_else(|| "local-aiua-01".into()),
                         "target_role": incarnation.target_role.clone().unwrap_or_else(|| format!("tool.{tool_name}")),
                         "runner_id": incarnation.runner_id.clone().unwrap_or_else(|| incarnation.incarnation_id.clone()),
                         "incarnation_id": incarnation.incarnation_id,
@@ -3832,8 +3832,8 @@ fn select_allowed_incarnation<'a>(
                 right_live.cmp(&left_live)
             })
             .then_with(|| {
-                let left_local = left.hotel_id.as_deref() == Some("local-ansible-01");
-                let right_local = right.hotel_id.as_deref() == Some("local-ansible-01");
+                let left_local = left.hotel_id.as_deref() == Some("local-aiua-01");
+                let right_local = right.hotel_id.as_deref() == Some("local-aiua-01");
                 right_local.cmp(&left_local)
             })
             .then_with(|| left.incarnation_id.cmp(&right.incarnation_id))
@@ -3885,7 +3885,7 @@ fn selection_reason_for_incarnation(
     } else if preferences.preferred_hotel_id.as_deref() == incarnation.hotel_id.as_deref() {
         format!("preferred_hotel_{suffix}")
     } else if incarnation.availability_state == "live"
-        && incarnation.hotel_id.as_deref() == Some("local-ansible-01")
+        && incarnation.hotel_id.as_deref() == Some("local-aiua-01")
     {
         "live_local_fallback".into()
     } else if incarnation.availability_state == "live" {
@@ -4209,7 +4209,7 @@ mod tests {
         let graph: Arc<dyn GraphStorage> = Arc::new(TestGraphStorage);
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         );
@@ -4250,7 +4250,7 @@ mod tests {
 
         let response = membrane
             .send_request(IpcRequest::EmitTask {
-                target_node: "local-ansible-01".into(),
+                target_node: "local-aiua-01".into(),
                 target_role: "agent".into(),
                 target_guest_id: None,
                 task_json: task_payload.clone(),
@@ -4272,7 +4272,7 @@ mod tests {
                 task_json,
                 ..
             } => {
-                assert_eq!(source_node, "local-ansible-01");
+                assert_eq!(source_node, "local-aiua-01");
                 assert_eq!(task_json, task_payload);
             }
             other => panic!("unexpected inbound response: {other:?}"),
@@ -4284,8 +4284,8 @@ mod tests {
             .expect("ledger command should be emitted");
         match ledger_msg {
             LedgerCommand::AppendLocal(env) => {
-                assert_eq!(env.source_node_id, "local-ansible-01");
-                assert_eq!(env.target_node_id.as_deref(), Some("local-ansible-01"));
+                assert_eq!(env.source_node_id, "local-aiua-01");
+                assert_eq!(env.target_node_id.as_deref(), Some("local-aiua-01"));
             }
             _ => panic!("unexpected ledger command"),
         }
@@ -4308,7 +4308,7 @@ mod tests {
         let graph: Arc<dyn GraphStorage> = Arc::new(TestGraphStorage);
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         );
@@ -4346,7 +4346,7 @@ mod tests {
 
         sender
             .send_request(IpcRequest::EmitTask {
-                target_node: "local-ansible-01".into(),
+                target_node: "local-aiua-01".into(),
                 target_role: "membrane".into(),
                 target_guest_id: Some("membrane-telegram-01".into()),
                 task_json: serde_json::json!({
@@ -4422,7 +4422,7 @@ mod tests {
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         );
@@ -4468,7 +4468,7 @@ mod tests {
 
         let response = membrane
             .send_request(IpcRequest::EmitTask {
-                target_node: "local-ansible-01".into(),
+                target_node: "local-aiua-01".into(),
                 target_role: "agent".into(),
                 target_guest_id: None,
                 task_json: task_payload.clone(),
@@ -4546,7 +4546,7 @@ mod tests {
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         );
@@ -4585,7 +4585,7 @@ mod tests {
 
         let response = membrane
             .send_request(IpcRequest::EmitTask {
-                target_node: "local-ansible-01".into(),
+                target_node: "local-aiua-01".into(),
                 target_role: "agent".into(),
                 target_guest_id: None,
                 task_json: task_payload.clone(),
@@ -4655,7 +4655,7 @@ mod tests {
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         );
@@ -4694,7 +4694,7 @@ mod tests {
 
         let response = membrane
             .send_request(IpcRequest::EmitTask {
-                target_node: "local-ansible-01".into(),
+                target_node: "local-aiua-01".into(),
                 target_role: "agent".into(),
                 target_guest_id: None,
                 task_json: task_payload.clone(),
@@ -4738,7 +4738,7 @@ mod tests {
             .upsert_hotel(&HotelRecord {
                 hotel_name: "local-hotel".into(),
                 capabilities: NodeCapabilities {
-                    node_id: "local-ansible-01".into(),
+                    node_id: "local-aiua-01".into(),
                     roles: vec![],
                     models: vec![],
                     tools: vec![],
@@ -4786,7 +4786,7 @@ mod tests {
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         )
@@ -4819,7 +4819,7 @@ mod tests {
 
         let response = membrane
             .send_request(IpcRequest::EmitTask {
-                target_node: "local-ansible-01".into(),
+                target_node: "local-aiua-01".into(),
                 target_role: "agent".into(),
                 target_guest_id: None,
                 task_json: task_payload.clone(),
@@ -4896,7 +4896,7 @@ mod tests {
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph.clone(),
         );
@@ -5016,7 +5016,7 @@ mod tests {
             .upsert_hotel(&HotelRecord {
                 hotel_name: "local-hotel".into(),
                 capabilities: NodeCapabilities {
-                    node_id: "local-ansible-01".into(),
+                    node_id: "local-aiua-01".into(),
                     roles: vec![],
                     models: vec![],
                     tools: vec![],
@@ -5075,7 +5075,7 @@ mod tests {
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph.clone(),
         )
@@ -5202,7 +5202,7 @@ mod tests {
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         );
@@ -5270,7 +5270,7 @@ mod tests {
                 assert!(confirmed_lease.lease_expires_at > 0);
                 assert_eq!(
                     confirmed_lease.owner_component_type.as_deref(),
-                    Some("agent-worker")
+                    Some("philote-worker")
                 );
             }
             other => panic!("unexpected spawn_subagent response: {other:?}"),
@@ -5294,7 +5294,7 @@ mod tests {
         let graph: Arc<dyn GraphStorage> = Arc::new(TestGraphStorage);
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         );
@@ -5326,7 +5326,7 @@ mod tests {
         let large_audio = "A".repeat(256 * 1024);
         sender
             .send_request(IpcRequest::EmitTask {
-                target_node: "local-ansible-01".into(),
+                target_node: "local-aiua-01".into(),
                 target_role: "membrane".into(),
                 target_guest_id: Some("membrane-telegram-01".into()),
                 task_json: serde_json::json!({
@@ -5385,7 +5385,7 @@ mod tests {
         let graph: Arc<dyn GraphStorage> = Arc::new(TestGraphStorage);
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         );
@@ -5487,7 +5487,7 @@ mod tests {
         );
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         )
@@ -5556,7 +5556,7 @@ mod tests {
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph.clone(),
         );
@@ -5630,7 +5630,7 @@ mod tests {
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         );
@@ -5655,7 +5655,7 @@ mod tests {
 
         membrane
             .send_request(IpcRequest::EmitTask {
-                target_node: "local-ansible-01".into(),
+                target_node: "local-aiua-01".into(),
                 target_role: "agent".into(),
                 target_guest_id: None,
                 task_json: serde_json::json!({
@@ -5707,7 +5707,7 @@ mod tests {
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         );
@@ -5834,7 +5834,7 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite");
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
-        let server = IpcServer::new(socket_path.clone(), "local-ansible-01", dispatcher_tx, graph);
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         // Seed profile with known allowed_tools and allowed_skills.
         graph_store
@@ -5948,7 +5948,7 @@ mod tests {
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         );
@@ -6029,7 +6029,7 @@ mod tests {
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         );
@@ -6168,7 +6168,7 @@ mod tests {
         );
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         )
@@ -6266,7 +6266,7 @@ mod tests {
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         );
@@ -6388,7 +6388,7 @@ mod tests {
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         );
@@ -6421,9 +6421,9 @@ mod tests {
                             {
                                 "incarnation_id": "tool-runner-local",
                                 "runner_id": "tool-runner-local",
-                                "hotel_id": "local-ansible-01",
+                                "hotel_id": "local-aiua-01",
                                 "environment_id": "env://local",
-                                "target_node": "local-ansible-01",
+                                "target_node": "local-aiua-01",
                                 "target_role": "tool.echo",
                                 "supported_tools": ["echo"],
                                 "execution_mode": "capability",
@@ -6538,7 +6538,7 @@ mod tests {
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         );
@@ -6561,9 +6561,9 @@ mod tests {
                             {
                                 "incarnation_id": "tool-runner-local",
                                 "runner_id": "tool-runner-local",
-                                "hotel_id": "local-ansible-01",
+                                "hotel_id": "local-aiua-01",
                                 "environment_id": "env://local",
-                                "target_node": "local-ansible-01",
+                                "target_node": "local-aiua-01",
                                 "target_role": "tool.echo",
                                 "supported_tools": ["echo"],
                                 "execution_mode": "capability",
@@ -6716,7 +6716,7 @@ mod tests {
         );
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         )
@@ -6809,7 +6809,7 @@ mod tests {
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         );
@@ -6859,7 +6859,7 @@ mod tests {
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         );
@@ -6961,7 +6961,7 @@ mod tests {
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         );
@@ -7020,7 +7020,7 @@ mod tests {
                         "task_id": Uuid::nil().to_string(),
                         "chat_id": "chat-sess-1",
                         "user_content": "hello from sess-1",
-                        "final_reply_to": "local-ansible-01",
+                        "final_reply_to": "local-aiua-01",
                         "final_reply_role": "membrane"
                     },
                     "recent_turns": [{
@@ -7113,7 +7113,7 @@ mod tests {
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         );
@@ -7192,7 +7192,7 @@ mod tests {
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         );
@@ -7270,7 +7270,7 @@ mod tests {
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         );
@@ -7362,7 +7362,7 @@ mod tests {
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         );
@@ -7403,7 +7403,7 @@ mod tests {
 
         membrane
             .send_request(IpcRequest::EmitTask {
-                target_node: "local-ansible-01".into(),
+                target_node: "local-aiua-01".into(),
                 target_role: "agent".into(),
                 target_guest_id: None,
                 task_json: serde_json::json!({
@@ -7412,7 +7412,7 @@ mod tests {
                     "turn_id": turn_id,
                     "chat_id": "123",
                     "content": "hello from telegram",
-                    "final_reply_to": "local-ansible-01",
+                    "final_reply_to": "local-aiua-01",
                     "final_reply_role": "membrane"
                 })
                 .to_string(),
@@ -7454,7 +7454,7 @@ mod tests {
             .expect("update task");
         agent
             .send_request(IpcRequest::EmitTask {
-                target_node: "local-ansible-01".into(),
+                target_node: "local-aiua-01".into(),
                 target_role: "model".into(),
                 target_guest_id: None,
                 task_json: serde_json::json!({
@@ -7463,9 +7463,9 @@ mod tests {
                     "turn_id": turn_id,
                     "prompt": "hello from telegram",
                     "chat_id": "123",
-                    "reply_to": "local-ansible-01",
+                    "reply_to": "local-aiua-01",
                     "reply_role": "agent",
-                    "final_reply_to": "local-ansible-01",
+                    "final_reply_to": "local-aiua-01",
                     "final_reply_role": "membrane"
                 })
                 .to_string(),
@@ -7490,7 +7490,7 @@ mod tests {
 
         model
             .send_request(IpcRequest::EmitTask {
-                target_node: "local-ansible-01".into(),
+                target_node: "local-aiua-01".into(),
                 target_role: "agent".into(),
                 target_guest_id: None,
                 task_json: serde_json::json!({
@@ -7499,7 +7499,7 @@ mod tests {
                     "turn_id": turn_id,
                     "chat_id": "123",
                     "content": "hi back",
-                    "final_reply_to": "local-ansible-01",
+                    "final_reply_to": "local-aiua-01",
                     "final_reply_role": "membrane"
                 })
                 .to_string(),
@@ -7537,7 +7537,7 @@ mod tests {
             .expect("complete task");
         agent
             .send_request(IpcRequest::EmitTask {
-                target_node: "local-ansible-01".into(),
+                target_node: "local-aiua-01".into(),
                 target_role: "membrane".into(),
                 target_guest_id: None,
                 task_json: serde_json::json!({
@@ -7617,7 +7617,7 @@ mod tests {
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         );
@@ -7658,7 +7658,7 @@ mod tests {
 
         membrane
             .send_request(IpcRequest::EmitTask {
-                target_node: "local-ansible-01".into(),
+                target_node: "local-aiua-01".into(),
                 target_role: "agent".into(),
                 target_guest_id: None,
                 task_json: serde_json::json!({
@@ -7667,7 +7667,7 @@ mod tests {
                     "turn_id": turn_id,
                     "chat_id": "456",
                     "content": "use echo hello structured tool",
-                    "final_reply_to": "local-ansible-01",
+                    "final_reply_to": "local-aiua-01",
                     "final_reply_role": "membrane"
                 })
                 .to_string(),
@@ -7709,7 +7709,7 @@ mod tests {
             .expect("update task");
         agent
             .send_request(IpcRequest::EmitTask {
-                target_node: "local-ansible-01".into(),
+                target_node: "local-aiua-01".into(),
                 target_role: "model".into(),
                 target_guest_id: None,
                 task_json: serde_json::json!({
@@ -7719,9 +7719,9 @@ mod tests {
                     "prompt": "use echo hello structured tool",
                     "user_content": "use echo hello structured tool",
                     "chat_id": "456",
-                    "reply_to": "local-ansible-01",
+                    "reply_to": "local-aiua-01",
                     "reply_role": "agent",
-                    "final_reply_to": "local-ansible-01",
+                    "final_reply_to": "local-aiua-01",
                     "final_reply_role": "membrane"
                 })
                 .to_string(),
@@ -7746,7 +7746,7 @@ mod tests {
 
         model
             .send_request(IpcRequest::EmitTask {
-                target_node: "local-ansible-01".into(),
+                target_node: "local-aiua-01".into(),
                 target_role: "agent".into(),
                 target_guest_id: None,
                 task_json: serde_json::json!({
@@ -7762,7 +7762,7 @@ mod tests {
                     "turn_id": turn_id,
                     "chat_id": "456",
                     "content": "tool_call: echo hello structured tool",
-                    "final_reply_to": "local-ansible-01",
+                    "final_reply_to": "local-aiua-01",
                     "final_reply_role": "membrane"
                 })
                 .to_string(),
@@ -7800,7 +7800,7 @@ mod tests {
             .expect("complete task");
         agent
             .send_request(IpcRequest::EmitTask {
-                target_node: "local-ansible-01".into(),
+                target_node: "local-aiua-01".into(),
                 target_role: "membrane".into(),
                 target_guest_id: None,
                 task_json: serde_json::json!({
@@ -7891,7 +7891,7 @@ mod tests {
             .upsert_hotel(&HotelRecord {
                 hotel_name: "local-hotel".into(),
                 capabilities: NodeCapabilities {
-                    node_id: "local-ansible-01".into(),
+                    node_id: "local-aiua-01".into(),
                     roles: vec![],
                     models: vec![],
                     tools: vec![],
@@ -7915,7 +7915,7 @@ mod tests {
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         );
@@ -8012,7 +8012,7 @@ mod tests {
             .upsert_hotel(&HotelRecord {
                 hotel_name: "local-hotel".into(),
                 capabilities: NodeCapabilities {
-                    node_id: "local-ansible-01".into(),
+                    node_id: "local-aiua-01".into(),
                     roles: vec![],
                     models: vec![],
                     tools: vec![],
@@ -8036,7 +8036,7 @@ mod tests {
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         );
@@ -8098,7 +8098,7 @@ mod tests {
             .upsert_hotel(&HotelRecord {
                 hotel_name: "local-hotel".into(),
                 capabilities: NodeCapabilities {
-                    node_id: "local-ansible-01".into(),
+                    node_id: "local-aiua-01".into(),
                     roles: vec![],
                     models: vec![],
                     tools: vec![],
@@ -8124,7 +8124,7 @@ mod tests {
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         );
@@ -8180,7 +8180,7 @@ mod tests {
             .upsert_hotel(&HotelRecord {
                 hotel_name: "local-hotel".into(),
                 capabilities: NodeCapabilities {
-                    node_id: "local-ansible-01".into(),
+                    node_id: "local-aiua-01".into(),
                     roles: vec![],
                     models: vec![],
                     tools: vec![],
@@ -8204,7 +8204,7 @@ mod tests {
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         );
@@ -8272,7 +8272,7 @@ mod tests {
             .upsert_hotel(&HotelRecord {
                 hotel_name: "local-hotel".into(),
                 capabilities: NodeCapabilities {
-                    node_id: "local-ansible-01".into(),
+                    node_id: "local-aiua-01".into(),
                     roles: vec![],
                     models: vec![],
                     tools: vec![],
@@ -8296,7 +8296,7 @@ mod tests {
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         );
@@ -8371,7 +8371,7 @@ mod tests {
             .upsert_hotel(&HotelRecord {
                 hotel_name: "local-hotel".into(),
                 capabilities: NodeCapabilities {
-                    node_id: "local-ansible-01".into(),
+                    node_id: "local-aiua-01".into(),
                     roles: vec![],
                     models: vec![],
                     tools: vec![],
@@ -8395,7 +8395,7 @@ mod tests {
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         );
@@ -8476,7 +8476,7 @@ mod tests {
             .upsert_hotel(&HotelRecord {
                 hotel_name: "local-hotel".into(),
                 capabilities: NodeCapabilities {
-                    node_id: "local-ansible-01".into(),
+                    node_id: "local-aiua-01".into(),
                     roles: vec![],
                     models: vec![],
                     tools: vec![],
@@ -8514,7 +8514,7 @@ mod tests {
         let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         );
@@ -8578,7 +8578,7 @@ mod tests {
         let graph: Arc<dyn ansible_mesh_core::storage::GraphStorage> = Arc::new(TestGraphStorage);
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         );
@@ -8639,7 +8639,7 @@ mod tests {
         let graph: Arc<dyn ansible_mesh_core::storage::GraphStorage> = Arc::new(TestGraphStorage);
         let server = IpcServer::new(
             socket_path.clone(),
-            "local-ansible-01",
+            "local-aiua-01",
             dispatcher_tx,
             graph,
         );

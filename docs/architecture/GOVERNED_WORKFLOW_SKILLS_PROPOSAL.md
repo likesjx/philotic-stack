@@ -210,7 +210,7 @@ The exact field split can evolve, but the framework should carry more than promp
 
 ## OpenClaw Lessons To Reuse Carefully
 
-The OpenClaw `ansible` plugin had a useful `delegate` / `execute` split and a skill-pair manifest model.
+The OpenClaw `aiua` plugin had a useful `delegate` / `execute` split and a skill-pair manifest model.
 
 Useful ideas to carry forward:
 

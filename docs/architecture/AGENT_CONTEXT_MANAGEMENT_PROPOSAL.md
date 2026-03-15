@@ -256,16 +256,16 @@ It is the first proof that live agent configuration can flow through the hotel i
 
 Recommended ownership for the first live slice:
 
-1. `agent-core` or another caller requests a bounded update
-2. `ansible` validates:
+1. `philote` or another caller requests a bounded update
+2. `aiua` validates:
    - caller identity
    - self-only scope
    - field allowlist
    - value type/shape
-3. `ansible` loads current `AgentIdentityRecord`
-4. `ansible` applies the patch into `bundle_json`
-5. `ansible` persists via `upsert_agent_identity`
-6. `ansible` returns the refreshed canonical projection
+3. `aiua` loads current `AgentIdentityRecord`
+4. `aiua` applies the patch into `bundle_json`
+5. `aiua` persists via `upsert_agent_identity`
+6. `aiua` returns the refreshed canonical projection
 7. caller refreshes local runtime state from that canonical result
 
 That keeps the hotel as write authority and prevents local runtime convenience APIs from quietly becoming a shadow database.

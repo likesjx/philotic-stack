@@ -37,8 +37,8 @@ Port the useful parts of ZeroClaw's session + tool-call loop into Philotic witho
 
 The key architectural decision is:
 
-- `ansible` owns generalized session state, routing, leases, participants, and event history.
-- `agent-core` owns cognition inside a session: prompt assembly, model invocation, tool planning, tool execution coordination, compaction, and final reply synthesis.
+- `aiua` owns generalized session state, routing, leases, participants, and event history.
+- `philote` owns cognition inside a session: prompt assembly, model invocation, tool planning, tool execution coordination, compaction, and final reply synthesis.
 - `membrane` and other edge guests own transport-specific bindings (`telegram chat -> philotic session`) and delivery UX, not reasoning.
 - `SyncApartment` remains the agent's checkpoint path back to the Context Graph, but it should be treated as snapshot sync, not as a fine-grained event stream.
 
@@ -154,10 +154,10 @@ ZeroClaw's loop is a good *turn engine*. It is a bad fit as Philotic's *system b
 
 Today Philotic already has some of the right primitives:
 
-- Guests register over UDS and subscribe by role in [ipc.rs](/Users/jaredlikes/code/philotic-stack/crates/ansible/src/service/ipc.rs).
+- Guests register over UDS and subscribe by role in [ipc.rs](/Users/jaredlikes/code/philotic-stack/crates/aiua/src/service/ipc.rs).
 - The graph persists guest materialization metadata and memory apartments in [sqlite_storage.rs](/Users/jaredlikes/code/philotic-stack/crates/ansible-mesh-core/src/sqlite_storage.rs).
-- `membrane`, `agent-core`, and `model-router` already exchange routed tasks over IPC.
-- `agent-core` is still a stub and has no first-class session lifecycle.
+- `membrane`, `philote`, and `model-router` already exchange routed tasks over IPC.
+- `philote` is still a stub and has no first-class session lifecycle.
 
 The main missing concept is a durable `session` object that survives guest restarts and can drive turn replay, resumption, multi-channel continuity, and cross-component coordination.
 
@@ -170,7 +170,7 @@ This is not just a chat transcript container.
 A Philotic session should be a durable coordination envelope that any guest can participate in:
 
 - `membrane` can bind an external user/channel to it
-- `agent-core` can own the cognitive state within it
+- `philote` can own the cognitive state within it
 - `model-router` can contribute inference work to it
 - approval or streaming guests can observe or extend it
 - WebRTC or long-running workflow guests can attach to it later
@@ -223,7 +223,7 @@ The split should be:
 
 - generalized session state in the hotel
   - identifiers, bindings, lifecycle, leases, participants, event/timeline metadata
-- cognitive conversation state in `agent-core`
+- cognitive conversation state in `philote`
   - working history, intermediate tool loop state, compaction logic, prompt assembly
 - durable memory checkpoints in the Context Graph
   - written back via `SyncApartment`
@@ -234,7 +234,7 @@ Session state should have exactly one canonical home:
 
 - canonical session state lives in the hotel/context graph
 - apartment checkpoints are derived recovery projections for agent hot-path restore
-- `agent-core` may cache and project session state locally, but it should not become a second authority
+- `philote` may cache and project session state locally, but it should not become a second authority
 
 This avoids split-brain session ownership while still preserving fast local recovery.
 
@@ -244,7 +244,7 @@ This avoids split-brain session ownership while still preserving fast local reco
 
 That means:
 
-- `agent-core` can keep rich local working state during a turn
+- `philote` can keep rich local working state during a turn
 - it periodically writes a compacted or structured snapshot home
 - the hotel does not need every token of transient thinking to be persisted through `SyncApartment`
 
@@ -374,7 +374,7 @@ That keeps channel guests stateless apart from transport cursors.
 
 ### 1. Intake
 
-`membrane` receives a user message and asks `ansible` to:
+`membrane` receives a user message and asks `aiua` to:
 
 - resolve or create session
 - append an inbound event / queued turn
@@ -382,7 +382,7 @@ That keeps channel guests stateless apart from transport cursors.
 
 ### 2. Lease
 
-Before processing a turn, `agent-core` acquires a session lease from `ansible`.
+Before processing a turn, `philote` acquires a session lease from `aiua`.
 
 Rules:
 
@@ -394,7 +394,7 @@ This prevents duplicate replies when guests restart or supervisors respawn.
 
 ### 3. Context Load
 
-`agent-core` asks the hotel for a `SessionSnapshot`:
+`philote` asks the hotel for a `SessionSnapshot`:
 
 - system/persona prompt inputs
 - session summary
@@ -408,7 +408,7 @@ This replaces ZeroClaw's purely agent-local `history` vector with a rebuildable 
 
 ### 4. Run the cognitive loop
 
-Inside `agent-core`, keep a loop very close to legacy ZeroClaw:
+Inside `philote`, keep a loop very close to legacy ZeroClaw:
 
 1. Build provider messages from the snapshot plus current working turn history.
 2. Invoke model.
@@ -424,7 +424,7 @@ The difference is that each state transition is visible through session events, 
 
 ### 5. Checkpoint after each step
 
-After each model/tool phase, `agent-core` emits turn/session progress:
+After each model/tool phase, `philote` emits turn/session progress:
 
 - current loop iteration
 - tool calls requested
@@ -444,7 +444,7 @@ Checkpointing cadence should be coarse enough to stay cheap, but frequent enough
 
 ### 6. Finalize
 
-When the loop completes, `ansible`:
+When the loop completes, `aiua`:
 
 - marks the turn completed
 - updates session summary / recent transcript cache
@@ -468,9 +468,9 @@ Recommended approach:
 
 This preserves a general communication plane while still making session a first-class concept in storage and routing.
 
-## Recommended `agent-core` Internal Structure
+## Recommended `philote` Internal Structure
 
-Implement `agent-core` as a small runtime with explicit loop stages.
+Implement `philote` as a small runtime with explicit loop stages.
 
 ### Core structs
 
@@ -498,7 +498,7 @@ Implement `agent-core` as a small runtime with explicit loop stages.
 
 ### Important boundary
 
-Do not let `agent-core` become responsible for:
+Do not let `philote` become responsible for:
 
 - owning SQLite directly
 - talking to Telegram/Discord directly
@@ -546,11 +546,11 @@ Why:
 
 Design:
 
-- `agent-core` detects approval-required tools before execution
-- `ansible` records `waiting_approval` on the turn
+- `philote` detects approval-required tools before execution
+- `aiua` records `waiting_approval` on the turn
 - `membrane` or another UX guest delivers the approval request
 - approval response is written back through hotel IPC
-- `agent-core` resumes from checkpoint
+- `philote` resumes from checkpoint
 
 This preserves ZeroClaw's useful approval semantics while fitting Philotic's multi-guest reality.
 
@@ -605,7 +605,7 @@ Deliverables:
 
 Scope:
 
-- ZeroClaw-style bounded turn loop in `agent-core`
+- ZeroClaw-style bounded turn loop in `philote`
 - context assembly from session snapshot + apartments
 - tool-call execution and approval-aware control flow
 - checkpoint policy for `SyncApartment`
@@ -618,7 +618,7 @@ Non-goals:
 
 Deliverables:
 
-- `agent-core` loop/runtime modules
+- `philote` loop/runtime modules
 - local working session state
 - apartment checkpoint writes
 - tests for loop progression, compaction, and recovery from snapshot
@@ -633,7 +633,7 @@ Deliverables:
 
 ### Phase 2: Single-turn durable loop
 
-- Refactor `agent-core` into `SessionSnapshot -> WorkingTurn -> TurnOutcome`
+- Refactor `philote` into `SessionSnapshot -> WorkingTurn -> TurnOutcome`
 - Implement bounded tool-call loop with session events plus apartment checkpoints
 - Persist final answer and recent transcript
 
@@ -659,7 +659,7 @@ Build only:
 - deterministic channel-to-session mapping
 - durable turn records
 - lease acquisition
-- legacy-style bounded tool loop in `agent-core`
+- legacy-style bounded tool loop in `philote`
 - final response delivery back through `membrane`
 
 Defer for later:
@@ -674,8 +674,8 @@ Defer for later:
 
 The cleanest Philotic implementation is:
 
-- `ansible` becomes the source of truth for generalized session and turn lifecycle
-- `agent-core` ports the ZeroClaw cognitive loop as a resumable worker inside that session
+- `aiua` becomes the source of truth for generalized session and turn lifecycle
+- `philote` ports the ZeroClaw cognitive loop as a resumable worker inside that session
 - `membrane` becomes a transport adapter that binds users to sessions and renders replies/approvals
 - memory apartments remain the agent checkpoint path back to the graph
 - `SyncApartment` stays snapshot-oriented while smaller session events carry deltas/progress
@@ -687,4 +687,4 @@ If we follow that split, we get:
 - a general session envelope usable by more than just chat agents
 - a path to multi-channel and multi-node sessions later
 
-If we do not follow that split, we will accidentally rebuild a monolith inside `agent-core`, only this time with more IPC and less honesty.
+If we do not follow that split, we will accidentally rebuild a monolith inside `philote`, only this time with more IPC and less honesty.

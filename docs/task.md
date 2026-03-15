@@ -52,7 +52,7 @@ Seam IDs: `session-leases`
 
 Seam IDs: `session-compaction`
 
-- [ ] Implement the bounded ZeroClaw-style loop in `agent-core`.
+- [ ] Implement the bounded ZeroClaw-style loop in `philote`.
 - [ ] Build context from session snapshot plus memory apartments.
 - [ ] Execute tools with approval-aware flow control.
 - [x] Keep local working turn state in the agent during execution.
@@ -73,7 +73,7 @@ Seam IDs: `session-compaction`
 
 - [x] Review [AGENT_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/AGENT_LOOP_PROPOSAL.md).
 - [x] Build real tool catalog with proper descriptions and schemas (Gap 3 — prerequisite for Gap 4).
-  - [x] Add `class: Option<String>` field to `ToolDefinition` in `agent-core`.
+  - [x] Add `class: Option<String>` field to `ToolDefinition` in `philote`.
   - [x] Create static `tool_catalog()` in `agent-core/src/catalog.rs` with real descriptions and schemas for `session.status`, `echo`, `workspace.list`, `workspace.read`.
   - [x] Add `AbstractToolRecord` to `ansible-mesh-core/src/graph.rs` as the context graph entity.
   - [x] Add `upsert_abstract_tool` / `get_abstract_tool` / `list_abstract_tools` to `GraphStorage` trait and `SqliteGraphStorage` impl.
@@ -185,10 +185,10 @@ Seam IDs: `role-incarnation-records`, `active-membrane-routing`, `handoff-skill`
 ### Workers / Subagents
 - [x] Implement `SpawnSubagent` execution and async result routing back to parent incarnation (Block D — lease + hook registries; `SpawnSubagentOk`/`SpawnSubagentProposal` responses).
 - [x] Thread the first compatibility-first `SpawnSubagent` request boundary through shared IPC with explicit structured `SUBAGENT_NOT_IMPLEMENTED` hotel rejection.
-- [x] Split `agent-core` into lib + `agent-core` (persona) + `agent-worker` (subagent worker) binaries; define `AgentDriver` trait (Block E).
+- [x] Split `philote` into lib + `philote` (persona) + `philote-worker` (subagent worker) binaries; define `AgentDriver` trait (Block E).
 - [x] Add `skill.register` IPC handler in hotel (`RegisterSkill` → Layer 1 validate → `AbstractSkillRecord` persist → `SkillRegistered` response) (Block F).
 - [x] Add `skill.register` and `subagent.spawn` tools to abstract tool catalog + `is_local_agent_tool()` + `execute_local_agent_tool()` IPC dispatch (Block F).
-- [x] Fix subagent spawn path: add `PHILOTIC_AGENT_ID` to worker env in `config_json`; add `set_guest_active` to `GraphStorage`; deactivate guest on `ReleaseSubagent` to stop supervisor respawn loop. (`PHILOTIC_AGENT_MODE=subagent` superseded by the `agent-worker` binary split in Block E.)
+- [x] Fix subagent spawn path: add `PHILOTIC_AGENT_ID` to worker env in `config_json`; add `set_guest_active` to `GraphStorage`; deactivate guest on `ReleaseSubagent` to stop supervisor respawn loop. (`PHILOTIC_AGENT_MODE=subagent` superseded by the `philote-worker` binary split in Block E.)
 - [x] Add `/abandon` slash command; fires `FireSubagentHook(TurnCompleted, completed=false)` when `PHILOTIC_PARENT_GUEST_ID` is set; handles all 4 match sites in runtime.rs.
 - [x] Define the first compatibility-first `SubagentDelegation` contract and parent-side builder:
   - parent role
@@ -225,7 +225,7 @@ Seam IDs: `role-incarnation-records`, `active-membrane-routing`, `handoff-skill`
 ## New Project: Agent Context Management
 
 - [x] Pin the need for a dedicated management plane for agent-owned and operator-owned context graph mutations instead of continuing to rely on `mesh-config.json` edits plus restart cycles.
-- [x] Accept the first implementation target as a hotel-mediated self-update path that writes canonical `AgentIdentityRecord` state rather than only mutating `agent-core` session-local profile data.
+- [x] Accept the first implementation target as a hotel-mediated self-update path that writes canonical `AgentIdentityRecord` state rather than only mutating `philote` session-local profile data.
 - [ ] Define the first request/response contract for `agent.context.update`, including:
   - self-only scope
   - path/update semantics
@@ -289,7 +289,7 @@ Seam IDs: `context-engine-contract`, `deterministic-context-assembly`, `memory-e
   - `ContextProjection`
   - `LayerPayload`
 - [x] Prove one current context path and one current memory path behind those abstractions.
-- [x] Thread the first structured `ContextProjection` path from `agent-core` into outbound model requests and through `model-router` prompt composition.
+- [x] Thread the first structured `ContextProjection` path from `philote` into outbound model requests and through `model-router` prompt composition.
 - [x] Carry session `active_incarnation_id` through the canonical snapshot, context projection, and model-router prompt composition so agent identity and active role posture stop being silently conflated.
 - [ ] Review [MEMORY_RELATION_LIFECYCLE_WHITEPAPER.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMORY_RELATION_LIFECYCLE_WHITEPAPER.md).
 - [ ] Define the first memory-formation contract:
@@ -386,7 +386,7 @@ Seam IDs: `local-admin-capability-envelope`, `onnx-admin-fallback-path`
 
 - [x] Review [AGENT_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/AGENT_LOOP_PROPOSAL.md).
 - [x] Build real tool catalog with proper descriptions and schemas (Gap 3 — prerequisite for Gap 4).
-  - [x] Add `class: Option<String>` field to `ToolDefinition` in `agent-core`.
+  - [x] Add `class: Option<String>` field to `ToolDefinition` in `philote`.
   - [x] Create static `tool_catalog()` in `agent-core/src/catalog.rs` with real descriptions and schemas for `session.status`, `echo`, `workspace.list`, `workspace.read`.
   - [x] Add `AbstractToolRecord` to `ansible-mesh-core/src/graph.rs` as the context graph entity.
   - [x] Add `upsert_abstract_tool` / `get_abstract_tool` / `list_abstract_tools` to `GraphStorage` trait and `SqliteGraphStorage` impl.
@@ -480,7 +480,7 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 
 Seam IDs: `secret-handling-hardening`, `watched-live-vps-smoke`, `artifact-distribution-rollout`
 
-- [x] Pin the architecture boundary between Red Hat Ansible as the outer deployment orchestrator and Philotic `ansible` as the inner hotel runtime authority.
+- [x] Pin the architecture boundary between Red Hat Ansible as the outer deployment orchestrator and Philotic `aiua` as the inner hotel runtime authority.
 - [x] Define the first Linux/VPS deployment contract:
   - host prerequisites
   - filesystem layout
@@ -596,7 +596,7 @@ Seam IDs: `structured-model-envelope`, `hotel-gemini-oauth-flow`
 - [ ] Review [MODEL_CONTROLLER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MODEL_CONTROLLER_PROPOSAL.md).
 - [x] Land the first `voice.synthesize` request envelope with `display_text`, `spoken_text`, `voice`, `model`, and `provider_options`.
 - [x] Add an upstream producer example that emits the richer `voice.synthesize` envelope through the hotel.
-- [x] Move the first task failure contract into the shared protocol layer (`philotic-client`) so `model-router` and `agent-core` can exchange structured errors without making `agent-core` the accidental owner of reality.
+- [x] Move the first task failure contract into the shared protocol layer (`philotic-client`) so `model-router` and `philote` can exchange structured errors without making `philote` the accidental owner of reality.
 - [ ] Emit structured task failures consistently from all model-controller capability paths and log provider/code/component fields during watched runs.
 - [ ] Define the canonical capability envelope for:
   - `text.generate`
@@ -673,8 +673,8 @@ Seam IDs: `structured-model-envelope`, `hotel-gemini-oauth-flow`
 - [x] Make the startup Telegram smoke honestly green end-to-end by fixing `PhiloticClient` frame reads to survive `tokio::select!` cancellation during the final voice reply handoff to `membrane`.
 - [x] Prove watched-live Telegram text/photo/voice/document delivery through membrane -> agent-core -> Gemini and normalize markdown-ish document MIME for Gemini media analysis.
 - [x] Make materialized Telegram/agent guests configurable enough for separate hotel/persona stacks (for example Jane vs Aria) instead of hardcoding one Jane-shaped membrane.
-- [x] Remove Jane/Aria-specific built-in hotel/agent profile selection from `ansible` startup so agent identity, persona naming, and guest targeting resolve from hotel config or generic hotel-derived fallback rather than persona-specific Rust tables.
-- [x] Make hotel-local node identity explicit across startup/runtime smokes and materialized guests so Jane and Aria can both pass local `/ping` and startup text round-trips without hidden `local-ansible-01` assumptions or legacy `model` role registration.
+- [x] Remove Jane/Aria-specific built-in hotel/agent profile selection from `aiua` startup so agent identity, persona naming, and guest targeting resolve from hotel config or generic hotel-derived fallback rather than persona-specific Rust tables.
+- [x] Make hotel-local node identity explicit across startup/runtime smokes and materialized guests so Jane and Aria can both pass local `/ping` and startup text round-trips without hidden `local-aiua-01` assumptions or legacy `model` role registration.
 - [x] Make inter-hotel mesh dispatch node-aware by carrying `target_node_id`, discovering peer hotels from the Context Graph, and returning real mesh ACK packets for local multi-hotel development.
 - [x] Prove a first local two-hotel remote model smoke over the new TCP execution plane after remote model placement resolves through the live registry.
 - [ ] Seed `hotels.aria-architect-hotel.agents.aria.telegram.bot_token` in local `mesh-config.json` and run the first watched-live Aria hotel Telegram poller on its own bot token.
@@ -848,10 +848,10 @@ Seam IDs: `runtime-authority-leases`
   - discovered hotel environments
   - agent default toolsets
   - session narrowing/hiding rules
-- [x] Move real tool execution out of `agent-core` and behind routed tool runners/toolset components.
+- [x] Move real tool execution out of `philote` and behind routed tool runners/toolset components.
 - [ ] Add runner readiness/materialization checks during tool assembly.
 - [ ] Add environment-aware runner routing and materialization policy so tools can target non-IPC execution environments when needed.
-- [x] Keep local config/session mutation commands in `agent-core`, but externalize real tool execution.
+- [x] Keep local config/session mutation commands in `philote`, but externalize real tool execution.
 - [x] Let session-scoped allowed runner incarnations derive visible tools and preassembled execution routes.
 - [x] Add execution taxonomy for routed tools:
   - `local_agent`
@@ -874,7 +874,7 @@ Seam IDs: `runtime-authority-leases`
 - [ ] Review [PERSONALITY_AND_CONTEXT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PERSONALITY_AND_CONTEXT_PROPOSAL.md).
 - [ ] Review [ZEROCLAW_TO_PHILOTIC_BRIDGE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ZEROCLAW_TO_PHILOTIC_BRIDGE_PROPOSAL.md).
 - [ ] Review [HEURISTIC_MIND_AND_CONTEXT_PAPER.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/HEURISTIC_MIND_AND_CONTEXT_PAPER.md).
-- [x] Refactor `agent-core` prompt assembly into turn-time projection functions:
+- [x] Refactor `philote` prompt assembly into turn-time projection functions:
   - `project_agent_self`
   - `project_user`
   - `project_knowledge`
@@ -990,7 +990,7 @@ Seam IDs: `wider-client-adoption`, `philotic-native-memory-integration`
 - [ ] Telegram streaming: add message length chunking to `membrane` — split at paragraph boundaries before `sendMessage`, shared `send_formatted_text` helper.
 - [x] Telegram streaming Layer 2 protocol: add `TurnEventPayload` to `agent-core/src/protocol.rs` and `emit_turn_event` helper to `AgentRuntime`; emit `waiting_tool`, `waiting_approval` events back to membrane via the existing `EmitTask` path.
 - [x] Telegram streaming Layer 2 membrane: handle `action = "turn_event"` in `InboundTask` dispatch — maintain or cancel typing heartbeat per event type; stop typing on `waiting_approval`.
-- [ ] Telegram streaming partial reply: add `action = "partial_reply"` signal from `agent-core` once model-router supports chunked output; implement edit-based progressive delivery in `membrane`.
+- [ ] Telegram streaming partial reply: add `action = "partial_reply"` signal from `philote` once model-router supports chunked output; implement edit-based progressive delivery in `membrane`.
 - [ ] Voice machine design: define STT, TTS, speech-to-speech, transcript generation, and media artifact/session handling.
 - [ ] Nostr communication-plane investigation (`nostr-membrane-contract`): evaluate Nostr as a decentralized/event-native membrane with relay trust classes, addressed-event gating, signature verification, replay defense, and perimeter/sentinel integration before any implementation.
 - [ ] A2A membrane investigation (`a2a-membrane-contract`): evaluate `A2A` as an external agent interoperability membrane with explicit peer trust records, bounded capability exposure, approval semantics for privileged actions, and no inheritance of internal mesh trust.
@@ -1076,7 +1076,7 @@ Now that the End-to-End Philotic architecture is complete, we need to separate i
 ### 1. Repository Separation
 
 - [x] Create a new repository for the Philotic architecture.
-- [x] Migrate the `ansible`, `membrane`, `agent-core`, `model-router`, `philotic-ipc`, and `ansible-mesh-core` crates to the new repository.
+- [x] Migrate the `aiua`, `membrane`, `philote`, `model-router`, `philotic-ipc`, and `ansible-mesh-core` crates to the new repository.
 - [x] Ensure the legacy ZeroClaw/OpenClaw code remains accessible in the original repository as a reference for migrating future capabilities (tools, MCPs).
 
 ### 2. Veo3 Metaphor Video

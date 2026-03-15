@@ -139,7 +139,7 @@ The first useful intent shape is:
 {
   "intent_type": "remote_materialization",
   "requesting_hotel": "hotel-a",
-  "component_kind": "agent-core",
+  "component_kind": "philote",
   "required_capability": "agent.session.orchestrator",
   "reason": "route-demand",
   "preferred_hotels": ["hotel-b", "hotel-c"],

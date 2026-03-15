@@ -167,7 +167,7 @@ async fn run_google_auth_validate(args: GoogleValidateArgs) -> Result<()> {
         );
     }
 
-    let graph = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open("ansible_context.db")?;
+    let graph = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open("aiua_context.db")?;
     let token = load_gemini_access_token(&graph)?;
     let project_id = graph
         .get_config_value("gemini_oauth_project_id")?
@@ -399,7 +399,7 @@ fn resolve_client_secret(args: &GoogleStartArgs) -> Option<String> {
 }
 
 fn persist_gemini_oauth_config(args: &GoogleStartArgs, token: &GoogleTokenResponse) -> Result<()> {
-    let graph = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open("ansible_context.db")?;
+    let graph = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open("aiua_context.db")?;
 
     let access_token_ref = store_secret(
         &graph,
@@ -457,7 +457,7 @@ fn persist_gemini_oauth_config(args: &GoogleStartArgs, token: &GoogleTokenRespon
                 SecretInput {
                     secret_kind: "gemini-refresh-token".into(),
                     scope: "hotel".into(),
-                    allowed_roles: vec!["ansible".into()],
+                    allowed_roles: vec!["aiua".into()],
                     allowed_guests: Vec::new(),
                     plaintext: refresh_token.to_string(),
                 },

@@ -1,7 +1,7 @@
 /// Shared driver interface for Philotic agent runtimes.
 ///
 /// Both the persona runtime ([`crate::runtime::AgentRuntime`]) and the subagent
-/// worker runtime (`WorkerRuntime` in `agent-worker`) share this contract:
+/// worker runtime (`WorkerRuntime` in `philote-worker`) share this contract:
 /// connect to the hotel IPC, then run the event loop until graceful shutdown
 /// or fatal error.
 ///
