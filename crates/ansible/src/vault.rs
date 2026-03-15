@@ -279,7 +279,7 @@ mod tests {
             SecretInput {
                 secret_kind: "gemini-access-token".into(),
                 scope: "hotel".into(),
-                allowed_roles: vec!["model.gemini".into()],
+                allowed_roles: vec!["model".into()],
                 allowed_guests: Vec::new(),
                 plaintext: "shh".into(),
             },
@@ -290,7 +290,7 @@ mod tests {
             &graph,
             &secret_ref,
             &SecretAccess {
-                role: "model.gemini".into(),
+                role: "model".into(),
                 guest_id: "guest-1".into(),
             },
         )

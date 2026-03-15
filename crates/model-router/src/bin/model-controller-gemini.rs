@@ -6,7 +6,7 @@ use model_router::runtime::{ControllerGuestConfig, run_model_controller};
 async fn main() -> Result<()> {
     run_model_controller(ControllerGuestConfig {
         guest_id: "model-controller-gemini-01",
-        role: "model.gemini",
+        role: "model",
         allow_inline_audio: false,
         providers: Box::new(|http_client, configs| {
             vec![std::sync::Arc::new(GeminiProvider::new(

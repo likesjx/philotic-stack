@@ -4,6 +4,9 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_DIR="$(mktemp -d)"
 HOTEL_NAME="model-smoke-$$"
+export PHILOTIC_NODE_ID="${HOTEL_NAME}-ansible-01"
+export PHILOTIC_TARGET_NODE="${HOTEL_NAME}-ansible-01"
+export PHILOTIC_FINAL_REPLY_TO="${HOTEL_NAME}-ansible-01"
 
 cleanup() {
   local exit_code=$?

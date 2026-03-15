@@ -591,7 +591,7 @@ fn guest_seed_for_profile(hotel_name: &str, profile: &AgentProfile) -> Vec<Guest
                 }
             })
             .to_string(),
-            role: "model.gemini".into(),
+            role: "model".into(),
             is_active: true,
             active_pid: None,
         },
@@ -898,7 +898,7 @@ fn deactivate_legacy_managed_guests(
                             | "hegemon"
                             | "membrane"
                             | "model"
-                            | "model.gemini"
+                            | "model"
                             | "model.elevenlabs"
                             | "tool"
                     ))
@@ -1116,7 +1116,7 @@ fn enable_guest_test_overrides(
     match test {
         StartupTest::TextRoundTrip => {
             for guest in &mut guests {
-                if guest.role != "model.gemini" {
+                if guest.role != "model" {
                     continue;
                 }
 
@@ -1141,7 +1141,7 @@ fn enable_guest_test_overrides(
             )?;
 
             for guest in &mut guests {
-                if guest.role != "model.gemini" {
+                if guest.role != "model" {
                     continue;
                 }
 
@@ -1166,14 +1166,14 @@ fn enable_guest_test_overrides(
                 SecretInput {
                     secret_kind: "gemini-startup-oauth-token".into(),
                     scope: "startup-test".into(),
-                    allowed_roles: vec!["model.gemini".into()],
+                    allowed_roles: vec!["model".into()],
                     allowed_guests: Vec::new(),
                     plaintext: "startup-test-oauth-bearer".into(),
                 },
             )?;
 
             for guest in &mut guests {
-                if guest.role != "model.gemini" {
+                if guest.role != "model" {
                     continue;
                 }
 
@@ -1244,7 +1244,7 @@ fn enable_guest_test_overrides(
                     .and_then(serde_json::Value::as_object_mut)
                     .context("guest config missing env object")?;
 
-                if guest.role == "model.gemini" {
+                if guest.role == "model" {
                     env.remove("PHILOTIC_MODEL_ROUTER_STUB_RESPONSE");
                     env.insert(
                         "PHILOTIC_GEMINI_BASE_URL".into(),
@@ -2054,7 +2054,7 @@ async fn run_startup_test(
             let response = client
                 .send_request(IpcRequest::EmitTask {
                     target_node: local_node_id.clone(),
-                    target_role: "model.gemini".into(),
+                    target_role: "model".into(),
                     target_guest_id: None,
                     task_json: serde_json::json!({
                         "kind": "text.generate",
@@ -3657,7 +3657,7 @@ mod tests {
             Some("/tmp/philotic-beta-hotel.sock")
         );
         assert!(guests.iter().all(|guest| guest.hotel_name == "beta-hotel"));
-        assert!(guests.iter().any(|guest| guest.role == "model.gemini"));
+        assert!(guests.iter().any(|guest| guest.role == "model"));
         assert!(guests.iter().any(|guest| guest.role == "model.elevenlabs"));
         assert!(guests.iter().any(|guest| guest.role == "tool"));
         assert_eq!(
@@ -3971,7 +3971,7 @@ mod tests {
             .expect("list guests");
         let model = stored
             .into_iter()
-            .find(|guest| guest.role == "model.gemini")
+            .find(|guest| guest.role == "model")
             .expect("model guest should exist");
         let config: serde_json::Value =
             serde_json::from_str(&model.config_json).expect("config should decode");
@@ -4002,7 +4002,7 @@ mod tests {
             .expect("list guests");
         let model = stored
             .into_iter()
-            .find(|guest| guest.role == "model.gemini")
+            .find(|guest| guest.role == "model")
             .expect("model guest should exist");
         let config: serde_json::Value =
             serde_json::from_str(&model.config_json).expect("config should decode");

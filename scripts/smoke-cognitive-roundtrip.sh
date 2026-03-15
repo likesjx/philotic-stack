@@ -4,6 +4,10 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_DIR="$(mktemp -d)"
 HOTEL_NAME="cognitive-smoke-$$"
+export PHILOTIC_AGENT_ID="agent-jane-01"
+export PHILOTIC_NODE_ID="${HOTEL_NAME}-ansible-01"
+export PHILOTIC_TARGET_NODE="${HOTEL_NAME}-ansible-01"
+export PHILOTIC_FINAL_REPLY_TO="${HOTEL_NAME}-ansible-01"
 LOG_FILE="${TMP_DIR}/ansible.log"
 
 cleanup() {

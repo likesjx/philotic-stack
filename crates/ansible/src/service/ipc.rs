@@ -3294,13 +3294,18 @@ fn component_implementation_to_role(implementation: &str) -> String {
         .split(['.', '-', '@', '/'])
         .find(|segment| !segment.is_empty())
         .unwrap_or("gemini");
-    format!("model.{prefix}")
+
+    if prefix == "elevenlabs" {
+        "model.elevenlabs".into()
+    } else {
+        "model".into()
+    }
 }
 
 fn default_component_role(capability: &str) -> &'static str {
     match capability {
         "voice.synthesize" => "model.elevenlabs",
-        _ => "model.gemini",
+        _ => "model",
     }
 }
 
@@ -5443,7 +5448,7 @@ mod tests {
                 hotel_id: "aria-architect-hotel".into(),
                 node_id: "aria-node".into(),
                 incarnation_id: "aria-architect-hotel:model-controller-gemini".into(),
-                target_role: "model.gemini".into(),
+                target_role: "model".into(),
                 availability_state: "live".into(),
                 selection_hint: Some("remote_fallback".into()),
                 latency_hint_ms: Some(12),
@@ -5503,7 +5508,7 @@ mod tests {
                 );
                 assert_eq!(
                     snapshot["nodes"][0]["advertisements"][0]["target_role"],
-                    "model.gemini"
+                    "model"
                 );
             }
             other => panic!("unexpected response: {other:?}"),
@@ -6012,7 +6017,7 @@ mod tests {
                 hotel_id: "aria-architect-hotel".into(),
                 node_id: "aria-node".into(),
                 incarnation_id: "aria-architect-hotel:model-controller-gemini".into(),
-                target_role: "model.gemini".into(),
+                target_role: "model".into(),
                 availability_state: "live".into(),
                 selection_hint: Some("remote_latency_capacity".into()),
                 latency_hint_ms: Some(8),
@@ -6093,7 +6098,7 @@ mod tests {
                 );
                 assert_eq!(
                     snapshot["component_route_assembly"]["execution_routes"]["text.generate"]["target_role"],
-                    "model.gemini"
+                    "model"
                 );
                 assert_eq!(
                     snapshot["component_route_assembly"]["execution_routes"]["text.generate"]["incarnation_id"],
@@ -7252,7 +7257,7 @@ mod tests {
         .expect("agent connect");
         let mut model = PhiloticClient::connect(GuestIdentity {
             guest_id: "model-local".into(),
-            role: "model.gemini".into(),
+            role: "model".into(),
             supported_tools: Vec::new(),
         })
         .await
@@ -7315,7 +7320,7 @@ mod tests {
         agent
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
-                target_role: "model.gemini".into(),
+                target_role: "model".into(),
                 target_guest_id: None,
                 task_json: serde_json::json!({
                     "action": "generate_text",
@@ -7507,7 +7512,7 @@ mod tests {
         .expect("agent connect");
         let mut model = PhiloticClient::connect(GuestIdentity {
             guest_id: "model-local".into(),
-            role: "model.gemini".into(),
+            role: "model".into(),
             supported_tools: Vec::new(),
         })
         .await
@@ -7570,7 +7575,7 @@ mod tests {
         agent
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
-                target_role: "model.gemini".into(),
+                target_role: "model".into(),
                 target_guest_id: None,
                 task_json: serde_json::json!({
                     "action": "generate_text",

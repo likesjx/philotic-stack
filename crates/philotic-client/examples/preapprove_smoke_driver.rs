@@ -25,9 +25,12 @@ async fn main() -> Result<()> {
     .await
     .with_context(|| format!("failed to connect preapprove smoke driver to {socket_path}"))?;
 
+    let target_node =
+        std::env::var("PHILOTIC_TARGET_NODE").unwrap_or_else(|_| "local-ansible-01".to_string());
+
     client
         .send_request(IpcRequest::EmitTask {
-            target_node: "local-ansible-01".into(),
+            target_node: target_node.clone(),
             target_role: "agent".into(),
             target_guest_id: None,
             task_json: serde_json::json!({
@@ -36,7 +39,7 @@ async fn main() -> Result<()> {
                 "turn_id": "preapprove-turn-1",
                 "chat_id": chat_id,
                 "content": "/preapprove this-session",
-                "final_reply_to": "local-ansible-01",
+                "final_reply_to": target_node.clone(),
                 "final_reply_role": "membrane",
                 "final_reply_guest_id": "preapprove-smoke-membrane"
             })
@@ -44,18 +47,24 @@ async fn main() -> Result<()> {
         })
         .await?;
 
-    let preapprove_reply = timeout(Duration::from_secs(10), client.recv_task())
-        .await
-        .context("timed out waiting for preapprove reply")??;
-    let IpcResponse::InboundTask { task_json, .. } = preapprove_reply else {
-        bail!("unexpected preapprove reply envelope: {preapprove_reply:?}");
-    };
-    let payload: serde_json::Value =
-        serde_json::from_str(&task_json).context("failed to decode preapprove reply")?;
-    let preapprove_content = payload
-        .get("content")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
+    let mut preapprove_content = String::new();
+    for _ in 0..10 {
+        let preapprove_reply = timeout(Duration::from_secs(5), client.recv_task())
+            .await
+            .context("timed out waiting for preapprove reply")??;
+        let IpcResponse::InboundTask { task_json, .. } = preapprove_reply else {
+            continue;
+        };
+        let payload: serde_json::Value =
+            serde_json::from_str(&task_json).context("failed to decode preapprove reply")?;
+        if let Some(c) = payload.get("content").and_then(serde_json::Value::as_str) {
+            if !c.is_empty() {
+                preapprove_content = c.to_string();
+                break;
+            }
+        }
+    }
+
     if preapprove_content != expected_preapprove {
         bail!(
             "expected preapprove reply {:?}, got {:?}",
@@ -66,7 +75,7 @@ async fn main() -> Result<()> {
 
     client
         .send_request(IpcRequest::EmitTask {
-            target_node: "local-ansible-01".into(),
+            target_node: target_node.clone(),
             target_role: "agent".into(),
             target_guest_id: None,
             task_json: serde_json::json!({
@@ -75,7 +84,7 @@ async fn main() -> Result<()> {
                 "turn_id": "preapprove-turn-2",
                 "chat_id": chat_id,
                 "content": "need approval deploy the thing",
-                "final_reply_to": "local-ansible-01",
+                "final_reply_to": target_node.clone(),
                 "final_reply_role": "membrane",
                 "final_reply_guest_id": "preapprove-smoke-membrane"
             })
@@ -83,18 +92,24 @@ async fn main() -> Result<()> {
         })
         .await?;
 
-    let final_reply = timeout(Duration::from_secs(10), client.recv_task())
-        .await
-        .context("timed out waiting for preapproved final reply")??;
-    let IpcResponse::InboundTask { task_json, .. } = final_reply else {
-        bail!("unexpected preapproved reply envelope: {final_reply:?}");
-    };
-    let payload: serde_json::Value =
-        serde_json::from_str(&task_json).context("failed to decode preapproved final reply")?;
-    let final_content = payload
-        .get("content")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
+    let mut final_content = String::new();
+    for _ in 0..10 {
+        let final_reply = timeout(Duration::from_secs(5), client.recv_task())
+            .await
+            .context("timed out waiting for preapproved final reply")??;
+        let IpcResponse::InboundTask { task_json, .. } = final_reply else {
+            continue;
+        };
+        let payload: serde_json::Value =
+            serde_json::from_str(&task_json).context("failed to decode preapproved final reply")?;
+        if let Some(c) = payload.get("content").and_then(serde_json::Value::as_str) {
+            if !c.is_empty() {
+                final_content = c.to_string();
+                break;
+            }
+        }
+    }
+
     if final_content != expected_final {
         bail!(
             "expected final preapproved reply {:?}, got {:?}",

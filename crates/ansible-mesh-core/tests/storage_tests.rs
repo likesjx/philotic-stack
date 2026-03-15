@@ -403,7 +403,7 @@ fn graph_storage_secret_round_trips() {
         secret_ref: "secret://hotel/default/test/one".into(),
         secret_kind: "test".into(),
         scope: "hotel".into(),
-        allowed_roles: vec!["model.gemini".into()],
+        allowed_roles: vec!["model".into()],
         allowed_guests: vec!["guest-1".into()],
         ciphertext_b64: "ciphertext".into(),
         nonce_b64: "nonce".into(),

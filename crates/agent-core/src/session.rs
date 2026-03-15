@@ -2729,7 +2729,7 @@ mod tests {
                 "text.generate".into(),
                 ComponentExecutionRoute {
                     target_node: "aria-node".into(),
-                    target_role: "model.gemini".into(),
+                    target_role: "model".into(),
                     incarnation_id: Some("aria-architect-hotel:model-controller-gemini".into()),
                     hotel_id: Some("aria-architect-hotel".into()),
                     environment_id: None,

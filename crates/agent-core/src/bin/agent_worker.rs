@@ -29,7 +29,7 @@ use uuid::Uuid;
 const WORKER_ROLE: &str = "agent-worker";
 
 /// Default model role used when the delegation does not specify an implementation.
-const DEFAULT_MODEL_ROLE: &str = "model.gemini";
+const DEFAULT_MODEL_ROLE: &str = "model";
 
 fn local_node_id() -> String {
     std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-ansible-01".to_string())

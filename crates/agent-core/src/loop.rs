@@ -78,9 +78,7 @@ pub fn interpret_model_payload(agent_action: Option<&Value>, content: Option<&st
             match kind {
                 "respond" => {
                     if let Some(content) = agent_action.get("content").and_then(Value::as_str) {
-                        return AgentAction::Respond {
-                            content: content.to_string(),
-                        };
+                        return interpret_model_output(content);
                     }
                 }
                 "tool_call" => {
@@ -143,6 +141,16 @@ pub fn interpret_model_output(content: &str) -> AgentAction {
             arguments: serde_json::json!({
                 "text": path.trim(),
             }),
+        });
+    }
+
+    let search_marker = "APPROVAL_REQUIRED:";
+    if trimmed.to_uppercase().starts_with(search_marker) {
+        let reason = trimmed[search_marker.len()..].trim();
+        return AgentAction::RequestApproval(ApprovalRequest {
+            approval_id: None,
+            reason: reason.to_string(),
+            approved_response: format!("Approved: {}", reason),
         });
     }
 

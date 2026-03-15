@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 pub const DEFAULT_AGENT_ID: &str = "agent-jane-01";
 const DEFAULT_REPLY_ROLE: &str = "membrane";
-const DEFAULT_TEXT_MODEL_ROLE: &str = "model.gemini";
+const DEFAULT_TEXT_MODEL_ROLE: &str = "model";
 const DEFAULT_VOICE_MODEL_ROLE: &str = "model.elevenlabs";
 /// Maximum model round-trips per turn. Exhausting this budget fails the turn with a
 /// clear error rather than looping indefinitely.
@@ -75,7 +75,12 @@ fn implementation_to_model_role(implementation: &str) -> String {
         .split(['.', '-', '@', '/'])
         .find(|segment| !segment.is_empty())
         .unwrap_or("gemini");
-    format!("model.{normalized}")
+
+    if normalized == "elevenlabs" {
+        "model.elevenlabs".into()
+    } else {
+        "model".into()
+    }
 }
 
 fn resolve_model_execution_target(
@@ -3665,18 +3670,18 @@ mod tests {
 
     #[test]
     fn default_text_model_role_targets_gemini_controller() {
-        assert_eq!(DEFAULT_TEXT_MODEL_ROLE, "model.gemini");
+        assert_eq!(DEFAULT_TEXT_MODEL_ROLE, "model");
     }
 
     #[test]
     fn implementation_names_map_to_model_roles() {
         assert_eq!(
             super::implementation_to_model_role("gemini"),
-            "model.gemini"
+            "model"
         );
         assert_eq!(
             super::implementation_to_model_role("gemini-flash"),
-            "model.gemini"
+            "model"
         );
         assert_eq!(
             super::implementation_to_model_role("elevenlabs-v1"),
@@ -3713,7 +3718,7 @@ mod tests {
                 "media.analyze".into(),
                 ComponentExecutionRoute {
                     target_node: "aria-node".into(),
-                    target_role: "model.gemini".into(),
+                    target_role: "model".into(),
                     incarnation_id: Some("aria-architect-hotel:model-controller-gemini".into()),
                     hotel_id: Some("aria-architect-hotel".into()),
                     environment_id: None,
@@ -3727,7 +3732,7 @@ mod tests {
         let target =
             resolve_model_execution_target(Some(&state), "media.analyze", DEFAULT_TEXT_MODEL_ROLE);
         assert_eq!(target.0, "aria-node");
-        assert_eq!(target.1, "model.gemini");
+        assert_eq!(target.1, "model");
         assert_eq!(
             target.2.as_deref(),
             Some("aria-architect-hotel:model-controller-gemini")

@@ -71,7 +71,7 @@ mod tests {
                 hotel_id: "aria-architect-hotel".into(),
                 node_id: "aria-node".into(),
                 incarnation_id: "aria-architect-hotel:model-controller-gemini".into(),
-                target_role: "model.gemini".into(),
+                target_role: "model".into(),
                 availability_state: "live".into(),
                 selection_hint: Some("remote_fallback".into()),
                 latency_hint_ms: Some(12),
