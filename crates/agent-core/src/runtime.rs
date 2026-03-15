@@ -562,6 +562,7 @@ impl AgentRuntime {
                         .await;
                 }
                 SlashCommand::PreapproveThisSession
+                | SlashCommand::Preapprove { .. }
                 | SlashCommand::ApprovalStatus
                 | SlashCommand::ApprovalReset => {}
                 SlashCommand::Tts { .. } => {}
@@ -651,6 +652,7 @@ impl AgentRuntime {
                     .await
                 }
                 SlashCommand::PreapproveThisSession
+                | SlashCommand::Preapprove { .. }
                 | SlashCommand::ApprovalStatus
                 | SlashCommand::ApprovalReset => {
                     self.handle_session_control_command(
@@ -2056,6 +2058,7 @@ impl AgentRuntime {
                 | SlashCommand::WorkspaceSet { .. }
                 | SlashCommand::WorkspaceClear
                 | SlashCommand::PreapproveThisSession
+                | SlashCommand::Preapprove { .. }
                 | SlashCommand::ApprovalStatus
                 | SlashCommand::ApprovalReset
                 | SlashCommand::Abandon { .. }
@@ -2225,6 +2228,7 @@ impl AgentRuntime {
             | SlashCommand::WorkspaceSet { .. }
             | SlashCommand::WorkspaceClear
             | SlashCommand::PreapproveThisSession
+            | SlashCommand::Preapprove { .. }
             | SlashCommand::ApprovalStatus
             | SlashCommand::ApprovalReset
             | SlashCommand::Abandon { .. }
@@ -2867,6 +2871,20 @@ impl AgentRuntime {
                     state.set_preapprove_this_session();
                     (
                         "Approval policy updated: this session is now pre-approved.".to_string(),
+                        "session_policy_updated",
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "turn_id": command_turn_id,
+                            "chat_id": command_chat_id,
+                            "approval_policy": state.approval_policy,
+                            "action": "approval_policy_update",
+                        }),
+                    )
+                }
+                SlashCommand::Preapprove { name } => {
+                    let reply = state.preapprove_by_name(name.as_str());
+                    (
+                        reply,
                         "session_policy_updated",
                         serde_json::json!({
                             "session_id": session_id,

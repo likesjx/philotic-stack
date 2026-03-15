@@ -818,7 +818,30 @@ impl SessionState {
     }
 
     pub fn reset_approval_policy(&mut self) {
-        self.approval_policy = ApprovalPolicy::default();
+        self.approval_policy.preapproved_tools.clear();
+        self.approval_policy.preapproved_classes.clear();
+    }
+
+    /// Known approval class names that can be pre-approved by class rather than by tool name.
+    const APPROVAL_CLASSES: &'static [&'static str] =
+        &["session", "workspace", "utility", "capability", "config", "handoff"];
+
+    /// Preapprove a tool name or class name for this session.
+    ///
+    /// Returns a human-readable confirmation string. If `name` matches a known class name it is
+    /// added to `preapproved_classes`; otherwise it is added to `preapproved_tools`.
+    pub fn preapprove_by_name(&mut self, name: &str) -> String {
+        if Self::APPROVAL_CLASSES.contains(&name) {
+            if !self.approval_policy.preapproved_classes.contains(&name.to_string()) {
+                self.approval_policy.preapproved_classes.push(name.to_string());
+            }
+            format!("Preapproved: `{name}` (class)")
+        } else {
+            if !self.approval_policy.preapproved_tools.contains(&name.to_string()) {
+                self.approval_policy.preapproved_tools.push(name.to_string());
+            }
+            format!("Preapproved: `{name}` (tool)")
+        }
     }
 
     /// Apply a configuration change from the `agent.configure` tool.
@@ -1150,29 +1173,22 @@ impl SessionState {
     }
 
     pub fn approval_policy_status_text(&self) -> String {
-        if self.approval_policy.auto_approve_all {
-            return "Approval policy: pre-approved for this session.".into();
-        }
-
-        let mut parts = Vec::new();
-        if !self.approval_policy.preapproved_tools.is_empty() {
-            parts.push(format!(
-                "tools={}",
-                self.approval_policy.preapproved_tools.join(", ")
-            ));
-        }
-        if !self.approval_policy.preapproved_classes.is_empty() {
-            parts.push(format!(
-                "classes={}",
-                self.approval_policy.preapproved_classes.join(", ")
-            ));
-        }
-
-        if parts.is_empty() {
-            "Approval policy: no pre-approvals configured.".into()
+        let tools = if self.approval_policy.preapproved_tools.is_empty() {
+            "none".to_string()
         } else {
-            format!("Approval policy: {}.", parts.join(" | "))
-        }
+            self.approval_policy.preapproved_tools.join(", ")
+        };
+        let classes = if self.approval_policy.preapproved_classes.is_empty() {
+            "none".to_string()
+        } else {
+            self.approval_policy.preapproved_classes.join(", ")
+        };
+        format!(
+            "Approval policy:\n- auto_approve_all: {}\n- preapproved_tools: {}\n- preapproved_classes: {}\n\nCommands: /preapprove <tool|class>  /preapprove this-session  /approval reset",
+            self.approval_policy.auto_approve_all,
+            tools,
+            classes,
+        )
     }
 
     pub fn session_status_text(&self) -> String {
@@ -3566,10 +3582,10 @@ mod tests {
     #[test]
     fn status_text_reports_when_no_preapproval_exists() {
         let state = SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
-        assert_eq!(
-            state.approval_policy_status_text(),
-            "Approval policy: no pre-approvals configured."
-        );
+        let text = state.approval_policy_status_text();
+        assert!(text.contains("auto_approve_all: false"));
+        assert!(text.contains("preapproved_tools: none"));
+        assert!(text.contains("preapproved_classes: none"));
     }
 
     #[test]

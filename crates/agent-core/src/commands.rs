@@ -17,6 +17,7 @@ pub enum SlashCommand {
     Deny { note: Option<String> },
     Abandon { reason: Option<String> },
     PreapproveThisSession,
+    Preapprove { name: String },
     ApprovalStatus,
     ApprovalReset,
     Tts { mode: Option<String> },
@@ -41,7 +42,10 @@ impl SlashCommand {
             Self::Approve { .. } => Some("approved"),
             Self::Deny { .. } => Some("denied"),
             Self::Abandon { .. } => None,
-            Self::PreapproveThisSession | Self::ApprovalStatus | Self::ApprovalReset => None,
+            Self::PreapproveThisSession
+            | Self::Preapprove { .. }
+            | Self::ApprovalStatus
+            | Self::ApprovalReset => None,
             Self::Tts { .. } => None,
         }
     }
@@ -93,6 +97,9 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
             reason: join_command_note(rest),
         }),
         ["/preapprove", "this-session", ..] => Some(SlashCommand::PreapproveThisSession),
+        ["/preapprove", name, ..] => Some(SlashCommand::Preapprove {
+            name: (*name).to_string(),
+        }),
         ["/approval", "status", ..] => Some(SlashCommand::ApprovalStatus),
         ["/approval", "reset", ..] => Some(SlashCommand::ApprovalReset),
         ["/tts"] => Some(SlashCommand::Tts { mode: None }),
@@ -231,6 +238,30 @@ mod tests {
     fn ignores_non_commands_and_unknown_commands() {
         assert_eq!(parse_slash_command("hello"), None);
         assert_eq!(parse_slash_command("/unknown"), None);
+    }
+
+    #[test]
+    fn parses_preapprove_tool_name() {
+        assert_eq!(
+            parse_slash_command("/preapprove echo"),
+            Some(SlashCommand::Preapprove { name: "echo".into() })
+        );
+    }
+
+    #[test]
+    fn parses_preapprove_class_name() {
+        assert_eq!(
+            parse_slash_command("/preapprove workspace"),
+            Some(SlashCommand::Preapprove { name: "workspace".into() })
+        );
+    }
+
+    #[test]
+    fn preapprove_this_session_still_parses() {
+        assert_eq!(
+            parse_slash_command("/preapprove this-session"),
+            Some(SlashCommand::PreapproveThisSession)
+        );
     }
 
     #[test]
