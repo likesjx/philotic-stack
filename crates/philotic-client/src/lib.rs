@@ -82,16 +82,24 @@ pub struct HandoffBundle {
     pub return_to: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff_reason: Option<String>,
+    /// The role handing off (e.g. "orchestrator", "developer"). None = orchestrator base.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_role: Option<String>,
+    /// The role receiving the handoff. Always set for same-identity role handoffs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_goal: Option<String>,
     #[serde(default)]
     pub active_constraints: Vec<String>,
+    /// Session-local facts still live at handoff time. Owned by the workflow, not the operator.
     #[serde(default)]
     pub relevant_session_facts: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_summary: Option<String>,
     #[serde(default)]
     pub suggested_memory_refs: Vec<String>,
+    /// One of: "required" (target must hand back), "optional", "none".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_return_mode: Option<String>,
     #[serde(default)]

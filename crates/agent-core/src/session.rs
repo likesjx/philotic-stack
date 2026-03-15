@@ -1823,6 +1823,12 @@ impl SessionState {
             relevant_session_facts.push("approval=preapproved".into());
         }
 
+        let from_role = self
+            .role_activation
+            .as_ref()
+            .map(|r| r.role_name.clone())
+            .or_else(|| Some("orchestrator".into()));
+
         HandoffBundle {
             goal: format!("Switch active role to {target_role} for this session."),
             context_excerpt: format!(
@@ -1833,6 +1839,8 @@ impl SessionState {
             initiating_turn_id: initiating_turn_id.to_string(),
             return_to,
             handoff_reason: Some(handoff_reason.to_string()),
+            from_role,
+            to_role: Some(target_role.to_string()),
             active_goal,
             active_constraints: vec![
                 format!("transport_source={}", self.source),
@@ -1841,7 +1849,7 @@ impl SessionState {
             relevant_session_facts,
             working_summary,
             suggested_memory_refs: Vec::new(),
-            expected_return_mode: Some("stay_active_until_manual_return".into()),
+            expected_return_mode: Some("required".into()),
             cleanup_actions: vec![
                 "persist_role_local_working_state".into(),
                 "switch_active_role".into(),
@@ -3386,10 +3394,9 @@ mod tests {
                 .relevant_session_facts
                 .contains(&"workspace=workspace://main".to_string())
         );
-        assert_eq!(
-            bundle.expected_return_mode.as_deref(),
-            Some("stay_active_until_manual_return")
-        );
+        assert_eq!(bundle.expected_return_mode.as_deref(), Some("required"));
+        assert_eq!(bundle.from_role.as_deref(), Some("developer"));
+        assert_eq!(bundle.to_role.as_deref(), Some("architect"));
         assert!(
             bundle
                 .cleanup_actions

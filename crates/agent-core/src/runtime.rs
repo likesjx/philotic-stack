@@ -2263,12 +2263,14 @@ impl AgentRuntime {
                         initiating_turn_id: command_turn_id.clone(),
                         return_to: Some("orchestrator".into()),
                         handoff_reason: Some("manual_role_switch".into()),
+                        from_role: Some("orchestrator".into()),
+                        to_role: Some(role_name.clone()),
                         active_goal: None,
                         active_constraints: vec!["same_identity_role_handoff".into()],
                         relevant_session_facts: Vec::new(),
                         working_summary: None,
                         suggested_memory_refs: Vec::new(),
-                        expected_return_mode: Some("stay_active_until_manual_return".into()),
+                        expected_return_mode: Some("required".into()),
                         cleanup_actions: vec!["switch_active_role".into()],
                     });
                 self.ipc_client
@@ -3513,12 +3515,21 @@ impl AgentRuntime {
                     })
                     .unwrap_or_default();
 
+                let from_role = self
+                    .sessions
+                    .get(&payload.session_id)
+                    .and_then(|s| s.role_activation.as_ref())
+                    .map(|r| r.role_name.clone())
+                    .or_else(|| Some("orchestrator".into()));
+
                 let handoff_bundle = HandoffBundle {
                     goal: active_goal.clone().unwrap_or_else(|| reason.clone()),
                     context_excerpt: context_summary,
                     session_id: payload.session_id.clone(),
                     initiating_turn_id: payload.turn_id.clone(),
                     handoff_reason: Some(reason),
+                    from_role,
+                    to_role: Some(role_name.clone()),
                     active_goal,
                     expected_return_mode,
                     cleanup_actions,

@@ -4943,8 +4943,10 @@ mod tests {
                         "phase=waiting_model, iteration=1, pending_tool=false, pending_approval=false"
                             .into(),
                     ),
+                    from_role: Some("orchestrator".into()),
+                    to_role: Some("developer".into()),
                     suggested_memory_refs: Vec::new(),
-                    expected_return_mode: Some("stay_active_until_manual_return".into()),
+                    expected_return_mode: Some("required".into()),
                     cleanup_actions: vec!["switch_active_role".into()],
                 },
             })
@@ -4988,7 +4990,7 @@ mod tests {
                 );
                 assert_eq!(
                     payload["handoff_bundle"]["expected_return_mode"],
-                    "stay_active_until_manual_return"
+                    "required"
                 );
             }
             other => panic!("unexpected developer inbound response: {other:?}"),
@@ -5114,8 +5116,10 @@ mod tests {
                         "phase=waiting_model, iteration=1, pending_tool=false, pending_approval=false"
                             .into(),
                     ),
+                    from_role: Some("orchestrator".into()),
+                    to_role: Some("developer".into()),
                     suggested_memory_refs: Vec::new(),
-                    expected_return_mode: Some("stay_active_until_manual_return".into()),
+                    expected_return_mode: Some("required".into()),
                     cleanup_actions: vec!["switch_active_role".into()],
                 },
             })
@@ -5164,7 +5168,7 @@ mod tests {
                 assert_eq!(payload["handoff_bundle"]["goal"], "implement later");
                 assert_eq!(
                     payload["handoff_bundle"]["expected_return_mode"],
-                    "stay_active_until_manual_return"
+                    "required"
                 );
             }
             other => panic!("unexpected developer inbound response: {other:?}"),
