@@ -1,4 +1,4 @@
-use crate::commands::{SlashCommand, parse_slash_command};
+use crate::commands::{SlashCommand, command_manifest, parse_slash_command};
 use crate::r#loop::{
     AgentAction, ApprovalRequest, ToolCall, ToolResult, TurnPhase, interpret_model_payload,
 };
@@ -442,6 +442,23 @@ impl AgentRuntime {
 
     pub async fn run(&mut self) -> Result<()> {
         info!("Listening for inbound Persona tasks from the Philotic Web...");
+
+        // Publish command manifest to the hotel so membrane can discover it.
+        let manifest = command_manifest(&[]);
+        if let Ok(content_json) = serde_json::to_value(&manifest) {
+            match self
+                .ipc_client
+                .send_request(IpcRequest::SyncApartment {
+                    agent_id: self.agent_id.clone(),
+                    memory_type: "command_manifest".into(),
+                    content_json,
+                })
+                .await
+            {
+                Ok(_) => info!("Command manifest published ({} entries).", manifest.len()),
+                Err(e) => warn!("Failed to publish command manifest: {}", e),
+            }
+        }
 
         loop {
             match tokio::time::timeout(Duration::from_secs(5), self.ipc_client.recv_task()).await {
