@@ -36,12 +36,11 @@ just workstream-overlap <slug>  # show risky overlap vs origin/main
 
 The hotel daemon requires `mesh-config.json` in root — copy from `mesh-config.example.json`.
 
-## Parallel Workstreams
+## Branch Model
 
-Treat a worktree as the unit of an implementation conversation. See [docs/operations/parallel-worktree-runbook.md](docs/operations/parallel-worktree-runbook.md).
-
-- One active conversation -> one sibling worktree.
-- Hot files: `ansible/src/main.rs`, `ansible/src/service/ipc.rs`, `agent-core/src/runtime.rs`, `membrane/src/main.rs`, `philotic-client/src/lib.rs`, `docs/task.md`.
+- `develop` — the golden integration edge; all `codex/<slug>` branches PR into `develop`, not `main`.
+- `main` — stable; only merged from `develop` when the edge is ready to ship.
+- `codex/<slug>` — one per active implementation thread; lives in a sibling worktree.
 
 ## Parallel Workstreams
 
@@ -50,6 +49,7 @@ Treat a worktree as the unit of an implementation conversation.
 - one active implementation thread -> one `codex/<slug>` branch
 - one `codex/<slug>` branch -> one sibling worktree
 - do not continue multiple active implementation conversations in the same checkout
+- PRs target `develop`; do not merge feature branches directly to `main`
 
 Before touching hot runtime files in a worktree:
 
@@ -63,9 +63,7 @@ Before opening a PR from a worktree:
 just workstream-overlap <slug>
 ```
 
-Hot files include `crates/ansible/src/main.rs`, `crates/ansible/src/service/ipc.rs`, `crates/agent-core/src/runtime.rs`, `crates/membrane/src/main.rs`, `crates/model-router/*`, `crates/philotic-client/src/lib.rs`, `crates/ansible/README.md`, `docs/task.md`, and `docs/architecture/MODEL_CONTROLLER_PROPOSAL.md`.
-
-See [docs/operations/parallel-worktree-runbook.md](docs/operations/parallel-worktree-runbook.md).
+Hot files include `crates/ansible/src/main.rs`, `crates/ansible/src/service/ipc.rs`, `crates/agent-core/src/runtime.rs`, `crates/membrane/src/main.rs`, `crates/model-router/*`, `crates/philotic-client/src/lib.rs`, `crates/ansible/README.md`, `docs/task.md`.
 
 ## Architecture
 

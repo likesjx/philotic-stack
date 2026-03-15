@@ -331,7 +331,9 @@ When multiple conversations or workstreams are active in parallel:
 - let one thread own architectural boundary changes while other threads implement within those boundaries
 - capture assumption-vs-reality gaps quickly, because drift accelerates when work is parallel
 
-Use the repo-local worktree workflow in [parallel-worktree-runbook.md](/Users/jaredlikes/code/philotic-stack/docs/operations/parallel-worktree-runbook.md), and prefer:
+Branch model: `codex/<slug>` branches PR into `develop` (integration edge); `develop` merges to `main` when stable. Never merge feature branches directly to `main`.
+
+Use the repo-local worktree workflow and prefer:
 
 - `just workstream-start <slug>`
 - `just workstream-status <slug>`
