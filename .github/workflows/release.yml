@@ -1,0 +1,169 @@
+name: Release
+
+# Triggers on semver tags: v0.1.0, v1.2.3, etc.
+# What this workflow does:
+#   1. Builds release binaries for darwin-arm64, darwin-x86_64, and linux-x86_64
+#   2. Creates a GitHub Release with binaries and SHA256 checksums
+#   3. Opens a PR on likesjx/homebrew-philotic to bump the formula version
+#
+# Prerequisites (one-time setup):
+#   - Create a GitHub PAT with `repo` scope on likesjx/homebrew-philotic
+#   - Add it as a secret named TAP_GITHUB_TOKEN on this repo
+#
+# To cut a release:
+#   git tag v0.1.0 && git push origin v0.1.0
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Build native binaries ────────────────────────────────────────────────────
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            artifact: darwin-arm64
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            artifact: darwin-x86_64
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            artifact: linux-x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ matrix.target }}-cargo-
+
+      # Build the operator CLI and hotel daemon
+      # NOTE: update binary names here after ansible → aiua rename
+      - name: Build binaries
+        run: |
+          cargo build --release --target ${{ matrix.target }} \
+            -p ansible \
+            -p agent-core \
+            -p membrane \
+            -p model-router \
+            -p tool-runner
+
+      - name: Package binaries
+        shell: bash
+        run: |
+          STAGING="philotic-${{ github.ref_name }}-${{ matrix.artifact }}"
+          mkdir -p "$STAGING"
+
+          # Copy built binaries
+          # NOTE: update binary names after rename
+          for bin in ansible agent-core membrane model-router tool-runner; do
+            [ -f "target/${{ matrix.target }}/release/$bin" ] && \
+              cp "target/${{ matrix.target }}/release/$bin" "$STAGING/"
+          done
+
+          # Include example config
+          [ -f mesh-config.example.json ] && cp mesh-config.example.json "$STAGING/"
+
+          tar czf "$STAGING.tar.gz" "$STAGING"
+          sha256sum "$STAGING.tar.gz" > "$STAGING.tar.gz.sha256" 2>/dev/null || \
+            shasum -a 256 "$STAGING.tar.gz" > "$STAGING.tar.gz.sha256"
+
+          echo "STAGING=$STAGING" >> $GITHUB_ENV
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            philotic-${{ github.ref_name }}-${{ matrix.artifact }}.tar.gz
+            philotic-${{ github.ref_name }}-${{ matrix.artifact }}.tar.gz.sha256
+
+  # ── Create GitHub Release ────────────────────────────────────────────────────
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-22.04
+    outputs:
+      source_sha256: ${{ steps.source.outputs.sha256 }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create source archive
+        id: source
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          PREFIX="philotic-stack-$VERSION"
+          git archive --format=tar.gz --prefix="$PREFIX/" HEAD \
+            > "philotic-stack-$VERSION.tar.gz"
+          SHA=$(sha256sum "philotic-stack-$VERSION.tar.gz" | cut -d' ' -f1)
+          echo "sha256=$SHA" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_ENV
+
+      - name: Collect release assets
+        run: |
+          mkdir -p release-assets
+          cp "philotic-stack-${{ env.version }}.tar.gz" release-assets/
+          find artifacts -name "*.tar.gz" -o -name "*.sha256" | \
+            xargs -I{} cp {} release-assets/
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
+  # ── Update Homebrew tap ──────────────────────────────────────────────────────
+  update-tap:
+    name: Bump Homebrew formulae
+    needs: release
+    runs-on: ubuntu-22.04
+
+    steps:
+      # Bump aiua formula
+      # NOTE: once philotic-web crate exists, add a second step for it
+      - name: Bump aiua formula
+        uses: mislav/bump-homebrew-formula-action@v3
+        with:
+          formula-name: aiua
+          formula-path: Formula/aiua.rb
+          homebrew-tap: likesjx/homebrew-philotic
+          base-branch: main
+          tag-name: ${{ github.ref_name }}
+          download-url: >-
+            https://github.com/likesjx/philotic-stack/archive/refs/tags/${{ github.ref_name }}.tar.gz
+          download-sha256: ${{ needs.release.outputs.source_sha256 }}
+          commit-message: |
+            aiua {{version}}
+
+            Release: https://github.com/likesjx/philotic-stack/releases/tag/{{tag}}
+        env:
+          COMMITTER_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
