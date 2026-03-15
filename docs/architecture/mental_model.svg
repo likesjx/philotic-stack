@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="840" height="560" viewBox="0 0 840 560">
+<defs>
+  <style>text { font-family: Inter, system-ui, -apple-system, sans-serif; }</style>
+</defs>
+<rect width="840" height="560" fill="#0a0c14"/>
+
+  <circle cx="40" cy="40" r="16" fill="none" stroke="#00e5ff" stroke-width="2" opacity="0.9"/>
+  <text x="40" y="44" text-anchor="middle" font-size="14" fill="#00e5ff">&#x2B21;</text>
+  <text x="65" y="45" font-size="16" font-weight="700" fill="#e8eaf0">Philotic Stack <tspan fill="#00e5ff">Mental Model</tspan></text>
+  <rect x="220" y="100" width="400" height="360" rx="12" fill="#00e5ff" fill-opacity="0.03" stroke="#00e5ff" stroke-opacity="0.4" stroke-width="1.5"/>
+  <text x="232" y="122" font-size="11" font-weight="700" letter-spacing="1" fill="#00e5ff" text-anchor="start" font-family="Inter, system-ui, -apple-system, sans-serif" style="text-transform:uppercase">The Hotel (Node Authority)</text>
+  <rect x="340" y="220" width="160" height="120" rx="8" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
+  <text x="420.0" y="276.0" font-size="24" text-anchor="middle">📀</text>
+  <text x="420.0" y="324" font-size="11" font-weight="600" fill="#e8eaf0" text-anchor="middle">Context Graph</text>
+  <text x="420.0" y="337" font-size="9" fill="#8892b0" text-anchor="middle" font-family="JetBrains Mono, monospace">SQLite (Source of Truth)</text>
+  <rect x="60" y="220" width="120" height="120" rx="8" fill="#161b2e" stroke="#d500f9" stroke-width="1"/>
+  <text x="120.0" y="276.0" font-size="24" text-anchor="middle">🌐</text>
+  <text x="120.0" y="324" font-size="11" font-weight="600" fill="#e8eaf0" text-anchor="middle">Membrane</text>
+  <text x="120.0" y="337" font-size="9" fill="#8892b0" text-anchor="middle" font-family="JetBrains Mono, monospace">External Gateway</text>
+  <rect x="660" y="160" width="120" height="120" rx="8" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
+  <text x="720.0" y="216.0" font-size="24" text-anchor="middle">🧠</text>
+  <text x="720.0" y="264" font-size="11" font-weight="600" fill="#e8eaf0" text-anchor="middle">Agent-Core</text>
+  <text x="720.0" y="277" font-size="9" fill="#8892b0" text-anchor="middle" font-family="JetBrains Mono, monospace">Cognitive Loop</text>
+  <rect x="660" y="300" width="120" height="120" rx="8" fill="#161b2e" stroke="#2979ff" stroke-width="1"/>
+  <text x="720.0" y="356.0" font-size="24" text-anchor="middle">🤖</text>
+  <text x="720.0" y="404" font-size="11" font-weight="600" fill="#e8eaf0" text-anchor="middle">Model-Router</text>
+  <text x="720.0" y="417" font-size="9" fill="#8892b0" text-anchor="middle" font-family="JetBrains Mono, monospace">LLM Inference</text>
+  <line x1="180" y1="280" x2="240" y2="280" stroke="#00e5ff" stroke-width="1.5"/>
+  <rect x="175.0" y="272.0" width="70" height="16" rx="4" fill="#0a0c14" opacity="0.8"/>
+  <text x="210.0" y="284.0" font-size="8" font-weight="700" fill="#8892b0" text-anchor="middle" font-family="Inter, system-ui, -apple-system, sans-serif">IPC (UDS)</text>
+  <line x1="620" y1="220" x2="660" y2="220" stroke="#00e5ff" stroke-width="1.5"/>
+  <rect x="605.0" y="212.0" width="70" height="16" rx="4" fill="#0a0c14" opacity="0.8"/>
+  <text x="640.0" y="224.0" font-size="8" font-weight="700" fill="#8892b0" text-anchor="middle" font-family="Inter, system-ui, -apple-system, sans-serif">IPC (UDS)</text>
+  <line x1="620" y1="360" x2="660" y2="360" stroke="#00e5ff" stroke-width="1.5"/>
+  <rect x="605.0" y="352.0" width="70" height="16" rx="4" fill="#0a0c14" opacity="0.8"/>
+  <text x="640.0" y="364.0" font-size="8" font-weight="700" fill="#8892b0" text-anchor="middle" font-family="Inter, system-ui, -apple-system, sans-serif">IPC (UDS)</text>
+  <line x1="420.0" y1="460" x2="420.0" y2="500" stroke="#d500f9" stroke-width="1.5" stroke-dasharray="5,3"/>
+  <rect x="385.0" y="472.0" width="70" height="16" rx="4" fill="#0a0c14" opacity="0.8"/>
+  <text x="420.0" y="484.0" font-size="8" font-weight="700" fill="#8892b0" text-anchor="middle" font-family="Inter, system-ui, -apple-system, sans-serif">PHILOTIC WEB</text>
+  <rect x="280" y="500" width="280" height="40" rx="12" fill="#d500f9" fill-opacity="0.06" stroke="#d500f9" stroke-opacity="0.4" stroke-width="1.5"/>
+  <text x="420.0" y="522" font-size="11" font-weight="700" letter-spacing="1" fill="#d500f9" text-anchor="middle" font-family="Inter, system-ui, -apple-system, sans-serif" style="text-transform:uppercase">Peer Hotel Nodes (Mesh)</text>
+  <line x1="120.0" y1="220" x2="120.0" y2="100" stroke="#8892b0" stroke-width="1.5" stroke-dasharray="5,3"/>
+  <rect x="85.0" y="152.0" width="70" height="16" rx="4" fill="#0a0c14" opacity="0.8"/>
+  <text x="120.0" y="164.0" font-size="8" font-weight="700" fill="#8892b0" text-anchor="middle" font-family="Inter, system-ui, -apple-system, sans-serif">External World</text>
+  <text x="120.0" y="80" font-size="10" fill="#8892b0" text-anchor="middle" font-weight="600">Telegram / Nostr / API</text></svg>

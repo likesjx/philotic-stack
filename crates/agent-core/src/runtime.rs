@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 pub const DEFAULT_AGENT_ID: &str = "agent-jane-01";
 const DEFAULT_REPLY_ROLE: &str = "membrane";
-const DEFAULT_TEXT_MODEL_ROLE: &str = "model.gemini";
+const DEFAULT_TEXT_MODEL_ROLE: &str = "model";
 const DEFAULT_VOICE_MODEL_ROLE: &str = "model.elevenlabs";
 /// Maximum model round-trips per turn. Exhausting this budget fails the turn with a
 /// clear error rather than looping indefinitely.
@@ -75,7 +75,12 @@ fn implementation_to_model_role(implementation: &str) -> String {
         .split(['.', '-', '@', '/'])
         .find(|segment| !segment.is_empty())
         .unwrap_or("gemini");
-    format!("model.{normalized}")
+
+    if normalized == "elevenlabs" {
+        "model.elevenlabs".into()
+    } else {
+        "model".into()
+    }
 }
 
 fn resolve_model_execution_target(
@@ -560,6 +565,7 @@ impl AgentRuntime {
                 | SlashCommand::ApprovalStatus
                 | SlashCommand::ApprovalReset => {}
                 SlashCommand::Tts { .. } => {}
+                SlashCommand::Abandon { .. } => {}
             }
         }
 
@@ -663,6 +669,10 @@ impl AgentRuntime {
                         .await
                 }
                 SlashCommand::Approve { .. } | SlashCommand::Deny { .. } => Ok(()),
+                SlashCommand::Abandon { reason } => {
+                    self.handle_abandon_command(session_id, turn_id, reason)
+                        .await
+                }
             };
         }
 
@@ -2048,6 +2058,7 @@ impl AgentRuntime {
                 | SlashCommand::PreapproveThisSession
                 | SlashCommand::ApprovalStatus
                 | SlashCommand::ApprovalReset
+                | SlashCommand::Abandon { .. }
                 | SlashCommand::Tts { .. } => {}
             }
             (
@@ -2216,6 +2227,7 @@ impl AgentRuntime {
             | SlashCommand::PreapproveThisSession
             | SlashCommand::ApprovalStatus
             | SlashCommand::ApprovalReset
+            | SlashCommand::Abandon { .. }
             | SlashCommand::Tts { .. } => {}
         }
 
@@ -2570,6 +2582,57 @@ impl AgentRuntime {
         Ok(())
     }
 
+    /// Handle `/abandon [reason]`.
+    ///
+    /// If `PHILOTIC_PARENT_GUEST_ID` is set (this process is a subagent worker),
+    /// fires a `FireSubagentHook(TurnCompleted, { completed: false })` to the hotel
+    /// so the parent agent receives the failure notification.
+    /// Always completes the local turn with an abandonment acknowledgement.
+    async fn handle_abandon_command(
+        &mut self,
+        session_id: String,
+        turn_id: String,
+        reason: Option<String>,
+    ) -> Result<()> {
+        let reason_text = reason
+            .as_deref()
+            .unwrap_or("operator requested abandonment");
+
+        // If we're running as a subagent, notify the parent via the hook channel.
+        if let Ok(worker_id) = std::env::var("PHILOTIC_AGENT_ID") {
+            if std::env::var("PHILOTIC_PARENT_GUEST_ID").is_ok() {
+                let hook_result = self
+                    .ipc_client
+                    .send_request(IpcRequest::FireSubagentHook {
+                        subagent_guest_id: worker_id.clone(),
+                        hook_kind: philotic_client::HookKind::TurnCompleted,
+                        payload: serde_json::json!({
+                            "completed": false,
+                            "error": reason_text,
+                        }),
+                    })
+                    .await;
+                match hook_result {
+                    Ok(_) => info!(
+                        agent_id = %worker_id,
+                        "Abandon: failure hook fired to parent."
+                    ),
+                    Err(e) => warn!(
+                        agent_id = %worker_id,
+                        "Abandon: failed to fire failure hook: {}", e
+                    ),
+                }
+            }
+        }
+
+        let ack = if let Some(r) = reason.as_deref() {
+            format!("Abandoned: {r}")
+        } else {
+            "Abandoned.".into()
+        };
+        self.complete_local_command(session_id, turn_id, ack).await
+    }
+
     async fn handle_session_control_command(
         &mut self,
         command_task_id: Uuid,
@@ -2842,7 +2905,8 @@ impl AgentRuntime {
                 | SlashCommand::Roles
                 | SlashCommand::Back
                 | SlashCommand::Approve { .. }
-                | SlashCommand::Deny { .. } => (
+                | SlashCommand::Deny { .. }
+                | SlashCommand::Abandon { .. } => (
                     "Unsupported session control command.".to_string(),
                     "session_control_unsupported",
                     serde_json::json!({
@@ -3058,6 +3122,344 @@ impl AgentRuntime {
                 })
                 .await
             }
+            "role.configure" => {
+                let args = &payload.arguments;
+
+                macro_rules! require_str_arg {
+                    ($key:literal) => {
+                        match args.get($key).and_then(|v| v.as_str()) {
+                            Some(s) => s.to_string(),
+                            None => {
+                                return self
+                                    .fail_active_turn(
+                                        payload.session_id,
+                                        payload.turn_id,
+                                        format!(
+                                            "role.configure: missing required argument '{}'",
+                                            $key
+                                        ),
+                                    )
+                                    .await;
+                            }
+                        }
+                    };
+                }
+
+                let role_name = require_str_arg!("role_name");
+                let toolset_profile = require_str_arg!("toolset_profile");
+
+                if let None = args.get("reasoning").and_then(|v| v.as_object()) {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "role.configure: missing required object argument 'reasoning'".into(),
+                        )
+                        .await;
+                }
+
+                let role_identity_addendum = args.get("role_identity_addendum").and_then(|v| v.as_str()).map(str::to_string);
+                let inactive_ttl_seconds = args.get("inactive_ttl_seconds").and_then(|v| v.as_u64());
+                let iteration_cap = args.get("iteration_cap").and_then(|v| v.as_u64()).map(|v| v as u32);
+                let approval_policy = args.get("approval_policy").and_then(|v| v.as_str()).map(str::to_string);
+                let model_profile = args.get("model_profile").and_then(|v| v.as_str()).map(str::to_string);
+                let context_window_policy = args.get("context_window_policy").and_then(|v| v.as_str()).map(str::to_string);
+
+                let req = IpcRequest::ConfigureRole {
+                    agent_id: self.agent_id.clone(),
+                    role_name: role_name.clone(),
+                    guest_id: format!("{}:{}", self.agent_id, role_name),
+                    toolset_profile,
+                    role_identity_addendum,
+                    inactive_ttl_seconds,
+                    iteration_cap,
+                    approval_policy,
+                    model_profile,
+                    context_window_policy,
+                };
+
+                let content = match self.ipc_client.send_request(req).await {
+                    Ok(IpcResponse::ConfigureRoleOk { role_name: name }) => {
+                        format!("Successfully configured role incarnation for '{}'.", name)
+                    }
+                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                        format!("role.configure failed [{code}]: {message}")
+                    }
+                    Ok(IpcResponse::Error(msg)) => {
+                        format!("role.configure IPC error: {msg}")
+                    }
+                    Ok(_) => "role.configure: unexpected hotel response.".to_string(),
+                    Err(e) => format!("role.configure: IPC transport error — {e}"),
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(content),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: None,
+                    tool_name: Some(payload.tool_name),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                })
+                .await
+            }
+            "skill.register" => {
+                let args = &payload.arguments;
+
+                macro_rules! require_str_arg {
+                    ($key:literal) => {
+                        match args.get($key).and_then(|v| v.as_str()) {
+                            Some(s) => s.to_string(),
+                            None => {
+                                return self
+                                    .fail_active_turn(
+                                        payload.session_id,
+                                        payload.turn_id,
+                                        format!(
+                                            "skill.register: missing required argument '{}'",
+                                            $key
+                                        ),
+                                    )
+                                    .await;
+                            }
+                        }
+                    };
+                }
+
+                let skill_name    = require_str_arg!("skill_name");
+                let description   = require_str_arg!("description");
+                let subagent_kind = require_str_arg!("subagent_kind");
+                let goal          = require_str_arg!("goal");
+
+                let str_vec = |key: &str| -> Vec<String> {
+                    args.get(key)
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                let allowed_tools   = str_vec("allowed_tools");
+                let allowed_classes = str_vec("allowed_classes");
+
+                let response = self
+                    .ipc_client
+                    .send_request(IpcRequest::RegisterSkill {
+                        skill_name:        skill_name.clone(),
+                        description,
+                        subagent_kind,
+                        goal,
+                        allowed_tools,
+                        allowed_classes,
+                        hook_subscriptions: vec![],
+                        completion_route:   Default::default(),
+                        failure_route:      Default::default(),
+                        idle_behavior:      Default::default(),
+                        lease_terms:        Default::default(),
+                    })
+                    .await;
+
+                let content = match response {
+                    Ok(IpcResponse::SkillRegistered {
+                        skill_name: name,
+                        validation_state,
+                        validation_errors,
+                    }) => {
+                        if validation_errors.is_empty() {
+                            format!(
+                                "Skill '{}' registered (state: {}).",
+                                name, validation_state
+                            )
+                        } else {
+                            format!(
+                                "Skill '{}' registered with state '{}'. Validation issues:\n{}",
+                                name,
+                                validation_state,
+                                validation_errors
+                                    .iter()
+                                    .map(|e| format!("- {e}"))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            )
+                        }
+                    }
+                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                        format!("skill.register failed [{code}]: {message}")
+                    }
+                    Ok(IpcResponse::Error(msg)) => {
+                        format!("skill.register IPC error: {msg}")
+                    }
+                    Ok(_) => "skill.register: unexpected hotel response.".to_string(),
+                    Err(e) => format!("skill.register: IPC transport error — {e}"),
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action:              Some("tool_result".into()),
+                    agent_action:        None,
+                    source:              Some("agent".into()),
+                    session_id:          Some(payload.session_id),
+                    turn_id:             Some(payload.turn_id),
+                    transport:           None,
+                    chat_id:             Some(payload.chat_id),
+                    thread_id:           None,
+                    sender_id:           None,
+                    sender_username:     None,
+                    message_kind:        None,
+                    content:             Some(content),
+                    attachments:         Vec::new(),
+                    command:             None,
+                    callback_data:       None,
+                    raw_transport_event: None,
+                    error:               None,
+                    tool_name:           Some(payload.tool_name),
+                    arguments:           None,
+                    final_reply_to:      Some(payload.final_reply_to),
+                    final_reply_role:    Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                })
+                .await
+            }
+
+            "subagent.spawn" => {
+                let args = &payload.arguments;
+
+                let goal = match args.get("goal").and_then(|v| v.as_str()) {
+                    Some(s) => s.to_string(),
+                    None => {
+                        return self
+                            .fail_active_turn(
+                                payload.session_id,
+                                payload.turn_id,
+                                "subagent.spawn: missing required argument 'goal'".into(),
+                            )
+                            .await;
+                    }
+                };
+                let subagent_kind = args
+                    .get("subagent_kind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("agent-worker")
+                    .to_string();
+                let context_summary = args
+                    .get("context_summary")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let allowed_tools: Vec<String> = args
+                    .get("allowed_tools")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let iteration_budget = args
+                    .get("iteration_budget")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as u32);
+
+                let delegation = philotic_client::SubagentDelegation {
+                    parent_agent_id: self.agent_id.clone(),
+                    parent_role:     "agent".to_string(),
+                    subagent_kind,
+                    goal,
+                    context_packet: philotic_client::SubagentContextPacket {
+                        summary: context_summary,
+                        ..Default::default()
+                    },
+                    allowed_tools,
+                    iteration_budget,
+                    ..Default::default()
+                };
+
+                let response = self
+                    .ipc_client
+                    .send_request(IpcRequest::SpawnSubagent {
+                        session_id: payload.session_id.clone(),
+                        delegation,
+                    })
+                    .await;
+
+                let content = match response {
+                    Ok(IpcResponse::SpawnSubagentOk {
+                        subagent_guest_id,
+                        confirmed_lease,
+                    }) => {
+                        format!(
+                            "Subagent spawned.\nGuest ID: {}\nLease expires at: {} (epoch {})",
+                            subagent_guest_id,
+                            confirmed_lease.lease_expires_at,
+                            confirmed_lease.lease_epoch,
+                        )
+                    }
+                    Ok(IpcResponse::SpawnSubagentProposal {
+                        subagent_guest_id,
+                        confirmed_lease,
+                        delta,
+                    }) => {
+                        format!(
+                            "Subagent spawned (TTL adjusted: {}s → {}s).\nGuest ID: {}\nLease expires at: {}",
+                            delta.requested_ttl,
+                            delta.confirmed_ttl,
+                            subagent_guest_id,
+                            confirmed_lease.lease_expires_at,
+                        )
+                    }
+                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                        format!("subagent.spawn failed [{code}]: {message}")
+                    }
+                    Ok(IpcResponse::Error(msg)) => {
+                        format!("subagent.spawn IPC error: {msg}")
+                    }
+                    Ok(_) => "subagent.spawn: unexpected hotel response.".to_string(),
+                    Err(e) => format!("subagent.spawn: IPC transport error — {e}"),
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action:              Some("tool_result".into()),
+                    agent_action:        None,
+                    source:              Some("agent".into()),
+                    session_id:          Some(payload.session_id),
+                    turn_id:             Some(payload.turn_id),
+                    transport:           None,
+                    chat_id:             Some(payload.chat_id),
+                    thread_id:           None,
+                    sender_id:           None,
+                    sender_username:     None,
+                    message_kind:        None,
+                    content:             Some(content),
+                    attachments:         Vec::new(),
+                    command:             None,
+                    callback_data:       None,
+                    raw_transport_event: None,
+                    error:               None,
+                    tool_name:           Some(payload.tool_name),
+                    arguments:           None,
+                    final_reply_to:      Some(payload.final_reply_to),
+                    final_reply_role:    Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                })
+                .await
+            }
+
             other => {
                 self.fail_active_turn(
                     payload.session_id,
@@ -3268,18 +3670,18 @@ mod tests {
 
     #[test]
     fn default_text_model_role_targets_gemini_controller() {
-        assert_eq!(DEFAULT_TEXT_MODEL_ROLE, "model.gemini");
+        assert_eq!(DEFAULT_TEXT_MODEL_ROLE, "model");
     }
 
     #[test]
     fn implementation_names_map_to_model_roles() {
         assert_eq!(
             super::implementation_to_model_role("gemini"),
-            "model.gemini"
+            "model"
         );
         assert_eq!(
             super::implementation_to_model_role("gemini-flash"),
-            "model.gemini"
+            "model"
         );
         assert_eq!(
             super::implementation_to_model_role("elevenlabs-v1"),
@@ -3316,7 +3718,7 @@ mod tests {
                 "media.analyze".into(),
                 ComponentExecutionRoute {
                     target_node: "aria-node".into(),
-                    target_role: "model.gemini".into(),
+                    target_role: "model".into(),
                     incarnation_id: Some("aria-architect-hotel:model-controller-gemini".into()),
                     hotel_id: Some("aria-architect-hotel".into()),
                     environment_id: None,
@@ -3330,7 +3732,7 @@ mod tests {
         let target =
             resolve_model_execution_target(Some(&state), "media.analyze", DEFAULT_TEXT_MODEL_ROLE);
         assert_eq!(target.0, "aria-node");
-        assert_eq!(target.1, "model.gemini");
+        assert_eq!(target.1, "model");
         assert_eq!(
             target.2.as_deref(),
             Some("aria-architect-hotel:model-controller-gemini")

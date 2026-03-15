@@ -24,6 +24,20 @@ pub fn tool_catalog() -> &'static HashMap<String, ToolDefinition> {
     TOOL_CATALOG.get_or_init(build_catalog)
 }
 
+/// Returns the static list of tool names implied by a built-in skill.
+///
+/// When `effective_skillset` contains a skill name, all tools in this list
+/// are merged into the visible toolset during assembly. Returns an empty slice
+/// for unknown or zero-implied-tool skills.
+pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
+    match skill_name {
+        "handoff.to_role" => &["session.status"],
+        "handoff.back" => &["session.status"],
+        "role.governance" => &["session.status", "agent.configure", "role.configure"],
+        _ => &[],
+    }
+}
+
 /// Returns the approval/projection class for a tool name, or `None` if the tool
 /// is not in the built-in catalog.
 pub fn tool_class(tool_name: &str) -> Option<&'static str> {
@@ -131,6 +145,97 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
     );
 
     m.insert(
+        "skill.register".into(),
+        ToolDefinition {
+            tool_name: "skill.register".into(),
+            description: "Registers a new delegation skill in the hotel's shared skill catalog. \
+                          A delegation skill defines a reusable subagent role with a goal template, \
+                          allowed tools, and lifecycle configuration. The hotel validates the skill \
+                          structurally and returns the validation outcome. Once registered, the skill \
+                          can be referenced by name when spawning subagents."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "skill_name": {
+                        "type": "string",
+                        "description": "Stable identifier for the skill. Lowercase alphanumeric, \
+                                        hyphens, and underscores only. Max 64 characters."
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Human-readable description of what the skill does. Max 2048 characters."
+                    },
+                    "subagent_kind": {
+                        "type": "string",
+                        "description": "The role name of the subagent worker this skill delegates to \
+                                        (e.g., 'agent-worker')."
+                    },
+                    "goal": {
+                        "type": "string",
+                        "description": "Goal template injected into the subagent context when this \
+                                        skill is invoked. May include placeholders."
+                    },
+                    "allowed_tools": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional list of tool IDs the subagent is permitted to use."
+                    },
+                    "allowed_classes": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional list of tool class names the subagent may use \
+                                        (e.g., 'utility', 'workspace')."
+                    }
+                },
+                "required": ["skill_name", "description", "subagent_kind", "goal"]
+            }),
+            class: Some("capability".into()),
+        },
+    );
+
+    m.insert(
+        "subagent.spawn".into(),
+        ToolDefinition {
+            tool_name: "subagent.spawn".into(),
+            description: "Spawns a new subagent worker in the hotel. The subagent runs \
+                          independently with its own lease and model turn budget. Use this to \
+                          delegate a discrete, self-contained task to a worker process. The hotel \
+                          responds with the subagent's guest ID and confirmed lease details."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "goal": {
+                        "type": "string",
+                        "description": "The mission goal text delivered to the subagent."
+                    },
+                    "subagent_kind": {
+                        "type": "string",
+                        "description": "The worker role to spawn. Defaults to 'agent-worker'."
+                    },
+                    "context_summary": {
+                        "type": "string",
+                        "description": "Optional context summary paragraph handed to the subagent \
+                                        as background knowledge."
+                    },
+                    "allowed_tools": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional list of tool IDs the subagent may use."
+                    },
+                    "iteration_budget": {
+                        "type": "integer",
+                        "description": "Maximum model-turn iterations for the subagent. Defaults to 5."
+                    }
+                },
+                "required": ["goal"]
+            }),
+            class: Some("capability".into()),
+        },
+    );
+
+    m.insert(
         "agent.configure".into(),
         ToolDefinition {
             tool_name: "agent.configure".into(),
@@ -169,6 +274,66 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                 "required": ["config_path", "value"]
             }),
             class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "role.configure".into(),
+        ToolDefinition {
+            tool_name: "role.configure".into(),
+            description: "Create or update a role incarnation for the current agent identity. \
+                          Requires reasoning about: purpose, toolset, skillset, handoff posture, \
+                          and limits (TTL, iteration caps). Only the orchestrator can use this tool."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "role_name": {
+                        "type": "string",
+                        "description": "The name of the role (e.g. 'developer', 'researcher')."
+                    },
+                    "toolset_profile": {
+                        "type": "string",
+                        "description": "The profile name determining default tools/skills (e.g. 'codex', 'research', 'utility')."
+                    },
+                    "role_identity_addendum": {
+                        "type": "string",
+                        "description": "Additive persona/identity instructions for this specific role."
+                    },
+                    "inactive_ttl_seconds": {
+                        "type": "integer",
+                        "description": "Seconds of inactivity before the role is suspended/terminated."
+                    },
+                    "iteration_cap": {
+                        "type": "integer",
+                        "description": "Maximum model-turn iterations allowed for this role before it must return or stop."
+                    },
+                    "approval_policy": {
+                        "type": "string",
+                        "description": "Stringified JSON describing the approval policy structure."
+                    },
+                    "model_profile": {
+                        "type": "string",
+                        "description": "Stringified JSON describing model preferences (provider, temperature)."
+                    },
+                    "context_window_policy": {
+                        "type": "string",
+                        "description": "Stringified JSON describing context packaging rules."
+                    },
+                    "reasoning": {
+                        "type": "object",
+                        "description": "Required reasoning for this role's existence, purpose, and capability posture.",
+                        "properties": {
+                            "purpose": { "type": "string" },
+                            "toolset_rationale": { "type": "string" },
+                            "handoff_posture_and_limits": { "type": "string" }
+                        },
+                        "required": ["purpose", "toolset_rationale", "handoff_posture_and_limits"]
+                    }
+                },
+                "required": ["role_name", "toolset_profile", "reasoning"]
+            }),
+            class: Some("capability".into()),
         },
     );
 

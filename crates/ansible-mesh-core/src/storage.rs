@@ -8,6 +8,7 @@
 use crate::event::EventEnvelope;
 use crate::graph::{
     AbstractSkillRecord, AbstractToolRecord, GraphEdge, GraphNode, RoleIncarnationRecord,
+    ToolsetProfileRecord,
 };
 use crate::NodeCapabilities;
 use anyhow::Result;
@@ -200,6 +201,9 @@ pub trait GraphStorage: Send + Sync {
     /// Update the `active_pid` column for a guest.
     fn set_guest_pid(&self, hotel_name: &str, guest_id: &str, pid: Option<&str>) -> Result<()>;
 
+    /// Update the `is_active` flag for a guest (e.g. mark released subagents inactive).
+    fn set_guest_active(&self, hotel_name: &str, guest_id: &str, active: bool) -> Result<()>;
+
     /// Bulk-insert or replace guest rows (used during initial seeding).
     fn seed_guests(&self, hotel_name: &str, guests: &[GuestRecord]) -> Result<()>;
 
@@ -266,6 +270,20 @@ pub trait GraphStorage: Send + Sync {
 
     /// List all abstract skill definitions in the catalog.
     fn list_abstract_skills(&self) -> Result<Vec<AbstractSkillRecord>>;
+
+    // ── Toolset profiles (role provisioning bundles) ─────────────────────
+
+    /// Upsert a named toolset profile into the context graph.
+    fn upsert_toolset_profile(&self, profile: &ToolsetProfileRecord) -> Result<()>;
+
+    /// Load a single toolset profile by name, or `None` if not found.
+    fn get_toolset_profile(
+        &self,
+        profile_name: &str,
+    ) -> Result<Option<ToolsetProfileRecord>>;
+
+    /// List all toolset profiles in the context graph.
+    fn list_toolset_profiles(&self) -> Result<Vec<ToolsetProfileRecord>>;
 }
 
 /// Generic graph persistence contract.

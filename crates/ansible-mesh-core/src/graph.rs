@@ -68,17 +68,71 @@ pub struct AbstractToolRecord {
     pub class: String,
 }
 
+/// Lifecycle and validation state for a shared skill definition.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", content = "data")]
+#[serde(rename_all = "snake_case")]
+pub enum SkillValidationState {
+    Draft,
+    Validated,
+    Registered,
+    Suspended { reason: String },
+    Invalid { errors: Vec<String> },
+    Deprecated,
+}
+
+impl Default for SkillValidationState {
+    fn default() -> Self {
+        Self::Draft
+    }
+}
+
+/// Provenance snapshot describing where and when a skill was registered.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct SkillSourceSnapshot {
+    pub mesh_catalog_version: String,
+    pub hotel_policy_version: String,
+    pub registered_at: u64,
+    pub registered_by: String,
+}
+
 /// A system-wide shared skill definition stored in the context graph.
 ///
 /// Node kind: `abstract_skill`. Node key: `abstract_skill:{skill_name}`.
 /// Skills provide model-facing posture hints and can imply tool grants when a
 /// role or session activates them.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct AbstractSkillRecord {
     pub skill_name: String,
     pub description: String,
     #[serde(default)]
     pub implied_tools: Vec<String>,
+    #[serde(default)]
+    pub validation_state: SkillValidationState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_snapshot: Option<SkillSourceSnapshot>,
+    #[serde(default)]
+    pub field_sources: serde_json::Value,
+}
+
+/// A named bundle of allowed tools, tool classes, and skills granted to a role.
+///
+/// Node kind: `toolset_profile`. Node key: `toolset_profile:{profile_name}`.
+/// `RoleIncarnationRecord.toolset_profile` holds this name as a reference.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ToolsetProfileRecord {
+    pub profile_name: String,
+    /// Explicit tool names granted by this profile.
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    /// Tool class names granted by this profile (e.g. "session", "utility").
+    #[serde(default)]
+    pub allowed_classes: Vec<String>,
+    /// Skill names whose `implied_tools` are transitively granted.
+    #[serde(default)]
+    pub allowed_skills: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// Per-role runtime loop controls for a role incarnation.

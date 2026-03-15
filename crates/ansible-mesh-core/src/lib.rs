@@ -19,6 +19,7 @@ pub mod runtime;
 pub mod sqlite_storage;
 pub mod storage;
 pub mod tools;
+pub mod validation;
 pub mod webrtc;
 
 /// Represents a unique identifier for a node in the mesh network.

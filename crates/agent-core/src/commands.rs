@@ -15,6 +15,7 @@ pub enum SlashCommand {
     WorkspaceClear,
     Approve { note: Option<String> },
     Deny { note: Option<String> },
+    Abandon { reason: Option<String> },
     PreapproveThisSession,
     ApprovalStatus,
     ApprovalReset,
@@ -39,6 +40,7 @@ impl SlashCommand {
             Self::WorkspaceClear => None,
             Self::Approve { .. } => Some("approved"),
             Self::Deny { .. } => Some("denied"),
+            Self::Abandon { .. } => None,
             Self::PreapproveThisSession | Self::ApprovalStatus | Self::ApprovalReset => None,
             Self::Tts { .. } => None,
         }
@@ -86,6 +88,9 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         }),
         ["/deny", rest @ ..] => Some(SlashCommand::Deny {
             note: join_command_note(rest),
+        }),
+        ["/abandon", rest @ ..] => Some(SlashCommand::Abandon {
+            reason: join_command_note(rest),
         }),
         ["/preapprove", "this-session", ..] => Some(SlashCommand::PreapproveThisSession),
         ["/approval", "status", ..] => Some(SlashCommand::ApprovalStatus),
@@ -204,6 +209,20 @@ mod tests {
             parse_slash_command("/tts auto"),
             Some(SlashCommand::Tts {
                 mode: Some("auto".into())
+            })
+        );
+    }
+
+    #[test]
+    fn parses_abandon_command() {
+        assert_eq!(
+            parse_slash_command("/abandon"),
+            Some(SlashCommand::Abandon { reason: None })
+        );
+        assert_eq!(
+            parse_slash_command("/abandon could not complete the task"),
+            Some(SlashCommand::Abandon {
+                reason: Some("could not complete the task".into())
             })
         );
     }

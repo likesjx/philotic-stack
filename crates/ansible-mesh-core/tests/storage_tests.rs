@@ -7,7 +7,9 @@
 //! - `IpcRequest` / `IpcResponse` serialization round-trips
 
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
-use ansible_mesh_core::graph::{AbstractSkillRecord, RoleIncarnationRecord, TurnLoopConfig};
+use ansible_mesh_core::graph::{
+    AbstractSkillRecord, RoleIncarnationRecord, ToolsetProfileRecord, TurnLoopConfig,
+};
 use ansible_mesh_core::sqlite_storage::{
     SqliteCursorStorage, SqliteEventStorage, SqliteGraphStorage,
 };
@@ -401,7 +403,7 @@ fn graph_storage_secret_round_trips() {
         secret_ref: "secret://hotel/default/test/one".into(),
         secret_kind: "test".into(),
         scope: "hotel".into(),
-        allowed_roles: vec!["model.gemini".into()],
+        allowed_roles: vec!["model".into()],
         allowed_guests: vec!["guest-1".into()],
         ciphertext_b64: "ciphertext".into(),
         nonce_b64: "nonce".into(),
@@ -840,6 +842,7 @@ fn graph_storage_abstract_skill_round_trip() {
         skill_name: "handoff.to_role".into(),
         description: "Hand off to a specialist role once the target is justified.".into(),
         implied_tools: vec!["session.status".into()],
+        ..Default::default()
     };
 
     store.upsert_abstract_skill(&skill).unwrap();
@@ -854,6 +857,31 @@ fn graph_storage_abstract_skill_round_trip() {
     assert!(listed
         .iter()
         .any(|entry| entry.skill_name == "handoff.to_role"));
+}
+
+#[test]
+fn graph_storage_toolset_profile_round_trip() {
+    let store = open_graph_storage();
+    let profile = ToolsetProfileRecord {
+        profile_name: "orchestrator".into(),
+        allowed_tools: vec!["session.status".into(), "echo".into()],
+        allowed_classes: vec!["session".into()],
+        allowed_skills: vec!["handoff.to_role".into()],
+        description: Some("Core orchestrator profile.".into()),
+    };
+
+    store.upsert_toolset_profile(&profile).unwrap();
+
+    let loaded = store
+        .get_toolset_profile("orchestrator")
+        .unwrap()
+        .expect("toolset profile should exist");
+    assert_eq!(loaded, profile);
+
+    let listed = store.list_toolset_profiles().unwrap();
+    assert!(listed
+        .iter()
+        .any(|p| p.profile_name == "orchestrator"));
 }
 
 #[test]

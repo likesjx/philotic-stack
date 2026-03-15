@@ -1,5 +1,5 @@
 use ansible_mesh_core::beacon::BeaconDaemon;
-use ansible_mesh_core::graph::{AbstractSkillRecord, AbstractToolRecord};
+use ansible_mesh_core::graph::{AbstractSkillRecord, AbstractToolRecord, ToolsetProfileRecord};
 use ansible_mesh_core::heartbeat::emit_heartbeat;
 use ansible_mesh_core::registry::{CapabilityAdvertisement, ExecutionReachability};
 use ansible_mesh_core::storage::{
@@ -591,7 +591,7 @@ fn guest_seed_for_profile(hotel_name: &str, profile: &AgentProfile) -> Vec<Guest
                 }
             })
             .to_string(),
-            role: "model.gemini".into(),
+            role: "model".into(),
             is_active: true,
             active_pid: None,
         },
@@ -898,7 +898,7 @@ fn deactivate_legacy_managed_guests(
                             | "hegemon"
                             | "membrane"
                             | "model"
-                            | "model.gemini"
+                            | "model"
                             | "model.elevenlabs"
                             | "tool"
                     ))
@@ -1024,23 +1024,81 @@ fn seed_abstract_skill_catalog(graph: &dyn GraphStorage) -> anyhow::Result<()> {
     let catalog = [
         AbstractSkillRecord {
             skill_name: "handoff.to_role".into(),
-            description: "Assess whether the current session should be handed off to a named specialist role, summarize the goal clearly, and only hand off once the target role is justified.".into(),
-            implied_tools: Vec::new(),
+            description: "Handoff to a specialist role cleanly, explicitly transferring context, goals, and known constraints so the target can start work immediately without thrashing.".into(),
+            implied_tools: vec!["session.status".into()],
+            ..Default::default()
         },
         AbstractSkillRecord {
             skill_name: "handoff.back".into(),
             description: "Return a session from a specialist role back to the orchestrator with a concise summary of completed work, open questions, and the next recommended action.".into(),
-            implied_tools: Vec::new(),
+            implied_tools: vec!["session.status".into()],
+            ..Default::default()
         },
         AbstractSkillRecord {
             skill_name: "role.governance".into(),
             description: "Govern role definitions deliberately for the current agent identity, reasoning explicitly about purpose, capability posture, handoff behavior, and limits before proposing changes.".into(),
-            implied_tools: Vec::new(),
+            implied_tools: vec!["session.status".into(), "agent.configure".into(), "role.configure".into()],
+            ..Default::default()
         },
     ];
 
     for skill in &catalog {
         graph.upsert_abstract_skill(skill)?;
+    }
+    Ok(())
+}
+
+fn seed_toolset_profiles(graph: &dyn GraphStorage) -> anyhow::Result<()> {
+    let profiles = [
+        ToolsetProfileRecord {
+            profile_name: "orchestrator".into(),
+            allowed_tools: vec![
+                "session.status".into(),
+                "echo".into(),
+                "agent.configure".into(),
+                "skill.register".into(),
+                "subagent.spawn".into(),
+                "workspace.list".into(),
+                "workspace.read".into(),
+            ],
+            allowed_classes: vec!["session".into(), "utility".into(), "config".into()],
+            allowed_skills: vec![
+                "handoff.to_role".into(),
+                "handoff.back".into(),
+                "role.governance".into(),
+            ],
+            description: Some("Default orchestrator role profile.".into()),
+        },
+        ToolsetProfileRecord {
+            profile_name: "codex".into(),
+            allowed_tools: vec![
+                "session.status".into(),
+                "echo".into(),
+                "workspace.list".into(),
+                "workspace.read".into(),
+            ],
+            allowed_classes: vec!["session".into(), "utility".into(), "workspace".into()],
+            allowed_skills: vec!["handoff.back".into()],
+            description: Some("Codex specialist role profile — workspace read access.".into()),
+        },
+        ToolsetProfileRecord {
+            profile_name: "research".into(),
+            allowed_tools: vec!["session.status".into(), "echo".into()],
+            allowed_classes: vec!["session".into(), "utility".into()],
+            allowed_skills: vec!["handoff.back".into()],
+            description: Some("Research specialist role profile — minimal tool surface.".into()),
+        },
+        ToolsetProfileRecord {
+            profile_name: "utility".into(),
+            allowed_tools: vec!["session.status".into(), "echo".into()],
+            allowed_classes: vec!["session".into(), "utility".into()],
+            allowed_skills: Vec::new(),
+            description: Some("Bare utility profile — session and echo only.".into()),
+        },
+    ];
+
+    for profile in &profiles {
+        graph.upsert_toolset_profile(profile)?;
     }
     Ok(())
 }
@@ -1058,7 +1116,7 @@ fn enable_guest_test_overrides(
     match test {
         StartupTest::TextRoundTrip => {
             for guest in &mut guests {
-                if guest.role != "model.gemini" {
+                if guest.role != "model" {
                     continue;
                 }
 
@@ -1083,7 +1141,7 @@ fn enable_guest_test_overrides(
             )?;
 
             for guest in &mut guests {
-                if guest.role != "model.gemini" {
+                if guest.role != "model" {
                     continue;
                 }
 
@@ -1108,14 +1166,14 @@ fn enable_guest_test_overrides(
                 SecretInput {
                     secret_kind: "gemini-startup-oauth-token".into(),
                     scope: "startup-test".into(),
-                    allowed_roles: vec!["model.gemini".into()],
+                    allowed_roles: vec!["model".into()],
                     allowed_guests: Vec::new(),
                     plaintext: "startup-test-oauth-bearer".into(),
                 },
             )?;
 
             for guest in &mut guests {
-                if guest.role != "model.gemini" {
+                if guest.role != "model" {
                     continue;
                 }
 
@@ -1186,7 +1244,7 @@ fn enable_guest_test_overrides(
                     .and_then(serde_json::Value::as_object_mut)
                     .context("guest config missing env object")?;
 
-                if guest.role == "model.gemini" {
+                if guest.role == "model" {
                     env.remove("PHILOTIC_MODEL_ROUTER_STUB_RESPONSE");
                     env.insert(
                         "PHILOTIC_GEMINI_BASE_URL".into(),
@@ -1996,7 +2054,7 @@ async fn run_startup_test(
             let response = client
                 .send_request(IpcRequest::EmitTask {
                     target_node: local_node_id.clone(),
-                    target_role: "model.gemini".into(),
+                    target_role: "model".into(),
                     target_guest_id: None,
                     task_json: serde_json::json!({
                         "kind": "text.generate",
@@ -2985,6 +3043,7 @@ async fn main() -> Result<()> {
 
     seed_abstract_tool_catalog(&graph_storage)?;
     seed_abstract_skill_catalog(&graph_storage)?;
+    seed_toolset_profiles(&graph_storage)?;
 
     if let Some(test) = startup_test {
         prepare_startup_test_binaries(test)?;
@@ -3598,7 +3657,7 @@ mod tests {
             Some("/tmp/philotic-beta-hotel.sock")
         );
         assert!(guests.iter().all(|guest| guest.hotel_name == "beta-hotel"));
-        assert!(guests.iter().any(|guest| guest.role == "model.gemini"));
+        assert!(guests.iter().any(|guest| guest.role == "model"));
         assert!(guests.iter().any(|guest| guest.role == "model.elevenlabs"));
         assert!(guests.iter().any(|guest| guest.role == "tool"));
         assert_eq!(
@@ -3912,7 +3971,7 @@ mod tests {
             .expect("list guests");
         let model = stored
             .into_iter()
-            .find(|guest| guest.role == "model.gemini")
+            .find(|guest| guest.role == "model")
             .expect("model guest should exist");
         let config: serde_json::Value =
             serde_json::from_str(&model.config_json).expect("config should decode");
@@ -3943,7 +4002,7 @@ mod tests {
             .expect("list guests");
         let model = stored
             .into_iter()
-            .find(|guest| guest.role == "model.gemini")
+            .find(|guest| guest.role == "model")
             .expect("model guest should exist");
         let config: serde_json::Value =
             serde_json::from_str(&model.config_json).expect("config should decode");

@@ -1,14 +1,7 @@
-mod catalog;
-mod commands;
-mod r#loop;
-mod protocol;
-mod runtime;
-mod session;
-
+use agent_core::runtime::{AgentRuntime, DEFAULT_AGENT_ID};
 use anyhow::Result;
 use clap::Parser;
 use philotic_client::GuestIdentity;
-use runtime::{AgentRuntime, DEFAULT_AGENT_ID};
 use tracing::info;
 
 #[derive(Parser, Debug)]

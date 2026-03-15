@@ -6,12 +6,15 @@ use crate::service::lease::{
 };
 use crate::vault::{SecretAccess, resolve_secret};
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
+use ansible_mesh_core::graph::{AbstractSkillRecord, SkillValidationState};
 use ansible_mesh_core::registry::{CapabilityAdvertisement, NodeRegistry};
 use ansible_mesh_core::storage::{
     GraphStorage, SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,
 };
+use ansible_mesh_core::validation::{apply_validation_to_record, validate_skill_layer1, SkillDraft};
 use philotic_client::{
-    GuestIdentity, HandoffBundle, IpcRequest, IpcResponse, LeaseEnvelope, LeaseStatus,
+    GuestIdentity, HookRoute, HookSubscription, IpcRequest, IpcResponse, LeaseEnvelope,
+    LeaseStatus, SubagentDelegation,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -27,6 +30,25 @@ use uuid::Uuid;
 use ansible_mesh_core::registry::ExecutionReachability;
 
 pub(crate) type InboxRegistry = Arc<Mutex<HashMap<String, Vec<RoleSubscriber>>>>;
+
+/// Per-subagent hook routing record stored in the hotel's in-memory registry.
+/// Created at SpawnSubagent time; dropped on ReleaseSubagent or lease expiry.
+#[derive(Clone)]
+struct SubagentHookRecord {
+    /// Which persona agent spawned this subagent (for PersonaAgent route).
+    persona_guest_id: String,
+    /// The role the persona agent registered under (for inbox lookup).
+    persona_role: String,
+    /// Hook subscriptions declared by the delegation skill.
+    hook_subscriptions: Vec<HookSubscription>,
+    /// Where to deliver `subagent.complete`.
+    completion_route: HookRoute,
+    /// Where to deliver `subagent.failed`.
+    failure_route: HookRoute,
+}
+
+/// Maps `subagent_guest_id` → routing record.
+type SubagentHookRegistry = Arc<Mutex<HashMap<String, SubagentHookRecord>>>;
 
 #[derive(Clone)]
 pub(crate) struct RoleSubscriber {
@@ -104,6 +126,8 @@ pub struct IpcServer {
     parked_inbound: Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
     materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
     telegram_poll_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
+    subagent_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
+    subagent_hooks: SubagentHookRegistry,
     registry: Arc<RwLock<NodeRegistry>>,
 }
 
@@ -135,6 +159,39 @@ impl LeaseObserver for LoggingLeaseObserver {
             LeaseObserverEventKind::Revoked => info!(
                 "Telegram poll lease [{}] revoked for guest [{}] epoch {}.",
                 event.lease.lease_scope, event.lease.owner_guest_id, event.lease.lease_epoch
+            ),
+        }
+    }
+}
+
+struct LoggingSubagentLeaseObserver;
+
+impl LeaseObserver for LoggingSubagentLeaseObserver {
+    fn on_event(&mut self, event: &LeaseObserverEvent) {
+        match event.kind {
+            LeaseObserverEventKind::Granted => info!(
+                "Subagent lease [{}] granted to guest [{}] epoch {}.",
+                event.lease.lease_scope, event.lease.owner_guest_id, event.lease.lease_epoch
+            ),
+            LeaseObserverEventKind::Released => info!(
+                "Subagent lease [{}] released by guest [{}].",
+                event.lease.lease_scope, event.lease.owner_guest_id
+            ),
+            LeaseObserverEventKind::Renewed => info!(
+                "Subagent lease [{}] renewed by guest [{}] epoch {}.",
+                event.lease.lease_scope, event.lease.owner_guest_id, event.lease.lease_epoch
+            ),
+            LeaseObserverEventKind::Expired => info!(
+                "Subagent lease [{}] expired for guest [{}] epoch {}.",
+                event.lease.lease_scope, event.lease.owner_guest_id, event.lease.lease_epoch
+            ),
+            LeaseObserverEventKind::StaleOwnerDropped => info!(
+                "Stale subagent lease [{}] dropped for guest [{}].",
+                event.lease.lease_scope, event.lease.owner_guest_id
+            ),
+            LeaseObserverEventKind::Revoked => info!(
+                "Subagent lease [{}] revoked for guest [{}].",
+                event.lease.lease_scope, event.lease.owner_guest_id
             ),
         }
     }
@@ -318,6 +375,8 @@ impl IpcServer {
             parked_inbound: Arc::new(Mutex::new(HashMap::new())),
             materialization_requester: None,
             telegram_poll_leases: Arc::new(Mutex::new(RuntimeLeaseRegistry::default())),
+            subagent_leases: Arc::new(Mutex::new(RuntimeLeaseRegistry::default())),
+            subagent_hooks: Arc::new(Mutex::new(HashMap::new())),
             registry: Arc::new(RwLock::new(NodeRegistry::new())),
         }
     }
@@ -359,6 +418,8 @@ impl IpcServer {
                     let parked_inbound = self.parked_inbound.clone();
                     let materialization_requester = self.materialization_requester.clone();
                     let telegram_poll_leases = self.telegram_poll_leases.clone();
+                    let subagent_leases = self.subagent_leases.clone();
+                    let subagent_hooks = self.subagent_hooks.clone();
                     let registry = self.registry.clone();
                     tokio::spawn(async move {
                         if let Err(e) = Self::handle_client(
@@ -370,6 +431,8 @@ impl IpcServer {
                             parked_inbound,
                             materialization_requester,
                             telegram_poll_leases,
+                            subagent_leases,
+                            subagent_hooks,
                             registry,
                         )
                         .await
@@ -394,6 +457,8 @@ impl IpcServer {
         parked_inbound: Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
         materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
         telegram_poll_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
+        subagent_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
+        subagent_hooks: SubagentHookRegistry,
         registry: Arc<RwLock<NodeRegistry>>,
     ) -> anyhow::Result<()> {
         let conn_id = Uuid::new_v4();
@@ -437,6 +502,8 @@ impl IpcServer {
                             &parked_inbound,
                             materialization_requester.as_deref(),
                             &telegram_poll_leases,
+                            &subagent_leases,
+                            &subagent_hooks,
                             &registry,
                             conn_id,
                             &outbound_tx,
@@ -520,6 +587,226 @@ impl IpcServer {
         let mut observer = LoggingLeaseObserver;
         for scope in scopes {
             let _ = guard.release(&scope, conn_id, &mut observer);
+        }
+    }
+
+    // ── Subagent lease helpers ──────────────────────────────────────────────
+
+    fn subagent_lease_scope(subagent_guest_id: &str) -> String {
+        format!("subagent:{}", subagent_guest_id)
+    }
+
+    fn subagent_lease_candidate(
+        local_node_id: &str,
+        subagent_guest_id: &str,
+        persona_guest_id: &str,
+        ttl_seconds: u64,
+    ) -> LeaseEnvelope {
+        LeaseEnvelope {
+            lease_type: "subagent".into(),
+            lease_scope: Self::subagent_lease_scope(subagent_guest_id),
+            authority_hotel: local_node_id.to_string(),
+            authority_component: Some("ansible".into()),
+            owner_guest_id: subagent_guest_id.to_string(),
+            owner_hotel: Some(local_node_id.to_string()),
+            owner_component_type: Some("agent-worker".into()),
+            lease_epoch: 0,
+            lease_expires_at: 0,
+            last_heartbeat_at: 0,
+            status: LeaseStatus::Active,
+            delegated_from: Some(persona_guest_id.to_string()),
+            metadata: serde_json::json!({
+                "persona_guest_id": persona_guest_id,
+                "ttl_seconds": ttl_seconds,
+            }),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_spawn_subagent(
+        local_node_id: &str,
+        graph: &dyn GraphStorage,
+        inboxes: &InboxRegistry,
+        materialization_requester: Option<&dyn GuestMaterializationRequester>,
+        subagent_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
+        subagent_hooks: &SubagentHookRegistry,
+        conn_id: Uuid,
+        identity: &GuestIdentity,
+        session_id: &str,
+        delegation: SubagentDelegation,
+    ) -> IpcResponse {
+        let subagent_guest_id = Uuid::new_v4().to_string();
+        let ttl = delegation.lease_terms.ttl_seconds;
+
+        // 1. Register the subagent guest in the context graph so the materializer
+        //    can spawn and supervise it.
+        let config_json = serde_json::json!({
+            "command": "agent-worker",
+            "env": {
+                "PHILOTIC_AGENT_ID":        &subagent_guest_id,
+                "PHILOTIC_SESSION_ID":      session_id,
+                "PHILOTIC_PARENT_GUEST_ID": identity.guest_id,
+                "PHILOTIC_SUBAGENT_KIND":   &delegation.subagent_kind,
+            },
+        });
+        let guest_record = ansible_mesh_core::storage::GuestRecord {
+            hotel_name: local_node_id.to_string(),
+            guest_id: subagent_guest_id.clone(),
+            role: delegation.subagent_kind.clone(),
+            config_json: config_json.to_string(),
+            is_active: true,
+            active_pid: None,
+        };
+        if let Err(e) = graph.seed_guests(local_node_id, &[guest_record]) {
+            return IpcResponse::error(
+                "spawn_subagent",
+                "SUBAGENT_GUEST_REGISTER_FAILED",
+                e.to_string(),
+            );
+        }
+
+        // 2. Acquire a subagent lease on behalf of the new guest.
+        let candidate = Self::subagent_lease_candidate(
+            local_node_id,
+            &subagent_guest_id,
+            &identity.guest_id,
+            ttl,
+        );
+        let lease = {
+            let mut guard = subagent_leases.lock().await;
+            let mut observer = LoggingSubagentLeaseObserver;
+            match guard.acquire(conn_id, candidate, ttl, unix_ts(), &mut observer) {
+                LeaseAcquireOutcome::Granted(lease) => lease,
+                LeaseAcquireOutcome::Denied(existing) => {
+                    return IpcResponse::error(
+                        "spawn_subagent",
+                        "SUBAGENT_LEASE_DENIED",
+                        format!(
+                            "Subagent lease scope already held by epoch {}",
+                            existing.lease_epoch
+                        ),
+                    );
+                }
+            }
+        };
+
+        // 3. Register hook subscriptions and routing for this subagent.
+        {
+            let mut guard = subagent_hooks.lock().await;
+            guard.insert(
+                subagent_guest_id.clone(),
+                SubagentHookRecord {
+                    persona_guest_id: identity.guest_id.clone(),
+                    persona_role: identity.role.clone(),
+                    hook_subscriptions: delegation.hook_subscriptions.clone(),
+                    completion_route: delegation.completion_route.clone(),
+                    failure_route: delegation.failure_route.clone(),
+                },
+            );
+        }
+
+        // 4. Trigger materialization so the worker binary starts up.
+        if let Some(requester) = materialization_requester {
+            match requester.ensure_guest_active(&subagent_guest_id).await {
+                Ok(activated) => {
+                    if activated {
+                        info!(
+                            "Subagent guest [{}] materialization triggered for session [{}].",
+                            subagent_guest_id, session_id
+                        );
+                    } else {
+                        info!(
+                            "Subagent guest [{}] was already active (session [{}]).",
+                            subagent_guest_id, session_id
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Subagent guest [{}] materialization failed: {}. Lease granted; worker may self-start.",
+                        subagent_guest_id, e
+                    );
+                }
+            }
+        } else {
+            info!(
+                "No materialization requester configured; subagent [{}] must connect independently.",
+                subagent_guest_id
+            );
+        }
+
+        // 5. Eagerly notify persona's inbox that spawning is underway.
+        let notification_task_id = Uuid::new_v4();
+        let notification_json = serde_json::json!({
+            "kind": "subagent_spawned",
+            "subagent_guest_id": subagent_guest_id,
+            "session_id": session_id,
+            "lease_epoch": lease.lease_epoch,
+            "lease_expires_at": lease.lease_expires_at,
+        })
+        .to_string();
+        Self::deliver_inbound_task(
+            inboxes,
+            local_node_id,
+            &identity.role,
+            Some(&identity.guest_id),
+            notification_task_id,
+            notification_json,
+        )
+        .await;
+
+        info!(
+            "SpawnSubagent complete: subagent_guest_id=[{}] session=[{}] kind=[{}] ttl={}s.",
+            subagent_guest_id, session_id, delegation.subagent_kind, ttl
+        );
+
+        IpcResponse::SpawnSubagentOk {
+            subagent_guest_id,
+            confirmed_lease: lease,
+        }
+    }
+
+    /// Deliver a hook event to the appropriate inbox based on its `HookRoute`.
+    async fn deliver_hook_to_route(
+        inboxes: &InboxRegistry,
+        route: &HookRoute,
+        persona_guest_id: &str,
+        persona_role: &str,
+        local_node_id: &str,
+        task_id: Uuid,
+        task_json: String,
+    ) {
+        match route {
+            HookRoute::PersonaAgent => {
+                Self::deliver_inbound_task(
+                    inboxes,
+                    local_node_id,
+                    persona_role,
+                    Some(persona_guest_id),
+                    task_id,
+                    task_json,
+                )
+                .await;
+            }
+            HookRoute::Role { role_name } => {
+                Self::deliver_inbound_task(
+                    inboxes,
+                    local_node_id,
+                    role_name,
+                    None, // any subscriber for this role
+                    task_id,
+                    task_json,
+                )
+                .await;
+            }
+            HookRoute::Discard => {
+                // Side-effect only — handler_skill invocation is out of scope for hotel.
+                // Hotel logs and drops. The skill runtime will invoke handler_skill locally.
+                info!(
+                    "Hook task {} routed to Discard (local side-effect only).",
+                    task_id
+                );
+            }
         }
     }
 
@@ -853,6 +1140,8 @@ impl IpcServer {
         parked_inbound: &Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
         materialization_requester: Option<&dyn GuestMaterializationRequester>,
         telegram_poll_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
+        subagent_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
+        subagent_hooks: &SubagentHookRegistry,
         registry: &Arc<RwLock<NodeRegistry>>,
         conn_id: Uuid,
         outbound_tx: &mpsc::UnboundedSender<IpcResponse>,
@@ -1703,14 +1992,19 @@ impl IpcServer {
                     );
                 }
 
-                IpcResponse::error(
-                    "spawn_subagent",
-                    "SUBAGENT_NOT_IMPLEMENTED",
-                    format!(
-                        "Subagent delegation contract is defined for session [{}] and kind [{}], but runtime spawning is not implemented yet.",
-                        session_id, delegation.subagent_kind
-                    ),
+                Self::handle_spawn_subagent(
+                    local_node_id,
+                    graph,
+                    inboxes,
+                    materialization_requester,
+                    subagent_leases,
+                    subagent_hooks,
+                    conn_id,
+                    identity,
+                    &session_id,
+                    delegation,
                 )
+                .await
             }
             IpcRequest::ListRoleIncarnations { agent_id } => {
                 match graph.list_role_incarnations(&agent_id) {
@@ -1727,6 +2021,398 @@ impl IpcServer {
                         err.to_string(),
                     ),
                 }
+            }
+            IpcRequest::AssignSubagentTask {
+                subagent_guest_id,
+                lease_epoch,
+                delegation,
+            } => {
+                let Some(identity) = current_identity.as_ref() else {
+                    return IpcResponse::error(
+                        "assign_subagent_task",
+                        "SUBAGENT_UNREGISTERED",
+                        "guest must register before assigning subagent tasks",
+                    );
+                };
+                // Verify the lease is still live and epoch matches.
+                let lease_ok = {
+                    let guard = subagent_leases.lock().await;
+                    let scope = Self::subagent_lease_scope(&subagent_guest_id);
+                    guard
+                        .inspect(&scope)
+                        .is_some_and(|l| l.lease_epoch == lease_epoch && l.is_active())
+                };
+                if !lease_ok {
+                    return IpcResponse::error(
+                        "assign_subagent_task",
+                        "SUBAGENT_LEASE_INVALID",
+                        format!(
+                            "No active subagent lease for guest [{}] at epoch {}",
+                            subagent_guest_id, lease_epoch
+                        ),
+                    );
+                }
+                let task_id = Uuid::new_v4();
+                let task_json = match serde_json::to_string(&delegation) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        return IpcResponse::error(
+                            "assign_subagent_task",
+                            "DELEGATION_SERIALIZE_FAILED",
+                            e.to_string(),
+                        );
+                    }
+                };
+                // Route to the subagent worker's inbox by subagent_kind + guest_id.
+                Self::deliver_inbound_task(
+                    inboxes,
+                    &identity.guest_id,
+                    &delegation.subagent_kind,
+                    Some(&subagent_guest_id),
+                    task_id,
+                    task_json,
+                )
+                .await;
+                IpcResponse::success(
+                    "assign_subagent_task",
+                    Some(serde_json::json!({
+                        "subagent_guest_id": subagent_guest_id,
+                        "task_id": task_id.to_string(),
+                    })),
+                )
+            }
+            IpcRequest::RenewSubagentLease {
+                subagent_guest_id,
+                lease_epoch,
+            } => {
+                let Some(identity) = current_identity.as_ref() else {
+                    return IpcResponse::error(
+                        "renew_subagent_lease",
+                        "SUBAGENT_UNREGISTERED",
+                        "guest must register before renewing subagent leases",
+                    );
+                };
+                let scope = Self::subagent_lease_scope(&subagent_guest_id);
+                let ttl = {
+                    // Read the registered TTL from hook record, fall back to default.
+                    let guard = subagent_hooks.lock().await;
+                    // We can't store ttl in SubagentHookRecord easily without adding a field —
+                    // for now use the default 300s. Block F will wire this from the skill record.
+                    let _ = guard.get(&subagent_guest_id);
+                    300u64
+                };
+                let outcome = {
+                    let mut guard = subagent_leases.lock().await;
+                    let mut observer = LoggingSubagentLeaseObserver;
+                    guard.renew(&scope, conn_id, lease_epoch, ttl, unix_ts(), &mut observer)
+                };
+                match outcome {
+                    LeaseRenewOutcome::Renewed(lease) => IpcResponse::SubagentLeaseRenewed {
+                        subagent_guest_id,
+                        new_epoch: lease.lease_epoch,
+                        expires_at: lease.lease_expires_at,
+                    },
+                    LeaseRenewOutcome::Lost(current) => IpcResponse::error(
+                        "renew_subagent_lease",
+                        "SUBAGENT_LEASE_LOST",
+                        format!(
+                            "Lease renewal failed for subagent [{}] at epoch {} by guest [{}]: {:?}",
+                            subagent_guest_id,
+                            lease_epoch,
+                            identity.guest_id,
+                            current.map(|l| l.lease_epoch),
+                        ),
+                    ),
+                }
+            }
+            IpcRequest::ReleaseSubagent { subagent_guest_id } => {
+                let scope = Self::subagent_lease_scope(&subagent_guest_id);
+                let released = {
+                    let mut guard = subagent_leases.lock().await;
+                    let mut observer = LoggingSubagentLeaseObserver;
+                    guard.release(&scope, conn_id, &mut observer)
+                };
+                // Clean up hook registry regardless of whether release succeeded.
+                subagent_hooks.lock().await.remove(&subagent_guest_id);
+
+                // Deactivate the guest record so the supervisor does not respawn
+                // the worker process after it exits.
+                if let Err(e) =
+                    graph.set_guest_active(local_node_id, &subagent_guest_id, false)
+                {
+                    warn!(
+                        "ReleaseSubagent: failed to deactivate guest [{}] in graph: {}",
+                        subagent_guest_id, e
+                    );
+                }
+
+                if released.is_some() {
+                    info!(
+                        "Subagent lease released for guest [{}].",
+                        subagent_guest_id
+                    );
+                    IpcResponse::success(
+                        "release_subagent",
+                        Some(serde_json::json!({ "subagent_guest_id": subagent_guest_id })),
+                    )
+                } else {
+                    // Already expired or not owned — idempotent success.
+                    IpcResponse::success(
+                        "release_subagent",
+                        Some(serde_json::json!({
+                            "subagent_guest_id": subagent_guest_id,
+                            "note": "lease not found or already released",
+                        })),
+                    )
+                }
+            }
+            IpcRequest::FireSubagentHook {
+                subagent_guest_id,
+                hook_kind,
+                payload,
+            } => {
+                let hook_record = subagent_hooks
+                    .lock()
+                    .await
+                    .get(&subagent_guest_id)
+                    .cloned();
+                let Some(record) = hook_record else {
+                    return IpcResponse::error(
+                        "fire_subagent_hook",
+                        "SUBAGENT_HOOK_UNKNOWN",
+                        format!(
+                            "No hook registry entry for subagent guest [{}]",
+                            subagent_guest_id
+                        ),
+                    );
+                };
+                // Find the matching subscription for this hook_kind.
+                let subscription = record
+                    .hook_subscriptions
+                    .iter()
+                    .find(|s| s.hook_kind == hook_kind)
+                    .cloned();
+
+                let Some(sub) = subscription else {
+                    // Hook not subscribed — fire-and-forget discard is valid.
+                    return IpcResponse::success(
+                        "fire_subagent_hook",
+                        Some(serde_json::json!({
+                            "subagent_guest_id": subagent_guest_id,
+                            "note": "hook not subscribed, discarded",
+                        })),
+                    );
+                };
+
+                let task_id = Uuid::new_v4();
+                let task_json = serde_json::json!({
+                    "kind": "subagent_hook",
+                    "subagent_guest_id": subagent_guest_id,
+                    "hook_kind": sub.hook_kind,
+                    "payload": payload,
+                })
+                .to_string();
+
+                Self::deliver_hook_to_route(
+                    inboxes,
+                    &sub.route,
+                    &record.persona_guest_id,
+                    &record.persona_role,
+                    local_node_id,
+                    task_id,
+                    task_json,
+                )
+                .await;
+
+                IpcResponse::success(
+                    "fire_subagent_hook",
+                    Some(serde_json::json!({
+                        "subagent_guest_id": subagent_guest_id,
+                        "task_id": task_id.to_string(),
+                    })),
+                )
+            }
+            IpcRequest::AcceptSubagentLease { subagent_guest_id } => {
+                // Worker calls this to acknowledge it has received and accepted the lease.
+                // Verify the lease exists and mark acknowledgement in the hook record metadata.
+                let scope = Self::subagent_lease_scope(&subagent_guest_id);
+                let lease = subagent_leases.lock().await.inspect(&scope);
+                if lease.is_some() {
+                    info!(
+                        "Subagent guest [{}] acknowledged lease.",
+                        subagent_guest_id
+                    );
+                    IpcResponse::success(
+                        "accept_subagent_lease",
+                        Some(serde_json::json!({ "subagent_guest_id": subagent_guest_id })),
+                    )
+                } else {
+                    IpcResponse::error(
+                        "accept_subagent_lease",
+                        "SUBAGENT_LEASE_NOT_FOUND",
+                        format!("No active lease for subagent guest [{}]", subagent_guest_id),
+                    )
+                }
+            }
+            IpcRequest::ConfigureRole {
+                agent_id,
+                role_name,
+                guest_id,
+                toolset_profile,
+                role_identity_addendum,
+                inactive_ttl_seconds,
+                iteration_cap,
+                approval_policy,
+                model_profile,
+                context_window_policy,
+            } => {
+                let Some(identity) = current_identity.as_ref() else {
+                    return IpcResponse::error(
+                        "configure_role",
+                        "CONFIGURE_UNREGISTERED",
+                        "guest must register before configuring roles",
+                    );
+                };
+                if identity.role != "orchestrator" {
+                    return IpcResponse::error(
+                        "configure_role",
+                        "CONFIGURE_FORBIDDEN",
+                        "only orchestrator guests may configure role incarnations",
+                    );
+                }
+                if !identity.guest_id.starts_with(&agent_id) {
+                    return IpcResponse::error(
+                        "configure_role",
+                        "CONFIGURE_FORBIDDEN",
+                        "orchestrator guests may only configure roles for their own agent identity",
+                    );
+                }
+                
+                let record = ansible_mesh_core::graph::RoleIncarnationRecord {
+                    agent_id: agent_id.clone(),
+                    role_name: role_name.clone(),
+                    guest_id,
+                    toolset_profile,
+                    role_identity_addendum,
+                    inactive_ttl_seconds,
+                    turn_loop_config: ansible_mesh_core::graph::TurnLoopConfig {
+                        iteration_cap,
+                        approval_policy,
+                        model_profile,
+                        context_window_policy,
+                    },
+                };
+
+                if let Err(e) = graph.upsert_role_incarnation(&record) {
+                    warn!("Failed to persist role config [{}]: {}", role_name, e);
+                    return IpcResponse::error(
+                        "configure_role",
+                        "ROLE_PERSIST_FAILED",
+                        format!("Failed to persist role config: {e}"),
+                    );
+                }
+
+                info!(
+                    agent_id = %agent_id,
+                    role_name = %role_name,
+                    "Role incarnation configured via IPC"
+                );
+
+                IpcResponse::ConfigureRoleOk {
+                    role_name,
+                }
+            }
+            IpcRequest::RegisterSkill {
+                skill_name,
+                description,
+                subagent_kind,
+                goal,
+                allowed_tools,
+                allowed_classes: _,
+                hook_subscriptions: _,
+                completion_route: _,
+                failure_route: _,
+                idle_behavior: _,
+                lease_terms: _,
+            } => {
+                // Translate to a SkillDraft and run Layer 1 structural validation.
+                let draft = SkillDraft {
+                    skill_name:          skill_name.clone(),
+                    description:         description.clone(),
+                    subagent_kind,
+                    goal_template:       goal,
+                    allowed_tools:       allowed_tools.clone(),
+                    allowed_skills:      vec![],
+                    iteration_budget:    None,
+                    lease_terms:         ansible_mesh_core::validation::SkillLeaseTerms::default(),
+                    hook_subscriptions:  vec![],
+                    completion_route:    ansible_mesh_core::validation::HookRoute::default(),
+                    failure_route:       ansible_mesh_core::validation::HookRoute::default(),
+                    completion_contract: ansible_mesh_core::validation::SkillCompletionContract::default(),
+                    // An empty object satisfies the "must be a JSON object" invariant.
+                    field_sources:       serde_json::json!({}),
+                };
+
+                let validation_result = validate_skill_layer1(&draft);
+
+                let mut record = AbstractSkillRecord {
+                    skill_name:       skill_name.clone(),
+                    description,
+                    implied_tools:    allowed_tools,
+                    ..Default::default()
+                };
+                apply_validation_to_record(&mut record, validation_result);
+
+                if let Err(e) = graph.upsert_abstract_skill(&record) {
+                    warn!("Failed to persist skill [{}]: {}", skill_name, e);
+                    return IpcResponse::error(
+                        "register_skill",
+                        "SKILL_PERSIST_FAILED",
+                        format!("Failed to persist skill: {e}"),
+                    );
+                }
+
+                let (state_str, errors) = match &record.validation_state {
+                    SkillValidationState::Validated      => ("validated".to_string(), vec![]),
+                    SkillValidationState::Invalid { errors } => ("invalid".to_string(), errors.clone()),
+                    SkillValidationState::Draft          => ("draft".to_string(), vec![]),
+                    SkillValidationState::Registered     => ("registered".to_string(), vec![]),
+                    SkillValidationState::Suspended { reason } => {
+                        ("suspended".to_string(), vec![reason.clone()])
+                    }
+                    SkillValidationState::Deprecated     => ("deprecated".to_string(), vec![]),
+                };
+
+                info!(
+                    skill_name = %skill_name,
+                    validation_state = %state_str,
+                    "Skill registered via IPC"
+                );
+
+                IpcResponse::SkillRegistered {
+                    skill_name,
+                    validation_state: state_str,
+                    validation_errors: errors,
+                }
+            }
+            IpcRequest::AbortSubagentSpawn { subagent_guest_id } => {
+                // Persona cancels before the worker has connected.
+                // Release the lease and clean up hooks; worker spawn is no-op if it arrives late.
+                let scope = Self::subagent_lease_scope(&subagent_guest_id);
+                {
+                    let mut guard = subagent_leases.lock().await;
+                    let mut observer = LoggingSubagentLeaseObserver;
+                    guard.release(&scope, conn_id, &mut observer);
+                }
+                subagent_hooks.lock().await.remove(&subagent_guest_id);
+                info!(
+                    "Subagent spawn aborted by persona for guest [{}].",
+                    subagent_guest_id
+                );
+                IpcResponse::success(
+                    "abort_subagent_spawn",
+                    Some(serde_json::json!({ "subagent_guest_id": subagent_guest_id })),
+                )
             }
         }
     }
@@ -2159,20 +2845,49 @@ impl IpcServer {
             .cloned()
             .unwrap_or(serde_json::Value::Null);
 
-        let bindings = session
+        let mut bindings = session
             .summary_json
             .get("bindings")
             .cloned()
             .unwrap_or_else(|| serde_json::json!({}));
-        let role_activation = session
+
+        let active_role_record = session
             .active_incarnation_id
             .as_deref()
             .and_then(|active_incarnation_id| {
                 let agent_id = session.primary_agent_id.as_deref()?;
                 let roles = graph.list_role_incarnations(agent_id).ok()?;
-                let role_record = roles
+                roles
                     .into_iter()
-                    .find(|role| role.guest_id == active_incarnation_id)?;
+                    .find(|role| role.guest_id == active_incarnation_id)
+            });
+
+        if let Some(role_record) = &active_role_record {
+            let is_unseeded = bindings.get("effective_toolset").is_none()
+                && bindings.get("effective_skillset").is_none();
+            if is_unseeded {
+                if let Ok(Some(profile)) = graph.get_toolset_profile(&role_record.toolset_profile) {
+                    if let Some(obj) = bindings.as_object_mut() {
+                        obj.insert(
+                            "effective_toolset".to_string(),
+                            serde_json::json!(profile.allowed_tools),
+                        );
+                        obj.insert(
+                            "effective_skillset".to_string(),
+                            serde_json::json!(profile.allowed_skills),
+                        );
+                    } else {
+                        bindings = serde_json::json!({
+                            "effective_toolset": profile.allowed_tools,
+                            "effective_skillset": profile.allowed_skills,
+                        });
+                    }
+                }
+            }
+        }
+
+        let role_activation = active_role_record
+            .and_then(|role_record| {
                 let effective_skillset = bindings
                     .get("effective_skillset")
                     .and_then(serde_json::Value::as_array)
@@ -2186,11 +2901,15 @@ impl IpcServer {
                     .unwrap_or_default();
                 Some(serde_json::json!({
                     "role_name": role_record.role_name,
-                    "active_incarnation_id": active_incarnation_id,
+                    "active_incarnation_id": role_record.guest_id.clone(),
                     "activation_reason": "session_active_incarnation",
                     "requested_by": "hotel_runtime",
+                    "activation_requester_class": "system",
+                    "activation_policy_owner": "hotel_runtime",
+                    "base_identity_ref": role_record.agent_id.clone(),
                     "role_addendum": role_record.role_identity_addendum,
                     "toolset_profile_ref": role_record.toolset_profile,
+                    "skillset_profile_ref": role_record.toolset_profile,
                     "effective_skillset": effective_skillset,
                     "working_memory_policy": "role_local",
                     "memory_projection_policy": "shared_identity_role_scoped",
@@ -2575,13 +3294,18 @@ fn component_implementation_to_role(implementation: &str) -> String {
         .split(['.', '-', '@', '/'])
         .find(|segment| !segment.is_empty())
         .unwrap_or("gemini");
-    format!("model.{prefix}")
+
+    if prefix == "elevenlabs" {
+        "model.elevenlabs".into()
+    } else {
+        "model".into()
+    }
 }
 
 fn default_component_role(capability: &str) -> &'static str {
     match capability {
         "voice.synthesize" => "model.elevenlabs",
-        _ => "model.gemini",
+        _ => "model",
     }
 }
 
@@ -2834,7 +3558,10 @@ fn remote_available_capacity(advertisement: &CapabilityAdvertisement) -> i64 {
 }
 
 fn is_local_agent_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "session.status")
+    matches!(
+        tool_name,
+        "session.status" | "agent.configure" | "skill.register" | "subagent.spawn" | "role.configure"
+    )
 }
 
 fn is_pinned_tool(tool_name: &str) -> bool {
@@ -3204,8 +3931,8 @@ mod tests {
     };
     use base64::Engine;
     use philotic_client::{
-        GuestIdentity, PhiloticClient, SubagentCompletionContract, SubagentContextPacket,
-        SubagentDelegation,
+        GuestIdentity, HandoffBundle, HookKind, PhiloticClient, SubagentCompletionContract,
+        SubagentContextPacket, SubagentDelegation,
     };
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3284,6 +4011,14 @@ mod tests {
             _hotel_name: &str,
             _guest_id: &str,
             _pid: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn set_guest_active(
+            &self,
+            _hotel_name: &str,
+            _guest_id: &str,
+            _active: bool,
         ) -> anyhow::Result<()> {
             Ok(())
         }
@@ -3413,6 +4148,26 @@ mod tests {
         fn list_abstract_skills(
             &self,
         ) -> anyhow::Result<Vec<ansible_mesh_core::graph::AbstractSkillRecord>> {
+            Ok(vec![])
+        }
+
+        fn upsert_toolset_profile(
+            &self,
+            _profile: &ansible_mesh_core::graph::ToolsetProfileRecord,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn get_toolset_profile(
+            &self,
+            _profile_name: &str,
+        ) -> anyhow::Result<Option<ansible_mesh_core::graph::ToolsetProfileRecord>> {
+            Ok(None)
+        }
+
+        fn list_toolset_profiles(
+            &self,
+        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::ToolsetProfileRecord>> {
             Ok(vec![])
         }
     }
@@ -4416,7 +5171,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_subagent_returns_structured_not_implemented_error() {
+    async fn spawn_subagent_acquires_lease_and_returns_ok() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
@@ -4472,23 +5227,28 @@ mod tests {
                         failure_summary_required: true,
                         requires_parent_ack: true,
                     },
+                    ..Default::default()
                 },
             })
             .await
             .expect("spawn subagent request");
 
         match response {
-            IpcResponse::Standard {
-                ok,
-                code,
-                corr_id,
-                message,
-                ..
+            IpcResponse::SpawnSubagentOk {
+                subagent_guest_id,
+                confirmed_lease,
             } => {
-                assert!(!ok);
-                assert_eq!(corr_id, "spawn_subagent");
-                assert_eq!(code, "SUBAGENT_NOT_IMPLEMENTED");
-                assert!(message.contains("research_worker"));
+                assert!(
+                    !subagent_guest_id.is_empty(),
+                    "subagent_guest_id should be a UUID"
+                );
+                assert!(confirmed_lease.is_active());
+                assert_eq!(confirmed_lease.lease_epoch, 1);
+                assert!(confirmed_lease.lease_expires_at > 0);
+                assert_eq!(
+                    confirmed_lease.owner_component_type.as_deref(),
+                    Some("agent-worker")
+                );
             }
             other => panic!("unexpected spawn_subagent response: {other:?}"),
         }
@@ -4688,7 +5448,7 @@ mod tests {
                 hotel_id: "aria-architect-hotel".into(),
                 node_id: "aria-node".into(),
                 incarnation_id: "aria-architect-hotel:model-controller-gemini".into(),
-                target_role: "model.gemini".into(),
+                target_role: "model".into(),
                 availability_state: "live".into(),
                 selection_hint: Some("remote_fallback".into()),
                 latency_hint_ms: Some(12),
@@ -4748,7 +5508,7 @@ mod tests {
                 );
                 assert_eq!(
                     snapshot["nodes"][0]["advertisements"][0]["target_role"],
-                    "model.gemini"
+                    "model"
                 );
             }
             other => panic!("unexpected response: {other:?}"),
@@ -5257,7 +6017,7 @@ mod tests {
                 hotel_id: "aria-architect-hotel".into(),
                 node_id: "aria-node".into(),
                 incarnation_id: "aria-architect-hotel:model-controller-gemini".into(),
-                target_role: "model.gemini".into(),
+                target_role: "model".into(),
                 availability_state: "live".into(),
                 selection_hint: Some("remote_latency_capacity".into()),
                 latency_hint_ms: Some(8),
@@ -5338,7 +6098,7 @@ mod tests {
                 );
                 assert_eq!(
                     snapshot["component_route_assembly"]["execution_routes"]["text.generate"]["target_role"],
-                    "model.gemini"
+                    "model"
                 );
                 assert_eq!(
                     snapshot["component_route_assembly"]["execution_routes"]["text.generate"]["incarnation_id"],
@@ -6497,7 +7257,7 @@ mod tests {
         .expect("agent connect");
         let mut model = PhiloticClient::connect(GuestIdentity {
             guest_id: "model-local".into(),
-            role: "model.gemini".into(),
+            role: "model".into(),
             supported_tools: Vec::new(),
         })
         .await
@@ -6560,7 +7320,7 @@ mod tests {
         agent
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
-                target_role: "model.gemini".into(),
+                target_role: "model".into(),
                 target_guest_id: None,
                 task_json: serde_json::json!({
                     "action": "generate_text",
@@ -6752,7 +7512,7 @@ mod tests {
         .expect("agent connect");
         let mut model = PhiloticClient::connect(GuestIdentity {
             guest_id: "model-local".into(),
-            role: "model.gemini".into(),
+            role: "model".into(),
             supported_tools: Vec::new(),
         })
         .await
@@ -6815,7 +7575,7 @@ mod tests {
         agent
             .send_request(IpcRequest::EmitTask {
                 target_node: "local-ansible-01".into(),
-                target_role: "model.gemini".into(),
+                target_role: "model".into(),
                 target_guest_id: None,
                 task_json: serde_json::json!({
                     "action": "generate_text",
@@ -7663,6 +8423,131 @@ mod tests {
         let (active, lease) = expect_telegram_poll_status(status);
         assert!(!active);
         assert!(lease.is_none());
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn configure_role_persists_config_successfully() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _) = mpsc::channel(8);
+        let graph: Arc<dyn ansible_mesh_core::storage::GraphStorage> = Arc::new(TestGraphStorage);
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-ansible-01",
+            dispatcher_tx,
+            graph,
+        );
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut orchestrator = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane-01:orchestrator".into(),
+            role: "orchestrator".into(),
+            supported_tools: vec![],
+        })
+        .await
+        .expect("orchestrator connect");
+
+        let resp = orchestrator
+            .send_request(IpcRequest::ConfigureRole {
+                agent_id: "agent-jane-01".into(),
+                role_name: "developer".into(),
+                guest_id: "agent-jane-01:developer".into(),
+                toolset_profile: "developer".into(),
+                role_identity_addendum: Some("Addendum".into()),
+                inactive_ttl_seconds: Some(60),
+                iteration_cap: Some(10),
+                approval_policy: Some("auto".into()),
+                model_profile: Some("fast".into()),
+                context_window_policy: Some("standard".into()),
+            })
+            .await
+            .expect("configure request");
+
+        match resp {
+            IpcResponse::ConfigureRoleOk { role_name } => assert_eq!(role_name, "developer"),
+            other => panic!("expected ConfigureRoleOk, got {:?}", other),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn configure_role_forbids_configuring_other_identities() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _) = mpsc::channel(8);
+        let graph: Arc<dyn ansible_mesh_core::storage::GraphStorage> = Arc::new(TestGraphStorage);
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-ansible-01",
+            dispatcher_tx,
+            graph,
+        );
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut orchestrator = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane-01:orchestrator".into(),
+            role: "orchestrator".into(),
+            supported_tools: vec![],
+        })
+        .await
+        .expect("orchestrator connect");
+
+        let resp = orchestrator
+            .send_request(IpcRequest::ConfigureRole {
+                agent_id: "agent-bob-01".into(), // Different agent!
+                role_name: "developer".into(),
+                guest_id: "agent-bob-01:developer".into(),
+                toolset_profile: "developer".into(),
+                role_identity_addendum: None,
+                inactive_ttl_seconds: None,
+                iteration_cap: None,
+                approval_policy: None,
+                model_profile: None,
+                context_window_policy: None,
+            })
+            .await
+            .expect("configure request");
+
+        match resp {
+            IpcResponse::Standard { ok, code, .. } => {
+                assert!(!ok);
+                assert_eq!(code, "CONFIGURE_FORBIDDEN");
+            }
+            other => panic!("expected Error, got {:?}", other),
+        }
 
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");

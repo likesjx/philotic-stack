@@ -141,7 +141,7 @@ mod tests {
             hotel_id: "aria-architect-hotel".into(),
             node_id: "aria-architect-hotel-ansible-01".into(),
             incarnation_id: "aria-architect-hotel:model-controller-gemini".into(),
-            target_role: "model.gemini".into(),
+            target_role: "model".into(),
             availability_state: "live".into(),
             selection_hint: Some("remote_fallback".into()),
             latency_hint_ms: Some(12),
@@ -201,7 +201,7 @@ mod tests {
                 hotel_id: "aria-architect-hotel".into(),
                 node_id: "aria-node".into(),
                 incarnation_id: "aria-architect-hotel:model-controller-gemini".into(),
-                target_role: "model.gemini".into(),
+                target_role: "model".into(),
                 availability_state: "live".into(),
                 selection_hint: Some("remote_fallback".into()),
                 latency_hint_ms: Some(12),
@@ -216,7 +216,7 @@ mod tests {
             }),
         );
 
-        let model_ads: Vec<_> = registry.advertisements_for_role("model.gemini").collect();
+        let model_ads: Vec<_> = registry.advertisements_for_role("model").collect();
         assert_eq!(model_ads.len(), 1);
         assert_eq!(
             model_ads[0].incarnation_id,
@@ -250,7 +250,7 @@ mod tests {
                 hotel_id: "default".into(),
                 node_id: "fresh-node".into(),
                 incarnation_id: "default:model-controller-gemini".into(),
-                target_role: "model.gemini".into(),
+                target_role: "model".into(),
                 availability_state: "live".into(),
                 selection_hint: Some("local_live_preferred".into()),
                 latency_hint_ms: Some(5),
@@ -266,7 +266,7 @@ mod tests {
                 hotel_id: "stale-hotel".into(),
                 node_id: "stale-node".into(),
                 incarnation_id: "stale-hotel:model-controller-gemini".into(),
-                target_role: "model.gemini".into(),
+                target_role: "model".into(),
                 availability_state: "live".into(),
                 selection_hint: Some("remote_fallback".into()),
                 latency_hint_ms: Some(50),
@@ -283,7 +283,7 @@ mod tests {
             .expect("stale node should exist")
             .last_seen = Instant::now() - (DEFAULT_NODE_TTL + Duration::from_secs(1));
 
-        let ads: Vec<_> = registry.advertisements_for_role("model.gemini").collect();
+        let ads: Vec<_> = registry.advertisements_for_role("model").collect();
         assert_eq!(ads.len(), 1);
         assert_eq!(ads[0].node_id, "fresh-node");
     }

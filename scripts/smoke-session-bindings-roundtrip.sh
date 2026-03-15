@@ -3,7 +3,11 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_DIR="$(mktemp -d)"
-HOTEL_NAME="smk-sess-bind-$$"
+HOTEL_NAME="jane-smoke-sess-bind-$$"
+export PHILOTIC_AGENT_ID="agent-jane-01"
+export PHILOTIC_NODE_ID="${HOTEL_NAME}-ansible-01"
+export PHILOTIC_TARGET_NODE="${HOTEL_NAME}-ansible-01"
+export PHILOTIC_FINAL_REPLY_TO="${HOTEL_NAME}-ansible-01"
 SOCKET_PATH="/tmp/philotic-${HOTEL_NAME}.sock"
 
 cleanup() {
@@ -31,7 +35,7 @@ cargo build -p ansible -p agent-core -p philotic-client --example session_bindin
 echo "Starting ansible in ${TMP_DIR}..."
 (
   cd "${TMP_DIR}"
-  PHILOTIC_SMOKE_MODE=1 cargo run -q --manifest-path "${ROOT_DIR}/crates/ansible/Cargo.toml" -- --hotel "${HOTEL_NAME}" >"${TMP_DIR}/ansible.log" 2>&1
+  PHILOTIC_SMOKE_MODE=1 cargo run -q --manifest-path "${ROOT_DIR}/crates/ansible/Cargo.toml" --bin ansible -- --hotel "${HOTEL_NAME}" >"${TMP_DIR}/ansible.log" 2>&1
 ) &
 ANSIBLE_PID=$!
 
@@ -49,7 +53,7 @@ fi
 
 echo "Starting agent-core..."
 PHILOTIC_HOTEL_SOCKET="${SOCKET_PATH}" \
-  cargo run -q --manifest-path "${ROOT_DIR}/crates/agent-core/Cargo.toml" >"${TMP_DIR}/agent.log" 2>&1 &
+  cargo run -q --manifest-path "${ROOT_DIR}/crates/agent-core/Cargo.toml" --bin agent-core >"${TMP_DIR}/agent.log" 2>&1 &
 AGENT_PID=$!
 
 sleep 1

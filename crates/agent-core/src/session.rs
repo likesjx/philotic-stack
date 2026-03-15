@@ -212,7 +212,15 @@ pub struct RoleActivation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_addendum: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_identity_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_requester_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_policy_owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub toolset_profile_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skillset_profile_ref: Option<String>,
     #[serde(default)]
     pub effective_skillset: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -592,6 +600,19 @@ fn first_line_summary(text: &str) -> String {
         .unwrap_or_else(|| "empty".into())
 }
 
+/// Lightweight tracking record for a subagent spawned during this session.
+///
+/// Persisted in [`SessionState::active_subagents`] on every successful
+/// `subagent.spawn` so subsequent tools (`subagent.release`, `subagent.abort`,
+/// `subagent.list`) can reference the guest by ID without re-querying the hotel.
+#[derive(Debug, Clone)]
+pub struct SpawnedSubagentRef {
+    pub guest_id: String,
+    pub kind: String,
+    pub lease_epoch: u64,
+    pub lease_expires_at: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionState {
     pub session_id: String,
@@ -607,6 +628,8 @@ pub struct SessionState {
     pub tool_assembly: ToolAssembly,
     pub recent_turns: Vec<TurnRecord>,
     pub active_turn: Option<WorkingTurn>,
+    /// Subagents spawned during this session that have not yet been released or aborted.
+    pub active_subagents: Vec<SpawnedSubagentRef>,
 }
 
 impl SessionState {
@@ -626,6 +649,7 @@ impl SessionState {
             bindings,
             recent_turns: Vec::new(),
             active_turn: None,
+            active_subagents: Vec::new(),
         }
     }
 
@@ -1890,6 +1914,7 @@ impl SessionState {
                 failure_summary_required: true,
                 requires_parent_ack: true,
             },
+            ..Default::default()
         }
     }
 
@@ -2155,6 +2180,7 @@ impl SessionState {
             tool_assembly,
             recent_turns,
             active_turn,
+            active_subagents: Vec::new(),
         })
     }
 }
@@ -2322,15 +2348,30 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
 }
 
 fn default_visible_toolset(bindings: &SessionBindings) -> Vec<String> {
-    if bindings.effective_toolset.is_empty() {
+    let mut toolset = if bindings.effective_toolset.is_empty() {
         vec!["echo".to_string()]
     } else {
         bindings.effective_toolset.clone()
+    };
+
+    // Expand skill grants: merge implied tools from each active skill.
+    for skill in &bindings.effective_skillset {
+        for &implied in crate::catalog::skill_implied_tools(skill) {
+            let implied = implied.to_string();
+            if !toolset.contains(&implied) {
+                toolset.push(implied);
+            }
+        }
     }
+
+    toolset
 }
 
 fn is_local_agent_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "session.status" | "agent.configure")
+    matches!(
+        tool_name,
+        "session.status" | "agent.configure" | "skill.register" | "subagent.spawn" | "role.configure"
+    )
 }
 
 fn is_pinned_tool(tool_name: &str) -> bool {
@@ -2688,7 +2729,7 @@ mod tests {
                 "text.generate".into(),
                 ComponentExecutionRoute {
                     target_node: "aria-node".into(),
-                    target_role: "model.gemini".into(),
+                    target_role: "model".into(),
                     incarnation_id: Some("aria-architect-hotel:model-controller-gemini".into()),
                     hotel_id: Some("aria-architect-hotel".into()),
                     environment_id: None,
@@ -3143,6 +3184,7 @@ mod tests {
             effective_skillset: vec!["planning".into()],
             working_memory_policy: Some("role_local".into()),
             memory_projection_policy: Some("shared_identity_role_scoped".into()),
+            ..Default::default()
         });
         state.agent_profile.identity_text = Some("Identity anchor: Jane".into());
         state.agent_profile.user_context_text =
@@ -3271,6 +3313,7 @@ mod tests {
             effective_skillset: vec!["planning".into(), "implementation".into()],
             working_memory_policy: Some("role_local".into()),
             memory_projection_policy: Some("shared_identity_role_scoped".into()),
+            ..Default::default()
         });
 
         let prompt = state.build_prompt("status");
@@ -3298,6 +3341,7 @@ mod tests {
             effective_skillset: vec!["planning".into()],
             working_memory_policy: Some("role_local".into()),
             memory_projection_policy: Some("shared_identity_role_scoped".into()),
+            ..Default::default()
         });
         state.start_turn(WorkingTurn {
             task_id: Uuid::nil(),
@@ -3364,6 +3408,7 @@ mod tests {
             effective_skillset: vec!["implementation".into()],
             working_memory_policy: Some("role_local".into()),
             memory_projection_policy: Some("shared_identity_role_scoped".into()),
+            ..Default::default()
         });
         state.start_turn(WorkingTurn {
             task_id: Uuid::nil(),
@@ -3484,6 +3529,7 @@ mod tests {
             effective_skillset: vec!["planning".into()],
             working_memory_policy: Some("role_local".into()),
             memory_projection_policy: Some("shared_identity_role_scoped".into()),
+            ..Default::default()
         });
 
         let projection = state.build_context_projection("status");

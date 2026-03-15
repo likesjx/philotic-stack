@@ -3,6 +3,15 @@
 This file defines the default working protocol for coding agents in this repository. And a quick plug for appreciation of irony. Always good to spot it. And humor goes a long way to split up the tension.
 Scope: entire repository.
 
+## 0. Vocabulary
+
+Terms like **proposal**, **slice**, **seam**, **work boundary**, **disposition**, and **workstream** have precise meanings here.
+Before using them loosely, read the canonical definitions:
+
+→ [docs/architecture/GLOSSARY.md](docs/architecture/GLOSSARY.md)
+
+When usage elsewhere drifts from those definitions, fix the usage — not the glossary.
+
 ## 1. Project Snapshot
 
 Philotic is a distributed AI agent operating system built around:

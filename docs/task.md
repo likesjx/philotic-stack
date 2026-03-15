@@ -107,18 +107,18 @@ Seam IDs: `role-incarnation-records`, `active-membrane-routing`, `handoff-skill`
 ### Skill Catalog + Toolset Profiles (prerequisite for role provisioning)
 - [x] Add `AbstractSkillRecord` to `ansible-mesh-core/src/graph.rs` (parallel to `AbstractToolRecord`).
 - [x] Add `upsert_abstract_skill` / `get_abstract_skill` / `list_abstract_skills` to `GraphStorage` trait and `SqliteGraphStorage`.
-- [ ] Add `ToolsetProfileRecord` to the context graph (`toolset_profile` node kind).
-- [ ] Add `upsert_toolset_profile` / `get_toolset_profile` / `list_toolset_profiles` to `GraphStorage`.
+- [x] Add `ToolsetProfileRecord` to the context graph (`toolset_profile` node kind).
+- [x] Add `upsert_toolset_profile` / `get_toolset_profile` / `list_toolset_profiles` to `GraphStorage` trait and `SqliteGraphStorage` impl.
 - [x] Seed the first built-in handoff/governance abstract skills at hotel startup.
-- [ ] Expand the built-in skill catalog and toolset profiles at hotel startup (`orchestrator`, `codex`, `browser`, `research`, `utility`).
-- [ ] Update session binding assembly to expand skill grants into `implied_tools` when building `tools_for_model`.
+- [x] Seed built-in toolset profiles at hotel startup: `orchestrator`, `codex`, `research`, `utility` via `seed_toolset_profiles`.
+- [x] Update session binding assembly to expand skill grants into `implied_tools` when building `tools_for_model`.
 
 ### Role Incarnation Records
 - [x] Add `RoleIncarnationRecord` and `TurnLoopConfig` to the context graph (`role_incarnation` node kind).
 - [x] Add `upsert_role_incarnation` / `get_role_incarnation` / `list_role_incarnations` to `GraphStorage`.
-- [ ] Add `ConfigureRole` IPC action (orchestrator → hotel); hotel enforces orchestrator-only writes for the same agent identity.
-- [ ] Define the first rigid orchestrator-only role-governance workflow skill for create/update, including required reasoning about purpose, toolset, skillset, handoff posture, and limits.
-- [ ] Seed session bindings from the role's `toolset_profile` when a role incarnation session is initialized.
+- [x] Add `ConfigureRole` IPC action (orchestrator → hotel); hotel enforces orchestrator-only writes for the same agent identity.
+- [x] Define the first rigid orchestrator-only role-governance workflow skill for create/update, including required reasoning about purpose, toolset, skillset, handoff posture, and limits.
+- [x] Seed session bindings from the role's `toolset_profile` when a role incarnation session is initialized.
 - [ ] Define the canonical shared-self role contract:
   - base identity and durable memory remain shared
   - role addendum is additive
@@ -132,7 +132,7 @@ Seam IDs: `role-incarnation-records`, `active-membrane-routing`, `handoff-skill`
   - effective skillset
   - working memory policy
   - memory projection policy
-- [ ] Expand `RoleActivation` beyond the first compatibility slice:
+- [x] Expand `RoleActivation` beyond the first compatibility slice:
   - base identity reference
   - explicit skillset profile reference
   - richer activation requester semantics
@@ -183,10 +183,13 @@ Seam IDs: `role-incarnation-records`, `active-membrane-routing`, `handoff-skill`
 - [ ] Keep concurrent role materialization explicitly conditional; do not let TTL/rematerialization policy silently become the default role ontology.
 
 ### Workers / Subagents
-- [ ] Implement `SpawnSubagent` execution and async result routing back to parent incarnation.
+- [x] Implement `SpawnSubagent` execution and async result routing back to parent incarnation (Block D — lease + hook registries; `SpawnSubagentOk`/`SpawnSubagentProposal` responses).
 - [x] Thread the first compatibility-first `SpawnSubagent` request boundary through shared IPC with explicit structured `SUBAGENT_NOT_IMPLEMENTED` hotel rejection.
-- [ ] Add `PHILOTIC_AGENT_MODE=subagent` one-shot runtime mode to `agent-core`.
-- [ ] Add `/abandon` slash command; deliver `FailTask` summary to parent on abandonment.
+- [x] Split `agent-core` into lib + `agent-core` (persona) + `agent-worker` (subagent worker) binaries; define `AgentDriver` trait (Block E).
+- [x] Add `skill.register` IPC handler in hotel (`RegisterSkill` → Layer 1 validate → `AbstractSkillRecord` persist → `SkillRegistered` response) (Block F).
+- [x] Add `skill.register` and `subagent.spawn` tools to abstract tool catalog + `is_local_agent_tool()` + `execute_local_agent_tool()` IPC dispatch (Block F).
+- [x] Fix subagent spawn path: add `PHILOTIC_AGENT_ID` to worker env in `config_json`; add `set_guest_active` to `GraphStorage`; deactivate guest on `ReleaseSubagent` to stop supervisor respawn loop. (`PHILOTIC_AGENT_MODE=subagent` superseded by the `agent-worker` binary split in Block E.)
+- [x] Add `/abandon` slash command; fires `FireSubagentHook(TurnCompleted, completed=false)` when `PHILOTIC_PARENT_GUEST_ID` is set; handles all 4 match sites in runtime.rs.
 - [x] Define the first compatibility-first `SubagentDelegation` contract and parent-side builder:
   - parent role
   - goal
@@ -413,18 +416,18 @@ Seam IDs: `local-admin-capability-envelope`, `onnx-admin-fallback-path`
 Model revised: three-kind taxonomy (conversational/worker/subagent) replaced with role incarnations + workers/subagents. See [AGENT_INCARNATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/AGENT_INCARNATION_PROPOSAL.md).
 
 ### Skill Catalog + Toolset Profiles (prerequisite for role provisioning)
-- [ ] Add `AbstractSkillRecord` to `ansible-mesh-core/src/graph.rs` (parallel to `AbstractToolRecord`).
-- [ ] Add `upsert_abstract_skill` / `get_abstract_skill` / `list_abstract_skills` to `GraphStorage` trait and `SqliteGraphStorage`.
-- [ ] Add `ToolsetProfileRecord` to the context graph (`toolset_profile` node kind).
-- [ ] Add `upsert_toolset_profile` / `get_toolset_profile` / `list_toolset_profiles` to `GraphStorage`.
-- [ ] Seed built-in skill catalog and toolset profiles at hotel startup (`orchestrator`, `codex`, `browser`, `research`, `utility`).
-- [ ] Update session binding assembly to expand skill grants into `implied_tools` when building `tools_for_model`.
+- [x] Add `AbstractSkillRecord` to `ansible-mesh-core/src/graph.rs` (parallel to `AbstractToolRecord`).
+- [x] Add `upsert_abstract_skill` / `get_abstract_skill` / `list_abstract_skills` to `GraphStorage` trait and `SqliteGraphStorage`.
+- [x] Add `ToolsetProfileRecord` to the context graph (`toolset_profile` node kind).
+- [x] Add `upsert_toolset_profile` / `get_toolset_profile` / `list_toolset_profiles` to `GraphStorage` trait and `SqliteGraphStorage` impl.
+- [x] Seed built-in toolset profiles at hotel startup (see main section above).
+- [x] Update session binding assembly to expand skill grants into `implied_tools` when building `tools_for_model`.
 
 ### Role Incarnation Records
 - [ ] Add `RoleIncarnationRecord` and `TurnLoopConfig` to the context graph (`role_incarnation` node kind).
 - [ ] Add `upsert_role_incarnation` / `get_role_incarnation` / `list_role_incarnations` to `GraphStorage`.
-- [ ] Add `ConfigureRole` IPC action (orchestrator → hotel); hotel enforces orchestrator-only writes.
-- [ ] Seed session bindings from the role's `toolset_profile` when a role incarnation session is initialized.
+- [x] Add `ConfigureRole` IPC action (orchestrator → hotel); hotel enforces orchestrator-only writes.
+- [x] Seed session bindings from the role's `toolset_profile` when a role incarnation session is initialized.
 
 ### Active Membrane Routing
 - [ ] Add `active_incarnation_id` to `SessionRecord` in the Context Graph.
@@ -442,9 +445,9 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 - [ ] On rematerialization: hotel sends session snapshot to restore working memory from Tier 2.
 
 ### Workers / Subagents
-- [ ] Implement `SpawnSubagent` IPC and async result routing back to parent incarnation.
-- [ ] Add `PHILOTIC_AGENT_MODE=subagent` one-shot runtime mode to `agent-core`.
-- [ ] Add `/abandon` slash command; deliver `FailTask` summary to parent on abandonment.
+- [x] Implement `SpawnSubagent` IPC and async result routing back to parent incarnation (see main Workers section above).
+- [x] Fix subagent spawn path (see main Workers section above).
+- [x] Add `/abandon` slash command (see main Workers section above).
 
 ### Memory
 - [ ] Add `session_facts` apartment type and `UpdateMemory` IPC with hotel-side rate/size enforcement.

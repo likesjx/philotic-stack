@@ -9,10 +9,11 @@ async fn emit_and_expect(
     turn_id: &str,
     content: &str,
     expected: &str,
+    target_node: &str,
 ) -> Result<()> {
     client
         .send_request(IpcRequest::EmitTask {
-            target_node: "local-ansible-01".into(),
+            target_node: target_node.into(),
             target_role: "agent".into(),
             target_guest_id: None,
             task_json: serde_json::json!({
@@ -21,7 +22,7 @@ async fn emit_and_expect(
                 "turn_id": turn_id,
                 "chat_id": chat_id,
                 "content": content,
-                "final_reply_to": "local-ansible-01",
+                "final_reply_to": target_node,
                 "final_reply_role": "membrane",
                 "final_reply_guest_id": "session-bindings-smoke-membrane"
             })
@@ -29,18 +30,24 @@ async fn emit_and_expect(
         })
         .await?;
 
-    let reply = timeout(Duration::from_secs(10), client.recv_task())
-        .await
-        .with_context(|| format!("timed out waiting for reply to {content}"))??;
-    let IpcResponse::InboundTask { task_json, .. } = reply else {
-        bail!("unexpected envelope while waiting for {content}: {reply:?}");
-    };
-    let payload: serde_json::Value =
-        serde_json::from_str(&task_json).context("failed to decode session binding reply")?;
-    let actual = payload
-        .get("content")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
+    let mut actual = String::new();
+    for _ in 0..10 {
+        let reply = timeout(Duration::from_secs(5), client.recv_task())
+            .await
+            .with_context(|| format!("timed out waiting for reply to {content}"))??;
+        let IpcResponse::InboundTask { task_json, .. } = reply else {
+            continue;
+        };
+        let payload: serde_json::Value =
+            serde_json::from_str(&task_json).context("failed to decode session binding reply")?;
+        if let Some(c) = payload.get("content").and_then(serde_json::Value::as_str) {
+            if !c.is_empty() {
+                actual = c.to_string();
+                break;
+            }
+        }
+    }
+
     if !actual.contains(expected) {
         bail!("expected reply containing {:?}, got {:?}", expected, actual);
     }
@@ -62,6 +69,9 @@ async fn main() -> Result<()> {
     .await
     .with_context(|| format!("failed to connect session bindings smoke driver to {socket_path}"))?;
 
+    let target_node =
+        std::env::var("PHILOTIC_TARGET_NODE").unwrap_or_else(|_| "local-ansible-01".to_string());
+
     emit_and_expect(
         &mut client,
         session_id,
@@ -69,6 +79,7 @@ async fn main() -> Result<()> {
         "bindings-turn-1",
         "/tools add echo",
         "Tool bindings updated: echo.",
+        &target_node,
     )
     .await?;
     emit_and_expect(
@@ -78,6 +89,7 @@ async fn main() -> Result<()> {
         "bindings-turn-2",
         "/skills add planning",
         "Skill bindings updated: planning.",
+        &target_node,
     )
     .await?;
     emit_and_expect(
@@ -87,6 +99,7 @@ async fn main() -> Result<()> {
         "bindings-turn-3",
         "/workspace set workspace://main",
         "Workspace binding updated: workspace://main.",
+        &target_node,
     )
     .await?;
     emit_and_expect(
@@ -96,6 +109,7 @@ async fn main() -> Result<()> {
         "bindings-turn-4",
         "/status",
         "Skillset: planning.",
+        &target_node,
     )
     .await?;
 

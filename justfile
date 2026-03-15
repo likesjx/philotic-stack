@@ -162,6 +162,10 @@ smoke-deny-redirect:
 smoke-preapprove:
     ./scripts/smoke-preapprove-roundtrip.sh
 
+# Run the subagent spawn/lease/assign/hook smoke test
+smoke-subagent:
+    ./scripts/smoke-subagent-roundtrip.sh
+
 # Run the session lifecycle/control binary smoke test
 smoke-session-control:
     ./scripts/smoke-session-control-roundtrip.sh

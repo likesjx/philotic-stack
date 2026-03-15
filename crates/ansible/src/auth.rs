@@ -406,7 +406,7 @@ fn persist_gemini_oauth_config(args: &GoogleStartArgs, token: &GoogleTokenRespon
         SecretInput {
             secret_kind: "gemini-access-token".into(),
             scope: "hotel".into(),
-            allowed_roles: vec!["model".into(), "model.gemini".into()],
+            allowed_roles: vec!["model".into(), "model".into()],
             allowed_guests: Vec::new(),
             plaintext: token.access_token.clone(),
         },
@@ -494,7 +494,7 @@ fn load_gemini_access_token(
         graph,
         &secret_ref,
         &SecretAccess {
-            role: "model.gemini".into(),
+            role: "model".into(),
             guest_id: "ansible-auth-validator".into(),
         },
     )?

@@ -207,11 +207,53 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
 }
 
 fn short_circuit_response(task: &Value, stub_response: Option<&str>) -> Option<String> {
-    if let Some(stub_text) = stub_response {
-        if task.get("prompt").and_then(Value::as_str).is_some() {
-            info!("Model controller stub mode returning deterministic response.");
-            return Some(stub_text.to_string());
+    let stub = stub_response?;
+
+    if task.get("prompt").and_then(Value::as_str).is_some() {
+        if stub.contains('=') {
+            let turn_id = task["context_projection"]["conversation_turn"]["conversation_turn_id"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    // Fallback to older path if needed
+                    task["context_projection"]["current_turn"]["id"]
+                        .as_str()
+                        .unwrap_or("")
+                });
+            let iteration = task["context_projection"]["active_step"]["iteration"]
+                .as_u64()
+                .unwrap_or_else(|| {
+                    // Fallback to older path if needed
+                    task["context_projection"]["cognitive_step"]["iteration"]
+                        .as_u64()
+                        .unwrap_or(0)
+                });
+
+            let mut turn_match = None;
+            for pair in stub.split(';') {
+                if let Some((k, v)) = pair.split_once('=') {
+                    // Try exact match with iteration (e.g. "turn-1:1")
+                    if iteration > 0 {
+                        let iter_key = format!("{}:{}", turn_id, iteration);
+                        if k == iter_key {
+                            info!("Model controller turn/iteration-aware stub mode returning response for [{}].", iter_key);
+                            return Some(v.to_string());
+                        }
+                    }
+
+                    // Keep track of plain turn_id match as fallback
+                    if k == turn_id {
+                        turn_match = Some(v.to_string());
+                    }
+                }
+            }
+            if let Some(v) = turn_match {
+                info!("Model controller turn-aware stub mode returning response for [{}].", turn_id);
+                return Some(v);
+            }
         }
+
+        info!("Model controller stub mode returning deterministic response.");
+        return Some(stub.to_string());
     }
 
     None

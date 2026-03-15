@@ -23,7 +23,7 @@ Routing constraints supported: `latency_ms`, `privacy`, `cost_tier`.
 
 ## Current Materialized Controllers
 
-- `model-controller-gemini` registers as role `model.gemini`
+- `model-controller-gemini` registers as role `model`
 - `model-controller-elevenlabs` registers as role `model.elevenlabs`
 - the legacy `model-router` binary remains as an all-in-one compatibility binary during transition
 

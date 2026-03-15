@@ -575,6 +575,17 @@ mod tests {
             Ok(())
         }
 
+        fn set_guest_active(&self, hotel_name: &str, guest_id: &str, active: bool) -> Result<()> {
+            let mut guests = self.guests.lock().unwrap();
+            if let Some(rec) = guests
+                .iter_mut()
+                .find(|g| g.hotel_name == hotel_name && g.guest_id == guest_id)
+            {
+                rec.is_active = active;
+            }
+            Ok(())
+        }
+
         fn seed_guests(&self, _hotel_name: &str, guests: &[GuestRecord]) -> Result<()> {
             let mut stored = self.guests.lock().unwrap();
             *stored = guests.to_vec();
@@ -717,6 +728,26 @@ mod tests {
         fn list_abstract_skills(
             &self,
         ) -> Result<Vec<ansible_mesh_core::graph::AbstractSkillRecord>> {
+            Ok(vec![])
+        }
+
+        fn upsert_toolset_profile(
+            &self,
+            _profile: &ansible_mesh_core::graph::ToolsetProfileRecord,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn get_toolset_profile(
+            &self,
+            _profile_name: &str,
+        ) -> Result<Option<ansible_mesh_core::graph::ToolsetProfileRecord>> {
+            Ok(None)
+        }
+
+        fn list_toolset_profiles(
+            &self,
+        ) -> Result<Vec<ansible_mesh_core::graph::ToolsetProfileRecord>> {
             Ok(vec![])
         }
     }

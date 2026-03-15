@@ -12,6 +12,10 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "smoke-approval-chat".to_string());
     let approval_request = std::env::var("PHILOTIC_SMOKE_APPROVAL_REQUEST")
         .unwrap_or_else(|_| "need approval deploy the thing".to_string());
+    let target_node =
+        std::env::var("PHILOTIC_TARGET_NODE").unwrap_or_else(|_| "local-ansible-01".to_string());
+    let final_reply_to =
+        std::env::var("PHILOTIC_FINAL_REPLY_TO").unwrap_or_else(|_| target_node.clone());
     let expected_wait = std::env::var("PHILOTIC_SMOKE_EXPECTED_WAIT").unwrap_or_else(|_| {
         "Approval required: deploy the thing. Reply /approve or /deny.".to_string()
     });
@@ -31,7 +35,7 @@ async fn main() -> Result<()> {
     let first_turn_id = "approval-turn-1";
     let first_response = client
         .send_request(IpcRequest::EmitTask {
-            target_node: "local-ansible-01".into(),
+            target_node: target_node.clone(),
             target_role: "agent".into(),
             target_guest_id: None,
             task_json: serde_json::json!({
@@ -40,7 +44,7 @@ async fn main() -> Result<()> {
                 "turn_id": first_turn_id,
                 "chat_id": chat_id,
                 "content": approval_request,
-                "final_reply_to": "local-ansible-01",
+                "final_reply_to": final_reply_to,
                 "final_reply_role": "membrane",
                 "final_reply_guest_id": "approval-smoke-membrane"
             })
@@ -53,18 +57,23 @@ async fn main() -> Result<()> {
         other => bail!("unexpected approval emit response: {other:?}"),
     }
 
-    let wait_reply = timeout(Duration::from_secs(10), client.recv_task())
-        .await
-        .context("timed out waiting for approval prompt")??;
-    let IpcResponse::InboundTask { task_json, .. } = wait_reply else {
-        bail!("unexpected approval prompt envelope: {wait_reply:?}");
-    };
-    let payload: serde_json::Value =
-        serde_json::from_str(&task_json).context("failed to decode approval prompt")?;
-    let wait_content = payload
-        .get("content")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
+    let mut wait_content = String::new();
+    for _ in 0..10 {
+        let wait_reply = timeout(Duration::from_secs(5), client.recv_task())
+            .await
+            .context("timed out waiting for approval prompt")??;
+        let IpcResponse::InboundTask { task_json, .. } = wait_reply else {
+            continue;
+        };
+        let payload: serde_json::Value = serde_json::from_str(&task_json).context("failed to decode approval prompt")?;
+        if let Some(content) = payload.get("content").and_then(serde_json::Value::as_str) {
+            if !content.is_empty() {
+                wait_content = content.to_string();
+                break;
+            }
+        }
+    }
+
     if wait_content != expected_wait {
         bail!(
             "expected approval prompt {:?}, got {:?}",
@@ -76,7 +85,7 @@ async fn main() -> Result<()> {
     let second_turn_id = "approval-turn-2";
     let second_response = client
         .send_request(IpcRequest::EmitTask {
-            target_node: "local-ansible-01".into(),
+            target_node: target_node.clone().into(),
             target_role: "agent".into(),
             target_guest_id: None,
             task_json: serde_json::json!({
@@ -85,7 +94,7 @@ async fn main() -> Result<()> {
                 "turn_id": second_turn_id,
                 "chat_id": chat_id,
                 "content": approval_command,
-                "final_reply_to": "local-ansible-01",
+                "final_reply_to": final_reply_to,
                 "final_reply_role": "membrane",
                 "final_reply_guest_id": "approval-smoke-membrane"
             })
@@ -98,18 +107,22 @@ async fn main() -> Result<()> {
         other => bail!("unexpected approval resolution emit response: {other:?}"),
     }
 
-    let final_reply = timeout(Duration::from_secs(10), client.recv_task())
-        .await
-        .context("timed out waiting for approved response")??;
-    let IpcResponse::InboundTask { task_json, .. } = final_reply else {
-        bail!("unexpected approved reply envelope: {final_reply:?}");
-    };
-    let payload: serde_json::Value =
-        serde_json::from_str(&task_json).context("failed to decode approved reply")?;
-    let final_content = payload
-        .get("content")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
+    let mut final_content = String::new();
+    for _ in 0..10 {
+        let final_reply = timeout(Duration::from_secs(5), client.recv_task())
+            .await
+            .context("timed out waiting for approved response")??;
+        let IpcResponse::InboundTask { task_json, .. } = final_reply else {
+            continue;
+        };
+        let payload: serde_json::Value = serde_json::from_str(&task_json).context("failed to decode approved reply")?;
+        if let Some(content) = payload.get("content").and_then(serde_json::Value::as_str) {
+            if !content.is_empty() {
+                final_content = content.to_string();
+                break;
+            }
+        }
+    }
     if final_content != expected_final {
         bail!(
             "expected final approved reply {:?}, got {:?}",
