@@ -148,8 +148,8 @@ Seam IDs: `role-incarnation-records`, `active-membrane-routing`, `handoff-skill`
 
 ### Handoff Skill + Membrane Switching
 - [x] Implement `HandoffToRole { role_name, handoff_bundle }` and `HandoffBack { summary, return_to? }` IPC actions.
-- [ ] Define the first generic orchestrator-owned `handoff.to_role` workflow skill: trigger patterns, target-role selection, context bundle assembly, role-local cleanup steps, return conditions, and context-shift semantics.
-- [ ] Decide what role metadata the generic handoff workflow reads so we do not regress into per-role bespoke skill-pair manifests unless the generic approach proves too weak.
+- [x] Define the first generic orchestrator-owned `handoff.to_role` workflow skill: trigger patterns, target-role selection, context bundle assembly, role-local cleanup steps, return conditions, and context-shift semantics.
+- [x] Decide what role metadata the generic handoff workflow reads so we do not regress into per-role bespoke skill-pair manifests unless the generic approach proves too weak.
 - [x] Define the first compatibility-first `SameIdentityHandoffPacket` through the existing `HandoffBundle` wire path:
   - handoff_reason
   - active_goal

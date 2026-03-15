@@ -3460,6 +3460,185 @@ impl AgentRuntime {
                 .await
             }
 
+            "handoff.to_role" => {
+                let args = payload.arguments.as_object();
+                let role_name = args
+                    .and_then(|a| a.get("role_name"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let reason = args
+                    .and_then(|a| a.get("reason"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+
+                let Some(role_name) = role_name else {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "handoff.to_role: missing required argument 'role_name'".into(),
+                        )
+                        .await;
+                };
+                let Some(reason) = reason else {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "handoff.to_role: missing required argument 'reason'".into(),
+                        )
+                        .await;
+                };
+
+                let active_goal = args
+                    .and_then(|a| a.get("active_goal"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let context_summary = args
+                    .and_then(|a| a.get("context_summary"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let expected_return_mode = args
+                    .and_then(|a| a.get("expected_return_mode"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let cleanup_actions: Vec<String> = args
+                    .and_then(|a| a.get("cleanup_actions"))
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let handoff_bundle = HandoffBundle {
+                    goal: active_goal.clone().unwrap_or_else(|| reason.clone()),
+                    context_excerpt: context_summary,
+                    session_id: payload.session_id.clone(),
+                    initiating_turn_id: payload.turn_id.clone(),
+                    handoff_reason: Some(reason),
+                    active_goal,
+                    expected_return_mode,
+                    cleanup_actions,
+                    ..Default::default()
+                };
+
+                let content = match self
+                    .ipc_client
+                    .send_request(IpcRequest::HandoffToRole {
+                        session_id: payload.session_id.clone(),
+                        role_name: role_name.clone(),
+                        handoff_bundle,
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::HandoffAck { handoff_guest_id, .. }) => {
+                        format!("Handed off to role '{role_name}' (guest {handoff_guest_id}).")
+                    }
+                    Ok(IpcResponse::Error(msg)) => {
+                        format!("handoff.to_role failed: {msg}")
+                    }
+                    Ok(_) => "handoff.to_role: unexpected hotel response.".to_string(),
+                    Err(e) => format!("handoff.to_role: IPC transport error — {e}"),
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action:               Some("tool_result".into()),
+                    agent_action:         None,
+                    source:               Some("agent".into()),
+                    session_id:           Some(payload.session_id),
+                    turn_id:              Some(payload.turn_id),
+                    transport:            None,
+                    chat_id:              Some(payload.chat_id),
+                    thread_id:            None,
+                    sender_id:            None,
+                    sender_username:      None,
+                    message_kind:         None,
+                    content:              Some(content),
+                    attachments:          Vec::new(),
+                    command:              None,
+                    callback_data:        None,
+                    raw_transport_event:  None,
+                    error:                None,
+                    tool_name:            Some(payload.tool_name),
+                    arguments:            None,
+                    final_reply_to:       Some(payload.final_reply_to),
+                    final_reply_role:     Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                })
+                .await
+            }
+
+            "handoff.back" => {
+                let args = payload.arguments.as_object();
+                let summary = args
+                    .and_then(|a| a.get("summary"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+
+                let Some(summary) = summary else {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "handoff.back: missing required argument 'summary'".into(),
+                        )
+                        .await;
+                };
+
+                let return_to = args
+                    .and_then(|a| a.get("return_to"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+
+                let content = match self
+                    .ipc_client
+                    .send_request(IpcRequest::HandoffBack {
+                        session_id: payload.session_id.clone(),
+                        summary: summary.clone(),
+                        return_to,
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::HandoffBackAck { handoff_guest_id, .. }) => {
+                        format!("Returned control (from guest {handoff_guest_id}). Summary: {summary}")
+                    }
+                    Ok(IpcResponse::Error(msg)) => {
+                        format!("handoff.back failed: {msg}")
+                    }
+                    Ok(_) => "handoff.back: unexpected hotel response.".to_string(),
+                    Err(e) => format!("handoff.back: IPC transport error — {e}"),
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action:               Some("tool_result".into()),
+                    agent_action:         None,
+                    source:               Some("agent".into()),
+                    session_id:           Some(payload.session_id),
+                    turn_id:              Some(payload.turn_id),
+                    transport:            None,
+                    chat_id:              Some(payload.chat_id),
+                    thread_id:            None,
+                    sender_id:            None,
+                    sender_username:      None,
+                    message_kind:         None,
+                    content:              Some(content),
+                    attachments:          Vec::new(),
+                    command:              None,
+                    callback_data:        None,
+                    raw_transport_event:  None,
+                    error:                None,
+                    tool_name:            Some(payload.tool_name),
+                    arguments:            None,
+                    final_reply_to:       Some(payload.final_reply_to),
+                    final_reply_role:     Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                })
+                .await
+            }
+
             other => {
                 self.fail_active_turn(
                     payload.session_id,

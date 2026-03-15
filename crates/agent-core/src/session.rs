@@ -2370,7 +2370,13 @@ fn default_visible_toolset(bindings: &SessionBindings) -> Vec<String> {
 fn is_local_agent_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "session.status" | "agent.configure" | "skill.register" | "subagent.spawn" | "role.configure"
+        "session.status"
+            | "agent.configure"
+            | "skill.register"
+            | "subagent.spawn"
+            | "role.configure"
+            | "handoff.to_role"
+            | "handoff.back"
     )
 }
 

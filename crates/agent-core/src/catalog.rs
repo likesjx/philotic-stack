@@ -31,8 +31,8 @@ pub fn tool_catalog() -> &'static HashMap<String, ToolDefinition> {
 /// for unknown or zero-implied-tool skills.
 pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
     match skill_name {
-        "handoff.to_role" => &["session.status"],
-        "handoff.back" => &["session.status"],
+        "handoff.to_role" => &["session.status", "handoff.to_role", "handoff.back"],
+        "handoff.back" => &["session.status", "handoff.back"],
         "role.governance" => &["session.status", "agent.configure", "role.configure"],
         _ => &[],
     }
@@ -47,13 +47,10 @@ pub fn tool_class(tool_name: &str) -> Option<&'static str> {
 }
 
 /// Returns true if the tool requires operator approval before execution, regardless
-/// of what the model requests. Tools in class "config" require approval by default;
-/// others do not unless explicitly flagged.
+/// of what the model requests. Tools in class "config" or "handoff" require approval
+/// by default; others do not unless explicitly flagged.
 pub fn tool_requires_approval(tool_name: &str) -> bool {
-    match tool_class(tool_name) {
-        Some("config") => true,
-        _ => false,
-    }
+    matches!(tool_class(tool_name), Some("config") | Some("handoff"))
 }
 
 fn build_catalog() -> HashMap<String, ToolDefinition> {
@@ -274,6 +271,80 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                 "required": ["config_path", "value"]
             }),
             class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "handoff.to_role".into(),
+        ToolDefinition {
+            tool_name: "handoff.to_role".into(),
+            description: "Transfer active context and work custody to a configured role. \
+                          Packages the current working state into a handoff bundle and signals \
+                          the hotel to route the session to the named role. The current turn \
+                          ends and the target role receives the bundle as its activation context. \
+                          Requires operator approval."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "role_name": {
+                        "type": "string",
+                        "description": "The target role name to hand off to (e.g. 'developer', 'researcher')."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why this handoff is warranted. Required for operator visibility."
+                    },
+                    "active_goal": {
+                        "type": "string",
+                        "description": "The current goal being transferred. The target role inherits this."
+                    },
+                    "context_summary": {
+                        "type": "string",
+                        "description": "Compact summary of relevant working context for the target role."
+                    },
+                    "expected_return_mode": {
+                        "type": "string",
+                        "enum": ["required", "optional", "none"],
+                        "description": "Whether the role is expected to hand back on completion."
+                    },
+                    "cleanup_actions": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Actions completed before yielding (e.g. 'committed changes', 'closed open files')."
+                    }
+                },
+                "required": ["role_name", "reason"]
+            }),
+            class: Some("handoff".into()),
+        },
+    );
+
+    m.insert(
+        "handoff.back".into(),
+        ToolDefinition {
+            tool_name: "handoff.back".into(),
+            description: "Return context and work custody back to the orchestrator or a \
+                          specified prior role. Packages a completion summary and signals \
+                          the hotel to restore the previous session route. Use when the \
+                          current role's mission is complete or blocked. \
+                          Requires operator approval."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "summary": {
+                        "type": "string",
+                        "description": "Summary of what was accomplished or why control is being returned."
+                    },
+                    "return_to": {
+                        "type": "string",
+                        "description": "Optional role name to return to. Defaults to the orchestrator."
+                    }
+                },
+                "required": ["summary"]
+            }),
+            class: Some("handoff".into()),
         },
     );
 
