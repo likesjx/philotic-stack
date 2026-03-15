@@ -67,7 +67,7 @@ Seam IDs: `session-compaction`
 - [ ] Make compaction target `CompactSessionEnvelope` explicitly instead of freeform transcript summaries.
 - [x] Add slash-command short-circuiting for deterministic agent/system commands before the normal model loop.
 - [x] Add approval interrupts with explicit history and a pre-approval runtime path.
-- [ ] Extend the shared cross-component task error envelope beyond the current model/TTS path so tool-runner, membrane, and other routed components return structured failures instead of silent fallback strings.
+- [x] Extend the shared cross-component task error envelope beyond the current model/TTS path so tool-runner, membrane, and other routed components return structured failures instead of silent fallback strings.
 
 ## New Project: Agent Loop Gap Closure
 

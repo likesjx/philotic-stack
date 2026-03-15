@@ -51,6 +51,57 @@ impl TaskErrorPayload {
         }
     }
 
+    /// A tool execution failure originating inside agent-core local dispatch.
+    pub fn tool_execution(
+        tool_name: impl Into<String>,
+        message: impl Into<String>,
+        code: Option<&str>,
+    ) -> Self {
+        let tool_name = tool_name.into();
+        Self {
+            kind: "tool_execution_failure".into(),
+            message: message.into(),
+            code: code.map(str::to_string),
+            component: Some("agent-core".into()),
+            capability: Some(tool_name),
+            provider: None,
+            retryable: Some(false),
+        }
+    }
+
+    /// A failure returned by the hotel IPC layer (error code + message from hotel).
+    pub fn ipc_failure(
+        component: impl Into<String>,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: "ipc_failure".into(),
+            message: message.into(),
+            code: Some(code.into()),
+            component: Some(component.into()),
+            provider: None,
+            capability: None,
+            retryable: Some(true),
+        }
+    }
+
+    /// A transport-level failure (socket error, serialization failure, etc.).
+    pub fn transport_error(
+        component: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: "transport_error".into(),
+            message: message.into(),
+            code: None,
+            component: Some(component.into()),
+            provider: None,
+            capability: None,
+            retryable: Some(true),
+        }
+    }
+
     pub fn display_message(&self) -> String {
         let mut parts = vec![self.message.clone(), format!("kind={}", self.kind)];
         if let Some(code) = self.code.as_deref() {
