@@ -1686,7 +1686,7 @@ async fn main() -> Result<()> {
                                             let task_req = IpcRequest::EmitTask {
                                                 target_node: local_node_id.clone(),
                                                 target_role: "agent".into(),
-                                                target_guest_id: None,
+                                                target_guest_id: Some(target_agent_id.clone()),
                                                 task_json: json!({
                                                     "source": "telegram",
                                                     "transport": "telegram",
