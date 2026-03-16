@@ -634,6 +634,9 @@ pub struct SessionState {
     pub active_turn: Option<WorkingTurn>,
     /// Subagents spawned during this session that have not yet been released or aborted.
     pub active_subagents: Vec<SpawnedSubagentRef>,
+    /// Working summary carried in from the most recent inbound handoff bundle.
+    /// Injected into context when the next user turn begins under this role.
+    pub last_handoff_summary: Option<String>,
 }
 
 impl SessionState {
@@ -653,6 +656,7 @@ impl SessionState {
             bindings,
             recent_turns: Vec::new(),
             active_turn: None,
+            last_handoff_summary: None,
             active_subagents: Vec::new(),
         }
     }
@@ -2209,6 +2213,7 @@ impl SessionState {
             recent_turns,
             active_turn,
             active_subagents: Vec::new(),
+            last_handoff_summary: None,
         })
     }
 }
