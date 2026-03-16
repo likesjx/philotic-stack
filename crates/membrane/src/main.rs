@@ -1492,13 +1492,19 @@ async fn release_telegram_poll_lease(
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
-    let args = Args::parse();
-
-    info!("Starting Materialized Membrane (Telegram Gateway) Guest Process...");
-    let guest_id = local_guest_id();
+/// Core seat loop: one IPC connection + one Telegram bot polling indefinitely.
+///
+/// Called once per seat (once in single-seat mode, N times via tokio::spawn in multi-seat).
+async fn run_seat_impl(
+    seat_guest_id: String,
+    telegram_token_key: String,
+    target_agent_id: String,
+    http_client: reqwest::Client,
+    telegram_api_base: String,
+    telegram_file_api_base: String,
+    blob_base: String,
+) -> Result<()> {
+    let guest_id = seat_guest_id;
 
     let identity = GuestIdentity {
         guest_id: guest_id.clone(),
@@ -1507,8 +1513,6 @@ async fn main() -> Result<()> {
     };
 
     let mut ipc_client = PhiloticClient::connect(identity).await?;
-    let target_agent_id = configured_target_agent_id();
-    let telegram_token_key = configured_telegram_token_key();
 
     // Pull configuration from the Hotel Graph dynamically
     info!("Requesting Telegram Configuration from Ansible Context Graph...");
@@ -1582,25 +1586,8 @@ async fn main() -> Result<()> {
     let mut next_lease_renewal =
         tokio::time::Instant::now() + Duration::from_secs(TELEGRAM_POLL_LEASE_RENEW_INTERVAL_SECS);
 
-    // Boot the reqwest client for Telegram API
-    let http_client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()?;
-
-    let telegram_api_base = std::env::var("PHILOTIC_TELEGRAM_API_BASE_URL")
-        .unwrap_or_else(|_| "https://api.telegram.org".to_string())
-        .trim_end_matches('/')
-        .to_string();
-    let telegram_file_api_base = std::env::var("PHILOTIC_TELEGRAM_FILE_API_BASE_URL")
-        .unwrap_or_else(|_| telegram_api_base.clone())
-        .trim_end_matches('/')
-        .to_string();
     let tg_base = format!("{telegram_api_base}/bot{}/", bot_token);
     let tg_file_base = format!("{telegram_file_api_base}/file/bot{}/", bot_token);
-    let blob_base = std::env::var("PHILOTIC_BLOB_BASE_URL")
-        .unwrap_or_else(|_| format!("http://127.0.0.1:{}", args.ansible_port + 1))
-        .trim_end_matches('/')
-        .to_string();
     let agent_cmds = fetch_agent_command_manifest(&mut ipc_client, &target_agent_id).await;
     register_telegram_commands(&http_client, &tg_base, &agent_cmds).await;
     let mut offset: i64 = 0;
@@ -1902,6 +1889,106 @@ async fn main() -> Result<()> {
             }
         }
     }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
+    let args = Args::parse();
+
+    info!("Starting Materialized Membrane (Telegram Gateway) Guest Process...");
+
+    let http_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()?;
+
+    let telegram_api_base = std::env::var("PHILOTIC_TELEGRAM_API_BASE_URL")
+        .unwrap_or_else(|_| "https://api.telegram.org".to_string())
+        .trim_end_matches('/')
+        .to_string();
+    let telegram_file_api_base = std::env::var("PHILOTIC_TELEGRAM_FILE_API_BASE_URL")
+        .unwrap_or_else(|_| telegram_api_base.clone())
+        .trim_end_matches('/')
+        .to_string();
+    let blob_base = std::env::var("PHILOTIC_BLOB_BASE_URL")
+        .unwrap_or_else(|_| format!("http://127.0.0.1:{}", args.ansible_port + 1))
+        .trim_end_matches('/')
+        .to_string();
+
+    // ── Multi-seat mode ────────────────────────────────────────────────────────
+    // PHILOTIC_AGENT_ROSTER is set by aiua when running a multi-agent hotel.
+    // It's a JSON array of {agent_key, agent_id} objects — one entry per agent.
+    // One seat task is spawned per entry, each with its own IPC connection.
+    if let Ok(roster_json) = std::env::var("PHILOTIC_AGENT_ROSTER") {
+        if !roster_json.trim().is_empty() {
+            let roster: Vec<Value> = serde_json::from_str(&roster_json).unwrap_or_default();
+            let hotel_guest_id = local_guest_id(); // e.g. "default:membrane-gateway"
+
+            let mut tasks = Vec::new();
+            for entry in &roster {
+                let agent_key = entry.get("agent_key").and_then(Value::as_str).unwrap_or("");
+                let agent_id = entry.get("agent_id").and_then(Value::as_str).unwrap_or("");
+                if agent_key.is_empty() || agent_id.is_empty() {
+                    warn!("Skipping roster entry with missing agent_key or agent_id: {}", entry);
+                    continue;
+                }
+                // Each seat registers under the per-agent guest_id so that philote reply
+                // routing (final_reply_guest_id) lands in the correct seat's inbox.
+                let seat_guest_id = format!("{}-{}", hotel_guest_id, agent_key);
+                let token_key = format!("telegram_bot_token_{}", agent_key);
+
+                info!("Spawning seat for agent [{}] (guest_id: {})", agent_id, seat_guest_id);
+                let agent_id = agent_id.to_string();
+                let http = http_client.clone();
+                let tg_api = telegram_api_base.clone();
+                let tg_file = telegram_file_api_base.clone();
+                let blob = blob_base.clone();
+
+                tasks.push(tokio::spawn(async move {
+                    if let Err(e) = run_seat_impl(
+                        seat_guest_id.clone(),
+                        token_key,
+                        agent_id,
+                        http,
+                        tg_api,
+                        tg_file,
+                        blob,
+                    )
+                    .await
+                    {
+                        error!("Seat [{}] exited with error: {}", seat_guest_id, e);
+                    }
+                }));
+            }
+
+            if tasks.is_empty() {
+                warn!("PHILOTIC_AGENT_ROSTER contained no valid seats. Membrane exiting.");
+                return Ok(());
+            }
+
+            // All seats run indefinitely. Wait for all to exit (IPC disconnect or ctrl-c).
+            for task in tasks {
+                let _ = task.await;
+            }
+            return Ok(());
+        }
+    }
+
+    // ── Single-seat legacy mode (backward compat / single-agent hotels) ────────
+    let guest_id = local_guest_id();
+    let target_agent_id = configured_target_agent_id();
+    let telegram_token_key = configured_telegram_token_key();
+
+    run_seat_impl(
+        guest_id,
+        telegram_token_key,
+        target_agent_id,
+        http_client,
+        telegram_api_base,
+        telegram_file_api_base,
+        blob_base,
+    )
+    .await
 }
 
 #[cfg(test)]

@@ -622,15 +622,54 @@ fn raw_agent_config_for_key(
     if merged.is_empty() { None } else { Some(merged) }
 }
 
-fn guest_seed_for_profile(hotel_name: &str, profile: &AgentProfile) -> Vec<GuestRecord> {
+/// Per-agent guests: one philote per agent profile.
+fn agent_guests_for_profile(hotel_name: &str, profile: &AgentProfile) -> GuestRecord {
+    let hotel = default_hotel_record(hotel_name);
+    let socket_path = hotel.ipc_socket_path;
+    let node_id = hotel.capabilities.node_id;
+    GuestRecord {
+        hotel_name: hotel_name.to_string(),
+        guest_id: format!("{hotel_name}:philote-{}", profile.agent_key),
+        role: "agent".into(),
+        config_json: serde_json::json!({
+            "command": "philote",
+            "args": [],
+            "env": {
+                "PHILOTIC_HOTEL_SOCKET": socket_path,
+                "PHILOTIC_NODE_ID": node_id,
+                "PHILOTIC_AGENT_ID": profile.agent_id
+            }
+        })
+        .to_string(),
+        is_active: true,
+        active_pid: None,
+        last_active_at: None,
+    }
+}
+
+/// Hotel-level shared guests: one membrane for all agents, plus model controllers.
+fn hotel_shared_guests(hotel_name: &str, profiles: &[AgentProfile]) -> Vec<GuestRecord> {
     let hotel = default_hotel_record(hotel_name);
     let socket_path = hotel.ipc_socket_path;
     let blob_base_url = format!("http://127.0.0.1:{}", hotel.blob_port);
     let node_id = hotel.capabilities.node_id;
+
+    // Build the agent roster JSON for the single membrane
+    let roster: Vec<serde_json::Value> = profiles
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "agent_key": p.agent_key,
+                "agent_id": p.agent_id
+            })
+        })
+        .collect();
+    let roster_json = serde_json::to_string(&roster).unwrap_or_else(|_| "[]".to_string());
+
     vec![
         GuestRecord {
             hotel_name: hotel_name.to_string(),
-            guest_id: format!("{hotel_name}:membrane-gateway-{}", profile.agent_key),
+            guest_id: format!("{hotel_name}:membrane-gateway"),
             role: "membrane".into(),
             config_json: serde_json::json!({
                 "command": "membrane",
@@ -639,27 +678,8 @@ fn guest_seed_for_profile(hotel_name: &str, profile: &AgentProfile) -> Vec<Guest
                     "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
                     "PHILOTIC_NODE_ID": node_id.clone(),
                     "PHILOTIC_BLOB_BASE_URL": blob_base_url,
-                    "PHILOTIC_GUEST_ID": format!("{hotel_name}:membrane-gateway-{}", profile.agent_key),
-                    "PHILOTIC_TARGET_AGENT_ID": profile.agent_id,
-                    "PHILOTIC_TELEGRAM_BOT_TOKEN_KEY": format!("telegram_bot_token_{}", profile.agent_key)
-                }
-            })
-            .to_string(),
-            is_active: true,
-            active_pid: None,
-            last_active_at: None,
-        },
-        GuestRecord {
-            hotel_name: hotel_name.to_string(),
-            guest_id: format!("{hotel_name}:philote-{}", profile.agent_key),
-            role: "agent".into(),
-            config_json: serde_json::json!({
-                "command": "philote",
-                "args": [],
-                "env": {
-                    "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
-                    "PHILOTIC_NODE_ID": node_id.clone(),
-                    "PHILOTIC_AGENT_ID": profile.agent_id
+                    "PHILOTIC_GUEST_ID": format!("{hotel_name}:membrane-gateway"),
+                    "PHILOTIC_AGENT_ROSTER": roster_json
                 }
             })
             .to_string(),
@@ -721,6 +741,14 @@ fn guest_seed_for_profile(hotel_name: &str, profile: &AgentProfile) -> Vec<Guest
             last_active_at: None,
         },
     ]
+}
+
+/// Legacy single-profile seed — used in tests that expect the old per-profile layout.
+#[cfg(test)]
+fn guest_seed_for_profile(hotel_name: &str, profile: &AgentProfile) -> Vec<GuestRecord> {
+    let mut guests = hotel_shared_guests(hotel_name, std::slice::from_ref(profile));
+    guests.push(agent_guests_for_profile(hotel_name, profile));
+    guests
 }
 
 #[cfg(test)]
@@ -1015,6 +1043,9 @@ fn deactivate_legacy_managed_guests(
                     suffix.starts_with("philote-")
                         || suffix.starts_with("hegemon-gateway")
                         || suffix.starts_with("model-router-")
+                        // Old per-agent membranes: membrane-gateway-{agent_key}
+                        // New: single membrane-gateway (no agent_key suffix)
+                        || (suffix.starts_with("membrane-gateway-"))
                 });
 
             legacy_guest_ids.contains(&guest.guest_id)
@@ -3210,12 +3241,12 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Seed guests for every agent in the hotel.
+    // Seed guests: one philote per agent, plus one shared membrane + model controllers.
     let mut all_desired_guests: Vec<GuestRecord> = Vec::new();
     for profile in &all_profiles {
-        let guests = guest_seed_for_profile(&hotel_name, profile);
-        all_desired_guests.extend(guests);
+        all_desired_guests.push(agent_guests_for_profile(&hotel_name, profile));
     }
+    all_desired_guests.extend(hotel_shared_guests(&hotel_name, &all_profiles));
     deactivate_legacy_managed_guests(
         &graph_storage,
         &hotel_name,
@@ -3858,7 +3889,9 @@ mod tests {
     fn default_guest_seed_injects_hotel_socket_env() {
         let guests = default_guest_seed("beta-hotel");
         assert_eq!(guests.len(), 5);
-        let config: serde_json::Value = serde_json::from_str(&guests[0].config_json).unwrap();
+        // Membrane is the first guest from hotel_shared_guests
+        let membrane = guests.iter().find(|g| g.role == "membrane").expect("membrane");
+        let config: serde_json::Value = serde_json::from_str(&membrane.config_json).unwrap();
         assert_eq!(
             config["env"]["PHILOTIC_HOTEL_SOCKET"].as_str(),
             Some("/tmp/philotic-beta-hotel.sock")
@@ -3867,15 +3900,12 @@ mod tests {
         assert!(guests.iter().any(|guest| guest.role == "model"));
         assert!(guests.iter().any(|guest| guest.role == "model.elevenlabs"));
         assert!(guests.iter().any(|guest| guest.role == "tool"));
-        assert_eq!(
-            config["env"]["PHILOTIC_TARGET_AGENT_ID"].as_str(),
-            Some("agent-beta-01")
-        );
-        // Token key is now per-agent: telegram_bot_token_{agent_key}
-        assert_eq!(
-            config["env"]["PHILOTIC_TELEGRAM_BOT_TOKEN_KEY"].as_str(),
-            Some("telegram_bot_token_beta")
-        );
+        // Single membrane uses PHILOTIC_AGENT_ROSTER (not per-agent token key)
+        let roster_json = config["env"]["PHILOTIC_AGENT_ROSTER"].as_str().expect("roster");
+        let roster: Vec<serde_json::Value> = serde_json::from_str(roster_json).expect("parse roster");
+        assert!(!roster.is_empty());
+        assert_eq!(roster[0]["agent_key"].as_str(), Some("beta"));
+        assert_eq!(roster[0]["agent_id"].as_str(), Some("agent-beta-01"));
     }
 
     #[test]
@@ -3889,26 +3919,24 @@ mod tests {
                 import_workspace: None,
             },
         );
+        let membrane_guest = guests.iter().find(|g| g.role == "membrane").expect("membrane");
+        let agent_guest = guests.iter().find(|g| g.role == "agent").expect("agent");
         let membrane: serde_json::Value =
-            serde_json::from_str(&guests[0].config_json).expect("membrane config");
+            serde_json::from_str(&membrane_guest.config_json).expect("membrane config");
         let agent: serde_json::Value =
-            serde_json::from_str(&guests[1].config_json).expect("agent config");
+            serde_json::from_str(&agent_guest.config_json).expect("agent config");
 
-        assert_eq!(
-            membrane["env"]["PHILOTIC_TARGET_AGENT_ID"].as_str(),
-            Some("agent-beacon-01")
-        );
-        // Token key is now per-agent: telegram_bot_token_{agent_key}
-        assert_eq!(
-            membrane["env"]["PHILOTIC_TELEGRAM_BOT_TOKEN_KEY"].as_str(),
-            Some("telegram_bot_token_beacon")
-        );
+        // Single membrane uses PHILOTIC_AGENT_ROSTER; agent_id is embedded in the roster
+        let roster_json = membrane["env"]["PHILOTIC_AGENT_ROSTER"].as_str().expect("roster");
+        let roster: Vec<serde_json::Value> = serde_json::from_str(roster_json).expect("parse roster");
+        assert_eq!(roster[0]["agent_key"].as_str(), Some("beacon"));
+        assert_eq!(roster[0]["agent_id"].as_str(), Some("agent-beacon-01"));
+
         assert_eq!(
             agent["env"]["PHILOTIC_AGENT_ID"].as_str(),
             Some("agent-beacon-01")
         );
-        assert!(guests[0].guest_id.contains("beacon"));
-        assert!(guests[1].guest_id.contains("beacon"));
+        assert!(agent_guest.guest_id.contains("beacon"));
     }
 
     #[test]
@@ -4084,10 +4112,11 @@ mod tests {
         let membrane = guests.iter().find(|g| g.role == "membrane").expect("membrane guest");
         let config: serde_json::Value =
             serde_json::from_str(&membrane.config_json).expect("parse membrane config");
-        assert_eq!(
-            config["env"]["PHILOTIC_TELEGRAM_BOT_TOKEN_KEY"].as_str(),
-            Some("telegram_bot_token_aria")
-        );
+        // Token keys are now embedded in PHILOTIC_AGENT_ROSTER; membrane resolves them at runtime
+        let roster_json = config["env"]["PHILOTIC_AGENT_ROSTER"].as_str().expect("roster");
+        let roster: Vec<serde_json::Value> = serde_json::from_str(roster_json).expect("parse roster");
+        assert_eq!(roster[0]["agent_key"].as_str(), Some("aria"));
+        assert_eq!(roster[0]["agent_id"].as_str(), Some("agent-aria"));
     }
 
     #[test]
