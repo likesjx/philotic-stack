@@ -80,6 +80,9 @@ pub async fn run(config: Option<PathBuf>, force: bool) -> Result<()> {
     println!("\nNode fingerprint (share this when enrolling into a mesh):");
     println!("  ed25519:{fingerprint}");
 
+    // ── muninn init ────────────────────────────────────────────────────────
+    crate::muninn::run_init().await?;
+
     Ok(())
 }
 

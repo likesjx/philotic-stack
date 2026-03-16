@@ -17,6 +17,9 @@ pub async fn run(config: Option<PathBuf>, hotel: String, detach: bool) -> Result
         .canonicalize()
         .context("mesh-config.json not found — run `phil init` first")?;
 
+    // ── Ensure muninn is running ───────────────────────────────────────────
+    crate::muninn::ensure_running().await?;
+
     // ── Already running? ───────────────────────────────────────────────────
     if let Some(existing_pid) = read_pid() {
         if process_alive(existing_pid) {
