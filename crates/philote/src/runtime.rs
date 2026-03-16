@@ -7,8 +7,8 @@ use crate::protocol::{
     ToolExecutionPayload, TransportAttachment, TurnEventPayload,
 };
 use crate::session::{
-    MediaRoutingPolicy, SessionState, ToolExecutionRoute, TtsMode, VoiceResponsePolicy,
-    WorkingTurn, merge_session_index,
+    AgentProfile, MediaRoutingPolicy, SessionState, ToolExecutionRoute, TtsMode,
+    VoiceResponsePolicy, WorkingTurn, merge_session_index,
 };
 use anyhow::Result;
 use memory_core::{MuninnConfig, MuninnRestEngine, MemoryScope, VaultResolver};
@@ -444,6 +444,9 @@ pub struct AgentRuntime {
     muninn_config: Option<MuninnConfig>,
     /// Role configurations registered via `role.configure`, keyed by role_name.
     configured_roles: HashMap<String, CachedRoleConfig>,
+    /// Agent profile (identity_text, soul_text, etc.) fetched from hotel at startup.
+    /// Applied to every new session so the correct persona is used from the first turn.
+    default_agent_profile: AgentProfile,
 }
 
 impl AgentRuntime {
@@ -454,6 +457,35 @@ impl AgentRuntime {
             sessions: HashMap::new(),
             muninn_config: None,
             configured_roles: HashMap::new(),
+            default_agent_profile: AgentProfile::default(),
+        }
+    }
+
+    /// Fetch this agent's identity bundle from the hotel and store it as the default profile.
+    /// Applied to every new session so the correct persona is used from the first message.
+    async fn fetch_agent_profile(&mut self) {
+        let key = format!("__agent_bundle__:{}", self.agent_id);
+        match self
+            .ipc_client
+            .send_request(IpcRequest::GetConfig { key })
+            .await
+        {
+            Ok(IpcResponse::ConfigData {
+                value_json: Some(json),
+                ..
+            }) => match serde_json::from_str::<AgentProfile>(&json) {
+                Ok(profile) => {
+                    info!(agent_id = %self.agent_id, "Agent profile loaded from hotel.");
+                    self.default_agent_profile = profile;
+                }
+                Err(e) => warn!("Failed to parse agent profile bundle: {}", e),
+            },
+            Ok(IpcResponse::ConfigData { value_json: None, .. }) => {
+                info!(agent_id = %self.agent_id, "No agent identity bundle found in hotel — using default profile.");
+            }
+            Ok(_) | Err(_) => {
+                warn!("Unexpected response to agent bundle fetch — using default profile.");
+            }
         }
     }
 
@@ -506,6 +538,7 @@ impl AgentRuntime {
 
     pub async fn run(&mut self) -> Result<()> {
         info!("Listening for inbound Persona tasks from the Philotic Web...");
+        self.fetch_agent_profile().await;
         self.fetch_memory_config().await;
 
         // Publish command manifest to the hotel so membrane can discover it.
@@ -4172,14 +4205,13 @@ impl AgentRuntime {
             }
         }
 
-        self.sessions.insert(
+        let mut state = SessionState::new(
             session_id.to_string(),
-            SessionState::new(
-                session_id.to_string(),
-                self.agent_id.clone(),
-                fallback_source.into(),
-            ),
+            self.agent_id.clone(),
+            fallback_source.into(),
         );
+        state.agent_profile = self.default_agent_profile.clone();
+        self.sessions.insert(session_id.to_string(), state);
         Ok(())
     }
 

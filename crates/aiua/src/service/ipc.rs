@@ -1273,6 +1273,26 @@ impl IpcServer {
                         }
                     }
                 }
+                if let Some(agent_id) = key.strip_prefix("__agent_bundle__:") {
+                    match graph.get_agent_identity(agent_id) {
+                        Ok(Some(identity)) => {
+                            return IpcResponse::ConfigData {
+                                key,
+                                value_json: Some(identity.bundle_json.to_string()),
+                            };
+                        }
+                        Ok(None) => {
+                            return IpcResponse::ConfigData {
+                                key,
+                                value_json: None,
+                            };
+                        }
+                        Err(e) => {
+                            error!("Failed to load agent bundle from GraphStorage: {}", e);
+                            return IpcResponse::error("config", "CONFIG_ERROR", e.to_string());
+                        }
+                    }
+                }
                 match graph.get_config_value(&key) {
                     Ok(value_json) => IpcResponse::ConfigData { key, value_json },
                     Err(e) => {
