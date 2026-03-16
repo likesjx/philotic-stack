@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 mod init;
+mod reset;
 mod start;
 mod status;
 mod stop;
@@ -67,6 +68,13 @@ enum Command {
         #[arg(long, short)]
         config: Option<PathBuf>,
     },
+
+    /// Stop all services and wipe local state (aiua, muninn, sockets, data dirs)
+    Reset {
+        /// Keep ~/.philotic/identity/ (preserves operator keypair)
+        #[arg(long)]
+        keep_identity: bool,
+    },
 }
 
 #[tokio::main]
@@ -78,5 +86,6 @@ async fn main() -> Result<()> {
         Command::Stop => stop::run().await,
         Command::Status { config } => status::run(config).await,
         Command::Agents { config } => status::run_agents(config).await,
+        Command::Reset { keep_identity } => reset::run(keep_identity).await,
     }
 }
