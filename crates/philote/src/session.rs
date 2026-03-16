@@ -634,6 +634,9 @@ pub struct SessionState {
     pub active_turn: Option<WorkingTurn>,
     /// Subagents spawned during this session that have not yet been released or aborted.
     pub active_subagents: Vec<SpawnedSubagentRef>,
+    /// Working summary carried in from the most recent inbound handoff bundle.
+    /// Injected into context when the next user turn begins under this role.
+    pub last_handoff_summary: Option<String>,
 }
 
 impl SessionState {
@@ -653,6 +656,7 @@ impl SessionState {
             bindings,
             recent_turns: Vec::new(),
             active_turn: None,
+            last_handoff_summary: None,
             active_subagents: Vec::new(),
         }
     }
@@ -1741,6 +1745,9 @@ impl SessionState {
                 ));
             }
         }
+        if let Some(summary) = self.last_handoff_summary.as_deref() {
+            envelope.push_str(&format!("Handoff context: {}\n", summary));
+        }
         if !self.bindings.effective_toolset.is_empty() {
             envelope.push_str(&format!(
                 "Effective tools: {}.\n",
@@ -1777,6 +1784,12 @@ impl SessionState {
             envelope.push_str(&format!("Recent summary: {}.\n", self.summary_text()));
         }
         envelope.trim_end().to_string()
+    }
+
+    /// Consume and clear the one-shot handoff summary after it has been projected
+    /// into the first model turn under the new role.
+    pub fn clear_handoff_summary(&mut self) {
+        self.last_handoff_summary = None;
     }
 
     fn project_working_state(&self) -> String {
@@ -2209,6 +2222,7 @@ impl SessionState {
             recent_turns,
             active_turn,
             active_subagents: Vec::new(),
+            last_handoff_summary: None,
         })
     }
 }
@@ -4114,5 +4128,195 @@ mod tests {
         assert_eq!(active_turn.phase, TurnPhase::WaitingModel);
         assert_eq!(active_turn.iteration, 2);
         assert!(!active_turn.awaiting_transcription_reentry);
+    }
+
+    // ── Role handoff full-cycle smoke tests ──────────────────────────────────
+
+    fn make_role_activation(role_name: &str) -> RoleActivation {
+        RoleActivation {
+            role_name: role_name.into(),
+            activation_reason: "test_handoff".into(),
+            requested_by: Some("orchestrator".into()),
+            ..Default::default()
+        }
+    }
+
+    /// Applying a handoff bundle sets role_activation and stashes the summary.
+    #[test]
+    fn handoff_bundle_applies_role_activation_and_summary() {
+        let mut state =
+            SessionState::new("sess-handoff".into(), "agent-jane-01".into(), "telegram".into());
+
+        state.role_activation = Some(make_role_activation("researcher"));
+        state.last_handoff_summary = Some("Analysing dataset drift in experiment B.".into());
+
+        assert_eq!(
+            state.role_activation.as_ref().map(|r| r.role_name.as_str()),
+            Some("researcher")
+        );
+        assert_eq!(
+            state.last_handoff_summary.as_deref(),
+            Some("Analysing dataset drift in experiment B.")
+        );
+    }
+
+    /// The handoff summary is visible in the session envelope on the first turn.
+    #[test]
+    fn handoff_summary_appears_in_session_envelope() {
+        let mut state =
+            SessionState::new("sess-handoff".into(), "agent-jane-01".into(), "telegram".into());
+
+        state.role_activation = Some(make_role_activation("researcher"));
+        state.last_handoff_summary = Some("Analysing dataset drift in experiment B.".into());
+
+        let projection = state.build_context_projection("what's the status?");
+        let context = state.model_context_from_projection(&projection);
+        let instructions = context["instructions"]
+            .as_array()
+            .expect("instructions must be an array");
+
+        let session_text: String = instructions
+            .iter()
+            .filter(|item| item["projection_kind"] == "session")
+            .filter_map(|item| item["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            session_text.contains("Active role: researcher."),
+            "session envelope must include active role"
+        );
+        assert!(
+            session_text.contains("Handoff context: Analysing dataset drift in experiment B."),
+            "session envelope must include handoff summary"
+        );
+    }
+
+    /// After clear_handoff_summary, the next context build omits the summary.
+    #[test]
+    fn handoff_summary_consumed_after_clear() {
+        let mut state =
+            SessionState::new("sess-handoff".into(), "agent-jane-01".into(), "telegram".into());
+
+        state.role_activation = Some(make_role_activation("researcher"));
+        state.last_handoff_summary = Some("Analysing dataset drift in experiment B.".into());
+
+        // First turn — summary present.
+        let projection = state.build_context_projection("what's the status?");
+        let context = state.model_context_from_projection(&projection);
+        let first_text: String = context["instructions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["projection_kind"] == "session")
+            .filter_map(|item| item["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            first_text.contains("Handoff context:"),
+            "summary must appear before clear"
+        );
+
+        // Runtime clears it after dispatching the first model request.
+        state.clear_handoff_summary();
+
+        // Second turn — summary gone.
+        let projection2 = state.build_context_projection("follow up");
+        let context2 = state.model_context_from_projection(&projection2);
+        let second_text: String = context2["instructions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["projection_kind"] == "session")
+            .filter_map(|item| item["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !second_text.contains("Handoff context:"),
+            "summary must not appear after clear"
+        );
+    }
+
+    /// handoff_return clears role_activation, leaving no active role.
+    #[test]
+    fn handoff_return_clears_role_activation() {
+        let mut state =
+            SessionState::new("sess-handoff".into(), "agent-jane-01".into(), "telegram".into());
+
+        state.role_activation = Some(make_role_activation("researcher"));
+        state.last_handoff_summary = Some("Some prior context.".into());
+
+        assert!(state.role_activation.is_some());
+
+        // Simulate handle_handoff_return.
+        let previous_role = state.role_activation.as_ref().map(|r| r.role_name.clone());
+        state.role_activation = None;
+
+        assert_eq!(previous_role.as_deref(), Some("researcher"));
+        assert!(state.role_activation.is_none(), "role must be cleared after return");
+
+        let projection = state.build_context_projection("hello");
+        let context = state.model_context_from_projection(&projection);
+        let session_text: String = context["instructions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["projection_kind"] == "session")
+            .filter_map(|item| item["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !session_text.contains("Active role:"),
+            "no active role after handoff_return"
+        );
+    }
+
+    /// Full cycle: bundle → summary in context → clear → return → clean context.
+    #[test]
+    fn full_role_handoff_cycle() {
+        let mut state =
+            SessionState::new("sess-cycle".into(), "agent-jane-01".into(), "telegram".into());
+
+        // 1. handoff_bundle arrives — role applied, summary stashed.
+        state.role_activation = Some(make_role_activation("analyst"));
+        state.last_handoff_summary = Some("Focus: revenue anomaly in Q1 data.".into());
+
+        // 2. First model turn — summary is injected.
+        let projection = state.build_context_projection("start the analysis");
+        let context = state.model_context_from_projection(&projection);
+        let session_block = |ctx: &serde_json::Value| -> String {
+            ctx["instructions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["projection_kind"] == "session")
+                .filter_map(|item| item["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let turn1 = session_block(&context);
+        assert!(turn1.contains("Active role: analyst."));
+        assert!(turn1.contains("Handoff context: Focus: revenue anomaly in Q1 data."));
+
+        // 3. Runtime clears the one-shot summary.
+        state.clear_handoff_summary();
+
+        // 4. Second model turn — role still active, summary gone.
+        let projection2 = state.build_context_projection("continue");
+        let context2 = state.model_context_from_projection(&projection2);
+        let turn2 = session_block(&context2);
+        assert!(turn2.contains("Active role: analyst."));
+        assert!(!turn2.contains("Handoff context:"));
+
+        // 5. handoff_return arrives — role cleared.
+        state.role_activation = None;
+
+        // 6. Post-return turn — no role, no summary.
+        let projection3 = state.build_context_projection("back to normal");
+        let context3 = state.model_context_from_projection(&projection3);
+        let turn3 = session_block(&context3);
+        assert!(!turn3.contains("Active role:"));
+        assert!(!turn3.contains("Handoff context:"));
     }
 }

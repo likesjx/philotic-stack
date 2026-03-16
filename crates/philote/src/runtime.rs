@@ -426,12 +426,24 @@ fn format_roles_report(active_incarnation_id: Option<&str>, roles: &[serde_json:
     lines.join("\n")
 }
 
+/// Locally cached role configuration, populated when `role.configure` succeeds.
+/// Used to reconstruct `RoleActivation` on inbound handoff without an IPC round-trip.
+#[derive(Debug, Clone)]
+struct CachedRoleConfig {
+    toolset_profile: String,
+    role_identity_addendum: Option<String>,
+    iteration_cap: Option<u32>,
+    approval_policy: Option<String>,
+}
+
 pub struct AgentRuntime {
     ipc_client: PhiloticClient,
     agent_id: String,
     sessions: HashMap<String, SessionState>,
     /// MuninnDB config fetched from hotel at startup. None = NullMemoryEngine.
     muninn_config: Option<MuninnConfig>,
+    /// Role configurations registered via `role.configure`, keyed by role_name.
+    configured_roles: HashMap<String, CachedRoleConfig>,
 }
 
 impl AgentRuntime {
@@ -441,6 +453,7 @@ impl AgentRuntime {
             agent_id: agent_id.into(),
             sessions: HashMap::new(),
             muninn_config: None,
+            configured_roles: HashMap::new(),
         }
     }
 
@@ -474,6 +487,21 @@ impl AgentRuntime {
                 user_id: user_id.to_string(),
             })
         })
+    }
+
+    /// Test-only: inspect session state by id.
+    #[doc(hidden)]
+    pub fn session(&self, session_id: &str) -> Option<&crate::session::SessionState> {
+        self.sessions.get(session_id)
+    }
+
+    /// Test-only: mutate session state by id.
+    #[doc(hidden)]
+    pub fn session_mut_for_test(
+        &mut self,
+        session_id: &str,
+    ) -> Option<&mut crate::session::SessionState> {
+        self.sessions.get_mut(session_id)
     }
 
     pub async fn run(&mut self) -> Result<()> {
@@ -518,6 +546,16 @@ impl AgentRuntime {
                         Ok(task) if task.is_tool_result() => {
                             if let Err(err) = self.handle_tool_result(task).await {
                                 error!("Failed to handle tool result: {}", err);
+                            }
+                        }
+                        Ok(task) if task.action.as_deref() == Some("handoff_bundle") => {
+                            if let Err(err) = self.handle_handoff_bundle(task, task_id).await {
+                                error!("Failed to handle handoff_bundle: {}", err);
+                            }
+                        }
+                        Ok(task) if task.action.as_deref() == Some("handoff_return") => {
+                            if let Err(err) = self.handle_handoff_return(task, task_id).await {
+                                error!("Failed to handle handoff_return: {}", err);
                             }
                         }
                         Ok(task) => {
@@ -1563,6 +1601,9 @@ impl AgentRuntime {
                 )
             })
             .unwrap_or((None, None));
+        if let Some(state) = self.sessions.get_mut(&session_id) {
+            state.clear_handoff_summary();
+        }
 
         let model_req = ModelRequestPayload {
             action: "generate_text".to_string(),
@@ -2331,6 +2372,124 @@ impl AgentRuntime {
         Ok(())
     }
 
+    /// Receive an inbound `handoff_bundle` task — the hotel is asking this philote
+    /// to take over the session in the requested role. Apply the role context swap
+    /// and acknowledge back to the original turn's reply target.
+    pub async fn handle_handoff_bundle(
+        &mut self,
+        task: InboundTaskPayload,
+        task_id: Uuid,
+    ) -> Result<()> {
+        let session_id = task.session_id_or_default(&self.agent_id);
+        let turn_id = task.turn_id.clone().unwrap_or_else(|| task_id.to_string());
+
+        let bundle: HandoffBundle = match task
+            .agent_action
+            .as_ref()
+            .and_then(|v| v.get("handoff_bundle"))
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+        {
+            Some(b) => b,
+            None => {
+                warn!(
+                    "Received handoff_bundle for session [{}] with no parseable bundle; ignoring.",
+                    session_id
+                );
+                return Ok(());
+            }
+        };
+
+        let to_role = match bundle.to_role.as_deref() {
+            Some(r) => r.to_string(),
+            None => {
+                warn!("handoff_bundle for session [{}] has no to_role; ignoring.", session_id);
+                return Ok(());
+            }
+        };
+
+        info!(
+            "Philote [{}] applying role context swap: {:?} → {} for session [{}]",
+            self.agent_id, bundle.from_role, to_role, session_id
+        );
+
+        self.ensure_session_loaded(&session_id, "handoff").await?;
+
+        let role_config = self.configured_roles.get(&to_role).cloned();
+
+        {
+            let state = self.sessions.entry(session_id.clone()).or_insert_with(|| {
+                SessionState::new(session_id.clone(), self.agent_id.clone(), "handoff".into())
+            });
+
+            let activation = crate::session::RoleActivation {
+                role_name: to_role.clone(),
+                active_incarnation_id: None,
+                activation_reason: bundle
+                    .handoff_reason
+                    .clone()
+                    .unwrap_or_else(|| "handoff".into()),
+                requested_by: bundle.from_role.clone(),
+                role_addendum: role_config
+                    .as_ref()
+                    .and_then(|c| c.role_identity_addendum.clone()),
+                base_identity_ref: None,
+                activation_requester_class: Some("role_handoff".into()),
+                activation_policy_owner: None,
+                toolset_profile_ref: role_config
+                    .as_ref()
+                    .map(|c| c.toolset_profile.clone()),
+                skillset_profile_ref: None,
+                effective_skillset: vec![],
+                working_memory_policy: None,
+                memory_projection_policy: None,
+            };
+
+            state.role_activation = Some(activation);
+            // Carry over the handoff context as the working summary for the new role.
+            if let Some(summary) = bundle.working_summary {
+                if state.active_turn.is_none() {
+                    state.last_handoff_summary = Some(summary);
+                }
+            }
+        }
+
+        let reply = format!("Switched to role {}.", to_role);
+        self.complete_local_command(session_id, turn_id, reply).await
+    }
+
+    /// Receive an inbound `handoff_return` task — a role is handing control back
+    /// to the orchestrator. Clear role activation and acknowledge.
+    pub async fn handle_handoff_return(
+        &mut self,
+        task: InboundTaskPayload,
+        task_id: Uuid,
+    ) -> Result<()> {
+        let session_id = task.session_id_or_default(&self.agent_id);
+        let turn_id = task.turn_id.clone().unwrap_or_else(|| task_id.to_string());
+
+        info!(
+            "Philote [{}] handling handoff_return for session [{}]",
+            self.agent_id, session_id
+        );
+
+        self.ensure_session_loaded(&session_id, "handoff_return").await?;
+
+        let previous_role = {
+            let state = self.sessions.entry(session_id.clone()).or_insert_with(|| {
+                SessionState::new(session_id.clone(), self.agent_id.clone(), "handoff_return".into())
+            });
+            let prev = state.role_activation.as_ref().map(|r| r.role_name.clone());
+            state.role_activation = None;
+            prev
+        };
+
+        let reply = match previous_role {
+            Some(role) => format!("Returned from role {}. Back to orchestrator.", role),
+            None => "Back to orchestrator.".into(),
+        };
+        self.complete_local_command(session_id, turn_id, reply).await
+    }
+
     async fn handle_role_command(
         &mut self,
         command_task_id: Uuid,
@@ -2643,6 +2802,9 @@ impl AgentRuntime {
                 )
             })
             .unwrap_or((None, None));
+        if let Some(state) = self.sessions.get_mut(&session_id) {
+            state.clear_handoff_summary();
+        }
 
         let model_req = ModelRequestPayload {
             action: "generate_text".to_string(),
@@ -3281,7 +3443,7 @@ impl AgentRuntime {
                 let req = IpcRequest::ConfigureRole {
                     agent_id: self.agent_id.clone(),
                     role_name: role_name.clone(),
-                    guest_id: format!("{}:{}", self.agent_id, role_name),
+                    guest_id: self.agent_id.clone(),
                     toolset_profile,
                     role_identity_addendum,
                     inactive_ttl_seconds,
@@ -3293,6 +3455,16 @@ impl AgentRuntime {
 
                 let (content, tool_err) = match self.ipc_client.send_request(req).await {
                     Ok(IpcResponse::ConfigureRoleOk { role_name: name }) => {
+                        self.configured_roles.insert(name.clone(), CachedRoleConfig {
+                            toolset_profile: args.get("toolset_profile")
+                                .and_then(|v| v.as_str()).unwrap_or("default").to_string(),
+                            role_identity_addendum: args.get("role_identity_addendum")
+                                .and_then(|v| v.as_str()).map(str::to_string),
+                            iteration_cap: args.get("iteration_cap")
+                                .and_then(|v| v.as_u64()).map(|v| v as u32),
+                            approval_policy: args.get("approval_policy")
+                                .and_then(|v| v.as_str()).map(str::to_string),
+                        });
                         (format!("Successfully configured role incarnation for '{}'.", name), None)
                     }
                     Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
