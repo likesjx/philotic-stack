@@ -129,6 +129,16 @@ status:
     @ps aux | grep -v grep | grep "cargo run -p aiua" || echo "Aiua daemon is not running."
     @ps aux | grep -v grep | grep "cargo run -p membrane" || echo "Membrane gateway is not running."
 
+# Build and install phil symlink to /usr/local/bin (dev workflow shortcut)
+phil-install:
+    cargo build -p philotic-web
+    @ln -sf "$(pwd)/target/debug/philotic-web" /usr/local/bin/phil
+    @echo "phil installed → /usr/local/bin/phil"
+
+# Run philotic-web CLI (dev shortcut)
+phil *args:
+    cargo run -p philotic-web -- {{args}}
+
 # Format code
 format:
     cargo fmt --all

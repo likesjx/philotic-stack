@@ -8,5 +8,6 @@ members = [
     "crates/philotic-client",
     "crates/ansible-mesh-core",
     "crates/memory-core",
+    "crates/philotic-web",
 ]
 resolver = "2"
