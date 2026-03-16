@@ -79,14 +79,11 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
-            runner: macos-15
+            runner: macos-14
             artifact: darwin-arm64
           - target: x86_64-apple-darwin
             runner: macos-13
             artifact: darwin-x86_64
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-22.04
-            artifact: linux-x86_64
 
     steps:
       - uses: actions/checkout@v4
@@ -106,16 +103,14 @@ jobs:
           key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ matrix.target }}-cargo-
 
-      # NOTE: update binary names here after ansible → aiua rename
-      # NOTE: add -p philotic-web once that crate exists
       - name: Build binaries
         run: |
           cargo build --release --target ${{ matrix.target }} \
-            -p ansible \
-            -p agent-core \
+            -p philotic-web \
+            -p aiua \
+            -p philote \
             -p membrane \
-            -p model-router \
-            -p tool-runner
+            -p model-router
 
       - name: Package binaries
         shell: bash
@@ -124,9 +119,12 @@ jobs:
           STAGING="philotic-${TAG}-${{ matrix.artifact }}"
           mkdir -p "$STAGING"
 
-          for bin in ansible agent-core membrane model-router tool-runner; do
-            [ -f "target/${{ matrix.target }}/release/$bin" ] && \
-              cp "target/${{ matrix.target }}/release/$bin" "$STAGING/"
+          for bin in philotic-web aiua philote membrane model-router; do
+            SRC="target/${{ matrix.target }}/release/$bin"
+            if [ -f "$SRC" ]; then
+              cp "$SRC" "$STAGING/${bin}-${{ matrix.artifact }}"
+              shasum -a 256 "$STAGING/${bin}-${{ matrix.artifact }}" >> "$STAGING/SHA256SUMS"
+            fi
           done
 
           [ -f mesh-config.example.json ] && cp mesh-config.example.json "$STAGING/"

@@ -677,7 +677,7 @@ Seam IDs: `structured-model-envelope`, `hotel-gemini-oauth-flow`
 - [x] Make hotel-local node identity explicit across startup/runtime smokes and materialized guests so Jane and Aria can both pass local `/ping` and startup text round-trips without hidden `local-aiua-01` assumptions or legacy `model` role registration.
 - [x] Make inter-hotel mesh dispatch node-aware by carrying `target_node_id`, discovering peer hotels from the Context Graph, and returning real mesh ACK packets for local multi-hotel development.
 - [x] Prove a first local two-hotel remote model smoke over the new TCP execution plane after remote model placement resolves through the live registry.
-- [ ] Seed `hotels.aria-architect-hotel.agents.aria.telegram.bot_token` in local `mesh-config.json` and run the first watched-live Aria hotel Telegram poller on its own bot token.
+- [ ] Seed `hotels.default.agents.aria.telegram.bot_token` (and tokens for beacon, hermes, astrid) in local `mesh-config.json` and run the first multi-agent Telegram smoke with all five agents in the default hotel.
 - [ ] Tighten inter-hotel mesh reality gaps: preserve target guest specificity across hotels, move ACK emission to a true post-commit boundary, and replace loopback-only peer addressing with explicit host authority.
 - [x] Support `hotels.<hotel>.agents.<agent>.import_workspace` so startup can seed the selected agent identity bundle from a declared workspace path.
 - [x] Make agent-level media routing policy configurable so text/media/voice decisions are owned by the agent/session profile instead of one hardcoded runtime branch.
