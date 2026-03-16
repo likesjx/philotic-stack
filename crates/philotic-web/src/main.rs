@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 mod init;
+mod muninn;
 mod reset;
 mod start;
 mod status;
