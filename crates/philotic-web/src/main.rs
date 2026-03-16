@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+mod footprint;
 mod init;
 mod muninn;
 mod reset;
@@ -76,6 +77,13 @@ enum Command {
         #[arg(long)]
         keep_identity: bool,
     },
+
+    /// Show all running philotic processes, sockets, and PID files
+    Footprint {
+        /// Kill matched processes (* or 'all' to kill everything, or a name pattern e.g. 'membrane')
+        #[arg(long)]
+        kill: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -88,5 +96,6 @@ async fn main() -> Result<()> {
         Command::Status { config } => status::run(config).await,
         Command::Agents { config } => status::run_agents(config).await,
         Command::Reset { keep_identity } => reset::run(keep_identity).await,
+        Command::Footprint { kill } => footprint::run(kill).await,
     }
 }
