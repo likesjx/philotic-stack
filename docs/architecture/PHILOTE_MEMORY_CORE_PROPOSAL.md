@@ -18,6 +18,7 @@ related_docs:
   - ARCHITECTURE_STATUS.md
   - ARCHITECTURE.md
   - MEMORY_ENGINE_ABSTRACTION_PROPOSAL.md
+  - MEMORY_DURABILITY_PROPOSAL.md
   - MUNINN_MEMORY_PROTOCOL_PROPOSAL.md
   - PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md
   - PERSONALITY_AND_CONTEXT_PROPOSAL.md
@@ -174,10 +175,17 @@ The practical consequence: Phase 1 ships MemoryEngine. An agent can remember, re
 
 | Scope | Routes To | Use Case |
 |-------|-----------|----------|
-| SelfOnly | `self:{agent_id}` | Agent's private autobiographical memory |
-| SharedUser | `user:{user_id}` | Shared knowledge about the user |
-| Session(id) | `session:{session_id}` | Active working context |
+| SelfOnly | `self_{agent_id}` | Agent's private autobiographical memory |
+| SharedUser | `user_{user_id}` | Shared knowledge about the user |
+| Session(id) | `session_{session_id}` | Active working context |
 | CrossScope(scopes) | Fan-out query across multiple vaults | "Search everything I know" |
+
+**Vault naming convention:** MuninnDB vault names are restricted to `[a-z0-9_-]`, max
+64 chars. The `_` character is reserved as the scope prefix separator. Agent IDs and
+user IDs must use `-` as their internal separator (e.g. `philote-1`, `user-jared`)
+so that vault names are unambiguous by construction: `self_philote-1`, `user-jared`,
+`session_01abc-def`. A vault name is always parseable as `{scope}_{id}` where scope
+is the first `_`-delimited segment.
 
 ### The Thin Barrier: memory-core SDK
 

@@ -1,5 +1,10 @@
 {
   "context_graph": {
+    "muninn": {
+      "endpoint": "http://127.0.0.1:8475",
+      "admin_username": "root",
+      "admin_password": "YOUR_MUNINNDB_ADMIN_PASSWORD_HERE"
+    },
     "gemini_api_key": "YOUR_GEMINI_API_KEY_HERE",
     "elevenlabs_api_key": "YOUR_ELEVENLABS_API_KEY_HERE",
     "default_model": "gemini-flash-latest"

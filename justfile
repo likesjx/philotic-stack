@@ -24,6 +24,26 @@ install-git-hooks:
 session-start:
     python3 scripts/muninn_mcp.py bootstrap
 
+# Merge mesh-config.secrets.json into mesh-config.json.
+# mesh-config.secrets.json holds only rotating secrets (API keys, bot tokens).
+# mesh-config.example.json holds the full structure with placeholders — commit that, not the secrets.
+sync-config:
+    #!/usr/bin/env python3
+    import json, sys, os
+    base = json.load(open("mesh-config.json")) if os.path.exists("mesh-config.json") else json.load(open("mesh-config.example.json"))
+    if not os.path.exists("mesh-config.secrets.json"):
+        print("mesh-config.secrets.json not found — nothing to merge"); sys.exit(0)
+    secrets = json.load(open("mesh-config.secrets.json"))
+    def deep_merge(a, b):
+        for k, v in b.items():
+            if k in a and isinstance(a[k], dict) and isinstance(v, dict):
+                deep_merge(a[k], v)
+            else:
+                a[k] = v
+    deep_merge(base, secrets)
+    json.dump(base, open("mesh-config.json", "w"), indent=2)
+    print("mesh-config.json updated from secrets")
+
 # Start the Hotel Manager (Aiua Host Daemon)
 start-aiua hotel:
     cargo build --workspace
@@ -41,7 +61,7 @@ kill-local-stack:
     @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/model-controller-gemini" || true
     @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/model-controller-elevenlabs" || true
     @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/tool-runner" || true
-    @rm -f /tmp/philotic-default.sock /tmp/philotic-aria-architect-hotel.sock /tmp/philotic-startup-test-hotel.sock
+    @rm -f /tmp/philotic-default.sock /tmp/philotic-local-telegram.sock /tmp/philotic-aria-architect-hotel.sock /tmp/philotic-startup-test-hotel.sock
 
 # Rebuild first, then kill stale local runtime processes/sockets, then start one hotel cleanly.
 start-aiua-clean hotel:
@@ -61,10 +81,25 @@ gemini-oauth-validate:
     cargo run -p aiua -- auth google validate --provider gemini
 
 # Start the local UAT stack. Aiua will materialize the gateway, agent, model, and tool guests.
-start-aiua-uat:
-    @echo "Starting UAT stack on hotel 'local-telegram' using mesh-config.json..."
-    @echo "If you are testing Telegram, make sure only one Telegram poller is running for this bot token."
+# Pass worktree=<path> to run a worktree's philote binary instead of the main one.
+# Example: just uat worktree=../philotic-stack-philote-role-handoff
+uat worktree="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just kill-local-stack
+    if [ -n "{{worktree}}" ]; then
+        abs="$(cd "{{worktree}}" && pwd)"
+        export PHILOTIC_BIN_DIR="$abs/target/debug"
+        echo "UAT: using worktree binary from $PHILOTIC_BIN_DIR"
+        cargo build --manifest-path "{{worktree}}/Cargo.toml" -p philote
+    fi
+    echo "Starting UAT stack on hotel 'local-telegram'..."
+    echo "Only one Telegram poller should be running for this bot token."
     cargo run -p aiua -- --hotel local-telegram --load-config mesh-config.json
+
+# (legacy alias)
+start-aiua-uat:
+    just uat
 
 # Start the Gateway (Telegram Membrane)
 start-gateway:

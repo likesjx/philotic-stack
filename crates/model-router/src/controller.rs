@@ -833,6 +833,7 @@ pub struct TextResult {
     pub working_memory_delta: Option<String>,
     pub follow_up_questions: Vec<String>,
     pub intent_summary: Option<String>,
+    pub memory_concept: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -844,6 +845,7 @@ pub enum ProviderOutput {
         working_memory_delta: Option<String>,
         follow_up_questions: Vec<String>,
         intent_summary: Option<String>,
+        memory_concept: Option<String>,
     },
     Audio(AudioArtifact),
 }
@@ -887,6 +889,7 @@ impl ControllerResponseEnvelope {
                 working_memory_delta,
                 follow_up_questions,
                 intent_summary,
+                memory_concept,
             } => {
                 let text_result = TextResult {
                     display_text: display_text.or_else(|| Some(content.clone())),
@@ -894,6 +897,7 @@ impl ControllerResponseEnvelope {
                     working_memory_delta,
                     follow_up_questions,
                     intent_summary,
+                    memory_concept,
                 };
                 let result = serialize_text_result(task, &text_result);
                 let content = result
@@ -948,6 +952,7 @@ fn serialize_text_result(task: &ControllerTask, result: &TextResult) -> Value {
     let include_memory = channels_requested && task.wants_channel("working_memory_delta");
     let include_questions = channels_requested && task.wants_channel("follow_up_questions");
     let include_intent = channels_requested && task.wants_channel("intent_summary");
+    let include_concept = channels_requested && task.wants_channel("memory_concept");
 
     json!({
         "display_text": result.display_text,
@@ -955,6 +960,7 @@ fn serialize_text_result(task: &ControllerTask, result: &TextResult) -> Value {
         "working_memory_delta": if include_memory { result.working_memory_delta.clone() } else { None::<String> },
         "follow_up_questions": if include_questions { result.follow_up_questions.clone() } else { Vec::<String>::new() },
         "intent_summary": if include_intent { result.intent_summary.clone() } else { None::<String> },
+        "memory_concept": if include_concept { result.memory_concept.clone() } else { None::<String> },
     })
 }
 
@@ -1451,6 +1457,7 @@ mod tests {
                 working_memory_delta: Some("The user greeted the assistant.".into()),
                 follow_up_questions: vec!["How can I help next?".into()],
                 intent_summary: Some("Exchange greetings".into()),
+                memory_concept: None,
             },
         )
         .unwrap();
@@ -1486,6 +1493,7 @@ mod tests {
                 working_memory_delta: Some("The user greeted the assistant.".into()),
                 follow_up_questions: vec!["How can I help next?".into()],
                 intent_summary: Some("Exchange greetings".into()),
+                memory_concept: None,
             },
         )
         .unwrap();

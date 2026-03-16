@@ -88,37 +88,56 @@ impl GeminiProvider {
         })
     }
 
-    fn structured_text_request_payload(prompt: &str) -> Value {
+    fn structured_text_request_payload(prompt: &str, wants_concept: bool) -> Value {
+        let system_text = if wants_concept {
+            "When generating your response, produce a JSON object with three fields: \
+             \"display_text\" (your full response formatted for text display, markdown is fine), \
+             \"spoken_text\" (a natural, expressive version for voice delivery — no markdown, \
+             conversational tone, written to be heard), and \"memory_concept\" (a short kebab-case \
+             topic slug, 2–5 words, summarising what this exchange is about for the agent's \
+             autobiographical memory — e.g. \"greeting-exchange\", \"code-review-request\", \
+             \"deployment-question\")."
+        } else {
+            "When generating your response, produce a JSON object with two fields: \
+             \"display_text\" (your full response formatted for text display, \
+             markdown is fine) and \"spoken_text\" (a natural, expressive version \
+             for voice delivery — no markdown, conversational tone, written to be heard)."
+        };
+
+        let mut properties = json!({
+            "display_text": { "type": "STRING" },
+            "spoken_text": { "type": "STRING" }
+        });
+        let mut required = vec!["display_text", "spoken_text"];
+
+        if wants_concept {
+            properties["memory_concept"] = json!({ "type": "STRING" });
+            required.push("memory_concept");
+        }
+
         json!({
             "system_instruction": {
-                "parts": [{
-                    "text": "When generating your response, produce a JSON object with two fields: \
-                             \"display_text\" (your full response formatted for text display, \
-                             markdown is fine) and \"spoken_text\" (a natural, expressive version \
-                             for voice delivery — no markdown, conversational tone, written to be heard)."
-                }]
+                "parts": [{ "text": system_text }]
             },
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
                 "responseMimeType": "application/json",
                 "responseSchema": {
                     "type": "OBJECT",
-                    "properties": {
-                        "display_text": { "type": "STRING" },
-                        "spoken_text": { "type": "STRING" }
-                    },
-                    "required": ["display_text", "spoken_text"]
+                    "properties": properties,
+                    "required": required
                 }
             }
         })
     }
 
+    /// Parse a structured JSON response from Gemini.
+    /// Returns `(display_text, spoken_text, memory_concept)`.
     fn parse_structured_response(
         status: reqwest::StatusCode,
         body: Value,
-    ) -> (String, Option<String>) {
+    ) -> (String, Option<String>, Option<String>) {
         let raw = Self::parse_response_text(status, body);
-        // Try to parse as structured JSON output
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw) {
             let display = parsed
                 .get("display_text")
@@ -130,11 +149,16 @@ impl GeminiProvider {
                 .and_then(Value::as_str)
                 .filter(|s| !s.trim().is_empty())
                 .map(str::to_string);
+            let concept = parsed
+                .get("memory_concept")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string);
             if let Some(display) = display {
-                return (display, spoken);
+                return (display, spoken, concept);
             }
         }
-        (raw, None)
+        (raw, None, None)
     }
 
     async fn media_request_payload(&self, task: &ControllerTask) -> Result<Value> {
@@ -251,13 +275,18 @@ impl ModelProvider for GeminiProvider {
     }
 
     async fn invoke(&self, task: &ControllerTask) -> Result<ProviderOutput> {
+        let use_structured = task.kind == TaskKind::TextGenerate
+            && (task.wants_channel("spoken_text") || task.wants_channel("memory_concept"));
         let payload = match task.kind {
             TaskKind::TextGenerate => {
                 let prompt = task
                     .composed_prompt_text()
                     .context("Gemini text task missing prompt")?;
-                if task.wants_channel("spoken_text") {
-                    Self::structured_text_request_payload(&prompt)
+                if use_structured {
+                    Self::structured_text_request_payload(
+                        &prompt,
+                        task.wants_channel("memory_concept"),
+                    )
                 } else {
                     Self::request_payload(&prompt)
                 }
@@ -278,12 +307,11 @@ impl ModelProvider for GeminiProvider {
         let status = response.status();
         let body = response.json::<Value>().await?;
 
-        let (content, spoken_text) =
-            if task.kind == TaskKind::TextGenerate && task.wants_channel("spoken_text") {
-                Self::parse_structured_response(status, body)
-            } else {
-                (Self::parse_response_text(status, body), None)
-            };
+        let (content, spoken_text, memory_concept) = if use_structured {
+            Self::parse_structured_response(status, body)
+        } else {
+            (Self::parse_response_text(status, body), None, None)
+        };
 
         if content.trim().is_empty() {
             bail!("Gemini returned an empty response");
@@ -296,6 +324,7 @@ impl ModelProvider for GeminiProvider {
             working_memory_delta: None,
             follow_up_questions: Vec::new(),
             intent_summary: None,
+            memory_concept,
         })
     }
 }

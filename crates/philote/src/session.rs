@@ -419,6 +419,10 @@ pub struct AgentProfile {
     pub media_routing_policy: MediaRoutingPolicy,
     #[serde(default)]
     pub voice_response_policy: VoiceResponsePolicy,
+    /// Optional filesystem path used as the default working directory for shell tools.
+    /// Populated from `import_workspace` in the agent's hotel configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_workspace: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -3034,6 +3038,39 @@ mod tests {
         assert!(tool_requires_approval("agent.configure"));
         assert!(!tool_requires_approval("echo"));
         assert!(!tool_requires_approval("workspace.read"));
+    }
+
+    #[test]
+    fn bash_exec_is_in_shell_class_and_requires_approval() {
+        use crate::catalog::{tool_catalog, tool_class, tool_requires_approval};
+        let catalog = tool_catalog();
+        assert!(catalog.contains_key("bash.exec"), "bash.exec must be in catalog");
+        assert_eq!(tool_class("bash.exec"), Some("shell"));
+        assert!(tool_requires_approval("bash.exec"));
+    }
+
+    #[test]
+    fn bash_exec_catalog_entry_has_required_command_arg() {
+        use crate::catalog::tool_catalog;
+        let catalog = tool_catalog();
+        let entry = catalog.get("bash.exec").expect("bash.exec in catalog");
+        let required = entry
+            .input_schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .expect("required array");
+        assert!(
+            required.iter().any(|v| v.as_str() == Some("command")),
+            "'command' must be in required"
+        );
+        let props = entry
+            .input_schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("properties object");
+        assert!(props.contains_key("command"));
+        assert!(props.contains_key("working_dir"));
+        assert!(props.contains_key("timeout_secs"));
     }
 
     #[test]

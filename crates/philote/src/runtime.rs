@@ -11,6 +11,7 @@ use crate::session::{
     WorkingTurn, merge_session_index,
 };
 use anyhow::Result;
+use memory_core::{MuninnConfig, MuninnRestEngine, MemoryScope, VaultResolver};
 use philotic_client::{HandoffBundle, IpcRequest, IpcResponse, PhiloticClient, TaskErrorPayload, is_ipc_disconnect};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -429,6 +430,8 @@ pub struct AgentRuntime {
     ipc_client: PhiloticClient,
     agent_id: String,
     sessions: HashMap<String, SessionState>,
+    /// MuninnDB config fetched from hotel at startup. None = NullMemoryEngine.
+    muninn_config: Option<MuninnConfig>,
 }
 
 impl AgentRuntime {
@@ -437,11 +440,45 @@ impl AgentRuntime {
             ipc_client,
             agent_id: agent_id.into(),
             sessions: HashMap::new(),
+            muninn_config: None,
         }
+    }
+
+    /// Fetch MuninnDB config from hotel IPC and store it for session use.
+    async fn fetch_memory_config(&mut self) {
+        info!("Requesting MuninnDB config from hotel...");
+        match self.ipc_client.send_request(IpcRequest::FetchMemoryConfig).await {
+            Ok(IpcResponse::MemoryConfig { config_json: Some(json) }) => {
+                match serde_json::from_str::<MuninnConfig>(&json) {
+                    Ok(cfg) => {
+                        info!(endpoint = %cfg.base_url, vaults = cfg.vault_tokens.len(), "MuninnDB config loaded");
+                        self.muninn_config = Some(cfg);
+                    }
+                    Err(e) => warn!("Failed to parse MuninnConfig from hotel: {}", e),
+                }
+            }
+            Ok(IpcResponse::MemoryConfig { config_json: None }) => {
+                info!("Hotel has no MuninnDB config — running without memory");
+            }
+            Ok(_) | Err(_) => {
+                warn!("Unexpected response to FetchMemoryConfig — running without memory");
+            }
+        }
+    }
+
+    /// Build a `MuninnRestEngine` scoped to the given agent and user.
+    fn memory_engine_for(&self, agent_id: &str, user_id: &str) -> Option<MuninnRestEngine> {
+        self.muninn_config.clone().map(|cfg| {
+            MuninnRestEngine::new(cfg, VaultResolver {
+                agent_id: agent_id.to_string(),
+                user_id: user_id.to_string(),
+            })
+        })
     }
 
     pub async fn run(&mut self) -> Result<()> {
         info!("Listening for inbound Persona tasks from the Philotic Web...");
+        self.fetch_memory_config().await;
 
         loop {
             match tokio::time::timeout(Duration::from_secs(5), self.ipc_client.recv_task()).await {
@@ -820,7 +857,7 @@ impl AgentRuntime {
             context_projection: Some(context_projection),
             attachments,
             tools_for_model,
-            response_contract: Some(serde_json::json!({ "channels": ["spoken_text"] })),
+            response_contract: Some(serde_json::json!({ "channels": ["spoken_text", "memory_concept"] })),
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
@@ -909,12 +946,20 @@ impl AgentRuntime {
             state.set_active_turn_phase(TurnPhase::Thinking);
         }
 
-        let spoken_text = task
+        let model_result = task
             .agent_action
             .as_ref()
             .and_then(|a| a.get("model_result"))
-            .and_then(|mr| mr.get("result"))
+            .and_then(|mr| mr.get("result"));
+
+        let spoken_text = model_result
             .and_then(|r| r.get("spoken_text"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string);
+
+        let memory_concept = model_result
+            .and_then(|r| r.get("memory_concept"))
             .and_then(serde_json::Value::as_str)
             .filter(|s| !s.trim().is_empty())
             .map(str::to_string);
@@ -951,7 +996,7 @@ impl AgentRuntime {
 
         match action {
             AgentAction::Respond { content } => {
-                self.complete_agent_response(session_id, turn_id, content, spoken_text)
+                self.complete_agent_response(session_id, turn_id, content, spoken_text, memory_concept)
                     .await
             }
             AgentAction::ToolCall(tool_call) => {
@@ -1065,7 +1110,7 @@ impl AgentRuntime {
                 .await?;
 
             return self
-                .complete_agent_response(session_id, turn_id, approval.approved_response, None)
+                .complete_agent_response(session_id, turn_id, approval.approved_response, None, None)
                 .await;
         }
 
@@ -1197,7 +1242,7 @@ impl AgentRuntime {
             .emit_turn_event(&session_id, "waiting_tool", None)
             .await;
 
-        let (chat_id, final_reply_to, final_reply_role, final_reply_guest_id, workspace_ref, route) = {
+        let (chat_id, final_reply_to, final_reply_role, final_reply_guest_id, workspace_ref, route, session_user_id) = {
             let Some(state) = self.sessions.get(&session_id) else {
                 warn!(
                     "Tool execution requested for unknown session {}",
@@ -1224,6 +1269,7 @@ impl AgentRuntime {
                 active_turn.final_reply_guest_id.clone(),
                 state.bindings.effective_workspace_ref.clone(),
                 route,
+                state.source.clone(),
             )
         };
 
@@ -1235,6 +1281,8 @@ impl AgentRuntime {
             tool_name: tool_call.tool_name,
             arguments: tool_call.arguments,
             execution_mode: route.execution_mode.clone(),
+            agent_id: self.agent_id.clone(),
+            user_id: Some(session_user_id),
             runner_id: route.runner_id.clone(),
             incarnation_id: route.incarnation_id.clone(),
             hotel_id: route.hotel_id.clone(),
@@ -1510,7 +1558,7 @@ impl AgentRuntime {
             context_projection,
             attachments: Vec::new(),
             tools_for_model: reentry.tools_for_model,
-            response_contract: Some(serde_json::json!({ "channels": ["spoken_text"] })),
+            response_contract: Some(serde_json::json!({ "channels": ["spoken_text", "memory_concept"] })),
             chat_id: reentry.chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
@@ -1596,6 +1644,7 @@ impl AgentRuntime {
         turn_id: String,
         content: String,
         spoken_text: Option<String>,
+        memory_concept: Option<String>,
     ) -> Result<()> {
         let voice_policy = self
             .sessions
@@ -1616,7 +1665,7 @@ impl AgentRuntime {
                 .await;
         }
 
-        self.deliver_text_reply(session_id, turn_id, content, None, false)
+        self.deliver_text_reply(session_id, turn_id, content, None, false, memory_concept)
             .await
     }
 
@@ -1789,6 +1838,7 @@ impl AgentRuntime {
             text,
             audio_artifact,
             voice_policy.caption_enabled(),
+            None,
         )
         .await
     }
@@ -1801,6 +1851,7 @@ impl AgentRuntime {
         content: String,
         audio_artifact: Option<String>,
         send_text_caption: bool,
+        memory_concept: Option<String>,
     ) -> Result<()> {
         let (completed_turn, checkpoint_memory_type, checkpoint_json, index_state) = {
             let Some(state) = self.sessions.get_mut(&session_id) else {
@@ -1850,6 +1901,11 @@ impl AgentRuntime {
             })
             .await?;
 
+        // Capture for attend hook before moving into reply_payload.
+        let attend_turn_id = turn_id.clone();
+        let attend_content = content.clone();
+        let attend_session_id = session_id.clone();
+
         let reply_payload = FinalReplyPayload {
             action: "send_reply",
             session_id,
@@ -1868,6 +1924,26 @@ impl AgentRuntime {
                 task_json: serde_json::to_string(&reply_payload)?,
             })
             .await?;
+
+        // Attend hook (Slice E): fire-and-forget autobiographical memory write.
+        if let Some(engine) = self.memory_engine_for(&self.agent_id, &self.agent_id) {
+            let agent_id = self.agent_id.clone();
+            let concept = memory_concept.unwrap_or_else(|| format!("turn:{}", attend_turn_id));
+            let content_snapshot = attend_content;
+            let tags = vec![
+                format!("agent:{}", agent_id),
+                format!("session:{}", attend_session_id),
+            ];
+            tokio::spawn(async move {
+                use memory_core::MemoryEngine as _;
+                if let Err(e) = engine
+                    .remember(MemoryScope::SelfOnly, &concept, &content_snapshot, tags)
+                    .await
+                {
+                    warn!(agent = %agent_id, error = %e, "Attend: memory write failed (non-fatal)");
+                }
+            });
+        }
 
         Ok(())
     }
@@ -3704,6 +3780,82 @@ impl AgentRuntime {
                 .await
             }
 
+            "bash.exec" => {
+                let args = &payload.arguments;
+
+                let command = match args.get("command").and_then(|v| v.as_str()) {
+                    Some(c) => c.to_string(),
+                    None => {
+                        return self
+                            .fail_active_turn(
+                                payload.session_id,
+                                payload.turn_id,
+                                "bash.exec: missing required argument 'command'".into(),
+                            )
+                            .await;
+                    }
+                };
+
+                let working_dir = args
+                    .get("working_dir")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .or_else(|| {
+                        // Fall back to the agent session's import_workspace path if set.
+                        self.sessions
+                            .get(&payload.session_id)
+                            .and_then(|s| s.agent_profile.import_workspace.as_deref())
+                            .map(str::to_string)
+                    });
+
+                let timeout_secs = args
+                    .get("timeout_secs")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(30);
+
+                let exec_result = self
+                    .execute_bash_command(command, working_dir, timeout_secs)
+                    .await;
+
+                let (content, tool_err) = match exec_result {
+                    Ok(json) => (json.to_string(), None),
+                    Err(e) => {
+                        let err = TaskErrorPayload::tool_execution(
+                            "bash.exec",
+                            e.to_string(),
+                            Some("EXEC_ERROR"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action:              Some("tool_result".into()),
+                    agent_action:        None,
+                    source:              Some("agent".into()),
+                    session_id:          Some(payload.session_id),
+                    turn_id:             Some(payload.turn_id),
+                    transport:           None,
+                    chat_id:             Some(payload.chat_id),
+                    thread_id:           None,
+                    sender_id:           None,
+                    sender_username:     None,
+                    message_kind:        None,
+                    content:             Some(content),
+                    attachments:         Vec::new(),
+                    command:             None,
+                    callback_data:       None,
+                    raw_transport_event: None,
+                    error:               tool_err,
+                    tool_name:           Some(payload.tool_name),
+                    arguments:           None,
+                    final_reply_to:      Some(payload.final_reply_to),
+                    final_reply_role:    Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                })
+                .await
+            }
+
             other => {
                 self.fail_active_turn(
                     payload.session_id,
@@ -3713,6 +3865,16 @@ impl AgentRuntime {
                 .await
             }
         }
+    }
+
+    /// Executes a shell command via `sh -c`, capturing stdout/stderr and enforcing a timeout.
+    async fn execute_bash_command(
+        &self,
+        command: String,
+        working_dir: Option<String>,
+        timeout_secs: u64,
+    ) -> Result<serde_json::Value> {
+        run_bash_command(command, working_dir, timeout_secs).await
     }
 
     async fn complete_local_command(
@@ -3854,6 +4016,50 @@ impl AgentRuntime {
             .await?;
         Ok(())
     }
+}
+
+/// Executes a shell command via `sh -c`, capturing stdout/stderr and enforcing a timeout.
+///
+/// Returns a JSON object with `stdout`, `stderr`, `exit_code`, and `success` fields.
+/// Returns `Err` only on process-spawn failure or timeout — a non-zero exit code is
+/// represented as `success: false` within the returned JSON, not as a Rust error.
+async fn run_bash_command(
+    command: String,
+    working_dir: Option<String>,
+    timeout_secs: u64,
+) -> Result<serde_json::Value> {
+    use tokio::process::Command;
+    use tokio::time::{timeout, Duration};
+
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(&command);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    if let Some(dir) = &working_dir {
+        cmd.current_dir(dir);
+    }
+
+    let child = cmd
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("bash.exec: failed to spawn process — {e}"))?;
+
+    let output = timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
+        .await
+        .map_err(|_| anyhow::anyhow!("bash.exec: command timed out after {timeout_secs}s"))?
+        .map_err(|e| anyhow::anyhow!("bash.exec: process error — {e}"))?;
+
+    let exit_code = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let success = output.status.success();
+
+    Ok(serde_json::json!({
+        "stdout": stdout,
+        "stderr": stderr,
+        "exit_code": exit_code,
+        "success": success,
+    }))
 }
 
 #[cfg(test)]
@@ -4492,5 +4698,53 @@ mod tests {
         assert!(report.contains("Active role: developer."));
         assert!(report.contains("- orchestrator"));
         assert!(report.contains("* developer"));
+    }
+
+    // ── bash.exec tests ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn bash_exec_captures_stdout_and_exit_zero() {
+        let result = super::run_bash_command("echo hello".into(), None, 10)
+            .await
+            .expect("should succeed");
+        assert_eq!(result["stdout"].as_str().unwrap().trim(), "hello");
+        assert_eq!(result["stderr"].as_str().unwrap(), "");
+        assert_eq!(result["exit_code"].as_i64().unwrap(), 0);
+        assert!(result["success"].as_bool().unwrap());
+    }
+
+    #[tokio::test]
+    async fn bash_exec_captures_stderr_and_nonzero_exit() {
+        let result = super::run_bash_command("echo err >&2; exit 2".into(), None, 10)
+            .await
+            .expect("should not return Err for process failure");
+        assert_eq!(result["stdout"].as_str().unwrap(), "");
+        assert_eq!(result["stderr"].as_str().unwrap().trim(), "err");
+        assert_eq!(result["exit_code"].as_i64().unwrap(), 2);
+        assert!(!result["success"].as_bool().unwrap());
+    }
+
+    #[tokio::test]
+    async fn bash_exec_respects_working_dir() {
+        let result = super::run_bash_command("pwd".into(), Some("/tmp".into()), 10)
+            .await
+            .expect("should succeed");
+        let stdout = result["stdout"].as_str().unwrap().trim().to_string();
+        // /tmp may be a symlink on macOS — just check it resolves to something under /tmp
+        assert!(
+            stdout == "/tmp" || stdout.starts_with("/private/tmp"),
+            "unexpected pwd: {stdout}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_exec_enforces_timeout() {
+        let err = super::run_bash_command("sleep 60".into(), None, 1)
+            .await
+            .expect_err("should time out");
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected error: {err}"
+        );
     }
 }

@@ -47,10 +47,13 @@ pub fn tool_class(tool_name: &str) -> Option<&'static str> {
 }
 
 /// Returns true if the tool requires operator approval before execution, regardless
-/// of what the model requests. Tools in class "config" or "handoff" require approval
-/// by default; others do not unless explicitly flagged.
+/// of what the model requests. Tools in class "config", "handoff", or "shell" require
+/// approval by default; others do not unless explicitly flagged.
 pub fn tool_requires_approval(tool_name: &str) -> bool {
-    matches!(tool_class(tool_name), Some("config") | Some("handoff"))
+    matches!(
+        tool_class(tool_name),
+        Some("config") | Some("handoff") | Some("shell")
+    )
 }
 
 fn build_catalog() -> HashMap<String, ToolDefinition> {
@@ -138,6 +141,41 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                 "required": ["path"]
             }),
             class: Some("workspace".into()),
+        },
+    );
+
+    m.insert(
+        "bash.exec".into(),
+        ToolDefinition {
+            tool_name: "bash.exec".into(),
+            description: "Runs a shell command and returns stdout, stderr, and exit code. \
+                          Use for scripting, file system queries, or invoking CLI tools. \
+                          Requires operator approval. Commands run under the agent's effective \
+                          working directory unless overridden by working_dir. A timeout (default \
+                          30 s) is enforced; the process is killed and an error returned if it \
+                          exceeds the limit."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The shell command to execute (passed to `sh -c`)."
+                    },
+                    "working_dir": {
+                        "type": "string",
+                        "description": "Optional absolute path to use as the working directory. \
+                                        Defaults to the agent session workspace path if set."
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "description": "Maximum seconds to wait before killing the process. \
+                                        Defaults to 30."
+                    }
+                },
+                "required": ["command"]
+            }),
+            class: Some("shell".into()),
         },
     );
 

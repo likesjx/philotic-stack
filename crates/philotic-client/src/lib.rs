@@ -505,6 +505,8 @@ pub enum IpcRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context_window_policy: Option<String>,
     },
+    /// Request the hotel's loaded MuninnDB configuration (vault tokens included).
+    FetchMemoryConfig,
 }
 
 /// Represents the canonical response from the local Ansible back to the Guest via IPC.
@@ -583,6 +585,11 @@ pub enum IpcResponse {
         agent_id: String,
         memory_type: String,
         content_json: serde_json::Value,
+    },
+    /// Response to [`IpcRequest::FetchMemoryConfig`].
+    /// `config_json` is `None` if MuninnDB is not configured on this hotel.
+    MemoryConfig {
+        config_json: Option<String>,
     },
 }
 

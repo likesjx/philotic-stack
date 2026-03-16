@@ -16,6 +16,7 @@ use ansible_mesh_core::sqlite_storage::{
 use ansible_mesh_core::storage::{
     CursorStorage, EventStorage, GraphStorage, GuestRecord, HotelRecord, SecretRecord,
     SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,
+    VaultRegistryEntry,
 };
 use ansible_mesh_core::{NodeCapabilities, NodeRole};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1275,4 +1276,89 @@ mod ipc_serde_tests {
             _ => panic!("wrong variant"),
         }
     }
+}
+
+// ── MuninnDB config helpers ──────────────────────────────────────────────────
+
+#[test]
+fn muninn_endpoint_round_trip() {
+    let store = open_graph_storage();
+
+    // Absent by default.
+    assert!(store.get_muninn_endpoint().unwrap().is_none());
+
+    store.set_muninn_endpoint("http://127.0.0.1:8475").unwrap();
+    let loaded = store.get_muninn_endpoint().unwrap().expect("endpoint present");
+    assert_eq!(loaded, "http://127.0.0.1:8475");
+
+    // Overwrite.
+    store.set_muninn_endpoint("http://muninn.example.com:8475").unwrap();
+    let updated = store.get_muninn_endpoint().unwrap().expect("endpoint present");
+    assert_eq!(updated, "http://muninn.example.com:8475");
+}
+
+#[test]
+fn vault_registry_upsert_and_list() {
+    let store = open_graph_storage();
+
+    // Empty by default.
+    assert!(store.get_vault_registry().unwrap().is_empty());
+
+    // Insert two entries.
+    store.upsert_vault_registry_entry(&VaultRegistryEntry {
+        vault_name: "self_philote-1".into(),
+        secret_ref: "secret://hotel/default/muninn/self-philote-1".into(),
+    }).unwrap();
+    store.upsert_vault_registry_entry(&VaultRegistryEntry {
+        vault_name: "user_jared".into(),
+        secret_ref: "secret://hotel/default/muninn/user-jared".into(),
+    }).unwrap();
+
+    let entries = store.get_vault_registry().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(entries.iter().any(|e| e.vault_name == "self_philote-1"));
+    assert!(entries.iter().any(|e| e.vault_name == "user_jared"));
+}
+
+#[test]
+fn vault_registry_upsert_updates_existing() {
+    let store = open_graph_storage();
+
+    store.upsert_vault_registry_entry(&VaultRegistryEntry {
+        vault_name: "self_philote-1".into(),
+        secret_ref: "secret://hotel/default/muninn/self-philote-1-v1".into(),
+    }).unwrap();
+
+    // Upsert with same vault_name but new secret_ref.
+    store.upsert_vault_registry_entry(&VaultRegistryEntry {
+        vault_name: "self_philote-1".into(),
+        secret_ref: "secret://hotel/default/muninn/self-philote-1-v2".into(),
+    }).unwrap();
+
+    let entries = store.get_vault_registry().unwrap();
+    assert_eq!(entries.len(), 1, "should not duplicate");
+    assert_eq!(entries[0].secret_ref, "secret://hotel/default/muninn/self-philote-1-v2");
+}
+
+#[test]
+fn vault_registry_remove_entry() {
+    let store = open_graph_storage();
+
+    store.upsert_vault_registry_entry(&VaultRegistryEntry {
+        vault_name: "self_philote-1".into(),
+        secret_ref: "secret://hotel/default/muninn/self-philote-1".into(),
+    }).unwrap();
+    store.upsert_vault_registry_entry(&VaultRegistryEntry {
+        vault_name: "user_jared".into(),
+        secret_ref: "secret://hotel/default/muninn/user-jared".into(),
+    }).unwrap();
+
+    store.remove_vault_registry_entry("self_philote-1").unwrap();
+
+    let entries = store.get_vault_registry().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].vault_name, "user_jared");
+
+    // Remove non-existent — should be a no-op, not an error.
+    store.remove_vault_registry_entry("self_philote-1").unwrap();
 }
