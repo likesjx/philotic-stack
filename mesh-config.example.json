@@ -6,181 +6,131 @@
       "admin_password": "YOUR_MUNINNDB_ADMIN_PASSWORD_HERE"
     },
     "gemini_api_key": "YOUR_GEMINI_API_KEY_HERE",
-    "elevenlabs_api_key": "YOUR_ELEVENLABS_API_KEY_HERE",
-    "default_model": "gemini-flash-latest"
+    "elevenlabs_api_key": "",
+    "default_model": "gemini-2.0-flash-exp"
   },
   "hotels": {
     "default": {
       "agents": {
         "jane": {
-          "agent_id": "agent-jane-01",
+          "agent_id": "agent-jane",
           "persona_name": "Jane",
-          "system_prompt": "You are Jane, a warm and capable conversational assistant. You help with everyday tasks, answer questions, and have natural conversations. You are thoughtful, friendly, and direct.",
-          "import_workspace": "/Users/you/.openClaw/workspace",
+          "system_prompt": "You are Jane, a warm and capable conversational assistant. You are Jared's right-hand agent — attentive, thoughtful, and direct. You handle a wide range of requests and are the primary point of contact. You have access to bash for running commands when needed.",
+          "import_workspace": "",
           "telegram": {
-            "bot_token": "YOUR_JANE_TELEGRAM_BOT_TOKEN_HERE",
-            "allowed_users": ["your_telegram_username"]
+            "bot_token": "REPLACE_WITH_JANE_BOT_TOKEN",
+            "allowed_users": ["REPLACE_WITH_YOUR_TELEGRAM_USERNAME"]
           },
           "model": {
-            "default_model": "gemini-flash-latest"
+            "default_model": "gemini-2.0-flash-exp"
           },
-          "effective_toolset": {
-            "bash": {
-              "exec": true
-            }
-          },
-          "voice_response_policy": {
-            "mode": "off",
-            "provider": "elevenlabs",
-            "voice_id": "YOUR_JANE_ELEVENLABS_VOICE_ID_HERE",
-            "model": "eleven_multilingual_v2",
-            "speed_percent": 92,
-            "send_text_caption": true,
-            "fallback_to_text": true
+          "approval_policy": {
+            "require_approval": true,
+            "preapproved_classes": ["utility", "session"]
           },
           "media_routing_policy": {
             "forward_media_to_model": true,
             "voice_action": "transcribe",
             "image_action": "analyze_media",
             "document_action": "analyze_media",
-            "strip_tools_on_media": true
+            "strip_tools_on_media": false
           }
         },
         "aria": {
-          "agent_id": "agent-aria-01",
-          "persona_name": "Aria the Architect",
-          "system_prompt": "You are Aria the Architect, a senior software development specialist. You excel at system design, code review, refactoring, debugging, and technical decision-making. You write precise, well-reasoned technical analyses and produce clean, idiomatic code. You have access to elevated tools and use them responsibly.",
-          "import_workspace": "/Users/you/.openClaw/workspace",
+          "agent_id": "agent-aria",
+          "persona_name": "Aria",
+          "system_prompt": "You are Aria the Architect, a development specialist and technical lead. You track all active work, monitor documentation quality, and guide architectural decisions. You have an admin role — you can inspect and manage the Philotic Stack itself. You are precise, systematic, and think in systems. Use bash for development tasks.",
+          "import_workspace": "",
           "telegram": {
-            "bot_token": "YOUR_ARIA_TELEGRAM_BOT_TOKEN_HERE",
-            "allowed_users": ["your_telegram_username"]
+            "bot_token": "REPLACE_WITH_ARIA_BOT_TOKEN",
+            "allowed_users": ["REPLACE_WITH_YOUR_TELEGRAM_USERNAME"]
           },
           "model": {
-            "default_model": "gemini-flash-latest"
+            "default_model": "gemini-2.0-flash-exp"
           },
           "toolset_tags": ["admin-required"],
-          "effective_toolset": {
-            "bash": {
-              "exec": true
-            }
-          },
-          "voice_response_policy": {
-            "mode": "off",
-            "provider": "elevenlabs",
-            "voice_id": "YOUR_ARIA_ELEVENLABS_VOICE_ID_HERE",
-            "model": "eleven_multilingual_v2",
-            "speed_percent": 92,
-            "send_text_caption": true,
-            "fallback_to_text": true
+          "approval_policy": {
+            "require_approval": true,
+            "preapproved_classes": ["utility", "session", "workspace"]
           },
           "media_routing_policy": {
             "forward_media_to_model": true,
             "voice_action": "transcribe",
             "image_action": "analyze_media",
             "document_action": "analyze_media",
-            "strip_tools_on_media": true
+            "strip_tools_on_media": false
           }
         },
         "beacon": {
-          "agent_id": "agent-beacon-01",
-          "persona_name": "Beacon the Chief of Staff",
-          "system_prompt": "You are Beacon the Chief of Staff, a strategic planning specialist focused on goals, events, and coordination. You help define objectives, track progress, schedule activities, and synthesize high-level plans into actionable steps. You are organized, proactive, and keep things moving forward.",
-          "import_workspace": "/Users/you/.openClaw/workspace",
+          "agent_id": "agent-beacon",
+          "persona_name": "Beacon",
+          "system_prompt": "You are Beacon, Chief of Staff. You are the keeper of goals, roles, events, projects, and ongoing efforts. You help maintain clarity on what matters, what's in flight, and what's next. You track commitments, surface blockers, and ensure nothing falls through the cracks. You are organized, proactive, and operate at a strategic level.",
+          "import_workspace": "",
           "telegram": {
-            "bot_token": "YOUR_BEACON_TELEGRAM_BOT_TOKEN_HERE",
-            "allowed_users": ["your_telegram_username"]
+            "bot_token": "REPLACE_WITH_BEACON_BOT_TOKEN",
+            "allowed_users": ["REPLACE_WITH_YOUR_TELEGRAM_USERNAME"]
           },
           "model": {
-            "default_model": "gemini-flash-latest"
+            "default_model": "gemini-2.0-flash-exp"
           },
-          "effective_toolset": {
-            "bash": {
-              "exec": true
-            }
-          },
-          "voice_response_policy": {
-            "mode": "off",
-            "provider": "elevenlabs",
-            "voice_id": "YOUR_BEACON_ELEVENLABS_VOICE_ID_HERE",
-            "model": "eleven_multilingual_v2",
-            "speed_percent": 92,
-            "send_text_caption": true,
-            "fallback_to_text": true
+          "approval_policy": {
+            "require_approval": true,
+            "preapproved_classes": ["utility", "session"]
           },
           "media_routing_policy": {
             "forward_media_to_model": true,
             "voice_action": "transcribe",
             "image_action": "analyze_media",
             "document_action": "analyze_media",
-            "strip_tools_on_media": true
+            "strip_tools_on_media": false
           }
         },
         "hermes": {
-          "agent_id": "agent-hermes-01",
-          "persona_name": "Hermes the Messenger",
-          "system_prompt": "You are Hermes the Messenger, a communications specialist. You help draft messages, manage correspondence, summarize conversations, route information between people and systems, and ensure clear communication. You are concise, reliable, and attuned to tone and audience.",
-          "import_workspace": "/Users/you/.openClaw/workspace",
+          "agent_id": "agent-hermes",
+          "persona_name": "Hermes",
+          "system_prompt": "You are Hermes, Communications Specialist. You manage all outbound and inbound communications — email drafts, message routing, notification summaries, and correspondence. You are concise, clear, and know when something needs immediate attention versus when it can wait. Use bash to interact with mail and messaging tools.",
+          "import_workspace": "",
           "telegram": {
-            "bot_token": "YOUR_HERMES_TELEGRAM_BOT_TOKEN_HERE",
-            "allowed_users": ["your_telegram_username"]
+            "bot_token": "REPLACE_WITH_HERMES_BOT_TOKEN",
+            "allowed_users": ["REPLACE_WITH_YOUR_TELEGRAM_USERNAME"]
           },
           "model": {
-            "default_model": "gemini-flash-latest"
+            "default_model": "gemini-2.0-flash-exp"
           },
-          "effective_toolset": {
-            "bash": {
-              "exec": true
-            }
-          },
-          "voice_response_policy": {
-            "mode": "off",
-            "provider": "elevenlabs",
-            "voice_id": "YOUR_HERMES_ELEVENLABS_VOICE_ID_HERE",
-            "model": "eleven_multilingual_v2",
-            "speed_percent": 92,
-            "send_text_caption": true,
-            "fallback_to_text": true
+          "approval_policy": {
+            "require_approval": true,
+            "preapproved_classes": ["utility", "session"]
           },
           "media_routing_policy": {
             "forward_media_to_model": true,
             "voice_action": "transcribe",
             "image_action": "analyze_media",
             "document_action": "analyze_media",
-            "strip_tools_on_media": true
+            "strip_tools_on_media": false
           }
         },
         "astrid": {
-          "agent_id": "agent-astrid-01",
-          "persona_name": "Astrid the Librarian",
-          "system_prompt": "You are Astrid the Librarian, a knowledge management and documentation specialist. You maintain Obsidian vaults, organize notes, synthesize research, and help surface relevant knowledge on demand. You are meticulous, thorough, and skilled at structuring information for long-term retrieval.",
-          "import_workspace": "/Users/you/.openClaw/workspace",
+          "agent_id": "agent-astrid",
+          "persona_name": "Astrid",
+          "system_prompt": "You are Astrid the Librarian, keeper of the Obsidian vault and documentation systems. You organize knowledge, maintain the tag library, structure notes, and ensure information is findable and well-linked. You are methodical, thorough, and take naming and organization seriously. Use bash to interact with vault and documentation tools.",
+          "import_workspace": "",
           "telegram": {
-            "bot_token": "YOUR_ASTRID_TELEGRAM_BOT_TOKEN_HERE",
-            "allowed_users": ["your_telegram_username"]
+            "bot_token": "REPLACE_WITH_ASTRID_BOT_TOKEN",
+            "allowed_users": ["REPLACE_WITH_YOUR_TELEGRAM_USERNAME"]
           },
           "model": {
-            "default_model": "gemini-flash-latest"
+            "default_model": "gemini-2.0-flash-exp"
           },
-          "effective_toolset": {
-            "bash": {
-              "exec": true
-            }
-          },
-          "voice_response_policy": {
-            "mode": "off",
-            "provider": "elevenlabs",
-            "voice_id": "YOUR_ASTRID_ELEVENLABS_VOICE_ID_HERE",
-            "model": "eleven_multilingual_v2",
-            "speed_percent": 92,
-            "send_text_caption": true,
-            "fallback_to_text": true
+          "approval_policy": {
+            "require_approval": true,
+            "preapproved_classes": ["utility", "session", "workspace"]
           },
           "media_routing_policy": {
             "forward_media_to_model": true,
             "voice_action": "transcribe",
             "image_action": "analyze_media",
             "document_action": "analyze_media",
-            "strip_tools_on_media": true
+            "strip_tools_on_media": false
           }
         }
       }

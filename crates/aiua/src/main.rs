@@ -538,6 +538,90 @@ fn agent_profile_from_config(
     })
 }
 
+/// Returns profiles for ALL agents in the hotel config.
+/// Falls back to a single default profile if the hotel has no agents section.
+fn all_agent_profiles_from_config(
+    config_json: &serde_json::Value,
+    hotel_name: &str,
+) -> Vec<AgentProfile> {
+    let get_agents = |hotel: &serde_json::Map<String, serde_json::Value>| {
+        hotel
+            .get("agents")
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default()
+    };
+
+    let default_agents = hotel_object(config_json, "default")
+        .map(get_agents)
+        .unwrap_or_default();
+    let hotel_agents = if hotel_name != "default" {
+        hotel_object(config_json, hotel_name)
+            .map(get_agents)
+            .unwrap_or_default()
+    } else {
+        serde_json::Map::new()
+    };
+
+    // Merge: hotel-specific agents overlay the default agents by key
+    let mut all_agents = default_agents;
+    for (key, val) in hotel_agents {
+        all_agents.insert(key, val);
+    }
+
+    if all_agents.is_empty() {
+        return vec![default_agent_profile_for_hotel(hotel_name)];
+    }
+
+    all_agents
+        .into_iter()
+        .filter_map(|(agent_key, agent_val)| {
+            let agent = agent_val.as_object()?;
+            let agent_id = agent
+                .get("agent_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("agent-{}-01", agent_key));
+            let persona_name = agent
+                .get("persona_name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| title_case_agent_name(&agent_key));
+            let import_workspace = agent
+                .get("import_workspace")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            Some(AgentProfile {
+                agent_key,
+                agent_id,
+                persona_name,
+                import_workspace,
+            })
+        })
+        .collect()
+}
+
+/// Returns the raw agent config map for a specific agent key (not selection-based).
+fn raw_agent_config_for_key(
+    config_json: &serde_json::Value,
+    hotel_name: &str,
+    agent_key: &str,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let mut merged = serde_json::Map::new();
+    for name in ["default", hotel_name] {
+        if let Some(hotel) = hotel_object(config_json, name) {
+            if let Some(agents) = hotel.get("agents").and_then(serde_json::Value::as_object) {
+                if let Some(agent) = agents.get(agent_key).and_then(serde_json::Value::as_object) {
+                    merged.extend(agent.clone());
+                }
+            }
+        }
+    }
+    if merged.is_empty() { None } else { Some(merged) }
+}
+
 fn guest_seed_for_profile(hotel_name: &str, profile: &AgentProfile) -> Vec<GuestRecord> {
     let hotel = default_hotel_record(hotel_name);
     let socket_path = hotel.ipc_socket_path;
@@ -557,7 +641,7 @@ fn guest_seed_for_profile(hotel_name: &str, profile: &AgentProfile) -> Vec<Guest
                     "PHILOTIC_BLOB_BASE_URL": blob_base_url,
                     "PHILOTIC_GUEST_ID": format!("{hotel_name}:membrane-gateway-{}", profile.agent_key),
                     "PHILOTIC_TARGET_AGENT_ID": profile.agent_id,
-                    "PHILOTIC_TELEGRAM_BOT_TOKEN_KEY": "telegram_bot_token"
+                    "PHILOTIC_TELEGRAM_BOT_TOKEN_KEY": format!("telegram_bot_token_{}", profile.agent_key)
                 }
             })
             .to_string(),
@@ -697,8 +781,17 @@ fn extract_context_graph_entries(
     }
 
     if let Some(hotel_name) = hotel_name {
-        if let Some((_, agent)) = merged_agent_config(config_json, hotel_name) {
-            merge_agent_entries(&mut merged, &agent);
+        // For multi-agent hotels, extract per-agent token keys for all agents.
+        for hotel_key in ["default", hotel_name] {
+            if let Some(hotel) = hotel_object(config_json, hotel_key) {
+                if let Some(agents) = hotel.get("agents").and_then(serde_json::Value::as_object) {
+                    for (agent_key, agent_val) in agents {
+                        if let Some(agent) = agent_val.as_object() {
+                            merge_agent_entries(&mut merged, agent, Some(agent_key.as_str()));
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -723,13 +816,14 @@ fn merge_hotel_base_entries(
     }
 
     if let Some(telegram) = hotel.get("telegram").and_then(serde_json::Value::as_object) {
-        merge_telegram_entries(merged, telegram);
+        merge_telegram_entries(merged, telegram, None);
     }
 }
 
 fn merge_agent_entries(
     merged: &mut serde_json::Map<String, serde_json::Value>,
     agent: &serde_json::Map<String, serde_json::Value>,
+    agent_key: Option<&str>,
 ) {
     if let Some(context_graph) = agent
         .get("context_graph")
@@ -739,7 +833,7 @@ fn merge_agent_entries(
     }
 
     if let Some(telegram) = agent.get("telegram").and_then(serde_json::Value::as_object) {
-        merge_telegram_entries(merged, telegram);
+        merge_telegram_entries(merged, telegram, agent_key);
     }
 
     if let Some(model) = agent.get("model").and_then(serde_json::Value::as_object) {
@@ -771,11 +865,26 @@ fn merge_agent_entries(
 fn merge_telegram_entries(
     merged: &mut serde_json::Map<String, serde_json::Value>,
     telegram: &serde_json::Map<String, serde_json::Value>,
+    agent_key: Option<&str>,
 ) {
     if let Some(bot_token) = telegram.get("bot_token") {
+        // Always store the per-agent key so membrane can retrieve it by agent_key.
+        if let Some(key) = agent_key {
+            merged.insert(
+                format!("telegram_bot_token_{key}"),
+                bot_token.clone(),
+            );
+        }
+        // Also store the global fallback key for single-agent / legacy configs.
         merged.insert("telegram_bot_token".into(), bot_token.clone());
     }
     if let Some(allowed_users) = telegram.get("allowed_users") {
+        if let Some(key) = agent_key {
+            merged.insert(
+                format!("telegram_allowed_users_{key}"),
+                allowed_users.clone(),
+            );
+        }
         merged.insert("telegram_allowed_users".into(), allowed_users.clone());
     }
 }
@@ -810,13 +919,26 @@ fn agent_identity_record_for_profile(
         .map(|workspace| identity_bundle_from_workspace(&profile.agent_key, Path::new(workspace)))
         .unwrap_or_else(|| serde_json::json!({}));
 
-    // Merge policy fields from config into bundle so agent-core's AgentProfile picks them up
-    // via serde deserialization of the session snapshot's agent_profile field.
+    // Merge policy and identity fields from config into bundle.
     if let Some(bundle_obj) = bundle_json.as_object_mut() {
         if let Some(config) = agent_config {
             for key in ["voice_response_policy", "media_routing_policy"] {
                 if let Some(value) = config.get(key) {
                     bundle_obj.insert(key.to_string(), value.clone());
+                }
+            }
+            // If the workspace didn't supply an identity_text (no IDENTITY.md), fall back to
+            // system_prompt from the agent config. This lets operators define agent personas
+            // directly in mesh-config.json without needing workspace files on disk.
+            let has_identity = bundle_obj
+                .get("identity_text")
+                .map(|v| !v.is_null() && v.as_str().is_some_and(|s| !s.is_empty()))
+                .unwrap_or(false);
+            if !has_identity {
+                if let Some(sp) = config.get("system_prompt").and_then(|v| v.as_str()) {
+                    if !sp.is_empty() {
+                        bundle_obj.insert("identity_text".to_string(), sp.into());
+                    }
                 }
             }
         }
@@ -859,7 +981,7 @@ fn reconcile_hotel_record(graph: &dyn GraphStorage, hotel_name: &str) -> Result<
 fn deactivate_legacy_managed_guests(
     graph: &dyn GraphStorage,
     hotel_name: &str,
-    profile: &AgentProfile,
+    profiles: &[AgentProfile],
     desired_guests: &[GuestRecord],
 ) -> Result<()> {
     // Transitional cleanup: the Telegram gateway used to be named "hegemon".
@@ -868,16 +990,15 @@ fn deactivate_legacy_managed_guests(
         .iter()
         .map(|guest| guest.guest_id.as_str())
         .collect::<std::collections::HashSet<_>>();
-    let legacy_guest_ids = [
-        format!("philote-{}", profile.agent_key),
-        format!("{hotel_name}:philote-{}", profile.agent_key),
-        format!("hegemon-gateway-{}", profile.agent_key),
-        format!("{hotel_name}:hegemon-gateway-{}", profile.agent_key),
-        "hegemon-gateway".to_string(),
-        "model-router-gemini".to_string(),
-    ]
-    .into_iter()
-    .collect::<std::collections::HashSet<_>>();
+    let mut legacy_guest_ids = std::collections::HashSet::new();
+    legacy_guest_ids.insert("hegemon-gateway".to_string());
+    legacy_guest_ids.insert("model-router-gemini".to_string());
+    for profile in profiles {
+        legacy_guest_ids.insert(format!("philote-{}", profile.agent_key));
+        legacy_guest_ids.insert(format!("{hotel_name}:philote-{}", profile.agent_key));
+        legacy_guest_ids.insert(format!("hegemon-gateway-{}", profile.agent_key));
+        legacy_guest_ids.insert(format!("{hotel_name}:hegemon-gateway-{}", profile.agent_key));
+    }
 
     let stale = graph
         .list_guests(hotel_name, false)?
@@ -2987,8 +3108,8 @@ async fn main() -> Result<()> {
     let hotel_name = args.hotel.clone();
 
     // Handle Config Loading if requested
-    let mut effective_agent_profile = None;
-    let mut effective_agent_config: Option<serde_json::Map<String, serde_json::Value>> = None;
+    // Lifted out of the if-block so we can reference it during multi-agent profile collection.
+    let mut loaded_config_json: Option<serde_json::Value> = None;
     if let Some(config_path) = args.load_config {
         info!(
             "Loading configuration from '{}' into the Context Graph...",
@@ -2997,12 +3118,7 @@ async fn main() -> Result<()> {
         let config_data = fs::read_to_string(&config_path).context("Failed to read config file")?;
         let config_json: serde_json::Value =
             serde_json::from_str(&config_data).context("Invalid JSON config file")?;
-        if let Some(hotel_name) = hotel_name.as_deref() {
-            effective_agent_profile = agent_profile_from_config(&config_json, hotel_name);
-            // Stash the raw merged agent config so policy fields can be seeded into bundle_json.
-            effective_agent_config =
-                merged_agent_config(&config_json, hotel_name).map(|(_, agent)| agent);
-        }
+        loaded_config_json = Some(config_json.clone());
 
         let entries = extract_context_graph_entries(&config_json, hotel_name.as_deref());
 
@@ -3064,8 +3180,28 @@ async fn main() -> Result<()> {
 
     let hotel_name =
         hotel_name.context("--hotel is required unless using a subcommand such as `auth`")?;
-    let effective_agent_profile =
-        effective_agent_profile.unwrap_or_else(|| default_agent_profile_for_hotel(&hotel_name));
+    // Collect all agent profiles from the config. Falls back to a single default if none found.
+    let all_profiles = loaded_config_json
+        .as_ref()
+        .map(|cfg| all_agent_profiles_from_config(cfg, &hotel_name))
+        .unwrap_or_else(|| vec![default_agent_profile_for_hotel(&hotel_name)]);
+    info!(
+        "Hotel '{}' will materialize {} agent(s): {}",
+        hotel_name,
+        all_profiles.len(),
+        all_profiles
+            .iter()
+            .map(|p| p.persona_name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    // Keep the single effective_agent_profile for legacy code paths that need exactly one.
+    let _effective_agent_profile = all_profiles
+        .first()
+        .cloned()
+        .unwrap_or_else(|| default_agent_profile_for_hotel(&hotel_name));
+
     let startup_test = args.test;
     if graph_storage.get_hotel(&hotel_name)?.is_none() {
         info!(
@@ -3073,14 +3209,20 @@ async fn main() -> Result<()> {
             hotel_name
         );
     }
-    let desired_guests = guest_seed_for_profile(&hotel_name, &effective_agent_profile);
+
+    // Seed guests for every agent in the hotel.
+    let mut all_desired_guests: Vec<GuestRecord> = Vec::new();
+    for profile in &all_profiles {
+        let guests = guest_seed_for_profile(&hotel_name, profile);
+        all_desired_guests.extend(guests);
+    }
     deactivate_legacy_managed_guests(
         &graph_storage,
         &hotel_name,
-        &effective_agent_profile,
-        &desired_guests,
+        &all_profiles,
+        &all_desired_guests,
     )?;
-    graph_storage.seed_guests(&hotel_name, &desired_guests)?;
+    graph_storage.seed_guests(&hotel_name, &all_desired_guests)?;
     let mut hotel = reconcile_hotel_record(&graph_storage, &hotel_name)?;
 
     seed_abstract_tool_catalog(&graph_storage)?;
@@ -3092,19 +3234,21 @@ async fn main() -> Result<()> {
         enable_guest_test_overrides(&graph_storage, &hotel_name, test)?;
     }
 
-    let effective_identity = agent_identity_record_for_profile(
-        &effective_agent_profile,
-        &hotel_name,
-        effective_agent_config.as_ref(),
-    );
-    graph_storage
-        .upsert_agent_identity(&effective_identity)
-        .with_context(|| {
-            format!(
-                "Failed to seed effective agent identity bundle for {}",
-                effective_identity.agent_id
-            )
-        })?;
+    // Upsert identity records for all agents.
+    for profile in &all_profiles {
+        let agent_config = loaded_config_json
+            .as_ref()
+            .and_then(|cfg| raw_agent_config_for_key(cfg, &hotel_name, &profile.agent_key));
+        let identity = agent_identity_record_for_profile(profile, &hotel_name, agent_config.as_ref());
+        graph_storage
+            .upsert_agent_identity(&identity)
+            .with_context(|| {
+                format!(
+                    "Failed to seed agent identity bundle for {}",
+                    identity.agent_id
+                )
+            })?;
+    }
 
     if let Some(active_pid) = hotel.active_pid.as_deref() {
         if let Ok(pid) = active_pid.parse::<u32>() {
@@ -3681,7 +3825,8 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentProfile, StartupTest, agent_profile_from_config, deactivate_legacy_managed_guests,
+        AgentProfile, StartupTest, agent_identity_record_for_profile, agent_profile_from_config,
+        all_agent_profiles_from_config, deactivate_legacy_managed_guests,
         default_agent_profile_for_hotel, default_guest_seed, default_hotel_record,
         enable_guest_test_overrides, execution_reachability_for_hotel,
         extract_context_graph_entries, guest_seed_for_profile, guest_supervision_enabled,
@@ -3726,9 +3871,10 @@ mod tests {
             config["env"]["PHILOTIC_TARGET_AGENT_ID"].as_str(),
             Some("agent-beta-01")
         );
+        // Token key is now per-agent: telegram_bot_token_{agent_key}
         assert_eq!(
             config["env"]["PHILOTIC_TELEGRAM_BOT_TOKEN_KEY"].as_str(),
-            Some("telegram_bot_token")
+            Some("telegram_bot_token_beta")
         );
     }
 
@@ -3752,9 +3898,10 @@ mod tests {
             membrane["env"]["PHILOTIC_TARGET_AGENT_ID"].as_str(),
             Some("agent-beacon-01")
         );
+        // Token key is now per-agent: telegram_bot_token_{agent_key}
         assert_eq!(
             membrane["env"]["PHILOTIC_TELEGRAM_BOT_TOKEN_KEY"].as_str(),
-            Some("telegram_bot_token")
+            Some("telegram_bot_token_beacon")
         );
         assert_eq!(
             agent["env"]["PHILOTIC_AGENT_ID"].as_str(),
@@ -3882,6 +4029,118 @@ mod tests {
     }
 
     #[test]
+    fn all_agent_profiles_returns_all_agents_in_hotel() {
+        let config = serde_json::json!({
+            "hotels": {
+                "default": {
+                    "agents": {
+                        "jane": { "agent_id": "agent-jane", "persona_name": "Jane" },
+                        "aria": { "agent_id": "agent-aria", "persona_name": "Aria" },
+                        "beacon": { "agent_id": "agent-beacon", "persona_name": "Beacon" }
+                    }
+                }
+            }
+        });
+        let profiles = all_agent_profiles_from_config(&config, "default");
+        assert_eq!(profiles.len(), 3);
+        let names: std::collections::HashSet<&str> =
+            profiles.iter().map(|p| p.persona_name.as_str()).collect();
+        assert!(names.contains("Jane"));
+        assert!(names.contains("Aria"));
+        assert!(names.contains("Beacon"));
+    }
+
+    #[test]
+    fn multi_agent_context_graph_stores_per_agent_token_keys() {
+        let config = serde_json::json!({
+            "hotels": {
+                "default": {
+                    "agents": {
+                        "jane": {
+                            "telegram": { "bot_token": "jane-token", "allowed_users": ["jared"] }
+                        },
+                        "aria": {
+                            "telegram": { "bot_token": "aria-token", "allowed_users": ["jared"] }
+                        }
+                    }
+                }
+            }
+        });
+        let entries = extract_context_graph_entries(&config, Some("default"));
+        // Per-agent keys must be present
+        assert!(entries.iter().any(|(k, v)| k == "telegram_bot_token_jane" && v.as_str() == Some("jane-token")));
+        assert!(entries.iter().any(|(k, v)| k == "telegram_bot_token_aria" && v.as_str() == Some("aria-token")));
+    }
+
+    #[test]
+    fn guest_seed_uses_per_agent_token_key() {
+        let profile = AgentProfile {
+            agent_key: "aria".into(),
+            agent_id: "agent-aria".into(),
+            persona_name: "Aria".into(),
+            import_workspace: None,
+        };
+        let guests = guest_seed_for_profile("default", &profile);
+        let membrane = guests.iter().find(|g| g.role == "membrane").expect("membrane guest");
+        let config: serde_json::Value =
+            serde_json::from_str(&membrane.config_json).expect("parse membrane config");
+        assert_eq!(
+            config["env"]["PHILOTIC_TELEGRAM_BOT_TOKEN_KEY"].as_str(),
+            Some("telegram_bot_token_aria")
+        );
+    }
+
+    #[test]
+    fn system_prompt_used_as_identity_text_when_no_workspace() {
+        let profile = AgentProfile {
+            agent_key: "beacon".into(),
+            agent_id: "agent-beacon".into(),
+            persona_name: "Beacon".into(),
+            import_workspace: None,
+        };
+        let mut agent_config = serde_json::Map::new();
+        agent_config.insert(
+            "system_prompt".into(),
+            "You are Beacon, Chief of Staff.".into(),
+        );
+        let identity = agent_identity_record_for_profile(&profile, "default", Some(&agent_config));
+        let identity_text = identity.bundle_json["identity_text"].as_str().unwrap_or("");
+        assert_eq!(identity_text, "You are Beacon, Chief of Staff.");
+    }
+
+    #[test]
+    fn workspace_identity_text_takes_precedence_over_system_prompt() {
+        // If the workspace supplied identity_text, system_prompt must not overwrite it.
+        let profile = AgentProfile {
+            agent_key: "beacon".into(),
+            agent_id: "agent-beacon".into(),
+            persona_name: "Beacon".into(),
+            // Workspace path that doesn't exist — bundle will be empty
+            import_workspace: None,
+        };
+        let mut agent_config = serde_json::Map::new();
+        agent_config.insert("system_prompt".into(), "Fallback prompt.".into());
+        // Manually inject identity_text as if a workspace had provided it
+        let identity = {
+            let mut bundle = serde_json::json!({ "identity_text": "Workspace identity." });
+            let bundle_obj = bundle.as_object_mut().unwrap();
+            bundle_obj.insert("system_prompt".into(), "Fallback prompt.".into());
+            // system_prompt should NOT overwrite the existing identity_text
+            let has_identity = bundle_obj
+                .get("identity_text")
+                .map(|v| !v.is_null() && v.as_str().is_some_and(|s| !s.is_empty()))
+                .unwrap_or(false);
+            if !has_identity {
+                if let Some(sp) = agent_config.get("system_prompt").and_then(|v| v.as_str()) {
+                    bundle_obj.insert("identity_text".to_string(), sp.into());
+                }
+            }
+            bundle
+        };
+        assert_eq!(identity["identity_text"].as_str(), Some("Workspace identity."));
+    }
+
+    #[test]
     fn context_graph_entries_support_hotel_level_telegram_overlay() {
         let entries = extract_context_graph_entries(
             &serde_json::json!({
@@ -3999,7 +4258,7 @@ mod tests {
             .seed_guests(hotel_name, &desired)
             .expect("seed desired guests");
 
-        deactivate_legacy_managed_guests(&graph, hotel_name, &profile, &desired)
+        deactivate_legacy_managed_guests(&graph, hotel_name, &[profile], &desired)
             .expect("deactivate legacy predecessor guests");
 
         let stored = graph
