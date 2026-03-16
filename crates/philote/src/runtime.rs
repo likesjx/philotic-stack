@@ -3780,6 +3780,82 @@ impl AgentRuntime {
                 .await
             }
 
+            "bash.exec" => {
+                let args = &payload.arguments;
+
+                let command = match args.get("command").and_then(|v| v.as_str()) {
+                    Some(c) => c.to_string(),
+                    None => {
+                        return self
+                            .fail_active_turn(
+                                payload.session_id,
+                                payload.turn_id,
+                                "bash.exec: missing required argument 'command'".into(),
+                            )
+                            .await;
+                    }
+                };
+
+                let working_dir = args
+                    .get("working_dir")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .or_else(|| {
+                        // Fall back to the agent session's import_workspace path if set.
+                        self.sessions
+                            .get(&payload.session_id)
+                            .and_then(|s| s.agent_profile.import_workspace.as_deref())
+                            .map(str::to_string)
+                    });
+
+                let timeout_secs = args
+                    .get("timeout_secs")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(30);
+
+                let exec_result = self
+                    .execute_bash_command(command, working_dir, timeout_secs)
+                    .await;
+
+                let (content, tool_err) = match exec_result {
+                    Ok(json) => (json.to_string(), None),
+                    Err(e) => {
+                        let err = TaskErrorPayload::tool_execution(
+                            "bash.exec",
+                            e.to_string(),
+                            Some("EXEC_ERROR"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action:              Some("tool_result".into()),
+                    agent_action:        None,
+                    source:              Some("agent".into()),
+                    session_id:          Some(payload.session_id),
+                    turn_id:             Some(payload.turn_id),
+                    transport:           None,
+                    chat_id:             Some(payload.chat_id),
+                    thread_id:           None,
+                    sender_id:           None,
+                    sender_username:     None,
+                    message_kind:        None,
+                    content:             Some(content),
+                    attachments:         Vec::new(),
+                    command:             None,
+                    callback_data:       None,
+                    raw_transport_event: None,
+                    error:               tool_err,
+                    tool_name:           Some(payload.tool_name),
+                    arguments:           None,
+                    final_reply_to:      Some(payload.final_reply_to),
+                    final_reply_role:    Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                })
+                .await
+            }
+
             other => {
                 self.fail_active_turn(
                     payload.session_id,
@@ -3789,6 +3865,16 @@ impl AgentRuntime {
                 .await
             }
         }
+    }
+
+    /// Executes a shell command via `sh -c`, capturing stdout/stderr and enforcing a timeout.
+    async fn execute_bash_command(
+        &self,
+        command: String,
+        working_dir: Option<String>,
+        timeout_secs: u64,
+    ) -> Result<serde_json::Value> {
+        run_bash_command(command, working_dir, timeout_secs).await
     }
 
     async fn complete_local_command(
@@ -3930,6 +4016,50 @@ impl AgentRuntime {
             .await?;
         Ok(())
     }
+}
+
+/// Executes a shell command via `sh -c`, capturing stdout/stderr and enforcing a timeout.
+///
+/// Returns a JSON object with `stdout`, `stderr`, `exit_code`, and `success` fields.
+/// Returns `Err` only on process-spawn failure or timeout — a non-zero exit code is
+/// represented as `success: false` within the returned JSON, not as a Rust error.
+async fn run_bash_command(
+    command: String,
+    working_dir: Option<String>,
+    timeout_secs: u64,
+) -> Result<serde_json::Value> {
+    use tokio::process::Command;
+    use tokio::time::{timeout, Duration};
+
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(&command);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    if let Some(dir) = &working_dir {
+        cmd.current_dir(dir);
+    }
+
+    let child = cmd
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("bash.exec: failed to spawn process — {e}"))?;
+
+    let output = timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
+        .await
+        .map_err(|_| anyhow::anyhow!("bash.exec: command timed out after {timeout_secs}s"))?
+        .map_err(|e| anyhow::anyhow!("bash.exec: process error — {e}"))?;
+
+    let exit_code = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let success = output.status.success();
+
+    Ok(serde_json::json!({
+        "stdout": stdout,
+        "stderr": stderr,
+        "exit_code": exit_code,
+        "success": success,
+    }))
 }
 
 #[cfg(test)]
@@ -4568,5 +4698,53 @@ mod tests {
         assert!(report.contains("Active role: developer."));
         assert!(report.contains("- orchestrator"));
         assert!(report.contains("* developer"));
+    }
+
+    // ── bash.exec tests ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn bash_exec_captures_stdout_and_exit_zero() {
+        let result = super::run_bash_command("echo hello".into(), None, 10)
+            .await
+            .expect("should succeed");
+        assert_eq!(result["stdout"].as_str().unwrap().trim(), "hello");
+        assert_eq!(result["stderr"].as_str().unwrap(), "");
+        assert_eq!(result["exit_code"].as_i64().unwrap(), 0);
+        assert!(result["success"].as_bool().unwrap());
+    }
+
+    #[tokio::test]
+    async fn bash_exec_captures_stderr_and_nonzero_exit() {
+        let result = super::run_bash_command("echo err >&2; exit 2".into(), None, 10)
+            .await
+            .expect("should not return Err for process failure");
+        assert_eq!(result["stdout"].as_str().unwrap(), "");
+        assert_eq!(result["stderr"].as_str().unwrap().trim(), "err");
+        assert_eq!(result["exit_code"].as_i64().unwrap(), 2);
+        assert!(!result["success"].as_bool().unwrap());
+    }
+
+    #[tokio::test]
+    async fn bash_exec_respects_working_dir() {
+        let result = super::run_bash_command("pwd".into(), Some("/tmp".into()), 10)
+            .await
+            .expect("should succeed");
+        let stdout = result["stdout"].as_str().unwrap().trim().to_string();
+        // /tmp may be a symlink on macOS — just check it resolves to something under /tmp
+        assert!(
+            stdout == "/tmp" || stdout.starts_with("/private/tmp"),
+            "unexpected pwd: {stdout}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_exec_enforces_timeout() {
+        let err = super::run_bash_command("sleep 60".into(), None, 1)
+            .await
+            .expect_err("should time out");
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected error: {err}"
+        );
     }
 }
