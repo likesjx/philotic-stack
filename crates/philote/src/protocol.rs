@@ -22,7 +22,7 @@ pub struct TransportAttachment {
     pub transport_error: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct InboundTaskPayload {
     #[serde(default)]
     pub action: Option<String>,

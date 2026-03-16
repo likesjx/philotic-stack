@@ -489,6 +489,21 @@ impl AgentRuntime {
         })
     }
 
+    /// Test-only: inspect session state by id.
+    #[doc(hidden)]
+    pub fn session(&self, session_id: &str) -> Option<&crate::session::SessionState> {
+        self.sessions.get(session_id)
+    }
+
+    /// Test-only: mutate session state by id.
+    #[doc(hidden)]
+    pub fn session_mut_for_test(
+        &mut self,
+        session_id: &str,
+    ) -> Option<&mut crate::session::SessionState> {
+        self.sessions.get_mut(session_id)
+    }
+
     pub async fn run(&mut self) -> Result<()> {
         info!("Listening for inbound Persona tasks from the Philotic Web...");
         self.fetch_memory_config().await;
@@ -1586,6 +1601,9 @@ impl AgentRuntime {
                 )
             })
             .unwrap_or((None, None));
+        if let Some(state) = self.sessions.get_mut(&session_id) {
+            state.clear_handoff_summary();
+        }
 
         let model_req = ModelRequestPayload {
             action: "generate_text".to_string(),
@@ -2357,7 +2375,7 @@ impl AgentRuntime {
     /// Receive an inbound `handoff_bundle` task — the hotel is asking this philote
     /// to take over the session in the requested role. Apply the role context swap
     /// and acknowledge back to the original turn's reply target.
-    async fn handle_handoff_bundle(
+    pub async fn handle_handoff_bundle(
         &mut self,
         task: InboundTaskPayload,
         task_id: Uuid,
@@ -2441,7 +2459,7 @@ impl AgentRuntime {
 
     /// Receive an inbound `handoff_return` task — a role is handing control back
     /// to the orchestrator. Clear role activation and acknowledge.
-    async fn handle_handoff_return(
+    pub async fn handle_handoff_return(
         &mut self,
         task: InboundTaskPayload,
         task_id: Uuid,
@@ -2784,6 +2802,9 @@ impl AgentRuntime {
                 )
             })
             .unwrap_or((None, None));
+        if let Some(state) = self.sessions.get_mut(&session_id) {
+            state.clear_handoff_summary();
+        }
 
         let model_req = ModelRequestPayload {
             action: "generate_text".to_string(),
