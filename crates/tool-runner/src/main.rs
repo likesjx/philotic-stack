@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
+use memory_core::{MemoryEngine as _, MemoryScope, MuninnConfig, MuninnRestEngine, VaultResolver};
 use philotic_client::{is_ipc_disconnect, GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
 use serde_json::json;
 use std::fs;
@@ -426,6 +427,126 @@ fn search_workspace(
     Ok(results)
 }
 
+// ──── Memory tool helpers ─────────────────────────────────────────────────────
+
+fn parse_scope(s: Option<&str>, session_id: &str) -> MemoryScope {
+    match s {
+        Some("user")    => MemoryScope::SharedUser,
+        Some("session") => MemoryScope::Session(session_id.to_string()),
+        _               => MemoryScope::SelfOnly,
+    }
+}
+
+fn memory_engine(config: &MuninnConfig, agent_id: &str, user_id: &str) -> MuninnRestEngine {
+    MuninnRestEngine::new(
+        config.clone(),
+        VaultResolver {
+            agent_id: agent_id.to_string(),
+            user_id: user_id.to_string(),
+        },
+    )
+}
+
+async fn execute_memory_tool(
+    config: &MuninnConfig,
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    agent_id: &str,
+    user_id: &str,
+    session_id: &str,
+) -> String {
+    let engine = memory_engine(config, agent_id, user_id);
+    let scope = parse_scope(
+        arguments.get("scope").and_then(|v| v.as_str()),
+        session_id,
+    );
+
+    match tool_name {
+        "memory.recall" => {
+            let context = match arguments.get("context").and_then(|v| v.as_str()) {
+                Some(c) => c,
+                None => return "memory.recall error: missing `context`".into(),
+            };
+            let max_results = arguments
+                .get("max_results")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
+
+            match engine.activate(context, scope, max_results).await {
+                Ok(result) if result.engrams.is_empty() => {
+                    "memory.recall: no memories found".into()
+                }
+                Ok(result) => result
+                    .engrams
+                    .iter()
+                    .map(|e| format!("[{}] {}: {}", e.id, e.concept, e.content))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                Err(e) => format!("memory.recall error: {e}"),
+            }
+        }
+
+        "memory.remember" => {
+            let concept = match arguments.get("concept").and_then(|v| v.as_str()) {
+                Some(c) => c,
+                None => return "memory.remember error: missing `concept`".into(),
+            };
+            let content = match arguments.get("content").and_then(|v| v.as_str()) {
+                Some(c) => c,
+                None => return "memory.remember error: missing `content`".into(),
+            };
+            let tags: Vec<String> = arguments
+                .get("tags")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|t| t.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+
+            match engine.remember(scope, concept, content, tags).await {
+                Ok(r) => format!("stored: {}", r.id),
+                Err(e) => format!("memory.remember error: {e}"),
+            }
+        }
+
+        "memory.forget" => {
+            let id = match arguments.get("id").and_then(|v| v.as_str()) {
+                Some(id) => id.to_string(),
+                None => return "memory.forget error: missing `id`".into(),
+            };
+            match engine.forget(&id).await {
+                Ok(()) => "forgotten".into(),
+                Err(e) => format!("memory.forget error: {e}"),
+            }
+        }
+
+        "memory.link" => {
+            let from_id = match arguments.get("from_id").and_then(|v| v.as_str()) {
+                Some(id) => id.to_string(),
+                None => return "memory.link error: missing `from_id`".into(),
+            };
+            let to_id = match arguments.get("to_id").and_then(|v| v.as_str()) {
+                Some(id) => id.to_string(),
+                None => return "memory.link error: missing `to_id`".into(),
+            };
+            let kind = match arguments.get("kind").and_then(|v| v.as_str()).unwrap_or("related") {
+                "contradicts"  => memory_core::LinkKind::Contradicts,
+                "supersedes"   => memory_core::LinkKind::Supersedes,
+                "supports"     => memory_core::LinkKind::Supports,
+                "derived_from" => memory_core::LinkKind::DerivedFrom,
+                "related"      => memory_core::LinkKind::Related,
+                other          => memory_core::LinkKind::Custom(other.to_string()),
+            };
+            match engine.link(&from_id, &to_id, kind).await {
+                Ok(()) => "linked".into(),
+                Err(e) => format!("memory.link error: {e}"),
+            }
+        }
+
+        _ => format!("{tool_name}: unsupported memory tool"),
+    }
+}
+
+// ──── Entry point ─────────────────────────────────────────────────────────────
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -440,29 +561,47 @@ async fn main() -> Result<()> {
             "workspace.list".into(),
             "workspace.read".into(),
             "workspace.search".into(),
+            "memory.recall".into(),
+            "memory.remember".into(),
+            "memory.forget".into(),
+            "memory.link".into(),
         ],
     };
     let mut ipc_client = PhiloticClient::connect(identity).await?;
-    let _ = ipc_client
-        .send_request(IpcRequest::SubscribeInbox {
-            role: "tool.echo".into(),
-        })
-        .await?;
-    let _ = ipc_client
-        .send_request(IpcRequest::SubscribeInbox {
-            role: "tool.workspace.list".into(),
-        })
-        .await?;
-    let _ = ipc_client
-        .send_request(IpcRequest::SubscribeInbox {
-            role: "tool.workspace.read".into(),
-        })
-        .await?;
-    let _ = ipc_client
-        .send_request(IpcRequest::SubscribeInbox {
-            role: "tool.workspace.search".into(),
-        })
-        .await?;
+
+    for role in &[
+        "tool.echo",
+        "tool.workspace.list",
+        "tool.workspace.read",
+        "tool.workspace.search",
+        "tool.memory.recall",
+        "tool.memory.remember",
+        "tool.memory.forget",
+        "tool.memory.link",
+    ] {
+        let _ = ipc_client
+            .send_request(IpcRequest::SubscribeInbox { role: role.to_string() })
+            .await?;
+    }
+
+    // Fetch MuninnDB config from the hotel — None if memory is not configured.
+    let muninn_config: Option<MuninnConfig> =
+        match ipc_client.send_request(IpcRequest::FetchMemoryConfig).await {
+            Ok(IpcResponse::MemoryConfig { config_json: Some(json) }) => {
+                match serde_json::from_str::<MuninnConfig>(&json) {
+                    Ok(cfg) => {
+                        info!(endpoint = %cfg.base_url, vaults = cfg.vault_tokens.len(), "Memory tools enabled");
+                        Some(cfg)
+                    }
+                    Err(e) => { warn!("Failed to parse MuninnConfig: {e}"); None }
+                }
+            }
+            Ok(IpcResponse::MemoryConfig { config_json: None }) => {
+                info!("Memory tools disabled — hotel has no MuninnDB config");
+                None
+            }
+            _ => { warn!("Unexpected response to FetchMemoryConfig"); None }
+        };
 
     info!("Listening for tool execution tasks...");
 
@@ -526,7 +665,24 @@ async fn main() -> Result<()> {
                     .apply_base_config(runner_base_config)
                     .apply_overlay(runner_overlay);
 
-                let result_content = execute_tool(&effective_config, &tool_name, &arguments);
+                let result_content = if tool_name.starts_with("memory.") {
+                    let agent_id = task
+                        .get("agent_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    let user_id = task
+                        .get("user_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(agent_id);
+                    match &muninn_config {
+                        Some(cfg) => {
+                            execute_memory_tool(cfg, &tool_name, &arguments, agent_id, user_id, &session_id).await
+                        }
+                        None => format!("{tool_name} error: memory not configured on this hotel"),
+                    }
+                } else {
+                    execute_tool(&effective_config, &tool_name, &arguments)
+                };
 
                 ipc_client
                     .send_request(IpcRequest::EmitTask {

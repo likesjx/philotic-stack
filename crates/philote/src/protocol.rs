@@ -152,6 +152,12 @@ pub struct ToolExecutionPayload {
     pub tool_name: String,
     pub arguments: serde_json::Value,
     pub execution_mode: String,
+    /// The agent that issued this tool call — used by tool-runners that need
+    /// to scope operations to the agent's identity (e.g. memory vault routing).
+    pub agent_id: String,
+    /// The human user associated with this session, if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runner_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -419,6 +425,8 @@ mod tests {
                 max_read_bytes: Some(4096),
                 max_search_results: Some(25),
             }),
+            agent_id: "agent-jane-01".into(),
+            user_id: None,
             reply_to: "local-aiua-01".into(),
             reply_role: "agent".into(),
             final_reply_to: "local-aiua-01".into(),

@@ -28,6 +28,8 @@ use tracing::{debug, error, info, warn};
 
 mod auth;
 mod graph;
+mod memory;
+mod muninn_provision;
 mod vault;
 
 mod service;
@@ -3024,6 +3026,40 @@ async fn main() -> Result<()> {
         } else {
             warn!("Config file must be a JSON object or contain a top-level context_graph object.");
         }
+
+        // Provision MuninnDB vaults from `context_graph.muninn` section if present.
+        if let Some(muninn) = config_json
+            .get("context_graph")
+            .and_then(|cg| cg.get("muninn"))
+            .and_then(|v| v.as_object())
+        {
+            let endpoint = muninn
+                .get("endpoint")
+                .and_then(|v| v.as_str())
+                .unwrap_or("http://127.0.0.1:8475");
+            let username = muninn
+                .get("admin_username")
+                .and_then(|v| v.as_str())
+                .unwrap_or("root");
+            let password = muninn
+                .get("admin_password")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            graph_storage.set_muninn_endpoint(endpoint)?;
+
+            let vault_names = muninn_provision::derive_vault_names(&config_json);
+            if !vault_names.is_empty() {
+                muninn_provision::provision_muninn_vaults(
+                    &graph_storage,
+                    endpoint,
+                    username,
+                    password,
+                    vault_names,
+                )
+                .await?;
+            }
+        }
     }
 
     let hotel_name =
@@ -3099,6 +3135,24 @@ async fn main() -> Result<()> {
 
     let graph_arc: Arc<dyn ansible_mesh_core::storage::GraphStorage> = Arc::new(graph_storage);
 
+    // Boot-time MuninnDB config load (Slice D).
+    // Returns None if no vault registry is configured; guests fall back to NullMemoryEngine.
+    let muninn_config_arc: Option<Arc<memory_core::MuninnConfig>> =
+        match memory::load_muninn_config(graph_arc.as_ref()) {
+            Ok(Some(cfg)) => {
+                info!(endpoint = %cfg.base_url, vaults = cfg.vault_tokens.len(), "MuninnDB configured");
+                Some(Arc::new(cfg))
+            }
+            Ok(None) => {
+                info!("MuninnDB not configured — guests will use NullMemoryEngine");
+                None
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to load MuninnDB config — continuing without memory");
+                None
+            }
+        };
+
     if smoke_mode {
         warn!(
             "PHILOTIC_SMOKE_MODE enabled: starting local-only IPC runtime without mesh or guest materialization."
@@ -3112,7 +3166,8 @@ async fn main() -> Result<()> {
             caps.node_id.clone(),
             dispatcher_tx,
             graph_arc.clone(),
-        );
+        )
+        .with_memory_config(muninn_config_arc.clone());
         tokio::spawn(async move {
             if let Err(e) = ipc_server.run().await {
                 error!("Hotel Front Desk (UDS) failed: {}", e);
@@ -3271,6 +3326,7 @@ async fn main() -> Result<()> {
         dispatcher_tx.clone(),
         graph_arc.clone(),
     )
+    .with_memory_config(muninn_config_arc)
     .with_materialization_requester(guest_manager.clone())
     .with_registry(daemon.registry());
     let ipc_inboxes = ipc_server.inboxes();

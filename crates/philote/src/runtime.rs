@@ -11,6 +11,7 @@ use crate::session::{
     WorkingTurn, merge_session_index,
 };
 use anyhow::Result;
+use memory_core::{MuninnConfig, MuninnRestEngine, MemoryScope, VaultResolver};
 use philotic_client::{HandoffBundle, IpcRequest, IpcResponse, PhiloticClient, TaskErrorPayload, is_ipc_disconnect};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -429,6 +430,8 @@ pub struct AgentRuntime {
     ipc_client: PhiloticClient,
     agent_id: String,
     sessions: HashMap<String, SessionState>,
+    /// MuninnDB config fetched from hotel at startup. None = NullMemoryEngine.
+    muninn_config: Option<MuninnConfig>,
 }
 
 impl AgentRuntime {
@@ -437,11 +440,45 @@ impl AgentRuntime {
             ipc_client,
             agent_id: agent_id.into(),
             sessions: HashMap::new(),
+            muninn_config: None,
         }
+    }
+
+    /// Fetch MuninnDB config from hotel IPC and store it for session use.
+    async fn fetch_memory_config(&mut self) {
+        info!("Requesting MuninnDB config from hotel...");
+        match self.ipc_client.send_request(IpcRequest::FetchMemoryConfig).await {
+            Ok(IpcResponse::MemoryConfig { config_json: Some(json) }) => {
+                match serde_json::from_str::<MuninnConfig>(&json) {
+                    Ok(cfg) => {
+                        info!(endpoint = %cfg.base_url, vaults = cfg.vault_tokens.len(), "MuninnDB config loaded");
+                        self.muninn_config = Some(cfg);
+                    }
+                    Err(e) => warn!("Failed to parse MuninnConfig from hotel: {}", e),
+                }
+            }
+            Ok(IpcResponse::MemoryConfig { config_json: None }) => {
+                info!("Hotel has no MuninnDB config — running without memory");
+            }
+            Ok(_) | Err(_) => {
+                warn!("Unexpected response to FetchMemoryConfig — running without memory");
+            }
+        }
+    }
+
+    /// Build a `MuninnRestEngine` scoped to the given agent and user.
+    fn memory_engine_for(&self, agent_id: &str, user_id: &str) -> Option<MuninnRestEngine> {
+        self.muninn_config.clone().map(|cfg| {
+            MuninnRestEngine::new(cfg, VaultResolver {
+                agent_id: agent_id.to_string(),
+                user_id: user_id.to_string(),
+            })
+        })
     }
 
     pub async fn run(&mut self) -> Result<()> {
         info!("Listening for inbound Persona tasks from the Philotic Web...");
+        self.fetch_memory_config().await;
 
         loop {
             match tokio::time::timeout(Duration::from_secs(5), self.ipc_client.recv_task()).await {
@@ -820,7 +857,7 @@ impl AgentRuntime {
             context_projection: Some(context_projection),
             attachments,
             tools_for_model,
-            response_contract: Some(serde_json::json!({ "channels": ["spoken_text"] })),
+            response_contract: Some(serde_json::json!({ "channels": ["spoken_text", "memory_concept"] })),
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
@@ -909,12 +946,20 @@ impl AgentRuntime {
             state.set_active_turn_phase(TurnPhase::Thinking);
         }
 
-        let spoken_text = task
+        let model_result = task
             .agent_action
             .as_ref()
             .and_then(|a| a.get("model_result"))
-            .and_then(|mr| mr.get("result"))
+            .and_then(|mr| mr.get("result"));
+
+        let spoken_text = model_result
             .and_then(|r| r.get("spoken_text"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string);
+
+        let memory_concept = model_result
+            .and_then(|r| r.get("memory_concept"))
             .and_then(serde_json::Value::as_str)
             .filter(|s| !s.trim().is_empty())
             .map(str::to_string);
@@ -951,7 +996,7 @@ impl AgentRuntime {
 
         match action {
             AgentAction::Respond { content } => {
-                self.complete_agent_response(session_id, turn_id, content, spoken_text)
+                self.complete_agent_response(session_id, turn_id, content, spoken_text, memory_concept)
                     .await
             }
             AgentAction::ToolCall(tool_call) => {
@@ -1065,7 +1110,7 @@ impl AgentRuntime {
                 .await?;
 
             return self
-                .complete_agent_response(session_id, turn_id, approval.approved_response, None)
+                .complete_agent_response(session_id, turn_id, approval.approved_response, None, None)
                 .await;
         }
 
@@ -1197,7 +1242,7 @@ impl AgentRuntime {
             .emit_turn_event(&session_id, "waiting_tool", None)
             .await;
 
-        let (chat_id, final_reply_to, final_reply_role, final_reply_guest_id, workspace_ref, route) = {
+        let (chat_id, final_reply_to, final_reply_role, final_reply_guest_id, workspace_ref, route, session_user_id) = {
             let Some(state) = self.sessions.get(&session_id) else {
                 warn!(
                     "Tool execution requested for unknown session {}",
@@ -1224,6 +1269,7 @@ impl AgentRuntime {
                 active_turn.final_reply_guest_id.clone(),
                 state.bindings.effective_workspace_ref.clone(),
                 route,
+                state.source.clone(),
             )
         };
 
@@ -1235,6 +1281,8 @@ impl AgentRuntime {
             tool_name: tool_call.tool_name,
             arguments: tool_call.arguments,
             execution_mode: route.execution_mode.clone(),
+            agent_id: self.agent_id.clone(),
+            user_id: Some(session_user_id),
             runner_id: route.runner_id.clone(),
             incarnation_id: route.incarnation_id.clone(),
             hotel_id: route.hotel_id.clone(),
@@ -1510,7 +1558,7 @@ impl AgentRuntime {
             context_projection,
             attachments: Vec::new(),
             tools_for_model: reentry.tools_for_model,
-            response_contract: Some(serde_json::json!({ "channels": ["spoken_text"] })),
+            response_contract: Some(serde_json::json!({ "channels": ["spoken_text", "memory_concept"] })),
             chat_id: reentry.chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
@@ -1596,6 +1644,7 @@ impl AgentRuntime {
         turn_id: String,
         content: String,
         spoken_text: Option<String>,
+        memory_concept: Option<String>,
     ) -> Result<()> {
         let voice_policy = self
             .sessions
@@ -1616,7 +1665,7 @@ impl AgentRuntime {
                 .await;
         }
 
-        self.deliver_text_reply(session_id, turn_id, content, None, false)
+        self.deliver_text_reply(session_id, turn_id, content, None, false, memory_concept)
             .await
     }
 
@@ -1789,6 +1838,7 @@ impl AgentRuntime {
             text,
             audio_artifact,
             voice_policy.caption_enabled(),
+            None,
         )
         .await
     }
@@ -1801,6 +1851,7 @@ impl AgentRuntime {
         content: String,
         audio_artifact: Option<String>,
         send_text_caption: bool,
+        memory_concept: Option<String>,
     ) -> Result<()> {
         let (completed_turn, checkpoint_memory_type, checkpoint_json, index_state) = {
             let Some(state) = self.sessions.get_mut(&session_id) else {
@@ -1850,6 +1901,11 @@ impl AgentRuntime {
             })
             .await?;
 
+        // Capture for attend hook before moving into reply_payload.
+        let attend_turn_id = turn_id.clone();
+        let attend_content = content.clone();
+        let attend_session_id = session_id.clone();
+
         let reply_payload = FinalReplyPayload {
             action: "send_reply",
             session_id,
@@ -1868,6 +1924,26 @@ impl AgentRuntime {
                 task_json: serde_json::to_string(&reply_payload)?,
             })
             .await?;
+
+        // Attend hook (Slice E): fire-and-forget autobiographical memory write.
+        if let Some(engine) = self.memory_engine_for(&self.agent_id, &self.agent_id) {
+            let agent_id = self.agent_id.clone();
+            let concept = memory_concept.unwrap_or_else(|| format!("turn:{}", attend_turn_id));
+            let content_snapshot = attend_content;
+            let tags = vec![
+                format!("agent:{}", agent_id),
+                format!("session:{}", attend_session_id),
+            ];
+            tokio::spawn(async move {
+                use memory_core::MemoryEngine as _;
+                if let Err(e) = engine
+                    .remember(MemoryScope::SelfOnly, &concept, &content_snapshot, tags)
+                    .await
+                {
+                    warn!(agent = %agent_id, error = %e, "Attend: memory write failed (non-fatal)");
+                }
+            });
+        }
 
         Ok(())
     }

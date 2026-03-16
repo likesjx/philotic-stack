@@ -161,6 +161,30 @@ pub struct SecretRecord {
     pub updated_at: u64,
 }
 
+// ── MuninnDB config key constants ────────────────────────────────────────────
+
+/// Context Graph config key: MuninnDB REST endpoint URL.
+/// Value is a JSON string, e.g. `"http://127.0.0.1:8475"`.
+pub const CONFIG_MUNINN_ENDPOINT: &str = "muninn_endpoint";
+
+/// Context Graph config key: vault registry.
+/// Value is a JSON array of [`VaultRegistryEntry`].
+pub const CONFIG_VAULT_REGISTRY: &str = "vault_registry";
+
+/// Maps a MuninnDB vault name to the `secret_ref` of its API token in the
+/// hotel key vault. Stored in the Context Graph under [`CONFIG_VAULT_REGISTRY`].
+///
+/// Vault naming convention: `[a-z0-9_-]`, `_` as scope prefix separator,
+/// `-` for internal id separators — e.g. `self_philote-1`, `user_jared`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultRegistryEntry {
+    /// Vault name, e.g. `self_philote-1`. Must match `[a-z0-9_-]`, max 64 chars.
+    pub vault_name: String,
+    /// Secret ref for this vault's API token, e.g.
+    /// `secret://hotel/default/muninn/self-philote-1`.
+    pub secret_ref: String,
+}
+
 /// Abstraction over the local Context Graph database.
 pub trait GraphStorage: Send + Sync {
     // ── Node configuration ───────────────────────────────────────────
@@ -297,6 +321,54 @@ pub trait GraphStorage: Send + Sync {
 
     /// List all toolset profiles in the context graph.
     fn list_toolset_profiles(&self) -> Result<Vec<ToolsetProfileRecord>>;
+
+    // ── MuninnDB / memory-core configuration ────────────────────────────────
+
+    /// Load the MuninnDB REST endpoint URL, or `None` if not configured.
+    ///
+    /// Stored under `CONFIG_MUNINN_ENDPOINT` as a JSON string.
+    /// Default when absent: `http://127.0.0.1:8475` (local instance).
+    fn get_muninn_endpoint(&self) -> Result<Option<String>> {
+        self.get_config_value(CONFIG_MUNINN_ENDPOINT)?
+            .map(|raw| serde_json::from_str::<String>(&raw).map_err(anyhow::Error::from))
+            .transpose()
+    }
+
+    /// Persist the MuninnDB REST endpoint URL.
+    fn set_muninn_endpoint(&self, url: &str) -> Result<()> {
+        self.set_config_value(CONFIG_MUNINN_ENDPOINT, &serde_json::to_string(url)?)
+    }
+
+    /// Load all vault registry entries. Returns an empty vec if not configured.
+    ///
+    /// Each entry maps a vault name (e.g. `self_philote-1`) to the `secret_ref`
+    /// of its API token in the hotel key vault.
+    fn get_vault_registry(&self) -> Result<Vec<VaultRegistryEntry>> {
+        Ok(self
+            .get_config_value(CONFIG_VAULT_REGISTRY)?
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default())
+    }
+
+    /// Upsert a single vault registry entry (matched by `vault_name`).
+    fn upsert_vault_registry_entry(&self, entry: &VaultRegistryEntry) -> Result<()> {
+        let mut entries = self.get_vault_registry()?;
+        match entries.iter().position(|e| e.vault_name == entry.vault_name) {
+            Some(pos) => entries[pos] = entry.clone(),
+            None      => entries.push(entry.clone()),
+        }
+        self.set_config_value(CONFIG_VAULT_REGISTRY, &serde_json::to_string(&entries)?)
+    }
+
+    /// Remove a vault registry entry by vault name. No-op if not present.
+    fn remove_vault_registry_entry(&self, vault_name: &str) -> Result<()> {
+        let entries: Vec<VaultRegistryEntry> = self
+            .get_vault_registry()?
+            .into_iter()
+            .filter(|e| e.vault_name != vault_name)
+            .collect();
+        self.set_config_value(CONFIG_VAULT_REGISTRY, &serde_json::to_string(&entries)?)
+    }
 }
 
 /// Generic graph persistence contract.

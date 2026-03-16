@@ -3,7 +3,7 @@ title: "Muninn Memory Protocol Proposal"
 doc_type: proposal
 domain: memory-context
 status: accepted-current-slice
-last_updated: 2026-03-12
+last_updated: 2026-03-15
 tags:
   - muninn
   - memory
@@ -56,16 +56,25 @@ Implemented so far:
 
 Still pending:
 
-- wider client adoption beyond Codex
 - Philotic-native integration
 - automatic helper usage in every client runtime
 - retrieval quality and behavior evaluation over time
 - hard fail/approval-gate behavior in every client when Muninn bootstrap is unavailable
 - validate whether short atomic memories plus a lightweight tag vocabulary actually improve retrieval quality enough to justify deeper agent-memory use
 
-Observed reality gap:
+Progress since acceptance:
 
-- the helper now handshakes and can read/write successfully against the local Muninn MCP server, but the current `muninn_remember` / `muninn_decide` responses are echoing back an empty `concept` field even when one is provided
+- OpenCode integration landed (muninn init wizard now configures OpenCode natively)
+- SDK Stage 6 wire-format audit complete — Python, Node, Go SDKs now have full test suites and bug fixes
+- `muninn_read` now returns `entities` + `entity_relationships` in response, useful for Philotic entity graph awareness
+- `--listen-host` / `--cors-origins` flags landed, enabling binding to `0.0.0.0` for remote agent access — this unblocks distributed deployment
+- `muninn exec` one-shot CLI subcommand added (Stage 4) — agents can write/recall without holding a persistent connection
+- `muninn.Open()` embedded Go API added (Stage 3) — direct in-process embedding is now viable, changes the native port calculus
+
+Observed reality gap (resolved):
+
+- ~~the current `muninn_remember` / `muninn_decide` responses are echoing back an empty `concept` field even when one is provided~~ — **fixed** in upstream PR #179 (v0.3.15-alpha). Concept field now populates correctly in remember responses.
+- ~~`muninn_read` returns numeric state string instead of label~~ — **fixed** in upstream PR #249 (v0.4.2-alpha). State is now a human-readable label (e.g. `"active"`).
 
 This proposal now has three concrete artifacts behind it:
 
@@ -267,12 +276,39 @@ For Philotic specifically:
 - treat this work as a separate work item from personality/context modeling and from Philotic-native memory design
 - later decide whether to:
   - keep Muninn external over MCP
-  - build a Rust client wrapper
+  - build a Rust client wrapper using the Go SDK as a reference implementation
+  - embed directly in an agent-core binary via `muninn.Open()` (now viable — no network hop, no daemon)
   - port proven behavior into native Philotic memory systems
 
 Do not port first.
 
 Prove that the memory behavior helps first.
+
+### Production Deployment Topology (distributed Philotic)
+
+As Philotic moves toward distributed projects, the recommended topology is:
+
+```
+jane-vps  →  muninndb (Cortex, single writer, Docker)
+              ├─ vault: philotic          ← system-level shared memory
+              ├─ vault: agent/<id>        ← per-agent isolated memory
+              └─ vault: project/<name>    ← per-project working memory
+
+agents connect via:
+  - MCP over HTTP (remote, with --listen-host 0.0.0.0)
+  - muninn exec (one-shot writes, no persistent connection)
+  - muninn.Open() (embedded, for fully isolated local agents)
+```
+
+Key decisions:
+
+1. **Vault-per-agent** — one vault per agent identity, isolated API keys. Write-only keys for ingest-only agents; full keys for persona agents.
+2. **Central Cortex on jane-vps** — single writer for now. Lobe on the dev machine is viable once read scaling matters (uses MBP protocol, very low replication lag).
+3. **`muninn exec` as agent sidecar** — for agents that need one-shot writes without managing a persistent MCP session. Eliminates the handshake ceremony problem.
+4. **`muninn.Open()` for embedded agents** — if an agent-worker binary runs fully locally and needs no cross-agent memory sharing, embedding directly is now the lowest-friction option.
+5. **`--listen-host 0.0.0.0`** — required for remote agent access. Pair with Caddy TLS proxy and per-vault API keys for security boundary.
+
+This topology defers the native Rust port question. The embedded Go API (`muninn.Open()`) is now close enough to native that a thin Rust FFI wrapper over it is a realistic medium-term option if network latency ever becomes the bottleneck.
 
 ## Success Criteria
 
@@ -296,10 +332,13 @@ It is not working if:
 
 ## Near-Term Next Steps
 
-1. Use the helper-backed Muninn protocol in Codex by default.
+1. ~~Use the helper-backed Muninn protocol in Codex by default.~~ Done.
 2. Share the client instruction set with other cognitive clients.
-3. Add at least one more client integration path.
+3. ~~Add at least one more client integration path.~~ OpenCode integration landed.
 4. Observe whether Muninn materially improves continuity before making it deeper infrastructure.
+5. **New**: Stand up muninndb on jane-vps (Docker, Caddy TLS, per-agent vault provisioning) as the production Cortex.
+6. **New**: Evaluate `muninn exec` as the default write path for Philotic agent-workers that don't maintain persistent MCP sessions.
+7. **New**: Decide vault naming convention before provisioning more than a handful of agents.
 
 ## Implementation Recommendation
 

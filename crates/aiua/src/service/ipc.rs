@@ -129,6 +129,7 @@ pub struct IpcServer {
     subagent_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
     subagent_hooks: SubagentHookRegistry,
     registry: Arc<RwLock<NodeRegistry>>,
+    muninn_config: Option<Arc<memory_core::MuninnConfig>>,
 }
 
 struct LoggingLeaseObserver;
@@ -378,7 +379,13 @@ impl IpcServer {
             subagent_leases: Arc::new(Mutex::new(RuntimeLeaseRegistry::default())),
             subagent_hooks: Arc::new(Mutex::new(HashMap::new())),
             registry: Arc::new(RwLock::new(NodeRegistry::new())),
+            muninn_config: None,
         }
+    }
+
+    pub fn with_memory_config(mut self, config: Option<Arc<memory_core::MuninnConfig>>) -> Self {
+        self.muninn_config = config;
+        self
     }
 
     pub fn with_materialization_requester(
@@ -421,6 +428,7 @@ impl IpcServer {
                     let subagent_leases = self.subagent_leases.clone();
                     let subagent_hooks = self.subagent_hooks.clone();
                     let registry = self.registry.clone();
+                    let muninn_config = self.muninn_config.clone();
                     tokio::spawn(async move {
                         if let Err(e) = Self::handle_client(
                             stream,
@@ -434,6 +442,7 @@ impl IpcServer {
                             subagent_leases,
                             subagent_hooks,
                             registry,
+                            muninn_config,
                         )
                         .await
                         {
@@ -460,6 +469,7 @@ impl IpcServer {
         subagent_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
         subagent_hooks: SubagentHookRegistry,
         registry: Arc<RwLock<NodeRegistry>>,
+        muninn_config: Option<Arc<memory_core::MuninnConfig>>,
     ) -> anyhow::Result<()> {
         let conn_id = Uuid::new_v4();
         let (mut reader, mut writer) = stream.into_split();
@@ -491,6 +501,13 @@ impl IpcServer {
                     return Ok(());
                 }
                 Ok(Some(frame)) => match serde_json::from_slice::<IpcRequest>(&frame) {
+                    Ok(IpcRequest::FetchMemoryConfig) => {
+                        let config_json = muninn_config.as_deref().and_then(|cfg| {
+                            serde_json::to_string(cfg).ok()
+                        });
+                        info!(has_config = config_json.is_some(), "FetchMemoryConfig handled");
+                        let _ = outbound_tx.send(IpcResponse::MemoryConfig { config_json });
+                    }
                     Ok(req) => {
                         let mut follow_up_responses = Vec::new();
                         let response = Self::process_request(
@@ -2414,6 +2431,10 @@ impl IpcServer {
                     "abort_subagent_spawn",
                     Some(serde_json::json!({ "subagent_guest_id": subagent_guest_id })),
                 )
+            }
+            // Handled before process_request is called (in handle_client).
+            IpcRequest::FetchMemoryConfig => {
+                IpcResponse::error("memory", "UNREACHABLE", "FetchMemoryConfig dispatched early")
             }
         }
     }
