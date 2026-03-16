@@ -11,10 +11,10 @@ pub async fn run_init() -> Result<()> {
             return Ok(());
         }
         Some(bin) => {
-            println!("\n  Running muninn init...");
-            // muninn init is interactive — inherit stdio so the user can drive it
+            println!("  muninn    initializing (--yes)...");
             let status = tokio::process::Command::new(&bin)
                 .arg("init")
+                .arg("--yes")
                 .status()
                 .await;
             match status {
