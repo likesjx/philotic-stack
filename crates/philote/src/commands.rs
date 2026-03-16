@@ -1,3 +1,72 @@
+use philotic_client::CommandManifestEntry;
+
+/// Returns the agent's command manifest.  Pass `active_skills` to include skill-specific commands.
+/// This is the single source of truth for what slash commands the agent handles.
+pub fn command_manifest(_active_skills: &[String]) -> Vec<CommandManifestEntry> {
+    vec![
+        CommandManifestEntry {
+            command: "status".into(),
+            description: "Show current session status.".into(),
+            usage_hint: None,
+        },
+        CommandManifestEntry {
+            command: "pause".into(),
+            description: "Pause the current session.".into(),
+            usage_hint: None,
+        },
+        CommandManifestEntry {
+            command: "resume".into(),
+            description: "Resume a paused session.".into(),
+            usage_hint: None,
+        },
+        CommandManifestEntry {
+            command: "role".into(),
+            description: "Switch to a named role.".into(),
+            usage_hint: Some("/role <name>".into()),
+        },
+        CommandManifestEntry {
+            command: "roles".into(),
+            description: "List configured roles and highlight the active one.".into(),
+            usage_hint: None,
+        },
+        CommandManifestEntry {
+            command: "back".into(),
+            description: "Return to the orchestrator role.".into(),
+            usage_hint: None,
+        },
+        CommandManifestEntry {
+            command: "approve".into(),
+            description: "Approve the pending action.".into(),
+            usage_hint: Some("/approve [note]".into()),
+        },
+        CommandManifestEntry {
+            command: "deny".into(),
+            description: "Deny the pending action.".into(),
+            usage_hint: Some("/deny [note]".into()),
+        },
+        CommandManifestEntry {
+            command: "abandon".into(),
+            description: "Abandon the current turn.".into(),
+            usage_hint: None,
+        },
+        CommandManifestEntry {
+            command: "tts".into(),
+            description: "Set text-to-speech mode.".into(),
+            usage_hint: Some("/tts [on|off|auto]".into()),
+        },
+        CommandManifestEntry {
+            command: "preapprove".into(),
+            description: "Pre-approve a tool or class for this session.".into(),
+            usage_hint: Some("/preapprove <tool|class> | this-session".into()),
+        },
+        CommandManifestEntry {
+            command: "approval".into(),
+            description: "Show or reset the session approval policy.".into(),
+            usage_hint: Some("/approval status | reset".into()),
+        },
+    ]
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashCommand {
     Ping,

@@ -16,6 +16,18 @@ pub struct GuestIdentity {
     pub supported_tools: Vec<String>,
 }
 
+/// A single entry in an agent's command manifest — describes one slash command the agent handles.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandManifestEntry {
+    /// The command name without the leading slash, e.g. `"status"`.
+    pub command: String,
+    /// One-line human-readable description shown in Telegram's command menu.
+    pub description: String,
+    /// Optional short usage string shown in /help, e.g. `"/role <name>"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_hint: Option<String>,
+}
+
 /// Shared cross-component task failure envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct TaskErrorPayload {

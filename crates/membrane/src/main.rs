@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, is_ipc_disconnect};
+use philotic_client::{CommandManifestEntry, GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, is_ipc_disconnect};
 use pulldown_cmark::{
     CodeBlockKind, Event, LinkType, Options, Parser as MarkdownParser, Tag, TagEnd,
 };
@@ -767,6 +767,7 @@ async fn handle_membrane_command(
     envelope: &TelegramMessageEnvelope,
     session_id_overrides: &mut HashMap<String, String>,
     agent_id: &str,
+    agent_cmds: &[CommandManifestEntry],
 ) -> bool {
     let Some(command) = envelope.command.as_deref() else {
         return false;
@@ -782,7 +783,7 @@ async fn handle_membrane_command(
                 tg_base,
                 &envelope.chat_id,
                 envelope.thread_id.as_deref(),
-                &telegram_help_text(),
+                &telegram_help_text(agent_cmds),
             )
             .await;
             true
@@ -1149,72 +1150,26 @@ fn telegram_command(text: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Native membrane commands — these are always present regardless of what the agent advertises.
+/// Agent-side commands are fetched at startup via `fetch_agent_command_manifest` and merged in.
 const TELEGRAM_MENU_COMMANDS: &[TelegramBotCommand] = &[
     TelegramBotCommand {
         command: "help",
         description: "Show available commands.",
     },
     TelegramBotCommand {
-        command: "commands",
-        description: "List all supported slash commands.",
-    },
-    TelegramBotCommand {
         command: "ping",
         description: "Quick health check.",
-    },
-    TelegramBotCommand {
-        command: "status",
-        description: "Show current session status.",
-    },
-    TelegramBotCommand {
-        command: "pause",
-        description: "Pause the current session.",
-    },
-    TelegramBotCommand {
-        command: "resume",
-        description: "Resume the current session.",
-    },
-    TelegramBotCommand {
-        command: "role",
-        description: "Switch to a named role.",
-    },
-    TelegramBotCommand {
-        command: "roles",
-        description: "List configured roles and active role.",
-    },
-    TelegramBotCommand {
-        command: "back",
-        description: "Return to the orchestrator role.",
-    },
-    TelegramBotCommand {
-        command: "approve",
-        description: "Approve the pending action.",
-    },
-    TelegramBotCommand {
-        command: "deny",
-        description: "Deny the pending action.",
-    },
-    TelegramBotCommand {
-        command: "tts",
-        description: "Set text-to-speech mode.",
     },
     TelegramBotCommand {
         command: "new",
         description: "Start a fresh conversation.",
     },
-    TelegramBotCommand {
-        command: "preapprove",
-        description: "Pre-approve a tool or class for this session.",
-    },
-    TelegramBotCommand {
-        command: "approval",
-        description: "Show or reset session approval policy (status / reset).",
-    },
 ];
 
 const TELEGRAM_MAX_COMMANDS: usize = 100;
 
-fn telegram_help_text() -> String {
+fn telegram_help_text(agent_cmds: &[CommandManifestEntry]) -> String {
     let mut help = String::from("Available Telegram slash commands:\n\n");
     for command in TELEGRAM_MENU_COMMANDS {
         help.push_str(&format!(
@@ -1222,17 +1177,13 @@ fn telegram_help_text() -> String {
             command.command, command.description
         ));
     }
-    help.push_str("\nNotes:\n");
-    help.push_str("/role expects a role name, for example /role developer.\n");
-    help.push_str("/roles lists configured roles and highlights the active one.\n");
-    help.push_str("/back returns the session to the orchestrator role.\n");
-    help.push_str("/approve and /deny can include a note.\n");
-    help.push_str("/tts accepts optional modes like on, off, or auto.\n");
-    help.push_str("/new starts a fresh conversation with a new session ID.\n");
-    help.push_str("/preapprove <tool|class> adds a tool name or class to the session pre-approve list.\n");
-    help.push_str("/preapprove this-session pre-approves all tools for this session.\n");
-    help.push_str("/approval status shows the current session approval policy.\n");
-    help.push_str("/approval reset clears session-scoped pre-approvals.");
+    for entry in agent_cmds {
+        if let Some(hint) = &entry.usage_hint {
+            help.push_str(&format!("/{:<9} {} ({})\n", entry.command, entry.description, hint));
+        } else {
+            help.push_str(&format!("/{:<9} {}\n", entry.command, entry.description));
+        }
+    }
     help
 }
 
@@ -1255,6 +1206,7 @@ fn normalize_telegram_menu_command_name(command: &str) -> Option<String> {
     (!normalized.is_empty()).then_some(normalized)
 }
 
+#[allow(dead_code)]
 fn build_telegram_menu_commands(commands: &[TelegramBotCommand]) -> Vec<Value> {
     let mut normalized_commands = Vec::new();
     let mut seen = HashSet::new();
@@ -1296,7 +1248,91 @@ fn build_telegram_menu_commands(commands: &[TelegramBotCommand]) -> Vec<Value> {
     normalized_commands
 }
 
-async fn register_telegram_commands(http_client: &reqwest::Client, tg_base: &str) {
+/// Build the Telegram bot command list from native membrane commands plus agent-published entries.
+fn build_combined_telegram_commands(
+    native: &[TelegramBotCommand],
+    agent_cmds: &[CommandManifestEntry],
+) -> Vec<Value> {
+    let mut normalized_commands = Vec::new();
+    let mut seen = HashSet::new();
+
+    let mut push = |name: &str, description: &str| {
+        let Some(normalized_name) = normalize_telegram_menu_command_name(name) else {
+            return;
+        };
+        if !seen.insert(normalized_name.clone()) {
+            return;
+        }
+        normalized_commands.push(json!({
+            "command": normalized_name,
+            "description": description
+        }));
+    };
+
+    for cmd in native {
+        push(cmd.command, cmd.description);
+    }
+    for entry in agent_cmds {
+        push(&entry.command, &entry.description);
+    }
+
+    if normalized_commands.len() > TELEGRAM_MAX_COMMANDS {
+        let overflow = normalized_commands.len() - TELEGRAM_MAX_COMMANDS;
+        warn!(
+            "Telegram command menu has {} entries; truncating {} overflow command(s) to respect Telegram's {} command limit.",
+            normalized_commands.len(),
+            overflow,
+            TELEGRAM_MAX_COMMANDS
+        );
+        normalized_commands.truncate(TELEGRAM_MAX_COMMANDS);
+    }
+
+    normalized_commands
+}
+
+/// Fetch the command manifest that agent-core published to the hotel via `SyncApartment`.
+/// Returns an empty list if the agent hasn't started yet or on any error.
+async fn fetch_agent_command_manifest(
+    ipc_client: &mut PhiloticClient,
+    agent_id: &str,
+) -> Vec<CommandManifestEntry> {
+    let key = format!("__apartment__:{agent_id}:command_manifest");
+    match ipc_client
+        .send_request(IpcRequest::GetConfig { key })
+        .await
+    {
+        Ok(IpcResponse::ConfigData { value_json: Some(json_str), .. }) => {
+            match serde_json::from_str::<Vec<CommandManifestEntry>>(&json_str) {
+                Ok(entries) => {
+                    info!("Fetched {} agent command manifest entries.", entries.len());
+                    entries
+                }
+                Err(e) => {
+                    warn!("Failed to parse agent command manifest: {}", e);
+                    vec![]
+                }
+            }
+        }
+        Ok(IpcResponse::ConfigData { value_json: None, .. }) => {
+            info!("Agent command manifest not yet available; using native commands only.");
+            vec![]
+        }
+        Ok(_) => {
+            warn!("Unexpected IPC response when fetching agent command manifest.");
+            vec![]
+        }
+        Err(e) => {
+            warn!("Failed to fetch agent command manifest: {}", e);
+            vec![]
+        }
+    }
+}
+
+async fn register_telegram_commands(
+    http_client: &reqwest::Client,
+    tg_base: &str,
+    agent_cmds: &[CommandManifestEntry],
+) {
     let delete_url = format!("{tg_base}deleteMyCommands");
     match http_client.post(&delete_url).json(&json!({})).send().await {
         Ok(response) => {
@@ -1309,7 +1345,7 @@ async fn register_telegram_commands(http_client: &reqwest::Client, tg_base: &str
         Err(err) => warn!("deleteMyCommands request failed: {}", err),
     }
 
-    let commands = build_telegram_menu_commands(TELEGRAM_MENU_COMMANDS);
+    let commands = build_combined_telegram_commands(TELEGRAM_MENU_COMMANDS, agent_cmds);
     if commands.is_empty() {
         warn!(
             "Skipping setMyCommands because no Telegram-safe commands remained after normalization."
@@ -1326,8 +1362,10 @@ async fn register_telegram_commands(http_client: &reqwest::Client, tg_base: &str
         Ok(response) => {
             if response.status().is_success() {
                 info!(
-                    "Registered {} Telegram bot commands for menu UI.",
-                    TELEGRAM_MENU_COMMANDS.len()
+                    "Registered {} Telegram bot commands for menu UI ({} native, {} agent).",
+                    commands.len(),
+                    TELEGRAM_MENU_COMMANDS.len(),
+                    agent_cmds.len(),
                 );
             } else {
                 let status = response.status();
@@ -1563,7 +1601,8 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| format!("http://127.0.0.1:{}", args.ansible_port + 1))
         .trim_end_matches('/')
         .to_string();
-    register_telegram_commands(&http_client, &tg_base).await;
+    let agent_cmds = fetch_agent_command_manifest(&mut ipc_client, &target_agent_id).await;
+    register_telegram_commands(&http_client, &tg_base, &agent_cmds).await;
     let mut offset: i64 = 0;
     // session_id → ActiveTurn for in-flight agent turns.
     let mut active_turns: HashMap<String, ActiveTurn> = HashMap::new();
@@ -1636,6 +1675,7 @@ async fn main() -> Result<()> {
                                                 &envelope,
                                                 &mut session_id_overrides,
                                                 &target_agent_id,
+                                                &agent_cmds,
                                             )
                                             .await
                                             {
@@ -1868,10 +1908,11 @@ async fn main() -> Result<()> {
 mod tests {
     use super::{
         TELEGRAM_MAX_COMMANDS, TELEGRAM_MENU_COMMANDS, TelegramBotCommand, TelegramFileRef,
-        build_telegram_menu_commands, default_attachment_name, enrich_attachment_with_transport,
-        normalize_telegram_menu_command_name, telegram_command, telegram_format_text,
-        telegram_help_text, telegram_inbound_envelope,
+        build_combined_telegram_commands, build_telegram_menu_commands, default_attachment_name,
+        enrich_attachment_with_transport, normalize_telegram_menu_command_name, telegram_command,
+        telegram_format_text, telegram_help_text, telegram_inbound_envelope,
     };
+    use philotic_client::CommandManifestEntry;
     use serde_json::json;
 
     #[test]
@@ -2086,9 +2127,35 @@ mod tests {
 
     #[test]
     fn telegram_help_text_lists_registered_commands() {
-        let help = telegram_help_text();
+        let agent_cmds = vec![
+            CommandManifestEntry {
+                command: "status".into(),
+                description: "Show current session status.".into(),
+                usage_hint: None,
+            },
+            CommandManifestEntry {
+                command: "role".into(),
+                description: "Switch to a named role.".into(),
+                usage_hint: Some("/role <name>".into()),
+            },
+            CommandManifestEntry {
+                command: "roles".into(),
+                description: "List configured roles.".into(),
+                usage_hint: None,
+            },
+            CommandManifestEntry {
+                command: "back".into(),
+                description: "Return to orchestrator.".into(),
+                usage_hint: None,
+            },
+            CommandManifestEntry {
+                command: "approve".into(),
+                description: "Approve the pending action.".into(),
+                usage_hint: None,
+            },
+        ];
+        let help = telegram_help_text(&agent_cmds);
         assert!(help.contains("/help"));
-        assert!(help.contains("/commands"));
         assert!(help.contains("/status"));
         assert!(help.contains("/role"));
         assert!(help.contains("/roles"));
@@ -2190,7 +2257,7 @@ mod tests {
 
     #[test]
     fn help_text_includes_new_command() {
-        let help = super::telegram_help_text();
+        let help = super::telegram_help_text(&[]);
         assert!(help.contains("/new"), "help text should mention /new");
     }
 
@@ -2200,5 +2267,25 @@ mod tests {
             .iter()
             .any(|c| c.command == "new");
         assert!(has_new, "TELEGRAM_MENU_COMMANDS should include 'new'");
+    }
+
+    #[test]
+    fn combined_commands_include_native_and_agent_entries() {
+        let agent_cmds = vec![
+            CommandManifestEntry {
+                command: "status".into(),
+                description: "Show status.".into(),
+                usage_hint: None,
+            },
+        ];
+        let combined = build_combined_telegram_commands(TELEGRAM_MENU_COMMANDS, &agent_cmds);
+        let names: Vec<&str> = combined
+            .iter()
+            .filter_map(|v| v["command"].as_str())
+            .collect();
+        assert!(names.contains(&"help"));
+        assert!(names.contains(&"ping"));
+        assert!(names.contains(&"new"));
+        assert!(names.contains(&"status"));
     }
 }
