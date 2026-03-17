@@ -1254,11 +1254,56 @@ fn seed_toolset_profiles(graph: &dyn GraphStorage) -> anyhow::Result<()> {
             allowed_skills: Vec::new(),
             description: Some("Bare utility profile — session and echo only.".into()),
         },
+        ToolsetProfileRecord {
+            profile_name: "admin".into(),
+            allowed_tools: vec![
+                "session.status".into(),
+                "echo".into(),
+                "agent.configure".into(),
+                "skill.register".into(),
+                "skill.list".into(),
+                "skill.assign".into(),
+                "skill.revoke".into(),
+                "subagent.spawn".into(),
+                "role.configure".into(),
+                "workspace.list".into(),
+                "workspace.read".into(),
+            ],
+            allowed_classes: vec!["session".into(), "utility".into(), "config".into()],
+            allowed_skills: vec![
+                "skill.crafting".into(),
+                "handoff.to_role".into(),
+                "handoff.back".into(),
+                "role.governance".into(),
+            ],
+            description: Some("Admin role profile — full skill crafting and role governance authority.".into()),
+        },
     ];
 
     for profile in &profiles {
         graph.upsert_toolset_profile(profile)?;
     }
+    Ok(())
+}
+
+fn seed_skill_crafting(graph: &dyn GraphStorage) -> anyhow::Result<()> {
+    use ansible_mesh_core::graph::{AbstractSkillRecord, SkillValidationState};
+    let skill = AbstractSkillRecord {
+        skill_name: "skill.crafting".into(),
+        description: "Grants access to skill management tools — register, list, assign, and revoke skills across roles. Intended for admin role use.".into(),
+        implied_tools: vec![
+            "skill.register".into(),
+            "skill.list".into(),
+            "skill.assign".into(),
+            "skill.revoke".into(),
+            "subagent.spawn".into(),
+            "role.configure".into(),
+        ],
+        validation_state: SkillValidationState::Validated,
+        source_snapshot: None,
+        field_sources: serde_json::json!({}),
+    };
+    graph.upsert_abstract_skill(&skill)?;
     Ok(())
 }
 
@@ -3312,6 +3357,7 @@ async fn main() -> Result<()> {
     seed_abstract_tool_catalog(&graph_storage)?;
     seed_abstract_skill_catalog(&graph_storage)?;
     seed_toolset_profiles(&graph_storage)?;
+    seed_skill_crafting(&graph_storage)?;
     seed_orchestrator_roles(&graph_storage, &all_profiles)?;
 
     if let Some(test) = startup_test {

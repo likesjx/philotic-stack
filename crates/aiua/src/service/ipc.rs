@@ -2472,6 +2472,216 @@ impl IpcServer {
                     validation_errors: errors,
                 }
             }
+            IpcRequest::AssignSkill {
+                agent_id,
+                role_name,
+                skill_name,
+            } => {
+                let Some(identity) = current_identity.as_ref() else {
+                    return IpcResponse::error(
+                        "assign_skill",
+                        "ASSIGN_UNREGISTERED",
+                        "guest must register before assigning skills",
+                    );
+                };
+                if identity.role != "orchestrator" {
+                    return IpcResponse::error(
+                        "assign_skill",
+                        "ASSIGN_FORBIDDEN",
+                        "only orchestrator guests may assign skills",
+                    );
+                }
+                if !identity.guest_id.starts_with(&agent_id) {
+                    return IpcResponse::error(
+                        "assign_skill",
+                        "ASSIGN_FORBIDDEN",
+                        "orchestrator guests may only assign skills for their own agent identity",
+                    );
+                }
+                // Verify the skill exists in the catalog.
+                match graph.get_abstract_skill(&skill_name) {
+                    Ok(None) => {
+                        return IpcResponse::error(
+                            "assign_skill",
+                            "SKILL_NOT_FOUND",
+                            format!("skill [{}] not found in catalog", skill_name),
+                        );
+                    }
+                    Err(e) => {
+                        return IpcResponse::error(
+                            "assign_skill",
+                            "SKILL_LOOKUP_FAILED",
+                            format!("failed to look up skill: {e}"),
+                        );
+                    }
+                    Ok(Some(_)) => {}
+                }
+                // Load the role incarnation record.
+                let role_record = match graph.get_role_incarnation(&agent_id, &role_name) {
+                    Ok(Some(r)) => r,
+                    Ok(None) => {
+                        return IpcResponse::error(
+                            "assign_skill",
+                            "ROLE_NOT_FOUND",
+                            format!("role [{}] not configured for agent [{}]", role_name, agent_id),
+                        );
+                    }
+                    Err(e) => {
+                        return IpcResponse::error(
+                            "assign_skill",
+                            "ROLE_LOOKUP_FAILED",
+                            format!("failed to look up role: {e}"),
+                        );
+                    }
+                };
+                // Load the toolset profile.
+                let mut profile = match graph.get_toolset_profile(&role_record.toolset_profile) {
+                    Ok(Some(p)) => p,
+                    Ok(None) => {
+                        return IpcResponse::error(
+                            "assign_skill",
+                            "PROFILE_NOT_FOUND",
+                            format!("toolset profile [{}] not found", role_record.toolset_profile),
+                        );
+                    }
+                    Err(e) => {
+                        return IpcResponse::error(
+                            "assign_skill",
+                            "PROFILE_LOOKUP_FAILED",
+                            format!("failed to look up toolset profile: {e}"),
+                        );
+                    }
+                };
+                // Idempotent: if already assigned, return success.
+                if !profile.allowed_skills.contains(&skill_name) {
+                    profile.allowed_skills.push(skill_name.clone());
+                    if let Err(e) = graph.upsert_toolset_profile(&profile) {
+                        return IpcResponse::error(
+                            "assign_skill",
+                            "PROFILE_PERSIST_FAILED",
+                            format!("failed to persist toolset profile: {e}"),
+                        );
+                    }
+                }
+                info!(role_name = %role_name, skill_name = %skill_name, "Skill assigned to role via IPC");
+                IpcResponse::SkillAssigned {
+                    role_name,
+                    skill_name,
+                    operation: "assigned".into(),
+                }
+            }
+            IpcRequest::RevokeSkill {
+                agent_id,
+                role_name,
+                skill_name,
+            } => {
+                let Some(identity) = current_identity.as_ref() else {
+                    return IpcResponse::error(
+                        "revoke_skill",
+                        "REVOKE_UNREGISTERED",
+                        "guest must register before revoking skills",
+                    );
+                };
+                if identity.role != "orchestrator" {
+                    return IpcResponse::error(
+                        "revoke_skill",
+                        "REVOKE_FORBIDDEN",
+                        "only orchestrator guests may revoke skills",
+                    );
+                }
+                if !identity.guest_id.starts_with(&agent_id) {
+                    return IpcResponse::error(
+                        "revoke_skill",
+                        "REVOKE_FORBIDDEN",
+                        "orchestrator guests may only revoke skills for their own agent identity",
+                    );
+                }
+                // Load the role incarnation record.
+                let role_record = match graph.get_role_incarnation(&agent_id, &role_name) {
+                    Ok(Some(r)) => r,
+                    Ok(None) => {
+                        return IpcResponse::error(
+                            "revoke_skill",
+                            "ROLE_NOT_FOUND",
+                            format!("role [{}] not configured for agent [{}]", role_name, agent_id),
+                        );
+                    }
+                    Err(e) => {
+                        return IpcResponse::error(
+                            "revoke_skill",
+                            "ROLE_LOOKUP_FAILED",
+                            format!("failed to look up role: {e}"),
+                        );
+                    }
+                };
+                // Load the toolset profile.
+                let mut profile = match graph.get_toolset_profile(&role_record.toolset_profile) {
+                    Ok(Some(p)) => p,
+                    Ok(None) => {
+                        return IpcResponse::error(
+                            "revoke_skill",
+                            "PROFILE_NOT_FOUND",
+                            format!("toolset profile [{}] not found", role_record.toolset_profile),
+                        );
+                    }
+                    Err(e) => {
+                        return IpcResponse::error(
+                            "revoke_skill",
+                            "PROFILE_LOOKUP_FAILED",
+                            format!("failed to look up toolset profile: {e}"),
+                        );
+                    }
+                };
+                // Idempotent: if not present, return success.
+                if profile.allowed_skills.contains(&skill_name) {
+                    profile.allowed_skills.retain(|s| s != &skill_name);
+                    if let Err(e) = graph.upsert_toolset_profile(&profile) {
+                        return IpcResponse::error(
+                            "revoke_skill",
+                            "PROFILE_PERSIST_FAILED",
+                            format!("failed to persist toolset profile: {e}"),
+                        );
+                    }
+                }
+                info!(role_name = %role_name, skill_name = %skill_name, "Skill revoked from role via IPC");
+                IpcResponse::SkillAssigned {
+                    role_name,
+                    skill_name,
+                    operation: "revoked".into(),
+                }
+            }
+            IpcRequest::ListSkills {} => {
+                let skills = match graph.list_abstract_skills() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return IpcResponse::error(
+                            "list_skills",
+                            "LIST_SKILLS_FAILED",
+                            format!("failed to list skills: {e}"),
+                        );
+                    }
+                };
+                let json_skills: Vec<serde_json::Value> = skills
+                    .iter()
+                    .map(|s| {
+                        let state_str = match &s.validation_state {
+                            SkillValidationState::Validated      => "validated",
+                            SkillValidationState::Invalid { .. } => "invalid",
+                            SkillValidationState::Draft          => "draft",
+                            SkillValidationState::Registered     => "registered",
+                            SkillValidationState::Suspended { .. } => "suspended",
+                            SkillValidationState::Deprecated     => "deprecated",
+                        };
+                        serde_json::json!({
+                            "skill_name": s.skill_name,
+                            "description": s.description,
+                            "implied_tools": s.implied_tools,
+                            "validation_state": state_str,
+                        })
+                    })
+                    .collect();
+                IpcResponse::SkillList { skills: json_skills }
+            }
             IpcRequest::AbortSubagentSpawn { subagent_guest_id } => {
                 // Persona cancels before the worker has connected.
                 // Release the lease and clean up hooks; worker spawn is no-op if it arrives late.
@@ -2494,6 +2704,32 @@ impl IpcServer {
             // Handled before process_request is called (in handle_client).
             IpcRequest::FetchMemoryConfig => {
                 IpcResponse::error("memory", "UNREACHABLE", "FetchMemoryConfig dispatched early")
+            }
+            IpcRequest::RegisterGraphInstance { graph_id, instance_id } => {
+                use ansible_mesh_core::storage::GraphRunnerInstanceRecord;
+                let record = GraphRunnerInstanceRecord {
+                    graph_id: graph_id.clone(),
+                    instance_id: instance_id.clone(),
+                    registered_at: unix_ts(),
+                };
+                match graph.upsert_graph_runner_instance(&record) {
+                    Ok(()) => {
+                        info!(
+                            graph_id = %graph_id,
+                            instance_id = %instance_id,
+                            "Graph runner instance registered"
+                        );
+                        IpcResponse::GraphInstanceRegistered { graph_id }
+                    }
+                    Err(err) => {
+                        error!("Failed to register graph runner instance: {err}");
+                        IpcResponse::error(
+                            "register_graph_instance",
+                            "STORAGE_ERROR",
+                            err.to_string(),
+                        )
+                    }
+                }
             }
         }
     }
@@ -2969,6 +3205,50 @@ impl IpcServer {
                             "effective_skillset": profile.allowed_skills,
                         });
                     }
+                }
+            }
+        }
+
+        // Expand dynamic skill implied_tools into effective_toolset.
+        // For each skill in effective_skillset, load its AbstractSkillRecord and merge
+        // any implied_tools that are not already present. This runs hotel-side so philote
+        // receives a fully-expanded toolset without needing DB access.
+        {
+            let skillset: Vec<String> = bindings
+                .get("effective_skillset")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            if !skillset.is_empty() {
+                let mut toolset: Vec<String> = bindings
+                    .get("effective_toolset")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str())
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                for skill_name in &skillset {
+                    if let Ok(Some(skill_record)) = graph.get_abstract_skill(skill_name) {
+                        for implied in &skill_record.implied_tools {
+                            if !toolset.contains(implied) {
+                                toolset.push(implied.clone());
+                            }
+                        }
+                    }
+                }
+
+                if let Some(obj) = bindings.as_object_mut() {
+                    obj.insert("effective_toolset".to_string(), serde_json::json!(toolset));
                 }
             }
         }

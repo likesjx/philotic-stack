@@ -475,6 +475,22 @@ pub enum IpcRequest {
         #[serde(default)]
         lease_terms: SubagentLeaseTerms,
     },
+    /// Assign a registered skill to a role's toolset profile.
+    /// Requires orchestrator identity. Skill must exist in catalog.
+    AssignSkill {
+        agent_id: String,
+        role_name: String,
+        skill_name: String,
+    },
+    /// Remove a skill from a role's toolset profile.
+    /// Requires orchestrator identity.
+    RevokeSkill {
+        agent_id: String,
+        role_name: String,
+        skill_name: String,
+    },
+    /// List all registered skills with their validation states.
+    ListSkills {},
     ListRoleIncarnations {
         agent_id: String,
     },
@@ -523,6 +539,12 @@ pub enum IpcRequest {
     },
     /// Request the hotel's loaded MuninnDB configuration (vault tokens included).
     FetchMemoryConfig,
+    /// Register a graph instance with the hotel's ODS so it can route graph_id → instance_id.
+    /// Sent by the graph-runner on startup (for all existing graphs) and after each graph.create.
+    RegisterGraphInstance {
+        graph_id: String,
+        instance_id: String,
+    },
 }
 
 /// Represents the canonical response from the local Ansible back to the Guest via IPC.
@@ -579,6 +601,16 @@ pub enum IpcResponse {
         #[serde(default)]
         validation_errors: Vec<String>,
     },
+    /// Response to [`IpcRequest::AssignSkill`] and [`IpcRequest::RevokeSkill`].
+    SkillAssigned {
+        role_name: String,
+        skill_name: String,
+        operation: String, // "assigned" or "revoked"
+    },
+    /// Response to [`IpcRequest::ListSkills`].
+    SkillList {
+        skills: Vec<serde_json::Value>,
+    },
     InboundTask {
         source_node: String,
         task_id: Uuid,
@@ -606,6 +638,10 @@ pub enum IpcResponse {
     /// `config_json` is `None` if MuninnDB is not configured on this hotel.
     MemoryConfig {
         config_json: Option<String>,
+    },
+    /// Response to [`IpcRequest::RegisterGraphInstance`].
+    GraphInstanceRegistered {
+        graph_id: String,
     },
 }
 

@@ -1092,7 +1092,7 @@ impl AgentRuntime {
                 self.handle_tool_call(session_id, turn_id, tool_call).await
             }
             AgentAction::RequestApproval(approval) => {
-                self.handle_approval_request(session_id, turn_id, approval)
+                self.handle_approval_request(session_id, turn_id, approval, false)
                     .await
             }
             AgentAction::Fail { message } => {
@@ -1106,19 +1106,27 @@ impl AgentRuntime {
         session_id: String,
         turn_id: String,
         approval: ApprovalRequest,
+        always_require_human: bool,
     ) -> Result<()> {
         let approval = Self::normalize_approval_request(approval);
-        let preapproved = self
-            .sessions
-            .get(&session_id)
-            .map(|state| {
-                let tool = state
-                    .active_turn
-                    .as_ref()
-                    .and_then(|t| t.pending_tool_call.as_ref());
-                state.approval_policy_allows(&approval, tool)
-            })
-            .unwrap_or(false);
+        // `always_require_human` bypasses the approval policy entirely — the human operator
+        // must approve in this session. Used for admin role creation, which cannot be
+        // preapproved or bypassed by `auto_approve_all`.
+        let preapproved = if always_require_human {
+            false
+        } else {
+            self
+                .sessions
+                .get(&session_id)
+                .map(|state| {
+                    let tool = state
+                        .active_turn
+                        .as_ref()
+                        .and_then(|t| t.pending_tool_call.as_ref());
+                    state.approval_policy_allows(&approval, tool)
+                })
+                .unwrap_or(false)
+        };
 
         let (
             task_id,
@@ -1290,21 +1298,52 @@ impl AgentRuntime {
             })
             .unwrap_or(false);
 
-        if force_approval {
+        // Admin role creation requires live operator approval regardless of any approval policy.
+        // This check runs before the normal force_approval gate so it can set always_require_human.
+        let is_admin_role_creation = tool_call.tool_name == "role.configure"
+            && tool_call
+                .arguments
+                .get("is_admin")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+        if is_admin_role_creation || force_approval {
             // Set pending_tool_call so the approval handler can read it for class lookup.
             if let Some(state) = self.sessions.get_mut(&session_id) {
                 state.set_pending_tool_call(tool_call.clone());
             }
+            let role_name_hint = if is_admin_role_creation {
+                tool_call
+                    .arguments
+                    .get("role_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string()
+            } else {
+                String::new()
+            };
+            let (reason, approved_response) = if is_admin_role_creation {
+                (
+                    format!(
+                        "Admin role '{}' creation requires your explicit live approval. \
+                         This cannot be preapproved or bypassed by policy.",
+                        role_name_hint
+                    ),
+                    format!("Admin role '{}' approved.", role_name_hint),
+                )
+            } else {
+                (
+                    format!("Tool '{}' requires approval before execution.", tool_call.tool_name),
+                    format!("Executing {}.", tool_call.tool_name),
+                )
+            };
             let synthetic = ApprovalRequest {
                 approval_id: Some(uuid::Uuid::new_v4().to_string()),
-                reason: format!(
-                    "Tool '{}' requires approval before execution.",
-                    tool_call.tool_name
-                ),
-                approved_response: format!("Executing {}.", tool_call.tool_name),
+                reason,
+                approved_response,
             };
             return self
-                .handle_approval_request(session_id, turn_id, synthetic)
+                .handle_approval_request(session_id, turn_id, synthetic, is_admin_role_creation)
                 .await;
         }
 
@@ -3648,6 +3687,167 @@ impl AgentRuntime {
                     }
                     Err(e) => {
                         let err = TaskErrorPayload::transport_error("philote", format!("skill.register: IPC transport error — {e}"));
+                        (err.display_message(), Some(err))
+                    }
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action:              Some("tool_result".into()),
+                    agent_action:        None,
+                    source:              Some("agent".into()),
+                    session_id:          Some(payload.session_id),
+                    turn_id:             Some(payload.turn_id),
+                    transport:           None,
+                    chat_id:             Some(payload.chat_id),
+                    thread_id:           None,
+                    sender_id:           None,
+                    sender_username:     None,
+                    message_kind:        None,
+                    content:             Some(content),
+                    attachments:         Vec::new(),
+                    command:             None,
+                    callback_data:       None,
+                    raw_transport_event: None,
+                    error: tool_err,
+                    tool_name:           Some(payload.tool_name),
+                    arguments:           None,
+                    final_reply_to:      Some(payload.final_reply_to),
+                    final_reply_role:    Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                })
+                .await
+            }
+
+            "skill.list" => {
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::ListSkills {})
+                    .await
+                {
+                    Ok(IpcResponse::SkillList { skills }) => {
+                        let msg = if skills.is_empty() {
+                            "No skills registered.".to_string()
+                        } else {
+                            let lines: Vec<String> = skills
+                                .iter()
+                                .map(|s| {
+                                    let name = s.get("skill_name").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let state = s.get("validation_state").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let desc = s.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                                    let brief: String = desc.chars().take(80).collect();
+                                    format!("- {} [{}] — {}", name, state, brief)
+                                })
+                                .collect();
+                            format!("Registered skills:\n{}", lines.join("\n"))
+                        };
+                        (msg, None)
+                    }
+                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(IpcResponse::Error(msg)) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", "IPC_ERROR", msg);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", "UNEXPECTED_RESPONSE", "skill.list: unexpected hotel response");
+                        (e.display_message(), Some(e))
+                    }
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error("philote", format!("skill.list: IPC transport error — {e}"));
+                        (err.display_message(), Some(err))
+                    }
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action:              Some("tool_result".into()),
+                    agent_action:        None,
+                    source:              Some("agent".into()),
+                    session_id:          Some(payload.session_id),
+                    turn_id:             Some(payload.turn_id),
+                    transport:           None,
+                    chat_id:             Some(payload.chat_id),
+                    thread_id:           None,
+                    sender_id:           None,
+                    sender_username:     None,
+                    message_kind:        None,
+                    content:             Some(content),
+                    attachments:         Vec::new(),
+                    command:             None,
+                    callback_data:       None,
+                    raw_transport_event: None,
+                    error: tool_err,
+                    tool_name:           Some(payload.tool_name),
+                    arguments:           None,
+                    final_reply_to:      Some(payload.final_reply_to),
+                    final_reply_role:    Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                })
+                .await
+            }
+
+            "skill.assign" | "skill.revoke" => {
+                let args = &payload.arguments;
+                let op = payload.tool_name.as_str();
+
+                let role_name = match args.get("role_name").and_then(|v| v.as_str()) {
+                    Some(s) => s.to_string(),
+                    None => {
+                        return self
+                            .fail_active_turn(
+                                payload.session_id,
+                                payload.turn_id,
+                                format!("{op}: missing required argument 'role_name'"),
+                            )
+                            .await;
+                    }
+                };
+                let skill_name = match args.get("skill_name").and_then(|v| v.as_str()) {
+                    Some(s) => s.to_string(),
+                    None => {
+                        return self
+                            .fail_active_turn(
+                                payload.session_id,
+                                payload.turn_id,
+                                format!("{op}: missing required argument 'skill_name'"),
+                            )
+                            .await;
+                    }
+                };
+
+                let req = if op == "skill.assign" {
+                    IpcRequest::AssignSkill {
+                        agent_id: self.agent_id.clone(),
+                        role_name: role_name.clone(),
+                        skill_name: skill_name.clone(),
+                    }
+                } else {
+                    IpcRequest::RevokeSkill {
+                        agent_id: self.agent_id.clone(),
+                        role_name: role_name.clone(),
+                        skill_name: skill_name.clone(),
+                    }
+                };
+
+                let (content, tool_err) = match self.ipc_client.send_request(req).await {
+                    Ok(IpcResponse::SkillAssigned { role_name: rn, skill_name: sn, operation }) => {
+                        (format!("Skill '{}' {} role '{}'.", sn, operation, rn), None)
+                    }
+                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(IpcResponse::Error(msg)) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", "IPC_ERROR", msg);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", "UNEXPECTED_RESPONSE", &format!("{op}: unexpected hotel response"));
+                        (e.display_message(), Some(e))
+                    }
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error("philote", format!("{op}: IPC transport error — {e}"));
                         (err.display_message(), Some(err))
                     }
                 };

@@ -230,6 +230,74 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
     );
 
     m.insert(
+        "skill.list".into(),
+        ToolDefinition {
+            tool_name: "skill.list".into(),
+            description: "Lists all registered skills in the hotel's skill catalog, including their \
+                          validation states and implied tools. Use to browse available skills before \
+                          assigning them to a role."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+            class: Some("capability".into()),
+        },
+    );
+
+    m.insert(
+        "skill.assign".into(),
+        ToolDefinition {
+            tool_name: "skill.assign".into(),
+            description: "Assigns a registered skill to a role's toolset profile. Once assigned, \
+                          the skill's implied tools become available to the role on its next session. \
+                          The skill must exist in the catalog. Idempotent."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "role_name": {
+                        "type": "string",
+                        "description": "The role to assign the skill to (e.g. 'developer')."
+                    },
+                    "skill_name": {
+                        "type": "string",
+                        "description": "The name of the skill to assign."
+                    }
+                },
+                "required": ["role_name", "skill_name"]
+            }),
+            class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "skill.revoke".into(),
+        ToolDefinition {
+            tool_name: "skill.revoke".into(),
+            description: "Removes a skill from a role's toolset profile. The skill's implied tools \
+                          will no longer be available to the role after the next session reset. \
+                          Idempotent."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "role_name": {
+                        "type": "string",
+                        "description": "The role to revoke the skill from."
+                    },
+                    "skill_name": {
+                        "type": "string",
+                        "description": "The name of the skill to revoke."
+                    }
+                },
+                "required": ["role_name", "skill_name"]
+            }),
+            class: Some("config".into()),
+        },
+    );
+
+    m.insert(
         "subagent.spawn".into(),
         ToolDefinition {
             tool_name: "subagent.spawn".into(),
@@ -415,7 +483,7 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     },
                     "is_admin": {
                         "type": "boolean",
-                        "description": "If true, this role has admin authority — it may update operator-owned records such as the orchestrator manifest. Only existing admin roles may create other admin roles."
+                        "description": "If true, this role has admin authority — it may update operator-owned records such as the orchestrator manifest. Only existing admin roles may create other admin roles. Setting this to true always triggers a live operator approval interrupt that cannot be preapproved or bypassed."
                     },
                     "inactive_ttl_seconds": {
                         "type": "integer",
@@ -450,7 +518,7 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                 },
                 "required": ["role_name", "toolset_profile", "reasoning"]
             }),
-            class: Some("capability".into()),
+            class: Some("config".into()),
         },
     );
 
