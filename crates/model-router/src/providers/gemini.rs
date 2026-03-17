@@ -295,6 +295,7 @@ impl ModelProvider for GeminiProvider {
                 self.media_request_payload(task).await?
             }
             TaskKind::VoiceSynthesize => bail!("Gemini does not support voice synthesis"),
+            TaskKind::Embed => bail!("Gemini does not support local embedding (use OnnxProvider)"),
         };
         let response = self
             .apply_auth_headers(

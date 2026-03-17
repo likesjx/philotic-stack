@@ -12,6 +12,7 @@ pub enum TaskKind {
     MediaAnalyze,
     AudioTranscribe,
     VoiceSynthesize,
+    Embed,
 }
 
 impl TaskKind {
@@ -21,6 +22,7 @@ impl TaskKind {
             Self::MediaAnalyze => "media.analyze",
             Self::AudioTranscribe => "voice.transcribe",
             Self::VoiceSynthesize => "voice.synthesize",
+            Self::Embed => "text.embed",
         }
     }
 }
@@ -49,6 +51,7 @@ impl RequestClass {
             TaskKind::TextGenerate => Self::Cognitive,
             TaskKind::MediaAnalyze | TaskKind::AudioTranscribe => Self::Transform,
             TaskKind::VoiceSynthesize => Self::Synthesis,
+            TaskKind::Embed => Self::Embedding,
         }
     }
 
@@ -231,6 +234,7 @@ impl ControllerTask {
                 TaskKind::AudioTranscribe
             }
             Some("voice.synthesize") | Some("voice_synthesize") => TaskKind::VoiceSynthesize,
+            Some("text.embed") | Some("embed") => TaskKind::Embed,
             Some(other) => bail!("unsupported task kind [{}]", other),
             None if task.get("prompt").and_then(Value::as_str).is_some() => TaskKind::TextGenerate,
             None if !context.attachments.is_empty() => TaskKind::MediaAnalyze,
@@ -477,6 +481,14 @@ impl ControllerTask {
                     bail!("voice.synthesize task text cannot be empty");
                 }
             }
+            TaskKind::Embed => {
+                let text = self
+                    .composed_prompt_text()
+                    .context("text.embed task missing input text (prompt)")?;
+                if text.trim().is_empty() {
+                    bail!("text.embed task input text cannot be empty");
+                }
+            }
         }
 
         match self.request_class {
@@ -511,7 +523,12 @@ impl ControllerTask {
                 }
             }
             RequestClass::Embedding => {
-                bail!("request_class [embedding] is not yet supported by model-router");
+                if self.kind != TaskKind::Embed {
+                    bail!(
+                        "request_class [embedding] requires task kind [text.embed], got [{}]",
+                        self.kind.as_str()
+                    );
+                }
             }
         }
 
@@ -836,7 +853,7 @@ pub struct TextResult {
     pub memory_concept: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ProviderOutput {
     Text {
         content: String,
@@ -848,6 +865,14 @@ pub enum ProviderOutput {
         memory_concept: Option<String>,
     },
     Audio(AudioArtifact),
+    /// A dense embedding vector produced by a local ONNX embedding model.
+    ///
+    /// `model_gen` carries the provenance token `"{repo}@{sha8}"` so consumers
+    /// can detect embedding-space drift when the model is hot-swapped.
+    Embedding {
+        vector: Vec<f32>,
+        model_gen: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -938,6 +963,39 @@ impl ControllerResponseEnvelope {
                         provider: Some(provider_id.to_string()),
                         model: Some(audio.model.clone()),
                         voice: Some(audio.voice_id.clone()),
+                    },
+                    provider_output: Value::Null,
+                })
+            }
+            ProviderOutput::Embedding { vector, model_gen } => {
+                let vector_value: Value = vector
+                    .iter()
+                    .map(|&f| serde_json::Number::from_f64(f as f64).map(Value::Number))
+                    .collect::<Option<Vec<_>>>()
+                    .map(Value::Array)
+                    .unwrap_or(Value::Null);
+
+                Ok(Self {
+                    capability: task.kind.as_str().to_string(),
+                    content: model_gen.clone(),
+                    result: json!({
+                        "model_gen": model_gen,
+                        "dim": vector.len(),
+                    }),
+                    artifacts: vec![ResponseArtifact {
+                        kind: "embedding".into(),
+                        mime_type: Some("application/json".into()),
+                        output_format: None,
+                        payload: json!({
+                            "vector": vector_value,
+                            "model_gen": model_gen,
+                            "dim": vector.len(),
+                        }),
+                    }],
+                    trace: ResponseTrace {
+                        provider: Some(provider_id.to_string()),
+                        model: task.model.clone(),
+                        voice: None,
                     },
                     provider_output: Value::Null,
                 })
