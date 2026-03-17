@@ -432,6 +432,7 @@ fn format_roles_report(active_incarnation_id: Option<&str>, roles: &[serde_json:
 struct CachedRoleConfig {
     toolset_profile: String,
     role_identity_addendum: Option<String>,
+    role_manifest: Option<String>,
     iteration_cap: Option<u32>,
     approval_policy: Option<String>,
 }
@@ -2465,6 +2466,9 @@ impl AgentRuntime {
                 role_addendum: role_config
                     .as_ref()
                     .and_then(|c| c.role_identity_addendum.clone()),
+                role_manifest: role_config
+                    .as_ref()
+                    .and_then(|c| c.role_manifest.clone()),
                 base_identity_ref: None,
                 activation_requester_class: Some("role_handoff".into()),
                 activation_policy_owner: None,
@@ -3467,6 +3471,7 @@ impl AgentRuntime {
                 }
 
                 let role_identity_addendum = args.get("role_identity_addendum").and_then(|v| v.as_str()).map(str::to_string);
+                let role_manifest = args.get("role_manifest").and_then(|v| v.as_str()).map(str::to_string);
                 let inactive_ttl_seconds = args.get("inactive_ttl_seconds").and_then(|v| v.as_u64());
                 let iteration_cap = args.get("iteration_cap").and_then(|v| v.as_u64()).map(|v| v as u32);
                 let approval_policy = args.get("approval_policy").and_then(|v| v.as_str()).map(str::to_string);
@@ -3479,6 +3484,7 @@ impl AgentRuntime {
                     guest_id: self.agent_id.clone(),
                     toolset_profile,
                     role_identity_addendum,
+                    role_manifest,
                     inactive_ttl_seconds,
                     iteration_cap,
                     approval_policy,
@@ -3492,6 +3498,8 @@ impl AgentRuntime {
                             toolset_profile: args.get("toolset_profile")
                                 .and_then(|v| v.as_str()).unwrap_or("default").to_string(),
                             role_identity_addendum: args.get("role_identity_addendum")
+                                .and_then(|v| v.as_str()).map(str::to_string),
+                            role_manifest: args.get("role_manifest")
                                 .and_then(|v| v.as_str()).map(str::to_string),
                             iteration_cap: args.get("iteration_cap")
                                 .and_then(|v| v.as_u64()).map(|v| v as u32),

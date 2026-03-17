@@ -2303,6 +2303,7 @@ impl IpcServer {
                 guest_id,
                 toolset_profile,
                 role_identity_addendum,
+                role_manifest,
                 inactive_ttl_seconds,
                 iteration_cap,
                 approval_policy,
@@ -2337,6 +2338,7 @@ impl IpcServer {
                     guest_id,
                     toolset_profile,
                     role_identity_addendum,
+                    role_manifest,
                     inactive_ttl_seconds,
                     turn_loop_config: ansible_mesh_core::graph::TurnLoopConfig {
                         iteration_cap,
@@ -2907,6 +2909,12 @@ impl IpcServer {
                 roles
                     .into_iter()
                     .find(|role| role.guest_id == active_incarnation_id)
+            })
+            // When no explicit role is active, fall back to the orchestrator role record so the
+            // agent always gets its full toolset and manifest from the first session turn.
+            .or_else(|| {
+                let agent_id = session.primary_agent_id.as_deref()?;
+                graph.get_role_incarnation(agent_id, "orchestrator").ok().flatten()
             });
 
         if let Some(role_record) = &active_role_record {
@@ -2946,15 +2954,21 @@ impl IpcServer {
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
+                let activation_reason = if session.active_incarnation_id.is_some() {
+                    "session_active_incarnation"
+                } else {
+                    "default_identity_posture"
+                };
                 Some(serde_json::json!({
                     "role_name": role_record.role_name,
                     "active_incarnation_id": role_record.guest_id.clone(),
-                    "activation_reason": "session_active_incarnation",
+                    "activation_reason": activation_reason,
                     "requested_by": "hotel_runtime",
                     "activation_requester_class": "system",
                     "activation_policy_owner": "hotel_runtime",
                     "base_identity_ref": role_record.agent_id.clone(),
                     "role_addendum": role_record.role_identity_addendum,
+                    "role_manifest": role_record.role_manifest,
                     "toolset_profile_ref": role_record.toolset_profile,
                     "skillset_profile_ref": role_record.toolset_profile,
                     "effective_skillset": effective_skillset,
@@ -3001,7 +3015,16 @@ impl IpcServer {
                 .summary_json
                 .get("approval_policy")
                 .cloned()
-                .unwrap_or_else(|| serde_json::json!({})),
+                .unwrap_or_else(|| {
+                    // Bootstrap the orchestrator approval policy: governance and self-config
+                    // tools run without per-action approval so the agent can operate
+                    // autonomously from the first turn.
+                    serde_json::json!({
+                        "auto_approve_all": false,
+                        "preapproved_classes": ["session", "utility", "capability"],
+                        "preapproved_tools": ["agent.configure"]
+                    })
+                }),
             "bindings": bindings,
             "component_route_assembly": component_route_assembly,
             "tool_assembly": tool_assembly,
@@ -4569,6 +4592,7 @@ mod tests {
                 guest_id: "agent-jane:orchestrator".into(),
                 toolset_profile: "orchestrator".into(),
                 role_identity_addendum: None,
+                role_manifest: None,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
             })
@@ -4678,6 +4702,7 @@ mod tests {
                 guest_id: "agent-jane:orchestrator".into(),
                 toolset_profile: "orchestrator".into(),
                 role_identity_addendum: None,
+                role_manifest: None,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
             })
@@ -4935,6 +4960,7 @@ mod tests {
                 guest_id: "agent-jane:developer".into(),
                 toolset_profile: "codex".into(),
                 role_identity_addendum: None,
+                role_manifest: None,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
             })
@@ -5112,6 +5138,7 @@ mod tests {
                 guest_id: "agent-jane:developer".into(),
                 toolset_profile: "codex".into(),
                 role_identity_addendum: None,
+                role_manifest: None,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
             })
@@ -5806,6 +5833,7 @@ mod tests {
                 guest_id: "agent-jane:developer".into(),
                 toolset_profile: "codex".into(),
                 role_identity_addendum: Some("Focus on implementation and code changes.".into()),
+                role_manifest: None,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
             })
@@ -5924,6 +5952,7 @@ mod tests {
                 guest_id: "agent-jane:codex".into(),
                 toolset_profile: "codex".into(),
                 role_identity_addendum: None,
+                role_manifest: None,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
             })
@@ -8653,6 +8682,7 @@ mod tests {
                 guest_id: "agent-jane-01:developer".into(),
                 toolset_profile: "developer".into(),
                 role_identity_addendum: Some("Addendum".into()),
+                role_manifest: None,
                 inactive_ttl_seconds: Some(60),
                 iteration_cap: Some(10),
                 approval_policy: Some("auto".into()),
@@ -8714,6 +8744,7 @@ mod tests {
                 guest_id: "agent-bob-01:developer".into(),
                 toolset_profile: "developer".into(),
                 role_identity_addendum: None,
+                role_manifest: None,
                 inactive_ttl_seconds: None,
                 iteration_cap: None,
                 approval_policy: None,

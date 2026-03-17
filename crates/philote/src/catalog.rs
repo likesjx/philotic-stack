@@ -409,6 +409,10 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                         "type": "string",
                         "description": "Additive persona/identity instructions for this specific role."
                     },
+                    "role_manifest": {
+                        "type": "string",
+                        "description": "Governance document for this role — focus, rules, delegation posture, and approval constraints. Written in natural language. The agent sees this as its [Governance] context block when the role is active. Should describe: what this role does, what tools are available and when to use them, what requires approval, and when to hand off."
+                    },
                     "inactive_ttl_seconds": {
                         "type": "integer",
                         "description": "Seconds of inactivity before the role is suspended/terminated."

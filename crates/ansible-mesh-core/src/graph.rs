@@ -159,6 +159,11 @@ pub struct RoleIncarnationRecord {
     pub toolset_profile: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_identity_addendum: Option<String>,
+    /// Governance document projected into the agent's Identity context layer when this role is
+    /// active. Written in natural language — describes focus, rules, delegation posture, and
+    /// approval constraints so the agent can reason about its own capabilities and limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_manifest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inactive_ttl_seconds: Option<u64>,
     #[serde(default)]

@@ -1262,6 +1262,62 @@ fn seed_toolset_profiles(graph: &dyn GraphStorage) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Governance document seeded for every agent's orchestrator role.
+/// This is the agent's self-description — it tells the agent what it IS, what it can do,
+/// what requires approval, and how to delegate. Agents can update this via role.configure.
+const ORCHESTRATOR_MANIFEST: &str = "\
+You are in orchestrator posture — the sovereign identity layer of your agent.
+
+Responsibilities:
+- Govern your own role definitions and delegation vocabulary.
+- Configure your approval policy and operational bindings.
+- Delegate sustained specialist work to configured roles via handoff.to_role.
+- Oversee subagents spawned for parallel, bounded tasks.
+- Return delegated work to orchestrator custody when roles complete.
+
+Rules:
+- Reason explicitly before creating a role: purpose, toolset, handoff posture, limits.
+- Do not bypass the approval gate; if a tool requires operator approval, surface it clearly.
+- Keep soul_text and core identity stable — those changes require operator approval.
+- Use handoff.to_role for sustained specialist work; use subagent.spawn for parallel bounded tasks.
+
+Approval posture:
+- Governance tools (role.configure, skill.register, handoff.to_role, handoff.back) run without per-action approval.
+- Self-configuration (agent.configure for approval_policy, profile, bindings) runs without approval.
+- Shell execution (bash.exec) and core identity field changes require operator approval.";
+
+/// Seeds an orchestrator RoleIncarnationRecord for each agent profile.
+///
+/// This ensures every agent has a fully populated toolset and manifest from the first session
+/// turn, breaking the chicken-and-egg where role.configure requires tools that only appear
+/// after a role exists.
+fn seed_orchestrator_roles(
+    graph: &dyn GraphStorage,
+    profiles: &[AgentProfile],
+) -> anyhow::Result<()> {
+    for profile in profiles {
+        let record = ansible_mesh_core::graph::RoleIncarnationRecord {
+            agent_id: profile.agent_id.clone(),
+            role_name: "orchestrator".into(),
+            guest_id: format!("{}:orchestrator", profile.agent_id),
+            toolset_profile: "orchestrator".into(),
+            role_identity_addendum: None,
+            role_manifest: Some(ORCHESTRATOR_MANIFEST.into()),
+            inactive_ttl_seconds: None,
+            turn_loop_config: ansible_mesh_core::graph::TurnLoopConfig::default(),
+        };
+        // Use upsert so re-starts don't overwrite a manifest the agent has customized.
+        // Only insert if no record exists yet.
+        if graph
+            .get_role_incarnation(&profile.agent_id, "orchestrator")?
+            .is_none()
+        {
+            graph.upsert_role_incarnation(&record)?;
+        }
+    }
+    Ok(())
+}
+
 fn enable_guest_test_overrides(
     graph: &dyn GraphStorage,
     hotel_name: &str,
@@ -3259,6 +3315,7 @@ async fn main() -> Result<()> {
     seed_abstract_tool_catalog(&graph_storage)?;
     seed_abstract_skill_catalog(&graph_storage)?;
     seed_toolset_profiles(&graph_storage)?;
+    seed_orchestrator_roles(&graph_storage, &all_profiles)?;
 
     if let Some(test) = startup_test {
         prepare_startup_test_binaries(test)?;

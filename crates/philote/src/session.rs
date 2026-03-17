@@ -227,6 +227,10 @@ pub struct RoleActivation {
     pub working_memory_policy: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_projection_policy: Option<String>,
+    /// Governance document for this role — projected into the Identity layer so the agent
+    /// knows its focus, rules, tools, delegation posture, and approval constraints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_manifest: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1590,17 +1594,28 @@ impl SessionState {
         }
 
         if let Some(role_activation) = self.role_activation.as_ref() {
-            lines.push(format!(
-                "Active role posture: {}.",
-                role_activation.role_name
-            ));
-            if let Some(role_addendum) = role_activation
-                .role_addendum
+            // Render the role manifest as a [Governance] block so the agent knows its focus,
+            // rules, tools, and approval constraints for this role posture.
+            if let Some(manifest) = role_activation
+                .role_manifest
                 .as_deref()
                 .map(str::trim)
                 .filter(|text| !text.is_empty())
             {
-                lines.push(format!("Role addendum: {role_addendum}"));
+                lines.push(format!("\n[Governance — {}]\n{}", role_activation.role_name, manifest));
+            } else {
+                lines.push(format!(
+                    "Active role posture: {}.",
+                    role_activation.role_name
+                ));
+                if let Some(role_addendum) = role_activation
+                    .role_addendum
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                {
+                    lines.push(format!("Role addendum: {role_addendum}"));
+                }
             }
         }
 
@@ -1755,12 +1770,17 @@ impl SessionState {
             ));
         }
         if !projected_tools.is_empty() {
-            let abstract_tools = projected_tools
-                .iter()
-                .map(|tool| tool.tool_name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            envelope.push_str(&format!("Abstract tools available: {}.\n", abstract_tools));
+            envelope.push_str("Tools available:\n");
+            for tool in projected_tools {
+                let desc = tool.description.lines().next().unwrap_or("").trim();
+                if desc.is_empty() {
+                    envelope.push_str(&format!("  {} \n", tool.tool_name));
+                } else {
+                    // Truncate to first sentence or 80 chars so the list stays scannable.
+                    let brief: String = desc.chars().take(80).collect();
+                    envelope.push_str(&format!("  {} — {}\n", tool.tool_name, brief));
+                }
+            }
         }
         if let Some(workspace) = &self.bindings.effective_workspace_ref {
             envelope.push_str(&format!("Workspace: {}.\n", workspace));
