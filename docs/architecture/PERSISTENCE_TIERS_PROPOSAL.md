@@ -309,6 +309,52 @@ in a dedicated `codex/ods-rename` workstream.
 
 ---
 
+## Inter-Agent Communication
+
+The agent graph is shared state, not a conversation channel. Agents also need
+to talk to one another directly. Three shapes serve different needs:
+
+### Shape 1 — Async graph message
+
+Agent A writes a `Message` node in `system:agents` with
+`visibility: ["identity:agent-b"]`. Persistent, auditable, not real-time.
+Use when handing off context, leaving a note, or coordinating across a
+session boundary.
+
+### Shape 2 — Direct IPC
+
+Agent A emits a task directly to Agent B's `guest_id` or role via
+`EmitTask`. No session overhead. Lightweight coordination, delegation,
+quick signals. Already supported by the IPC routing layer — needs a defined
+inbox convention on the receiving agent.
+
+Crosses hotel boundaries naturally via mesh routing.
+
+### Shape 3 — Inter-agent session
+
+Agent A and Agent B are both participants in a session. Same turn loop,
+same tool and approval infrastructure as human→agent conversations. Use
+when the work requires real back-and-forth, shared tool use, and a joint
+cognitive loop.
+
+### The judgment layer
+
+The runtime provides all three shapes as capabilities. The **agent profile**
+in `system:agents` encodes default preferences per interaction type. **Skills**
+encode the how and when for specific interaction patterns.
+
+```
+runtime provides:    async graph  +  direct IPC  +  inter-agent session
+agent profile says:  default preferences per interaction type
+skills say:          protocol for specific patterns
+agent graph records: lightweight audit nodes for all interactions
+```
+
+A `INTER_AGENT_COMMUNICATION_PROPOSAL.md` should formalize the inbox
+convention and session participation model when the time comes.
+
+---
+
 ## Disposition
 
 `proposed` — all decisions confirmed in design session 2026-03-17.
