@@ -2331,6 +2331,17 @@ impl IpcServer {
                         "orchestrator guests may only configure roles for their own agent identity",
                     );
                 }
+                // The orchestrator role record is owned by the hotel operator — its manifest is
+                // the system-standard governance document, not per-agent customizable. Only the
+                // hotel seed (or a future admin tier) may write it. Orchestrators govern their
+                // delegation vocabulary (specialist roles), not their own constitution.
+                if role_name == "orchestrator" {
+                    return IpcResponse::error(
+                        "configure_role",
+                        "CONFIGURE_FORBIDDEN",
+                        "the orchestrator role record is operator-owned and cannot be modified via IPC; update the hotel seed to change the standard orchestrator manifest",
+                    );
+                }
                 
                 let record = ansible_mesh_core::graph::RoleIncarnationRecord {
                     agent_id: agent_id.clone(),

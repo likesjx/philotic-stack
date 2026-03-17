@@ -1306,14 +1306,10 @@ fn seed_orchestrator_roles(
             inactive_ttl_seconds: None,
             turn_loop_config: ansible_mesh_core::graph::TurnLoopConfig::default(),
         };
-        // Use upsert so re-starts don't overwrite a manifest the agent has customized.
-        // Only insert if no record exists yet.
-        if graph
-            .get_role_incarnation(&profile.agent_id, "orchestrator")?
-            .is_none()
-        {
-            graph.upsert_role_incarnation(&record)?;
-        }
+        // Always upsert — the hotel seed is the canonical source for the orchestrator manifest.
+        // The manifest is institutional (same rules for all agents), not per-agent customizable.
+        // To change the manifest, update this seed and restart the hotel.
+        graph.upsert_role_incarnation(&record)?;
     }
     Ok(())
 }
