@@ -68,7 +68,7 @@ pub async fn run(config: Option<PathBuf>, hotel: String, detach: bool) -> Result
 
     // ── Wait for socket to appear ─────────────────────────────────────────
     let socket_path = std::env::var("PHILOTIC_HOTEL_SOCKET")
-        .unwrap_or_else(|_| "/tmp/philotic-aiua.sock".to_string());
+        .unwrap_or_else(|_| format!("/tmp/philotic-{hotel}.sock"));
 
     print!("Waiting for aiua socket");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
@@ -114,7 +114,7 @@ fn find_aiua_binary() -> Result<PathBuf> {
         return Ok(debug);
     }
     bail!(
-        "aiua binary not found. Install via `brew install jaredlikes/philotic/philotic-web` \
+        "aiua binary not found. Install via `brew install likesjx/philotic/aiua` \
          or build with `cargo build -p aiua --release`."
     )
 }
