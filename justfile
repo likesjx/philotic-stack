@@ -223,6 +223,10 @@ smoke-session-bindings:
 smoke-cognitive:
     bash scripts/smoke-cognitive-roundtrip.sh
 
+# Run the ONNX embedding sidecar smoke (downloads model on first run, ~300 MB)
+smoke-embed:
+    bash scripts/smoke-embed-roundtrip.sh
+
 # Run the trusted vertical-slice verification suite
 verify-vertical-slice:
     cargo test -p philotic-client -- --nocapture

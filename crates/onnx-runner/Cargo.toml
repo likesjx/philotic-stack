@@ -1,0 +1,20 @@
+[package]
+name = "onnx-runner"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "onnx_runner"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+hf-hub = "0.5"
+ndarray = "0.17"
+ort = { version = "2.0.0-rc.12", features = ["download-binaries", "ndarray"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tokenizers = { version = "0.21", default-features = false, features = ["http", "fancy-regex"] }
