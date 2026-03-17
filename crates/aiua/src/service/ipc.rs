@@ -307,8 +307,10 @@ impl IpcServer {
             return true;
         };
         let Some(pid_text) = owner_guest.active_pid.as_deref() else {
-            // No PID recorded — IPC-only guest; trust TTL.
-            return true;
+            // Guest is in DB but has no PID — it was never started or its PID was cleared
+            // on shutdown. Treat as dead so the lease is dropped.
+            // (IPC-only seats that are *not in the DB at all* are handled by the guard above.)
+            return false;
         };
         let Ok(pid) = pid_text.parse::<u32>() else {
             return false;
