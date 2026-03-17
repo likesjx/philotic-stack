@@ -65,8 +65,18 @@ pub async fn run(
     config: Option<PathBuf>,
     allow_origins: Option<String>,
 ) -> Result<()> {
-    let db_path = db.unwrap_or_else(|| PathBuf::from("aiua_context.db"));
-    let config_path = config.unwrap_or_else(|| PathBuf::from("mesh-config.json"));
+    let db_path = db.unwrap_or_else(|| {
+        match crate::init::active_profile() {
+            Some(_) => crate::init::profile_dir().join("context.db"),
+            None => PathBuf::from("aiua_context.db"),
+        }
+    });
+    let config_path = config.unwrap_or_else(|| {
+        match crate::init::active_profile() {
+            Some(_) => crate::init::profile_dir().join("config.json"),
+            None => PathBuf::from("mesh-config.json"),
+        }
+    });
 
     // Generate session token
     let token: String = {
@@ -491,8 +501,7 @@ async fn handle_guest_stop(
 async fn ipc_guest_action(guest_id: &str, action: &str) -> Result<()> {
     use philotic_client::{GuestIdentity, IpcRequest, PhiloticClient};
 
-    let socket = std::env::var("PHILOTIC_HOTEL_SOCKET")
-        .unwrap_or_else(|_| "/tmp/philotic-aiua.sock".to_string());
+    let socket = crate::start::socket_path("aiua");
 
     let identity = GuestIdentity {
         guest_id: "philotic-web-mgmt".into(),

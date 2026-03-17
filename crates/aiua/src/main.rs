@@ -37,6 +37,18 @@ use service::blob::BlobService;
 use service::ipc::IpcServer;
 use std::sync::Arc;
 
+// ── Profile path resolution ────────────────────────────────────────────────
+
+/// Returns `~/.philotic/<profile>/` when `PHILOTIC_PROFILE` is set, else `None`.
+///
+/// When `Some`, all runtime paths (DB, socket) are namespaced to that directory
+/// so that two profiles never collide. When `None`, legacy path behavior applies.
+fn profile_dir() -> Option<PathBuf> {
+    let profile = std::env::var("PHILOTIC_PROFILE").ok().filter(|s| !s.is_empty())?;
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(".philotic").join(profile))
+}
+
 use ansible_mesh_core::event::EventEnvelope;
 use auth::AuthCommand;
 use vault::{SecretInput, store_secret};
@@ -256,7 +268,9 @@ fn default_hotel_record(hotel_name: &str) -> HotelRecord {
         mesh_port: base_port,
         blob_port: base_port + 1,
         execution_port: hotel_execution_port(&safe_name),
-        ipc_socket_path: format!("/tmp/philotic-{safe_name}.sock"),
+        ipc_socket_path: profile_dir()
+            .map(|d| d.join("aiua.sock").to_string_lossy().into_owned())
+            .unwrap_or_else(|| format!("/tmp/philotic-{safe_name}.sock")),
         active_pid: None,
     }
 }
@@ -994,7 +1008,9 @@ fn reconcile_hotel_record(graph: &dyn GraphStorage, hotel_name: &str) -> Result<
         hotel.execution_port = desired.execution_port;
         changed = true;
     }
-    if hotel.ipc_socket_path.trim().is_empty() {
+    // When a profile is active, always use the profile-derived socket path.
+    // The stored path may be from a non-profile run and must not win.
+    if hotel.ipc_socket_path.trim().is_empty() || profile_dir().is_some() {
         hotel.ipc_socket_path = desired.ipc_socket_path;
         changed = true;
     }
@@ -2015,8 +2031,14 @@ fn startup_test_telegram_poll_lease_key(token_key: &str, token: &str) -> String 
     format!("{token_key}:{}", hex::encode(&digest[..8]))
 }
 
+fn startup_test_db_path() -> PathBuf {
+    profile_dir()
+        .map(|d| d.join("context.db"))
+        .unwrap_or_else(|| PathBuf::from("aiua_context.db"))
+}
+
 fn startup_test_membrane_guests(hotel_name: &str) -> Result<Vec<GuestRecord>> {
-    let graph = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open("aiua_context.db")?;
+    let graph = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open(startup_test_db_path())?;
     let mut membranes = graph
         .list_guests(hotel_name, false)?
         .into_iter()
@@ -2032,8 +2054,8 @@ fn startup_test_set_guest_active(
     is_active: bool,
     active_pid: Option<&str>,
 ) -> Result<()> {
-    let conn = rusqlite::Connection::open("aiua_context.db")
-        .context("failed to open aiua_context.db for startup guest update")?;
+    let conn = rusqlite::Connection::open(startup_test_db_path())
+        .context("failed to open context.db for startup guest update")?;
     conn.execute(
         "UPDATE materialized_guests SET is_active = ?1, active_pid = ?2 WHERE hotel_name = ?3 AND guest_id = ?4",
         rusqlite::params![is_active, active_pid, hotel_name, guest_id],
@@ -2043,8 +2065,8 @@ fn startup_test_set_guest_active(
 }
 
 fn startup_test_clear_guest_pid(hotel_name: &str, guest_id: &str) -> Result<()> {
-    let conn = rusqlite::Connection::open("aiua_context.db")
-        .context("failed to open aiua_context.db for startup guest pid clear")?;
+    let conn = rusqlite::Connection::open(startup_test_db_path())
+        .context("failed to open context.db for startup guest pid clear")?;
     conn.execute(
         "UPDATE materialized_guests SET active_pid = NULL WHERE hotel_name = ?1 AND guest_id = ?2",
         rusqlite::params![hotel_name, guest_id],
@@ -3231,15 +3253,39 @@ async fn main() -> Result<()> {
     info!("---------------------");
 
     // Initialize the always-on Context Graph DB via the abstract storage trait
-    let db_path = Path::new("aiua_context.db");
+    // When PHILOTIC_PROFILE is set, namespace the DB into ~/.philotic/<profile>/.
+    // Otherwise fall back to the legacy relative path for backward compatibility.
+    let db_path_buf;
+    let db_path: &Path = if let Some(ref pdir) = profile_dir() {
+        fs::create_dir_all(pdir)
+            .with_context(|| format!("create profile dir {}", pdir.display()))?;
+        db_path_buf = pdir.join("context.db");
+        info!("Profile: {}  (DB: {})", std::env::var("PHILOTIC_PROFILE").unwrap_or_default(), db_path_buf.display());
+        &db_path_buf
+    } else {
+        Path::new("aiua_context.db")
+    };
     let graph_storage = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open(db_path)?;
 
     let hotel_name = args.hotel.clone();
 
-    // Handle Config Loading if requested
+    // Handle Config Loading if requested.
+    // When PHILOTIC_PROFILE is set and no --load-config is given, auto-load
+    // ~/.philotic/<profile>/config.json if it exists.
+    let effective_load_config = args.load_config.or_else(|| {
+        let pdir = profile_dir()?;
+        let auto = pdir.join("config.json");
+        if auto.exists() {
+            info!("Auto-loading profile config: {}", auto.display());
+            Some(auto.to_string_lossy().into_owned())
+        } else {
+            None
+        }
+    });
+
     // Lifted out of the if-block so we can reference it during multi-agent profile collection.
     let mut loaded_config_json: Option<serde_json::Value> = None;
-    if let Some(config_path) = args.load_config {
+    if let Some(config_path) = effective_load_config {
         info!(
             "Loading configuration from '{}' into the Context Graph...",
             config_path
