@@ -1008,7 +1008,9 @@ fn reconcile_hotel_record(graph: &dyn GraphStorage, hotel_name: &str) -> Result<
         hotel.execution_port = desired.execution_port;
         changed = true;
     }
-    if hotel.ipc_socket_path.trim().is_empty() {
+    // When a profile is active, always use the profile-derived socket path.
+    // The stored path may be from a non-profile run and must not win.
+    if hotel.ipc_socket_path.trim().is_empty() || profile_dir().is_some() {
         hotel.ipc_socket_path = desired.ipc_socket_path;
         changed = true;
     }
