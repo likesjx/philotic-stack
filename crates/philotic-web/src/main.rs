@@ -6,6 +6,7 @@ mod footprint;
 mod init;
 mod muninn;
 mod reset;
+mod serve;
 mod start;
 mod status;
 mod stop;
@@ -84,6 +85,25 @@ enum Command {
         #[arg(long)]
         kill: Option<String>,
     },
+
+    /// Start the local management web server (REST + WebSocket)
+    Serve {
+        /// Port to listen on (default: 7700)
+        #[arg(long, default_value = "7700")]
+        port: u16,
+
+        /// Path to aiua_context.db (default: ./aiua_context.db)
+        #[arg(long)]
+        db: Option<PathBuf>,
+
+        /// Path to mesh-config.json for agent metadata (default: ./mesh-config.json)
+        #[arg(long, short)]
+        config: Option<PathBuf>,
+
+        /// Allowed CORS origins, comma-separated (default: http://localhost:5173,https://desktop.jaredlikes.com)
+        #[arg(long)]
+        allow_origins: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -97,5 +117,8 @@ async fn main() -> Result<()> {
         Command::Agents { config } => status::run_agents(config).await,
         Command::Reset { keep_identity } => reset::run(keep_identity).await,
         Command::Footprint { kill } => footprint::run(kill).await,
+        Command::Serve { port, db, config, allow_origins } => {
+            serve::run(port, db, config, allow_origins).await
+        }
     }
 }
