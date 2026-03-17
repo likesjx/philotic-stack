@@ -1598,28 +1598,51 @@ async fn run_seat_impl(
 
     info!("Starting Telegram long-polling loop...");
 
+    // Poll task: spawned so that arriving IPC messages (agent replies) never cancel
+    // the in-flight getUpdates HTTP request.  A cancelled request leaves a zombie
+    // session on Telegram's server and causes immediate Conflict on the next retry.
+    let mut poll_handle: Option<tokio::task::JoinHandle<Result<Value, reqwest::Error>>> = None;
+    // When set, do not start a new poll until this instant (Conflict back-off).
+    let mut poll_resume_at: Option<tokio::time::Instant> = None;
+
     // Main Long-Polling Loop
     loop {
-        let url = format!("{}getUpdates", tg_base);
-        let params = [
-            ("offset", offset.to_string()),
-            ("timeout", TELEGRAM_POLL_TIMEOUT_SECS.to_string()),
-            (
-                "allowed_updates",
-                "[\"message\",\"callback_query\"]".to_string(),
-            ),
-        ];
+        // Start a new poll if none is in flight and we are not in back-off.
+        if poll_handle.is_none() {
+            let ready = poll_resume_at.map_or(true, |t| tokio::time::Instant::now() >= t);
+            if ready {
+                poll_resume_at = None;
+                let url = format!("{}getUpdates", tg_base);
+                let off = offset;
+                let client = http_client.clone();
+                poll_handle = Some(tokio::spawn(async move {
+                    let res = client
+                        .get(&url)
+                        .query(&[
+                            ("offset", off.to_string()),
+                            ("timeout", TELEGRAM_POLL_TIMEOUT_SECS.to_string()),
+                            ("allowed_updates", "[\"message\",\"callback_query\"]".to_string()),
+                        ])
+                        .send()
+                        .await?;
+                    res.json::<Value>().await
+                }));
+            }
+        }
 
         tokio::select! {
             // Branch 1: Wait for Telegram Updates (Long Polling)
-            // Note: lease renewal is checked AFTER this branch completes (not as a competing
-            // select branch) so that the in-flight HTTP request is never cancelled mid-flight,
-            // which would leave a zombie session on Telegram's side and cause Conflict loops.
-            http_result = http_client.get(&url).query(&params).send() => {
+            // The request runs in an independent tokio task so that the IPC branch
+            // (below) never cancels it mid-flight.
+            poll_result = poll_handle.as_mut().unwrap(), if poll_handle.is_some() => {
+                poll_handle = None;
+                let http_result: Result<Value, reqwest::Error> = match poll_result {
+                    Ok(r) => r,
+                    Err(e) => { warn!("Poll task panicked: {}", e); continue; }
+                };
                 match http_result {
-                    Ok(res) => {
-                        if let Ok(json) = res.json::<Value>().await {
-                            if let Some(result) = json.get("result").and_then(|r| r.as_array()) {
+                    Ok(json) => {
+                        if let Some(result) = json.get("result").and_then(|r| r.as_array()) {
                                 for update in result {
                                     if let Some(update_id) = update.get("update_id").and_then(|id| id.as_i64()) {
                                         offset = update_id + 1; // Ack the message
@@ -1721,19 +1744,29 @@ async fn run_seat_impl(
                                 }
                             } else if let Some(desc) = json.get("description").and_then(|d| d.as_str()) {
                                 error!("Telegram API Error: {}", desc);
-                                // On Conflict, back off before retrying to break the self-conflict loop
-                                // that occurs when a cancelled in-flight request still holds a Telegram session.
+                                // On Conflict, schedule a back-off before the next poll.
+                                // We do NOT sleep here so that IPC messages (agent replies) are
+                                // still processed during the back-off window.
                                 if desc.contains("Conflict") {
-                                    tokio::time::sleep(Duration::from_secs(TELEGRAM_POLL_TIMEOUT_SECS + 2)).await;
+                                    poll_resume_at = Some(
+                                        tokio::time::Instant::now()
+                                            + Duration::from_secs(TELEGRAM_POLL_TIMEOUT_SECS + 2),
+                                    );
                                 }
                             }
-                        }
                     }
                     Err(e) => {
                         warn!("Telegram Long Polling failed: {}. Retrying in 5s...", e);
-                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        poll_resume_at = Some(
+                            tokio::time::Instant::now() + Duration::from_secs(5),
+                        );
                     }
                 }
+            }
+
+            // Back-off timer: fires when poll_resume_at expires so we don't busy-loop.
+            _ = tokio::time::sleep_until(poll_resume_at.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(86400))), if poll_handle.is_none() && poll_resume_at.is_some() => {
+                poll_resume_at = None;
             }
 
             _ = tokio::signal::ctrl_c() => {
