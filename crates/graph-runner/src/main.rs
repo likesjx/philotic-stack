@@ -92,6 +92,16 @@ async fn main() -> Result<()> {
         .send_request(IpcRequest::SubscribeInbox { role: "tool.graph".into() })
         .await?;
 
+    // Register all graphs that already exist in this instance's store.
+    for graph_meta in store.list_graphs().unwrap_or_default() {
+        let _ = ipc_client
+            .send_request(IpcRequest::RegisterGraphInstance {
+                graph_id: graph_meta.graph_id.clone(),
+                instance_id: iid.clone(),
+            })
+            .await;
+    }
+
     info!(instance_id = %iid, tools = GRAPH_TOOLS.len(), "Graph runner ready");
 
     loop {
@@ -175,6 +185,22 @@ async fn main() -> Result<()> {
                 })
                 .await
                 .unwrap_or_else(|e| format!("graph runner internal error: {e}"));
+
+                // When a new graph is created, register it in the hotel ODS.
+                if tool_name == "graph.create" {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&result_content) {
+                        if v["ok"].as_bool() == Some(true) {
+                            if let Some(gid) = v["graph_id"].as_str() {
+                                let _ = ipc_client
+                                    .send_request(IpcRequest::RegisterGraphInstance {
+                                        graph_id: gid.to_string(),
+                                        instance_id: iid.clone(),
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                }
 
                 let _ = ipc_client
                     .send_request(IpcRequest::EmitTask {

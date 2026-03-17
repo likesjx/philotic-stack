@@ -65,7 +65,13 @@ replication path (Option C) without changing the tool surface.
 
 ## Disposition
 
-`proposed` — alignment confirmed, no implementation started.
+`in-progress` — Slice 1 and Slice 2 shipped.
+
+- [x] Slice 1: CRUD, visibility, FTS, traversal, 9 access tests + 20 store tests
+- [x] Slice 2: Hotel registry write (`RegisterGraphInstance` IpcRequest), traversal direction/depth/filter tests, FTS visibility tests (29 total tests)
+- [ ] Slice 3: Schema evolution + soft-delete lifecycle
+- [ ] Slice 4: Export
+- [ ] Slice 5: Replication foundation (Option C)
 
 ---
 

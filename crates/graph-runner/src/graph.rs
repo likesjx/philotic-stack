@@ -95,6 +95,9 @@ pub struct NodeInput {
     /// Access control tags. See visibility rules in the proposal doc.
     pub visibility: Vec<String>,
     pub creator: String,
+    /// Optional pointer to a `table_id` in the table adapter.
+    /// The node serves as metadata anchor; rows are read via `table.query`.
+    pub table_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +112,9 @@ pub struct Node {
     pub creator: String,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Pointer to a table in the table adapter, if this node anchors one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -156,6 +162,73 @@ pub struct EdgeFilter {
     pub to_node_id: Option<String>,
     pub edge_type: Option<String>,
     pub creator: Option<String>,
+}
+
+// ── Table adapter ─────────────────────────────────────────────────────────────
+
+/// A single column in a table's schema definition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColumnSpec {
+    pub name: String,
+    /// "text" | "integer" | "real" | "bool" | "json"
+    pub col_type: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub required: bool,
+}
+
+/// Input for creating a new table.
+#[derive(Debug, Clone)]
+pub struct TableSpec {
+    pub name: String,
+    pub description: Option<String>,
+    pub columns: Vec<ColumnSpec>,
+    /// If set, this table is linked to the given graph (for discovery).
+    pub graph_id: Option<String>,
+    pub creator: String,
+}
+
+/// Metadata about a table (no rows).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TableMeta {
+    pub table_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub columns: Vec<ColumnSpec>,
+    pub graph_id: Option<String>,
+    pub creator: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Input for inserting or upserting a row.
+#[derive(Debug, Clone)]
+pub struct RowInput {
+    /// If provided, upsert by this ID. If absent, a new ULID is minted.
+    pub row_id: Option<String>,
+    pub data: serde_json::Value,
+    pub creator: String,
+}
+
+/// A single row from a table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Row {
+    pub row_id: String,
+    pub table_id: String,
+    pub data: serde_json::Value,
+    pub creator: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Query parameters for reading rows.
+#[derive(Debug, Clone, Default)]
+pub struct RowQuery {
+    /// Equality filter: { "field": value, ... }. All conditions are ANDed.
+    pub filter: Option<serde_json::Value>,
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
 }
 
 // ── Traversal ─────────────────────────────────────────────────────────────────

@@ -371,7 +371,14 @@ Implementation in progress:
 
 ## Current Slice
 
-Implementing `graph-runner` Slice 2 next:
-- Hotel registry write on `graph.create`
-- Traversal + search test coverage
-- Seam: `graph-runner-hotel-registry`
+`graph-runner` Slice 2 shipped:
+- [x] Hotel registry write: `RegisterGraphInstance` IpcRequest → aiua → ODS `graph_runner_registry` config key
+- [x] Startup registration: graph-runner registers all existing graphs on connect
+- [x] `GraphRunnerInstanceRecord` + `get_graph_runner_registry` / `upsert_graph_runner_instance` / `get_graph_runner_instance` as defaulted `GraphStorage` methods
+- [x] Traversal tests: inbound, both-direction, max_depth cap, edge type filter, visibility pruning mid-traversal
+- [x] FTS search tests: text match, visibility-aware results
+
+Slice 3 candidates:
+- `table.*` surface on graph-runner: `TableStore` trait, same runner binary
+- `table_ref` as first-class field on Node
+- Agent graph provisioning at philote materialization

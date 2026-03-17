@@ -1066,6 +1066,227 @@ mod tests {
         assert_eq!(result.edges.len(), 1);
     }
 
+    // ── Traversal (extended) ──────────────────────────────────────────────────
+
+    /// Build a linear chain: n1 → n2 → n3 → n4 in the given graph.
+    /// Returns (n1, n2, n3, n4) IDs.
+    fn make_chain(store: &SqliteGraphStore, gid: &str, vis: &str) -> (String, String, String, String) {
+        let mk = |label: &str| NodeInput {
+            node_id: None, node_type: "Research".into(), label: label.into(),
+            content: serde_json::Value::Null, tags: vec![], visibility: vec![vis.into()],
+            creator: "alice".into(),
+        };
+        let n1 = store.upsert_node(gid, mk("n1")).unwrap();
+        let n2 = store.upsert_node(gid, mk("n2")).unwrap();
+        let n3 = store.upsert_node(gid, mk("n3")).unwrap();
+        let n4 = store.upsert_node(gid, mk("n4")).unwrap();
+        let mk_edge = |from: &str, to: &str, etype: &str| EdgeInput {
+            edge_id: None, from_node_id: from.into(), to_node_id: to.into(),
+            edge_type: etype.into(), label: None,
+            content: serde_json::Value::Null, visibility: vec![vis.into()],
+            creator: "alice".into(),
+        };
+        store.upsert_edge(gid, mk_edge(&n1, &n2, "SUPPORTS")).unwrap();
+        store.upsert_edge(gid, mk_edge(&n2, &n3, "SUPPORTS")).unwrap();
+        store.upsert_edge(gid, mk_edge(&n3, &n4, "SUPPORTS")).unwrap();
+        (n1, n2, n3, n4)
+    }
+
+    #[test]
+    fn traverse_inbound_edges() {
+        let store = store();
+        let gid = public_graph(&store);
+        let (n1, _n2, _n3, n4) = make_chain(&store, &gid, "public");
+
+        // From n4 inbound: should reach n1 (depth 3)
+        let result = store.traverse(&gid, &TraversalQuery {
+            start_node_id: n4.clone(),
+            direction: TraversalDirection::Inbound,
+            max_depth: 5,
+            edge_types: None,
+        }, &alice()).unwrap();
+
+        let node_ids: Vec<&String> = result.nodes.iter().map(|n| &n.node_id).collect();
+        assert!(node_ids.contains(&&n1), "inbound traversal from n4 should reach n1");
+        assert_eq!(result.edges.len(), 3);
+    }
+
+    #[test]
+    fn traverse_both_directions() {
+        let store = store();
+        let gid = public_graph(&store);
+        let (n1, n2, n3, n4) = make_chain(&store, &gid, "public");
+
+        // From n2 both: should reach n1 (inbound) and n3, n4 (outbound)
+        let result = store.traverse(&gid, &TraversalQuery {
+            start_node_id: n2.clone(),
+            direction: TraversalDirection::Both,
+            max_depth: 5,
+            edge_types: None,
+        }, &alice()).unwrap();
+
+        let node_ids: Vec<&String> = result.nodes.iter().map(|n| &n.node_id).collect();
+        assert!(node_ids.contains(&&n1), "both traversal should reach n1 inbound");
+        assert!(node_ids.contains(&&n3), "both traversal should reach n3 outbound");
+        assert!(node_ids.contains(&&n4), "both traversal should reach n4 outbound");
+    }
+
+    #[test]
+    fn traverse_respects_max_depth() {
+        let store = store();
+        let gid = public_graph(&store);
+        let (n1, n2, _n3, n4) = make_chain(&store, &gid, "public");
+
+        // max_depth=1 from n1 should only reach n2, not n4
+        let result = store.traverse(&gid, &TraversalQuery {
+            start_node_id: n1.clone(),
+            direction: TraversalDirection::Outbound,
+            max_depth: 1,
+            edge_types: None,
+        }, &alice()).unwrap();
+
+        let node_ids: Vec<&String> = result.nodes.iter().map(|n| &n.node_id).collect();
+        assert!(node_ids.contains(&&n2), "should reach n2 at depth 1");
+        assert!(!node_ids.contains(&&n4), "should NOT reach n4 at depth 1 cap");
+    }
+
+    #[test]
+    fn traverse_filters_by_edge_type() {
+        let store = store();
+        // Use a lenient schema so we can use arbitrary edge types without rejection.
+        let gid = store.create_graph(GraphSpec {
+            name: "lenient".into(), description: None,
+            schema: GraphSchema { node_types: vec![], edge_types: vec![], strict: false },
+            default_visibility: "public".into(), creator: "alice".into(),
+        }).unwrap();
+        let mk = |label: &str| NodeInput {
+            node_id: None, node_type: "Research".into(), label: label.into(),
+            content: serde_json::Value::Null, tags: vec![], visibility: vec!["public".into()],
+            creator: "alice".into(),
+        };
+        let n1 = store.upsert_node(&gid, mk("src")).unwrap();
+        let n2 = store.upsert_node(&gid, mk("via-supports")).unwrap();
+        let n3 = store.upsert_node(&gid, mk("via-blocks")).unwrap();
+        store.upsert_edge(&gid, EdgeInput {
+            edge_id: None, from_node_id: n1.clone(), to_node_id: n2.clone(),
+            edge_type: "SUPPORTS".into(), label: None,
+            content: serde_json::Value::Null, visibility: vec!["public".into()],
+            creator: "alice".into(),
+        }).unwrap();
+        store.upsert_edge(&gid, EdgeInput {
+            edge_id: None, from_node_id: n1.clone(), to_node_id: n3.clone(),
+            edge_type: "BLOCKS".into(), label: None,
+            content: serde_json::Value::Null, visibility: vec!["public".into()],
+            creator: "alice".into(),
+        }).unwrap();
+
+        let result = store.traverse(&gid, &TraversalQuery {
+            start_node_id: n1.clone(),
+            direction: TraversalDirection::Outbound,
+            max_depth: 2,
+            edge_types: Some(vec!["SUPPORTS".into()]),
+        }, &alice()).unwrap();
+
+        let node_ids: Vec<&String> = result.nodes.iter().map(|n| &n.node_id).collect();
+        assert!(node_ids.contains(&&n2), "SUPPORTS edge should be traversed");
+        assert!(!node_ids.contains(&&n3), "BLOCKS edge should be filtered out");
+    }
+
+    #[test]
+    fn traverse_prunes_at_invisible_nodes() {
+        let store = store();
+        // Private graph: alice-only nodes form a chain n1 → n2(bob-hidden) → n3
+        let gid = private_graph(&store);
+        let n1 = store.upsert_node(&gid, NodeInput {
+            node_id: None, node_type: "".into(), label: "n1".into(),
+            content: serde_json::Value::Null, tags: vec![],
+            visibility: vec!["public".into()],
+            creator: "alice".into(),
+        }).unwrap();
+        let n2 = store.upsert_node(&gid, NodeInput {
+            node_id: None, node_type: "".into(), label: "n2-alice-only".into(),
+            content: serde_json::Value::Null, tags: vec![],
+            visibility: vec!["identity:alice".into()],
+            creator: "alice".into(),
+        }).unwrap();
+        let n3 = store.upsert_node(&gid, NodeInput {
+            node_id: None, node_type: "".into(), label: "n3".into(),
+            content: serde_json::Value::Null, tags: vec![],
+            visibility: vec!["public".into()],
+            creator: "alice".into(),
+        }).unwrap();
+        store.upsert_edge(&gid, EdgeInput {
+            edge_id: None, from_node_id: n1.clone(), to_node_id: n2.clone(),
+            edge_type: "".into(), label: None, content: serde_json::Value::Null,
+            visibility: vec!["public".into()], creator: "alice".into(),
+        }).unwrap();
+        store.upsert_edge(&gid, EdgeInput {
+            edge_id: None, from_node_id: n2.clone(), to_node_id: n3.clone(),
+            edge_type: "".into(), label: None, content: serde_json::Value::Null,
+            visibility: vec!["public".into()], creator: "alice".into(),
+        }).unwrap();
+
+        // Alice sees everything
+        let alice_result = store.traverse(&gid, &TraversalQuery {
+            start_node_id: n1.clone(),
+            direction: TraversalDirection::Outbound,
+            max_depth: 5, edge_types: None,
+        }, &alice()).unwrap();
+        let alice_ids: Vec<&String> = alice_result.nodes.iter().map(|n| &n.node_id).collect();
+        assert!(alice_ids.contains(&&n3), "alice should reach n3 through n2");
+
+        // Bob can't see n2, so traversal is pruned — n3 is unreachable
+        let bob_result = store.traverse(&gid, &TraversalQuery {
+            start_node_id: n1.clone(),
+            direction: TraversalDirection::Outbound,
+            max_depth: 5, edge_types: None,
+        }, &bob()).unwrap();
+        let bob_ids: Vec<&String> = bob_result.nodes.iter().map(|n| &n.node_id).collect();
+        assert!(!bob_ids.contains(&&n2), "bob should not see n2");
+        assert!(!bob_ids.contains(&&n3), "bob should not reach n3 (path pruned at n2)");
+    }
+
+    // ── Full-text search ──────────────────────────────────────────────────────
+
+    #[test]
+    fn fts_search_finds_matching_nodes() {
+        let store = store();
+        let gid = public_graph(&store);
+        let n1 = store.upsert_node(&gid, NodeInput {
+            node_id: None, node_type: "Research".into(),
+            label: "quantum entanglement notes".into(),
+            content: serde_json::json!({ "text": "spooky action at a distance" }),
+            tags: vec![], visibility: vec!["public".into()], creator: "alice".into(),
+        }).unwrap();
+        let _n2 = store.upsert_node(&gid, NodeInput {
+            node_id: None, node_type: "Goal".into(),
+            label: "improve test coverage".into(),
+            content: serde_json::json!({ "text": "increase branch coverage to 90%" }),
+            tags: vec![], visibility: vec!["public".into()], creator: "alice".into(),
+        }).unwrap();
+
+        let results = store.search_nodes(&gid, "quantum", &alice()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].node_id, n1);
+    }
+
+    #[test]
+    fn fts_search_respects_visibility() {
+        let store = store();
+        let gid = private_graph(&store);
+        let _n1 = store.upsert_node(&gid, NodeInput {
+            node_id: None, node_type: "".into(), label: "secret finding".into(),
+            content: serde_json::json!({ "text": "classified information here" }),
+            tags: vec![], visibility: vec!["identity:alice".into()], creator: "alice".into(),
+        }).unwrap();
+
+        let alice_results = store.search_nodes(&gid, "classified", &alice()).unwrap();
+        assert_eq!(alice_results.len(), 1, "alice should find her secret node");
+
+        let bob_results = store.search_nodes(&gid, "classified", &bob()).unwrap();
+        assert_eq!(bob_results.len(), 0, "bob should not find alice's secret node");
+    }
+
     // ── Schema update ─────────────────────────────────────────────────────────
 
     #[test]

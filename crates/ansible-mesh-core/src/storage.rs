@@ -161,6 +161,21 @@ pub struct SecretRecord {
     pub updated_at: u64,
 }
 
+// ── Graph runner registry key constant ───────────────────────────────────────
+
+/// Context Graph config key: graph runner instance registry.
+/// Value is a JSON array of [`GraphRunnerInstanceRecord`].
+pub const CONFIG_GRAPH_RUNNER_REGISTRY: &str = "graph_runner_registry";
+
+/// Maps a `graph_id` to the `instance_id` of the graph-runner that owns it.
+/// Stored in the ODS under [`CONFIG_GRAPH_RUNNER_REGISTRY`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphRunnerInstanceRecord {
+    pub graph_id: String,
+    pub instance_id: String,
+    pub registered_at: u64,
+}
+
 // ── MuninnDB config key constants ────────────────────────────────────────────
 
 /// Context Graph config key: MuninnDB REST endpoint URL.
@@ -368,6 +383,34 @@ pub trait GraphStorage: Send + Sync {
             .filter(|e| e.vault_name != vault_name)
             .collect();
         self.set_config_value(CONFIG_VAULT_REGISTRY, &serde_json::to_string(&entries)?)
+    }
+
+    // ── Graph runner registry ─────────────────────────────────────────────────
+
+    /// Load all graph runner instance records. Returns an empty vec if not set.
+    fn get_graph_runner_registry(&self) -> Result<Vec<GraphRunnerInstanceRecord>> {
+        Ok(self
+            .get_config_value(CONFIG_GRAPH_RUNNER_REGISTRY)?
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default())
+    }
+
+    /// Upsert a single graph runner instance record (matched by `graph_id`).
+    fn upsert_graph_runner_instance(&self, record: &GraphRunnerInstanceRecord) -> Result<()> {
+        let mut entries = self.get_graph_runner_registry()?;
+        match entries.iter().position(|e| e.graph_id == record.graph_id) {
+            Some(pos) => entries[pos] = record.clone(),
+            None => entries.push(record.clone()),
+        }
+        self.set_config_value(CONFIG_GRAPH_RUNNER_REGISTRY, &serde_json::to_string(&entries)?)
+    }
+
+    /// Look up the instance_id for a given graph_id, or None if not registered.
+    fn get_graph_runner_instance(&self, graph_id: &str) -> Result<Option<GraphRunnerInstanceRecord>> {
+        Ok(self
+            .get_graph_runner_registry()?
+            .into_iter()
+            .find(|e| e.graph_id == graph_id))
     }
 }
 

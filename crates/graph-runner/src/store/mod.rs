@@ -1,6 +1,7 @@
 use crate::graph::{
-    Edge, EdgeFilter, EdgeInput, GraphMeta, GraphSchema, GraphSpec, Identity, Node, NodeFilter,
-    NodeInput, TraversalQuery, TraversalResult,
+    ColumnSpec, Edge, EdgeFilter, EdgeInput, GraphMeta, GraphSchema, GraphSpec, Identity, Node,
+    NodeFilter, NodeInput, Row, RowInput, RowQuery, TableMeta, TableSpec, TraversalQuery,
+    TraversalResult,
 };
 use anyhow::Result;
 
