@@ -302,10 +302,13 @@ impl IpcServer {
             .into_iter()
             .find(|guest| guest.guest_id == owner_guest_id)
         else {
-            return false;
+            // Guest not in DB — it's an IPC-registered seat (e.g. multi-seat membrane task),
+            // not a seeded subprocess. Trust the TTL-based expiry rather than declaring dead.
+            return true;
         };
         let Some(pid_text) = owner_guest.active_pid.as_deref() else {
-            return false;
+            // No PID recorded — IPC-only guest; trust TTL.
+            return true;
         };
         let Ok(pid) = pid_text.parse::<u32>() else {
             return false;
