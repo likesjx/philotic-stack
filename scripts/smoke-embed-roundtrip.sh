@@ -45,20 +45,16 @@ PHILOTIC_ONNX_EMBED_REPO="${EMBED_REPO}" \
     >"${TMP_DIR}/sidecar.log" 2>&1 &
 SIDECAR_PID=$!
 
-echo "Waiting for sidecar to accept connections..."
+echo "Waiting for sidecar to accept connections (our PID: ${SIDECAR_PID})..."
 for i in $(seq 1 60); do
-  if curl -sf "http://${SIDECAR_ADDR}/api/embeddings" \
-       -H "Content-Type: application/json" \
-       -d '{"prompt":"warmup"}' \
-       -o /dev/null 2>/dev/null; then
-    break
+  # Abort early if our process died.
+  if ! kill -0 "${SIDECAR_PID}" 2>/dev/null; then
+    echo "Sidecar process died during startup; log follows:" >&2
+    cat "${TMP_DIR}/sidecar.log" >&2
+    exit 1
   fi
-  # Also accept a 4xx/5xx — the port is up, endpoint is live
-  http_code=$(curl -s -o /dev/null -w "%{http_code}" \
-    -X POST "http://${SIDECAR_ADDR}/api/embeddings" \
-    -H "Content-Type: application/json" \
-    -d '{"prompt":"warmup"}' 2>/dev/null || echo "000")
-  if [[ "${http_code}" != "000" ]]; then
+  # Wait for the "listening on" line — confirms it's OUR server, not a stale process.
+  if grep -q "ONNX sidecar listening" "${TMP_DIR}/sidecar.log" 2>/dev/null; then
     break
   fi
   if [[ ${i} -eq 60 ]]; then
