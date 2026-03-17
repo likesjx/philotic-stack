@@ -1612,6 +1612,9 @@ async fn run_seat_impl(
 
         tokio::select! {
             // Branch 1: Wait for Telegram Updates (Long Polling)
+            // Note: lease renewal is checked AFTER this branch completes (not as a competing
+            // select branch) so that the in-flight HTTP request is never cancelled mid-flight,
+            // which would leave a zombie session on Telegram's side and cause Conflict loops.
             http_result = http_client.get(&url).query(&params).send() => {
                 match http_result {
                     Ok(res) => {
@@ -1729,36 +1732,6 @@ async fn run_seat_impl(
                     Err(e) => {
                         warn!("Telegram Long Polling failed: {}. Retrying in 5s...", e);
                         tokio::time::sleep(Duration::from_secs(5)).await;
-                    }
-                }
-            }
-
-            _ = tokio::time::sleep_until(next_lease_renewal) => {
-                match renew_telegram_poll_lease(
-                    &mut ipc_client,
-                    &poll_lease_key,
-                    &target_agent_id,
-                    poll_lease_epoch,
-                ).await {
-                    Ok(lease_epoch) => {
-                        poll_lease_epoch = lease_epoch;
-                        next_lease_renewal = tokio::time::Instant::now()
-                            + Duration::from_secs(TELEGRAM_POLL_LEASE_RENEW_INTERVAL_SECS);
-                    }
-                    Err(err) => {
-                        warn!(
-                            "Failed to renew Telegram poll lease [{}]: {}. Membrane will stop polling.",
-                            poll_lease_key, err
-                        );
-                        if let Err(release_err) =
-                            release_telegram_poll_lease(&mut ipc_client, &poll_lease_key).await
-                        {
-                            warn!(
-                                "Failed to release Telegram poll lease [{}] during shutdown: {}",
-                                poll_lease_key, release_err
-                            );
-                        }
-                        return Ok(());
                     }
                 }
             }
@@ -1890,6 +1863,21 @@ async fn run_seat_impl(
                         }
                         warn!("IPC Recv error: {}", e);
                     },
+                }
+            }
+        }
+
+        // Renew lease between polls (never mid-poll) to avoid cancelling in-flight HTTP requests.
+        if tokio::time::Instant::now() >= next_lease_renewal {
+            match renew_telegram_poll_lease(&mut ipc_client, &poll_lease_key, &target_agent_id, poll_lease_epoch).await {
+                Ok(epoch) => {
+                    poll_lease_epoch = epoch;
+                    next_lease_renewal = tokio::time::Instant::now() + Duration::from_secs(TELEGRAM_POLL_LEASE_RENEW_INTERVAL_SECS);
+                }
+                Err(err) => {
+                    warn!("Failed to renew Telegram poll lease [{}]: {}. Seat exiting.", poll_lease_key, err);
+                    let _ = release_telegram_poll_lease(&mut ipc_client, &poll_lease_key).await;
+                    return Ok(());
                 }
             }
         }
