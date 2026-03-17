@@ -5,17 +5,38 @@ use std::time::Duration;
 use tokio::net::UnixStream;
 use tokio::time::sleep;
 
-use crate::init::philotic_dir;
+use crate::init::{active_profile, philotic_dir, profile_dir};
 
 pub fn pid_path() -> PathBuf {
-    philotic_dir().join("aiua.pid")
+    profile_dir().join("aiua.pid")
+}
+
+/// Returns the expected aiua socket path for the current profile.
+/// When PHILOTIC_PROFILE is set: ~/.philotic/<profile>/aiua.sock
+/// When unset: falls back to PHILOTIC_HOTEL_SOCKET env var or /tmp/philotic-<hotel>.sock
+pub fn socket_path(hotel: &str) -> String {
+    if active_profile().is_some() {
+        profile_dir()
+            .join("aiua.sock")
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        std::env::var("PHILOTIC_HOTEL_SOCKET")
+            .unwrap_or_else(|_| format!("/tmp/philotic-{hotel}.sock"))
+    }
 }
 
 pub async fn run(config: Option<PathBuf>, hotel: String, detach: bool) -> Result<()> {
+    // When a profile is active, default config to ~/.philotic/<profile>/config.json.
+    // Otherwise fall back to mesh-config.json in the working directory.
+    let default_config = match active_profile() {
+        Some(_) => profile_dir().join("config.json"),
+        None => PathBuf::from("mesh-config.json"),
+    };
     let config_path = config
-        .unwrap_or_else(|| PathBuf::from("mesh-config.json"))
+        .unwrap_or(default_config)
         .canonicalize()
-        .context("mesh-config.json not found — run `phil init` first")?;
+        .context("config not found — run `phil init` first or check PHILOTIC_PROFILE")?;
 
     // ── Ensure muninn is running ───────────────────────────────────────────
     crate::muninn::ensure_running().await?;
@@ -37,23 +58,36 @@ pub async fn run(config: Option<PathBuf>, hotel: String, detach: bool) -> Result
     println!("Starting aiua from: {}", aiua_bin.display());
     println!("Config: {}", config_path.display());
     println!("Hotel: {hotel}");
+    if let Some(ref p) = active_profile() {
+        println!("Profile: {p}  ({})", profile_dir().display());
+    }
 
-    // ── Create ~/.philotic/ if needed ─────────────────────────────────────
+    // ── Create profile dir if needed ──────────────────────────────────────
+    std::fs::create_dir_all(profile_dir())
+        .with_context(|| format!("create {}", profile_dir().display()))?;
+    // Always ensure ~/.philotic/ itself exists too
     std::fs::create_dir_all(philotic_dir()).context("create ~/.philotic/")?;
 
     // ── Spawn ──────────────────────────────────────────────────────────────
-    let log_path = philotic_dir().join("aiua.log");
+    let log_path = profile_dir().join("aiua.log");
     let log_file = std::fs::File::create(&log_path)
         .with_context(|| format!("create log file {}", log_path.display()))?;
     let log_file2 = log_file.try_clone().context("clone log file handle")?;
 
-    let child = tokio::process::Command::new(&aiua_bin)
-        .arg("--load-config")
+    let mut cmd = tokio::process::Command::new(&aiua_bin);
+    cmd.arg("--load-config")
         .arg(&config_path)
         .arg("--hotel")
         .arg(&hotel)
         .stdout(Stdio::from(log_file))
-        .stderr(Stdio::from(log_file2))
+        .stderr(Stdio::from(log_file2));
+
+    // Propagate PHILOTIC_PROFILE to the aiua child so its paths stay in sync.
+    if let Some(ref p) = active_profile() {
+        cmd.env("PHILOTIC_PROFILE", p);
+    }
+
+    let child = cmd
         .spawn()
         .with_context(|| format!("spawn {}", aiua_bin.display()))?;
 
@@ -67,8 +101,7 @@ pub async fn run(config: Option<PathBuf>, hotel: String, detach: bool) -> Result
     }
 
     // ── Wait for socket to appear ─────────────────────────────────────────
-    let socket_path = std::env::var("PHILOTIC_HOTEL_SOCKET")
-        .unwrap_or_else(|_| format!("/tmp/philotic-{hotel}.sock"));
+    let socket_path = socket_path(&hotel);
 
     print!("Waiting for aiua socket");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);

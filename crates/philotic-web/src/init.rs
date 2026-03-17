@@ -6,11 +6,32 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
-/// Path to the philotic operator directory.
+/// Path to the philotic operator directory: `~/.philotic/`.
 pub fn philotic_dir() -> PathBuf {
     dirs::home_dir()
         .expect("cannot determine home directory")
         .join(".philotic")
+}
+
+/// Returns the active profile name from `PHILOTIC_PROFILE`, or `None` if not set.
+pub fn active_profile() -> Option<String> {
+    std::env::var("PHILOTIC_PROFILE")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// Returns the active profile directory.
+///
+/// When `PHILOTIC_PROFILE` is set: `~/.philotic/<profile>/`
+/// When unset: falls back to `~/.philotic/` for backward compatibility.
+///
+/// All profile-namespaced paths (pid, log, socket, config, DB) should derive
+/// from this function so that two profiles cannot collide by construction.
+pub fn profile_dir() -> PathBuf {
+    match active_profile() {
+        Some(profile) => philotic_dir().join(profile),
+        None => philotic_dir(),
+    }
 }
 
 pub fn identity_dir() -> PathBuf {

@@ -5,14 +5,22 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use uuid::Uuid;
 
-use crate::start::{pid_path, process_alive, read_pid};
+use crate::init::{active_profile, profile_dir};
+use crate::start::{pid_path, process_alive, read_pid, socket_path};
 
 pub async fn run(config: Option<PathBuf>) -> Result<()> {
-    let config_path = config.unwrap_or_else(|| PathBuf::from("mesh-config.json"));
+    let default_config = match active_profile() {
+        Some(_) => profile_dir().join("config.json"),
+        None => PathBuf::from("mesh-config.json"),
+    };
+    let config_path = config.unwrap_or(default_config);
 
     // ── Daemon status ──────────────────────────────────────────────────────
     println!("aiua daemon");
     println!("───────────────────────────────────────");
+    if let Some(ref p) = active_profile() {
+        println!("  profile  {p}  ({})", profile_dir().display());
+    }
 
     let daemon_alive = match read_pid() {
         Some(pid) if process_alive(pid) => {
@@ -31,8 +39,7 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
     };
 
     // ── IPC health check ───────────────────────────────────────────────────
-    let socket_path = std::env::var("PHILOTIC_HOTEL_SOCKET")
-        .unwrap_or_else(|_| "/tmp/philotic-aiua.sock".to_string());
+    let socket_path = socket_path("aiua");
 
     if daemon_alive {
         println!("\nipc");
