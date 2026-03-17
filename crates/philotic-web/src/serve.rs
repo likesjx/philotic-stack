@@ -21,12 +21,13 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Path, Query, State,
     },
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{get, post},
     Router,
 };
 use rand::Rng;
+use rust_embed::RustEmbed;
 use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -38,11 +39,18 @@ use std::{
 use tokio::sync::broadcast;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
+// ── Embedded UI assets ────────────────────────────────────────────────────────
+
+#[derive(RustEmbed)]
+#[folder = "ui-dist/"]
+struct UiAssets;
+
 // ── State shared across request handlers ─────────────────────────────────────
 
 #[derive(Clone)]
 struct AppState {
     token: Arc<String>,
+    port: u16,
     db_path: Arc<PathBuf>,
     config_path: Arc<PathBuf>,
     /// Broadcast channel for WebSocket push events
@@ -71,15 +79,17 @@ pub async fn run(
 
     let state = AppState {
         token: Arc::new(token.clone()),
+        port,
         db_path: Arc::new(db_path),
         config_path: Arc::new(config_path),
         tx,
     };
 
-    // CORS — allow desktop.jaredlikes.com + localhost dev server by default
+    // CORS — localhost only; UI is embedded and served from the same origin
     let cors = build_cors(allow_origins.as_deref());
 
     let app = Router::new()
+        // API routes
         .route("/api/status",                      get(handle_status))
         .route("/api/guests",                      get(handle_guests))
         .route("/api/agents",                      get(handle_agents))
@@ -88,40 +98,74 @@ pub async fn run(
         .route("/api/guests/:guest_id/restart",    post(handle_guest_restart))
         .route("/api/guests/:guest_id/stop",       post(handle_guest_stop))
         .route("/ws",                              get(handle_ws))
+        // Embedded UI — index.html gets token injected; all other assets served as-is
+        .route("/",                                get(handle_index))
+        .fallback(get(handle_static))
         .layer(cors)
         .with_state(state);
 
     let addr = format!("127.0.0.1:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
-    // Build desktop URLs with token pre-injected as query params.
-    // The desktop reads these on load and auto-connects — no manual paste needed.
-    let api_url = format!("http://{addr}");
-    let local_url = format!(
-        "http://localhost:5173?aiua_token={token}&aiua_url={api_url}"
-    );
-    let remote_url = format!(
-        "https://desktop.jaredlikes.com?aiua_token={token}&aiua_url={api_url}"
-    );
-
     println!("philotic-web serve");
     println!("──────────────────────────────────────────");
-    println!("  api      {api_url}");
-    println!("  ws       ws://{addr}/ws");
-    println!();
-    println!("  Open one of these to connect instantly:");
-    println!("  local    {local_url}");
-    println!("  remote   {remote_url}");
+    println!("  http://127.0.0.1:{port}");
     println!();
     println!("  Press Ctrl-C to stop.");
 
-    // Auto-open local desktop in the default browser
+    // Auto-open the embedded desktop in the default browser
     let _ = tokio::process::Command::new("open")
-        .arg(&local_url)
+        .arg(format!("http://127.0.0.1:{port}"))
         .spawn();
 
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+// ── Embedded UI handlers ──────────────────────────────────────────────────────
+
+/// Serve `index.html` with the session token injected as a JS global.
+/// The desktop reads `window.__PHILOTIC_AIUA_TOKEN__` on startup and
+/// auto-connects — the token is never visible in the URL or browser history.
+async fn handle_index(State(state): State<AppState>) -> Response {
+    let html = match UiAssets::get("index.html") {
+        Some(f) => String::from_utf8_lossy(f.data.as_ref()).into_owned(),
+        None => return (StatusCode::NOT_FOUND, "UI not built").into_response(),
+    };
+
+    let injection = format!(
+        "<script>window.__PHILOTIC_AIUA_TOKEN__={:?};window.__PHILOTIC_AIUA_URL__={:?};</script>",
+        state.token.as_str(),
+        format!("http://127.0.0.1:{}", state.port),
+    );
+
+    let html = html.replace("</head>", &format!("{injection}</head>"));
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        html,
+    )
+        .into_response()
+}
+
+/// Serve any other embedded asset (JS, CSS, icons, etc.).
+/// Falls back to `index.html` for SPA client-side routes.
+async fn handle_static(State(state): State<AppState>, uri: axum::http::Uri) -> Response {
+    let path = uri.path().trim_start_matches('/');
+
+    if let Some(asset) = UiAssets::get(path) {
+        let mime = asset.metadata.mimetype();
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, mime)],
+            asset.data.into_owned(),
+        )
+            .into_response()
+    } else {
+        // SPA fallback — let the client-side router handle it
+        handle_index(State(state)).await
+    }
 }
 
 // ── Auth helper ───────────────────────────────────────────────────────────────
@@ -533,7 +577,7 @@ fn build_cors(allow_origins: Option<&str>) -> CorsLayer {
     use axum::http::{header, Method};
 
     let origins: Vec<axum::http::HeaderValue> = allow_origins
-        .unwrap_or("http://localhost:5173,https://desktop.jaredlikes.com")
+        .unwrap_or("http://localhost:5173")
         .split(',')
         .filter_map(|o| o.trim().parse().ok())
         .collect();

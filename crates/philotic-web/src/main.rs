@@ -100,7 +100,7 @@ enum Command {
         #[arg(long, short)]
         config: Option<PathBuf>,
 
-        /// Allowed CORS origins, comma-separated (default: http://localhost:5173,https://desktop.jaredlikes.com)
+        /// Allowed CORS origins, comma-separated (default: http://localhost:5173)
         #[arg(long)]
         allow_origins: Option<String>,
     },
