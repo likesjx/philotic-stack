@@ -1,6 +1,6 @@
 use crate::controller::{
-    ControllerResponseEnvelope, ControllerTask, ModelProvider, ProviderConfigs, ProviderRegistry,
-    TaskKind,
+    ControllerResponseEnvelope, ControllerTask, ModelProvider, ProviderConfigs, ProviderOutput,
+    ProviderRegistry, TaskKind,
 };
 use anyhow::Result;
 use philotic_client::{
@@ -164,6 +164,15 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                 );
 
                 match provider.invoke(&controller_task).await {
+                    Ok(ProviderOutput::ToolCall { tool_name, arguments }) => {
+                        emit_tool_call_response(
+                            &mut ipc_client,
+                            &reply,
+                            tool_name,
+                            arguments,
+                        )
+                        .await?;
+                    }
                     Ok(output) => {
                         let response = ControllerResponseEnvelope::from_output(
                             &controller_task,
@@ -296,6 +305,37 @@ async fn emit_text_response(
             "turn_id": reply.turn_id,
             "chat_id": reply.chat_id,
             "content": response.content,
+            "final_reply_to": reply.final_reply_to,
+            "final_reply_role": reply.final_reply_role,
+            "final_reply_guest_id": reply.final_reply_guest_id
+        })
+        .to_string(),
+    };
+
+    ipc_client.send_request(reply_req).await?;
+    Ok(())
+}
+
+async fn emit_tool_call_response(
+    ipc_client: &mut PhiloticClient,
+    reply: &ReplyRoute,
+    tool_name: String,
+    arguments: serde_json::Value,
+) -> Result<()> {
+    let reply_req = IpcRequest::EmitTask {
+        target_node: reply.reply_to.clone(),
+        target_role: reply.reply_role.clone(),
+        target_guest_id: None,
+        task_json: json!({
+            "action": "model_response",
+            "agent_action": {
+                "kind": "tool_call",
+                "tool_name": tool_name,
+                "arguments": arguments,
+            },
+            "session_id": reply.session_id,
+            "turn_id": reply.turn_id,
+            "chat_id": reply.chat_id,
             "final_reply_to": reply.final_reply_to,
             "final_reply_role": reply.final_reply_role,
             "final_reply_guest_id": reply.final_reply_guest_id

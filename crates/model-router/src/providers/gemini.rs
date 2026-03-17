@@ -88,6 +88,76 @@ impl GeminiProvider {
         })
     }
 
+    /// Build a request payload for turns where tools are available.
+    ///
+    /// The model must output JSON with either:
+    /// - `display_text` (and optionally `spoken_text`, `memory_concept`) for a text response, OR
+    /// - `tool_call` with `tool_name` + `arguments` to invoke a tool.
+    ///
+    /// Exactly one of `display_text` or `tool_call` must be present.
+    fn tool_aware_request_payload(
+        prompt: &str,
+        tools: &[serde_json::Value],
+        wants_concept: bool,
+    ) -> Value {
+        let tool_list: String = tools
+            .iter()
+            .map(|t| {
+                let name = t.get("tool_name").and_then(Value::as_str).unwrap_or("?");
+                let desc = t.get("description").and_then(Value::as_str).unwrap_or("");
+                let brief: String = desc.chars().take(120).collect();
+                format!("  {name}: {brief}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let concept_instruction = if wants_concept {
+            " Also include \"memory_concept\": a short kebab-case slug (2–5 words) summarising the exchange."
+        } else {
+            ""
+        };
+
+        let system_text = format!(
+            "You are an agent with tools. To invoke a tool, output ONLY a JSON object with \
+             a \"tool_call\" key containing \"tool_name\" (string) and \"arguments\" (object). \
+             Do not include display_text when calling a tool.\n\
+             To reply without a tool, output a JSON object with \"display_text\" (your reply, \
+             markdown fine) and \"spoken_text\" (conversational version for voice, no markdown).{}\n\n\
+             Available tools:\n{}",
+            concept_instruction,
+            tool_list,
+        );
+
+        let mut properties = json!({
+            "display_text": { "type": "STRING" },
+            "spoken_text": { "type": "STRING" },
+            "tool_call": {
+                "type": "OBJECT",
+                "properties": {
+                    "tool_name": { "type": "STRING" },
+                    "arguments": { "type": "OBJECT" }
+                }
+            }
+        });
+        if wants_concept {
+            properties["memory_concept"] = json!({ "type": "STRING" });
+        }
+
+        json!({
+            "system_instruction": {
+                "parts": [{ "text": system_text }]
+            },
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "responseMimeType": "application/json",
+                "responseSchema": {
+                    "type": "OBJECT",
+                    "properties": properties
+                }
+            }
+        })
+    }
+
     fn structured_text_request_payload(prompt: &str, wants_concept: bool) -> Value {
         let system_text = if wants_concept {
             "When generating your response, produce a JSON object with three fields: \
@@ -275,18 +345,20 @@ impl ModelProvider for GeminiProvider {
     }
 
     async fn invoke(&self, task: &ControllerTask) -> Result<ProviderOutput> {
+        let has_tools = !task.tools.is_empty();
+        let wants_concept = task.wants_channel("memory_concept");
         let use_structured = task.kind == TaskKind::TextGenerate
-            && (task.wants_channel("spoken_text") || task.wants_channel("memory_concept"));
+            && (has_tools || task.wants_channel("spoken_text") || wants_concept);
+
         let payload = match task.kind {
             TaskKind::TextGenerate => {
                 let prompt = task
                     .composed_prompt_text()
                     .context("Gemini text task missing prompt")?;
-                if use_structured {
-                    Self::structured_text_request_payload(
-                        &prompt,
-                        task.wants_channel("memory_concept"),
-                    )
+                if has_tools {
+                    Self::tool_aware_request_payload(&prompt, &task.tools, wants_concept)
+                } else if use_structured {
+                    Self::structured_text_request_payload(&prompt, wants_concept)
                 } else {
                     Self::request_payload(&prompt)
                 }
@@ -308,25 +380,82 @@ impl ModelProvider for GeminiProvider {
         let status = response.status();
         let body = response.json::<Value>().await?;
 
-        let (content, spoken_text, memory_concept) = if use_structured {
-            Self::parse_structured_response(status, body)
+        if use_structured {
+            let (content, spoken_text, memory_concept) =
+                Self::parse_structured_response(status, body.clone());
+
+            // Check if model returned a tool_call instead of display_text.
+            if let Ok(parsed) = serde_json::from_str::<Value>(&content) {
+                if let Some(tc) = parsed.get("tool_call") {
+                    let tool_name = tc
+                        .get("tool_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let arguments = tc
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or_else(|| json!({}));
+                    if !tool_name.is_empty() {
+                        return Ok(ProviderOutput::ToolCall { tool_name, arguments });
+                    }
+                }
+            }
+            // Also check the raw parsed JSON directly (before display_text wrapping).
+            if let Some(raw_text) = body
+                .get("candidates")
+                .and_then(|c| c.get(0))
+                .and_then(|c| c.get("content"))
+                .and_then(|c| c.get("parts"))
+                .and_then(|p| p.get(0))
+                .and_then(|p| p.get("text"))
+                .and_then(Value::as_str)
+            {
+                if let Ok(parsed) = serde_json::from_str::<Value>(raw_text) {
+                    if let Some(tc) = parsed.get("tool_call") {
+                        let tool_name = tc
+                            .get("tool_name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let arguments = tc
+                            .get("arguments")
+                            .cloned()
+                            .unwrap_or_else(|| json!({}));
+                        if !tool_name.is_empty() {
+                            return Ok(ProviderOutput::ToolCall { tool_name, arguments });
+                        }
+                    }
+                }
+            }
+
+            if content.trim().is_empty() {
+                bail!("Gemini returned an empty response");
+            }
+            Ok(ProviderOutput::Text {
+                display_text: Some(content.clone()),
+                content,
+                spoken_text,
+                working_memory_delta: None,
+                follow_up_questions: Vec::new(),
+                intent_summary: None,
+                memory_concept,
+            })
         } else {
-            (Self::parse_response_text(status, body), None, None)
-        };
-
-        if content.trim().is_empty() {
-            bail!("Gemini returned an empty response");
+            let content = Self::parse_response_text(status, body);
+            if content.trim().is_empty() {
+                bail!("Gemini returned an empty response");
+            }
+            Ok(ProviderOutput::Text {
+                display_text: Some(content.clone()),
+                content,
+                spoken_text: None,
+                working_memory_delta: None,
+                follow_up_questions: Vec::new(),
+                intent_summary: None,
+                memory_concept: None,
+            })
         }
-
-        Ok(ProviderOutput::Text {
-            display_text: Some(content.clone()),
-            content,
-            spoken_text,
-            working_memory_delta: None,
-            follow_up_questions: Vec::new(),
-            intent_summary: None,
-            memory_concept,
-        })
     }
 }
 
@@ -515,6 +644,7 @@ mod tests {
             affordances: Default::default(),
             routing_hints: RoutingHints::default(),
             provider_options: Default::default(),
+            tools: vec![],
         };
 
         assert!(crate::controller::ModelProvider::supports(&provider, &task));
@@ -556,6 +686,7 @@ mod tests {
             affordances: Default::default(),
             routing_hints: RoutingHints::default(),
             provider_options: Default::default(),
+            tools: vec![],
         };
 
         assert!(crate::controller::ModelProvider::supports(&provider, &task));

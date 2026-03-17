@@ -205,6 +205,9 @@ pub struct ControllerTask {
     pub affordances: Affordances,
     pub routing_hints: RoutingHints,
     pub provider_options: Map<String, Value>,
+    /// Tools the agent has available this turn. Non-empty signals tool-enabled mode.
+    /// Each entry is a raw JSON object with at minimum `tool_name` and `description`.
+    pub tools: Vec<Value>,
 }
 
 impl ControllerTask {
@@ -307,6 +310,11 @@ impl ControllerTask {
             affordances,
             routing_hints,
             provider_options,
+            tools: task
+                .get("tools_for_model")
+                .and_then(Value::as_array)
+                .map(|arr| arr.iter().filter(|v| v.is_object()).cloned().collect())
+                .unwrap_or_default(),
         };
 
         controller_task.validate()?;
@@ -865,6 +873,11 @@ pub enum ProviderOutput {
         memory_concept: Option<String>,
     },
     Audio(AudioArtifact),
+    /// Model chose to call a tool rather than produce a text response.
+    ToolCall {
+        tool_name: String,
+        arguments: Value,
+    },
     /// A dense embedding vector produced by a local ONNX embedding model.
     ///
     /// `model_gen` carries the provenance token `"{repo}@{sha8}"` so consumers
@@ -999,6 +1012,14 @@ impl ControllerResponseEnvelope {
                     },
                     provider_output: Value::Null,
                 })
+            }
+            // ToolCall is intercepted in runtime.rs before reaching from_output.
+            // If it somehow arrives here, treat it as an error.
+            ProviderOutput::ToolCall { tool_name, .. } => {
+                anyhow::bail!(
+                    "ProviderOutput::ToolCall({}) reached from_output — should have been intercepted in runtime",
+                    tool_name
+                )
             }
         }
     }
