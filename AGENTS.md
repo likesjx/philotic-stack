@@ -218,17 +218,67 @@ Before moving on, state:
 
 ## 6. Commit and Push Discipline
 
-Default to one commit/push per coherent slice.
+Default to one commit/push per coherent slice. The quality control is slice size — if the slice is too big to explain cleanly, it is too big to commit cleanly.
 
-Commit messages should:
+### 6.1 Subject Line
 
-- describe the primary change in the subject
-- list the core behavioral or architectural changes in the body
-- mention important verification or operational consequences when relevant
+```
+type(scope): short description
+```
 
-Avoid vague progress commits.
+**Types**: `feat`, `fix`, `chore`, `ops`, `docs`, `refactor`, `test`, `perf`
+**Scope**: crate or area — `aiua`, `membrane`, `philote`, `model-router`, `philotic-web`, `ansible-mesh-core`, `phil`, `skills`
 
-The quality control is slice size. If the slice is too big to explain cleanly, it is probably too big to commit cleanly.
+### 6.2 Body
+
+1–5 bullet points. Focus on *why* and *what changed at the boundary* — not a changelog dump.
+
+### 6.3 Trailers
+
+Trailers are **additive** — include the ones that apply. Do not add empty or N/A placeholders.
+
+| Trailer | When to include |
+|---|---|
+| `Slice: codex/<slug>` | Always, when on a named workstream |
+| `Seam: <seam-id>` | When the change touches a known seam boundary |
+| `Fixes: DEF-NNN` | When closing a tracked defect in `docs/DEFECTS.md` |
+| `Refs: <short-name>` | Architectural cross-link; repeat the line for multiple refs |
+| `Verified: <level>` | Always; be honest: `test-green`, `smoke-green`, `watched-live-green`, `check-only` |
+
+Short names for `Refs:` are preferred — `TELEGRAM_POLL_LEASE_PROPOSAL`, `SEAM_REGISTRY`, `DEFECTS` — not full paths.
+
+### 6.4 Examples
+
+```
+feat(membrane): graceful poll lease release on shutdown
+
+- release lease explicitly on SIGTERM instead of relying on TTL expiry
+- prevents ~30s standby takeover delay during intentional restarts
+
+Slice: codex/telegram-poll-hardening
+Seam: telegram-poll-lease
+Verified: smoke-green (dual-poller handoff)
+```
+
+```
+fix(aiua): dead guest with cleared PID drops poll lease correctly
+
+- cleared PID no longer holds the poll lease open after supervisor reap
+- lease drop fires before supervisor reschedules the slot
+
+Slice: codex/telegram-poll-hardening
+Seam: telegram-poll-lease
+Fixes: DEF-001
+Refs: TELEGRAM_POLL_LEASE_PROPOSAL
+Refs: RUNTIME_AUTHORITY_LEASES_PROPOSAL
+Verified: test-green
+```
+
+```
+chore(skills): add check-engine skill, fix muninn-memory-habit subagent rule
+
+Verified: check-only
+```
 
 ## 7. Testing and Validation Rules
 

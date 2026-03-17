@@ -33,6 +33,16 @@ For anything not yet stored: call `muninn_remember_batch` directly in the main t
 
 Check `~/.claude/projects/<project>/memory/MEMORY.md`. Does it have pointers to everything relevant? Add any new memory files to the index. Remove stale pointers.
 
+### 2.5 Defect Sweep
+
+Check `docs/DEFECTS.md`. For each defect touched this session:
+
+- **New bug found or root-caused** → add a `DEF-NNN` entry with status, severity, size, seam, and found date. Store to Muninn.
+- **Defect resolved** → update `Status: fixed` and add `Fixed: <commit-hash>`. Confirm the closing commit carries `Fixes: DEF-NNN`.
+- **Defect progressed but not closed** → update status to `in-progress` and add a short note.
+
+Ask explicitly: *did any commit this session close a known defect without updating DEFECTS.md or adding a `Fixes:` trailer?*
+
 ### 3. Open Threads
 
 List explicitly:
