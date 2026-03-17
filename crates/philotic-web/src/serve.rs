@@ -94,16 +94,31 @@ pub async fn run(
     let addr = format!("127.0.0.1:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
+    // Build desktop URLs with token pre-injected as query params.
+    // The desktop reads these on load and auto-connects — no manual paste needed.
+    let api_url = format!("http://{addr}");
+    let local_url = format!(
+        "http://localhost:5173?aiua_token={token}&aiua_url={api_url}"
+    );
+    let remote_url = format!(
+        "https://desktop.jaredlikes.com?aiua_token={token}&aiua_url={api_url}"
+    );
+
     println!("philotic-web serve");
     println!("──────────────────────────────────────────");
-    println!("  url     http://{addr}");
-    println!("  token   {token}");
-    println!("  ws      ws://{addr}/ws");
+    println!("  api      {api_url}");
+    println!("  ws       ws://{addr}/ws");
     println!();
-    println!("  Paste the token into the Aiua app on desktop.jaredlikes.com");
-    println!("  or your local desktop instance to connect.");
+    println!("  Open one of these to connect instantly:");
+    println!("  local    {local_url}");
+    println!("  remote   {remote_url}");
     println!();
     println!("  Press Ctrl-C to stop.");
+
+    // Auto-open local desktop in the default browser
+    let _ = tokio::process::Command::new("open")
+        .arg(&local_url)
+        .spawn();
 
     axum::serve(listener, app).await?;
     Ok(())
