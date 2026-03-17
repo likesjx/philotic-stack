@@ -7,6 +7,10 @@ use anyhow::Result;
 
 pub mod sqlite;
 
+/// Combined supertrait for the full store capability — both graph and table operations.
+/// All concrete store implementations implement this.
+pub trait GraphTableStore: GraphStore + TableStore {}
+
 /// Unified storage interface for the context graph runner.
 ///
 /// All read operations accept an `Identity` and are responsible for enforcing
@@ -96,4 +100,50 @@ pub trait GraphStore: Send + Sync {
         query: &str,
         identity: &Identity,
     ) -> Result<Vec<Node>>;
+}
+
+/// Table adapter storage interface.
+///
+/// Tables live alongside graphs in the same runner instance. A table may be
+/// linked to a graph via `TableSpec::graph_id`, or standalone. Rows are plain
+/// JSON objects; column specs describe the intended schema but are not strictly
+/// enforced at the storage layer (enforcement is a tool-layer concern).
+///
+/// Access control for tables is capability-based: knowing the `table_id` is
+/// sufficient for reads. Write access requires the caller to be the creator
+/// or to have been explicitly granted access (enforced by the tool layer;
+/// the store trusts what the tool layer passes in).
+pub trait TableStore: Send + Sync {
+    // ── Table lifecycle ────────────────────────────────────────────────────────
+
+    /// Create a new table. Returns the stable `table_id` (ULID).
+    fn create_table(&self, spec: TableSpec) -> Result<String>;
+
+    fn get_table(&self, table_id: &str) -> Result<Option<TableMeta>>;
+
+    /// List all tables, optionally filtered to those linked to a specific graph.
+    fn list_tables(&self, graph_id: Option<&str>) -> Result<Vec<TableMeta>>;
+
+    /// Update table metadata (name, description, columns). Additive-only on columns —
+    /// the implementation must reject removal of columns that have row data.
+    fn update_table(&self, table_id: &str, name: Option<String>, description: Option<String>, columns: Option<Vec<ColumnSpec>>) -> Result<()>;
+
+    /// Permanently delete a table and all its rows.
+    fn drop_table(&self, table_id: &str) -> Result<()>;
+
+    // ── Row operations ─────────────────────────────────────────────────────────
+
+    /// Insert or upsert a row. Returns the stable `row_id` (ULID).
+    fn insert_row(&self, table_id: &str, input: RowInput) -> Result<String>;
+
+    fn get_row(&self, table_id: &str, row_id: &str) -> Result<Option<Row>>;
+
+    /// Merge `patch` into the existing row's data (shallow merge).
+    fn update_row(&self, table_id: &str, row_id: &str, patch: serde_json::Value) -> Result<()>;
+
+    /// Soft-delete a row.
+    fn delete_row(&self, table_id: &str, row_id: &str) -> Result<()>;
+
+    /// Return rows matching the query. Equality filter evaluated in-memory.
+    fn query_rows(&self, table_id: &str, query: &RowQuery) -> Result<Vec<Row>>;
 }

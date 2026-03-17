@@ -361,9 +361,9 @@ convention and session participation model when the time comes.
 Implementation in progress:
 
 - [x] `graph-runner` Slice 1 shipped (CRUD, visibility, traversal, FTS, 22 tests)
+- [x] `graph-runner` Slice 2 shipped (hotel registry, extended traversal + FTS tests, 29 tests)
+- [x] `graph-runner` Slice 3 shipped (table adapter, 38 tests)
 - [ ] ODS rename (`GraphStorage` → `OdsStorage`)
-- [ ] `table.*` surface on graph-runner
-- [ ] `table_ref` as first-class field on Node
 - [ ] Agent graph provisioning at philote materialization
 - [ ] Mesh distribution for agent graph (graph-runner Slice 5 / Option C)
 
@@ -371,14 +371,15 @@ Implementation in progress:
 
 ## Current Slice
 
-`graph-runner` Slice 2 shipped:
-- [x] Hotel registry write: `RegisterGraphInstance` IpcRequest → aiua → ODS `graph_runner_registry` config key
-- [x] Startup registration: graph-runner registers all existing graphs on connect
-- [x] `GraphRunnerInstanceRecord` + `get_graph_runner_registry` / `upsert_graph_runner_instance` / `get_graph_runner_instance` as defaulted `GraphStorage` methods
-- [x] Traversal tests: inbound, both-direction, max_depth cap, edge type filter, visibility pruning mid-traversal
-- [x] FTS search tests: text match, visibility-aware results
+`graph-runner` Slice 3 shipped:
+- [x] `TableStore` trait: `create_table`, `get_table`, `list_tables`, `update_table`, `drop_table`, `insert_row`, `get_row`, `update_row`, `delete_row`, `query_rows`
+- [x] `GraphTableStore` supertrait combining `GraphStore + TableStore` — single `&dyn GraphTableStore` dispatch object
+- [x] `table_ref: Option<String>` first-class field on `NodeInput` / `Node` with SQLite column + index
+- [x] SQLite schema: `tables` + `table_rows` with soft-delete on rows; additive-only column enforcement on `update_table`
+- [x] `table.*` tool namespace (10 tools): wired into IPC dispatch in main.rs
+- [x] 9 table adapter tests + round-trip test for `table_ref` on nodes
+- [x] 38 total tests passing
 
-Slice 3 candidates:
-- `table.*` surface on graph-runner: `TableStore` trait, same runner binary
-- `table_ref` as first-class field on Node
+Slice 4 candidates:
+- Subgraph export: `graph.export` tool returning JSON / Mermaid / DOT
 - Agent graph provisioning at philote materialization

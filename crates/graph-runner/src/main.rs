@@ -11,7 +11,7 @@ use clap::Parser;
 use philotic_client::{is_ipc_disconnect, GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
 use serde_json::json;
 use store::sqlite::SqliteGraphStore;
-use store::GraphStore;
+use store::GraphTableStore;
 use tracing::{info, warn};
 
 use graph::Identity;
@@ -54,6 +54,20 @@ const GRAPH_TOOLS: &[&str] = &[
     "graph.edge.delete",
     "graph.traverse",
     "graph.search",
+    "graph.export",
+];
+
+const TABLE_TOOLS: &[&str] = &[
+    "table.create",
+    "table.schema.get",
+    "table.update",
+    "table.drop",
+    "table.list",
+    "table.row.insert",
+    "table.row.get",
+    "table.row.update",
+    "table.row.delete",
+    "table.query",
 ];
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -68,20 +82,23 @@ async fn main() -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     info!(path = %path.display(), "Opening graph store");
-    let store: &'static dyn GraphStore =
+    let store: &'static dyn GraphTableStore =
         Box::leak(Box::new(SqliteGraphStore::open(&path)?));
 
     let iid = instance_id();
+    let all_tools: Vec<String> = GRAPH_TOOLS.iter().chain(TABLE_TOOLS.iter())
+        .map(|s| s.to_string())
+        .collect();
     let identity = GuestIdentity {
         guest_id: iid.clone(),
         role: "tool.graph".into(),
-        supported_tools: GRAPH_TOOLS.iter().map(|s| s.to_string()).collect(),
+        supported_tools: all_tools.clone(),
     };
 
     let mut ipc_client = PhiloticClient::connect(identity).await?;
 
-    // Subscribe to the tool.graph inbox role so the hotel routes tool calls here.
-    for tool in GRAPH_TOOLS {
+    // Subscribe to inbox roles for all graph + table tools.
+    for tool in &all_tools {
         let role = format!("tool.{}", tool);
         let _ = ipc_client
             .send_request(IpcRequest::SubscribeInbox { role })

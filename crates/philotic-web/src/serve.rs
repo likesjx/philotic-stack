@@ -121,6 +121,8 @@ pub async fn run(
     println!("──────────────────────────────────────────");
     println!("  http://127.0.0.1:{port}");
     println!();
+    println!("  Session token: {token}");
+    println!();
     println!("  Press Ctrl-C to stop.");
 
     // Auto-open the embedded desktop in the default browser

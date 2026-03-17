@@ -65,12 +65,12 @@ replication path (Option C) without changing the tool surface.
 
 ## Disposition
 
-`in-progress` — Slice 1 and Slice 2 shipped.
+`in-progress` — Slices 1–3 shipped.
 
 - [x] Slice 1: CRUD, visibility, FTS, traversal, 9 access tests + 20 store tests
 - [x] Slice 2: Hotel registry write (`RegisterGraphInstance` IpcRequest), traversal direction/depth/filter tests, FTS visibility tests (29 total tests)
-- [ ] Slice 3: Schema evolution + soft-delete lifecycle
-- [ ] Slice 4: Export
+- [x] Slice 3: Table adapter — `TableStore` trait, `GraphTableStore` supertrait, `table.*` tool namespace (10 tools), `table_ref` on Node, 38 total tests
+- [ ] Slice 4: Export (`graph.export` — JSON / Mermaid / DOT)
 - [ ] Slice 5: Replication foundation (Option C)
 
 ---
