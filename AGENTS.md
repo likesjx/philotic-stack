@@ -305,6 +305,8 @@ For older open sessions that may not yet know this shorthand, the operator shoul
 
 ### 8.2 Muninn Failure Rule
 
+The session bootstrap in CLAUDE.md is non-negotiable. It applies on every session start — including sessions resumed from a summary, continued mid-task, or picking up after context compression. A context summary is observed state only; Muninn recall is required for decision history.
+
 When Muninn is required by protocol for meaningful work:
 
 - if the Muninn MCP surface or helper is unavailable, say so immediately
