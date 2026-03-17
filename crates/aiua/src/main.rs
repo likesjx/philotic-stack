@@ -1303,6 +1303,7 @@ fn seed_orchestrator_roles(
             toolset_profile: "orchestrator".into(),
             role_identity_addendum: None,
             role_manifest: Some(ORCHESTRATOR_MANIFEST.into()),
+            is_admin: false,
             inactive_ttl_seconds: None,
             turn_loop_config: ansible_mesh_core::graph::TurnLoopConfig::default(),
         };

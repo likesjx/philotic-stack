@@ -3472,6 +3472,7 @@ impl AgentRuntime {
 
                 let role_identity_addendum = args.get("role_identity_addendum").and_then(|v| v.as_str()).map(str::to_string);
                 let role_manifest = args.get("role_manifest").and_then(|v| v.as_str()).map(str::to_string);
+                let is_admin = args.get("is_admin").and_then(|v| v.as_bool()).unwrap_or(false);
                 let inactive_ttl_seconds = args.get("inactive_ttl_seconds").and_then(|v| v.as_u64());
                 let iteration_cap = args.get("iteration_cap").and_then(|v| v.as_u64()).map(|v| v as u32);
                 let approval_policy = args.get("approval_policy").and_then(|v| v.as_str()).map(str::to_string);
@@ -3485,6 +3486,7 @@ impl AgentRuntime {
                     toolset_profile,
                     role_identity_addendum,
                     role_manifest,
+                    is_admin,
                     inactive_ttl_seconds,
                     iteration_cap,
                     approval_policy,

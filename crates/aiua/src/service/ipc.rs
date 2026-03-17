@@ -2304,6 +2304,7 @@ impl IpcServer {
                 toolset_profile,
                 role_identity_addendum,
                 role_manifest,
+                is_admin,
                 inactive_ttl_seconds,
                 iteration_cap,
                 approval_policy,
@@ -2331,15 +2332,34 @@ impl IpcServer {
                         "orchestrator guests may only configure roles for their own agent identity",
                     );
                 }
-                // The orchestrator role record is owned by the hotel operator — its manifest is
-                // the system-standard governance document, not per-agent customizable. Only the
-                // hotel seed (or a future admin tier) may write it. Orchestrators govern their
-                // delegation vocabulary (specialist roles), not their own constitution.
-                if role_name == "orchestrator" {
+                // Determine whether the calling guest has admin authority by looking up their
+                // role incarnation record. Only admin roles may update operator-owned records.
+                let caller_agent_id = identity
+                    .guest_id
+                    .strip_suffix(&format!(":{}", identity.role))
+                    .unwrap_or(&identity.guest_id);
+                let caller_is_admin = graph
+                    .get_role_incarnation(caller_agent_id, &identity.role)
+                    .ok()
+                    .flatten()
+                    .map(|r| r.is_admin)
+                    .unwrap_or(false);
+
+                // The orchestrator role record is operator-owned. Only admin roles may update it.
+                if role_name == "orchestrator" && !caller_is_admin {
                     return IpcResponse::error(
                         "configure_role",
                         "CONFIGURE_FORBIDDEN",
-                        "the orchestrator role record is operator-owned and cannot be modified via IPC; update the hotel seed to change the standard orchestrator manifest",
+                        "the orchestrator role record is operator-owned; only admin roles may update it",
+                    );
+                }
+
+                // Prevent privilege escalation: only admin roles may create other admin roles.
+                if is_admin && !caller_is_admin {
+                    return IpcResponse::error(
+                        "configure_role",
+                        "CONFIGURE_FORBIDDEN",
+                        "only admin roles may create other admin roles",
                     );
                 }
                 
@@ -2350,6 +2370,7 @@ impl IpcServer {
                     toolset_profile,
                     role_identity_addendum,
                     role_manifest,
+                    is_admin,
                     inactive_ttl_seconds,
                     turn_loop_config: ansible_mesh_core::graph::TurnLoopConfig {
                         iteration_cap,
@@ -4604,6 +4625,7 @@ mod tests {
                 toolset_profile: "orchestrator".into(),
                 role_identity_addendum: None,
                 role_manifest: None,
+                is_admin: false,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
             })
@@ -4714,6 +4736,7 @@ mod tests {
                 toolset_profile: "orchestrator".into(),
                 role_identity_addendum: None,
                 role_manifest: None,
+                is_admin: false,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
             })
@@ -4972,6 +4995,7 @@ mod tests {
                 toolset_profile: "codex".into(),
                 role_identity_addendum: None,
                 role_manifest: None,
+                is_admin: false,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
             })
@@ -5150,6 +5174,7 @@ mod tests {
                 toolset_profile: "codex".into(),
                 role_identity_addendum: None,
                 role_manifest: None,
+                is_admin: false,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
             })
@@ -5845,6 +5870,7 @@ mod tests {
                 toolset_profile: "codex".into(),
                 role_identity_addendum: Some("Focus on implementation and code changes.".into()),
                 role_manifest: None,
+                is_admin: false,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
             })
@@ -5964,6 +5990,7 @@ mod tests {
                 toolset_profile: "codex".into(),
                 role_identity_addendum: None,
                 role_manifest: None,
+                is_admin: false,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
             })
@@ -8694,6 +8721,7 @@ mod tests {
                 toolset_profile: "developer".into(),
                 role_identity_addendum: Some("Addendum".into()),
                 role_manifest: None,
+                is_admin: false,
                 inactive_ttl_seconds: Some(60),
                 iteration_cap: Some(10),
                 approval_policy: Some("auto".into()),
@@ -8756,6 +8784,7 @@ mod tests {
                 toolset_profile: "developer".into(),
                 role_identity_addendum: None,
                 role_manifest: None,
+                is_admin: false,
                 inactive_ttl_seconds: None,
                 iteration_cap: None,
                 approval_policy: None,

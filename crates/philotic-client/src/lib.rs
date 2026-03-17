@@ -508,6 +508,8 @@ pub enum IpcRequest {
         role_identity_addendum: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         role_manifest: Option<String>,
+        #[serde(default)]
+        is_admin: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         inactive_ttl_seconds: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

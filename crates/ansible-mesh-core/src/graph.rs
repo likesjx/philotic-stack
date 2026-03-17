@@ -164,6 +164,10 @@ pub struct RoleIncarnationRecord {
     /// approval constraints so the agent can reason about its own capabilities and limits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_manifest: Option<String>,
+    /// Admin roles may update operator-owned records such as the orchestrator role manifest.
+    /// Only the hotel seed or an existing admin role may create a role with is_admin: true.
+    #[serde(default)]
+    pub is_admin: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inactive_ttl_seconds: Option<u64>,
     #[serde(default)]
