@@ -360,6 +360,7 @@ The repository contains specialized skills in `skills/` to standardize common wo
 
 | Skill | Purpose |
 |---|---|
+| `check-engine` | **End-of-session review** — memory sweep, MEMORY.md sync, open threads, process gaps, green status |
 | `philotic-slice-closeout` | Finalizing implementation slices (tasks, proposals, commits) |
 | `verification-ladder` | Deciding and reporting the honest validation level |
 | `proposal-maintainer` | Architecture/process proposal and spec hygiene |
