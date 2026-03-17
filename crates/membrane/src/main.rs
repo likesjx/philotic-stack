@@ -1718,6 +1718,11 @@ async fn run_seat_impl(
                                 }
                             } else if let Some(desc) = json.get("description").and_then(|d| d.as_str()) {
                                 error!("Telegram API Error: {}", desc);
+                                // On Conflict, back off before retrying to break the self-conflict loop
+                                // that occurs when a cancelled in-flight request still holds a Telegram session.
+                                if desc.contains("Conflict") {
+                                    tokio::time::sleep(Duration::from_secs(TELEGRAM_POLL_TIMEOUT_SECS + 2)).await;
+                                }
                             }
                         }
                     }
