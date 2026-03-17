@@ -9,5 +9,6 @@ members = [
     "crates/ansible-mesh-core",
     "crates/memory-core",
     "crates/philotic-web",
+    "crates/graph-runner",
 ]
 resolver = "2"

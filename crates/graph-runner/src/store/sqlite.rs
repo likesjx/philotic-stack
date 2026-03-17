@@ -1,0 +1,1101 @@
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::{anyhow, bail, Result};
+use rusqlite::{params, Connection};
+use ulid::Ulid;
+
+use crate::access::{resolve_edge_visibility, resolve_node_visibility};
+use crate::graph::{
+    Edge, EdgeFilter, EdgeInput, GraphMeta, GraphSchema, GraphSpec, Identity, Node, NodeFilter,
+    NodeInput, TraversalDirection, TraversalQuery, TraversalResult,
+};
+use crate::store::GraphStore;
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+fn new_ulid() -> String {
+    Ulid::new().to_string()
+}
+
+// ── SqliteGraphStore ──────────────────────────────────────────────────────────
+
+pub struct SqliteGraphStore {
+    conn: Mutex<Connection>,
+}
+
+impl SqliteGraphStore {
+    pub fn open(path: &Path) -> Result<Self> {
+        let conn = Connection::open(path)?;
+        let store = Self { conn: Mutex::new(conn) };
+        store.migrate()?;
+        Ok(store)
+    }
+
+    pub fn open_in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        let store = Self { conn: Mutex::new(conn) };
+        store.migrate()?;
+        Ok(store)
+    }
+
+    fn migrate(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        conn.execute_batch(SCHEMA_SQL)?;
+        Ok(())
+    }
+}
+
+// ── Schema SQL ────────────────────────────────────────────────────────────────
+
+const SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS graphs (
+    graph_id           TEXT NOT NULL PRIMARY KEY,
+    name               TEXT NOT NULL UNIQUE,
+    description        TEXT,
+    schema_json        TEXT NOT NULL DEFAULT '{"node_types":[],"edge_types":[],"strict":false}',
+    default_visibility TEXT NOT NULL DEFAULT 'private',
+    creator            TEXT NOT NULL DEFAULT '',
+    created_at         INTEGER NOT NULL,
+    updated_at         INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS nodes (
+    node_id         TEXT NOT NULL,
+    graph_id        TEXT NOT NULL REFERENCES graphs(graph_id),
+    node_type       TEXT NOT NULL DEFAULT '',
+    label           TEXT NOT NULL DEFAULT '',
+    content_json    TEXT NOT NULL DEFAULT '{}',
+    tags_json       TEXT NOT NULL DEFAULT '[]',
+    visibility_json TEXT NOT NULL DEFAULT '[]',
+    creator         TEXT NOT NULL DEFAULT '',
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    deleted_at      INTEGER,
+    PRIMARY KEY (graph_id, node_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_nodes_graph_type
+    ON nodes(graph_id, node_type)
+    WHERE deleted_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_nodes_creator
+    ON nodes(graph_id, creator)
+    WHERE deleted_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS edges (
+    edge_id         TEXT NOT NULL,
+    graph_id        TEXT NOT NULL REFERENCES graphs(graph_id),
+    from_node_id    TEXT NOT NULL,
+    to_node_id      TEXT NOT NULL,
+    edge_type       TEXT NOT NULL DEFAULT '',
+    label           TEXT,
+    content_json    TEXT NOT NULL DEFAULT '{}',
+    visibility_json TEXT NOT NULL DEFAULT '[]',
+    creator         TEXT NOT NULL DEFAULT '',
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    deleted_at      INTEGER,
+    PRIMARY KEY (graph_id, edge_id),
+    FOREIGN KEY (graph_id, from_node_id) REFERENCES nodes(graph_id, node_id),
+    FOREIGN KEY (graph_id, to_node_id)   REFERENCES nodes(graph_id, node_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_edges_from
+    ON edges(graph_id, from_node_id)
+    WHERE deleted_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_edges_to
+    ON edges(graph_id, to_node_id)
+    WHERE deleted_at IS NULL;
+
+CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
+    node_id,
+    graph_id,
+    label,
+    content_json,
+    tokenize = 'porter ascii'
+);
+"#;
+
+// ── Row deserialization helpers ───────────────────────────────────────────────
+
+fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
+    let content_str: String = row.get("content_json")?;
+    let tags_str: String = row.get("tags_json")?;
+    let vis_str: String = row.get("visibility_json")?;
+
+    Ok(Node {
+        node_id: row.get("node_id")?,
+        graph_id: row.get("graph_id")?,
+        node_type: row.get("node_type")?,
+        label: row.get("label")?,
+        content: serde_json::from_str(&content_str).unwrap_or(serde_json::Value::Null),
+        tags: serde_json::from_str(&tags_str).unwrap_or_default(),
+        visibility: serde_json::from_str(&vis_str).unwrap_or_default(),
+        creator: row.get("creator")?,
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+    })
+}
+
+fn row_to_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<Edge> {
+    let content_str: String = row.get("content_json")?;
+    let vis_str: String = row.get("visibility_json")?;
+
+    Ok(Edge {
+        edge_id: row.get("edge_id")?,
+        graph_id: row.get("graph_id")?,
+        from_node_id: row.get("from_node_id")?,
+        to_node_id: row.get("to_node_id")?,
+        edge_type: row.get("edge_type")?,
+        label: row.get("label")?,
+        content: serde_json::from_str(&content_str).unwrap_or(serde_json::Value::Null),
+        visibility: serde_json::from_str(&vis_str).unwrap_or_default(),
+        creator: row.get("creator")?,
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+    })
+}
+
+// ── Schema validation helpers ─────────────────────────────────────────────────
+
+fn validate_node_type(schema: &GraphSchema, node_type: &str) -> Result<()> {
+    if schema.strict && !schema.node_types.iter().any(|t| t.name == node_type) {
+        bail!(
+            "node type '{}' is not defined in graph schema (strict mode)",
+            node_type
+        );
+    }
+    Ok(())
+}
+
+fn validate_edge_type(schema: &GraphSchema, edge_type: &str) -> Result<()> {
+    if schema.strict && !schema.edge_types.iter().any(|t| t.name == edge_type) {
+        bail!(
+            "edge type '{}' is not defined in graph schema (strict mode)",
+            edge_type
+        );
+    }
+    Ok(())
+}
+
+// ── GraphStore implementation ─────────────────────────────────────────────────
+
+impl GraphStore for SqliteGraphStore {
+    fn create_graph(&self, spec: GraphSpec) -> Result<String> {
+        let graph_id = new_ulid();
+        let now = now_ms();
+        let schema_json = serde_json::to_string(&spec.schema)?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO graphs (graph_id, name, description, schema_json, default_visibility, creator, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                graph_id,
+                spec.name,
+                spec.description,
+                schema_json,
+                spec.default_visibility,
+                spec.creator,
+                now,
+                now,
+            ],
+        )?;
+        Ok(graph_id)
+    }
+
+    fn get_graph(&self, graph_id: &str) -> Result<Option<GraphMeta>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT graph_id, name, description, schema_json, default_visibility, creator, created_at, updated_at
+             FROM graphs WHERE graph_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![graph_id])?;
+        if let Some(row) = rows.next()? {
+            let schema_json: String = row.get("schema_json")?;
+            let schema: GraphSchema = serde_json::from_str(&schema_json).unwrap_or_default();
+            Ok(Some(GraphMeta {
+                graph_id: row.get("graph_id")?,
+                name: row.get("name")?,
+                description: row.get("description")?,
+                schema,
+                default_visibility: row.get("default_visibility")?,
+                creator: row.get("creator")?,
+                created_at: row.get("created_at")?,
+                updated_at: row.get("updated_at")?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn list_graphs(&self) -> Result<Vec<GraphMeta>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT graph_id, name, description, schema_json, default_visibility, creator, created_at, updated_at
+             FROM graphs ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let schema_json: String = row.get("schema_json")?;
+            let schema: GraphSchema =
+                serde_json::from_str(&schema_json).unwrap_or_default();
+            Ok(GraphMeta {
+                graph_id: row.get("graph_id")?,
+                name: row.get("name")?,
+                description: row.get("description")?,
+                schema,
+                default_visibility: row.get("default_visibility")?,
+                creator: row.get("creator")?,
+                created_at: row.get("created_at")?,
+                updated_at: row.get("updated_at")?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
+    fn update_schema(&self, graph_id: &str, new_schema: GraphSchema) -> Result<()> {
+        let meta = self
+            .get_graph(graph_id)?
+            .ok_or_else(|| anyhow!("graph '{}' not found", graph_id))?;
+
+        // Additive-only: reject removal of node types that have live nodes.
+        let existing_node_type_names: HashSet<_> =
+            meta.schema.node_types.iter().map(|t| t.name.as_str()).collect();
+        let new_node_type_names: HashSet<_> =
+            new_schema.node_types.iter().map(|t| t.name.as_str()).collect();
+
+        for removed in existing_node_type_names.difference(&new_node_type_names) {
+            let conn = self.conn.lock().unwrap();
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM nodes WHERE graph_id = ?1 AND node_type = ?2 AND deleted_at IS NULL",
+                params![graph_id, removed],
+                |r| r.get(0),
+            )?;
+            if count > 0 {
+                bail!(
+                    "cannot remove node type '{}': {} node(s) still use it",
+                    removed,
+                    count
+                );
+            }
+        }
+
+        let schema_json = serde_json::to_string(&new_schema)?;
+        let now = now_ms();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE graphs SET schema_json = ?1, updated_at = ?2 WHERE graph_id = ?3",
+            params![schema_json, now, graph_id],
+        )?;
+        Ok(())
+    }
+
+    fn upsert_node(&self, graph_id: &str, input: NodeInput) -> Result<String> {
+        let meta = self
+            .get_graph(graph_id)?
+            .ok_or_else(|| anyhow!("graph '{}' not found", graph_id))?;
+
+        validate_node_type(&meta.schema, &input.node_type)?;
+
+        let node_id = input.node_id.unwrap_or_else(new_ulid);
+        let now = now_ms();
+        let content_json = serde_json::to_string(&input.content)?;
+        let tags_json = serde_json::to_string(&input.tags)?;
+        let vis_json = serde_json::to_string(&input.visibility)?;
+
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO nodes (node_id, graph_id, node_type, label, content_json, tags_json, visibility_json, creator, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(graph_id, node_id) DO UPDATE SET
+               node_type       = excluded.node_type,
+               label           = excluded.label,
+               content_json    = excluded.content_json,
+               tags_json       = excluded.tags_json,
+               visibility_json = excluded.visibility_json,
+               updated_at      = excluded.updated_at,
+               deleted_at      = NULL",
+            params![
+                node_id, graph_id, input.node_type, input.label,
+                content_json, tags_json, vis_json, input.creator, now, now,
+            ],
+        )?;
+
+        // Sync FTS index.
+        conn.execute(
+            "INSERT OR REPLACE INTO nodes_fts (node_id, graph_id, label, content_json)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![node_id, graph_id, input.label, content_json],
+        )?;
+
+        Ok(node_id)
+    }
+
+    fn get_node(&self, graph_id: &str, node_id: &str, identity: &Identity) -> Result<Option<Node>> {
+        let meta = match self.get_graph(graph_id)? {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT node_id, graph_id, node_type, label, content_json, tags_json, visibility_json, creator, created_at, updated_at
+             FROM nodes WHERE graph_id = ?1 AND node_id = ?2 AND deleted_at IS NULL",
+        )?;
+        let mut rows = stmt.query(params![graph_id, node_id])?;
+        if let Some(row) = rows.next()? {
+            let node = row_to_node(row)?;
+            if resolve_node_visibility(&node.visibility, &meta.default_visibility, identity) {
+                Ok(Some(node))
+            } else {
+                Ok(None)
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn list_nodes(&self, graph_id: &str, filter: &NodeFilter, identity: &Identity) -> Result<Vec<Node>> {
+        let meta = match self.get_graph(graph_id)? {
+            Some(m) => m,
+            None => return Ok(vec![]),
+        };
+
+        let conn = self.conn.lock().unwrap();
+
+        // Build a dynamic query. We always filter by graph_id and deleted_at.
+        let mut sql = String::from(
+            "SELECT node_id, graph_id, node_type, label, content_json, tags_json, visibility_json, creator, created_at, updated_at
+             FROM nodes WHERE graph_id = ?1 AND deleted_at IS NULL",
+        );
+        let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(graph_id.to_string())];
+        let mut param_idx = 2usize;
+
+        if let Some(nt) = &filter.node_type {
+            sql.push_str(&format!(" AND node_type = ?{}", param_idx));
+            param_values.push(Box::new(nt.clone()));
+            param_idx += 1;
+        }
+        if let Some(creator) = &filter.creator {
+            sql.push_str(&format!(" AND creator = ?{}", param_idx));
+            param_values.push(Box::new(creator.clone()));
+            // param_idx += 1; // unused after this
+        }
+
+        let mut stmt = conn.prepare(&sql)?;
+        let params_ref: Vec<&dyn rusqlite::ToSql> = param_values.iter().map(|b| b.as_ref()).collect();
+
+        let all_nodes = stmt
+            .query_map(params_ref.as_slice(), row_to_node)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        // Apply in-memory: visibility + optional tag filter (tag filter requires JSON parsing).
+        let nodes = all_nodes
+            .into_iter()
+            .filter(|n| {
+                // Visibility gate.
+                if !resolve_node_visibility(&n.visibility, &meta.default_visibility, identity) {
+                    return false;
+                }
+                // Tag filter: node must contain ALL requested tags.
+                if let Some(required_tags) = &filter.tags {
+                    for required in required_tags {
+                        if !n.tags.contains(required) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .collect();
+
+        Ok(nodes)
+    }
+
+    fn delete_node(&self, graph_id: &str, node_id: &str) -> Result<()> {
+        let now = now_ms();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE nodes SET deleted_at = ?1 WHERE graph_id = ?2 AND node_id = ?3",
+            params![now, graph_id, node_id],
+        )?;
+        // Remove from FTS.
+        conn.execute(
+            "DELETE FROM nodes_fts WHERE graph_id = ?1 AND node_id = ?2",
+            params![graph_id, node_id],
+        )?;
+        Ok(())
+    }
+
+    fn upsert_edge(&self, graph_id: &str, input: EdgeInput) -> Result<String> {
+        let meta = self
+            .get_graph(graph_id)?
+            .ok_or_else(|| anyhow!("graph '{}' not found", graph_id))?;
+
+        validate_edge_type(&meta.schema, &input.edge_type)?;
+
+        // Verify both endpoint nodes exist (not deleted).
+        {
+            let conn = self.conn.lock().unwrap();
+            let from_exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM nodes WHERE graph_id = ?1 AND node_id = ?2 AND deleted_at IS NULL)",
+                params![graph_id, input.from_node_id],
+                |r| r.get(0),
+            )?;
+            if !from_exists {
+                bail!("from_node_id '{}' not found in graph '{}'", input.from_node_id, graph_id);
+            }
+            let to_exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM nodes WHERE graph_id = ?1 AND node_id = ?2 AND deleted_at IS NULL)",
+                params![graph_id, input.to_node_id],
+                |r| r.get(0),
+            )?;
+            if !to_exists {
+                bail!("to_node_id '{}' not found in graph '{}'", input.to_node_id, graph_id);
+            }
+        }
+
+        let edge_id = input.edge_id.unwrap_or_else(new_ulid);
+        let now = now_ms();
+        let content_json = serde_json::to_string(&input.content)?;
+        let vis_json = serde_json::to_string(&input.visibility)?;
+
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO edges (edge_id, graph_id, from_node_id, to_node_id, edge_type, label, content_json, visibility_json, creator, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(graph_id, edge_id) DO UPDATE SET
+               edge_type       = excluded.edge_type,
+               label           = excluded.label,
+               content_json    = excluded.content_json,
+               visibility_json = excluded.visibility_json,
+               updated_at      = excluded.updated_at,
+               deleted_at      = NULL",
+            params![
+                edge_id, graph_id, input.from_node_id, input.to_node_id,
+                input.edge_type, input.label, content_json, vis_json,
+                input.creator, now, now,
+            ],
+        )?;
+        Ok(edge_id)
+    }
+
+    fn get_edge(&self, graph_id: &str, edge_id: &str, identity: &Identity) -> Result<Option<Edge>> {
+        let meta = match self.get_graph(graph_id)? {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT edge_id, graph_id, from_node_id, to_node_id, edge_type, label, content_json, visibility_json, creator, created_at, updated_at
+             FROM edges WHERE graph_id = ?1 AND edge_id = ?2 AND deleted_at IS NULL",
+        )?;
+        let mut rows = stmt.query(params![graph_id, edge_id])?;
+        if let Some(row) = rows.next()? {
+            let edge = row_to_edge(row)?;
+            // Check both endpoint visibilities and the edge's own visibility.
+            let from_vis = self.node_is_visible_locked(&conn, graph_id, &edge.from_node_id, &meta.default_visibility, identity);
+            let to_vis = self.node_is_visible_locked(&conn, graph_id, &edge.to_node_id, &meta.default_visibility, identity);
+            if resolve_edge_visibility(&edge.visibility, &meta.default_visibility, from_vis, to_vis, identity) {
+                Ok(Some(edge))
+            } else {
+                Ok(None)
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn list_edges(&self, graph_id: &str, filter: &EdgeFilter, identity: &Identity) -> Result<Vec<Edge>> {
+        let meta = match self.get_graph(graph_id)? {
+            Some(m) => m,
+            None => return Ok(vec![]),
+        };
+        let conn = self.conn.lock().unwrap();
+
+        let mut sql = String::from(
+            "SELECT edge_id, graph_id, from_node_id, to_node_id, edge_type, label, content_json, visibility_json, creator, created_at, updated_at
+             FROM edges WHERE graph_id = ?1 AND deleted_at IS NULL",
+        );
+        let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(graph_id.to_string())];
+        let mut param_idx = 2usize;
+
+        if let Some(from) = &filter.from_node_id {
+            sql.push_str(&format!(" AND from_node_id = ?{}", param_idx));
+            param_values.push(Box::new(from.clone()));
+            param_idx += 1;
+        }
+        if let Some(to) = &filter.to_node_id {
+            sql.push_str(&format!(" AND to_node_id = ?{}", param_idx));
+            param_values.push(Box::new(to.clone()));
+            param_idx += 1;
+        }
+        if let Some(et) = &filter.edge_type {
+            sql.push_str(&format!(" AND edge_type = ?{}", param_idx));
+            param_values.push(Box::new(et.clone()));
+            param_idx += 1;
+        }
+        if let Some(creator) = &filter.creator {
+            sql.push_str(&format!(" AND creator = ?{}", param_idx));
+            param_values.push(Box::new(creator.clone()));
+            // param_idx += 1;
+        }
+
+        let mut stmt = conn.prepare(&sql)?;
+        let params_ref: Vec<&dyn rusqlite::ToSql> = param_values.iter().map(|b| b.as_ref()).collect();
+        let all_edges = stmt
+            .query_map(params_ref.as_slice(), row_to_edge)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        // Cache node visibility lookups to avoid redundant queries.
+        let mut vis_cache: HashMap<String, bool> = HashMap::new();
+        let mut node_visible = |node_id: &str| -> bool {
+            if let Some(&v) = vis_cache.get(node_id) {
+                return v;
+            }
+            let v = self.node_is_visible_locked(&conn, graph_id, node_id, &meta.default_visibility, identity);
+            vis_cache.insert(node_id.to_string(), v);
+            v
+        };
+
+        let edges = all_edges
+            .into_iter()
+            .filter(|e| {
+                let from_vis = node_visible(&e.from_node_id);
+                let to_vis = node_visible(&e.to_node_id);
+                resolve_edge_visibility(&e.visibility, &meta.default_visibility, from_vis, to_vis, identity)
+            })
+            .collect();
+
+        Ok(edges)
+    }
+
+    fn delete_edge(&self, graph_id: &str, edge_id: &str) -> Result<()> {
+        let now = now_ms();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE edges SET deleted_at = ?1 WHERE graph_id = ?2 AND edge_id = ?3",
+            params![now, graph_id, edge_id],
+        )?;
+        Ok(())
+    }
+
+    fn traverse(&self, graph_id: &str, query: &TraversalQuery, identity: &Identity) -> Result<TraversalResult> {
+        let meta = self
+            .get_graph(graph_id)?
+            .ok_or_else(|| anyhow!("graph '{}' not found", graph_id))?;
+
+        let mut visited_nodes: HashSet<String> = HashSet::new();
+        let mut result_nodes: Vec<crate::graph::Node> = Vec::new();
+        let mut result_edges: Vec<Edge> = Vec::new();
+
+        // BFS queue: (node_id, depth)
+        let mut queue: VecDeque<(String, u32)> = VecDeque::new();
+        queue.push_back((query.start_node_id.clone(), 0));
+
+        while let Some((current_id, depth)) = queue.pop_front() {
+            if visited_nodes.contains(&current_id) {
+                continue;
+            }
+
+            // Fetch and visibility-check the node.
+            let node = match self.get_node(graph_id, &current_id, identity)? {
+                Some(n) => n,
+                None => continue, // not visible or deleted
+            };
+
+            visited_nodes.insert(current_id.clone());
+            result_nodes.push(node);
+
+            if depth >= query.max_depth {
+                continue;
+            }
+
+            // Fetch adjacent edges according to the traversal direction.
+            let conn = self.conn.lock().unwrap();
+            let mut candidate_edges: Vec<Edge> = Vec::new();
+
+            match &query.direction {
+                TraversalDirection::Outbound | TraversalDirection::Both => {
+                    let edges = Self::fetch_edges_from_locked(&conn, graph_id, &current_id, query.edge_types.as_deref())?;
+                    candidate_edges.extend(edges);
+                }
+                _ => {}
+            }
+            match &query.direction {
+                TraversalDirection::Inbound | TraversalDirection::Both => {
+                    let edges = Self::fetch_edges_to_locked(&conn, graph_id, &current_id, query.edge_types.as_deref())?;
+                    candidate_edges.extend(edges);
+                }
+                _ => {}
+            }
+            drop(conn);
+
+            for edge in candidate_edges {
+                let from_vis = self.node_raw_visible(graph_id, &edge.from_node_id, &meta.default_visibility, identity);
+                let to_vis = self.node_raw_visible(graph_id, &edge.to_node_id, &meta.default_visibility, identity);
+                if !resolve_edge_visibility(&edge.visibility, &meta.default_visibility, from_vis, to_vis, identity) {
+                    continue;
+                }
+
+                let next_id = match &query.direction {
+                    TraversalDirection::Outbound => edge.to_node_id.clone(),
+                    TraversalDirection::Inbound => edge.from_node_id.clone(),
+                    TraversalDirection::Both => {
+                        if edge.from_node_id == current_id { edge.to_node_id.clone() } else { edge.from_node_id.clone() }
+                    }
+                };
+
+                if !visited_nodes.contains(&next_id) {
+                    queue.push_back((next_id, depth + 1));
+                }
+                result_edges.push(edge);
+            }
+        }
+
+        Ok(TraversalResult {
+            nodes: result_nodes,
+            edges: result_edges,
+        })
+    }
+
+    fn search_nodes(&self, graph_id: &str, query: &str, identity: &Identity) -> Result<Vec<crate::graph::Node>> {
+        let meta = match self.get_graph(graph_id)? {
+            Some(m) => m,
+            None => return Ok(vec![]),
+        };
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT n.node_id, n.graph_id, n.node_type, n.label, n.content_json, n.tags_json, n.visibility_json, n.creator, n.created_at, n.updated_at
+             FROM nodes n
+             JOIN nodes_fts f ON n.node_id = f.node_id AND n.graph_id = f.graph_id
+             WHERE f.nodes_fts MATCH ?1
+               AND n.graph_id = ?2
+               AND n.deleted_at IS NULL",
+        )?;
+        let all_nodes = stmt
+            .query_map(params![query, graph_id], row_to_node)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let nodes = all_nodes
+            .into_iter()
+            .filter(|n| resolve_node_visibility(&n.visibility, &meta.default_visibility, identity))
+            .collect();
+
+        Ok(nodes)
+    }
+}
+
+// ── Internal helpers (not part of the trait) ──────────────────────────────────
+
+impl SqliteGraphStore {
+    /// Check node visibility using an already-held connection lock.
+    fn node_is_visible_locked(
+        &self,
+        conn: &Connection,
+        graph_id: &str,
+        node_id: &str,
+        default_visibility: &str,
+        identity: &Identity,
+    ) -> bool {
+        let result: rusqlite::Result<String> = conn.query_row(
+            "SELECT visibility_json FROM nodes WHERE graph_id = ?1 AND node_id = ?2 AND deleted_at IS NULL",
+            params![graph_id, node_id],
+            |r| r.get(0),
+        );
+        match result {
+            Ok(vis_json) => {
+                let vis: Vec<String> = serde_json::from_str(&vis_json).unwrap_or_default();
+                resolve_node_visibility(&vis, default_visibility, identity)
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Same check but acquires the lock itself (for use in traverse where conn is already dropped).
+    fn node_raw_visible(
+        &self,
+        graph_id: &str,
+        node_id: &str,
+        default_visibility: &str,
+        identity: &Identity,
+    ) -> bool {
+        let conn = self.conn.lock().unwrap();
+        self.node_is_visible_locked(&conn, graph_id, node_id, default_visibility, identity)
+    }
+
+    fn fetch_edges_from_locked(
+        conn: &Connection,
+        graph_id: &str,
+        from_node_id: &str,
+        edge_type_filter: Option<&[String]>,
+    ) -> Result<Vec<Edge>> {
+        let base = "SELECT edge_id, graph_id, from_node_id, to_node_id, edge_type, label, content_json, visibility_json, creator, created_at, updated_at
+                    FROM edges WHERE graph_id = ?1 AND from_node_id = ?2 AND deleted_at IS NULL";
+        Self::fetch_edges_with_optional_type(conn, base, graph_id, from_node_id, edge_type_filter)
+    }
+
+    fn fetch_edges_to_locked(
+        conn: &Connection,
+        graph_id: &str,
+        to_node_id: &str,
+        edge_type_filter: Option<&[String]>,
+    ) -> Result<Vec<Edge>> {
+        let base = "SELECT edge_id, graph_id, from_node_id, to_node_id, edge_type, label, content_json, visibility_json, creator, created_at, updated_at
+                    FROM edges WHERE graph_id = ?1 AND to_node_id = ?2 AND deleted_at IS NULL";
+        Self::fetch_edges_with_optional_type(conn, base, graph_id, to_node_id, edge_type_filter)
+    }
+
+    fn fetch_edges_with_optional_type(
+        conn: &Connection,
+        base_sql: &str,
+        graph_id: &str,
+        node_id: &str,
+        edge_type_filter: Option<&[String]>,
+    ) -> Result<Vec<Edge>> {
+        // If there's an edge type filter, we apply it in memory since SQLite
+        // doesn't easily handle IN (?) for variable-length lists without extra work.
+        let mut stmt = conn.prepare(base_sql)?;
+        let all_edges = stmt
+            .query_map(params![graph_id, node_id], row_to_edge)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        if let Some(types) = edge_type_filter {
+            Ok(all_edges.into_iter().filter(|e| types.contains(&e.edge_type)).collect())
+        } else {
+            Ok(all_edges)
+        }
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::*;
+
+    fn store() -> SqliteGraphStore {
+        SqliteGraphStore::open_in_memory().expect("in-memory store")
+    }
+
+    fn public_graph(store: &SqliteGraphStore) -> String {
+        store
+            .create_graph(GraphSpec {
+                name: "test-graph".into(),
+                description: None,
+                schema: GraphSchema {
+                    node_types: vec![
+                        NodeTypeSpec { name: "Research".into(), description: None },
+                        NodeTypeSpec { name: "Goal".into(), description: None },
+                    ],
+                    edge_types: vec![
+                        EdgeTypeSpec {
+                            name: "SUPPORTS".into(),
+                            description: None,
+                            allowed_from: None,
+                            allowed_to: None,
+                        },
+                    ],
+                    strict: true,
+                },
+                default_visibility: "public".into(),
+                creator: "alice".into(),
+            })
+            .expect("create graph")
+    }
+
+    fn private_graph(store: &SqliteGraphStore) -> String {
+        store
+            .create_graph(GraphSpec {
+                name: "private-graph".into(),
+                description: None,
+                schema: GraphSchema::default(),
+                default_visibility: "private".into(),
+                creator: "alice".into(),
+            })
+            .expect("create private graph")
+    }
+
+    fn alice() -> Identity {
+        Identity::new("alice").with_roles(vec!["researcher".into()])
+    }
+
+    fn bob() -> Identity {
+        Identity::new("bob")
+    }
+
+    // ── Graph CRUD ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn create_and_get_graph() {
+        let store = store();
+        let gid = public_graph(&store);
+        let meta = store.get_graph(&gid).unwrap().unwrap();
+        assert_eq!(meta.name, "test-graph");
+        assert_eq!(meta.default_visibility, "public");
+        assert_eq!(meta.schema.node_types.len(), 2);
+    }
+
+    #[test]
+    fn list_graphs_returns_all() {
+        let store = store();
+        let _ = public_graph(&store);
+        let _ = private_graph(&store);
+        let graphs = store.list_graphs().unwrap();
+        assert_eq!(graphs.len(), 2);
+    }
+
+    // ── Node CRUD ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn upsert_and_get_node() {
+        let store = store();
+        let gid = public_graph(&store);
+        let nid = store
+            .upsert_node(
+                &gid,
+                NodeInput {
+                    node_id: None,
+                    node_type: "Research".into(),
+                    label: "Finding Alpha".into(),
+                    content: serde_json::json!({ "summary": "important" }),
+                    tags: vec!["important".into()],
+                    visibility: vec!["public".into()],
+                    creator: "alice".into(),
+                },
+            )
+            .unwrap();
+
+        let node = store.get_node(&gid, &nid, &alice()).unwrap().unwrap();
+        assert_eq!(node.label, "Finding Alpha");
+        assert_eq!(node.node_type, "Research");
+    }
+
+    #[test]
+    fn strict_schema_rejects_unknown_node_type() {
+        let store = store();
+        let gid = public_graph(&store);
+        let result = store.upsert_node(
+            &gid,
+            NodeInput {
+                node_id: None,
+                node_type: "Unknown".into(),
+                label: "oops".into(),
+                content: serde_json::Value::Null,
+                tags: vec![],
+                visibility: vec![],
+                creator: "alice".into(),
+            },
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("strict mode"));
+    }
+
+    #[test]
+    fn node_upsert_is_idempotent() {
+        let store = store();
+        let gid = public_graph(&store);
+        let nid = "fixed-id".to_string();
+        let input = || NodeInput {
+            node_id: Some(nid.clone()),
+            node_type: "Research".into(),
+            label: "First".into(),
+            content: serde_json::Value::Null,
+            tags: vec![],
+            visibility: vec!["public".into()],
+            creator: "alice".into(),
+        };
+        store.upsert_node(&gid, input()).unwrap();
+        let mut updated = input();
+        updated.label = "Updated".into();
+        store.upsert_node(&gid, updated).unwrap();
+
+        let node = store.get_node(&gid, &nid, &alice()).unwrap().unwrap();
+        assert_eq!(node.label, "Updated");
+    }
+
+    #[test]
+    fn soft_delete_hides_node() {
+        let store = store();
+        let gid = public_graph(&store);
+        let nid = store
+            .upsert_node(&gid, NodeInput {
+                node_id: None, node_type: "Research".into(), label: "gone".into(),
+                content: serde_json::Value::Null, tags: vec![], visibility: vec!["public".into()],
+                creator: "alice".into(),
+            })
+            .unwrap();
+        store.delete_node(&gid, &nid).unwrap();
+        assert!(store.get_node(&gid, &nid, &alice()).unwrap().is_none());
+    }
+
+    // ── Visibility ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn private_node_hidden_from_other_identity() {
+        let store = store();
+        let gid = private_graph(&store);
+        let nid = store
+            .upsert_node(&gid, NodeInput {
+                node_id: None, node_type: "".into(), label: "secret".into(),
+                content: serde_json::Value::Null, tags: vec![],
+                visibility: vec!["identity:alice".into()],
+                creator: "alice".into(),
+            })
+            .unwrap();
+        assert!(store.get_node(&gid, &nid, &alice()).unwrap().is_some());
+        assert!(store.get_node(&gid, &nid, &bob()).unwrap().is_none());
+    }
+
+    #[test]
+    fn role_visibility_permits_matching_role() {
+        let store = store();
+        let gid = private_graph(&store);
+        let nid = store
+            .upsert_node(&gid, NodeInput {
+                node_id: None, node_type: "".into(), label: "research-only".into(),
+                content: serde_json::Value::Null, tags: vec![],
+                visibility: vec!["role:researcher".into()],
+                creator: "alice".into(),
+            })
+            .unwrap();
+        assert!(store.get_node(&gid, &nid, &alice()).unwrap().is_some()); // alice has researcher role
+        assert!(store.get_node(&gid, &nid, &bob()).unwrap().is_none());   // bob does not
+    }
+
+    // ── Edge CRUD ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn upsert_and_get_edge() {
+        let store = store();
+        let gid = public_graph(&store);
+        let n1 = store.upsert_node(&gid, NodeInput {
+            node_id: None, node_type: "Research".into(), label: "A".into(),
+            content: serde_json::Value::Null, tags: vec![], visibility: vec!["public".into()],
+            creator: "alice".into(),
+        }).unwrap();
+        let n2 = store.upsert_node(&gid, NodeInput {
+            node_id: None, node_type: "Goal".into(), label: "B".into(),
+            content: serde_json::Value::Null, tags: vec![], visibility: vec!["public".into()],
+            creator: "alice".into(),
+        }).unwrap();
+        let eid = store.upsert_edge(&gid, EdgeInput {
+            edge_id: None, from_node_id: n1.clone(), to_node_id: n2.clone(),
+            edge_type: "SUPPORTS".into(), label: None,
+            content: serde_json::Value::Null, visibility: vec!["public".into()],
+            creator: "alice".into(),
+        }).unwrap();
+
+        let edge = store.get_edge(&gid, &eid, &alice()).unwrap().unwrap();
+        assert_eq!(edge.from_node_id, n1);
+        assert_eq!(edge.to_node_id, n2);
+        assert_eq!(edge.edge_type, "SUPPORTS");
+    }
+
+    #[test]
+    fn edge_hidden_when_endpoint_not_visible() {
+        let store = store();
+        let gid = private_graph(&store);
+        let n1 = store.upsert_node(&gid, NodeInput {
+            node_id: None, node_type: "".into(), label: "A".into(),
+            content: serde_json::Value::Null, tags: vec![],
+            visibility: vec!["identity:alice".into()], // alice only
+            creator: "alice".into(),
+        }).unwrap();
+        let n2 = store.upsert_node(&gid, NodeInput {
+            node_id: None, node_type: "".into(), label: "B".into(),
+            content: serde_json::Value::Null, tags: vec![],
+            visibility: vec!["public".into()],
+            creator: "alice".into(),
+        }).unwrap();
+        let eid = store.upsert_edge(&gid, EdgeInput {
+            edge_id: None, from_node_id: n1, to_node_id: n2,
+            edge_type: "".into(), label: None,
+            content: serde_json::Value::Null, visibility: vec!["public".into()],
+            creator: "alice".into(),
+        }).unwrap();
+
+        assert!(store.get_edge(&gid, &eid, &alice()).unwrap().is_some());
+        assert!(store.get_edge(&gid, &eid, &bob()).unwrap().is_none()); // n1 hidden from bob
+    }
+
+    // ── Traversal ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn traverse_follows_outbound_edges() {
+        let store = store();
+        let gid = public_graph(&store);
+        let n1 = store.upsert_node(&gid, NodeInput {
+            node_id: None, node_type: "Research".into(), label: "root".into(),
+            content: serde_json::Value::Null, tags: vec![], visibility: vec!["public".into()],
+            creator: "alice".into(),
+        }).unwrap();
+        let n2 = store.upsert_node(&gid, NodeInput {
+            node_id: None, node_type: "Goal".into(), label: "child".into(),
+            content: serde_json::Value::Null, tags: vec![], visibility: vec!["public".into()],
+            creator: "alice".into(),
+        }).unwrap();
+        store.upsert_edge(&gid, EdgeInput {
+            edge_id: None, from_node_id: n1.clone(), to_node_id: n2.clone(),
+            edge_type: "SUPPORTS".into(), label: None,
+            content: serde_json::Value::Null, visibility: vec!["public".into()],
+            creator: "alice".into(),
+        }).unwrap();
+
+        let result = store.traverse(&gid, &TraversalQuery {
+            start_node_id: n1,
+            direction: TraversalDirection::Outbound,
+            max_depth: 2,
+            edge_types: None,
+        }, &alice()).unwrap();
+
+        let node_ids: Vec<_> = result.nodes.iter().map(|n| &n.node_id).collect();
+        assert!(node_ids.contains(&&n2));
+        assert_eq!(result.edges.len(), 1);
+    }
+
+    // ── Schema update ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn schema_update_can_add_types() {
+        let store = store();
+        let gid = public_graph(&store);
+        let mut meta = store.get_graph(&gid).unwrap().unwrap();
+        meta.schema.node_types.push(NodeTypeSpec { name: "Decision".into(), description: None });
+        store.update_schema(&gid, meta.schema).unwrap();
+        let updated = store.get_graph(&gid).unwrap().unwrap();
+        assert_eq!(updated.schema.node_types.len(), 3);
+    }
+
+    #[test]
+    fn schema_update_cannot_remove_used_type() {
+        let store = store();
+        let gid = public_graph(&store);
+        store.upsert_node(&gid, NodeInput {
+            node_id: None, node_type: "Research".into(), label: "test".into(),
+            content: serde_json::Value::Null, tags: vec![], visibility: vec!["public".into()],
+            creator: "alice".into(),
+        }).unwrap();
+        // Try to update schema with Research type removed.
+        let schema = GraphSchema {
+            node_types: vec![NodeTypeSpec { name: "Goal".into(), description: None }],
+            edge_types: vec![],
+            strict: true,
+        };
+        let result = store.update_schema(&gid, schema);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("cannot remove node type"));
+    }
+}
