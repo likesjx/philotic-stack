@@ -2457,7 +2457,7 @@ fn task_runner_kind_for_tool(tool_name: &str) -> Option<String> {
         return Some("workspace".into());
     }
 
-    if tool_name.starts_with("shell.") {
+    if tool_name.starts_with("shell.") || tool_name == "bash.exec" {
         return Some("shell".into());
     }
 

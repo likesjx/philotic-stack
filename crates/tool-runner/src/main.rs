@@ -8,6 +8,7 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 use tracing::{info, warn};
+use tokio::process::Command as TokioCommand;
 
 fn local_node_id() -> String {
     std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string())
@@ -545,6 +546,59 @@ async fn execute_memory_tool(
     }
 }
 
+// ──── Shell tool helpers ──────────────────────────────────────────────────────
+
+async fn execute_bash_tool(arguments: &serde_json::Value) -> String {
+    let command = match arguments.get("command").and_then(|v| v.as_str()) {
+        Some(cmd) => cmd,
+        None => return "bash.exec error: missing `command`".into(),
+    };
+    let working_dir = arguments
+        .get("working_dir")
+        .and_then(|v| v.as_str());
+    let timeout_secs = arguments
+        .get("timeout_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(30)
+        .min(300);
+
+    let mut cmd = TokioCommand::new("sh");
+    cmd.arg("-c").arg(command);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    if let Some(dir) = working_dir {
+        cmd.current_dir(dir);
+    }
+
+    let result = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
+        match cmd.spawn() {
+            Ok(child) => child.wait_with_output().await,
+            Err(e) => Err(e),
+        }
+    })
+    .await;
+
+    match result {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let exit_code = output.status.code().unwrap_or(-1);
+            if stderr.is_empty() {
+                format!("exit_code: {}\n{}", exit_code, stdout.trim_end())
+            } else {
+                format!(
+                    "exit_code: {}\nstdout:\n{}\nstderr:\n{}",
+                    exit_code,
+                    stdout.trim_end(),
+                    stderr.trim_end()
+                )
+            }
+        }
+        Ok(Err(e)) => format!("bash.exec error: {e}"),
+        Err(_) => format!("bash.exec error: timed out after {timeout_secs}s"),
+    }
+}
+
 // ──── Entry point ─────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -565,6 +619,7 @@ async fn main() -> Result<()> {
             "memory.remember".into(),
             "memory.forget".into(),
             "memory.link".into(),
+            "bash.exec".into(),
         ],
     };
     let mut ipc_client = PhiloticClient::connect(identity).await?;
@@ -578,6 +633,7 @@ async fn main() -> Result<()> {
         "tool.memory.remember",
         "tool.memory.forget",
         "tool.memory.link",
+        "tool.bash.exec",
     ] {
         let _ = ipc_client
             .send_request(IpcRequest::SubscribeInbox { role: role.to_string() })
@@ -680,6 +736,8 @@ async fn main() -> Result<()> {
                         }
                         None => format!("{tool_name} error: memory not configured on this hotel"),
                     }
+                } else if tool_name == "bash.exec" {
+                    execute_bash_tool(&arguments).await
                 } else {
                     execute_tool(&effective_config, &tool_name, &arguments)
                 };
