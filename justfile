@@ -275,6 +275,7 @@ jane-push:
             chmod u+w "$CELLAR/$bin"
             cp target/release/$bin "$CELLAR/$bin"
             chmod u-w "$CELLAR/$bin"
+            ln -sf "$CELLAR/$bin" /opt/homebrew/bin/$bin
             echo "  ✓ $bin"
         fi
     done
