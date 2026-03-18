@@ -257,6 +257,31 @@ operator-checklist:
     @echo "   - watched-live-green"
     @echo "5. Note any assumption-vs-reality gaps before closing the slice"
 
+# Build release binaries and hot-push them into the Homebrew Cellar (mbp-jane).
+# Stops Jane, installs, restarts with PHILOTIC_PROFILE=jane.
+jane-push:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    CELLAR=/opt/homebrew/Cellar/aiua/0.1.0-alpha/bin
+    BINS="aiua philote membrane model-router model-controller-gemini model-controller-elevenlabs philote-worker tool-runner"
+    echo "▶ Building release binaries..."
+    cargo build --release -p aiua -p philote -p membrane -p model-router -p tool-runner
+    echo "▶ Stopping Jane..."
+    PHILOTIC_PROFILE=jane phil stop 2>/dev/null || true
+    sleep 1
+    echo "▶ Installing binaries into Cellar..."
+    for bin in $BINS; do
+        if [ -f target/release/$bin ]; then
+            chmod u+w "$CELLAR/$bin"
+            cp target/release/$bin "$CELLAR/$bin"
+            chmod u-w "$CELLAR/$bin"
+            echo "  ✓ $bin"
+        fi
+    done
+    echo "▶ Starting Jane..."
+    PHILOTIC_PROFILE=jane phil start --hotel default
+    echo "✅ Jane updated and running."
+
 # Show configured Ansible inventory for deployment targets
 ansible-inventory:
     cd ansible && ansible-inventory --list
