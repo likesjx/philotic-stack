@@ -640,6 +640,7 @@ impl AgentRuntime {
         let inbound_final_reply_guest_id = task.final_reply_guest_id.clone();
 
         self.ensure_session_loaded(&session_id, &source).await?;
+        self.refresh_bindings_from_snapshot(&session_id).await;
 
         let (final_reply_to, final_reply_role, final_reply_guest_id) = {
             let state = self.sessions.entry(session_id.clone()).or_insert_with(|| {
@@ -4378,6 +4379,56 @@ impl AgentRuntime {
             .await?;
 
         Ok(())
+    }
+
+    /// Re-fetches the session snapshot from the hotel on every user turn and merges the latest
+    /// effective_toolset and effective_skillset into the live session state, then rebuilds the
+    /// tool assembly. This ensures tool grants and profile changes take effect immediately on
+    /// the next message without requiring a session restart or reconnect.
+    async fn refresh_bindings_from_snapshot(&mut self, session_id: &str) {
+        let response = self
+            .ipc_client
+            .send_request(IpcRequest::GetConfig {
+                key: format!("__session_snapshot__:{session_id}"),
+            })
+            .await;
+
+        let snapshot = match response {
+            Ok(IpcResponse::ConfigData {
+                value_json: Some(ref value_json),
+                ..
+            }) => serde_json::from_str::<serde_json::Value>(value_json).ok(),
+            _ => None,
+        };
+
+        let Some(snapshot) = snapshot else { return };
+        let Some(bindings) = snapshot.get("bindings") else { return };
+
+        let new_toolset: Option<Vec<String>> = bindings
+            .get("effective_toolset")
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let new_skillset: Option<Vec<String>> = bindings
+            .get("effective_skillset")
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+
+        let Some(state) = self.sessions.get_mut(session_id) else { return };
+
+        let mut changed = false;
+        if let Some(toolset) = new_toolset {
+            if toolset != state.bindings.effective_toolset {
+                state.bindings.effective_toolset = toolset;
+                changed = true;
+            }
+        }
+        if let Some(skillset) = new_skillset {
+            if skillset != state.bindings.effective_skillset {
+                state.bindings.effective_skillset = skillset;
+                changed = true;
+            }
+        }
+        if changed {
+            state.rebuild_default_tool_assembly();
+        }
     }
 
     async fn ensure_session_loaded(
