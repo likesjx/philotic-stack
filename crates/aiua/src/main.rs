@@ -748,9 +748,7 @@ fn hotel_shared_guests(hotel_name: &str, profiles: &[AgentProfile]) -> Vec<Guest
                 }
             })
             .to_string(),
-            // Not yet implemented — marked inactive so the hotel skips spawn
-            // without a hard failure. Activate when tool-runner crate exists.
-            is_active: false,
+            is_active: true,
             active_pid: None,
             last_active_at: None,
         },
