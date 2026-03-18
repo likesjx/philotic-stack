@@ -743,8 +743,26 @@ fn hotel_shared_guests(hotel_name: &str, profiles: &[AgentProfile]) -> Vec<Guest
                 "command": "tool-runner",
                 "args": [],
                 "env": {
+                    "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
+                    "PHILOTIC_NODE_ID": node_id.clone()
+                }
+            })
+            .to_string(),
+            is_active: true,
+            active_pid: None,
+            last_active_at: None,
+        },
+        GuestRecord {
+            hotel_name: hotel_name.to_string(),
+            guest_id: format!("{hotel_name}:graph-runner"),
+            role: "tool.graph".into(),
+            config_json: serde_json::json!({
+                "command": "graph-runner",
+                "args": [],
+                "env": {
                     "PHILOTIC_HOTEL_SOCKET": socket_path,
-                    "PHILOTIC_NODE_ID": node_id
+                    "PHILOTIC_NODE_ID": node_id,
+                    "PHILOTIC_GRAPH_RUNNER_ID": format!("{hotel_name}:graph-runner")
                 }
             })
             .to_string(),
