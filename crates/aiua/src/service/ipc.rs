@@ -3186,25 +3186,36 @@ impl IpcServer {
             });
 
         if let Some(role_record) = &active_role_record {
-            let is_unseeded = bindings.get("effective_toolset").is_none()
-                && bindings.get("effective_skillset").is_none();
-            if is_unseeded {
-                if let Ok(Some(profile)) = graph.get_toolset_profile(&role_record.toolset_profile) {
-                    if let Some(obj) = bindings.as_object_mut() {
-                        obj.insert(
-                            "effective_toolset".to_string(),
-                            serde_json::json!(profile.allowed_tools),
-                        );
-                        obj.insert(
-                            "effective_skillset".to_string(),
-                            serde_json::json!(profile.allowed_skills),
-                        );
-                    } else {
-                        bindings = serde_json::json!({
-                            "effective_toolset": profile.allowed_tools,
-                            "effective_skillset": profile.allowed_skills,
-                        });
+            if let Ok(Some(profile)) = graph.get_toolset_profile(&role_record.toolset_profile) {
+                // Always union the current profile tools into the stored effective_toolset so that
+                // profile additions flow through to existing sessions on hotel restart, without
+                // discarding any tools the agent added itself above the profile baseline.
+                let mut toolset: Vec<String> = bindings
+                    .get("effective_toolset")
+                    .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+                    .unwrap_or_default();
+                for tool in &profile.allowed_tools {
+                    if !toolset.contains(tool) {
+                        toolset.push(tool.clone());
                     }
+                }
+                let mut skillset: Vec<String> = bindings
+                    .get("effective_skillset")
+                    .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+                    .unwrap_or_default();
+                for skill in &profile.allowed_skills {
+                    if !skillset.contains(skill) {
+                        skillset.push(skill.clone());
+                    }
+                }
+                if let Some(obj) = bindings.as_object_mut() {
+                    obj.insert("effective_toolset".to_string(), serde_json::json!(toolset));
+                    obj.insert("effective_skillset".to_string(), serde_json::json!(skillset));
+                } else {
+                    bindings = serde_json::json!({
+                        "effective_toolset": toolset,
+                        "effective_skillset": skillset,
+                    });
                 }
             }
         }
