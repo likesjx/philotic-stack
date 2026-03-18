@@ -1209,13 +1209,28 @@ impl SessionState {
             .as_ref()
             .map(|turn| format!("active turn {} ({})", turn.turn_id, turn.phase.as_str()))
             .unwrap_or_else(|| "no active turn".into());
-        let toolset = if self.bindings.effective_toolset.is_empty() {
-            "default".into()
-        } else {
-            self.bindings.effective_toolset.join(", ")
+
+        // Prefer the live tool assembly (what the model actually sees) over raw bindings.
+        let toolset = {
+            let live: Vec<&str> = self
+                .tool_assembly
+                .tools_for_model
+                .iter()
+                .map(|t| t.tool_name.as_str())
+                .collect();
+            if live.is_empty() {
+                if self.bindings.effective_toolset.is_empty() {
+                    "none".into()
+                } else {
+                    self.bindings.effective_toolset.join(", ")
+                }
+            } else {
+                live.join(", ")
+            }
         };
+
         let skillset = if self.bindings.effective_skillset.is_empty() {
-            "default".into()
+            "none".into()
         } else {
             self.bindings.effective_skillset.join(", ")
         };
@@ -1223,10 +1238,10 @@ impl SessionState {
             .bindings
             .effective_workspace_ref
             .clone()
-            .unwrap_or_else(|| "default".into());
+            .unwrap_or_else(|| "none".into());
         let routing = self
             .component_route_summary()
-            .unwrap_or_else(|| "default".into());
+            .unwrap_or_else(|| "none".into());
         let delivery = self
             .transport_reply_target()
             .map(|target| {
@@ -1239,7 +1254,7 @@ impl SessionState {
             .unwrap_or_else(|| "unbound".into());
 
         format!(
-            "Session status: {}. {}. Toolset: {}. Skillset: {}. Workspace: {}. Component routes: {}. Delivery target: {}.",
+            "Session status: {}. {}. Tools: {}. Skills: {}. Workspace: {}. Routes: {}. Delivery: {}.",
             self.status, active_turn, toolset, skillset, workspace, routing, delivery
         )
     }
@@ -3679,12 +3694,12 @@ mod tests {
 
         let text = state.session_status_text();
         assert!(text.contains("Session status: paused."));
-        assert!(text.contains("Toolset: echo."));
+        assert!(text.contains("Tools: echo."));
         assert!(text.contains("Workspace: workspace://main."));
-        assert!(text.contains("Component routes: text.generate [legacy] impl=gemini-flash."));
+        assert!(text.contains("Routes: text.generate [legacy] impl=gemini-flash."));
         assert!(
             text.contains(
-                "Delivery target: local-aiua-01 / membrane guest=membrane-telegram-01."
+                "Delivery: local-aiua-01 / membrane guest=membrane-telegram-01."
             )
         );
     }
