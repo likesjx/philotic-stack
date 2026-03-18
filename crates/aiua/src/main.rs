@@ -1235,6 +1235,7 @@ fn seed_toolset_profiles(graph: &dyn GraphStorage) -> anyhow::Result<()> {
                 "subagent.spawn".into(),
                 "workspace.list".into(),
                 "workspace.read".into(),
+                "bash.exec".into(),
             ],
             allowed_classes: vec!["session".into(), "utility".into(), "config".into()],
             allowed_skills: vec![
@@ -1284,8 +1285,9 @@ fn seed_toolset_profiles(graph: &dyn GraphStorage) -> anyhow::Result<()> {
                 "role.configure".into(),
                 "workspace.list".into(),
                 "workspace.read".into(),
+                "bash.exec".into(),
             ],
-            allowed_classes: vec!["session".into(), "utility".into(), "config".into()],
+            allowed_classes: vec!["session".into(), "utility".into(), "config".into(), "shell".into()],
             allowed_skills: vec![
                 "skill.crafting".into(),
                 "handoff.to_role".into(),
