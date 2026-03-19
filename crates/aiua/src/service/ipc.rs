@@ -292,7 +292,9 @@ impl IpcServer {
         let Some(local_hotel_name) = Self::local_hotel_name(graph, local_node_id) else {
             return true;
         };
-        let Ok(guests) = graph.list_guests(&local_hotel_name, false) else {
+        // Only consider active guests — inactive/legacy records (e.g. old per-agent membrane
+        // seats marked is_active=false during stale cleanup) must not trigger a false-dead result.
+        let Ok(guests) = graph.list_guests(&local_hotel_name, true) else {
             return true;
         };
         if guests.is_empty() {
@@ -302,8 +304,8 @@ impl IpcServer {
             .into_iter()
             .find(|guest| guest.guest_id == owner_guest_id)
         else {
-            // Guest not in DB — it's an IPC-registered seat (e.g. multi-seat membrane task),
-            // not a seeded subprocess. Trust the TTL-based expiry rather than declaring dead.
+            // Guest not in DB (or not active) — it's an IPC-registered seat (e.g. multi-seat
+            // membrane task), not a seeded subprocess. Trust the TTL-based expiry instead.
             return true;
         };
         let Some(pid_text) = owner_guest.active_pid.as_deref() else {
@@ -2731,6 +2733,50 @@ impl IpcServer {
                     }
                 }
             }
+            IpcRequest::ProposeRule { agent_id, description, rationale } => {
+                use ansible_mesh_core::graph::RuleRecord;
+                let rule_id = Uuid::new_v4().to_string();
+                let record = RuleRecord {
+                    rule_id: rule_id.clone(),
+                    agent_id: agent_id.clone(),
+                    description,
+                    rationale,
+                    created_at: unix_ts(),
+                };
+                match graph.upsert_rule(&record) {
+                    Ok(()) => {
+                        info!(agent_id = %agent_id, rule_id = %rule_id, "Rule stored via IPC");
+                        IpcResponse::RuleProposed { rule_id }
+                    }
+                    Err(err) => {
+                        error!("Failed to store rule: {err}");
+                        IpcResponse::error("propose_rule", "STORAGE_ERROR", err.to_string())
+                    }
+                }
+            }
+            IpcRequest::ListRules { agent_id } => {
+                match graph.list_rules(&agent_id) {
+                    Ok(rules) => {
+                        let json_rules: Vec<serde_json::Value> = rules
+                            .iter()
+                            .map(|r| {
+                                serde_json::json!({
+                                    "rule_id": r.rule_id,
+                                    "agent_id": r.agent_id,
+                                    "description": r.description,
+                                    "rationale": r.rationale,
+                                    "created_at": r.created_at,
+                                })
+                            })
+                            .collect();
+                        IpcResponse::RuleList { rules: json_rules }
+                    }
+                    Err(err) => {
+                        error!("Failed to list rules: {err}");
+                        IpcResponse::error("list_rules", "STORAGE_ERROR", err.to_string())
+                    }
+                }
+            }
         }
     }
 
@@ -3303,6 +3349,16 @@ impl IpcServer {
         let registered_runners = load_tool_runner_registry(graph)?;
         let tool_runners = live_tool_runners(inboxes).await;
         let live_model_subscribers = live_role_subscribers(inboxes, "model.").await;
+        let local_guest_roles = Self::local_hotel_name(graph, local_node_id)
+            .and_then(|hotel_name| graph.list_guests(&hotel_name, true).ok())
+            .map(|guests| {
+                guests
+                    .into_iter()
+                    .filter(|guest| guest.active_pid.is_some())
+                    .map(|guest| guest.role)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let (remote_tool_ads, component_route_assembly) = {
             let guard = registry.read().await;
             (
@@ -3310,6 +3366,7 @@ impl IpcServer {
                 compose_component_route_assembly(
                     &bindings,
                     &live_model_subscribers,
+                    &local_guest_roles,
                     &guard,
                     local_node_id,
                 ),
@@ -3417,10 +3474,11 @@ async fn live_role_subscribers(
     inboxes: &InboxRegistry,
     role_prefix: &str,
 ) -> Vec<LiveRoleSubscriberView> {
+    let exact_role = role_prefix.strip_suffix('.').unwrap_or(role_prefix);
     let guard = inboxes.lock().await;
     let mut subscribers = guard
         .iter()
-        .filter(|(role, _)| role.starts_with(role_prefix))
+        .filter(|(role, _)| *role == exact_role || role.starts_with(role_prefix))
         .flat_map(|(role, entries)| {
             entries.iter().map(|entry| LiveRoleSubscriberView {
                 guest_id: entry.guest_id.clone(),
@@ -3498,6 +3556,7 @@ fn merge_tool_runners(
 fn compose_component_route_assembly(
     bindings: &serde_json::Value,
     local_subscribers: &[LiveRoleSubscriberView],
+    local_guest_roles: &[String],
     registry: &NodeRegistry,
     local_node_id: &str,
 ) -> serde_json::Value {
@@ -3508,6 +3567,7 @@ fn compose_component_route_assembly(
                 bindings,
                 &capability,
                 local_subscribers,
+                local_guest_roles,
                 registry,
                 local_node_id,
             )
@@ -3544,6 +3604,7 @@ fn select_component_route(
     bindings: &serde_json::Value,
     capability: &str,
     local_subscribers: &[LiveRoleSubscriberView],
+    local_guest_roles: &[String],
     registry: &NodeRegistry,
     local_node_id: &str,
 ) -> Option<serde_json::Value> {
@@ -3644,6 +3705,23 @@ fn select_component_route(
                 "live_local_capability"
             } else {
                 "live_local_fallback"
+            },
+        }));
+    }
+
+    if local_guest_roles.iter().any(|role| role == &target_role) {
+        return Some(serde_json::json!({
+            "target_node": local_node_id,
+            "target_role": target_role,
+            "incarnation_id": serde_json::Value::Null,
+            "hotel_id": local_node_id,
+            "environment_id": preferred_environment_id,
+            "execution_mode": "capability",
+            "availability_state": "live",
+            "selection_reason": if binding.is_some() {
+                "local_active_guest_fallback"
+            } else {
+                "local_active_guest_fallback"
             },
         }));
     }
@@ -4577,6 +4655,27 @@ mod tests {
         fn list_toolset_profiles(
             &self,
         ) -> anyhow::Result<Vec<ansible_mesh_core::graph::ToolsetProfileRecord>> {
+            Ok(vec![])
+        }
+
+        fn upsert_rule(
+            &self,
+            _rule: &ansible_mesh_core::graph::RuleRecord,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn get_rule(
+            &self,
+            _rule_id: &str,
+        ) -> anyhow::Result<Option<ansible_mesh_core::graph::RuleRecord>> {
+            Ok(None)
+        }
+
+        fn list_rules(
+            &self,
+            _agent_id: &str,
+        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::RuleRecord>> {
             Ok(vec![])
         }
     }
@@ -6646,6 +6745,274 @@ mod tests {
                 assert_eq!(
                     snapshot["component_route_assembly"]["execution_routes"]["text.generate"]["selection_reason"],
                     "remote_latency_capacity"
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn session_snapshot_prefers_live_local_generic_model_over_remote_advertisement() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
+        let registry = Arc::new(RwLock::new(NodeRegistry::new()));
+        registry.write().await.update_node(
+            NodeCapabilities {
+                node_id: "aria-node".into(),
+                roles: vec![ansible_mesh_core::NodeRole::AnsibleNode],
+                models: vec!["gemini".into()],
+                tools: vec![],
+                constraints: Default::default(),
+            },
+            vec![CapabilityAdvertisement {
+                hotel_id: "aria-architect-hotel".into(),
+                node_id: "aria-node".into(),
+                incarnation_id: "aria-architect-hotel:model-controller-gemini".into(),
+                target_role: "model".into(),
+                availability_state: "live".into(),
+                selection_hint: Some("remote_latency_capacity".into()),
+                latency_hint_ms: Some(8),
+                max_concurrent_jobs: Some(8),
+                active_jobs: 1,
+                queue_depth: 0,
+            }],
+            Some(ExecutionReachability {
+                protocol: "tcp-framed-v1".into(),
+                host: "aria-vps".into(),
+                port: 9002,
+            }),
+        );
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph,
+        )
+        .with_registry(registry);
+
+        graph_store
+            .upsert_session(&SessionRecord {
+                session_id: "sess-local-model".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: None,
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("123".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "bindings": {
+                        "effective_model_controller": "gemini-flash"
+                    }
+                }),
+                created_at: 1,
+                updated_at: 2,
+            })
+            .expect("session should seed");
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("agent connect");
+        let mut local_model = PhiloticClient::connect(GuestIdentity {
+            guest_id: "local-aiua-01:model-controller-gemini".into(),
+            role: "model".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("local model connect");
+        local_model
+            .send_request(IpcRequest::SubscribeInbox {
+                role: "model".into(),
+            })
+            .await
+            .expect("local model subscribe");
+
+        let response = agent
+            .send_request(IpcRequest::GetConfig {
+                key: "__session_snapshot__:sess-local-model".into(),
+            })
+            .await
+            .expect("snapshot request should succeed");
+
+        match response {
+            IpcResponse::ConfigData {
+                value_json: Some(value_json),
+                ..
+            } => {
+                let snapshot: serde_json::Value =
+                    serde_json::from_str(&value_json).expect("snapshot should decode");
+                assert_eq!(
+                    snapshot["component_route_assembly"]["execution_routes"]["text.generate"]["target_node"],
+                    "local-aiua-01"
+                );
+                assert_eq!(
+                    snapshot["component_route_assembly"]["execution_routes"]["text.generate"]["target_role"],
+                    "model"
+                );
+                assert_eq!(
+                    snapshot["component_route_assembly"]["execution_routes"]["text.generate"]["incarnation_id"],
+                    "local-aiua-01:model-controller-gemini"
+                );
+                assert_eq!(
+                    snapshot["component_route_assembly"]["execution_routes"]["text.generate"]["selection_reason"],
+                    "live_local_fallback"
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn session_snapshot_prefers_local_active_guest_when_model_subscriber_visibility_is_missing()
+     {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
+        let registry = Arc::new(RwLock::new(NodeRegistry::new()));
+        registry.write().await.update_node(
+            NodeCapabilities {
+                node_id: "aria-node".into(),
+                roles: vec![ansible_mesh_core::NodeRole::AnsibleNode],
+                models: vec!["gemini".into()],
+                tools: vec![],
+                constraints: Default::default(),
+            },
+            vec![CapabilityAdvertisement {
+                hotel_id: "aria-architect-hotel".into(),
+                node_id: "aria-node".into(),
+                incarnation_id: "aria-architect-hotel:model-controller-gemini".into(),
+                target_role: "model".into(),
+                availability_state: "live".into(),
+                selection_hint: Some("remote_latency_capacity".into()),
+                latency_hint_ms: Some(8),
+                max_concurrent_jobs: Some(8),
+                active_jobs: 1,
+                queue_depth: 0,
+            }],
+            Some(ExecutionReachability {
+                protocol: "tcp-framed-v1".into(),
+                host: "aria-vps".into(),
+                port: 9002,
+            }),
+        );
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph,
+        )
+        .with_registry(registry);
+
+        let mut hotel = crate::default_hotel_record("local");
+        hotel.ipc_socket_path = socket_path.clone();
+        graph_store.upsert_hotel(&hotel).expect("hotel should seed");
+        graph_store
+            .seed_guests("local", &crate::default_guest_seed("local"))
+            .expect("local guests should seed");
+        graph_store
+            .set_guest_pid("local", "local:model-controller-gemini", Some("4242"))
+            .expect("local model guest pid should seed");
+        graph_store
+            .upsert_session(&SessionRecord {
+                session_id: "sess-local-active-guest".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: None,
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("123".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "bindings": {
+                        "effective_model_controller": "gemini-flash"
+                    }
+                }),
+                created_at: 1,
+                updated_at: 2,
+            })
+            .expect("session should seed");
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("agent connect");
+
+        let response = agent
+            .send_request(IpcRequest::GetConfig {
+                key: "__session_snapshot__:sess-local-active-guest".into(),
+            })
+            .await
+            .expect("snapshot request should succeed");
+
+        match response {
+            IpcResponse::ConfigData {
+                value_json: Some(value_json),
+                ..
+            } => {
+                let snapshot: serde_json::Value =
+                    serde_json::from_str(&value_json).expect("snapshot should decode");
+                assert_eq!(
+                    snapshot["component_route_assembly"]["execution_routes"]["text.generate"]["target_node"],
+                    "local-aiua-01"
+                );
+                assert_eq!(
+                    snapshot["component_route_assembly"]["execution_routes"]["text.generate"]["target_role"],
+                    "model"
+                );
+                assert!(snapshot["component_route_assembly"]["execution_routes"]["text.generate"]["incarnation_id"].is_null());
+                assert_eq!(
+                    snapshot["component_route_assembly"]["execution_routes"]["text.generate"]["selection_reason"],
+                    "local_active_guest_fallback"
                 );
             }
             other => panic!("unexpected response: {other:?}"),

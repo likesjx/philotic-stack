@@ -756,6 +756,32 @@ fn graph_storage_sync_apartment_creates_graph_node_and_edge() {
 }
 
 #[test]
+fn graph_storage_sync_apartment_backfills_missing_agent_identity() {
+    let store = open_graph_storage();
+
+    store
+        .sync_apartment(
+            "agent-unseeded",
+            "short",
+            &serde_json::json!({"summary": "created from sync"}),
+        )
+        .expect("sync apartment should backfill agent identity");
+
+    let identity = store
+        .get_agent_identity("agent-unseeded")
+        .expect("get agent identity")
+        .expect("identity should exist after apartment sync");
+    assert_eq!(identity.agent_id, "agent-unseeded");
+    assert_eq!(identity.persona_name, "agent-unseeded");
+
+    let apartment = store
+        .get_apartment("agent-unseeded", "short")
+        .expect("get apartment")
+        .expect("apartment should exist");
+    assert_eq!(apartment["summary"], "created from sync");
+}
+
+#[test]
 fn graph_storage_get_apartment_returns_latest_checkpoint() {
     let store = open_graph_storage();
     seed_agent_identity(&store, "agent-jane");

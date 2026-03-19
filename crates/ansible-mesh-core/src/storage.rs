@@ -8,7 +8,7 @@
 use crate::event::EventEnvelope;
 use crate::graph::{
     AbstractSkillRecord, AbstractToolRecord, GraphEdge, GraphNode, RoleIncarnationRecord,
-    ToolsetProfileRecord,
+    RuleRecord, ToolsetProfileRecord,
 };
 use crate::NodeCapabilities;
 use anyhow::Result;
@@ -384,6 +384,17 @@ pub trait GraphStorage: Send + Sync {
             .collect();
         self.set_config_value(CONFIG_VAULT_REGISTRY, &serde_json::to_string(&entries)?)
     }
+
+    // ── Rules tier (durable behavioral constraints) ──────────────────────────
+
+    /// Upsert a durable rule into the context graph. Idempotent on `rule_id`.
+    fn upsert_rule(&self, rule: &RuleRecord) -> Result<()>;
+
+    /// Load a single rule by `rule_id`, or `None` if not found.
+    fn get_rule(&self, rule_id: &str) -> Result<Option<RuleRecord>>;
+
+    /// List all rules owned by the given agent. Returns an empty vec if none.
+    fn list_rules(&self, agent_id: &str) -> Result<Vec<RuleRecord>>;
 
     // ── Graph runner registry ─────────────────────────────────────────────────
 

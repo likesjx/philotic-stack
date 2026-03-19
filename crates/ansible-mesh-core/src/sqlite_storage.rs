@@ -7,7 +7,7 @@
 use crate::event::{EventEnvelope, EventId, EventKind, EventPayload};
 use crate::graph::{
     AbstractSkillRecord, AbstractToolRecord, GraphEdge, GraphNode, RoleIncarnationRecord,
-    ToolsetProfileRecord,
+    RuleRecord, ToolsetProfileRecord,
 };
 use crate::storage::{
     CursorStorage, EventStorage, GraphAdapter, GraphStorage, GuestRecord, HotelRecord,
@@ -1113,8 +1113,26 @@ impl GraphStorage for SqliteGraphStorage {
         memory_type: &str,
         content_json: &serde_json::Value,
     ) -> Result<()> {
+        let agent_key = Self::agent_node_key(agent_id);
+        self.adapter.upsert_node(&GraphNode {
+            node_key: agent_key.clone(),
+            kind: "agent".into(),
+            label: Some(agent_id.to_string()),
+            data: serde_json::json!({
+                "agent_id": agent_id,
+            }),
+        })?;
+
         let conn = self.conn.lock().unwrap();
         let content_str = serde_json::to_string(content_json)?;
+        let bundle_json = serde_json::to_string(&serde_json::json!({}))?;
+
+        conn.execute(
+            "INSERT INTO agent_identities (agent_id, persona_name, authority_hotel, bundle_json)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(agent_id) DO NOTHING",
+            params![agent_id, agent_id, "", bundle_json],
+        )?;
 
         conn.execute(
             "DELETE FROM memory_apartments WHERE agent_id = ?1 AND memory_type = ?2",
@@ -1127,15 +1145,6 @@ impl GraphStorage for SqliteGraphStorage {
         )?;
         drop(conn);
 
-        let agent_key = Self::agent_node_key(agent_id);
-        self.adapter.upsert_node(&GraphNode {
-            node_key: agent_key.clone(),
-            kind: "agent".into(),
-            label: Some(agent_id.to_string()),
-            data: serde_json::json!({
-                "agent_id": agent_id,
-            }),
-        })?;
         let apartment_key = Self::apartment_node_key(agent_id, memory_type);
         self.adapter.upsert_node(&GraphNode {
             node_key: apartment_key.clone(),
@@ -1501,6 +1510,31 @@ impl GraphStorage for SqliteGraphStorage {
             .list_nodes_by_kind("toolset_profile")?
             .into_iter()
             .map(|node| serde_json::from_value(node.data).map_err(Into::into))
+            .collect()
+    }
+
+    fn upsert_rule(&self, rule: &RuleRecord) -> Result<()> {
+        self.adapter.upsert_node(&GraphNode {
+            node_key: format!("rule:{}", rule.rule_id),
+            kind: "rule".into(),
+            label: Some(rule.description.chars().take(64).collect()),
+            data: serde_json::to_value(rule)?,
+        })
+    }
+
+    fn get_rule(&self, rule_id: &str) -> Result<Option<RuleRecord>> {
+        match self.adapter.get_node(&format!("rule:{rule_id}"))? {
+            Some(node) => Ok(Some(serde_json::from_value(node.data)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn list_rules(&self, agent_id: &str) -> Result<Vec<RuleRecord>> {
+        self.adapter
+            .list_nodes_by_kind("rule")?
+            .into_iter()
+            .map(|node| serde_json::from_value::<RuleRecord>(node.data).map_err(Into::into))
+            .filter(|r| r.as_ref().map(|rule| rule.agent_id == agent_id).unwrap_or(true))
             .collect()
     }
 }

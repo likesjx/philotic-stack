@@ -1,6 +1,6 @@
 # Philotic Stack — Documentation Index
 
-> **Last Updated:** 2026-03-12
+> **Last Updated:** 2026-03-19
 
 ---
 
@@ -16,6 +16,15 @@ Use these in order when you want the current architecture without archaeology:
 | [architecture/SEAM_REGISTRY.md](architecture/SEAM_REGISTRY.md) | Stable IDs for active seams across proposals and task tracking |
 | [architecture/ARCHITECTURE.md](architecture/ARCHITECTURE.md) | Deep architecture reference for runtime structure and major protocols |
 | [task.md](task.md) | Current work surface and sequencing |
+
+Source-of-truth order for architecture questions:
+
+1. observed code and tests
+2. [architecture/ARCHITECTURE_STATUS.md](architecture/ARCHITECTURE_STATUS.md)
+3. [architecture/ARCHITECTURE.md](architecture/ARCHITECTURE.md)
+4. proposal and historical docs
+
+Use [task.md](task.md) for execution sequencing, not to settle runtime protocol details when another doc or the code disagrees.
 
 ## Architecture Reference
 
@@ -69,9 +78,14 @@ These docs are proposal space, not automatic runtime truth:
 
 ## Quick Reference
 
-- **IPC socket:** `/tmp/philotic-aiua.sock` (env: `PHILOTIC_HOTEL_SOCKET`)
+- **IPC socket:** `PHILOTIC_HOTEL_SOCKET` points to the active hotel socket; generic local default is `/tmp/philotic-aiua.sock`, while named hotels commonly materialize `/tmp/philotic-<hotel>.sock`
 - **Mesh UDP port:** `8999`
 - **Blob HTTP port:** `9001`
 - **Execution TCP port:** `mesh_port + 2`
 - **Context DB:** `aiua_context.db` (SQLite)
 - **Guest supervisor interval:** 5 seconds
+
+## Known Drift To Treat Carefully
+
+- Some crate READMEs still use older `Ansible` naming or port-first IPC wording.
+- [PHILOTIC-ARCHITECTURE.md](PHILOTIC-ARCHITECTURE.md), [ARCHITECT_THOUGHTS_CONTEXT_GRAPH.md](ARCHITECT_THOUGHTS_CONTEXT_GRAPH.md), [walkthrough.md](walkthrough.md), and [architecture/PORT_BLUEPRINT.md](architecture/PORT_BLUEPRINT.md) are historical context, not current authority.

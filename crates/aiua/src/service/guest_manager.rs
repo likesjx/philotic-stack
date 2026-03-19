@@ -820,6 +820,27 @@ mod tests {
         ) -> Result<Vec<ansible_mesh_core::graph::ToolsetProfileRecord>> {
             Ok(vec![])
         }
+
+        fn upsert_rule(
+            &self,
+            _rule: &ansible_mesh_core::graph::RuleRecord,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn get_rule(
+            &self,
+            _rule_id: &str,
+        ) -> Result<Option<ansible_mesh_core::graph::RuleRecord>> {
+            Ok(None)
+        }
+
+        fn list_rules(
+            &self,
+            _agent_id: &str,
+        ) -> Result<Vec<ansible_mesh_core::graph::RuleRecord>> {
+            Ok(vec![])
+        }
     }
 
     struct MockMaterializer {

@@ -545,6 +545,21 @@ pub enum IpcRequest {
         graph_id: String,
         instance_id: String,
     },
+    /// Propose a new durable rule for the agent.
+    ///
+    /// The hotel stores the rule in the context graph and requires operator confirmation
+    /// before the rule takes effect. Responds with [`IpcResponse::RuleProposed`].
+    ProposeRule {
+        agent_id: String,
+        description: String,
+        rationale: String,
+    },
+    /// List all durable rules owned by the given agent.
+    ///
+    /// Responds with [`IpcResponse::RuleList`].
+    ListRules {
+        agent_id: String,
+    },
 }
 
 /// Represents the canonical response from the local Ansible back to the Guest via IPC.
@@ -642,6 +657,14 @@ pub enum IpcResponse {
     /// Response to [`IpcRequest::RegisterGraphInstance`].
     GraphInstanceRegistered {
         graph_id: String,
+    },
+    /// Response to [`IpcRequest::ProposeRule`].
+    RuleProposed {
+        rule_id: String,
+    },
+    /// Response to [`IpcRequest::ListRules`].
+    RuleList {
+        rules: Vec<serde_json::Value>,
     },
 }
 

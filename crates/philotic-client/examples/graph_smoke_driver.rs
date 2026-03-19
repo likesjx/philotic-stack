@@ -9,12 +9,13 @@ use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
 use tokio::time::{Duration, timeout};
 
 const DRIVER_GUEST_ID: &str = "graph-smoke-driver";
-const DRIVER_ROLE: &str = "agent";
+const DRIVER_ROLE: &str = "graph.smoke.reply";
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let target_node = std::env::var("PHILOTIC_TARGET_NODE")
         .unwrap_or_else(|_| "local-aiua-01".to_string());
+    let graph_name = format!("smoke-graph-{}", uuid::Uuid::new_v4());
 
     let mut client = PhiloticClient::connect(GuestIdentity {
         guest_id: DRIVER_GUEST_ID.into(),
@@ -24,6 +25,17 @@ async fn main() -> Result<()> {
     .await
     .context("failed to connect graph smoke driver")?;
 
+    let subscribe = client
+        .send_request(IpcRequest::SubscribeInbox {
+            role: DRIVER_ROLE.into(),
+        })
+        .await
+        .context("failed to subscribe graph smoke driver inbox")?;
+    match subscribe {
+        IpcResponse::Standard { ok: true, .. } => {}
+        other => bail!("unexpected subscribe response: {other:?}"),
+    }
+
     // ── graph.create ─────────────────────────────────────────────────────────
 
     let graph_id = emit_tool(
@@ -31,7 +43,7 @@ async fn main() -> Result<()> {
         &target_node,
         "graph.create",
         serde_json::json!({
-            "name": "smoke-graph",
+            "name": graph_name,
             "default_visibility": "public",
             "caller_id": DRIVER_GUEST_ID
         }),
@@ -144,9 +156,9 @@ async fn emit_tool(
                 "chat_id": "smoke-chat",
                 "agent_id": DRIVER_GUEST_ID,
                 "caller_roles": [DRIVER_ROLE],
-                "reply_to": DRIVER_GUEST_ID,
+                "reply_to": target_node,
                 "reply_role": DRIVER_ROLE,
-                "final_reply_to": DRIVER_GUEST_ID,
+                "final_reply_to": target_node,
                 "final_reply_role": DRIVER_ROLE,
             })
             .to_string(),

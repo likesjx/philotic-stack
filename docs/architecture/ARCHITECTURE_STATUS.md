@@ -3,7 +3,7 @@ title: "Philotic Architecture Status"
 doc_type: status
 domain: runtime-sessions
 status: active
-last_updated: 2026-03-13
+last_updated: 2026-03-19
 tags:
   - source-of-truth
   - current-state
@@ -32,7 +32,7 @@ tracks_domains:
 
 # Philotic Architecture Status
 
-> **Status:** Living Snapshot | **Last Updated:** 2026-03-13
+> **Status:** Living Snapshot | **Last Updated:** 2026-03-19
 
 This document is the single source of truth for Philotic's current architecture status.
 
@@ -49,6 +49,7 @@ This is not the place for full design arguments. For those, follow the linked pr
 - `Implemented` means there is code and test evidence in the repo today.
 - `Transitional` means the shape is real enough to rely on for the current slice, but it is not presented as final architecture.
 - `Active` means the seam is currently hot based on [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md), active proposals, and the observed worktree on 2026-03-12.
+- when convenience docs disagree on concrete transport details, current code and [docs/README.md](/Users/jaredlikes/code/philotic-stack/docs/README.md) win over stale crate-level prose.
 
 ## Current Architecture Summary
 
@@ -56,6 +57,7 @@ Philotic currently operates as a hotel-centered runtime:
 
 - `aiua` is the runtime authority for hotel orchestration, guest materialization, context-graph persistence, IPC handling, and inter-hotel coordination.
 - `membrane`, `philote`, `model-router`, and `tool-runner` are separate guest-facing binaries with explicit runtime boundaries.
+- local guest-to-hotel IPC currently runs over Unix domain sockets, driven by `PHILOTIC_HOTEL_SOCKET`; default paths include `/tmp/philotic-aiua.sock` for generic local clients and hotel-specific socket paths such as `/tmp/philotic-<hotel>.sock` when `aiua` materializes a named hotel.
 - canonical session state now lives in the context graph, while apartment-style checkpoints remain derived recovery projections rather than a competing source of truth.
 - Telegram ingress is session-aware and guarded by hotel-owned poll-lease authority, with explicit delegated remote polling available as a transitional exception.
 - local and remote execution routing both exist, but several placement, delegation, and admin/control-plane seams are still under active development.
@@ -139,6 +141,7 @@ These are real current choices, but they are explicitly not the final story:
 - model/provider egress is still an explicit exception rather than routed through a perimeter egress plane
 - build-on-host VPS deployment is still transitional until artifact distribution hardens
 - role incarnation design direction is adopted, and the first graph/routing substrate now exists; current design direction now favors context-shift role activation with shared self/memory by default, while concurrent role materialization remains conditional
+- some architecture-facing crate READMEs still carry older `Ansible`, port-oriented, or socket-path wording and should be treated as convenience narratives until they are reconciled with current code
 
 ## Active Work Right Now
 
@@ -180,6 +183,7 @@ When a slice lands:
 
 ## Related Entry Points
 
+- [docs/README.md](/Users/jaredlikes/code/philotic-stack/docs/README.md)
 - [README.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/README.md)
 - [ARCHITECTURE.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE.md)
 - [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md)

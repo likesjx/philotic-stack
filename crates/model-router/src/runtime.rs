@@ -39,6 +39,12 @@ struct ReplyRoute {
     chat_id: String,
 }
 
+#[derive(Debug, Clone)]
+enum StubResponse {
+    Text(String),
+    Structured(Value),
+}
+
 pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
     tracing_subscriber::fmt::init();
     info!(
@@ -53,6 +59,11 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
     };
 
     let mut ipc_client = PhiloticClient::connect(identity).await?;
+    ipc_client
+        .send_request(IpcRequest::SubscribeInbox {
+            role: config.role.into(),
+        })
+        .await?;
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
         .build()?;
@@ -85,22 +96,10 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
 
                 let reply = ReplyRoute::from_task(&task_value);
 
-                if let Some(response_text) =
+                if let Some(stub_response) =
                     short_circuit_response(&task_value, stub_response.as_deref())
                 {
-                    emit_text_response(
-                        &mut ipc_client,
-                        &reply,
-                        ControllerResponseEnvelope {
-                            capability: TaskKind::TextGenerate.as_str().to_string(),
-                            content: response_text.clone(),
-                            result: json!({ "display_text": response_text }),
-                            artifacts: Vec::new(),
-                            trace: Default::default(),
-                            provider_output: Value::Null,
-                        },
-                    )
-                    .await?;
+                    emit_stub_response(&mut ipc_client, &reply, &task_value, stub_response).await?;
                     continue;
                 }
 
@@ -170,6 +169,7 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                             &reply,
                             tool_name,
                             arguments,
+                            None,
                         )
                         .await?;
                     }
@@ -215,7 +215,7 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
     }
 }
 
-fn short_circuit_response(task: &Value, stub_response: Option<&str>) -> Option<String> {
+fn short_circuit_response(task: &Value, stub_response: Option<&str>) -> Option<StubResponse> {
     let stub = stub_response?;
 
     if task.get("prompt").and_then(Value::as_str).is_some() {
@@ -245,13 +245,13 @@ fn short_circuit_response(task: &Value, stub_response: Option<&str>) -> Option<S
                         let iter_key = format!("{}:{}", turn_id, iteration);
                         if k == iter_key {
                             info!("Model controller turn/iteration-aware stub mode returning response for [{}].", iter_key);
-                            return Some(v.to_string());
+                            return Some(parse_stub_response(v));
                         }
                     }
 
                     // Keep track of plain turn_id match as fallback
                     if k == turn_id {
-                        turn_match = Some(v.to_string());
+                        turn_match = Some(parse_stub_response(v));
                     }
                 }
             }
@@ -262,10 +262,122 @@ fn short_circuit_response(task: &Value, stub_response: Option<&str>) -> Option<S
         }
 
         info!("Model controller stub mode returning deterministic response.");
-        return Some(stub.to_string());
+        return Some(parse_stub_response(stub));
     }
 
     None
+}
+
+fn parse_stub_response(raw: &str) -> StubResponse {
+    let trimmed = raw.trim();
+    if let Some(json_text) = trimmed.strip_prefix("json:") {
+        let value: Value = serde_json::from_str(json_text)
+            .unwrap_or_else(|_| json!({ "display_text": trimmed }));
+        return StubResponse::Structured(value);
+    }
+    StubResponse::Text(trimmed.to_string())
+}
+
+async fn emit_stub_response(
+    ipc_client: &mut PhiloticClient,
+    reply: &ReplyRoute,
+    task_value: &Value,
+    stub_response: StubResponse,
+) -> Result<()> {
+    match stub_response {
+        StubResponse::Text(response_text) => {
+            emit_text_response(
+                ipc_client,
+                reply,
+                ControllerResponseEnvelope {
+                    capability: TaskKind::TextGenerate.as_str().to_string(),
+                    content: response_text.clone(),
+                    result: json!({ "display_text": response_text }),
+                    artifacts: Vec::new(),
+                    trace: Default::default(),
+                    provider_output: Value::Null,
+                },
+            )
+            .await
+        }
+        StubResponse::Structured(value) => {
+            validate_stub_prompt(task_value, &value)?;
+
+            if let Some(tool_call) = value.get("tool_call").and_then(Value::as_object) {
+                let tool_name = tool_call
+                    .get("tool_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("echo")
+                    .to_string();
+                let arguments = tool_call
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                let model_result = json!({
+                    "capability": TaskKind::TextGenerate.as_str(),
+                    "result": {
+                        "active_plan": value.get("active_plan").cloned(),
+                        "spoken_text": value.get("spoken_text").cloned(),
+                        "memory_concept": value.get("memory_concept").cloned(),
+                    },
+                    "artifacts": [],
+                    "trace": {},
+                    "provider_output": Value::Null,
+                });
+                emit_tool_call_response(ipc_client, reply, tool_name, arguments, Some(model_result))
+                    .await
+            } else {
+                let display_text = value
+                    .get("display_text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let content = value
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| display_text.clone());
+                emit_text_response(
+                    ipc_client,
+                    reply,
+                    ControllerResponseEnvelope {
+                        capability: TaskKind::TextGenerate.as_str().to_string(),
+                        content,
+                        result: json!({
+                            "display_text": display_text,
+                            "spoken_text": value.get("spoken_text").cloned(),
+                            "memory_concept": value.get("memory_concept").cloned(),
+                            "active_plan": value.get("active_plan").cloned(),
+                        }),
+                        artifacts: Vec::new(),
+                        trace: Default::default(),
+                        provider_output: Value::Null,
+                    },
+                )
+                .await
+            }
+        }
+    }
+}
+
+fn validate_stub_prompt(task_value: &Value, stub_value: &Value) -> Result<()> {
+    let Some(required) = stub_value
+        .get("require_prompt_substrings")
+        .and_then(Value::as_array)
+    else {
+        return Ok(());
+    };
+
+    let prompt = ControllerTask::from_value(task_value)
+        .ok()
+        .and_then(|task| task.composed_prompt_text().or_else(|| task.prompt_text().map(str::to_string)))
+        .unwrap_or_default();
+    for needle in required.iter().filter_map(Value::as_str) {
+        if !prompt.contains(needle) {
+            anyhow::bail!("stub validation failed: prompt missing required substring {:?}", needle);
+        }
+    }
+    Ok(())
 }
 
 async fn emit_text_response(
@@ -321,6 +433,7 @@ async fn emit_tool_call_response(
     reply: &ReplyRoute,
     tool_name: String,
     arguments: serde_json::Value,
+    model_result: Option<Value>,
 ) -> Result<()> {
     let reply_req = IpcRequest::EmitTask {
         target_node: reply.reply_to.clone(),
@@ -332,6 +445,7 @@ async fn emit_tool_call_response(
                 "kind": "tool_call",
                 "tool_name": tool_name,
                 "arguments": arguments,
+                "model_result": model_result,
             },
             "session_id": reply.session_id,
             "turn_id": reply.turn_id,
@@ -434,5 +548,79 @@ impl ReplyRoute {
                 .unwrap_or_default()
                 .to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StubResponse, parse_stub_response, short_circuit_response, validate_stub_prompt};
+    use serde_json::json;
+
+    #[test]
+    fn parse_stub_response_supports_json_prefix() {
+        let parsed = parse_stub_response(r#"json:{"display_text":"hello"}"#);
+        match parsed {
+            StubResponse::Structured(value) => {
+                assert_eq!(value["display_text"], "hello");
+            }
+            other => panic!("expected structured stub response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn short_circuit_response_prefers_iteration_specific_stub() {
+        let task = json!({
+            "prompt": "continue",
+            "context_projection": {
+                "conversation_turn": { "conversation_turn_id": "turn-1" },
+                "active_step": { "iteration": 2 }
+            }
+        });
+
+        let stub = r#"turn-1=json:{"display_text":"fallback"};turn-1:2=json:{"display_text":"iteration-two"}"#;
+        let parsed = short_circuit_response(&task, Some(stub)).expect("stub should match");
+        match parsed {
+            StubResponse::Structured(value) => {
+                assert_eq!(value["display_text"], "iteration-two");
+            }
+            other => panic!("expected structured stub response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_stub_prompt_checks_composed_reentry_prompt() {
+        let task = json!({
+            "kind": "text.generate",
+            "context": {
+                "active_turn": { "role": "user", "text": "Keep going." },
+                "tool_history": [{
+                    "index": 1,
+                    "tool_name": "echo",
+                    "arguments": { "text": "hello structured tool" },
+                    "result": "hello structured tool"
+                }],
+                "active_plan": {
+                    "goal": "echo hello structured tool",
+                    "status": "in_progress",
+                    "steps": [{
+                        "id": 1,
+                        "description": "call echo",
+                        "tool_name": "echo",
+                        "status": "in_progress"
+                    }]
+                }
+            }
+        });
+
+        let stub = json!({
+            "require_prompt_substrings": [
+                "[Tool call history]",
+                "Call 1: echo({\"text\":\"hello structured tool\"})",
+                "[Active plan]",
+                "Goal: echo hello structured tool"
+            ]
+        });
+
+        validate_stub_prompt(&task, &stub).expect("composed prompt should satisfy stub checks");
     }
 }

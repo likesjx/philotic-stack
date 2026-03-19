@@ -20,6 +20,8 @@ pub struct TurnRecord {
     pub turn_id: String,
     pub user_content: String,
     pub assistant_content: Option<String>,
+    /// Unix timestamp (seconds) when this turn was completed.
+    pub created_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -233,6 +235,29 @@ pub struct RoleActivation {
     pub role_manifest: Option<String>,
 }
 
+/// A single step inside an `ActivePlan`. Tracks the description, optional bound
+/// tool, and lifecycle status of the step.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanStep {
+    pub id: u32,
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    /// One of: "pending", "in_progress", "done", "failed"
+    pub status: String,
+}
+
+/// The model's declared execution plan for the current turn.
+/// Captured from the model response and threaded through re-entry turns so the
+/// model can update step status as it executes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivePlan {
+    pub goal: String,
+    pub steps: Vec<PlanStep>,
+    /// One of: "planning", "executing", "done", "failed"
+    pub status: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkingTurn {
     pub task_id: Uuid,
@@ -251,6 +276,13 @@ pub struct WorkingTurn {
     /// Accumulated (tool_call, tool_result) pairs for the current in-flight turn.
     /// Fed back into the model prompt on each re-entry so the model has full context.
     pub working_tool_history: Vec<(ToolCall, ToolResult)>,
+    /// Current execution plan if the model has declared one. Updated from model
+    /// responses; threaded into context on re-entry.
+    pub active_plan: Option<ActivePlan>,
+    /// Consecutive tool step failures this turn. Reset to 0 on any successful step.
+    /// When this reaches `settings.execution.stall_detection_threshold`, the loop
+    /// surfaces to the user instead of re-entering.
+    pub consecutive_step_failures: u32,
     /// Stashed text content while waiting for voice synthesis to complete.
     pub pending_text_reply: Option<String>,
     pub had_voice_input: bool,
@@ -405,6 +437,98 @@ impl Default for VoiceResponsePolicy {
     }
 }
 
+/// Configures how the rolling `dialogue_window` is assembled and bounded.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextWindowPolicy {
+    /// Maximum age of turns included in the dialogue window, in minutes.
+    /// Turns older than this are dropped before the context is built.
+    /// Default: 10, min: 2, max: 60.
+    pub dialogue_window_minutes: u32,
+    /// Maximum total character budget for the dialogue window.
+    /// Oldest turns are dropped first when the budget is exceeded.
+    /// Default: 10_000, min: 1_000, max: 50_000.
+    pub dialogue_window_chars: usize,
+    /// When true (default), assistant turns in the dialogue window include
+    /// tool call names and args alongside the response text.
+    pub include_tool_calls: bool,
+}
+
+impl Default for ContextWindowPolicy {
+    fn default() -> Self {
+        Self {
+            dialogue_window_minutes: 10,
+            dialogue_window_chars: 10_000,
+            include_tool_calls: true,
+        }
+    }
+}
+
+/// Configures the two-axis memory strategy: local rolling window + on-demand recall.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryPolicy {
+    /// Number of recent memory entries kept in the rolling local window.
+    /// Default: 10, min: 3, max: 30.
+    pub memory_window_size: usize,
+    /// When true (default), the `memory.recall` local agent tool is available
+    /// for on-demand Muninn retrieval.
+    pub long_term_recall_enabled: bool,
+    /// Default result limit passed to `engine.activate()` when the model calls
+    /// `memory.recall` without an explicit limit.
+    /// Default: 5, min: 1, max: 20.
+    pub recall_limit: usize,
+}
+
+impl Default for MemoryPolicy {
+    fn default() -> Self {
+        Self {
+            memory_window_size: 10,
+            long_term_recall_enabled: true,
+            recall_limit: 5,
+        }
+    }
+}
+
+/// Configures the cognitive execution loop: iteration cap, plan behaviour, stall detection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionPolicy {
+    /// Maximum model round-trips per turn before the turn is failed.
+    /// Default: 10, min: 1, max: 50.
+    pub iteration_cap: u32,
+    /// When true (default), a structured plan is required as the first model
+    /// output whenever a skill is activated.
+    pub plan_required_on_skill: bool,
+    /// When true (default), intermediate turn events (step_started, step_completed,
+    /// step_failed) are emitted to membrane during execution.
+    pub stream_tool_events: bool,
+    /// Number of consecutive step failures before the loop surfaces to the user
+    /// instead of continuing. Default: 3.
+    pub stall_detection_threshold: u32,
+}
+
+impl Default for ExecutionPolicy {
+    fn default() -> Self {
+        Self {
+            iteration_cap: 10,
+            plan_required_on_skill: true,
+            stream_tool_events: true,
+            stall_detection_threshold: 3,
+        }
+    }
+}
+
+/// Top-level settings tree for a philote session.
+/// Stored in the context graph keyed by agent_id; fetched at session init.
+/// Configurable via `agent.configure` with `settings.*` config path prefix.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct AgentSettings {
+    #[serde(default)]
+    pub context_window: ContextWindowPolicy,
+    #[serde(default)]
+    pub memory: MemoryPolicy,
+    #[serde(default)]
+    pub execution: ExecutionPolicy,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct AgentProfile {
     #[serde(default)]
@@ -427,6 +551,10 @@ pub struct AgentProfile {
     /// Populated from `import_workspace` in the agent's hotel configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub import_workspace: Option<String>,
+    /// Tools available in every new session for this agent, before any per-session
+    /// `/tools add` commands. Falls back to `["echo"]` when empty.
+    #[serde(default)]
+    pub default_toolset: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -629,6 +757,7 @@ pub struct SessionState {
     pub active_incarnation_id: Option<String>,
     pub role_activation: Option<RoleActivation>,
     pub agent_profile: AgentProfile,
+    pub settings: AgentSettings,
     pub status: String,
     pub approval_policy: ApprovalPolicy,
     pub bindings: SessionBindings,
@@ -641,6 +770,10 @@ pub struct SessionState {
     /// Working summary carried in from the most recent inbound handoff bundle.
     /// Injected into context when the next user turn begins under this role.
     pub last_handoff_summary: Option<String>,
+    /// Durable behavioral rules fetched from the hotel context graph at session init.
+    /// Injected into the `instructions` section of every cognitive call and never
+    /// rolled off by the dialogue window.
+    pub rules: Vec<Value>,
 }
 
 impl SessionState {
@@ -653,6 +786,7 @@ impl SessionState {
             active_incarnation_id: None,
             role_activation: None,
             agent_profile: AgentProfile::default(),
+            settings: AgentSettings::default(),
             status: "active".into(),
             approval_policy: ApprovalPolicy::default(),
             tool_assembly: default_tool_assembly_for_bindings(&bindings),
@@ -662,6 +796,7 @@ impl SessionState {
             active_turn: None,
             last_handoff_summary: None,
             active_subagents: Vec::new(),
+            rules: Vec::new(),
         }
     }
 
@@ -702,6 +837,29 @@ impl SessionState {
     pub fn clear_pending_approval(&mut self) {
         if let Some(turn) = self.active_turn.as_mut() {
             turn.pending_approval = None;
+        }
+    }
+
+    pub fn set_active_plan(&mut self, plan: ActivePlan) {
+        if let Some(turn) = self.active_turn.as_mut() {
+            turn.active_plan = Some(plan);
+        }
+    }
+
+    /// Increment consecutive step failure counter and return the new count.
+    pub fn increment_step_failures(&mut self) -> u32 {
+        if let Some(turn) = self.active_turn.as_mut() {
+            turn.consecutive_step_failures += 1;
+            turn.consecutive_step_failures
+        } else {
+            0
+        }
+    }
+
+    /// Reset consecutive step failure counter (called on a successful step).
+    pub fn reset_step_failures(&mut self) {
+        if let Some(turn) = self.active_turn.as_mut() {
+            turn.consecutive_step_failures = 0;
         }
     }
 
@@ -773,13 +931,19 @@ impl SessionState {
 
     pub fn complete_active_turn(&mut self, assistant_content: String) -> Option<WorkingTurn> {
         let turn = self.active_turn.take()?;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         self.recent_turns.push(TurnRecord {
             turn_id: turn.turn_id.clone(),
             user_content: turn.user_content.clone(),
             assistant_content: Some(assistant_content),
+            created_at: now_secs,
         });
-        if self.recent_turns.len() > 8 {
-            let drain = self.recent_turns.len() - 8;
+        let window_size = self.settings.memory.memory_window_size.max(1);
+        if self.recent_turns.len() > window_size {
+            let drain = self.recent_turns.len() - window_size;
             self.recent_turns.drain(0..drain);
         }
         Some(turn)
@@ -962,12 +1126,91 @@ impl SessionState {
                 apply_string_list_op(&mut self.bindings.effective_skillset, &item, operation)
                     .map(|_| format!("{operation} '{item}' in bindings.effective_skillset."))
             }
+            // ── Settings tree ─────────────────────────────────────────────────
+            "settings.context_window.dialogue_window_minutes" => {
+                let v = value
+                    .as_u64()
+                    .ok_or("settings.context_window.dialogue_window_minutes requires a u32")?;
+                let clamped = (v as u32).clamp(2, 60);
+                self.settings.context_window.dialogue_window_minutes = clamped;
+                Ok(format!("Set settings.context_window.dialogue_window_minutes = {clamped}."))
+            }
+            "settings.context_window.dialogue_window_chars" => {
+                let v = value
+                    .as_u64()
+                    .ok_or("settings.context_window.dialogue_window_chars requires a usize")?;
+                let clamped = (v as usize).clamp(1_000, 50_000);
+                self.settings.context_window.dialogue_window_chars = clamped;
+                Ok(format!("Set settings.context_window.dialogue_window_chars = {clamped}."))
+            }
+            "settings.context_window.include_tool_calls" => {
+                let v = value
+                    .as_bool()
+                    .ok_or("settings.context_window.include_tool_calls requires a boolean")?;
+                self.settings.context_window.include_tool_calls = v;
+                Ok(format!("Set settings.context_window.include_tool_calls = {v}."))
+            }
+            "settings.memory.memory_window_size" => {
+                let v = value
+                    .as_u64()
+                    .ok_or("settings.memory.memory_window_size requires a usize")?;
+                let clamped = (v as usize).clamp(3, 30);
+                self.settings.memory.memory_window_size = clamped;
+                Ok(format!("Set settings.memory.memory_window_size = {clamped}."))
+            }
+            "settings.memory.long_term_recall_enabled" => {
+                let v = value
+                    .as_bool()
+                    .ok_or("settings.memory.long_term_recall_enabled requires a boolean")?;
+                self.settings.memory.long_term_recall_enabled = v;
+                Ok(format!("Set settings.memory.long_term_recall_enabled = {v}."))
+            }
+            "settings.memory.recall_limit" => {
+                let v = value
+                    .as_u64()
+                    .ok_or("settings.memory.recall_limit requires a usize")?;
+                let clamped = (v as usize).clamp(1, 20);
+                self.settings.memory.recall_limit = clamped;
+                Ok(format!("Set settings.memory.recall_limit = {clamped}."))
+            }
+            "settings.execution.iteration_cap" => {
+                let v = value
+                    .as_u64()
+                    .ok_or("settings.execution.iteration_cap requires a u32")?;
+                let clamped = (v as u32).clamp(1, 50);
+                self.settings.execution.iteration_cap = clamped;
+                Ok(format!("Set settings.execution.iteration_cap = {clamped}."))
+            }
+            "settings.execution.stall_detection_threshold" => {
+                let v = value
+                    .as_u64()
+                    .ok_or("settings.execution.stall_detection_threshold requires a u32")?;
+                let clamped = (v as u32).clamp(1, 10);
+                self.settings.execution.stall_detection_threshold = clamped;
+                Ok(format!("Set settings.execution.stall_detection_threshold = {clamped}."))
+            }
+            "settings.execution.stream_tool_events" => {
+                let v = value
+                    .as_bool()
+                    .ok_or("settings.execution.stream_tool_events requires a boolean")?;
+                self.settings.execution.stream_tool_events = v;
+                Ok(format!("Set settings.execution.stream_tool_events = {v}."))
+            }
             other => Err(format!(
                 "Unknown config path: '{other}'. Supported paths: \
                 approval_policy.auto_approve_all, approval_policy.preapproved_tools, \
                 approval_policy.preapproved_classes, profile.persona_name, profile.soul_text, \
                 profile.identity_text, profile.user_context_text, profile.memory_summary, \
-                bindings.effective_toolset, bindings.effective_skillset"
+                bindings.effective_toolset, bindings.effective_skillset, \
+                settings.context_window.dialogue_window_minutes, \
+                settings.context_window.dialogue_window_chars, \
+                settings.context_window.include_tool_calls, \
+                settings.memory.memory_window_size, \
+                settings.memory.long_term_recall_enabled, \
+                settings.memory.recall_limit, \
+                settings.execution.iteration_cap, \
+                settings.execution.stall_detection_threshold, \
+                settings.execution.stream_tool_events"
             )),
         }
     }
@@ -1144,6 +1387,11 @@ impl SessionState {
     }
 
     pub fn rebuild_default_tool_assembly(&mut self) {
+        // Seed effective_toolset from the profile default when empty.
+        // This lets agents have persistent tool grants without per-session /tools add.
+        if self.bindings.effective_toolset.is_empty() && !self.agent_profile.default_toolset.is_empty() {
+            self.bindings.effective_toolset = self.agent_profile.default_toolset.clone();
+        }
         self.tool_assembly = default_tool_assembly_for_bindings(&self.bindings);
     }
 
@@ -1182,6 +1430,23 @@ impl SessionState {
         }
 
         Some(prompt)
+    }
+
+    /// Build the full context envelope for a cognitive re-entry after a tool result.
+    ///
+    /// Returns `(prompt, context, context_projection, tools_for_model)`.
+    /// Unlike `build_reentry_prompt`, this produces the complete structured envelope
+    /// so that model-router receives identity, instructions, memory, dialogue_window,
+    /// active_turn, and tool_history on every cognitive re-entry — not just a flat prompt.
+    pub fn build_reentry_context_envelope(
+        &self,
+    ) -> Option<(String, Value, Value, Vec<ToolDefinition>)> {
+        let turn = self.active_turn.as_ref()?;
+        let user_content = turn.user_content.clone();
+        let tools = self.tool_assembly.tools_for_model.clone();
+        let (prompt, context, context_projection) =
+            self.model_request_payloads(&user_content, &tools);
+        Some((prompt, context, context_projection, tools))
     }
 
     pub fn approval_policy_status_text(&self) -> String {
@@ -1257,6 +1522,87 @@ impl SessionState {
             "Session status: {}. {}. Tools: {}. Skills: {}. Workspace: {}. Routes: {}. Delivery: {}.",
             self.status, active_turn, toolset, skillset, workspace, routing, delivery
         )
+    }
+
+    /// Render a human-readable breakdown of the context envelope that would be sent
+    /// to the model on the next turn.  Surfaces section names, approximate byte sizes,
+    /// turn/tool history counts, and active-turn state so the operator can see exactly
+    /// what the model will receive.
+    pub fn context_breakdown_text(&self) -> String {
+        let mut lines = Vec::new();
+
+        // Identity section
+        let identity = self.project_agent_self();
+        lines.push(format!(
+            "identity       {} chars — persona + soul + role posture",
+            identity.len()
+        ));
+
+        // Instructions (session + working)
+        let instructions = format!("{}\n{}", self.project_session_context(&[]), self.project_working_state());
+        lines.push(format!(
+            "instructions   {} chars — session state + working projection",
+            instructions.len()
+        ));
+
+        // Memory (relationship + knowledge)
+        let memory = format!("{}\n{}", self.project_user(""), self.project_knowledge("", &[]));
+        lines.push(format!(
+            "memory         {} chars — relationship + knowledge layers",
+            memory.len()
+        ));
+
+        // Dialogue window
+        let turn_count = self.recent_turns.len();
+        let dialogue_chars: usize = self
+            .recent_turns
+            .iter()
+            .map(|t| {
+                t.user_content.len()
+                    + t.assistant_content.as_deref().map(str::len).unwrap_or(0)
+            })
+            .sum();
+        lines.push(format!(
+            "dialogue_window {} turns / {} chars",
+            turn_count, dialogue_chars
+        ));
+
+        // Active turn
+        match self.active_turn.as_ref() {
+            Some(turn) => lines.push(format!(
+                "active_turn    {} chars — iteration {} / phase {}",
+                turn.user_content.len(),
+                turn.iteration,
+                turn.phase.as_str()
+            )),
+            None => lines.push("active_turn    (none — between turns)".into()),
+        }
+
+        // Tool history
+        let history_count = self
+            .active_turn
+            .as_ref()
+            .map(|t| t.working_tool_history.len())
+            .unwrap_or(0);
+        if history_count > 0 {
+            let history_summary = self
+                .active_turn
+                .as_ref()
+                .map(|t| {
+                    t.working_tool_history
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (call, _))| format!("  {}: {}", i + 1, call.tool_name))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
+            lines.push(format!("tool_history   {} call(s):\n{}", history_count, history_summary));
+        } else {
+            lines.push("tool_history   (empty — initial turn or no tools called yet)".into());
+        }
+
+        format!("Context envelope breakdown:\n{}", lines.join("\n"))
     }
 
     pub fn project_tools_for_turn(&self, user_content: &str) -> Vec<ToolDefinition> {
@@ -1507,8 +1853,46 @@ impl SessionState {
             })
             .collect::<Vec<_>>();
 
+        // Apply dialogue window: time-based roll-off first, then char-budget.
+        // Turns older than `dialogue_window_minutes` are dropped unconditionally.
+        // Among the remaining, oldest are dropped until the char budget fits.
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let max_age_secs = u64::from(self.settings.context_window.dialogue_window_minutes) * 60;
+        let time_filtered: Vec<&TurnRecord> = self
+            .recent_turns
+            .iter()
+            .filter(|turn| {
+                // turns with created_at == 0 (legacy / checkpoint without timestamp) are kept
+                turn.created_at == 0 || now_secs.saturating_sub(turn.created_at) <= max_age_secs
+            })
+            .collect();
+
+        let char_budget = self.settings.context_window.dialogue_window_chars;
+        let mut budget_used: usize = 0;
+        let windowed_turns: Vec<&TurnRecord> = time_filtered
+            .iter()
+            .rev()
+            .take_while(|turn| {
+                let cost = turn.user_content.len()
+                    + turn.assistant_content.as_deref().map(str::len).unwrap_or(0);
+                if budget_used + cost <= char_budget {
+                    budget_used += cost;
+                    true
+                } else {
+                    false
+                }
+            })
+            .copied()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+
         let mut dialogue_window = Vec::new();
-        for turn in &self.recent_turns {
+        for turn in windowed_turns {
             dialogue_window.push(json!({
                 "role": "user",
                 "text": turn.user_content,
@@ -1521,6 +1905,33 @@ impl SessionState {
             }
         }
 
+        // tool_history: accumulated (call, result) pairs from the active turn.
+        // Always present in the envelope — empty on initial turn, populated on re-entry.
+        let tool_history: Vec<Value> = self
+            .active_turn
+            .as_ref()
+            .map(|turn| {
+                turn.working_tool_history
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (call, result))| {
+                        json!({
+                            "index": i + 1,
+                            "tool_name": call.tool_name,
+                            "arguments": call.arguments,
+                            "result": result.content,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let active_plan: Option<Value> = self
+            .active_turn
+            .as_ref()
+            .and_then(|t| t.active_plan.as_ref())
+            .and_then(|p| serde_json::to_value(p).ok());
+
         json!({
             "instructions": instructions,
             "identity": identity,
@@ -1530,6 +1941,8 @@ impl SessionState {
                 "role": "user",
                 "text": projection.current_user_message,
             },
+            "tool_history": tool_history,
+            "active_plan": active_plan,
         })
     }
 
@@ -1818,6 +2231,18 @@ impl SessionState {
         if !self.summary_text().is_empty() {
             envelope.push_str(&format!("Recent summary: {}.\n", self.summary_text()));
         }
+        if !self.rules.is_empty() {
+            envelope.push_str("\n[Rules]\n");
+            envelope.push_str("The following behavioral rules are permanently in effect. \
+                               They take precedence over all other instructions and are never \
+                               negotiable without explicit operator approval:\n");
+            for (i, rule) in self.rules.iter().enumerate() {
+                let desc = rule.get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<unknown rule>");
+                envelope.push_str(&format!("{}. {}\n", i + 1, desc));
+            }
+        }
         envelope.trim_end().to_string()
     }
 
@@ -2024,6 +2449,8 @@ impl SessionState {
                 "working_tool_history": turn.working_tool_history.iter().map(|(call, result)| {
                     json!({ "call": call, "result": result })
                 }).collect::<Vec<_>>(),
+                "active_plan": turn.active_plan,
+                "consecutive_step_failures": turn.consecutive_step_failures,
                 "pending_text_reply": turn.pending_text_reply,
                 "had_voice_input": turn.had_voice_input,
                 "awaiting_transcription_reentry": turn.awaiting_transcription_reentry,
@@ -2048,9 +2475,11 @@ impl SessionState {
                     "turn_id": turn.turn_id,
                     "user_content": turn.user_content,
                     "assistant_content": turn.assistant_content,
+                    "created_at": turn.created_at,
                 })
             }).collect::<Vec<_>>(),
             "summary": self.summary_text(),
+            "rules": self.rules,
         })
     }
 
@@ -2146,6 +2575,10 @@ impl SessionState {
                                 .get("assistant_content")
                                 .and_then(serde_json::Value::as_str)
                                 .map(str::to_string),
+                            created_at: turn
+                                .get("created_at")
+                                .and_then(serde_json::Value::as_u64)
+                                .unwrap_or(0),
                         })
                     })
                     .collect::<Vec<_>>()
@@ -2227,6 +2660,14 @@ impl SessionState {
                             .collect()
                     })
                     .unwrap_or_default(),
+                active_plan: turn
+                    .get("active_plan")
+                    .cloned()
+                    .and_then(|v| serde_json::from_value::<ActivePlan>(v).ok()),
+                consecutive_step_failures: turn
+                    .get("consecutive_step_failures")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u32,
                 pending_text_reply: turn
                     .get("pending_text_reply")
                     .and_then(serde_json::Value::as_str)
@@ -2249,6 +2690,7 @@ impl SessionState {
             active_incarnation_id,
             role_activation,
             agent_profile,
+            settings: AgentSettings::default(),
             status,
             approval_policy,
             bindings,
@@ -2258,6 +2700,11 @@ impl SessionState {
             active_turn,
             active_subagents: Vec::new(),
             last_handoff_summary: None,
+            rules: checkpoint
+                .get("rules")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default(),
         })
     }
 }
@@ -2449,6 +2896,9 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
         tool_name,
         "session.status"
             | "agent.configure"
+            | "memory.recall"
+            | "memory.remember"
+            | "rule.propose"
             | "skill.register"
             | "skill.list"
             | "skill.assign"
@@ -2762,6 +3212,8 @@ mod tests {
             pending_tool_call: None,
             pending_approval: None,
             working_tool_history: Vec::new(),
+            active_plan: None,
+            consecutive_step_failures: 0,
             pending_text_reply: Some("hello back".into()),
             had_voice_input: true,
             awaiting_transcription_reentry: true,
@@ -2856,6 +3308,8 @@ mod tests {
             pending_tool_call: None,
             pending_approval: None,
             working_tool_history: Vec::new(),
+            active_plan: None,
+            consecutive_step_failures: 0,
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: false,
@@ -3331,6 +3785,8 @@ mod tests {
                     content: "hello".into(),
                 },
             )],
+            active_plan: None,
+            consecutive_step_failures: 0,
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: false,
@@ -3406,6 +3862,8 @@ mod tests {
             pending_tool_call: None,
             pending_approval: None,
             working_tool_history: Vec::new(),
+            active_plan: None,
+            consecutive_step_failures: 0,
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: false,
@@ -3475,6 +3933,8 @@ mod tests {
             pending_tool_call: None,
             pending_approval: None,
             working_tool_history: Vec::new(),
+            active_plan: None,
+            consecutive_step_failures: 0,
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: false,
@@ -3541,6 +4001,8 @@ mod tests {
             pending_tool_call: None,
             pending_approval: None,
             working_tool_history: Vec::new(),
+            active_plan: None,
+            consecutive_step_failures: 0,
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: false,
@@ -3990,6 +4452,8 @@ mod tests {
             pending_tool_call: None,
             pending_approval: None,
             working_tool_history: Vec::new(),
+            active_plan: None,
+            consecutive_step_failures: 0,
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: false,
@@ -4029,6 +4493,8 @@ mod tests {
             pending_tool_call: None,
             pending_approval: None,
             working_tool_history: Vec::new(),
+            active_plan: None,
+            consecutive_step_failures: 0,
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: true,
@@ -4083,6 +4549,8 @@ mod tests {
             pending_tool_call: None,
             pending_approval: None,
             working_tool_history: Vec::new(),
+            active_plan: None,
+            consecutive_step_failures: 0,
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: false,
@@ -4138,6 +4606,8 @@ mod tests {
             pending_tool_call: None,
             pending_approval: None,
             working_tool_history: Vec::new(),
+            active_plan: None,
+            consecutive_step_failures: 0,
             pending_text_reply: None,
             had_voice_input: true,
             awaiting_transcription_reentry: true,

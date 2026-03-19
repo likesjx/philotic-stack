@@ -1,7 +1,7 @@
 use ansible_mesh_core::beacon::BeaconDaemon;
 use ansible_mesh_core::graph::{AbstractSkillRecord, AbstractToolRecord, ToolsetProfileRecord};
 use ansible_mesh_core::heartbeat::emit_heartbeat;
-use ansible_mesh_core::registry::{CapabilityAdvertisement, ExecutionReachability};
+use ansible_mesh_core::registry::{CapabilityAdvertisement, ExecutionReachability, NodeRegistry};
 use ansible_mesh_core::storage::{
     AgentIdentityRecord, CursorStorage, EventStorage, GraphStorage, GuestRecord, HotelRecord,
 };
@@ -20,10 +20,10 @@ use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpListener, UdpSocket as StdUdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 
 mod auth;
@@ -69,6 +69,35 @@ pub enum LedgerCommand {
     },
 }
 
+type BeaconInboxReceiver =
+    Arc<Mutex<Option<mpsc::Receiver<ansible_mesh_core::BeaconMessage>>>>;
+type WebRtcSignalReceiver =
+    Arc<Mutex<Option<mpsc::Receiver<ansible_mesh_core::webrtc::WebRtcSignalMessage>>>>;
+
+#[derive(Clone)]
+struct MeshRuntimeContext {
+    hotel_name: String,
+    hotel: HotelRecord,
+    caps: NodeCapabilities,
+    mesh_addr: String,
+    execution_addr: String,
+    mesh_psk: String,
+    db_path: String,
+    enable_rust_auth: bool,
+    enable_rust_dispatcher: bool,
+    graph: Arc<dyn ansible_mesh_core::storage::GraphStorage>,
+    registry: Arc<RwLock<NodeRegistry>>,
+    ledger: Arc<dyn EventStorage>,
+    tracker: Arc<dyn CursorStorage>,
+    dispatcher_tx: mpsc::Sender<LedgerCommand>,
+    ipc_inboxes: crate::service::ipc::InboxRegistry,
+    shutdown_tx: tokio::sync::broadcast::Sender<()>,
+    inbox_tx: mpsc::Sender<ansible_mesh_core::BeaconMessage>,
+    inbox_rx: BeaconInboxReceiver,
+    webrtc_signal_tx: mpsc::Sender<ansible_mesh_core::webrtc::WebRtcSignalMessage>,
+    webrtc_signal_rx: WebRtcSignalReceiver,
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -78,10 +107,6 @@ struct Args {
     /// Name of the hotel to boot from the Context Graph
     #[arg(long)]
     hotel: Option<String>,
-
-    /// Optional path to a JSON file containing configuration to load into the Context Graph
-    #[arg(long)]
-    load_config: Option<String>,
 
     /// Optional startup validation to run after the hotel materializes its guests
     #[arg(long, value_enum)]
@@ -102,12 +127,25 @@ enum Command {
         #[command(subcommand)]
         provider: AuthCommand,
     },
+    /// Apply a config file to the Context Graph DB.
+    /// Run this once on first setup or whenever the config changes.
+    /// Normal `aiua --hotel <name>` startup runs purely from the DB.
+    Load {
+        /// Path to the JSON config file to apply
+        #[arg(long)]
+        file: String,
+        /// Hotel section to seed (default: "default")
+        #[arg(long, default_value = "default")]
+        hotel: String,
+    },
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 enum StartupTest {
     #[value(name = "text-roundtrip", alias = "text-round-trip")]
     TextRoundTrip,
+    #[value(name = "graph-roundtrip", alias = "graph-round-trip")]
+    GraphRoundTrip,
     #[value(name = "cognitive-roundtrip", alias = "cognitive-round-trip")]
     CognitiveRoundTrip,
     #[value(name = "gemini-oauth-roundtrip", alias = "gemini-oauth")]
@@ -252,6 +290,101 @@ fn hotel_execution_port(hotel_name: &str) -> u16 {
     hotel_base_port(hotel_name) + 2
 }
 
+fn is_udp_port_available(port: u16) -> bool {
+    StdUdpSocket::bind(("0.0.0.0", port)).is_ok()
+}
+
+fn is_tcp_port_available(port: u16) -> bool {
+    TcpListener::bind(("0.0.0.0", port)).is_ok()
+}
+
+fn port_cluster_available(mesh_port: u16, blob_port: u16, execution_port: u16) -> bool {
+    is_udp_port_available(mesh_port)
+        && is_tcp_port_available(blob_port)
+        && is_tcp_port_available(execution_port)
+}
+
+fn local_service_ports_available(blob_port: u16, execution_port: u16) -> bool {
+    is_tcp_port_available(blob_port) && is_tcp_port_available(execution_port)
+}
+
+fn nearest_available_base_port<F>(desired: u16, mut cluster_ok: F) -> Option<u16>
+where
+    F: FnMut(u16) -> bool,
+{
+    if cluster_ok(desired) {
+        return Some(desired);
+    }
+
+    let max_offset = u16::MAX.saturating_sub(desired).max(desired);
+    for offset in 1..=max_offset {
+        let up = desired.saturating_add(offset);
+        if up >= desired && cluster_ok(up) {
+            return Some(up);
+        }
+
+        let down = desired.saturating_sub(offset);
+        if down < desired && cluster_ok(down) {
+            return Some(down);
+        }
+    }
+
+    None
+}
+
+fn resolve_runtime_ports(hotel: &HotelRecord, mesh_enabled: bool) -> Result<(u16, u16, u16)> {
+    let desired_mesh = hotel.mesh_port;
+    let desired_blob = hotel.blob_port;
+    let desired_execution = hotel.execution_port;
+
+    let desired_ports_available = if mesh_enabled {
+        port_cluster_available(desired_mesh, desired_blob, desired_execution)
+    } else {
+        local_service_ports_available(desired_blob, desired_execution)
+    };
+
+    if desired_ports_available {
+        return Ok((desired_mesh, desired_blob, desired_execution));
+    }
+
+    let Some(base) = nearest_available_base_port(desired_mesh, |base| {
+        let Some(blob) = base.checked_add(1) else {
+            return false;
+        };
+        let Some(execution) = base.checked_add(2) else {
+            return false;
+        };
+        if mesh_enabled {
+            port_cluster_available(base, blob, execution)
+        } else {
+            local_service_ports_available(blob, execution)
+        }
+    }) else {
+        anyhow::bail!(
+            "No available {} port cluster found near base port {}",
+            if mesh_enabled {
+                "mesh/blob/execution"
+            } else {
+                "blob/execution"
+            },
+            desired_mesh
+        );
+    };
+
+    Ok((base, base + 1, base + 2))
+}
+
+fn hotel_ipc_socket_path(hotel_name: &str) -> String {
+    let safe_name = sanitize_hotel_name(hotel_name);
+    profile_dir()
+        .map(|d| {
+            d.join(format!("aiua-{safe_name}.sock"))
+                .to_string_lossy()
+                .into_owned()
+        })
+        .unwrap_or_else(|| format!("/tmp/philotic-{safe_name}.sock"))
+}
+
 fn default_hotel_record(hotel_name: &str) -> HotelRecord {
     let safe_name = sanitize_hotel_name(hotel_name);
     let base_port = hotel_base_port(&safe_name);
@@ -268,9 +401,7 @@ fn default_hotel_record(hotel_name: &str) -> HotelRecord {
         mesh_port: base_port,
         blob_port: base_port + 1,
         execution_port: hotel_execution_port(&safe_name),
-        ipc_socket_path: profile_dir()
-            .map(|d| d.join("aiua.sock").to_string_lossy().into_owned())
-            .unwrap_or_else(|| format!("/tmp/philotic-{safe_name}.sock")),
+        ipc_socket_path: hotel_ipc_socket_path(hotel_name),
         active_pid: None,
     }
 }
@@ -327,6 +458,303 @@ fn execution_reachability_for_hotel(
         host,
         port: hotel.execution_port,
     }
+}
+
+async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
+    let daemon = Arc::new(
+        BeaconDaemon::bind_with_registry(
+            &ctx.mesh_addr,
+            ctx.caps.clone(),
+            ctx.inbox_tx.clone(),
+            &ctx.mesh_psk,
+            &ctx.db_path,
+            ctx.enable_rust_auth,
+            ctx.registry.clone(),
+        )
+        .await?,
+    );
+
+    let mut inbox_rx = {
+        let mut guard = ctx.inbox_rx.lock().await;
+        guard.take()
+    }
+    .context("mesh runtime activation missing beacon inbox receiver")?;
+
+    let mut webrtc_signal_rx = {
+        let mut guard = ctx.webrtc_signal_rx.lock().await;
+        guard.take()
+    }
+    .context("mesh runtime activation missing WebRTC signal receiver")?;
+
+    info!(
+        hotel = %ctx.hotel_name,
+        "Mesh transport antenna extended"
+    );
+
+    if ctx.enable_rust_dispatcher {
+        tokio::spawn(crate::service::mesh_dispatcher::outbound_dispatcher(
+            ctx.ledger.clone(),
+            ctx.tracker.clone(),
+            daemon.socket(),
+            ctx.graph.clone(),
+            ctx.registry.clone(),
+            ctx.caps.node_id.clone(),
+            ctx.shutdown_tx.subscribe(),
+        ));
+    }
+
+    {
+        let execution_inbox_tx = daemon.inbox_tx();
+        let execution_caps = ctx.caps.clone();
+        let execution_db_path = ctx.db_path.clone();
+        let execution_psk = ctx.mesh_psk.clone();
+        let execution_addr = ctx.execution_addr.clone();
+        let execution_enable_rust_auth = ctx.enable_rust_auth;
+        tokio::spawn(async move {
+            if let Err(e) = crate::service::execution_transport::serve_execution_plane(
+                &execution_addr,
+                execution_caps,
+                execution_inbox_tx,
+                &execution_psk,
+                &execution_db_path,
+                execution_enable_rust_auth,
+            )
+            .await
+            {
+                error!("Hotel execution transport failed: {}", e);
+            }
+        });
+    }
+
+    {
+        let heartbeat_socket = daemon.socket();
+        let heartbeat_graph = ctx.graph.clone();
+        let heartbeat_hotel = ctx.hotel.clone();
+        let heartbeat_caps = ctx.caps.clone();
+        let mut heartbeat_shutdown = ctx.shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let targets = match mesh_targets_for_graph(heartbeat_graph.as_ref(), &heartbeat_caps.node_id) {
+                            Ok(targets) => targets,
+                            Err(err) => {
+                                warn!("Failed to resolve mesh heartbeat targets: {}", err);
+                                continue;
+                            }
+                        };
+                        if targets.is_empty() {
+                            continue;
+                        }
+                        let advertisements = match local_capability_advertisements(heartbeat_graph.as_ref(), &heartbeat_hotel) {
+                            Ok(advertisements) => advertisements,
+                            Err(err) => {
+                                warn!("Failed to build local capability advertisements: {}", err);
+                                continue;
+                            }
+                        };
+                        let execution_reachability =
+                            execution_reachability_for_hotel(heartbeat_graph.as_ref(), &heartbeat_hotel);
+                        for (_target_node_id, target_addr) in targets {
+                            let Ok(target) = target_addr.parse::<SocketAddr>() else {
+                                warn!("Skipping invalid heartbeat target address {}", target_addr);
+                                continue;
+                            };
+                            if let Err(err) = emit_heartbeat(
+                                &heartbeat_socket,
+                                target,
+                                &heartbeat_caps,
+                                &advertisements,
+                                Some(execution_reachability.clone()),
+                            )
+                            .await
+                            {
+                                warn!("Failed to emit heartbeat to {}: {}", target_addr, err);
+                            }
+                        }
+                    }
+                    _ = heartbeat_shutdown.recv() => break,
+                }
+            }
+        });
+    }
+
+    {
+        let dispatcher_inbound_tx = ctx.dispatcher_tx.clone();
+        let inbound_socket = daemon.socket();
+        let inbound_graph = ctx.graph.clone();
+        let inbound_inboxes = ctx.ipc_inboxes.clone();
+        let inbound_local_node_id = ctx.caps.node_id.clone();
+        let mesh_auth_inbound = ansible_mesh_core::authz::MeshAuth::new(&ctx.mesh_psk);
+        let webrtc_signal_tx_inbound = ctx.webrtc_signal_tx.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = inbox_rx.recv().await {
+                match msg.msg_type {
+                    ansible_mesh_core::MsgType::MeshEventBatch => {
+                        if let Ok(events) = serde_json::from_slice::<Vec<EventEnvelope>>(&msg.payload) {
+                            if !events.is_empty() {
+                                let max_seq = events.iter().map(|e| e.seq).max().unwrap_or(0);
+                                for event in &events {
+                                    IpcServer::deliver_event_envelope(&inbound_inboxes, event).await;
+                                }
+                                let _ = dispatcher_inbound_tx
+                                    .send(LedgerCommand::CommitInboundBatch {
+                                        events,
+                                        source_node: msg.src_node.clone(),
+                                    })
+                                    .await;
+
+                                let ack_payload =
+                                    serde_json::json!({ "acked_seq": max_seq }).to_string();
+                                if let Some(target_addr) =
+                                    mesh_target_addr_for_node(inbound_graph.as_ref(), &msg.src_node)
+                                        .ok()
+                                        .flatten()
+                                {
+                                    let msg_id = uuid::Uuid::new_v4();
+                                    let seq = 0;
+                                    let timestamp = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs();
+                                    let payload = ack_payload.into_bytes();
+                                    let hmac = mesh_auth_inbound
+                                        .sign(&msg_id, seq as u64, &payload, timestamp);
+                                    let ack = ansible_mesh_core::BeaconMessage {
+                                        version: 1,
+                                        msg_id,
+                                        src_node: inbound_local_node_id.clone(),
+                                        dest_node: msg.src_node.clone(),
+                                        msg_type: ansible_mesh_core::MsgType::MeshEventAck,
+                                        seq,
+                                        total: 1,
+                                        payload,
+                                        timestamp,
+                                        hmac,
+                                    };
+                                    match serde_json::to_vec(&ack) {
+                                        Ok(packet) => {
+                                            if let Err(err) =
+                                                inbound_socket.send_to(&packet, &target_addr).await
+                                            {
+                                                warn!(
+                                                    "Failed to return mesh ACK to {} at {}: {}",
+                                                    msg.src_node, target_addr, err
+                                                );
+                                            }
+                                        }
+                                        Err(err) => warn!(
+                                            "Failed to serialize mesh ACK for {}: {}",
+                                            msg.src_node, err
+                                        ),
+                                    }
+                                } else {
+                                    warn!(
+                                        "No mesh target address found for ACK destination {}",
+                                        msg.src_node
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    ansible_mesh_core::MsgType::MeshEventAck => {
+                        debug!("Received MeshEventAck from {}", msg.src_node);
+                        if let Ok(ack_payload) =
+                            serde_json::from_slice::<serde_json::Value>(&msg.payload)
+                        {
+                            if let Some(acked_seq) =
+                                ack_payload.get("acked_seq").and_then(|v| v.as_u64())
+                            {
+                                let _ = dispatcher_inbound_tx
+                                    .send(LedgerCommand::ProcessAck {
+                                        consumer_node_id: msg.src_node.clone(),
+                                        acked_seq,
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                    ansible_mesh_core::MsgType::WebRtcSignal => {
+                        info!("Received WebRTC Signaling Payload from {}", msg.src_node);
+                        if let Ok(signal_msg) = serde_json::from_slice::<
+                            ansible_mesh_core::webrtc::WebRtcSignalMessage,
+                        >(&msg.payload)
+                        {
+                            let webrtc_signal_tx = webrtc_signal_tx_inbound.clone();
+                            tokio::spawn(async move {
+                                if let ansible_mesh_core::webrtc::SignalPayload::Offer(sdp) =
+                                    signal_msg.signal
+                                {
+                                    let guest = crate::service::webrtc_guest::WebRtcGuest::new(
+                                        signal_msg.session_id,
+                                        msg.src_node,
+                                        webrtc_signal_tx,
+                                    );
+                                    if let Err(e) = guest.run_answering(sdp).await {
+                                        error!("WebRTC Transceiver Guest failed: {}", e);
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+
+    {
+        let socket_webrtc = daemon.socket();
+        let mesh_auth_webrtc = ansible_mesh_core::authz::MeshAuth::new(&ctx.mesh_psk);
+        let local_node_id_webrtc = ctx.caps.node_id.clone();
+        tokio::spawn(async move {
+            while let Some(signal) = webrtc_signal_rx.recv().await {
+                if let Ok(payload_bytes) = serde_json::to_vec(&signal) {
+                    let msg_id = uuid::Uuid::new_v4();
+                    let seq = 0;
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+
+                    let hmac =
+                        mesh_auth_webrtc.sign(&msg_id, seq as u64, &payload_bytes, timestamp);
+
+                    let msg = ansible_mesh_core::BeaconMessage {
+                        version: 1,
+                        msg_id,
+                        src_node: local_node_id_webrtc.clone(),
+                        dest_node: signal.target_guest_id.clone(),
+                        msg_type: ansible_mesh_core::MsgType::WebRtcSignal,
+                        seq,
+                        total: 1,
+                        timestamp,
+                        payload: payload_bytes,
+                        hmac,
+                    };
+
+                    if let Ok(packet) = serde_json::to_vec(&msg) {
+                        let target_addr = "127.0.0.1:8999";
+                        if let Err(e) = socket_webrtc.send_to(&packet, target_addr).await {
+                            tracing::error!("UDP WebRTC Signal send failed: {}", e);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    {
+        let daemon = daemon.clone();
+        tokio::spawn(async move {
+            if let Err(e) = daemon.run_loop().await {
+                error!("Beacon Daemon error: {}", e);
+            }
+        });
+    }
+
+    Ok(())
 }
 
 fn local_capability_advertisements(
@@ -481,32 +909,26 @@ fn merged_agent_config(
     config_json: &serde_json::Value,
     hotel_name: &str,
 ) -> Option<(String, serde_json::Map<String, serde_json::Value>)> {
-    let default_hotel = hotel_object(config_json, "default");
     let selected_hotel = hotel_object(config_json, hotel_name);
     let selected_key = selected_hotel
-        .and_then(selected_agent_key_for_hotel)
-        .or_else(|| default_hotel.and_then(selected_agent_key_for_hotel))?;
+        .and_then(selected_agent_key_for_hotel)?;
     let mut merged = serde_json::Map::new();
 
-    for hotel in [default_hotel, selected_hotel] {
-        let Some(hotel) = hotel else {
-            continue;
-        };
-        let Some(agents) = hotel.get("agents").and_then(serde_json::Value::as_object) else {
-            continue;
-        };
-        if selected_key != "default" {
-            if let Some(default_agent) =
-                agents.get("default").and_then(serde_json::Value::as_object)
-            {
-                merged.extend(default_agent.clone());
+    if let Some(hotel) = selected_hotel {
+        if let Some(agents) = hotel.get("agents").and_then(serde_json::Value::as_object) {
+            if selected_key != "default" {
+                if let Some(default_agent) =
+                    agents.get("default").and_then(serde_json::Value::as_object)
+                {
+                    merged.extend(default_agent.clone());
+                }
             }
-        }
-        if let Some(agent) = agents
-            .get(&selected_key)
-            .and_then(serde_json::Value::as_object)
-        {
-            merged.extend(agent.clone());
+            if let Some(agent) = agents
+                .get(&selected_key)
+                .and_then(serde_json::Value::as_object)
+            {
+                merged.extend(agent.clone());
+            }
         }
     }
 
@@ -558,30 +980,11 @@ fn all_agent_profiles_from_config(
     config_json: &serde_json::Value,
     hotel_name: &str,
 ) -> Vec<AgentProfile> {
-    let get_agents = |hotel: &serde_json::Map<String, serde_json::Value>| {
-        hotel
-            .get("agents")
-            .and_then(serde_json::Value::as_object)
-            .cloned()
-            .unwrap_or_default()
-    };
-
-    let default_agents = hotel_object(config_json, "default")
-        .map(get_agents)
+    let all_agents = hotel_object(config_json, hotel_name)
+        .and_then(|hotel| hotel.get("agents"))
+        .and_then(serde_json::Value::as_object)
+        .cloned()
         .unwrap_or_default();
-    let hotel_agents = if hotel_name != "default" {
-        hotel_object(config_json, hotel_name)
-            .map(get_agents)
-            .unwrap_or_default()
-    } else {
-        serde_json::Map::new()
-    };
-
-    // Merge: hotel-specific agents overlay the default agents by key
-    let mut all_agents = default_agents;
-    for (key, val) in hotel_agents {
-        all_agents.insert(key, val);
-    }
 
     if all_agents.is_empty() {
         return vec![default_agent_profile_for_hotel(hotel_name)];
@@ -624,12 +1027,10 @@ fn raw_agent_config_for_key(
     agent_key: &str,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
     let mut merged = serde_json::Map::new();
-    for name in ["default", hotel_name] {
-        if let Some(hotel) = hotel_object(config_json, name) {
-            if let Some(agents) = hotel.get("agents").and_then(serde_json::Value::as_object) {
-                if let Some(agent) = agents.get(agent_key).and_then(serde_json::Value::as_object) {
-                    merged.extend(agent.clone());
-                }
+    if let Some(hotel) = hotel_object(config_json, hotel_name) {
+        if let Some(agents) = hotel.get("agents").and_then(serde_json::Value::as_object) {
+            if let Some(agent) = agents.get(agent_key).and_then(serde_json::Value::as_object) {
+                merged.extend(agent.clone());
             }
         }
     }
@@ -824,29 +1225,19 @@ fn extract_context_graph_entries(
     }
 
     if let Some(hotels) = obj.get("hotels").and_then(serde_json::Value::as_object) {
-        if let Some(default_hotel) = hotels.get("default").and_then(serde_json::Value::as_object) {
-            merge_hotel_base_entries(&mut merged, default_hotel);
-        }
-
         if let Some(hotel_name) = hotel_name {
-            if let Some(hotel) = hotels
-                .get(hotel_name)
-                .and_then(serde_json::Value::as_object)
-            {
+            if let Some(hotel) = hotels.get(hotel_name).and_then(serde_json::Value::as_object) {
                 merge_hotel_base_entries(&mut merged, hotel);
             }
         }
     }
 
     if let Some(hotel_name) = hotel_name {
-        // For multi-agent hotels, extract per-agent token keys for all agents.
-        for hotel_key in ["default", hotel_name] {
-            if let Some(hotel) = hotel_object(config_json, hotel_key) {
-                if let Some(agents) = hotel.get("agents").and_then(serde_json::Value::as_object) {
-                    for (agent_key, agent_val) in agents {
-                        if let Some(agent) = agent_val.as_object() {
-                            merge_agent_entries(&mut merged, agent, Some(agent_key.as_str()));
-                        }
+        if let Some(hotel) = hotel_object(config_json, hotel_name) {
+            if let Some(agents) = hotel.get("agents").and_then(serde_json::Value::as_object) {
+                for (agent_key, agent_val) in agents {
+                    if let Some(agent) = agent_val.as_object() {
+                        merge_agent_entries(&mut merged, agent, Some(agent_key.as_str()));
                     }
                 }
             }
@@ -980,7 +1371,7 @@ fn agent_identity_record_for_profile(
     // Merge policy and identity fields from config into bundle.
     if let Some(bundle_obj) = bundle_json.as_object_mut() {
         if let Some(config) = agent_config {
-            for key in ["voice_response_policy", "media_routing_policy"] {
+            for key in ["voice_response_policy", "media_routing_policy", "default_toolset"] {
                 if let Some(value) = config.get(key) {
                     bundle_obj.insert(key.to_string(), value.clone());
                 }
@@ -1405,6 +1796,7 @@ fn enable_guest_test_overrides(
     }
 
     match test {
+        StartupTest::GraphRoundTrip => {}
         StartupTest::TextRoundTrip => {
             for guest in &mut guests {
                 if guest.role != "model" {
@@ -2105,6 +2497,21 @@ fn startup_test_force_kill_pid(pid: u32) -> Result<()> {
 }
 
 fn prepare_startup_test_binaries(_test: StartupTest) -> Result<()> {
+    let existing_bins = [
+        "target/debug/membrane",
+        "target/debug/philote",
+        "target/debug/tool-runner",
+        "target/debug/graph-runner",
+        "target/debug/model-controller-gemini",
+        "target/debug/model-controller-elevenlabs",
+    ];
+    if existing_bins
+        .iter()
+        .all(|path| std::path::Path::new(path).exists())
+    {
+        return Ok(());
+    }
+
     let status = std::process::Command::new("cargo")
         .args([
             "build",
@@ -2114,6 +2521,8 @@ fn prepare_startup_test_binaries(_test: StartupTest) -> Result<()> {
             "philote",
             "-p",
             "tool-runner",
+            "-p",
+            "graph-runner",
             "-p",
             "model-router",
             "--bins",
@@ -2137,6 +2546,117 @@ async fn run_startup_test(
 ) -> Result<()> {
     let local_node_id = default_hotel_record(hotel_name).capabilities.node_id;
     match test {
+        StartupTest::GraphRoundTrip => {
+            let graph_name = format!("startup-graph-{}-{}", hotel_name, std::process::id());
+
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+            let mut client = PhiloticClient::connect_at(
+                socket_path,
+                GuestIdentity {
+                    guest_id: "aiua-startup-graph-client".into(),
+                    role: "aiua-startup-graph".into(),
+                    supported_tools: Vec::new(),
+                },
+            )
+            .await?;
+
+            let subscribe = client
+                .send_request(IpcRequest::SubscribeInbox {
+                    role: "aiua-startup-graph".into(),
+                })
+                .await?;
+            match subscribe {
+                IpcResponse::Standard { ok: true, .. } => {}
+                other => anyhow::bail!("unexpected graph startup subscribe response: {other:?}"),
+            }
+
+            let graph_id = startup_test_emit_graph_tool(
+                &mut client,
+                &local_node_id,
+                "graph.create",
+                serde_json::json!({
+                    "name": graph_name,
+                    "default_visibility": "public",
+                    "caller_id": "aiua-startup-graph-client"
+                }),
+            )
+            .await?;
+            let graph_id = graph_id
+                .get("graph_id")
+                .and_then(serde_json::Value::as_str)
+                .context("graph.create startup reply missing graph_id")?
+                .to_string();
+
+            let node_result = startup_test_emit_graph_tool(
+                &mut client,
+                &local_node_id,
+                "graph.node.upsert",
+                serde_json::json!({
+                    "graph_id": graph_id,
+                    "node_type": "Smoke",
+                    "label": "startup smoke node",
+                    "visibility": ["public"],
+                    "caller_id": "aiua-startup-graph-client"
+                }),
+            )
+            .await?;
+            let node_id = node_result
+                .get("node_id")
+                .and_then(serde_json::Value::as_str)
+                .context("graph.node.upsert startup reply missing node_id")?
+                .to_string();
+
+            let get_result = startup_test_emit_graph_tool(
+                &mut client,
+                &local_node_id,
+                "graph.node.get",
+                serde_json::json!({
+                    "graph_id": graph_id,
+                    "node_id": node_id,
+                    "caller_id": "aiua-startup-graph-client"
+                }),
+            )
+            .await?;
+            let label = get_result
+                .get("node")
+                .and_then(|node| node.get("label"))
+                .and_then(serde_json::Value::as_str)
+                .context("graph.node.get startup reply missing node.label")?;
+            if label != "startup smoke node" {
+                anyhow::bail!(
+                    "unexpected graph.node.get startup label: expected {:?}, got {:?}",
+                    "startup smoke node",
+                    label
+                );
+            }
+
+            let export_result = startup_test_emit_graph_tool(
+                &mut client,
+                &local_node_id,
+                "graph.export",
+                serde_json::json!({
+                    "graph_id": graph_id,
+                    "caller_id": "aiua-startup-graph-client"
+                }),
+            )
+            .await?;
+            let node_count = export_result
+                .get("node_count")
+                .and_then(serde_json::Value::as_u64)
+                .context("graph.export startup reply missing node_count")?;
+            if node_count < 1 {
+                anyhow::bail!("expected graph export node_count >= 1, got {}", node_count);
+            }
+
+            info!(
+                graph_id = %graph_id,
+                node_id = %node_id,
+                node_count,
+                "Startup graph round-trip succeeded through materialized graph-runner"
+            );
+            Ok(())
+        }
         StartupTest::TextRoundTrip => {
             let text = text
                 .unwrap_or("hello from the Philotic startup text test")
@@ -3122,6 +3642,74 @@ async fn run_startup_test(
     }
 }
 
+async fn startup_test_emit_graph_tool(
+    client: &mut PhiloticClient,
+    local_node_id: &str,
+    tool_name: &str,
+    arguments: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let session_id = format!("startup-test:graph:{tool_name}");
+    let turn_id = format!("startup-graph-turn-{tool_name}");
+
+    let response = client
+        .send_request(IpcRequest::EmitTask {
+            target_node: local_node_id.to_string(),
+            target_role: format!("tool.{tool_name}"),
+            target_guest_id: None,
+            task_json: serde_json::json!({
+                "action": "execute_tool",
+                "tool_name": tool_name,
+                "arguments": arguments,
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "chat_id": "startup-test-chat",
+                "agent_id": "aiua-startup-graph-client",
+                "caller_roles": ["aiua-startup-graph"],
+                "reply_to": local_node_id,
+                "reply_role": "aiua-startup-graph",
+                "final_reply_to": local_node_id,
+                "final_reply_role": "aiua-startup-graph",
+                "final_reply_guest_id": "aiua-startup-graph-client"
+            })
+            .to_string(),
+        })
+        .await?;
+
+    match response {
+        IpcResponse::Standard { ok: true, .. } => {}
+        other => anyhow::bail!("{tool_name}: unexpected startup graph emit response: {other:?}"),
+    }
+
+    let reply = tokio::time::timeout(tokio::time::Duration::from_secs(15), client.recv_task())
+        .await
+        .with_context(|| format!("{tool_name}: timed out waiting for startup graph tool_result"))??;
+
+    let IpcResponse::InboundTask { task_json, .. } = reply else {
+        anyhow::bail!("{tool_name}: unexpected startup graph reply envelope: {reply:?}");
+    };
+
+    let payload: serde_json::Value = serde_json::from_str(&task_json)
+        .with_context(|| format!("{tool_name}: failed to decode startup graph tool_result"))?;
+    let content_str = payload
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .with_context(|| format!("{tool_name}: startup graph tool_result missing content"))?;
+    let content: serde_json::Value = serde_json::from_str(content_str).with_context(|| {
+        format!("{tool_name}: startup graph content was not valid JSON: {content_str}")
+    })?;
+    if content.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        anyhow::bail!(
+            "{tool_name}: startup graph tool returned ok=false: {}",
+            content
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(content_str)
+        );
+    }
+
+    Ok(content)
+}
+
 fn assert_fake_gemini_media_request(
     payload: &serde_json::Value,
     expected_mime_type: &str,
@@ -3221,6 +3809,123 @@ async fn stabilize_startup_test_guests(
     Ok(())
 }
 
+/// Apply a config file to the Context Graph DB and exit.
+/// Idempotent — safe to run repeatedly; uses upsert semantics throughout.
+async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
+    info!("Loading config '{}' into hotel '{}'...", file, hotel_name);
+
+    // Open the same DB that a normal startup would use.
+    let db_path_buf;
+    let db_path: &Path = if let Some(ref pdir) = profile_dir() {
+        fs::create_dir_all(pdir)
+            .with_context(|| format!("create profile dir {}", pdir.display()))?;
+        db_path_buf = pdir.join("context.db");
+        &db_path_buf
+    } else {
+        Path::new("aiua_context.db")
+    };
+    let graph_storage = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open(db_path)?;
+    let hotel = reconcile_hotel_record(&graph_storage, hotel_name)?;
+    graph_storage.upsert_hotel(&hotel)?;
+
+    let config_data = fs::read_to_string(file).context("Failed to read config file")?;
+    let config_json: serde_json::Value =
+        serde_json::from_str(&config_data).context("Invalid JSON in config file")?;
+
+    // Inject raw context_graph KV entries.
+    let entries = extract_context_graph_entries(&config_json, Some(hotel_name));
+    if !entries.is_empty() {
+        let mut count = 0;
+        for (key, value) in entries {
+            let val_str = if value.is_string() {
+                serde_json::to_string(&value)?
+            } else {
+                value.to_string()
+            };
+            graph_storage.set_config_value(&key, &val_str)?;
+            count += 1;
+        }
+        info!("Injected {} config key(s) into Context Graph.", count);
+    } else {
+        warn!("Config file has no context_graph entries.");
+    }
+
+    // Provision MuninnDB vaults if configured.
+    if let Some(muninn) = config_json
+        .get("context_graph")
+        .and_then(|cg| cg.get("muninn"))
+        .and_then(|v| v.as_object())
+    {
+        let endpoint = muninn
+            .get("endpoint")
+            .and_then(|v| v.as_str())
+            .unwrap_or("http://127.0.0.1:8475");
+        let username = muninn
+            .get("admin_username")
+            .and_then(|v| v.as_str())
+            .unwrap_or("root");
+        let password = muninn
+            .get("admin_password")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        graph_storage.set_muninn_endpoint(endpoint)?;
+        let vault_names = muninn_provision::derive_vault_names(&config_json);
+        if !vault_names.is_empty() {
+            muninn_provision::provision_muninn_vaults(
+                &graph_storage,
+                endpoint,
+                username,
+                password,
+                vault_names,
+            )
+            .await?;
+        }
+    }
+
+    // Derive agent profiles and seed guests + identities.
+    let all_profiles = all_agent_profiles_from_config(&config_json, hotel_name);
+    info!(
+        "Seeding {} agent(s): {}",
+        all_profiles.len(),
+        all_profiles.iter().map(|p| p.persona_name.as_str()).collect::<Vec<_>>().join(", ")
+    );
+
+    let mut all_desired_guests: Vec<GuestRecord> = Vec::new();
+    for profile in &all_profiles {
+        all_desired_guests.push(agent_guests_for_profile(hotel_name, profile));
+    }
+    all_desired_guests.extend(hotel_shared_guests(hotel_name, &all_profiles));
+
+    deactivate_legacy_managed_guests(&graph_storage, hotel_name, &all_profiles, &all_desired_guests)?;
+    graph_storage.seed_guests(hotel_name, &all_desired_guests)?;
+    info!("Seeded {} guest record(s).", all_desired_guests.len());
+
+    seed_orchestrator_roles(&graph_storage, &all_profiles)?;
+    seed_abstract_tool_catalog(&graph_storage)?;
+    seed_abstract_skill_catalog(&graph_storage)?;
+    seed_toolset_profiles(&graph_storage)?;
+    seed_skill_crafting(&graph_storage)?;
+
+    for profile in &all_profiles {
+        let agent_config =
+            raw_agent_config_for_key(&config_json, hotel_name, &profile.agent_key);
+        let identity =
+            agent_identity_record_for_profile(profile, hotel_name, agent_config.as_ref());
+        graph_storage
+            .upsert_agent_identity(&identity)
+            .with_context(|| format!("Failed to upsert identity for {}", identity.agent_id))?;
+        info!("Identity seeded for agent '{}'.", identity.agent_id);
+    }
+
+    println!(
+        "✓ Config loaded into DB ({}).\n  Hotel '{}' is ready — start with: aiua --hotel {}",
+        db_path.display(),
+        hotel_name,
+        hotel_name
+    );
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -3238,6 +3943,10 @@ async fn main() -> Result<()> {
 
     if let Some(Command::Auth { provider }) = args.command {
         return auth::run_auth_command(provider).await;
+    }
+
+    if let Some(Command::Load { file, hotel }) = args.command {
+        return run_load_command(&file, &hotel).await;
     }
 
     info!("Starting Philotic Ansible Daemon Boot Sequence...");
@@ -3285,164 +3994,42 @@ async fn main() -> Result<()> {
     };
     let graph_storage = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open(db_path)?;
 
-    let hotel_name = args.hotel.clone();
+    let hotel_name = args.hotel
+        .context("--hotel is required unless using a subcommand such as `aiua load`")?;
 
-    // Handle Config Loading if requested.
-    // When PHILOTIC_PROFILE is set and no --load-config is given, auto-load
-    // ~/.philotic/<profile>/config.json if it exists.
-    let effective_load_config = args.load_config.or_else(|| {
-        let pdir = profile_dir()?;
-        let auto = pdir.join("config.json");
-        if auto.exists() {
-            info!("Auto-loading profile config: {}", auto.display());
-            Some(auto.to_string_lossy().into_owned())
-        } else {
-            None
-        }
-    });
-
-    // Lifted out of the if-block so we can reference it during multi-agent profile collection.
-    let mut loaded_config_json: Option<serde_json::Value> = None;
-    if let Some(config_path) = effective_load_config {
-        info!(
-            "Loading configuration from '{}' into the Context Graph...",
-            config_path
+    let seeded_guests = graph_storage.list_guests(&hotel_name, true)?;
+    if seeded_guests.is_empty() {
+        warn!(
+            "Hotel '{}' has no seeded guests. Run `aiua load --file <config.json> --hotel {}` to provision.",
+            hotel_name, hotel_name
         );
-        let config_data = fs::read_to_string(&config_path).context("Failed to read config file")?;
-        let config_json: serde_json::Value =
-            serde_json::from_str(&config_data).context("Invalid JSON config file")?;
-        loaded_config_json = Some(config_json.clone());
-
-        let entries = extract_context_graph_entries(&config_json, hotel_name.as_deref());
-
-        if !entries.is_empty() {
-            let mut count = 0;
-            for (key, value) in entries {
-                let val_str = if value.is_string() {
-                    // Store strings as-is (with quotes, so they remain valid JSON strings in the db)
-                    serde_json::to_string(&value)?
-                } else {
-                    value.to_string()
-                };
-
-                graph_storage.set_config_value(&key, &val_str)?;
-                count += 1;
-            }
-            info!(
-                "Successfully injected {} configuration keys into Context Graph.",
-                count
-            );
-        } else {
-            warn!("Config file must be a JSON object or contain a top-level context_graph object.");
-        }
-
-        // Provision MuninnDB vaults from `context_graph.muninn` section if present.
-        if let Some(muninn) = config_json
-            .get("context_graph")
-            .and_then(|cg| cg.get("muninn"))
-            .and_then(|v| v.as_object())
-        {
-            let endpoint = muninn
-                .get("endpoint")
-                .and_then(|v| v.as_str())
-                .unwrap_or("http://127.0.0.1:8475");
-            let username = muninn
-                .get("admin_username")
-                .and_then(|v| v.as_str())
-                .unwrap_or("root");
-            let password = muninn
-                .get("admin_password")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-
-            graph_storage.set_muninn_endpoint(endpoint)?;
-
-            let vault_names = muninn_provision::derive_vault_names(&config_json);
-            if !vault_names.is_empty() {
-                muninn_provision::provision_muninn_vaults(
-                    &graph_storage,
-                    endpoint,
-                    username,
-                    password,
-                    vault_names,
-                )
-                .await?;
-            }
-        }
+    } else {
+        info!(
+            "Hotel '{}' booting with {} seeded guest(s): {}",
+            hotel_name,
+            seeded_guests.len(),
+            seeded_guests.iter().map(|g| g.guest_id.as_str()).collect::<Vec<_>>().join(", ")
+        );
     }
-
-    let hotel_name =
-        hotel_name.context("--hotel is required unless using a subcommand such as `auth`")?;
-    // Collect all agent profiles from the config. Falls back to a single default if none found.
-    let all_profiles = loaded_config_json
-        .as_ref()
-        .map(|cfg| all_agent_profiles_from_config(cfg, &hotel_name))
-        .unwrap_or_else(|| vec![default_agent_profile_for_hotel(&hotel_name)]);
-    info!(
-        "Hotel '{}' will materialize {} agent(s): {}",
-        hotel_name,
-        all_profiles.len(),
-        all_profiles
-            .iter()
-            .map(|p| p.persona_name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-
-    // Keep the single effective_agent_profile for legacy code paths that need exactly one.
-    let _effective_agent_profile = all_profiles
-        .first()
-        .cloned()
-        .unwrap_or_else(|| default_agent_profile_for_hotel(&hotel_name));
 
     let startup_test = args.test;
     if graph_storage.get_hotel(&hotel_name)?.is_none() {
         info!(
-            "Hotel '{}' is missing from the Context Graph. Bootstrapping it now.",
+            "Hotel '{}' is missing from the Context Graph. Run `aiua load` to provision.",
             hotel_name
         );
     }
 
-    // Seed guests: one philote per agent, plus one shared membrane + model controllers.
-    let mut all_desired_guests: Vec<GuestRecord> = Vec::new();
-    for profile in &all_profiles {
-        all_desired_guests.push(agent_guests_for_profile(&hotel_name, profile));
-    }
-    all_desired_guests.extend(hotel_shared_guests(&hotel_name, &all_profiles));
-    deactivate_legacy_managed_guests(
-        &graph_storage,
-        &hotel_name,
-        &all_profiles,
-        &all_desired_guests,
-    )?;
-    graph_storage.seed_guests(&hotel_name, &all_desired_guests)?;
     let mut hotel = reconcile_hotel_record(&graph_storage, &hotel_name)?;
 
     seed_abstract_tool_catalog(&graph_storage)?;
     seed_abstract_skill_catalog(&graph_storage)?;
     seed_toolset_profiles(&graph_storage)?;
     seed_skill_crafting(&graph_storage)?;
-    seed_orchestrator_roles(&graph_storage, &all_profiles)?;
 
     if let Some(test) = startup_test {
         prepare_startup_test_binaries(test)?;
         enable_guest_test_overrides(&graph_storage, &hotel_name, test)?;
-    }
-
-    // Upsert identity records for all agents.
-    for profile in &all_profiles {
-        let agent_config = loaded_config_json
-            .as_ref()
-            .and_then(|cfg| raw_agent_config_for_key(cfg, &hotel_name, &profile.agent_key));
-        let identity = agent_identity_record_for_profile(profile, &hotel_name, agent_config.as_ref());
-        graph_storage
-            .upsert_agent_identity(&identity)
-            .with_context(|| {
-                format!(
-                    "Failed to seed agent identity bundle for {}",
-                    identity.agent_id
-                )
-            })?;
     }
 
     if let Some(active_pid) = hotel.active_pid.as_deref() {
@@ -3459,10 +4046,37 @@ async fn main() -> Result<()> {
         hotel.active_pid = None;
     }
 
+    let smoke_mode = smoke_mode_enabled();
+    let mesh_enabled = !smoke_mode && graph_storage.list_hotels()?.len() > 1;
+
+    if !smoke_mode {
+        let (resolved_mesh_port, resolved_blob_port, resolved_execution_port) =
+            resolve_runtime_ports(&hotel, mesh_enabled)?;
+        if resolved_mesh_port != hotel.mesh_port
+            || resolved_blob_port != hotel.blob_port
+            || resolved_execution_port != hotel.execution_port
+        {
+            warn!(
+                hotel = %hotel_name,
+                mesh_enabled,
+                desired_mesh_port = hotel.mesh_port,
+                desired_blob_port = hotel.blob_port,
+                desired_execution_port = hotel.execution_port,
+                resolved_mesh_port,
+                resolved_blob_port,
+                resolved_execution_port,
+                "Preferred hotel runtime ports unavailable; using nearest available cluster"
+            );
+            hotel.mesh_port = resolved_mesh_port;
+            hotel.blob_port = resolved_blob_port;
+            hotel.execution_port = resolved_execution_port;
+            graph_storage.upsert_hotel(&hotel)?;
+        }
+    }
+
     let current_pid = std::process::id().to_string();
     graph_storage.set_hotel_pid(&hotel_name, Some(&current_pid))?;
     hotel.active_pid = Some(current_pid.clone());
-    let smoke_mode = smoke_mode_enabled();
 
     let caps = hotel.capabilities.clone();
     let mesh_port = hotel.mesh_port;
@@ -3519,33 +4133,25 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    if !mesh_enabled {
+        info!(
+            hotel = %hotel_name,
+            "Mesh antenna retracted: this hotel is alone in the known mesh"
+        );
+    }
+
     // Channel for inbound mesh UDP payloads bubbled up by the BeaconDaemon
-    let (inbox_tx, mut inbox_rx) = mpsc::channel::<ansible_mesh_core::BeaconMessage>(1024);
+    let (inbox_tx, inbox_rx) = mpsc::channel::<ansible_mesh_core::BeaconMessage>(1024);
+    let inbox_rx = Arc::new(Mutex::new(Some(inbox_rx)));
 
     // PORT-BP-006: Pre-Shared Key for mesh authentication
     let mesh_psk = std::env::var("PHILOTIC_MESH_PSK")
         .unwrap_or_else(|_| "INSECURE_DEV_DEFAULT_PSK".to_string());
 
-    let daemon = match BeaconDaemon::bind(
-        &addr,
-        caps.clone(),
-        inbox_tx,
-        &mesh_psk,
-        db_path.to_str().unwrap_or(""),
-        flags.enable_rust_auth,
-    )
-    .await
-    {
-        Ok(daemon) => daemon,
-        Err(e) => {
-            let _ = graph_arc.set_hotel_pid(&hotel_name, None);
-            return Err(e);
-        }
-    };
-
     // Channel for pushing generated SDP Answers back out to the mesh
-    let (webrtc_signal_tx, mut webrtc_signal_rx) =
+    let (webrtc_signal_tx, webrtc_signal_rx) =
         mpsc::channel::<ansible_mesh_core::webrtc::WebRtcSignalMessage>(32);
+    let webrtc_signal_rx = Arc::new(Mutex::new(Some(webrtc_signal_rx)));
 
     // Broadcast channel to tell tasks to kill their child process on shutdown
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(16);
@@ -3659,6 +4265,8 @@ async fn main() -> Result<()> {
         materializer,
     ));
 
+    let registry = Arc::new(RwLock::new(NodeRegistry::new()));
+
     let ipc_server = IpcServer::new(
         socket_path,
         caps.node_id.clone(),
@@ -3667,7 +4275,7 @@ async fn main() -> Result<()> {
     )
     .with_memory_config(muninn_config_arc)
     .with_materialization_requester(guest_manager.clone())
-    .with_registry(daemon.registry());
+    .with_registry(registry.clone());
     let ipc_inboxes = ipc_server.inboxes();
 
     tokio::spawn(async move {
@@ -3676,24 +4284,66 @@ async fn main() -> Result<()> {
         }
     });
 
-    let execution_inbox_tx = daemon.inbox_tx().clone();
-    let execution_caps = caps.clone();
-    let execution_db_path = db_path.to_string_lossy().to_string();
-    let execution_psk = mesh_psk.clone();
-    tokio::spawn(async move {
-        if let Err(e) = crate::service::execution_transport::serve_execution_plane(
-            &execution_addr,
-            execution_caps,
-            execution_inbox_tx,
-            &execution_psk,
-            &execution_db_path,
-            execution_enable_rust_auth,
-        )
-        .await
-        {
-            error!("Hotel execution transport failed: {}", e);
+    let mesh_runtime = MeshRuntimeContext {
+        hotel_name: hotel_name.clone(),
+        hotel: hotel.clone(),
+        caps: caps.clone(),
+        mesh_addr: addr.clone(),
+        execution_addr: execution_addr.clone(),
+        mesh_psk: mesh_psk.clone(),
+        db_path: db_path.to_string_lossy().to_string(),
+        enable_rust_auth: execution_enable_rust_auth,
+        enable_rust_dispatcher: flags.enable_rust_dispatcher,
+        graph: graph_arc.clone(),
+        registry: registry.clone(),
+        ledger: ledger.clone(),
+        tracker: tracker.clone(),
+        dispatcher_tx: dispatcher_tx.clone(),
+        ipc_inboxes: ipc_inboxes.clone(),
+        shutdown_tx: shutdown_tx.clone(),
+        inbox_tx: inbox_tx.clone(),
+        inbox_rx: inbox_rx.clone(),
+        webrtc_signal_tx: webrtc_signal_tx.clone(),
+        webrtc_signal_rx: webrtc_signal_rx.clone(),
+    };
+
+    if mesh_enabled {
+        if let Err(e) = activate_mesh_runtime(mesh_runtime.clone()).await {
+            let _ = graph_arc.set_hotel_pid(&hotel_name, None);
+            return Err(e);
         }
-    });
+    } else {
+        let mesh_runtime_watcher = mesh_runtime.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
+            loop {
+                interval.tick().await;
+                match mesh_runtime_watcher.graph.list_hotels() {
+                    Ok(hotels) if hotels.len() > 1 => {
+                        info!(
+                            hotel = %mesh_runtime_watcher.hotel_name,
+                            known_hotels = hotels.len(),
+                            "Second hotel detected; extending mesh antenna"
+                        );
+                        match activate_mesh_runtime(mesh_runtime_watcher.clone()).await {
+                            Ok(()) => break,
+                            Err(err) => warn!(
+                                hotel = %mesh_runtime_watcher.hotel_name,
+                                error = %err,
+                                "Failed to extend mesh antenna; will retry"
+                            ),
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(err) => warn!(
+                        hotel = %mesh_runtime_watcher.hotel_name,
+                        error = %err,
+                        "Failed to inspect known mesh while antenna was retracted"
+                    ),
+                }
+            }
+        });
+    }
 
     // MATERIALIZATION LOOP: Spin up all guests defined in the DB as child processes
     info!("--- BEGIN UNIVERSAL MATERIALIZATION ---");
@@ -3741,78 +4391,6 @@ async fn main() -> Result<()> {
         return test_result;
     }
 
-    // PORT-BP-003: Mesh Outbound Dispatcher (Periodic Queuing Loop)
-    if flags.enable_rust_dispatcher {
-        let dispatcher_ledger = ledger.clone();
-        let dispatcher_tracker = tracker.clone();
-        let dispatcher_socket = daemon.socket();
-        let dispatcher_graph = graph_arc.clone();
-        let dispatcher_registry = daemon.registry();
-
-        let rx_dispatch = shutdown_rx.resubscribe();
-        tokio::spawn(crate::service::mesh_dispatcher::outbound_dispatcher(
-            dispatcher_ledger,
-            dispatcher_tracker,
-            dispatcher_socket,
-            dispatcher_graph,
-            dispatcher_registry,
-            caps.node_id.clone(),
-            rx_dispatch,
-        ));
-    }
-
-    let heartbeat_socket = daemon.socket().clone();
-    let heartbeat_graph = graph_arc.clone();
-    let heartbeat_hotel = hotel.clone();
-    let heartbeat_caps = caps.clone();
-    let mut heartbeat_shutdown = shutdown_rx.resubscribe();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3));
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    let targets = match mesh_targets_for_graph(heartbeat_graph.as_ref(), &heartbeat_caps.node_id) {
-                        Ok(targets) => targets,
-                        Err(err) => {
-                            warn!("Failed to resolve mesh heartbeat targets: {}", err);
-                            continue;
-                        }
-                    };
-                    if targets.is_empty() {
-                        continue;
-                    }
-                    let advertisements = match local_capability_advertisements(heartbeat_graph.as_ref(), &heartbeat_hotel) {
-                        Ok(advertisements) => advertisements,
-                        Err(err) => {
-                            warn!("Failed to build local capability advertisements: {}", err);
-                            continue;
-                        }
-                    };
-                    let execution_reachability =
-                        execution_reachability_for_hotel(heartbeat_graph.as_ref(), &heartbeat_hotel);
-                    for (_target_node_id, target_addr) in targets {
-                        let Ok(target) = target_addr.parse::<SocketAddr>() else {
-                            warn!("Skipping invalid heartbeat target address {}", target_addr);
-                            continue;
-                        };
-                        if let Err(err) = emit_heartbeat(
-                            &heartbeat_socket,
-                            target,
-                            &heartbeat_caps,
-                            &advertisements,
-                            Some(execution_reachability.clone()),
-                        )
-                        .await
-                        {
-                            warn!("Failed to emit heartbeat to {}: {}", target_addr, err);
-                        }
-                    }
-                }
-                _ = heartbeat_shutdown.recv() => break,
-            }
-        }
-    });
-
     // PORT-BP-005: Large Payload Transport via Dedicated HTTP Server
     let blob_port = hotel.blob_port;
     let blob_addr = format!("0.0.0.0:{}", blob_port);
@@ -3826,191 +4404,12 @@ async fn main() -> Result<()> {
             error!("Blob HTTP Server failed: {}", e);
         }
     });
-
-    // PORT-BP-004: Async Mesh Inbound Router
-    // Receives BeaconMessages from the UDP socket and forwards them to the single DB writer thread
-    let dispatcher_inbound_tx = dispatcher_tx.clone();
-    let inbound_socket = daemon.socket().clone();
-    let inbound_graph = graph_arc.clone();
-    let inbound_inboxes = ipc_inboxes.clone();
-    let inbound_local_node_id = caps.node_id.clone();
-    let mesh_auth_inbound = ansible_mesh_core::authz::MeshAuth::new(&mesh_psk);
-    tokio::spawn(async move {
-        while let Some(msg) = inbox_rx.recv().await {
-            match msg.msg_type {
-                ansible_mesh_core::MsgType::MeshEventBatch => {
-                    if let Ok(events) = serde_json::from_slice::<Vec<EventEnvelope>>(&msg.payload) {
-                        if !events.is_empty() {
-                            let max_seq = events.iter().map(|e| e.seq).max().unwrap_or(0);
-                            for event in &events {
-                                IpcServer::deliver_event_envelope(&inbound_inboxes, event).await;
-                            }
-                            let _ = dispatcher_inbound_tx
-                                .send(LedgerCommand::CommitInboundBatch {
-                                    events,
-                                    source_node: msg.src_node.clone(),
-                                })
-                                .await; // The DB writer pushes this durably to the Inbox
-
-                            let ack_payload =
-                                serde_json::json!({ "acked_seq": max_seq }).to_string();
-                            if let Some(target_addr) =
-                                mesh_target_addr_for_node(inbound_graph.as_ref(), &msg.src_node)
-                                    .ok()
-                                    .flatten()
-                            {
-                                let msg_id = uuid::Uuid::new_v4();
-                                let seq = 0;
-                                let timestamp = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs();
-                                let payload = ack_payload.into_bytes();
-                                let hmac = mesh_auth_inbound
-                                    .sign(&msg_id, seq as u64, &payload, timestamp);
-                                let ack = ansible_mesh_core::BeaconMessage {
-                                    version: 1,
-                                    msg_id,
-                                    src_node: inbound_local_node_id.clone(),
-                                    dest_node: msg.src_node.clone(),
-                                    msg_type: ansible_mesh_core::MsgType::MeshEventAck,
-                                    seq,
-                                    total: 1,
-                                    payload,
-                                    timestamp,
-                                    hmac,
-                                };
-                                match serde_json::to_vec(&ack) {
-                                    Ok(packet) => {
-                                        if let Err(err) =
-                                            inbound_socket.send_to(&packet, &target_addr).await
-                                        {
-                                            warn!(
-                                                "Failed to return mesh ACK to {} at {}: {}",
-                                                msg.src_node, target_addr, err
-                                            );
-                                        }
-                                    }
-                                    Err(err) => warn!(
-                                        "Failed to serialize mesh ACK for {}: {}",
-                                        msg.src_node, err
-                                    ),
-                                }
-                            } else {
-                                warn!(
-                                    "No mesh target address found for ACK destination {}",
-                                    msg.src_node
-                                );
-                            }
-                        }
-                    }
-                }
-                ansible_mesh_core::MsgType::MeshEventAck => {
-                    debug!("Received MeshEventAck from {}", msg.src_node);
-                    // Dispatch to the single writer thread to handle cursor advancement
-                    if let Ok(ack_payload) =
-                        serde_json::from_slice::<serde_json::Value>(&msg.payload)
-                    {
-                        if let Some(acked_seq) =
-                            ack_payload.get("acked_seq").and_then(|v| v.as_u64())
-                        {
-                            let _ = dispatcher_inbound_tx
-                                .send(LedgerCommand::ProcessAck {
-                                    consumer_node_id: msg.src_node.clone(),
-                                    acked_seq,
-                                })
-                                .await;
-                        }
-                    }
-                }
-                ansible_mesh_core::MsgType::WebRtcSignal => {
-                    info!("Received WebRTC Signaling Payload from {}", msg.src_node);
-                    if let Ok(signal_msg) = serde_json::from_slice::<
-                        ansible_mesh_core::webrtc::WebRtcSignalMessage,
-                    >(&msg.payload)
-                    {
-                        let webrtc_signal_tx = webrtc_signal_tx.clone();
-                        tokio::spawn(async move {
-                            // In MVP 2 this channels to a long-running Guest Manager
-                            // For MVP 1 we just spin off a detached Guest directly
-                            if let ansible_mesh_core::webrtc::SignalPayload::Offer(sdp) =
-                                signal_msg.signal
-                            {
-                                let guest = crate::service::webrtc_guest::WebRtcGuest::new(
-                                    signal_msg.session_id,
-                                    msg.src_node,
-                                    webrtc_signal_tx,
-                                );
-                                if let Err(e) = guest.run_answering(sdp).await {
-                                    error!("WebRTC Transceiver Guest failed: {}", e);
-                                }
-                            }
-                        });
-                    }
-                }
-                _ => {}
-            }
-        }
-    });
-
-    // PORT-BP-008: WebRTC SDP Signal Dispatcher Loop
-    let local_node_id = caps.node_id.clone();
-
-    let socket_webrtc = daemon.socket().clone();
-    let mesh_auth_webrtc = ansible_mesh_core::authz::MeshAuth::new(&mesh_psk);
-    let local_node_id_webrtc = local_node_id.clone();
-
-    tokio::spawn(async move {
-        while let Some(signal) = webrtc_signal_rx.recv().await {
-            // trace!("Dispatching WebRTC Signal to Mesh: {:?}", signal.signal);
-            if let Ok(payload_bytes) = serde_json::to_vec(&signal) {
-                let msg_id = uuid::Uuid::new_v4();
-                let seq = 0;
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-
-                let hmac = mesh_auth_webrtc.sign(&msg_id, seq as u64, &payload_bytes, timestamp);
-
-                let msg = ansible_mesh_core::BeaconMessage {
-                    version: 1,
-                    msg_id,
-                    src_node: local_node_id_webrtc.clone(),
-                    dest_node: signal.target_guest_id.clone(), // In MVP, this relies on beacon broadcast or explicit target IP map
-                    msg_type: ansible_mesh_core::MsgType::WebRtcSignal,
-                    seq,
-                    total: 1,
-                    timestamp,
-                    payload: payload_bytes,
-                    hmac,
-                };
-
-                if let Ok(packet) = serde_json::to_vec(&msg) {
-                    let target_addr = "127.0.0.1:8999"; // MVP strict routing
-                    if let Err(e) = socket_webrtc.send_to(&packet, target_addr).await {
-                        tracing::error!("UDP WebRTC Signal send failed: {}", e);
-                    }
-                }
-            }
-        }
-    });
-
-    tokio::select! {
-        res = daemon.run_loop() => {
-            if let Err(e) = res {
-                error!("Beacon Daemon error: {}", e);
-            }
-        }
-        _ = tokio::signal::ctrl_c() => {
-            warn!("Ctrl-C received! Initiating shutdown of all Materialized Guests...");
-            let _ = shutdown_tx.send(());
-            // Give Guests a tiny breather to exit voluntarily
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-            let _ = graph_arc.set_hotel_pid(&hotel_name, None);
-            info!("Ansible Daemon shutdown complete.");
-        }
-    }
+    tokio::signal::ctrl_c().await?;
+    warn!("Ctrl-C received! Initiating shutdown of all Materialized Guests...");
+    let _ = shutdown_tx.send(());
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    let _ = graph_arc.set_hotel_pid(&hotel_name, None);
+    info!("Ansible Daemon shutdown complete.");
 
     let _ = graph_arc.set_hotel_pid(&hotel_name, None);
 
@@ -4025,10 +4424,11 @@ mod tests {
         default_agent_profile_for_hotel, default_guest_seed, default_hotel_record,
         enable_guest_test_overrides, execution_reachability_for_hotel,
         extract_context_graph_entries, guest_seed_for_profile, guest_supervision_enabled,
-        hotel_base_port, local_capability_advertisements, startup_test_gemini_base_url,
+        hotel_base_port, hotel_ipc_socket_path, local_capability_advertisements,
+        nearest_available_base_port, resolve_runtime_ports, startup_test_gemini_base_url,
     };
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
-    use ansible_mesh_core::storage::{GraphStorage, GuestRecord};
+    use ansible_mesh_core::storage::{GraphStorage, GuestRecord, HotelRecord};
 
     #[test]
     fn guest_supervision_defaults_disabled() {
@@ -4050,9 +4450,51 @@ mod tests {
     }
 
     #[test]
+    fn profile_socket_path_is_hotel_scoped() {
+        unsafe {
+            std::env::set_var("HOME", "/tmp/codex-home");
+            std::env::set_var("PHILOTIC_PROFILE", "jane");
+        }
+
+        assert_eq!(
+            hotel_ipc_socket_path("default"),
+            "/tmp/codex-home/.philotic/jane/aiua-default.sock"
+        );
+        assert_eq!(
+            hotel_ipc_socket_path("second-hotel"),
+            "/tmp/codex-home/.philotic/jane/aiua-second-hotel.sock"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_PROFILE");
+            std::env::remove_var("HOME");
+        }
+    }
+
+    #[test]
+    fn nearest_available_base_port_prefers_closest_upward_match() {
+        let resolved = nearest_available_base_port(100, |base| base == 101 || base == 103);
+        assert_eq!(resolved, Some(101));
+    }
+
+    #[test]
+    fn resolve_runtime_ports_ignores_mesh_port_when_mesh_is_dormant() {
+        let hotel = HotelRecord {
+            mesh_port: 30_000,
+            blob_port: 30_001,
+            execution_port: 30_002,
+            ..default_hotel_record("default")
+        };
+
+        let resolved = resolve_runtime_ports(&hotel, false).expect("ports should resolve");
+
+        assert_eq!(resolved, (30_000, 30_001, 30_002));
+    }
+
+    #[test]
     fn default_guest_seed_injects_hotel_socket_env() {
         let guests = default_guest_seed("beta-hotel");
-        assert_eq!(guests.len(), 5);
+        assert_eq!(guests.len(), 6); // membrane, model-gemini, model-elevenlabs, tool-runner, graph-runner, agent
         // Membrane is the first guest from hotel_shared_guests
         let membrane = guests.iter().find(|g| g.role == "membrane").expect("membrane");
         let config: serde_json::Value = serde_json::from_str(&membrane.config_json).unwrap();
@@ -4243,6 +4685,29 @@ mod tests {
     }
 
     #[test]
+    fn non_default_hotel_does_not_inherit_default_agents() {
+        let config = serde_json::json!({
+            "hotels": {
+                "default": {
+                    "agents": {
+                        "bjork": { "agent_id": "agent-bjork-01", "persona_name": "Bjork" }
+                    }
+                },
+                "second-hotel": {
+                    "agents": {
+                        "aria": { "agent_id": "agent-coach-01", "persona_name": "Coach" }
+                    }
+                }
+            }
+        });
+
+        let profiles = all_agent_profiles_from_config(&config, "second-hotel");
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].agent_key, "aria");
+        assert_eq!(profiles[0].persona_name, "Coach");
+    }
+
+    #[test]
     fn multi_agent_context_graph_stores_per_agent_token_keys() {
         let config = serde_json::json!({
             "hotels": {
@@ -4262,6 +4727,32 @@ mod tests {
         // Per-agent keys must be present
         assert!(entries.iter().any(|(k, v)| k == "telegram_bot_token_jane" && v.as_str() == Some("jane-token")));
         assert!(entries.iter().any(|(k, v)| k == "telegram_bot_token_aria" && v.as_str() == Some("aria-token")));
+    }
+
+    #[test]
+    fn non_default_hotel_context_entries_do_not_import_default_agent_tokens() {
+        let config = serde_json::json!({
+            "hotels": {
+                "default": {
+                    "agents": {
+                        "bjork": {
+                            "telegram": { "bot_token": "bjork-token", "allowed_users": ["likesjx"] }
+                        }
+                    }
+                },
+                "second-hotel": {
+                    "agents": {
+                        "aria": {
+                            "telegram": { "bot_token": "coach-token", "allowed_users": ["likesjx"] }
+                        }
+                    }
+                }
+            }
+        });
+
+        let entries = extract_context_graph_entries(&config, Some("second-hotel"));
+        assert!(entries.iter().any(|(k, v)| k == "telegram_bot_token_aria" && v.as_str() == Some("coach-token")));
+        assert!(!entries.iter().any(|(k, _)| k == "telegram_bot_token_bjork"));
     }
 
     #[test]

@@ -47,11 +47,11 @@ sync-config:
 # Start the Hotel Manager (Aiua Host Daemon)
 start-aiua hotel:
     cargo build --workspace
-    cargo run -p aiua -- --hotel {{hotel}} --load-config mesh-config.json
+    cargo run -p aiua -- --hotel {{hotel}}
 
 # Rebuild the local runtime binaries that the hotel materializes during watched UAT.
 build-runtime:
-    cargo build -p aiua -p philote -p membrane -p model-router
+    cargo build -p aiua -p philote -p membrane -p model-router -p tool-runner -p graph-runner
 
 # Kill local Philotic hotel/guest binaries from this checkout and clear stale sockets.
 kill-local-stack:
@@ -61,13 +61,14 @@ kill-local-stack:
     @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/model-controller-gemini" || true
     @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/model-controller-elevenlabs" || true
     @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/tool-runner" || true
+    @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/graph-runner" || true
     @rm -f /tmp/philotic-default.sock /tmp/philotic-local-telegram.sock /tmp/philotic-aria-architect-hotel.sock /tmp/philotic-startup-test-hotel.sock
 
 # Rebuild first, then kill stale local runtime processes/sockets, then start one hotel cleanly.
 start-aiua-clean hotel:
     just build-runtime
     just kill-local-stack
-    cargo run -p aiua -- --hotel {{hotel}} --load-config mesh-config.json
+    cargo run -p aiua -- --hotel {{hotel}}
 
 # Start the transitional Gemini OAuth flow through the hotel CLI
 gemini-oauth-start client_id project_id:
@@ -95,7 +96,7 @@ uat worktree="":
     fi
     echo "Starting UAT stack on hotel 'local-telegram'..."
     echo "Only one Telegram poller should be running for this bot token."
-    cargo run -p aiua -- --hotel local-telegram --load-config mesh-config.json
+    cargo run -p aiua -- --hotel local-telegram
 
 # (legacy alias)
 start-aiua-uat:
@@ -116,6 +117,10 @@ start-model:
 # Start the Tool Runner
 start-tool:
     cargo run -p tool-runner
+
+# Start the Graph Runner (context graph + table adapter)
+start-graph-runner:
+    cargo run -p graph-runner
 
 # Start the full stack in background (requires tmux or similar)
 start:
@@ -227,6 +232,10 @@ smoke-cognitive:
 smoke-embed:
     bash scripts/smoke-embed-roundtrip.sh
 
+# Run the graph-runner smoke (create → upsert node → get node → export round-trip)
+smoke-graph-runner:
+    bash scripts/smoke-graph-runner-roundtrip.sh
+
 # Run the trusted vertical-slice verification suite
 verify-vertical-slice:
     cargo test -p philotic-client -- --nocapture
@@ -257,31 +266,60 @@ operator-checklist:
     @echo "   - watched-live-green"
     @echo "5. Note any assumption-vs-reality gaps before closing the slice"
 
-# Build release binaries and hot-push them into the Homebrew Cellar (mbp-jane).
-# Stops Jane, installs, restarts with PHILOTIC_PROFILE=jane.
+# Build release binaries locally (MacBook Air) and push them to mbp-jane via SCP.
+# mbp-jane is a separate machine — it has no repo, only runs Cellar-installed binaries.
+# Stops Jane on mbp-jane, installs, restarts.
 jane-push:
     #!/usr/bin/env bash
     set -euo pipefail
-    CELLAR=/opt/homebrew/Cellar/aiua/0.1.0-alpha/bin
-    BINS="aiua philote membrane model-router model-controller-gemini model-controller-elevenlabs philote-worker tool-runner"
-    echo "▶ Building release binaries..."
-    cargo build --release -p aiua -p philote -p membrane -p model-router -p tool-runner
-    echo "▶ Stopping Jane..."
-    PHILOTIC_PROFILE=jane phil stop 2>/dev/null || true
-    sleep 1
-    echo "▶ Installing binaries into Cellar..."
+    REMOTE=mbp-jane
+    REMOTE_CELLAR=/opt/homebrew/Cellar/aiua/0.1.0-alpha/bin
+    BINS="aiua philote membrane model-router model-controller-gemini model-controller-elevenlabs philote-worker tool-runner graph-runner"
+    # Safety guard: verify we are actually talking to mbp-jane before touching anything.
+    # mbp-jane's system hostname is "MacBookPro" — the SSH alias is just our local label.
+    ACTUAL_HOST="$(ssh "${REMOTE}" hostname -s 2>/dev/null)"
+    if [ "${ACTUAL_HOST}" != "MacBookPro" ]; then
+        echo "❌ Aborting: remote hostname is '${ACTUAL_HOST}', expected 'MacBookPro' (mbp-jane)."
+        exit 1
+    fi
+    echo "▶ Building release binaries (local)..."
+    cargo build --release -p aiua -p philote -p membrane -p model-router -p tool-runner -p graph-runner
+    echo "▶ Stopping Jane on ${REMOTE}..."
+    ssh "${REMOTE}" "pkill -f '/opt/homebrew/bin/aiua' 2>/dev/null || true; sleep 2"
+    echo "▶ Pushing binaries to ${REMOTE}:${REMOTE_CELLAR}..."
     for bin in $BINS; do
-        if [ -f target/release/$bin ]; then
-            chmod u+w "$CELLAR/$bin"
-            cp target/release/$bin "$CELLAR/$bin"
-            chmod u-w "$CELLAR/$bin"
-            ln -sf "$CELLAR/$bin" /opt/homebrew/bin/$bin
-            echo "  ✓ $bin"
+        if [ ! -f "target/release/$bin" ]; then
+            echo "  – $bin (not built locally, skipping)"
+            continue
         fi
+        if ! ssh "${REMOTE}" "test -f '${REMOTE_CELLAR}/$bin'"; then
+            echo "  – $bin (not in remote Cellar, skipping)"
+            continue
+        fi
+        ssh "${REMOTE}" "chmod u+w '${REMOTE_CELLAR}/$bin'"
+        scp -q "target/release/$bin" "${REMOTE}:${REMOTE_CELLAR}/$bin"
+        ssh "${REMOTE}" "chmod u-w '${REMOTE_CELLAR}/$bin'"
+        echo "  ✓ $bin"
     done
-    echo "▶ Starting Jane..."
-    PHILOTIC_PROFILE=jane phil start --hotel default
-    echo "✅ Jane updated and running."
+    echo "▶ Applying config on ${REMOTE}..."
+    ssh "${REMOTE}" "/opt/homebrew/bin/aiua load --file ~/mesh-config.json --hotel default"
+    echo "▶ Starting Jane on ${REMOTE}..."
+    ssh "${REMOTE}" "nohup /opt/homebrew/bin/aiua --hotel default >> ~/.philotic/aiua.log 2>&1 & echo \$! > ~/.philotic/aiua.pid && echo 'aiua started pid '\$(cat ~/.philotic/aiua.pid)"
+    echo "✅ Jane updated and running on ${REMOTE}."
+
+# Stop Jane on mbp-jane without pushing new binaries.
+jane-stop:
+    #!/usr/bin/env bash
+    ssh mbp-jane "pkill -f '/opt/homebrew/bin/aiua' && echo '▶ aiua stopped' || echo '▶ aiua was not running'"
+
+# Start Jane on mbp-jane (without pushing — uses whatever binary is already installed).
+jane-start:
+    #!/usr/bin/env bash
+    ssh mbp-jane "nohup /opt/homebrew/bin/aiua --hotel default >> ~/.philotic/aiua.log 2>&1 & echo \$! > ~/.philotic/aiua.pid && echo 'aiua started pid '\$(cat ~/.philotic/aiua.pid)"
+
+# Check whether Jane (aiua) is running on mbp-jane.
+jane-status:
+    @ssh mbp-jane "ps aux | grep '[/]opt/homebrew/bin/aiua' || echo 'aiua is not running on mbp-jane'"
 
 # Show configured Ansible inventory for deployment targets
 ansible-inventory:

@@ -88,6 +88,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Checkout jaredlikes-desktop (for embedded UI)
+        uses: actions/checkout@v4
+        with:
+          repository: likesjx/jaredlikes-desktop
+          token: ${{ secrets.TAP_GITHUB_TOKEN }}
+          path: jaredlikes-desktop
+
+      - name: Build desktop UI
+        run: |
+          cd jaredlikes-desktop
+          npm ci
+          npm run build
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -104,6 +117,8 @@ jobs:
           restore-keys: ${{ matrix.target }}-cargo-
 
       - name: Build binaries
+        env:
+          PHILOTIC_DESKTOP_DIR: ${{ github.workspace }}/jaredlikes-desktop
         run: |
           cargo build --release --target ${{ matrix.target }} \
             -p philotic-web \
@@ -149,6 +164,8 @@ jobs:
     outputs:
       source_sha256: ${{ steps.source.outputs.sha256 }}
       is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
+      arm64_sha256: ${{ steps.binary_sha256.outputs.arm64 }}
+      x86_64_sha256: ${{ steps.binary_sha256.outputs.x86_64 }}
 
     steps:
       - uses: actions/checkout@v4
@@ -188,6 +205,15 @@ jobs:
           find artifacts -name "*.tar.gz" -o -name "*.sha256" | \
             xargs -I{} cp {} release-assets/
 
+      - name: Extract binary sha256s for tap
+        id: binary_sha256
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          ARM64=$(awk '{print $1}' "artifacts/darwin-arm64/philotic-${TAG}-darwin-arm64.tar.gz.sha256")
+          X86=$(awk '{print $1}' "artifacts/darwin-x86_64/philotic-${TAG}-darwin-x86_64.tar.gz.sha256")
+          echo "arm64=$ARM64" >> $GITHUB_OUTPUT
+          echo "x86_64=$X86" >> $GITHUB_OUTPUT
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
@@ -209,8 +235,7 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-      # NOTE: once philotic-web crate exists, add a second step for it
-      - name: Bump aiua formula
+      - name: Bump aiua formula (source build)
         uses: mislav/bump-homebrew-formula-action@v3
         with:
           formula-name: aiua
@@ -227,3 +252,66 @@ jobs:
             Release: https://github.com/likesjx/philotic-stack/releases/tag/{{tag}}
         env:
           COMMITTER_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+
+      - name: Update phil formula (pre-built binary with embedded desktop UI)
+        env:
+          TAG: ${{ github.ref_name }}
+          ARM64_SHA: ${{ needs.release.outputs.arm64_sha256 }}
+          X86_SHA: ${{ needs.release.outputs.x86_64_sha256 }}
+          GH_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          VERSION="${TAG#v}"
+
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/likesjx/homebrew-philotic.git" tap
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          python3 << 'PYEOF'
+          import os, textwrap
+          tag     = os.environ['TAG']
+          version = os.environ['VERSION']
+          arm64   = os.environ['ARM64_SHA']
+          x86     = os.environ['X86_SHA']
+          base    = f"https://github.com/likesjx/philotic-stack/releases/download/{tag}"
+          formula = (
+            'class Phil < Formula\n'
+            '  desc "Operator CLI for the Philotic Web mesh"\n'
+            '  homepage "https://github.com/likesjx/philotic-stack"\n'
+            f'  version "{version}"\n'
+            '  license "MIT"\n'
+            '\n'
+            '  on_macos do\n'
+            '    on_arm do\n'
+            f'      url "{base}/philotic-{tag}-darwin-arm64.tar.gz"\n'
+            f'      sha256 "{arm64}"\n'
+            '    end\n'
+            '    on_intel do\n'
+            f'      url "{base}/philotic-{tag}-darwin-x86_64.tar.gz"\n'
+            f'      sha256 "{x86}"\n'
+            '    end\n'
+            '  end\n'
+            '\n'
+            '  def install\n'
+            '    arch = Hardware::CPU.arm? ? "darwin-arm64" : "darwin-x86_64"\n'
+            '    bin.install "philotic-web-#{arch}" => "phil"\n'
+            '  end\n'
+            '\n'
+            '  test do\n'
+            '    assert_match version.to_s, shell_output("#{bin}/phil --version")\n'
+            '  end\n'
+            'end\n'
+          )
+          with open('Formula/phil.rb', 'w') as f:
+              f.write(formula)
+          PYEOF
+
+          git add Formula/phil.rb
+          if git diff --cached --quiet; then
+            echo "No changes to phil formula — skipping commit"
+          else
+            git commit -m "phil ${TAG}
+
+          Release: https://github.com/likesjx/philotic-stack/releases/tag/${TAG}"
+            git push
+          fi

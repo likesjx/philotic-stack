@@ -99,6 +99,7 @@ impl GeminiProvider {
         prompt: &str,
         tools: &[serde_json::Value],
         wants_concept: bool,
+        wants_plan: bool,
     ) -> Value {
         let tool_list: String = tools
             .iter()
@@ -117,14 +118,23 @@ impl GeminiProvider {
             ""
         };
 
+        let plan_instruction = if wants_plan {
+            " When starting a multi-step task, output \"active_plan\" with your goal, steps \
+              (each with id, description, tool_name, status), and overall status. Update step \
+              statuses as you execute. Omit active_plan for single-step responses."
+        } else {
+            ""
+        };
+
         let system_text = format!(
             "You are an agent with tools. To invoke a tool, output ONLY a JSON object with \
              a \"tool_call\" key containing \"tool_name\" (string) and \"arguments\" (object). \
              Do not include display_text when calling a tool.\n\
              To reply without a tool, output a JSON object with \"display_text\" (your reply, \
-             markdown fine) and \"spoken_text\" (conversational version for voice, no markdown).{}\n\n\
+             markdown fine) and \"spoken_text\" (conversational version for voice, no markdown).{}{}\n\n\
              Available tools:\n{}",
             concept_instruction,
+            plan_instruction,
             tool_list,
         );
 
@@ -142,6 +152,27 @@ impl GeminiProvider {
         if wants_concept {
             properties["memory_concept"] = json!({ "type": "STRING" });
         }
+        if wants_plan {
+            properties["active_plan"] = json!({
+                "type": "OBJECT",
+                "properties": {
+                    "goal": { "type": "STRING" },
+                    "status": { "type": "STRING" },
+                    "steps": {
+                        "type": "ARRAY",
+                        "items": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "id": { "type": "INTEGER" },
+                                "description": { "type": "STRING" },
+                                "tool_name": { "type": "STRING" },
+                                "status": { "type": "STRING" }
+                            }
+                        }
+                    }
+                }
+            });
+        }
 
         json!({
             "system_instruction": {
@@ -158,7 +189,7 @@ impl GeminiProvider {
         })
     }
 
-    fn structured_text_request_payload(prompt: &str, wants_concept: bool) -> Value {
+    fn structured_text_request_payload(prompt: &str, wants_concept: bool, wants_plan: bool) -> Value {
         let system_text = if wants_concept {
             "When generating your response, produce a JSON object with three fields: \
              \"display_text\" (your full response formatted for text display, markdown is fine), \
@@ -184,6 +215,27 @@ impl GeminiProvider {
             properties["memory_concept"] = json!({ "type": "STRING" });
             required.push("memory_concept");
         }
+        if wants_plan {
+            properties["active_plan"] = json!({
+                "type": "OBJECT",
+                "properties": {
+                    "goal": { "type": "STRING" },
+                    "status": { "type": "STRING" },
+                    "steps": {
+                        "type": "ARRAY",
+                        "items": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "id": { "type": "INTEGER" },
+                                "description": { "type": "STRING" },
+                                "tool_name": { "type": "STRING" },
+                                "status": { "type": "STRING" }
+                            }
+                        }
+                    }
+                }
+            });
+        }
 
         json!({
             "system_instruction": {
@@ -202,11 +254,11 @@ impl GeminiProvider {
     }
 
     /// Parse a structured JSON response from Gemini.
-    /// Returns `(display_text, spoken_text, memory_concept)`.
+    /// Returns `(display_text, spoken_text, memory_concept, active_plan)`.
     fn parse_structured_response(
         status: reqwest::StatusCode,
         body: Value,
-    ) -> (String, Option<String>, Option<String>) {
+    ) -> (String, Option<String>, Option<String>, Option<Value>) {
         let raw = Self::parse_response_text(status, body);
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw) {
             let display = parsed
@@ -224,11 +276,12 @@ impl GeminiProvider {
                 .and_then(Value::as_str)
                 .filter(|s| !s.trim().is_empty())
                 .map(str::to_string);
+            let active_plan = parsed.get("active_plan").cloned();
             if let Some(display) = display {
-                return (display, spoken, concept);
+                return (display, spoken, concept, active_plan);
             }
         }
-        (raw, None, None)
+        (raw, None, None, None)
     }
 
     async fn media_request_payload(&self, task: &ControllerTask) -> Result<Value> {
@@ -347,8 +400,9 @@ impl ModelProvider for GeminiProvider {
     async fn invoke(&self, task: &ControllerTask) -> Result<ProviderOutput> {
         let has_tools = !task.tools.is_empty();
         let wants_concept = task.wants_channel("memory_concept");
+        let wants_plan = task.wants_channel("active_plan");
         let use_structured = task.kind == TaskKind::TextGenerate
-            && (has_tools || task.wants_channel("spoken_text") || wants_concept);
+            && (has_tools || task.wants_channel("spoken_text") || wants_concept || wants_plan);
 
         let payload = match task.kind {
             TaskKind::TextGenerate => {
@@ -356,9 +410,9 @@ impl ModelProvider for GeminiProvider {
                     .composed_prompt_text()
                     .context("Gemini text task missing prompt")?;
                 if has_tools {
-                    Self::tool_aware_request_payload(&prompt, &task.tools, wants_concept)
+                    Self::tool_aware_request_payload(&prompt, &task.tools, wants_concept, wants_plan)
                 } else if use_structured {
-                    Self::structured_text_request_payload(&prompt, wants_concept)
+                    Self::structured_text_request_payload(&prompt, wants_concept, wants_plan)
                 } else {
                     Self::request_payload(&prompt)
                 }
@@ -381,7 +435,7 @@ impl ModelProvider for GeminiProvider {
         let body = response.json::<Value>().await?;
 
         if use_structured {
-            let (content, spoken_text, memory_concept) =
+            let (content, spoken_text, memory_concept, active_plan) =
                 Self::parse_structured_response(status, body.clone());
 
             // Check if model returned a tool_call instead of display_text.
@@ -440,6 +494,7 @@ impl ModelProvider for GeminiProvider {
                 follow_up_questions: Vec::new(),
                 intent_summary: None,
                 memory_concept,
+                active_plan,
             })
         } else {
             let content = Self::parse_response_text(status, body);
@@ -454,6 +509,7 @@ impl ModelProvider for GeminiProvider {
                 follow_up_questions: Vec::new(),
                 intent_summary: None,
                 memory_concept: None,
+                active_plan: None,
             })
         }
     }

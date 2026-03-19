@@ -141,12 +141,22 @@ pub struct AttachmentInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ToolHistoryEntry {
+    pub index: usize,
+    pub tool_name: String,
+    pub arguments: Value,
+    pub result: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ContextEnvelope {
     pub instructions: Vec<ProjectionItem>,
     pub identity: Vec<ProjectionItem>,
     pub memory: Vec<ProjectionItem>,
     pub dialogue_window: Vec<TurnInput>,
     pub active_turn: Option<TurnInput>,
+    pub tool_history: Vec<ToolHistoryEntry>,
+    pub active_plan: Option<Value>,
     pub attachments: Vec<AttachmentInput>,
 }
 
@@ -386,6 +396,67 @@ impl ControllerTask {
                 let role = active_turn.role.as_deref().unwrap_or("user");
                 sections.push(format!("[Active turn]\n{role}: {text}"));
             }
+        }
+
+        if !self.context.tool_history.is_empty() {
+            let history = self
+                .context
+                .tool_history
+                .iter()
+                .map(|entry| {
+                    let args = serde_json::to_string(&entry.arguments).unwrap_or_default();
+                    format!(
+                        "Call {n}: {name}({args})\nResult {n}: {result}",
+                        n = entry.index,
+                        name = entry.tool_name,
+                        result = entry.result,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            sections.push(format!(
+                "[Tool call history]\n{history}\n\nReview the above tool results and continue. \
+                 Call another tool if needed, or respond to the user if you have enough information."
+            ));
+        }
+
+        if let Some(plan) = self.context.active_plan.as_ref() {
+            let goal = plan.get("goal").and_then(Value::as_str).unwrap_or("unknown");
+            let status = plan
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let steps = plan
+                .get("steps")
+                .and_then(Value::as_array)
+                .map(|steps| {
+                    steps
+                        .iter()
+                        .map(|step| {
+                            let id = step
+                                .get("id")
+                                .or_else(|| step.get("index"))
+                                .and_then(Value::as_u64)
+                                .map(|n| n.to_string())
+                                .unwrap_or_else(|| "?".into());
+                            let description = step
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unnamed step");
+                            let step_status = step
+                                .get("status")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown");
+                            format!("[{step_status}] {id}. {description}")
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .filter(|steps| !steps.is_empty())
+                .unwrap_or_else(|| "No steps recorded.".into());
+            sections.push(format!(
+                "[Active plan]\nGoal: {goal}\nStatus: {status}\nSteps:\n{steps}"
+            ));
         }
 
         if let Some(prompt) = self
@@ -712,12 +783,48 @@ fn parse_context(value: Option<&Value>) -> ContextEnvelope {
         return ContextEnvelope::default();
     };
 
+    let tool_history = object
+        .get("tool_history")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    let obj = entry.as_object()?;
+                    Some(ToolHistoryEntry {
+                        index: obj
+                            .get("index")
+                            .and_then(Value::as_u64)
+                            .map(|n| n as usize)
+                            .unwrap_or(0),
+                        tool_name: obj
+                            .get("tool_name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_string(),
+                        arguments: obj
+                            .get("arguments")
+                            .cloned()
+                            .unwrap_or(Value::Object(Default::default())),
+                        result: obj
+                            .get("result")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     ContextEnvelope {
         instructions: parse_projection_items(object.get("instructions")),
         identity: parse_projection_items(object.get("identity")),
         memory: parse_projection_items(object.get("memory")),
         dialogue_window: parse_turns(object.get("dialogue_window")),
         active_turn: object.get("active_turn").map(parse_turn_input),
+        tool_history,
+        active_plan: object.get("active_plan").cloned(),
         attachments: parse_attachments(object.get("attachments")),
     }
 }
@@ -859,6 +966,7 @@ pub struct TextResult {
     pub follow_up_questions: Vec<String>,
     pub intent_summary: Option<String>,
     pub memory_concept: Option<String>,
+    pub active_plan: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -871,6 +979,7 @@ pub enum ProviderOutput {
         follow_up_questions: Vec<String>,
         intent_summary: Option<String>,
         memory_concept: Option<String>,
+        active_plan: Option<serde_json::Value>,
     },
     Audio(AudioArtifact),
     /// Model chose to call a tool rather than produce a text response.
@@ -928,6 +1037,7 @@ impl ControllerResponseEnvelope {
                 follow_up_questions,
                 intent_summary,
                 memory_concept,
+                active_plan,
             } => {
                 let text_result = TextResult {
                     display_text: display_text.or_else(|| Some(content.clone())),
@@ -936,6 +1046,7 @@ impl ControllerResponseEnvelope {
                     follow_up_questions,
                     intent_summary,
                     memory_concept,
+                    active_plan,
                 };
                 let result = serialize_text_result(task, &text_result);
                 let content = result
@@ -1032,6 +1143,7 @@ fn serialize_text_result(task: &ControllerTask, result: &TextResult) -> Value {
     let include_questions = channels_requested && task.wants_channel("follow_up_questions");
     let include_intent = channels_requested && task.wants_channel("intent_summary");
     let include_concept = channels_requested && task.wants_channel("memory_concept");
+    let include_plan = channels_requested && task.wants_channel("active_plan");
 
     json!({
         "display_text": result.display_text,
@@ -1040,6 +1152,7 @@ fn serialize_text_result(task: &ControllerTask, result: &TextResult) -> Value {
         "follow_up_questions": if include_questions { result.follow_up_questions.clone() } else { Vec::<String>::new() },
         "intent_summary": if include_intent { result.intent_summary.clone() } else { None::<String> },
         "memory_concept": if include_concept { result.memory_concept.clone() } else { None::<String> },
+        "active_plan": if include_plan { result.active_plan.clone() } else { None::<Value> },
     })
 }
 
@@ -1362,6 +1475,90 @@ mod tests {
     }
 
     #[test]
+    fn parse_context_preserves_active_plan() {
+        let task = ControllerTask::from_value(&json!({
+            "kind": "text.generate",
+            "context": {
+                "active_turn": {
+                    "role": "user",
+                    "text": "Continue the task."
+                },
+                "active_plan": {
+                    "goal": "finish the task",
+                    "status": "in_progress",
+                    "steps": [
+                        {
+                            "id": 1,
+                            "description": "inspect repo",
+                            "status": "done"
+                        },
+                        {
+                            "id": 2,
+                            "description": "apply fix",
+                            "status": "in_progress"
+                        }
+                    ]
+                }
+            }
+        }))
+        .unwrap();
+
+        let plan = task
+            .context
+            .active_plan
+            .as_ref()
+            .expect("active plan should survive context parsing");
+        assert_eq!(plan["goal"], "finish the task");
+        assert_eq!(plan["steps"][1]["description"], "apply fix");
+    }
+
+    #[test]
+    fn composed_prompt_includes_active_plan() {
+        let task = ControllerTask::from_value(&json!({
+            "kind": "text.generate",
+            "context": {
+                "identity": [{"text": "You are Jane."}],
+                "active_turn": {
+                    "role": "user",
+                    "text": "Keep going."
+                },
+                "tool_history": [{
+                    "index": 1,
+                    "tool_name": "workspace.read",
+                    "arguments": {"path": "README.md"},
+                    "result": "Read successfully."
+                }],
+                "active_plan": {
+                    "goal": "summarize README and patch the issue",
+                    "status": "in_progress",
+                    "steps": [
+                        {
+                            "id": 1,
+                            "description": "read README",
+                            "status": "done"
+                        },
+                        {
+                            "id": 2,
+                            "description": "patch the issue",
+                            "status": "in_progress"
+                        }
+                    ]
+                }
+            }
+        }))
+        .unwrap();
+
+        let composed = task
+            .composed_prompt_text()
+            .expect("structured task should compose a prompt");
+        assert!(composed.contains("[Tool call history]"));
+        assert!(composed.contains("[Active plan]"));
+        assert!(composed.contains("Goal: summarize README and patch the issue"));
+        assert!(composed.contains("[done] 1. read README"));
+        assert!(composed.contains("[in_progress] 2. patch the issue"));
+    }
+
+    #[test]
     fn infers_media_task_from_flat_blob_backed_attachments() {
         let task = ControllerTask::from_value(&json!({
             "action": "analyze_media",
@@ -1537,6 +1734,7 @@ mod tests {
                 follow_up_questions: vec!["How can I help next?".into()],
                 intent_summary: Some("Exchange greetings".into()),
                 memory_concept: None,
+                active_plan: None,
             },
         )
         .unwrap();
@@ -1573,6 +1771,7 @@ mod tests {
                 follow_up_questions: vec!["How can I help next?".into()],
                 intent_summary: Some("Exchange greetings".into()),
                 memory_concept: None,
+                active_plan: None,
             },
         )
         .unwrap();

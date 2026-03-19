@@ -34,6 +34,7 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
         "handoff.to_role" => &["session.status", "handoff.to_role", "handoff.back"],
         "handoff.back" => &["session.status", "handoff.back"],
         "role.governance" => &["session.status", "agent.configure", "role.configure"],
+        "memory" => &["memory.recall", "memory.remember"],
         _ => &[],
     }
 }
@@ -519,6 +520,103 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                 "required": ["role_name", "toolset_profile", "reasoning"]
             }),
             class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "rule.propose".into(),
+        ToolDefinition {
+            tool_name: "rule.propose".into(),
+            description: "Propose a durable behavioral rule to be stored permanently in the \
+                          agent's context graph. Rules survive dialogue window compaction and \
+                          are injected into every cognitive call. A rule captures a constraint, \
+                          pattern, or standing preference that should govern all future behavior. \
+                          Always requires live operator approval — cannot be preapproved or \
+                          bypassed by policy."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "description": {
+                        "type": "string",
+                        "description": "The behavioral rule in the imperative. \
+                                        E.g. 'Always ask for clarification before deleting files.' \
+                                        Max 512 characters."
+                    },
+                    "rationale": {
+                        "type": "string",
+                        "description": "The observation or reasoning that motivates this rule. \
+                                        Reference the specific turn, pattern, or user correction \
+                                        that led here. Max 1024 characters."
+                    }
+                },
+                "required": ["description", "rationale"]
+            }),
+            class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "memory.recall".into(),
+        ToolDefinition {
+            tool_name: "memory.recall".into(),
+            description: "Retrieve memories relevant to a query from the agent's long-term \
+                          autobiographical store (MuninnDB). Returns the most salient engrams \
+                          based on semantic + graph activation. Use when the current context \
+                          is insufficient and prior knowledge may apply."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural-language query describing what to recall. \
+                                        Be specific — the activation pipeline uses this as \
+                                        the primary context signal."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of engrams to return. Defaults to the \
+                                        session recall_limit setting (default 5). Range 1–20."
+                    }
+                },
+                "required": ["query"]
+            }),
+            class: Some("memory".into()),
+        },
+    );
+
+    m.insert(
+        "memory.remember".into(),
+        ToolDefinition {
+            tool_name: "memory.remember".into(),
+            description: "Store a new memory in the agent's long-term autobiographical store \
+                          (MuninnDB). Use for facts, decisions, user preferences, or observations \
+                          that should persist across sessions. Keep concept slugs short and \
+                          content atomic (1–3 sentences)."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "concept": {
+                        "type": "string",
+                        "description": "Short slug identifying the memory (e.g. 'user preference: dark mode', \
+                                        'decision: use postgres'). Max 128 characters."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The memory content. Keep atomic — one fact or decision. \
+                                        1–3 sentences max."
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional tags for recall filtering (e.g. ['preference', 'user', 'decision'])."
+                    }
+                },
+                "required": ["concept", "content"]
+            }),
+            class: Some("memory".into()),
         },
     );
 

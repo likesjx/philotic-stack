@@ -4,6 +4,8 @@ The `aiua` binary is the authoritative runtime process for a Philotic hotel node
 It is the first process that starts, owns the Context Graph database, materializes
 all guest processes, and acts as the routing hub for every interaction inside the hotel.
 
+Source-of-truth note: this README is a convenience overview. For current implemented architecture and transitional seam status, prefer [docs/architecture/ARCHITECTURE_STATUS.md](../../docs/architecture/ARCHITECTURE_STATUS.md). When this file disagrees with code on socket paths, transport ownership, or transitional boundaries, code wins.
+
 ## Responsibilities
 
 | Area                      | Detail                                                                           |
@@ -11,9 +13,9 @@ all guest processes, and acts as the routing hub for every interaction inside th
 | **Boot orchestration**    | Reads `aiua_context.db`, bootstraps `NodeCapabilities`, seeds demo guests     |
 | **Guest materialization** | Spawns all `is_active=1` guests from the DB via `GuestManager`                   |
 | **Guest supervision**     | Reconciliation loop every 5s — resurrects dead processes, reclaims inactive ones |
-| **IPC server**            | Unix Domain Socket at `/tmp/ansible.sock` — handles all guest↔hotel messages     |
+| **IPC server**            | Unix Domain Socket at the active hotel socket path (`PHILOTIC_HOTEL_SOCKET` for guests; commonly `/tmp/philotic-aiua.sock` or `/tmp/philotic-<hotel>.sock`) — handles all guest↔hotel messages |
 | **Mesh beacon**           | UDP server on port 8999 — handles inter-hotel `BeaconMessage` traffic            |
-| **Execution transport**   | TCP listener on port 9002 — handles point-to-point inter-hotel execution traffic |
+| **Execution transport**   | TCP listener on `mesh_port + 2` (often 9002 for the default hotel) — handles point-to-point inter-hotel execution traffic |
 | **Outbound dispatch**     | Polls `EventLedger`, ships unacked routed events to peer hotels over TCP         |
 | **Blob service**          | HTTP server on port 9001 — content-addressed large payload store                 |
 | **State sync**            | `SyncApartment` IPC → LWW upsert into `memory_apartments`                        |
@@ -32,7 +34,7 @@ all guest processes, and acts as the routing hub for every interaction inside th
 | Variable                              | Default                    | Description                           |
 | ------------------------------------- | -------------------------- | ------------------------------------- |
 | `PHILOTIC_MESH_PSK`                   | `INSECURE_DEV_DEFAULT_PSK` | Mesh auth key                         |
-| `PHILOTIC_HOTEL_PORT`                 | `9000`                     | IPC listen port                       |
+| `PHILOTIC_HOTEL_SOCKET`               | derived by hotel           | guest-facing IPC socket path exported to materialized guests |
 | `PHILOTIC_ENABLE_RUST_AUTH`           | `0`                        | 1 = enforce HMAC auth on mesh         |
 | `PHILOTIC_ENABLE_RUST_DISPATCHER`     | `0`                        | 1 = start outbound inter-hotel dispatcher |
 | `PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE` | `0`                        | 1 = start durable event ledger writer |
@@ -70,6 +72,8 @@ cargo run -p aiua -- --hotel startup-test-hotel --test telegram-roundtrip --test
 On macOS, the hotel now uses a Keychain-backed vault root key automatically and creates one on first use if needed. `PHILOTIC_VAULT_MASTER_KEY` remains a bootstrap fallback for non-macOS environments or explicit operator override. `PHILOTIC_VAULT_KEY_ID` can scope the Keychain item label when you want separate local vault roots.
 
 `mesh-config.json` can be a flat object, a top-level `context_graph` object, or a hotel-structured object. The preferred shape is `hotels.<hotel>.agents.<agent>.telegram` plus optional agent-scoped `model`, `context_graph`, and `import_workspace` sections. On startup, Ansible merges top-level shared keys, then `hotels.default`, then the selected hotel's overlay, flattens nested agent telegram/model settings into the current runtime config keys, and uses `import_workspace` to seed the selected agent identity bundle from an OpenClaw-style workspace.
+
+Some log/help text and comments still say `Ansible` for historical reasons. The runtime/component naming in the current repo is Philotic, with `aiua` as the hotel authority.
 
 Current inter-hotel transport split:
 - UDP mesh beacon remains the control plane for heartbeat, registry gossip, and compact coordination

@@ -460,12 +460,58 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 
 ## New Project: Philotic Agent Loop
 
-- [ ] Write a dedicated proposal for the Philotic loop architecture using Pi as the core turn-engine reference.
-- [ ] Write an implementation spec for loop state, events, checkpoints, tools, and approval interrupts.
+- [x] Write a dedicated proposal for the Philotic loop architecture using Pi as the core turn-engine reference. → Superseded by COGNITIVE_LOOP_PROPOSAL.md
+- [x] Write an implementation spec for loop state, events, checkpoints, tools, and approval interrupts. → Covered in COGNITIVE_LOOP_PROPOSAL.md
 - [ ] Define the provider boundary (`transformContext`, `convertToLlm`, tool/result records, structured outputs).
 - [ ] Define the bounded execution loop and checkpoint boundaries.
 - [ ] Define approval interrupt/resume semantics.
 - [ ] Define loop event streaming and tracing payloads.
+
+## New Project: Cognitive Loop Architecture
+
+Proposal: [COGNITIVE_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/COGNITIVE_LOOP_PROPOSAL.md)
+Seam IDs: `context-envelope-contract`, `memory-local-tools`, `active-plan-streaming`, `rules-tier`
+
+### Slice 1 — Context Envelope Fix (unblocks everything else)
+- [x] Add `build_reentry_context_envelope()` to `session.rs` — returns full `(prompt, context, context_projection, tools)`.
+- [x] Ensure all cognitive calls (initial + re-entry) send `context: Some(...)`, `context_projection: Some(...)`, `response_contract: Some(...)`.
+- [x] Add `tool_history` as a context envelope section in `model_context_from_projection` — always present, empty on initial turn, populated on re-entry.
+- [x] Add `ToolHistoryEntry` to `ContextEnvelope` in model-router; parse and render `[Tool call history]` in `composed_prompt_text()`.
+- [x] `handle_tool_result` now uses `build_reentry_context_envelope()` — model-router receives full structured envelope on every re-entry.
+- [ ] `active_plan` as context section (deferred to Slice 4).
+
+### Slice 2 — Settings Tree
+- [x] Add `AgentSettings`, `ContextWindowPolicy`, `MemoryPolicy`, `ExecutionPolicy` structs to `session.rs`.
+- [x] Create `docs/architecture/AGENT_SETTINGS_CATALOG.md` — full catalog with types, defaults, valid ranges.
+- [x] Expand `agent.configure` config paths to `settings.*` prefix (9 new paths, all clamped).
+- [x] Add dialogue window char-budget filtering in `model_context_from_projection`.
+- [x] Wire `settings.memory.memory_window_size` into `complete_active_turn` (replaces hardcoded `8`).
+- [x] Wire `settings.execution.iteration_cap` into `handle_tool_result` (removes `MAX_TOOL_ITERATIONS` constant).
+- [x] Time-based dialogue window filtering: `created_at: u64` on `TurnRecord`; time-first roll-off (minutes), then char-budget pass on what remains.
+
+### Slice 3 — Memory Local Tools ✓
+- [x] Add `memory.recall` to `catalog.rs` — class `"memory"`, approval: false, local-agent execution.
+- [x] Add `memory.remember` to `catalog.rs` — class `"memory"`, approval: false, local-agent execution.
+- [x] Wire `memory.recall` handler in `runtime.rs` → `engine.activate(query, SelfOnly, limit)`.
+- [x] Wire `memory.remember` handler in `runtime.rs` → `engine.remember(SelfOnly, ...)`.
+- [x] Add `memory` skill entry in `skill_implied_tools` (implies `memory.recall` + `memory.remember`).
+- [x] `is_local_agent_tool` recognises `memory.recall` and `memory.remember` — routes as `local_agent`.
+- [ ] Add `memory_summary` response channel to Gemini schema (alongside `memory_concept`). (deferred)
+
+### Slice 4 — Active Plan + Streaming ✓
+- [x] Add `ActivePlan` + `PlanStep` structs; `active_plan: Option<ActivePlan>` + `consecutive_step_failures: u32` on `WorkingTurn`.
+- [x] Capture plan from model response in `handle_model_response`; emit `plan_ready` on first capture.
+- [x] Turn events: `step_started` (handle_tool_call), `step_completed` / `step_failed` / `loop_recovering` (handle_tool_result). Gated by `stream_tool_events` setting.
+- [x] Stall detection: `consecutive_step_failures >= stall_detection_threshold` → `fail_active_turn` with "Stall detected" message. Failures reset to 0 on any successful step.
+- [x] `active_plan` added to context envelope (model sees current plan on re-entry) and Gemini response schema (`active_plan` channel in response_contract).
+- [x] `active_plan` threaded through `serialize_text_result` and `ProviderOutput::Text` in model-router.
+
+### Slice 5 — Rules Tier ✓
+- [x] Add `RuleRecord` to context graph in `ansible-mesh-core/src/graph.rs` (alongside `AbstractToolRecord`).
+- [x] Add `upsert_rule` / `get_rule` / `list_rules` to `GraphStorage` trait and `SqliteGraphStorage` impl.
+- [x] Add `rule.propose` tool to `catalog.rs` — class `"config"`, always requires operator approval (bypasses preapproval like `is_admin_role_creation`).
+- [x] Inject rules into `instructions` section on session snapshot (fetched at session init via `IpcRequest::ListRules`; stored in `SessionState.rules`; rendered as `[Rules]` block in `project_session_context`).
+- [x] Wire `CognitiveOutcome` → Rule elevation pathway via hotel IPC: `ProposeRule`/`ListRules` IpcRequest variants; `RuleProposed`/`RuleList` IpcResponse variants; `execute_local_agent_tool` dispatches `rule.propose` → hotel → `upsert_rule`; operator-confirmed via always_require_human gate.
 
 ## New Project: Guest Binary Resolution
 

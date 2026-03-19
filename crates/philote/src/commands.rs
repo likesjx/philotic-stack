@@ -10,6 +10,11 @@ pub fn command_manifest(_active_skills: &[String]) -> Vec<CommandManifestEntry> 
             usage_hint: None,
         },
         CommandManifestEntry {
+            command: "context".into(),
+            description: "Show a breakdown of the current context envelope (sections, sizes, turn history).".into(),
+            usage_hint: None,
+        },
+        CommandManifestEntry {
             command: "pause".into(),
             description: "Pause the current session.".into(),
             usage_hint: None,
@@ -71,6 +76,7 @@ pub fn command_manifest(_active_skills: &[String]) -> Vec<CommandManifestEntry> 
 pub enum SlashCommand {
     Ping,
     Status,
+    Context,
     Pause,
     Resume,
     Role { role_name: String },
@@ -97,6 +103,7 @@ impl SlashCommand {
         match self {
             Self::Ping => Some("pong"),
             Self::Status => None,
+            Self::Context => None,
             Self::Pause => None,
             Self::Resume => None,
             Self::Role { .. } => None,
@@ -137,6 +144,7 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
     match parts.as_slice() {
         ["/ping", ..] => Some(SlashCommand::Ping),
         ["/status", ..] => Some(SlashCommand::Status),
+        ["/context", ..] => Some(SlashCommand::Context),
         ["/pause", ..] => Some(SlashCommand::Pause),
         ["/resume", ..] => Some(SlashCommand::Resume),
         ["/role", role_name, ..] => Some(SlashCommand::Role {
@@ -193,6 +201,7 @@ mod tests {
         assert_eq!(parse_slash_command("/ping"), Some(SlashCommand::Ping));
         assert_eq!(parse_slash_command("/ping now"), Some(SlashCommand::Ping));
         assert_eq!(parse_slash_command("/status"), Some(SlashCommand::Status));
+        assert_eq!(parse_slash_command("/context"), Some(SlashCommand::Context));
         assert_eq!(parse_slash_command("/pause"), Some(SlashCommand::Pause));
         assert_eq!(parse_slash_command("/resume"), Some(SlashCommand::Resume));
         assert_eq!(

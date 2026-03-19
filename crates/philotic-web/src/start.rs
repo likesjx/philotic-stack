@@ -26,18 +26,7 @@ pub fn socket_path(hotel: &str) -> String {
     }
 }
 
-pub async fn run(config: Option<PathBuf>, hotel: String, detach: bool) -> Result<()> {
-    // When a profile is active, default config to ~/.philotic/<profile>/config.json.
-    // Otherwise fall back to mesh-config.json in the working directory.
-    let default_config = match active_profile() {
-        Some(_) => profile_dir().join("config.json"),
-        None => PathBuf::from("mesh-config.json"),
-    };
-    let config_path = config
-        .unwrap_or(default_config)
-        .canonicalize()
-        .context("config not found — run `phil init` first or check PHILOTIC_PROFILE")?;
-
+pub async fn run(hotel: String, detach: bool) -> Result<()> {
     // ── Ensure muninn is running ───────────────────────────────────────────
     crate::muninn::ensure_running().await?;
 
@@ -56,7 +45,6 @@ pub async fn run(config: Option<PathBuf>, hotel: String, detach: bool) -> Result
     // ── Find aiua binary ───────────────────────────────────────────────────
     let aiua_bin = find_aiua_binary()?;
     println!("Starting aiua from: {}", aiua_bin.display());
-    println!("Config: {}", config_path.display());
     println!("Hotel: {hotel}");
     if let Some(ref p) = active_profile() {
         println!("Profile: {p}  ({})", profile_dir().display());
@@ -75,9 +63,7 @@ pub async fn run(config: Option<PathBuf>, hotel: String, detach: bool) -> Result
     let log_file2 = log_file.try_clone().context("clone log file handle")?;
 
     let mut cmd = tokio::process::Command::new(&aiua_bin);
-    cmd.arg("--load-config")
-        .arg(&config_path)
-        .arg("--hotel")
+    cmd.arg("--hotel")
         .arg(&hotel)
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_file2));
@@ -131,7 +117,7 @@ pub async fn run(config: Option<PathBuf>, hotel: String, detach: bool) -> Result
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-fn find_aiua_binary() -> Result<PathBuf> {
+pub fn find_aiua_binary() -> Result<PathBuf> {
     // 1. On PATH
     if let Ok(p) = which_bin("aiua") {
         return Ok(p);

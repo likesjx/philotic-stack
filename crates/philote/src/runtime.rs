@@ -7,8 +7,8 @@ use crate::protocol::{
     ToolExecutionPayload, TransportAttachment, TurnEventPayload,
 };
 use crate::session::{
-    AgentProfile, MediaRoutingPolicy, SessionState, ToolExecutionRoute, TtsMode,
-    VoiceResponsePolicy, WorkingTurn, merge_session_index,
+    ActivePlan, AgentProfile, ComponentRouteAssembly, MediaRoutingPolicy, SessionState,
+    ToolExecutionRoute, TtsMode, VoiceResponsePolicy, WorkingTurn, merge_session_index,
 };
 use anyhow::Result;
 use memory_core::{MuninnConfig, MuninnRestEngine, MemoryScope, VaultResolver};
@@ -22,9 +22,6 @@ pub const DEFAULT_AGENT_ID: &str = "agent-jane-01";
 const DEFAULT_REPLY_ROLE: &str = "membrane";
 const DEFAULT_TEXT_MODEL_ROLE: &str = "model";
 const DEFAULT_VOICE_MODEL_ROLE: &str = "model.elevenlabs";
-/// Maximum model round-trips per turn. Exhausting this budget fails the turn with a
-/// clear error rather than looping indefinitely.
-const MAX_TOOL_ITERATIONS: u32 = 10;
 
 fn local_node_id() -> String {
     std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string())
@@ -394,6 +391,13 @@ fn format_role_command_reply(command: &SlashCommand, became_active: bool) -> Str
     }
 }
 
+fn command_bypasses_turn_start(command: &SlashCommand) -> bool {
+    matches!(
+        command,
+        SlashCommand::Ping | SlashCommand::Status | SlashCommand::Context
+    )
+}
+
 fn format_roles_report(active_incarnation_id: Option<&str>, roles: &[serde_json::Value]) -> String {
     let active_role_name = active_incarnation_id
         .and_then(|guest_id| guest_id.rsplit(':').next())
@@ -665,8 +669,43 @@ impl AgentRuntime {
 
         if let Some(command) = parse_slash_command(&content) {
             match command {
-                SlashCommand::Ping => {}
-                SlashCommand::Status | SlashCommand::Pause | SlashCommand::Resume => {}
+                _ if command_bypasses_turn_start(&command) => {
+                    return match command {
+                        SlashCommand::Ping => {
+                            self.complete_command_without_turn(
+                                task_id,
+                                session_id,
+                                turn_id,
+                                chat_id,
+                                final_reply_to,
+                                final_reply_role,
+                                final_reply_guest_id,
+                                "pong".into(),
+                                None,
+                                None,
+                            )
+                            .await
+                        }
+                        SlashCommand::Status | SlashCommand::Context => {
+                            self.handle_read_only_session_command(
+                                task_id,
+                                session_id,
+                                turn_id,
+                                chat_id,
+                                final_reply_to,
+                                final_reply_role,
+                                final_reply_guest_id,
+                                command,
+                            )
+                            .await
+                        }
+                        _ => unreachable!("command_bypasses_turn_start gate should be exhaustive"),
+                    };
+                }
+                SlashCommand::Ping | SlashCommand::Status | SlashCommand::Context => {
+                    unreachable!("read-only commands should bypass turn start")
+                }
+                SlashCommand::Pause | SlashCommand::Resume => {}
                 SlashCommand::Role { .. } | SlashCommand::Roles | SlashCommand::Back => {}
                 SlashCommand::ToolsAdd { .. }
                 | SlashCommand::ToolsClear
@@ -733,6 +772,8 @@ impl AgentRuntime {
                 pending_tool_call: None,
                 pending_approval: None,
                 working_tool_history: Vec::new(),
+                active_plan: None,
+                consecutive_step_failures: 0,
                 pending_text_reply: None,
                 had_voice_input,
                 awaiting_transcription_reentry: false,
@@ -765,6 +806,7 @@ impl AgentRuntime {
                         .await
                 }
                 SlashCommand::Status
+                | SlashCommand::Context
                 | SlashCommand::Pause
                 | SlashCommand::Resume
                 | SlashCommand::ToolsAdd { .. }
@@ -947,7 +989,7 @@ impl AgentRuntime {
             context_projection: Some(context_projection),
             attachments,
             tools_for_model,
-            response_contract: Some(serde_json::json!({ "channels": ["spoken_text", "memory_concept"] })),
+            response_contract: Some(serde_json::json!({ "channels": ["spoken_text", "memory_concept", "active_plan"] })),
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
@@ -1053,6 +1095,24 @@ impl AgentRuntime {
             .and_then(serde_json::Value::as_str)
             .filter(|s| !s.trim().is_empty())
             .map(str::to_string);
+
+        // Capture active_plan from the model response and store it on the turn.
+        // Present whenever the model outputs a structured plan — optional on all turns.
+        if let Some(plan_value) = model_result.and_then(|r| r.get("active_plan")) {
+            if let Ok(plan) = serde_json::from_value::<ActivePlan>(plan_value.clone()) {
+                if let Some(state) = self.sessions.get_mut(&session_id) {
+                    let is_first = state
+                        .active_turn
+                        .as_ref()
+                        .map(|t| t.active_plan.is_none())
+                        .unwrap_or(false);
+                    state.set_active_plan(plan);
+                    if is_first {
+                        let _ = self.emit_turn_event(&session_id, "plan_ready", None).await;
+                    }
+                }
+            }
+        }
 
         let awaiting_transcription_reentry = self
             .sessions
@@ -1308,7 +1368,11 @@ impl AgentRuntime {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
-        if is_admin_role_creation || force_approval {
+        // rule.propose always requires live operator approval — cannot be preapproved or bypassed.
+        // Rules are durable and permanently affect agent behavior, so human confirmation is required.
+        let is_rule_propose = tool_call.tool_name == "rule.propose";
+
+        if is_admin_role_creation || is_rule_propose || force_approval {
             // Set pending_tool_call so the approval handler can read it for class lookup.
             if let Some(state) = self.sessions.get_mut(&session_id) {
                 state.set_pending_tool_call(tool_call.clone());
@@ -1332,6 +1396,20 @@ impl AgentRuntime {
                     ),
                     format!("Admin role '{}' approved.", role_name_hint),
                 )
+            } else if is_rule_propose {
+                let desc = tool_call
+                    .arguments
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<no description>");
+                (
+                    format!(
+                        "The agent proposes a permanent behavioral rule: \"{desc}\"\n\
+                         Rules are durable — they persist across all future sessions and cannot \
+                         be removed without explicit operator action. Approve to store this rule."
+                    ),
+                    "Rule approved and stored permanently.".into(),
+                )
             } else {
                 (
                     format!("Tool '{}' requires approval before execution.", tool_call.tool_name),
@@ -1343,8 +1421,14 @@ impl AgentRuntime {
                 reason,
                 approved_response,
             };
+            // rule.propose and admin role creation both require always_require_human = true.
             return self
-                .handle_approval_request(session_id, turn_id, synthetic, is_admin_role_creation)
+                .handle_approval_request(
+                    session_id,
+                    turn_id,
+                    synthetic,
+                    is_admin_role_creation || is_rule_propose,
+                )
                 .await;
         }
 
@@ -1370,6 +1454,19 @@ impl AgentRuntime {
         let _ = self
             .emit_turn_event(&session_id, "waiting_tool", None)
             .await;
+
+        // Emit step_started if streaming is enabled.
+        let stream_events = self
+            .sessions
+            .get(&session_id)
+            .map(|s| s.settings.execution.stream_tool_events)
+            .unwrap_or(true);
+        if stream_events {
+            let step_info = Some(tool_call.tool_name.clone());
+            let _ = self
+                .emit_turn_event(&session_id, "step_started", step_info)
+                .await;
+        }
 
         let (chat_id, final_reply_to, final_reply_role, final_reply_guest_id, workspace_ref, route, session_user_id) = {
             let Some(state) = self.sessions.get(&session_id) else {
@@ -1470,6 +1567,14 @@ impl AgentRuntime {
             content: task.content.clone().unwrap_or_default(),
         };
 
+        // step_failed is determined by the presence of a non-empty error payload.
+        let step_failed = task.error.is_some();
+        let stream_events = self
+            .sessions
+            .get(&session_id)
+            .map(|s| s.settings.execution.stream_tool_events)
+            .unwrap_or(true);
+
         // Pair the result with the pending tool call, push to history, check iteration cap.
         let loop_outcome = {
             let Some(state) = self.sessions.get_mut(&session_id) else {
@@ -1489,24 +1594,42 @@ impl AgentRuntime {
             state.push_tool_history(tool_call, tool_result.clone());
             state.clear_pending_tool_call();
 
-            let iteration = state.active_turn.as_ref().map(|t| t.iteration).unwrap_or(0);
+            // Track consecutive failures for stall detection.
+            let consecutive_failures = if step_failed {
+                state.increment_step_failures()
+            } else {
+                state.reset_step_failures();
+                0
+            };
+            let stall_threshold = state.settings.execution.stall_detection_threshold;
 
-            if iteration >= MAX_TOOL_ITERATIONS {
+            let iteration = state.active_turn.as_ref().map(|t| t.iteration).unwrap_or(0);
+            let iteration_cap = state.settings.execution.iteration_cap;
+
+            if consecutive_failures >= stall_threshold {
                 Err(format!(
-                    "Turn exceeded maximum tool iterations ({MAX_TOOL_ITERATIONS}). Aborting."
+                    "Stall detected: {consecutive_failures} consecutive step failures \
+                     (threshold: {stall_threshold}). Surfacing to user."
+                ))
+            } else if iteration >= iteration_cap {
+                Err(format!(
+                    "Turn exceeded maximum tool iterations ({iteration_cap}). Aborting."
                 ))
             } else {
-                // Build re-entry prompt with full tool history injected.
-                match state.build_reentry_prompt() {
-                    Some(prompt) => {
+                // Build the full cognitive context envelope for re-entry.
+                // This ensures identity, instructions, memory, dialogue_window, active_turn,
+                // and tool_history all reach model-router — not just a flat prompt.
+                match state.build_reentry_context_envelope() {
+                    Some((prompt, context, context_projection, tools)) => {
                         if let Some(turn) = state.active_turn.as_mut() {
                             turn.iteration += 1;
                             turn.phase = TurnPhase::WaitingModel;
                         }
-                        let tools = state.tool_assembly.tools_for_model.clone();
                         let active_turn = state.active_turn.as_ref().expect("turn exists");
                         Ok((
                             prompt,
+                            context,
+                            context_projection,
                             active_turn.task_id,
                             active_turn.user_content.clone(),
                             active_turn.chat_id.clone(),
@@ -1520,16 +1643,30 @@ impl AgentRuntime {
                         ))
                     }
                     None => {
-                        Err("Active turn vanished before re-entry prompt could be built".into())
+                        Err("Active turn vanished before re-entry context could be built".into())
                     }
                 }
             }
         };
 
+        // Emit step_completed or step_failed event before continuing the loop.
+        if stream_events {
+            let event = if step_failed { "step_failed" } else { "step_completed" };
+            let _ = self.emit_turn_event(&session_id, event, None).await;
+        }
+
         match loop_outcome {
-            Err(msg) => self.fail_active_turn(session_id, turn_id, msg).await,
+            Err(msg) => {
+                if stream_events && !step_failed {
+                    // stall/cap hit — emit loop_recovering so observers know we stopped
+                    let _ = self.emit_turn_event(&session_id, "loop_recovering", None).await;
+                }
+                self.fail_active_turn(session_id, turn_id, msg).await
+            }
             Ok((
                 prompt,
+                context,
+                context_projection,
                 _task_id,
                 user_content,
                 chat_id,
@@ -1557,11 +1694,11 @@ impl AgentRuntime {
                     turn_id,
                     prompt,
                     user_content,
-                    context: None,
-                    context_projection: None,
+                    context: Some(context),
+                    context_projection: Some(context_projection),
                     attachments: Vec::new(),
                     tools_for_model,
-                    response_contract: None,
+                    response_contract: Some(serde_json::json!({ "channels": ["spoken_text", "memory_concept", "active_plan"] })),
                     chat_id,
                     reply_to: local_node_id(),
                     reply_role: "agent".into(),
@@ -1690,7 +1827,7 @@ impl AgentRuntime {
             context_projection,
             attachments: Vec::new(),
             tools_for_model: reentry.tools_for_model,
-            response_contract: Some(serde_json::json!({ "channels": ["spoken_text", "memory_concept"] })),
+            response_contract: Some(serde_json::json!({ "channels": ["spoken_text", "memory_concept", "active_plan"] })),
             chat_id: reentry.chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
@@ -2254,6 +2391,7 @@ impl AgentRuntime {
                 }
                 SlashCommand::Ping
                 | SlashCommand::Status
+                | SlashCommand::Context
                 | SlashCommand::Pause
                 | SlashCommand::Resume
                 | SlashCommand::Role { .. }
@@ -2424,6 +2562,7 @@ impl AgentRuntime {
             }
             SlashCommand::Ping
             | SlashCommand::Status
+            | SlashCommand::Context
             | SlashCommand::Pause
             | SlashCommand::Resume
             | SlashCommand::Role { .. }
@@ -3056,6 +3195,15 @@ impl AgentRuntime {
                         "approval_policy": state.approval_policy,
                     }),
                 ),
+                SlashCommand::Context => (
+                    state.context_breakdown_text(),
+                    "context_breakdown_reported",
+                    serde_json::json!({
+                        "session_id": session_id,
+                        "turn_id": command_turn_id,
+                        "chat_id": command_chat_id,
+                    }),
+                ),
                 SlashCommand::Pause => {
                     state.set_status("paused");
                     (
@@ -3295,6 +3443,133 @@ impl AgentRuntime {
 
         self.complete_local_command(session_id, command_turn_id, reply_content)
             .await
+    }
+
+    async fn handle_read_only_session_command(
+        &mut self,
+        command_task_id: Uuid,
+        session_id: String,
+        command_turn_id: String,
+        command_chat_id: String,
+        command_reply_to: String,
+        command_reply_role: String,
+        command_reply_guest_id: Option<String>,
+        command: SlashCommand,
+    ) -> Result<()> {
+        let Some(state) = self.sessions.get(&session_id) else {
+            warn!(
+                "Received read-only session command for unknown session {}",
+                session_id
+            );
+            return Ok(());
+        };
+
+        let (reply_content, update_state, payload) = match command {
+            SlashCommand::Status => (
+                state.session_status_text(),
+                Some("session_status_reported"),
+                Some(serde_json::json!({
+                    "session_id": session_id,
+                    "turn_id": command_turn_id,
+                    "chat_id": command_chat_id,
+                    "session_status": state.status,
+                    "bindings": state.bindings,
+                    "tool_assembly": state.tool_assembly,
+                    "approval_policy": state.approval_policy,
+                })),
+            ),
+            SlashCommand::Context => (
+                state.context_breakdown_text(),
+                Some("context_breakdown_reported"),
+                Some(serde_json::json!({
+                    "session_id": session_id,
+                    "turn_id": command_turn_id,
+                    "chat_id": command_chat_id,
+                })),
+            ),
+            _ => {
+                warn!("Unsupported read-only session command: {:?}", command);
+                return Ok(());
+            }
+        };
+
+        self.complete_command_without_turn(
+            command_task_id,
+            session_id,
+            command_turn_id,
+            command_chat_id,
+            command_reply_to,
+            command_reply_role,
+            command_reply_guest_id,
+            reply_content,
+            update_state,
+            payload,
+        )
+        .await
+    }
+
+    async fn complete_command_without_turn(
+        &mut self,
+        command_task_id: Uuid,
+        session_id: String,
+        turn_id: String,
+        chat_id: String,
+        reply_to: String,
+        reply_role: String,
+        reply_guest_id: Option<String>,
+        reply_content: String,
+        update_state: Option<&str>,
+        payload: Option<serde_json::Value>,
+    ) -> Result<()> {
+        if let Some(state) = update_state {
+            let _ = self
+                .ipc_client
+                .send_request(IpcRequest::UpdateTask {
+                    task_id: command_task_id,
+                    state: state.into(),
+                    payload: payload.unwrap_or_else(|| {
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "turn_id": turn_id,
+                            "chat_id": chat_id,
+                        })
+                    }),
+                })
+                .await?;
+        }
+
+        let _ = self
+            .ipc_client
+            .send_request(IpcRequest::CompleteTask {
+                task_id: command_task_id,
+                result: serde_json::json!({
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "chat_id": chat_id,
+                    "content": reply_content,
+                }),
+            })
+            .await?;
+
+        let reply_payload = FinalReplyPayload {
+            action: "send_reply",
+            session_id,
+            turn_id,
+            chat_id,
+            content: reply_content,
+            audio_artifact: None,
+            send_text_caption: false,
+        };
+
+        self.ipc_client
+            .send_request(IpcRequest::EmitTask {
+                target_node: reply_to,
+                target_role: reply_role,
+                target_guest_id: reply_guest_id,
+                task_json: serde_json::to_string(&reply_payload)?,
+            })
+            .await?;
+        Ok(())
     }
 
     fn execute_bound_tool<'a>(
@@ -4289,6 +4564,223 @@ impl AgentRuntime {
                 .await
             }
 
+            "memory.recall" => {
+                use memory_core::MemoryEngine as _;
+
+                let query = payload
+                    .arguments
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let explicit_limit = payload
+                    .arguments
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize);
+
+                let recall_limit = self
+                    .sessions
+                    .get(&payload.session_id)
+                    .map(|s| s.settings.memory.recall_limit)
+                    .unwrap_or(5);
+                let limit = explicit_limit.unwrap_or(recall_limit).clamp(1, 20);
+
+                let content = match self.memory_engine_for(&self.agent_id, &self.agent_id) {
+                    None => "Memory unavailable: MuninnDB not configured.".to_string(),
+                    Some(engine) => match engine.activate(&query, MemoryScope::SelfOnly, Some(limit)).await {
+                        Err(e) => format!("memory.recall error: {e}"),
+                        Ok(result) if result.engrams.is_empty() => {
+                            "No relevant memories found.".to_string()
+                        }
+                        Ok(result) => {
+                            let mut out = format!("{} engram(s) recalled:\n", result.engrams.len());
+                            for (i, eng) in result.engrams.iter().enumerate() {
+                                out.push_str(&format!(
+                                    "{}. [{}] {} — {}\n",
+                                    i + 1,
+                                    eng.concept,
+                                    eng.content,
+                                    eng.tags.join(", ")
+                                ));
+                            }
+                            out
+                        }
+                    },
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action:              Some("tool_result".into()),
+                    agent_action:        None,
+                    source:              Some("agent".into()),
+                    session_id:          Some(payload.session_id),
+                    turn_id:             Some(payload.turn_id),
+                    transport:           None,
+                    chat_id:             Some(payload.chat_id),
+                    thread_id:           None,
+                    sender_id:           None,
+                    sender_username:     None,
+                    message_kind:        None,
+                    content:             Some(content),
+                    attachments:         Vec::new(),
+                    command:             None,
+                    callback_data:       None,
+                    raw_transport_event: None,
+                    error:               None,
+                    tool_name:           Some(payload.tool_name),
+                    arguments:           None,
+                    final_reply_to:      Some(payload.final_reply_to),
+                    final_reply_role:    Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                })
+                .await
+            }
+
+            "memory.remember" => {
+                use memory_core::MemoryEngine as _;
+
+                let concept = payload
+                    .arguments
+                    .get("concept")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("untitled")
+                    .to_string();
+                let content_str = payload
+                    .arguments
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let tags: Vec<String> = payload
+                    .arguments
+                    .get("tags")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|t| t.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let result_text = match self.memory_engine_for(&self.agent_id, &self.agent_id) {
+                    None => "Memory unavailable: MuninnDB not configured.".to_string(),
+                    Some(engine) => match engine
+                        .remember(MemoryScope::SelfOnly, &concept, &content_str, tags)
+                        .await
+                    {
+                        Ok(engram_ref) => format!("Stored memory '{}' (id: {}).", concept, engram_ref.id),
+                        Err(e) => format!("memory.remember error: {e}"),
+                    },
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action:              Some("tool_result".into()),
+                    agent_action:        None,
+                    source:              Some("agent".into()),
+                    session_id:          Some(payload.session_id),
+                    turn_id:             Some(payload.turn_id),
+                    transport:           None,
+                    chat_id:             Some(payload.chat_id),
+                    thread_id:           None,
+                    sender_id:           None,
+                    sender_username:     None,
+                    message_kind:        None,
+                    content:             Some(result_text),
+                    attachments:         Vec::new(),
+                    command:             None,
+                    callback_data:       None,
+                    raw_transport_event: None,
+                    error:               None,
+                    tool_name:           Some(payload.tool_name),
+                    arguments:           None,
+                    final_reply_to:      Some(payload.final_reply_to),
+                    final_reply_role:    Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                })
+                .await
+            }
+
+            "rule.propose" => {
+                let description = payload
+                    .arguments
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let rationale = payload
+                    .arguments
+                    .get("rationale")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                if description.is_empty() {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "rule.propose: 'description' is required.".into(),
+                        )
+                        .await;
+                }
+
+                let agent_id = self.agent_id.clone();
+                let result_text = match self
+                    .ipc_client
+                    .send_request(IpcRequest::ProposeRule {
+                        agent_id: agent_id.clone(),
+                        description: description.clone(),
+                        rationale: rationale.clone(),
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::RuleProposed { rule_id }) => {
+                        // Optimistically push the new rule into session state so it is visible
+                        // in the next turn's context without requiring a restart.
+                        if let Some(state) = self.sessions.get_mut(&payload.session_id) {
+                            state.rules.push(serde_json::json!({
+                                "rule_id": rule_id,
+                                "description": description,
+                                "rationale": rationale,
+                            }));
+                        }
+                        format!("Rule stored permanently (id: {rule_id}). It will be injected into every future cognitive turn.")
+                    }
+                    Ok(IpcResponse::Standard { ok: true, message, .. }) => message,
+                    Ok(IpcResponse::Standard { ok: false, message, .. }) => {
+                        format!("rule.propose: hotel rejected — {message}")
+                    }
+                    Ok(_) => "rule.propose: unexpected response from hotel.".into(),
+                    Err(e) => format!("rule.propose: IPC error — {e}"),
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action:              Some("tool_result".into()),
+                    agent_action:        None,
+                    source:              Some("agent".into()),
+                    session_id:          Some(payload.session_id),
+                    turn_id:             Some(payload.turn_id),
+                    transport:           None,
+                    chat_id:             Some(payload.chat_id),
+                    thread_id:           None,
+                    sender_id:           None,
+                    sender_username:     None,
+                    message_kind:        None,
+                    content:             Some(result_text),
+                    attachments:         Vec::new(),
+                    command:             None,
+                    callback_data:       None,
+                    raw_transport_event: None,
+                    error:               None,
+                    tool_name:           Some(payload.tool_name),
+                    arguments:           None,
+                    final_reply_to:      Some(payload.final_reply_to),
+                    final_reply_role:    Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                })
+                .await
+            }
+
             other => {
                 self.fail_active_turn(
                     payload.session_id,
@@ -4382,9 +4874,9 @@ impl AgentRuntime {
     }
 
     /// Re-fetches the session snapshot from the hotel on every user turn and merges the latest
-    /// effective_toolset and effective_skillset into the live session state, then rebuilds the
-    /// tool assembly. This ensures tool grants and profile changes take effect immediately on
-    /// the next message without requiring a session restart or reconnect.
+    /// effective_toolset, effective_skillset, and component routing into the live session state.
+    /// This ensures tool grants and runtime routing changes take effect immediately on the next
+    /// message without requiring a session restart or reconnect.
     async fn refresh_bindings_from_snapshot(&mut self, session_id: &str) {
         let response = self
             .ipc_client
@@ -4401,17 +4893,23 @@ impl AgentRuntime {
             _ => None,
         };
 
+        let Some(state) = self.sessions.get_mut(session_id) else { return };
         let Some(snapshot) = snapshot else { return };
-        let Some(bindings) = snapshot.get("bindings") else { return };
+        Self::merge_snapshot_bindings(state, &snapshot);
+    }
 
+    fn merge_snapshot_bindings(state: &mut SessionState, snapshot: &serde_json::Value) {
+        let Some(bindings) = snapshot.get("bindings") else { return };
         let new_toolset: Option<Vec<String>> = bindings
             .get("effective_toolset")
             .and_then(|v| serde_json::from_value(v.clone()).ok());
         let new_skillset: Option<Vec<String>> = bindings
             .get("effective_skillset")
             .and_then(|v| serde_json::from_value(v.clone()).ok());
-
-        let Some(state) = self.sessions.get_mut(session_id) else { return };
+        let new_component_routes = snapshot
+            .get("component_route_assembly")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<ComponentRouteAssembly>(value).ok());
 
         let mut changed = false;
         if let Some(toolset) = new_toolset {
@@ -4423,6 +4921,12 @@ impl AgentRuntime {
         if let Some(skillset) = new_skillset {
             if skillset != state.bindings.effective_skillset {
                 state.bindings.effective_skillset = skillset;
+                changed = true;
+            }
+        }
+        if let Some(component_routes) = new_component_routes {
+            if component_routes != state.component_route_assembly {
+                state.component_route_assembly = component_routes;
                 changed = true;
             }
         }
@@ -4458,7 +4962,8 @@ impl AgentRuntime {
                     .and_then(serde_json::Value::as_str)
                     == Some(session_id)
                 {
-                    if let Some(state) = SessionState::from_checkpoint(&checkpoint) {
+                    if let Some(mut state) = SessionState::from_checkpoint(&checkpoint) {
+                        Self::fetch_and_inject_rules(&mut self.ipc_client, &self.agent_id, &mut state).await;
                         self.sessions.insert(session_id.to_string(), state);
                         return Ok(());
                     }
@@ -4472,8 +4977,32 @@ impl AgentRuntime {
             fallback_source.into(),
         );
         state.agent_profile = self.default_agent_profile.clone();
+        Self::fetch_and_inject_rules(&mut self.ipc_client, &self.agent_id, &mut state).await;
         self.sessions.insert(session_id.to_string(), state);
         Ok(())
+    }
+
+    /// Fetches durable rules from the hotel and injects them into the session state.
+    /// Called at session init so every cognitive call sees the current rule set.
+    /// Failures are non-fatal — rules will simply be absent from context.
+    async fn fetch_and_inject_rules(
+        ipc_client: &mut PhiloticClient,
+        agent_id: &str,
+        state: &mut SessionState,
+    ) {
+        match ipc_client
+            .send_request(IpcRequest::ListRules {
+                agent_id: agent_id.to_string(),
+            })
+            .await
+        {
+            Ok(IpcResponse::RuleList { rules }) => {
+                state.rules = rules;
+            }
+            Ok(_) | Err(_) => {
+                // Non-fatal: session proceeds without rules if the hotel is unavailable.
+            }
+        }
     }
 
     async fn sync_session_index(&mut self, state: &SessionState) -> Result<()> {
@@ -4547,7 +5076,7 @@ async fn run_bash_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE, extract_model_error, format_role_command_reply,
+        AgentRuntime, DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE, extract_model_error, format_role_command_reply,
         format_roles_report, media_analysis_attachments, normalized_user_content,
         resolve_media_routing, resolve_model_execution_target,
     };
@@ -4668,6 +5197,42 @@ mod tests {
             target.2.as_deref(),
             Some("aria-architect-hotel:model-controller-gemini")
         );
+    }
+
+    #[test]
+    fn merge_snapshot_bindings_updates_component_route_assembly() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        let snapshot = serde_json::json!({
+            "bindings": {
+                "effective_toolset": ["echo"],
+                "effective_skillset": ["planning"]
+            },
+            "component_route_assembly": {
+                "execution_routes": {
+                    "text.generate": {
+                        "target_node": "default-aiua-01",
+                        "target_role": "model",
+                        "incarnation_id": "default:model-controller-gemini",
+                        "hotel_id": "default",
+                        "environment_id": null,
+                        "execution_mode": "capability",
+                        "availability_state": "live",
+                        "selection_reason": "live_local_capability"
+                    }
+                }
+            }
+        });
+
+        AgentRuntime::merge_snapshot_bindings(&mut state, &snapshot);
+
+        let route = state
+            .resolve_component_execution_route("text.generate")
+            .expect("text.generate route should refresh from snapshot");
+        assert_eq!(route.target_node, "default-aiua-01");
+        assert_eq!(route.hotel_id.as_deref(), Some("default"));
+        assert_eq!(state.bindings.effective_toolset, vec!["echo"]);
+        assert_eq!(state.bindings.effective_skillset, vec!["planning"]);
     }
 
     #[test]
@@ -5180,6 +5745,15 @@ mod tests {
         assert!(report.contains("Active role: developer."));
         assert!(report.contains("- orchestrator"));
         assert!(report.contains("* developer"));
+    }
+
+    #[test]
+    fn command_bypasses_turn_start_for_read_only_commands() {
+        assert!(super::command_bypasses_turn_start(&SlashCommand::Ping));
+        assert!(super::command_bypasses_turn_start(&SlashCommand::Status));
+        assert!(super::command_bypasses_turn_start(&SlashCommand::Context));
+        assert!(!super::command_bypasses_turn_start(&SlashCommand::Pause));
+        assert!(!super::command_bypasses_turn_start(&SlashCommand::Approve { note: None }));
     }
 
     // ── bash.exec tests ──────────────────────────────────────────────────────

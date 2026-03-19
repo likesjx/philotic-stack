@@ -77,6 +77,7 @@ impl WorkspaceRunnerConfig {
             .filter(|tools| !tools.is_empty())
             .unwrap_or_else(|| {
                 vec![
+                    "echo".into(),
                     "workspace.list".into(),
                     "workspace.read".into(),
                     "workspace.search".into(),
@@ -799,6 +800,15 @@ mod tests {
         let output = execute_tool(&config, "workspace.list", &json!({ "path": "." }));
         assert!(output.contains("alpha.txt"));
         assert!(output.contains("nested/"));
+    }
+
+    #[test]
+    fn default_runner_config_allows_echo() {
+        let config = WorkspaceRunnerConfig::from_env();
+        assert!(
+            config.allowed_tools.iter().any(|tool| tool == "echo"),
+            "default runner config should expose echo so advertised utility tools remain executable"
+        );
     }
 
     #[test]

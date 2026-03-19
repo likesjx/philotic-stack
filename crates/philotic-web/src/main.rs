@@ -4,9 +4,11 @@ use std::path::PathBuf;
 
 mod footprint;
 mod init;
+mod load;
 mod muninn;
 mod reset;
 mod serve;
+mod service;
 mod start;
 mod status;
 mod stop;
@@ -40,12 +42,8 @@ enum Command {
         force: bool,
     },
 
-    /// Start the local aiua daemon
+    /// Start the local aiua daemon (boots from DB — run `phil load` first if DB is empty)
     Start {
-        /// Path to mesh-config.json (default: ./mesh-config.json)
-        #[arg(long, short)]
-        config: Option<PathBuf>,
-
         /// Hotel name to boot (default: default)
         #[arg(long, default_value = "default")]
         hotel: String,
@@ -79,6 +77,23 @@ enum Command {
         keep_identity: bool,
     },
 
+    /// Apply a config file to the Context Graph DB (run once on setup or when config changes)
+    Load {
+        /// Path to config file (default: mesh-config.json, or ~/.philotic/<profile>/config.json)
+        #[arg(long, short)]
+        file: Option<PathBuf>,
+
+        /// Hotel section to seed (default: "default")
+        #[arg(long, default_value = "default")]
+        hotel: String,
+    },
+
+    /// Manage the aiua launchd service (macOS only)
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+
     /// Show all running philotic processes, sockets, and PID files
     Footprint {
         /// Kill matched processes (* or 'all' to kill everything, or a name pattern e.g. 'membrane')
@@ -106,16 +121,44 @@ enum Command {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum ServiceAction {
+    /// Install and start the aiua launchd service
+    Install {
+        /// Hotel to run (default: "default")
+        #[arg(long, default_value = "default")]
+        hotel: String,
+    },
+    /// Stop and uninstall the aiua launchd service
+    Uninstall {
+        /// Hotel to uninstall (default: "default")
+        #[arg(long, default_value = "default")]
+        hotel: String,
+    },
+    /// Show launchd service status
+    Status {
+        /// Hotel to query (default: "default")
+        #[arg(long, default_value = "default")]
+        hotel: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Init { config, force } => init::run(config, force).await,
-        Command::Start { config, hotel, detach } => start::run(config, hotel, detach).await,
+        Command::Load { file, hotel } => load::run(file, hotel).await,
+        Command::Start { hotel, detach } => start::run(hotel, detach).await,
         Command::Stop => stop::run().await,
         Command::Status { config } => status::run(config).await,
         Command::Agents { config } => status::run_agents(config).await,
         Command::Reset { keep_identity } => reset::run(keep_identity).await,
+        Command::Service { action } => match action {
+            ServiceAction::Install { hotel } => service::install(hotel).await,
+            ServiceAction::Uninstall { hotel } => service::uninstall(hotel).await,
+            ServiceAction::Status { hotel } => service::status(hotel).await,
+        },
         Command::Footprint { kill } => footprint::run(kill).await,
         Command::Serve { port, db, config, allow_origins } => {
             serve::run(port, db, config, allow_origins).await

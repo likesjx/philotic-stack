@@ -14,7 +14,7 @@ let identity = GuestIdentity {
 };
 
 // Connect and register with the hotel
-let client = PhiloticClient::connect(9000).await?;
+let client = PhiloticClient::connect(identity).await?;
 
 // Publish an event into the hotel's durable ledger
 client.publish_event(envelope).await?;
@@ -25,7 +25,12 @@ client.sync_apartment("my-agent-01", "short", &json_value).await?;
 
 ## IPC Message Protocol
 
-All messages are JSON-encoded and exchanged over a UDP loopback socket (default port 9000).
+All messages are JSON-encoded and exchanged over the hotel's Unix domain socket.
+`PhiloticClient` resolves the socket from `PHILOTIC_HOTEL_SOCKET`, defaulting to
+`/tmp/philotic-aiua.sock` when the environment variable is absent.
+
+Source-of-truth note: some older crate READMEs and CLI help text still mention
+port-oriented `ansible` IPC. The current client contract is socket-path-driven.
 
 ### Requests (guest → hotel)
 

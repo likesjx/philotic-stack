@@ -3,7 +3,7 @@ title: "Philotic Architecture Map"
 doc_type: workflow
 domain: workflow-docs
 status: active
-last_updated: 2026-03-13
+last_updated: 2026-03-19
 tags:
   - docs
   - architecture
@@ -21,7 +21,7 @@ task_refs:
 
 # Philotic Architecture Map
 
-> **Status:** Living Index | **Last Updated:** 2026-03-13
+> **Status:** Living Index | **Last Updated:** 2026-03-19
 
 This directory now has one explicit split:
 
@@ -32,6 +32,8 @@ This directory now has one explicit split:
 - proposal docs in this directory describe intended or evolving design, not automatically implemented truth.
 
 If those ever disagree, observed code and tests win, then `ARCHITECTURE_STATUS.md`, then older narrative docs. Software does love pretending every markdown file is equally current.
+
+That precedence also applies when a crate README, quickstart note, or older architecture narrative disagrees on concrete runtime details like socket paths, port ownership, or whether a boundary is still transitional.
 
 ## Domain Map
 
@@ -56,10 +58,13 @@ For stable active seam IDs, see [SEAM_REGISTRY.md](/Users/jaredlikes/code/philot
 
 When updating docs, keep these boundaries explicit:
 
-1. Update [ARCHITECTURE_STATUS.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE_STATUS.md) when implemented behavior, active seams, or the repo's honest current state changes.
-2. Update [ARCHITECTURE.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE.md) when the durable architecture reference itself changes.
-3. Update a proposal when the recommendation, disposition, or current slice changes.
-4. Update [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md) when the work surface or sequencing changes.
+1. Observed code and tests win over prose when they disagree.
+2. Update [ARCHITECTURE_STATUS.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE_STATUS.md) when implemented behavior, active seams, or the repo's honest current state changes.
+3. Update [ARCHITECTURE.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE.md) when the durable architecture reference itself changes.
+4. Update a proposal when the recommendation, disposition, or current slice changes.
+5. Update [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md) when the work surface or sequencing changes.
+
+`docs/task.md` is the execution surface, not the runtime-protocol reference. Use it to see what is being worked, not to settle socket, transport, or ownership disputes.
 
 ## Metadata Strategy
 
@@ -116,5 +121,6 @@ Recommended disposition vocabulary:
 ## Current Gaps Worth Cleaning Later
 
 - [ARCHITECTURE.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE.md) still carries some older wording around mesh/data-plane details and should be tightened against the current execution-transport reality.
+- some crate READMEs still carry older `Ansible` naming, port-first launch examples, or stale IPC wording. Treat them as convenience docs unless they match current code and [docs/README.md](/Users/jaredlikes/code/philotic-stack/docs/README.md).
 - [docs/PHILOTIC-ARCHITECTURE.md](/Users/jaredlikes/code/philotic-stack/docs/PHILOTIC-ARCHITECTURE.md) is historical and should not be treated as current architecture truth.
 - [PORT_BLUEPRINT.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PORT_BLUEPRINT.md), [docs/ARCHITECT_THOUGHTS_CONTEXT_GRAPH.md](/Users/jaredlikes/code/philotic-stack/docs/ARCHITECT_THOUGHTS_CONTEXT_GRAPH.md), and [docs/walkthrough.md](/Users/jaredlikes/code/philotic-stack/docs/walkthrough.md) are now explicitly historical and should be used for lineage, not current authority.

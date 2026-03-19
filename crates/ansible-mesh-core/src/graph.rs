@@ -174,6 +174,27 @@ pub struct RoleIncarnationRecord {
     pub turn_loop_config: TurnLoopConfig,
 }
 
+/// A durable behavioral constraint stored in the context graph.
+///
+/// Node kind: `rule`. Node key: `rule:{rule_id}`.
+/// Rules are injected into the `instructions` section of every cognitive call
+/// and never rolled off by the dialogue window. An agent cannot self-elevate
+/// beliefs into rules — all rule proposals require operator confirmation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuleRecord {
+    /// Unique rule identifier (UUID).
+    pub rule_id: String,
+    /// Agent identity that owns this rule.
+    pub agent_id: String,
+    /// Human-readable behavioral constraint. Written in the imperative.
+    /// E.g. "Always ask for clarification before deleting files."
+    pub description: String,
+    /// The reasoning or observation that led to this rule being elevated.
+    pub rationale: String,
+    /// Unix epoch (seconds) when this rule was created.
+    pub created_at: u64,
+}
+
 /// A dedicated namespace for an agent's memory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryApartment {

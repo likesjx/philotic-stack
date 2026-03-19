@@ -53,25 +53,32 @@ async fn main() -> Result<()> {
         other => bail!("unexpected emit response: {other:?}"),
     }
 
-    let final_reply = timeout(Duration::from_secs(10), client.recv_task())
-        .await
-        .context("timed out waiting for final reply")??;
+    let deadline = Duration::from_secs(10);
+    let mut reply_content = None;
+    for _ in 0..10 {
+        let inbound = timeout(deadline, client.recv_task())
+            .await
+            .context("timed out waiting for final reply")??;
 
-    let IpcResponse::InboundTask { task_json, .. } = final_reply else {
-        bail!("unexpected final reply envelope: {final_reply:?}");
-    };
+        let IpcResponse::InboundTask { task_json, .. } = inbound else {
+            continue;
+        };
 
-    let payload: serde_json::Value =
-        serde_json::from_str(&task_json).context("failed to decode final reply json")?;
-    let action = payload.get("action").and_then(serde_json::Value::as_str);
-    let reply_content = payload
-        .get("content")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
+        let payload: serde_json::Value =
+            serde_json::from_str(&task_json).context("failed to decode final reply json")?;
+        let action = payload.get("action").and_then(serde_json::Value::as_str);
+        if action != Some("send_reply") {
+            continue;
+        }
 
-    if action != Some("send_reply") {
-        bail!("unexpected final reply action: {:?}", action);
+        reply_content = payload
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        break;
     }
+
+    let reply_content = reply_content.context("did not receive send_reply before timeout")?;
     if reply_content != expected {
         bail!(
             "expected final reply {:?}, got {:?}",
