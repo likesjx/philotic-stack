@@ -30,42 +30,43 @@ fn local_node_id() -> String {
 #[cfg(test)]
 const LOCAL_NODE: &str = "local-aiua-01";
 
-fn extract_model_error(task: &InboundTaskPayload) -> Option<String> {
+fn extract_model_error_payload(task: &InboundTaskPayload) -> Option<TaskErrorPayload> {
     if let Some(error) = task.error.as_ref() {
-        return Some(error.display_message());
+        return Some(error.clone());
     }
 
-    let agent_action = task.agent_action.as_ref()?;
-    let mut parts = Vec::new();
+    task.agent_action
+        .as_ref()
+        .and_then(|action| action.get("model_result"))
+        .and_then(|result| result.get("error"))
+        .cloned()
+        .and_then(|value| serde_json::from_value::<TaskErrorPayload>(value).ok())
+}
 
-    if let Some(message) = agent_action
-        .get("message")
-        .and_then(serde_json::Value::as_str)
-    {
-        parts.push(message.to_string());
-    }
+fn extract_model_error(task: &InboundTaskPayload) -> Option<String> {
+    let payload = extract_model_error_payload(task)?;
+    Some(payload.display_message())
+}
 
-    if let Some(error) = agent_action
-        .get("model_result")
-        .and_then(|mr| mr.get("error"))
-        .and_then(serde_json::Value::as_object)
-    {
-        if let Some(kind) = error.get("kind").and_then(serde_json::Value::as_str) {
-            parts.push(format!("kind={kind}"));
-        }
-        if let Some(provider) = error.get("provider").and_then(serde_json::Value::as_str) {
-            parts.push(format!("provider={provider}"));
-        }
-        if let Some(message) = error.get("message").and_then(serde_json::Value::as_str) {
-            parts.push(message.to_string());
-        }
-    }
+fn should_attempt_provider_repair(
+    error: &TaskErrorPayload,
+    state: Option<&SessionState>,
+) -> bool {
+    error.kind == "provider_failure"
+        && error.retryable.unwrap_or(false)
+        && error.capability.as_deref() == Some("text.generate")
+        && state
+            .map(|state| state.provider_repair_attempts() < 1)
+            .unwrap_or(false)
+}
 
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join(" | "))
-    }
+fn provider_repair_note(error: &TaskErrorPayload) -> String {
+    let provider = error.provider.as_deref().unwrap_or("the model");
+    format!(
+        "The previous {provider} response attempted a tool call but returned an invalid tool payload. \
+If you call a tool, output a complete tool_call object with a non-empty arguments object containing every required field. \
+If no tool is needed, reply with display_text and spoken_text only"
+    )
 }
 
 fn implementation_to_model_role(implementation: &str) -> String {
@@ -774,6 +775,8 @@ impl AgentRuntime {
                 working_tool_history: Vec::new(),
                 active_plan: None,
                 consecutive_step_failures: 0,
+                provider_repair_note: None,
+                provider_repair_attempts: 0,
                 pending_text_reply: None,
                 had_voice_input,
                 awaiting_transcription_reentry: false,
@@ -1058,6 +1061,23 @@ impl AgentRuntime {
             return self
                 .handle_voice_synthesis_response(session_id, turn_id, raw_content)
                 .await;
+        }
+
+        if let Some(error_payload) = extract_model_error_payload(&task) {
+            if should_attempt_provider_repair(&error_payload, self.sessions.get(&session_id)) {
+                warn!(
+                    "Session [{}] retrying model turn after retryable provider failure: {}",
+                    session_id,
+                    error_payload.display_message()
+                );
+                return self
+                    .retry_active_turn_after_provider_failure(
+                        session_id,
+                        turn_id,
+                        provider_repair_note(&error_payload),
+                    )
+                    .await;
+            }
         }
 
         if let Some(model_error) = extract_model_error(&task) {
@@ -1735,6 +1755,107 @@ impl AgentRuntime {
                 Ok(())
             }
         }
+    }
+
+    async fn retry_active_turn_after_provider_failure(
+        &mut self,
+        session_id: String,
+        turn_id: String,
+        note: String,
+    ) -> Result<()> {
+        let retry_plan = {
+            let Some(state) = self.sessions.get_mut(&session_id) else {
+                return Ok(());
+            };
+            state.set_provider_repair_note(note);
+            state.increment_provider_repair_attempts();
+
+            match state.build_reentry_context_envelope() {
+                Some((prompt, context, context_projection, tools_for_model)) => {
+                    if let Some(turn) = state.active_turn.as_mut() {
+                        turn.iteration += 1;
+                        turn.phase = TurnPhase::WaitingModel;
+                    }
+                    let active_turn = state.active_turn.as_ref().expect("turn exists");
+                    Ok((
+                        prompt,
+                        context,
+                        context_projection,
+                        active_turn.user_content.clone(),
+                        active_turn.chat_id.clone(),
+                        active_turn.final_reply_to.clone(),
+                        active_turn.final_reply_role.clone(),
+                        active_turn.final_reply_guest_id.clone(),
+                        tools_for_model,
+                        state.checkpoint_memory_type(),
+                        state.checkpoint_json(),
+                        state.clone(),
+                    ))
+                }
+                None => Err(anyhow::anyhow!(
+                    "Active turn vanished before provider-failure retry context could be built"
+                )),
+            }
+        }?;
+
+        let (
+            prompt,
+            context,
+            context_projection,
+            user_content,
+            chat_id,
+            final_reply_to,
+            final_reply_role,
+            final_reply_guest_id,
+            tools_for_model,
+            checkpoint_memory_type,
+            checkpoint_json,
+            index_state,
+        ) = retry_plan;
+
+        self.ipc_client
+            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
+            .await?;
+        self.sync_session_index(&index_state).await?;
+
+        let _ = self.emit_turn_event(&session_id, "loop_recovering", None).await;
+
+        let model_req = ModelRequestPayload {
+            action: "generate_text".to_string(),
+            request_class: Some("cognitive".to_string()),
+            session_id: session_id.clone(),
+            turn_id,
+            prompt,
+            user_content,
+            context: Some(context),
+            context_projection: Some(context_projection),
+            attachments: Vec::new(),
+            tools_for_model,
+            response_contract: Some(serde_json::json!({ "channels": ["spoken_text", "memory_concept", "active_plan"] })),
+            chat_id,
+            reply_to: local_node_id(),
+            reply_role: "agent".into(),
+            final_reply_to,
+            final_reply_role,
+            final_reply_guest_id,
+        };
+
+        let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
+            self.sessions.get(&session_id),
+            "text.generate",
+            DEFAULT_TEXT_MODEL_ROLE,
+        );
+
+        self.ipc_client
+            .send_request(IpcRequest::EmitTask {
+                target_node,
+                target_role,
+                target_guest_id,
+                task_json: serde_json::to_string(&model_req)?,
+            })
+            .await?;
+
+        Ok(())
     }
 
     async fn reenter_turn_after_transcription(
@@ -5076,20 +5197,22 @@ async fn run_bash_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentRuntime, DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE, extract_model_error, format_role_command_reply,
+        AgentRuntime, DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE, extract_model_error,
+        extract_model_error_payload, format_role_command_reply,
         format_roles_report, media_analysis_attachments, normalized_user_content,
-        resolve_media_routing, resolve_model_execution_target,
+        resolve_media_routing, resolve_model_execution_target, should_attempt_provider_repair,
     };
     use crate::commands::SlashCommand;
-    use crate::r#loop::{ApprovalRequest, ToolCall};
+    use crate::r#loop::{ApprovalRequest, ToolCall, TurnPhase};
     use crate::protocol::{
         FinalReplyPayload, InboundTaskPayload, ModelRequestPayload, TransportAttachment,
     };
     use crate::session::{
         ApprovalPolicy, ComponentExecutionRoute, ComponentRouteAssembly, ComponentRouteBinding,
-        SessionState,
+        SessionState, WorkingTurn,
     };
     use philotic_client::TaskErrorPayload;
+    use uuid::Uuid;
     #[test]
     fn model_request_targets_agent_for_reply() {
         let request = ModelRequestPayload {
@@ -5304,6 +5427,87 @@ mod tests {
         assert!(error.contains("component=model-router"));
         assert!(error.contains("provider=elevenlabs"));
         assert!(error.contains("capability=voice.synthesize"));
+    }
+
+    #[test]
+    fn extract_model_error_payload_preserves_retryable_flag() {
+        let payload = InboundTaskPayload {
+            agent_action: None,
+            action: None,
+            source: None,
+            session_id: None,
+            turn_id: None,
+            transport: None,
+            chat_id: None,
+            thread_id: None,
+            sender_id: None,
+            sender_username: None,
+            message_kind: None,
+            content: None,
+            attachments: Vec::new(),
+            command: None,
+            callback_data: None,
+            raw_transport_event: None,
+            tool_name: None,
+            arguments: None,
+            final_reply_to: None,
+            final_reply_role: None,
+            final_reply_guest_id: None,
+            error: Some(TaskErrorPayload {
+                kind: "provider_failure".into(),
+                message: "Provider invocation failed: tool_call.arguments missing from Gemini response".into(),
+                code: Some("MODEL_INVALID_TOOL_CALL".into()),
+                component: Some("model-router".into()),
+                provider: Some("gemini".into()),
+                capability: Some("text.generate".into()),
+                retryable: Some(true),
+            }),
+        };
+
+        let error = extract_model_error_payload(&payload).expect("structured payload should be extracted");
+        assert_eq!(error.retryable, Some(true));
+        assert_eq!(error.code.as_deref(), Some("MODEL_INVALID_TOOL_CALL"));
+    }
+
+    #[test]
+    fn retryable_provider_failure_allows_single_repair_attempt() {
+        let error = TaskErrorPayload {
+            kind: "provider_failure".into(),
+            message: "Provider invocation failed: tool_call.arguments missing from Gemini response".into(),
+            code: Some("MODEL_INVALID_TOOL_CALL".into()),
+            component: Some("model-router".into()),
+            provider: Some("gemini".into()),
+            capability: Some("text.generate".into()),
+            retryable: Some(true),
+        };
+
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.start_turn(WorkingTurn {
+            task_id: Uuid::nil(),
+            turn_id: "turn-1".into(),
+            chat_id: "123".into(),
+            user_content: "say hello".into(),
+            final_reply_to: "local-aiua-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase: TurnPhase::WaitingModel,
+            iteration: 1,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            active_plan: None,
+            consecutive_step_failures: 0,
+            provider_repair_note: None,
+            provider_repair_attempts: 0,
+            pending_text_reply: None,
+            had_voice_input: false,
+            awaiting_transcription_reentry: false,
+        });
+
+        assert!(should_attempt_provider_repair(&error, Some(&state)));
+        state.increment_provider_repair_attempts();
+        assert!(!should_attempt_provider_repair(&error, Some(&state)));
     }
 
     #[test]

@@ -283,6 +283,11 @@ pub struct WorkingTurn {
     /// When this reaches `settings.execution.stall_detection_threshold`, the loop
     /// surfaces to the user instead of re-entering.
     pub consecutive_step_failures: u32,
+    /// One-shot corrective note injected into the next model request after a
+    /// retryable provider failure. Cleared after projection.
+    pub provider_repair_note: Option<String>,
+    /// Number of corrective provider retries attempted for this turn.
+    pub provider_repair_attempts: u32,
     /// Stashed text content while waiting for voice synthesis to complete.
     pub pending_text_reply: Option<String>,
     pub had_voice_input: bool,
@@ -860,6 +865,28 @@ impl SessionState {
     pub fn reset_step_failures(&mut self) {
         if let Some(turn) = self.active_turn.as_mut() {
             turn.consecutive_step_failures = 0;
+        }
+    }
+
+    pub fn set_provider_repair_note(&mut self, note: String) {
+        if let Some(turn) = self.active_turn.as_mut() {
+            turn.provider_repair_note = Some(note);
+        }
+    }
+
+    pub fn provider_repair_attempts(&self) -> u32 {
+        self.active_turn
+            .as_ref()
+            .map(|turn| turn.provider_repair_attempts)
+            .unwrap_or(0)
+    }
+
+    pub fn increment_provider_repair_attempts(&mut self) -> u32 {
+        if let Some(turn) = self.active_turn.as_mut() {
+            turn.provider_repair_attempts += 1;
+            turn.provider_repair_attempts
+        } else {
+            0
         }
     }
 
@@ -2191,6 +2218,13 @@ impl SessionState {
         if let Some(summary) = self.last_handoff_summary.as_deref() {
             envelope.push_str(&format!("Handoff context: {}\n", summary));
         }
+        if let Some(note) = self
+            .active_turn
+            .as_ref()
+            .and_then(|turn| turn.provider_repair_note.as_deref())
+        {
+            envelope.push_str(&format!("Provider correction: {}.\n", note));
+        }
         if !self.bindings.effective_toolset.is_empty() {
             envelope.push_str(&format!(
                 "Effective tools: {}.\n",
@@ -2451,6 +2485,8 @@ impl SessionState {
                 }).collect::<Vec<_>>(),
                 "active_plan": turn.active_plan,
                 "consecutive_step_failures": turn.consecutive_step_failures,
+                "provider_repair_note": turn.provider_repair_note,
+                "provider_repair_attempts": turn.provider_repair_attempts,
                 "pending_text_reply": turn.pending_text_reply,
                 "had_voice_input": turn.had_voice_input,
                 "awaiting_transcription_reentry": turn.awaiting_transcription_reentry,
@@ -2666,6 +2702,14 @@ impl SessionState {
                     .and_then(|v| serde_json::from_value::<ActivePlan>(v).ok()),
                 consecutive_step_failures: turn
                     .get("consecutive_step_failures")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u32,
+                provider_repair_note: turn
+                    .get("provider_repair_note")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                provider_repair_attempts: turn
+                    .get("provider_repair_attempts")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0) as u32,
                 pending_text_reply: turn
@@ -3214,6 +3258,8 @@ mod tests {
             working_tool_history: Vec::new(),
             active_plan: None,
             consecutive_step_failures: 0,
+            provider_repair_note: None,
+            provider_repair_attempts: 0,
             pending_text_reply: Some("hello back".into()),
             had_voice_input: true,
             awaiting_transcription_reentry: true,
@@ -3223,6 +3269,7 @@ mod tests {
         assert_eq!(checkpoint["session_id"], "sess-1");
         assert_eq!(checkpoint["active_turn"]["turn_id"], "turn-1");
         assert_eq!(checkpoint["active_turn"]["phase"], "queued");
+        assert_eq!(checkpoint["active_turn"]["provider_repair_attempts"], 0);
         assert_eq!(
             checkpoint["active_turn"]["pending_text_reply"],
             "hello back"
@@ -3310,6 +3357,8 @@ mod tests {
             working_tool_history: Vec::new(),
             active_plan: None,
             consecutive_step_failures: 0,
+            provider_repair_note: None,
+            provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: false,
@@ -3787,6 +3836,8 @@ mod tests {
             )],
             active_plan: None,
             consecutive_step_failures: 0,
+            provider_repair_note: None,
+            provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: false,
@@ -3864,6 +3915,8 @@ mod tests {
             working_tool_history: Vec::new(),
             active_plan: None,
             consecutive_step_failures: 0,
+            provider_repair_note: None,
+            provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: false,
@@ -3935,6 +3988,8 @@ mod tests {
             working_tool_history: Vec::new(),
             active_plan: None,
             consecutive_step_failures: 0,
+            provider_repair_note: None,
+            provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: false,
@@ -4003,6 +4058,8 @@ mod tests {
             working_tool_history: Vec::new(),
             active_plan: None,
             consecutive_step_failures: 0,
+            provider_repair_note: None,
+            provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: false,
@@ -4454,6 +4511,8 @@ mod tests {
             working_tool_history: Vec::new(),
             active_plan: None,
             consecutive_step_failures: 0,
+            provider_repair_note: None,
+            provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: false,
@@ -4495,6 +4554,8 @@ mod tests {
             working_tool_history: Vec::new(),
             active_plan: None,
             consecutive_step_failures: 0,
+            provider_repair_note: None,
+            provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: true,
@@ -4551,6 +4612,8 @@ mod tests {
             working_tool_history: Vec::new(),
             active_plan: None,
             consecutive_step_failures: 0,
+            provider_repair_note: None,
+            provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: false,
@@ -4608,6 +4671,8 @@ mod tests {
             working_tool_history: Vec::new(),
             active_plan: None,
             consecutive_step_failures: 0,
+            provider_repair_note: None,
+            provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: true,
             awaiting_transcription_reentry: true,

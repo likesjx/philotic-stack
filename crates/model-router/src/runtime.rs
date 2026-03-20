@@ -468,8 +468,7 @@ async fn emit_failure(
     provider: Option<&str>,
     message: String,
 ) -> Result<()> {
-    let error_payload =
-        TaskErrorPayload::provider_failure("model-router", capability, provider, message.clone());
+    let error_payload = classify_provider_failure(capability, provider, &message);
     error!(
         "Emitting model failure capability={:?} provider={:?}: {}",
         capability, provider, message
@@ -502,6 +501,26 @@ async fn emit_failure(
 
     ipc_client.send_request(reply_req).await?;
     Ok(())
+}
+
+fn classify_provider_failure(
+    capability: Option<&str>,
+    provider: Option<&str>,
+    message: &str,
+) -> TaskErrorPayload {
+    let mut payload =
+        TaskErrorPayload::provider_failure("model-router", capability, provider, message.to_string());
+
+    let malformed_tool_call = message.contains("tool_call.arguments missing from")
+        || message.contains("returned invalid tool_call")
+        || message.contains("returned unsupported tool_call");
+
+    if malformed_tool_call {
+        payload.code = Some("MODEL_INVALID_TOOL_CALL".into());
+        payload.retryable = Some(true);
+    }
+
+    payload
 }
 
 impl ReplyRoute {
@@ -548,6 +567,39 @@ impl ReplyRoute {
                 .unwrap_or_default()
                 .to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::classify_provider_failure;
+
+    #[test]
+    fn classify_provider_failure_marks_malformed_tool_calls_retryable() {
+        let payload = classify_provider_failure(
+            Some("text.generate"),
+            Some("gemini"),
+            "Provider invocation failed: tool_call.arguments missing from Gemini response",
+        );
+
+        assert_eq!(payload.kind, "provider_failure");
+        assert_eq!(payload.code.as_deref(), Some("MODEL_INVALID_TOOL_CALL"));
+        assert_eq!(payload.retryable, Some(true));
+        assert_eq!(payload.provider.as_deref(), Some("gemini"));
+        assert_eq!(payload.capability.as_deref(), Some("text.generate"));
+    }
+
+    #[test]
+    fn classify_provider_failure_leaves_generic_errors_non_retryable() {
+        let payload = classify_provider_failure(
+            Some("voice.synthesize"),
+            Some("elevenlabs"),
+            "Provider invocation failed: missing voice",
+        );
+
+        assert_eq!(payload.kind, "provider_failure");
+        assert_eq!(payload.code, None);
+        assert_eq!(payload.retryable, None);
     }
 }
 
