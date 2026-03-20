@@ -35,6 +35,14 @@ Use `philotic-slice-closeout` when the main job is closing a Philotic implementa
 
 Climb the ladder when the change affects IPC, networking, concurrency, supervision, routing, delivery, materialization, or environment-specific behavior.
 
+Before claiming `smoke-green` or `watched-live-green` on an installed stack, confirm the installed runtime truth gate:
+
+- the installed binary changed
+- the supervised process restarted
+- the running process is using the updated binary path
+
+Otherwise the honest result remains `test-green`, no matter how persuasive the theory sounds.
+
 ## Output Expectations
 
 Report:

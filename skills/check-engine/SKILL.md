@@ -63,6 +63,12 @@ Common failure modes:
 
 Name the gap and whether it needs a skill/protocol update.
 
+Also ask:
+
+- did a rule live too high in top-level guidance and need to move into code?
+- did a repeated process step deserve a skill or workflow update?
+- should this session end with a retrospective instead of only a check-engine pass?
+
 ### 5. Green Status
 
 If any code was written or committed this session, confirm:
@@ -92,6 +98,24 @@ If any code was written or committed this session, confirm:
 ### Green Status
 - <check result or skipped if no code changed>
 ```
+
+## Relationship To Retrospectives
+
+`check-engine` and `retrospective-workflow` are not the same thing.
+
+Use `check-engine` to close the session cleanly:
+
+- memory written
+- open threads named
+- process gaps surfaced
+- green status stated
+
+Escalate to [$retrospective-workflow](../retrospective-workflow/SKILL.md) when the session exposed:
+
+- important surprises
+- repeated workflow pain
+- a new rule-placement lesson
+- an SVE/process optimization opportunity
 
 ## Muninn Write Rule at Session Close
 

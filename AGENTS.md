@@ -78,6 +78,26 @@ If a proposed design has:
 
 say so clearly and propose the alternative.
 
+### 2.6 Rule Placement
+
+Do not let top-level repo guidance become the only home for bug-preventing rules.
+
+Use this placement heuristic:
+
+- if violating the rule creates a code bug, the rule belongs in code
+- if violating the rule creates team confusion, the rule belongs in workflow/process docs
+- if it does both, enforce it in code and summarize it in process guidance
+
+Code-facing rules should live as close as possible to the enforcing boundary:
+
+- types and schemas
+- parser/serializer logic
+- nearby tests
+- module docs
+- crate READMEs
+
+Process-facing rules should live in repo workflow docs and skills. See [docs/process/WORKFLOW.md](/Users/jaredlikes/code/philotic-stack/docs/process/WORKFLOW.md).
+
 ## 3. Slice Contract
 
 Each coherent implementation slice should produce:
@@ -191,6 +211,31 @@ Do not stop at unit tests when the change affects:
 - delivery
 - materialization
 - environment-specific behavior
+
+### 5.3.1 Installed Runtime Truth Gate
+
+When validation depends on an installed or supervised runtime, do not treat source edits or local test binaries as live truth.
+
+Before claiming `smoke-green` or `watched-live-green` on an installed stack:
+
+- verify the installed binary path actually changed
+- verify the running process is using that path
+- verify the relevant supervisor or launch agent actually restarted
+- verify the observed behavior came from the updated runtime, not a stale process or stale cellar binary
+
+If source is fixed but rollout is not proven, say so explicitly. That is `test-green`, not live-green with good intentions.
+
+### 5.3.2 Tool Projection Is Policy
+
+Tool availability is not the same as tool appropriateness.
+
+When exposing tools to a model:
+
+- treat projection as a policy surface, not a passive mirror of bindings
+- suppress high-agency tools on conversational, gratitude, acknowledgment, or otherwise low-intent turns
+- treat voice/transcription re-entry as a first-class policy boundary, not just “text with extra steps”
+
+If a bad model action happened because an inappropriate tool was still visible, fix projection policy before blaming the model alone.
 
 ### 5.4 Decision Capture
 
@@ -349,7 +394,10 @@ Interpret `SVE refresh` as:
 - re-read [docs/architecture/README.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/README.md)
 - re-read [docs/architecture/ARCHITECTURE_STATUS.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE_STATUS.md)
 - re-read [docs/architecture/DOC_TAGGING_FRONTMATTER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DOC_TAGGING_FRONTMATTER_PROPOSAL.md)
+- re-read [docs/process/WORKFLOW.md](/Users/jaredlikes/code/philotic-stack/docs/process/WORKFLOW.md)
 - apply the current repo-local SVE skill/process stack before continuing
+
+The workflow home for the SVE operating loop is [docs/process/WORKFLOW.md](/Users/jaredlikes/code/philotic-stack/docs/process/WORKFLOW.md).
 
 For older open sessions that may not yet know this shorthand, the operator should use the explicit long form once and ask the agent to restate the refreshed protocol before continuing.
 
@@ -419,6 +467,8 @@ The repository contains specialized skills in `skills/` to standardize common wo
 | `subagent-delegation` | Splitting large tasks into bounded sub-tasks |
 | `runtime-debugger` | Diagnosing live multi-process/multimodal stack failures |
 | `runtime-materialization` | Designing startup/wake/sleep and placement policy |
+| `runtime-rollout-watch` | Proving installed/runtime rollout truth before claiming live validation |
+| `retrospective-workflow` | Running seam-based retrospectives and turning lessons into code/process/SVE changes |
 | `muninn-memory-protocol` | Client adapter contract for memory integration |
 
 ## 12. Repository-Specific Notes

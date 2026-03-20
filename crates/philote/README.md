@@ -11,6 +11,20 @@
 - Reply with `TaskResult` events via `publish_event`
 - Sync memory to the hotel via `sync_apartment` (short, long, episodic, semantic)
 
+## Local Invariants
+
+Rules that prevent `philote` bugs belong here and in nearby code/tests, not only in repo-level guidance.
+
+- Tool projection is policy, not a passive mirror of all enabled bindings.
+- Conversational, gratitude, acknowledgment, and quoted transcription turns should project few or no tools by default.
+- Voice/transcription re-entry is a first-class policy boundary.
+- Reply-side memory capture should prefer a structured memory candidate over ad hoc trailer fragments.
+
+See:
+
+- `src/session.rs` for tool projection and working-turn policy
+- `src/runtime.rs` for re-entry, reply handling, and autobiographical memory writes
+
 ## Memory Apartment Pattern
 
 ```rust

@@ -38,6 +38,7 @@ Use [$runtime-debugger](../runtime-debugger/SKILL.md) when the main job is findi
    - update `ARCHITECTURE.md` if durable reference changed
    - ensure metadata/domains/links still align
 6. Summarize the highest honest verification level.
+   - If live validation depended on a supervised/installed runtime, confirm installed binary truth and process restart before calling anything `smoke-green` or `watched-live-green`.
 7. Record assumption-vs-reality gaps exposed by the slice.
 8. Commit and push one coherent slice per the commit convention in `AGENTS.md §6`.
 9. State the next seam.

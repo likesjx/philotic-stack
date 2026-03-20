@@ -62,6 +62,7 @@ These docs are proposal space, not automatic runtime truth:
 
 | Document | Description |
 | -------- | ----------- |
+| [process/WORKFLOW.md](process/WORKFLOW.md) | Process/workflow home: SVE operating loop, rule placement, rollout truth, validation/close-out discipline |
 | [worktree-workflow.md](worktree-workflow.md) | Parallel workstream and worktree workflow guide |
 | [task.md](task.md) | Current task tracking |
 
