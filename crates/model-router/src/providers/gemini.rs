@@ -5,6 +5,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde_json::{Value, json};
 use std::borrow::Cow;
+use tracing::info;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GeminiAuth {
@@ -23,6 +24,13 @@ pub struct GeminiProvider {
 }
 
 impl GeminiProvider {
+    fn debug_model_requests_enabled() -> bool {
+        matches!(
+            std::env::var("PHILOTIC_DEBUG_MODEL_REQUESTS").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+        )
+    }
+
     pub fn new(
         http_client: reqwest::Client,
         auth: Option<GeminiAuth>,
@@ -439,6 +447,31 @@ impl ModelProvider for GeminiProvider {
             TaskKind::VoiceSynthesize => bail!("Gemini does not support voice synthesis"),
             TaskKind::Embed => bail!("Gemini does not support local embedding (use OnnxProvider)"),
         };
+
+        if Self::debug_model_requests_enabled() && task.kind == TaskKind::TextGenerate {
+            let prompt = task
+                .composed_prompt_text()
+                .unwrap_or_else(|| "<missing prompt>".into());
+            info!(
+                "PHILOTIC_DEBUG_MODEL_REQUESTS gemini composed prompt provider={} model={:?}:\n{}",
+                self.id(),
+                task.model,
+                prompt
+            );
+            match serde_json::to_string_pretty(&payload) {
+                Ok(json) => info!(
+                    "PHILOTIC_DEBUG_MODEL_REQUESTS gemini provider payload provider={} model={:?}:\n{}",
+                    self.id(),
+                    task.model,
+                    json
+                ),
+                Err(err) => info!(
+                    "PHILOTIC_DEBUG_MODEL_REQUESTS gemini payload serialization failed: {}",
+                    err
+                ),
+            }
+        }
+
         let response = self
             .apply_auth_headers(
                 self.http_client

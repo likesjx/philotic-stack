@@ -27,6 +27,13 @@ fn local_node_id() -> String {
     std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string())
 }
 
+fn debug_model_requests_enabled() -> bool {
+    matches!(
+        std::env::var("PHILOTIC_DEBUG_MODEL_REQUESTS").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+    )
+}
+
 #[cfg(test)]
 const LOCAL_NODE: &str = "local-aiua-01";
 
@@ -1001,6 +1008,19 @@ impl AgentRuntime {
             final_reply_guest_id,
         };
 
+        if debug_model_requests_enabled() && capability == "text.generate" {
+            match serde_json::to_string_pretty(&model_req) {
+                Ok(json) => info!(
+                    "PHILOTIC_DEBUG_MODEL_REQUESTS philote outbound model request session={} turn={}:\n{}",
+                    session_id, model_req.turn_id, json
+                ),
+                Err(err) => warn!(
+                    "PHILOTIC_DEBUG_MODEL_REQUESTS could not serialize outbound model request: {}",
+                    err
+                ),
+            }
+        }
+
         info!("Asking the Hotel to route inference to the model controller...");
         self.ipc_client
             .send_request(IpcRequest::EmitTask {
@@ -1839,6 +1859,19 @@ impl AgentRuntime {
             final_reply_role,
             final_reply_guest_id,
         };
+
+        if debug_model_requests_enabled() {
+            match serde_json::to_string_pretty(&model_req) {
+                Ok(json) => info!(
+                    "PHILOTIC_DEBUG_MODEL_REQUESTS philote retry model request session={} turn={}:\n{}",
+                    session_id, model_req.turn_id, json
+                ),
+                Err(err) => warn!(
+                    "PHILOTIC_DEBUG_MODEL_REQUESTS could not serialize retry model request: {}",
+                    err
+                ),
+            }
+        }
 
         let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
             self.sessions.get(&session_id),
