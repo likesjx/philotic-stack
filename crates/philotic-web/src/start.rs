@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -108,7 +108,10 @@ pub async fn run(config: Option<PathBuf>, hotel: String, detach: bool) -> Result
 
     loop {
         if tokio::time::Instant::now() > deadline {
-            println!("\nTimed out waiting for socket. Check log: {}", log_path.display());
+            println!(
+                "\nTimed out waiting for socket. Check log: {}",
+                log_path.display()
+            );
             bail!("aiua did not start in time");
         }
         if UnixStream::connect(&socket_path).await.is_ok() {
@@ -116,7 +119,10 @@ pub async fn run(config: Option<PathBuf>, hotel: String, detach: bool) -> Result
         }
         // Check if the process died already
         if !process_alive(pid) {
-            println!("\naiua exited unexpectedly. Check log: {}", log_path.display());
+            println!(
+                "\naiua exited unexpectedly. Check log: {}",
+                log_path.display()
+            );
             let _ = std::fs::remove_file(pid_path());
             bail!("aiua exited during startup");
         }

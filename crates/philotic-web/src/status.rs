@@ -73,15 +73,23 @@ async fn probe_ipc(socket_path: &str) -> Result<String> {
     };
     let mut client = PhiloticClient::connect_at(socket_path, identity).await?;
     let resp = client
-        .send_request(IpcRequest::QueryStatus { task_id: Uuid::new_v4() })
+        .send_request(IpcRequest::QueryStatus {
+            task_id: Uuid::new_v4(),
+        })
         .await?;
     match resp {
-        IpcResponse::Standard { ok: true, message, .. } => {
-            Ok(if message.is_empty() { "ok".into() } else { message })
-        }
-        IpcResponse::Standard { message, .. } => {
-            Ok(if message.is_empty() { "responded".into() } else { message })
-        }
+        IpcResponse::Standard {
+            ok: true, message, ..
+        } => Ok(if message.is_empty() {
+            "ok".into()
+        } else {
+            message
+        }),
+        IpcResponse::Standard { message, .. } => Ok(if message.is_empty() {
+            "responded".into()
+        } else {
+            message
+        }),
         _ => Ok("responded".into()),
     }
 }
@@ -135,14 +143,8 @@ fn print_agents_from_config(config_path: &PathBuf) {
             continue;
         }
         for (key, agent) in &hotel.agents {
-            let name = agent
-                .persona_name
-                .as_deref()
-                .unwrap_or(key.as_str());
-            let id = agent
-                .agent_id
-                .as_deref()
-                .unwrap_or("(no id)");
+            let name = agent.persona_name.as_deref().unwrap_or(key.as_str());
+            let id = agent.agent_id.as_deref().unwrap_or("(no id)");
             let tags = if agent.toolset_tags.is_empty() {
                 String::new()
             } else {

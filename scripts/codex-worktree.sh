@@ -29,7 +29,7 @@ require_repo_root() {
 }
 
 repo_root() {
-    git rev-parse --show-toplevel
+    dirname "$(git rev-parse --path-format=absolute --git-common-dir)"
 }
 
 repo_name() {

@@ -22,16 +22,16 @@ pub trait MemoryEngine: Send + Sync {
     /// Returns a lightweight reference to the stored engram.
     async fn remember(
         &self,
-        scope:   MemoryScope,
+        scope: MemoryScope,
         concept: &str,
         content: &str,
-        tags:    Vec<String>,
+        tags: Vec<String>,
     ) -> anyhow::Result<EngramRef>;
 
     /// Store multiple engrams in a single round-trip.
     async fn remember_batch(
         &self,
-        scope:   MemoryScope,
+        scope: MemoryScope,
         entries: Vec<(String, String, Vec<String>)>, // (concept, content, tags)
     ) -> anyhow::Result<Vec<EngramRef>>;
 
@@ -39,9 +39,9 @@ pub trait MemoryEngine: Send + Sync {
     /// The engram's core identity (id, vault) is immutable.
     async fn evolve(
         &self,
-        id:      &EngramId,
+        id: &EngramId,
         content: &str,
-        tags:    Option<Vec<String>>,
+        tags: Option<Vec<String>>,
     ) -> anyhow::Result<EngramRef>;
 
     /// Mark an engram for removal or accelerated decay.
@@ -56,8 +56,8 @@ pub trait MemoryEngine: Send + Sync {
     /// graph traversal, and ACT-R decay scoring.
     async fn activate(
         &self,
-        context:     &str,
-        scope:       MemoryScope,
+        context: &str,
+        scope: MemoryScope,
         max_results: Option<usize>,
     ) -> anyhow::Result<ActivationResult>;
 
@@ -73,8 +73,8 @@ pub trait MemoryEngine: Send + Sync {
     async fn link(
         &self,
         from_id: &EngramId,
-        to_id:   &EngramId,
-        kind:    LinkKind,
+        to_id: &EngramId,
+        kind: LinkKind,
     ) -> anyhow::Result<()>;
 
     /// Walk the association graph from a starting engram.
@@ -82,7 +82,7 @@ pub trait MemoryEngine: Send + Sync {
     /// primes related memories.
     async fn traverse(
         &self,
-        from_id:   &EngramId,
+        from_id: &EngramId,
         max_depth: Option<usize>,
     ) -> anyhow::Result<Vec<Engram>>;
 
@@ -105,6 +105,6 @@ pub trait MemoryEngine: Send + Sync {
     async fn subscribe(
         &self,
         context: &str,
-        scope:   MemoryScope,
+        scope: MemoryScope,
     ) -> anyhow::Result<mpsc::Receiver<Engram>>;
 }

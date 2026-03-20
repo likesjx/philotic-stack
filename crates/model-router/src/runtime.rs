@@ -164,14 +164,12 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                 );
 
                 match provider.invoke(&controller_task).await {
-                    Ok(ProviderOutput::ToolCall { tool_name, arguments }) => {
-                        emit_tool_call_response(
-                            &mut ipc_client,
-                            &reply,
-                            tool_name,
-                            arguments,
-                        )
-                        .await?;
+                    Ok(ProviderOutput::ToolCall {
+                        tool_name,
+                        arguments,
+                    }) => {
+                        emit_tool_call_response(&mut ipc_client, &reply, tool_name, arguments)
+                            .await?;
                     }
                     Ok(output) => {
                         let response = ControllerResponseEnvelope::from_output(
@@ -244,7 +242,10 @@ fn short_circuit_response(task: &Value, stub_response: Option<&str>) -> Option<S
                     if iteration > 0 {
                         let iter_key = format!("{}:{}", turn_id, iteration);
                         if k == iter_key {
-                            info!("Model controller turn/iteration-aware stub mode returning response for [{}].", iter_key);
+                            info!(
+                                "Model controller turn/iteration-aware stub mode returning response for [{}].",
+                                iter_key
+                            );
                             return Some(v.to_string());
                         }
                     }
@@ -256,7 +257,10 @@ fn short_circuit_response(task: &Value, stub_response: Option<&str>) -> Option<S
                 }
             }
             if let Some(v) = turn_match {
-                info!("Model controller turn-aware stub mode returning response for [{}].", turn_id);
+                info!(
+                    "Model controller turn-aware stub mode returning response for [{}].",
+                    turn_id
+                );
                 return Some(v);
             }
         }

@@ -2,10 +2,10 @@ use serde::{Deserialize, Serialize};
 
 // ──── Type Aliases ────────────────────────────────────────────────────────────
 
-pub type EngramId  = String;
-pub type VaultId   = String;
-pub type AgentId   = String;
-pub type UserId    = String;
+pub type EngramId = String;
+pub type VaultId = String;
+pub type AgentId = String;
+pub type UserId = String;
 pub type SessionId = String;
 
 // ──── Memory Scope ────────────────────────────────────────────────────────────
@@ -52,22 +52,22 @@ pub struct AttentionalLens {
 /// Memory value emerges from relational topology, not from isolated note quality.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Engram {
-    pub id:         EngramId,
-    pub vault_id:   VaultId,
-    pub concept:    String,
-    pub content:    String,
-    pub tags:       Vec<String>,
+    pub id: EngramId,
+    pub vault_id: VaultId,
+    pub concept: String,
+    pub content: String,
+    pub tags: Vec<String>,
     pub confidence: f32,
     pub created_at: u64,
     pub updated_at: u64,
     #[serde(default)]
-    pub metadata:   serde_json::Value,
+    pub metadata: serde_json::Value,
 }
 
 /// Lightweight reference returned after a successful `remember()` call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngramRef {
-    pub id:       EngramId,
+    pub id: EngramId,
     pub vault_id: VaultId,
 }
 
@@ -77,7 +77,7 @@ pub struct EngramRef {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActivationResult {
     pub engrams: Vec<Engram>,
-    pub total:   usize,
+    pub total: usize,
 }
 
 // ──── Link ────────────────────────────────────────────────────────────────────
@@ -109,27 +109,22 @@ pub enum CognitiveOutcome {
     /// Store the resolution — not the deliberation path.
     ResolvedContradiction {
         description: String,
-        resolution:  String,
+        resolution: String,
         /// IDs of engrams involved, if already stored.
         #[serde(default)]
-        engram_ids:  Vec<EngramId>,
+        engram_ids: Vec<EngramId>,
     },
     /// A belief that solidified during reasoning (e.g. about user preferences).
     /// L1-eligible at turn-end even if not explicitly stated in the response.
     SolidifiedBelief {
-        concept:    String,
-        content:    String,
+        concept: String,
+        content: String,
         confidence: f32,
     },
     /// A self-observation about cognitive patterns.
     /// Stored as a `cognitive:meta` engram.
-    MetacognitiveObservation {
-        observation: String,
-    },
+    MetacognitiveObservation { observation: String },
     /// An approach tried and rejected, with the reason.
     /// Durable value for future turns on similar problems.
-    RejectedApproach {
-        description: String,
-        reason:      String,
-    },
+    RejectedApproach { description: String, reason: String },
 }

@@ -6,7 +6,6 @@
 ///
 /// Run with:
 ///   MUNINN_INTEGRATION=1 cargo test -p memory-core --test rest_client_tests
-
 use memory_core::{
     AttentionalLens, LinkKind, MemoryEngine, MemoryScope, MuninnConfig, MuninnRestEngine,
     VaultResolver,
@@ -37,14 +36,16 @@ fn test_engine() -> MuninnRestEngine {
         config,
         VaultResolver {
             agent_id: "test-agent-1".to_string(),
-            user_id:  "test-user-1".to_string(),
+            user_id: "test-user-1".to_string(),
         },
     )
 }
 
 #[tokio::test]
 async fn remember_and_read_roundtrip() {
-    if !should_run() { return; }
+    if !should_run() {
+        return;
+    }
     let engine = test_engine();
 
     let eref = engine
@@ -60,7 +61,11 @@ async fn remember_and_read_roundtrip() {
     assert!(!eref.id.is_empty());
     assert_eq!(eref.vault_id, "self_test-agent-1");
 
-    let engram = engine.read(&eref.id).await.expect("read").expect("engram present");
+    let engram = engine
+        .read(&eref.id)
+        .await
+        .expect("read")
+        .expect("engram present");
     assert_eq!(engram.concept, "rest-client-test");
     assert!(engram.content.contains("integration test"));
 
@@ -70,12 +75,22 @@ async fn remember_and_read_roundtrip() {
 
 #[tokio::test]
 async fn remember_batch_returns_refs() {
-    if !should_run() { return; }
+    if !should_run() {
+        return;
+    }
     let engine = test_engine();
 
     let entries = vec![
-        ("batch-a".to_string(), "content a".to_string(), vec!["batch".to_string()]),
-        ("batch-b".to_string(), "content b".to_string(), vec!["batch".to_string()]),
+        (
+            "batch-a".to_string(),
+            "content a".to_string(),
+            vec!["batch".to_string()],
+        ),
+        (
+            "batch-b".to_string(),
+            "content b".to_string(),
+            vec!["batch".to_string()],
+        ),
     ];
     let refs = engine
         .remember_batch(MemoryScope::SharedUser, entries)
@@ -92,7 +107,9 @@ async fn remember_batch_returns_refs() {
 
 #[tokio::test]
 async fn activate_returns_results() {
-    if !should_run() { return; }
+    if !should_run() {
+        return;
+    }
     let engine = test_engine();
 
     // Write something we can retrieve
@@ -110,7 +127,11 @@ async fn activate_returns_results() {
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 
     let result = engine
-        .activate("activate-test-memory integration", MemoryScope::SelfOnly, Some(5))
+        .activate(
+            "activate-test-memory integration",
+            MemoryScope::SelfOnly,
+            Some(5),
+        )
         .await
         .expect("activate");
 
@@ -122,13 +143,34 @@ async fn activate_returns_results() {
 
 #[tokio::test]
 async fn link_and_traverse() {
-    if !should_run() { return; }
+    if !should_run() {
+        return;
+    }
     let engine = test_engine();
 
-    let a = engine.remember(MemoryScope::SelfOnly, "link-source", "source engram", vec![]).await.expect("a");
-    let b = engine.remember(MemoryScope::SelfOnly, "link-target", "target engram", vec![]).await.expect("b");
+    let a = engine
+        .remember(
+            MemoryScope::SelfOnly,
+            "link-source",
+            "source engram",
+            vec![],
+        )
+        .await
+        .expect("a");
+    let b = engine
+        .remember(
+            MemoryScope::SelfOnly,
+            "link-target",
+            "target engram",
+            vec![],
+        )
+        .await
+        .expect("b");
 
-    engine.link(&a.id, &b.id, LinkKind::Related).await.expect("link");
+    engine
+        .link(&a.id, &b.id, LinkKind::Related)
+        .await
+        .expect("link");
 
     let neighbors = engine.traverse(&a.id, Some(1)).await.expect("traverse");
     let found = neighbors.iter().any(|e| e.id == b.id);
@@ -140,7 +182,9 @@ async fn link_and_traverse() {
 
 #[tokio::test]
 async fn lens_auto_tags_applied_on_write() {
-    if !should_run() { return; }
+    if !should_run() {
+        return;
+    }
     let engine = test_engine();
 
     let lens = AttentionalLens {
@@ -168,15 +212,29 @@ async fn lens_auto_tags_applied_on_write() {
 
 #[tokio::test]
 async fn cross_scope_activate_merges_results() {
-    if !should_run() { return; }
+    if !should_run() {
+        return;
+    }
     let engine = test_engine();
 
     let self_ref = engine
-        .remember(MemoryScope::SelfOnly, "cross-scope-self", "self vault content", vec!["cross-scope".to_string()])
-        .await.expect("self write");
+        .remember(
+            MemoryScope::SelfOnly,
+            "cross-scope-self",
+            "self vault content",
+            vec!["cross-scope".to_string()],
+        )
+        .await
+        .expect("self write");
     let user_ref = engine
-        .remember(MemoryScope::SharedUser, "cross-scope-user", "user vault content", vec!["cross-scope".to_string()])
-        .await.expect("user write");
+        .remember(
+            MemoryScope::SharedUser,
+            "cross-scope-user",
+            "user vault content",
+            vec!["cross-scope".to_string()],
+        )
+        .await
+        .expect("user write");
 
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 

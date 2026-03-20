@@ -120,20 +120,38 @@ mod tests {
     #[test]
     fn edge_denied_when_endpoint_hidden() {
         let tags = vec!["public".into()];
-        assert!(!resolve_edge_visibility(&tags, "public", false, true, &alice()));
-        assert!(!resolve_edge_visibility(&tags, "public", true, false, &alice()));
+        assert!(!resolve_edge_visibility(
+            &tags,
+            "public",
+            false,
+            true,
+            &alice()
+        ));
+        assert!(!resolve_edge_visibility(
+            &tags,
+            "public",
+            true,
+            false,
+            &alice()
+        ));
     }
 
     #[test]
     fn edge_permitted_when_both_endpoints_visible() {
         let tags = vec!["public".into()];
-        assert!(resolve_edge_visibility(&tags, "public", true, true, &alice()));
+        assert!(resolve_edge_visibility(
+            &tags,
+            "public",
+            true,
+            true,
+            &alice()
+        ));
     }
 
     #[test]
     fn multiple_tags_any_match_permits() {
         let tags = vec!["role:admin".into(), "identity:alice".into()];
         assert!(visibility_permits(&tags, &alice())); // matches identity:alice
-        assert!(!visibility_permits(&tags, &bob()));  // matches neither
+        assert!(!visibility_permits(&tags, &bob())); // matches neither
     }
 }

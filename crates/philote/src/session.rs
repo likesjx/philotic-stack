@@ -835,8 +835,14 @@ impl SessionState {
     }
 
     /// Known approval class names that can be pre-approved by class rather than by tool name.
-    const APPROVAL_CLASSES: &'static [&'static str] =
-        &["session", "workspace", "utility", "capability", "config", "handoff"];
+    const APPROVAL_CLASSES: &'static [&'static str] = &[
+        "session",
+        "workspace",
+        "utility",
+        "capability",
+        "config",
+        "handoff",
+    ];
 
     /// Preapprove a tool name or class name for this session.
     ///
@@ -844,13 +850,25 @@ impl SessionState {
     /// added to `preapproved_classes`; otherwise it is added to `preapproved_tools`.
     pub fn preapprove_by_name(&mut self, name: &str) -> String {
         if Self::APPROVAL_CLASSES.contains(&name) {
-            if !self.approval_policy.preapproved_classes.contains(&name.to_string()) {
-                self.approval_policy.preapproved_classes.push(name.to_string());
+            if !self
+                .approval_policy
+                .preapproved_classes
+                .contains(&name.to_string())
+            {
+                self.approval_policy
+                    .preapproved_classes
+                    .push(name.to_string());
             }
             format!("Preapproved: `{name}` (class)")
         } else {
-            if !self.approval_policy.preapproved_tools.contains(&name.to_string()) {
-                self.approval_policy.preapproved_tools.push(name.to_string());
+            if !self
+                .approval_policy
+                .preapproved_tools
+                .contains(&name.to_string())
+            {
+                self.approval_policy
+                    .preapproved_tools
+                    .push(name.to_string());
             }
             format!("Preapproved: `{name}` (tool)")
         }
@@ -1197,9 +1215,7 @@ impl SessionState {
         };
         format!(
             "Approval policy:\n- auto_approve_all: {}\n- preapproved_tools: {}\n- preapproved_classes: {}\n\nCommands: /preapprove <tool|class>  /preapprove this-session  /approval reset",
-            self.approval_policy.auto_approve_all,
-            tools,
-            classes,
+            self.approval_policy.auto_approve_all, tools, classes,
         )
     }
 
@@ -1617,7 +1633,10 @@ impl SessionState {
                 .map(str::trim)
                 .filter(|text| !text.is_empty())
             {
-                lines.push(format!("\n[Governance — {}]\n{}", role_activation.role_name, manifest));
+                lines.push(format!(
+                    "\n[Governance — {}]\n{}",
+                    role_activation.role_name, manifest
+                ));
             } else {
                 lines.push(format!(
                     "Active role posture: {}.",
@@ -3096,7 +3115,10 @@ mod tests {
     fn bash_exec_is_in_shell_class_and_requires_approval() {
         use crate::catalog::{tool_catalog, tool_class, tool_requires_approval};
         let catalog = tool_catalog();
-        assert!(catalog.contains_key("bash.exec"), "bash.exec must be in catalog");
+        assert!(
+            catalog.contains_key("bash.exec"),
+            "bash.exec must be in catalog"
+        );
         assert_eq!(tool_class("bash.exec"), Some("shell"));
         assert!(tool_requires_approval("bash.exec"));
     }
@@ -3263,9 +3285,8 @@ mod tests {
         assert!(prompt.contains("Effective tools: echo."));
         assert!(prompt.contains("Workspace: workspace://main."));
         assert!(
-            prompt.contains(
-                "Delivery target: local-aiua-01 / membrane guest=membrane-telegram-01."
-            )
+            prompt
+                .contains("Delivery target: local-aiua-01 / membrane guest=membrane-telegram-01.")
         );
     }
 
@@ -3697,11 +3718,7 @@ mod tests {
         assert!(text.contains("Tools: echo."));
         assert!(text.contains("Workspace: workspace://main."));
         assert!(text.contains("Routes: text.generate [legacy] impl=gemini-flash."));
-        assert!(
-            text.contains(
-                "Delivery: local-aiua-01 / membrane guest=membrane-telegram-01."
-            )
-        );
+        assert!(text.contains("Delivery: local-aiua-01 / membrane guest=membrane-telegram-01."));
     }
 
     #[test]
@@ -4182,8 +4199,11 @@ mod tests {
     /// Applying a handoff bundle sets role_activation and stashes the summary.
     #[test]
     fn handoff_bundle_applies_role_activation_and_summary() {
-        let mut state =
-            SessionState::new("sess-handoff".into(), "agent-jane-01".into(), "telegram".into());
+        let mut state = SessionState::new(
+            "sess-handoff".into(),
+            "agent-jane-01".into(),
+            "telegram".into(),
+        );
 
         state.role_activation = Some(make_role_activation("researcher"));
         state.last_handoff_summary = Some("Analysing dataset drift in experiment B.".into());
@@ -4201,8 +4221,11 @@ mod tests {
     /// The handoff summary is visible in the session envelope on the first turn.
     #[test]
     fn handoff_summary_appears_in_session_envelope() {
-        let mut state =
-            SessionState::new("sess-handoff".into(), "agent-jane-01".into(), "telegram".into());
+        let mut state = SessionState::new(
+            "sess-handoff".into(),
+            "agent-jane-01".into(),
+            "telegram".into(),
+        );
 
         state.role_activation = Some(make_role_activation("researcher"));
         state.last_handoff_summary = Some("Analysing dataset drift in experiment B.".into());
@@ -4233,8 +4256,11 @@ mod tests {
     /// After clear_handoff_summary, the next context build omits the summary.
     #[test]
     fn handoff_summary_consumed_after_clear() {
-        let mut state =
-            SessionState::new("sess-handoff".into(), "agent-jane-01".into(), "telegram".into());
+        let mut state = SessionState::new(
+            "sess-handoff".into(),
+            "agent-jane-01".into(),
+            "telegram".into(),
+        );
 
         state.role_activation = Some(make_role_activation("researcher"));
         state.last_handoff_summary = Some("Analysing dataset drift in experiment B.".into());
@@ -4278,8 +4304,11 @@ mod tests {
     /// handoff_return clears role_activation, leaving no active role.
     #[test]
     fn handoff_return_clears_role_activation() {
-        let mut state =
-            SessionState::new("sess-handoff".into(), "agent-jane-01".into(), "telegram".into());
+        let mut state = SessionState::new(
+            "sess-handoff".into(),
+            "agent-jane-01".into(),
+            "telegram".into(),
+        );
 
         state.role_activation = Some(make_role_activation("researcher"));
         state.last_handoff_summary = Some("Some prior context.".into());
@@ -4291,7 +4320,10 @@ mod tests {
         state.role_activation = None;
 
         assert_eq!(previous_role.as_deref(), Some("researcher"));
-        assert!(state.role_activation.is_none(), "role must be cleared after return");
+        assert!(
+            state.role_activation.is_none(),
+            "role must be cleared after return"
+        );
 
         let projection = state.build_context_projection("hello");
         let context = state.model_context_from_projection(&projection);
@@ -4312,8 +4344,11 @@ mod tests {
     /// Full cycle: bundle → summary in context → clear → return → clean context.
     #[test]
     fn full_role_handoff_cycle() {
-        let mut state =
-            SessionState::new("sess-cycle".into(), "agent-jane-01".into(), "telegram".into());
+        let mut state = SessionState::new(
+            "sess-cycle".into(),
+            "agent-jane-01".into(),
+            "telegram".into(),
+        );
 
         // 1. handoff_bundle arrives — role applied, summary stashed.
         state.role_activation = Some(make_role_activation("analyst"));

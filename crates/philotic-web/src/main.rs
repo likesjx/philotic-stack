@@ -111,14 +111,21 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Init { config, force } => init::run(config, force).await,
-        Command::Start { config, hotel, detach } => start::run(config, hotel, detach).await,
+        Command::Start {
+            config,
+            hotel,
+            detach,
+        } => start::run(config, hotel, detach).await,
         Command::Stop => stop::run().await,
         Command::Status { config } => status::run(config).await,
         Command::Agents { config } => status::run_agents(config).await,
         Command::Reset { keep_identity } => reset::run(keep_identity).await,
         Command::Footprint { kill } => footprint::run(kill).await,
-        Command::Serve { port, db, config, allow_origins } => {
-            serve::run(port, db, config, allow_origins).await
-        }
+        Command::Serve {
+            port,
+            db,
+            config,
+            allow_origins,
+        } => serve::run(port, db, config, allow_origins).await,
     }
 }

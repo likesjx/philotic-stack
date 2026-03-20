@@ -885,9 +885,7 @@ fn graph_storage_toolset_profile_round_trip() {
     assert_eq!(loaded, profile);
 
     let listed = store.list_toolset_profiles().unwrap();
-    assert!(listed
-        .iter()
-        .any(|p| p.profile_name == "orchestrator"));
+    assert!(listed.iter().any(|p| p.profile_name == "orchestrator"));
 }
 
 #[test]
@@ -1292,12 +1290,20 @@ fn muninn_endpoint_round_trip() {
     assert!(store.get_muninn_endpoint().unwrap().is_none());
 
     store.set_muninn_endpoint("http://127.0.0.1:8475").unwrap();
-    let loaded = store.get_muninn_endpoint().unwrap().expect("endpoint present");
+    let loaded = store
+        .get_muninn_endpoint()
+        .unwrap()
+        .expect("endpoint present");
     assert_eq!(loaded, "http://127.0.0.1:8475");
 
     // Overwrite.
-    store.set_muninn_endpoint("http://muninn.example.com:8475").unwrap();
-    let updated = store.get_muninn_endpoint().unwrap().expect("endpoint present");
+    store
+        .set_muninn_endpoint("http://muninn.example.com:8475")
+        .unwrap();
+    let updated = store
+        .get_muninn_endpoint()
+        .unwrap()
+        .expect("endpoint present");
     assert_eq!(updated, "http://muninn.example.com:8475");
 }
 
@@ -1309,14 +1315,18 @@ fn vault_registry_upsert_and_list() {
     assert!(store.get_vault_registry().unwrap().is_empty());
 
     // Insert two entries.
-    store.upsert_vault_registry_entry(&VaultRegistryEntry {
-        vault_name: "self_philote-1".into(),
-        secret_ref: "secret://hotel/default/muninn/self-philote-1".into(),
-    }).unwrap();
-    store.upsert_vault_registry_entry(&VaultRegistryEntry {
-        vault_name: "user_jared".into(),
-        secret_ref: "secret://hotel/default/muninn/user-jared".into(),
-    }).unwrap();
+    store
+        .upsert_vault_registry_entry(&VaultRegistryEntry {
+            vault_name: "self_philote-1".into(),
+            secret_ref: "secret://hotel/default/muninn/self-philote-1".into(),
+        })
+        .unwrap();
+    store
+        .upsert_vault_registry_entry(&VaultRegistryEntry {
+            vault_name: "user_jared".into(),
+            secret_ref: "secret://hotel/default/muninn/user-jared".into(),
+        })
+        .unwrap();
 
     let entries = store.get_vault_registry().unwrap();
     assert_eq!(entries.len(), 2);
@@ -1328,34 +1338,45 @@ fn vault_registry_upsert_and_list() {
 fn vault_registry_upsert_updates_existing() {
     let store = open_graph_storage();
 
-    store.upsert_vault_registry_entry(&VaultRegistryEntry {
-        vault_name: "self_philote-1".into(),
-        secret_ref: "secret://hotel/default/muninn/self-philote-1-v1".into(),
-    }).unwrap();
+    store
+        .upsert_vault_registry_entry(&VaultRegistryEntry {
+            vault_name: "self_philote-1".into(),
+            secret_ref: "secret://hotel/default/muninn/self-philote-1-v1".into(),
+        })
+        .unwrap();
 
     // Upsert with same vault_name but new secret_ref.
-    store.upsert_vault_registry_entry(&VaultRegistryEntry {
-        vault_name: "self_philote-1".into(),
-        secret_ref: "secret://hotel/default/muninn/self-philote-1-v2".into(),
-    }).unwrap();
+    store
+        .upsert_vault_registry_entry(&VaultRegistryEntry {
+            vault_name: "self_philote-1".into(),
+            secret_ref: "secret://hotel/default/muninn/self-philote-1-v2".into(),
+        })
+        .unwrap();
 
     let entries = store.get_vault_registry().unwrap();
     assert_eq!(entries.len(), 1, "should not duplicate");
-    assert_eq!(entries[0].secret_ref, "secret://hotel/default/muninn/self-philote-1-v2");
+    assert_eq!(
+        entries[0].secret_ref,
+        "secret://hotel/default/muninn/self-philote-1-v2"
+    );
 }
 
 #[test]
 fn vault_registry_remove_entry() {
     let store = open_graph_storage();
 
-    store.upsert_vault_registry_entry(&VaultRegistryEntry {
-        vault_name: "self_philote-1".into(),
-        secret_ref: "secret://hotel/default/muninn/self-philote-1".into(),
-    }).unwrap();
-    store.upsert_vault_registry_entry(&VaultRegistryEntry {
-        vault_name: "user_jared".into(),
-        secret_ref: "secret://hotel/default/muninn/user-jared".into(),
-    }).unwrap();
+    store
+        .upsert_vault_registry_entry(&VaultRegistryEntry {
+            vault_name: "self_philote-1".into(),
+            secret_ref: "secret://hotel/default/muninn/self-philote-1".into(),
+        })
+        .unwrap();
+    store
+        .upsert_vault_registry_entry(&VaultRegistryEntry {
+            vault_name: "user_jared".into(),
+            secret_ref: "secret://hotel/default/muninn/user-jared".into(),
+        })
+        .unwrap();
 
     store.remove_vault_registry_entry("self_philote-1").unwrap();
 

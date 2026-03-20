@@ -6,13 +6,7 @@
 ///
 /// Port: 11435 (leaves Ollama's 11434 free for optional proxy fallback).
 use anyhow::Result;
-use axum::{
-    Json, Router,
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    routing::post,
-};
+use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::post};
 use onnx_runner::{EmbeddingsBackend, ModelCache};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;

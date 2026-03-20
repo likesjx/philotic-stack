@@ -255,6 +255,7 @@ pub trait GraphStorage: Send + Sync {
     // ── Agent identity bundles ───────────────────────────────────────
 
     fn upsert_agent_identity(&self, identity: &AgentIdentityRecord) -> Result<()>;
+    fn list_agent_identities(&self) -> Result<Vec<AgentIdentityRecord>>;
     fn get_agent_identity(&self, agent_id: &str) -> Result<Option<AgentIdentityRecord>>;
 
     // ── Memory apartments ────────────────────────────────────────────
@@ -329,10 +330,7 @@ pub trait GraphStorage: Send + Sync {
     fn upsert_toolset_profile(&self, profile: &ToolsetProfileRecord) -> Result<()>;
 
     /// Load a single toolset profile by name, or `None` if not found.
-    fn get_toolset_profile(
-        &self,
-        profile_name: &str,
-    ) -> Result<Option<ToolsetProfileRecord>>;
+    fn get_toolset_profile(&self, profile_name: &str) -> Result<Option<ToolsetProfileRecord>>;
 
     /// List all toolset profiles in the context graph.
     fn list_toolset_profiles(&self) -> Result<Vec<ToolsetProfileRecord>>;
@@ -368,9 +366,12 @@ pub trait GraphStorage: Send + Sync {
     /// Upsert a single vault registry entry (matched by `vault_name`).
     fn upsert_vault_registry_entry(&self, entry: &VaultRegistryEntry) -> Result<()> {
         let mut entries = self.get_vault_registry()?;
-        match entries.iter().position(|e| e.vault_name == entry.vault_name) {
+        match entries
+            .iter()
+            .position(|e| e.vault_name == entry.vault_name)
+        {
             Some(pos) => entries[pos] = entry.clone(),
-            None      => entries.push(entry.clone()),
+            None => entries.push(entry.clone()),
         }
         self.set_config_value(CONFIG_VAULT_REGISTRY, &serde_json::to_string(&entries)?)
     }
@@ -402,11 +403,17 @@ pub trait GraphStorage: Send + Sync {
             Some(pos) => entries[pos] = record.clone(),
             None => entries.push(record.clone()),
         }
-        self.set_config_value(CONFIG_GRAPH_RUNNER_REGISTRY, &serde_json::to_string(&entries)?)
+        self.set_config_value(
+            CONFIG_GRAPH_RUNNER_REGISTRY,
+            &serde_json::to_string(&entries)?,
+        )
     }
 
     /// Look up the instance_id for a given graph_id, or None if not registered.
-    fn get_graph_runner_instance(&self, graph_id: &str) -> Result<Option<GraphRunnerInstanceRecord>> {
+    fn get_graph_runner_instance(
+        &self,
+        graph_id: &str,
+    ) -> Result<Option<GraphRunnerInstanceRecord>> {
         Ok(self
             .get_graph_runner_registry()?
             .into_iter()

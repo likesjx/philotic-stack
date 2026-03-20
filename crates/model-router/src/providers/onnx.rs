@@ -37,10 +37,7 @@ impl OnnxProvider {
     pub fn load(config: OnnxProviderConfig) -> Result<Self> {
         let cache = ModelCache::new().context("failed to initialise HF Hub model cache")?;
         let handle = cache
-            .pull(
-                &config.embeddings.repo_id,
-                config.prefer_quantized,
-            )
+            .pull(&config.embeddings.repo_id, config.prefer_quantized)
             .with_context(|| {
                 format!(
                     "failed to pull embedding model {}",
@@ -73,8 +70,7 @@ impl OnnxProvider {
     pub async fn swap_embeddings(&self, repo_id: &str) -> Result<String> {
         let cache = ModelCache::new()?;
         let handle = cache.pull(repo_id, self.config.prefer_quantized)?;
-        let new_backend =
-            EmbeddingsBackend::load(&handle, self.config.embeddings.max_seq_len)?;
+        let new_backend = EmbeddingsBackend::load(&handle, self.config.embeddings.max_seq_len)?;
         let model_gen = new_backend.model_gen().to_string();
         *self.embeddings.write().await = Some(new_backend);
         info!(%model_gen, "embedding model hot-swapped");
@@ -100,9 +96,7 @@ impl ModelProvider for OnnxProvider {
                     .context("text.embed task missing input text")?;
 
                 let guard = self.embeddings.read().await;
-                let backend = guard
-                    .as_ref()
-                    .context("embedding backend not loaded")?;
+                let backend = guard.as_ref().context("embedding backend not loaded")?;
 
                 let output = backend
                     .embed(&text)

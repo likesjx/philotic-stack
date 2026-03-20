@@ -70,14 +70,12 @@ pub async fn run(config: Option<PathBuf>, force: bool) -> Result<()> {
         let vk = VerifyingKey::from(&sk);
 
         // Write private key — 0600
-        fs::write(private_key_path(), sk.to_bytes())
-            .context("write operator.key")?;
+        fs::write(private_key_path(), sk.to_bytes()).context("write operator.key")?;
         fs::set_permissions(private_key_path(), fs::Permissions::from_mode(0o600))
             .context("chmod operator.key")?;
 
         // Write public key — hex encoded
-        fs::write(public_key_path(), hex::encode(vk.to_bytes()))
-            .context("write operator.pub")?;
+        fs::write(public_key_path(), hex::encode(vk.to_bytes())).context("write operator.pub")?;
 
         println!("  identity  generated");
         (sk, vk)
@@ -89,7 +87,10 @@ pub async fn run(config: Option<PathBuf>, force: bool) -> Result<()> {
 
     // ── mesh-config.json template ──────────────────────────────────────────
     if config_path.exists() && !force {
-        println!("\n  config    {} already exists — skipping (use --force to overwrite)", config_path.display());
+        println!(
+            "\n  config    {} already exists — skipping (use --force to overwrite)",
+            config_path.display()
+        );
     } else {
         fs::write(&config_path, CONFIG_TEMPLATE)
             .with_context(|| format!("write {}", config_path.display()))?;

@@ -19,9 +19,7 @@ async fn null_remember_errors() {
 #[tokio::test]
 async fn null_remember_batch_errors() {
     let engine = NullMemoryEngine;
-    let result = engine
-        .remember_batch(MemoryScope::SharedUser, vec![])
-        .await;
+    let result = engine.remember_batch(MemoryScope::SharedUser, vec![]).await;
     assert!(result.is_err());
 }
 
@@ -78,11 +76,12 @@ async fn null_lens_errors() {
 #[tokio::test]
 async fn null_subscribe_errors_with_phase5_message() {
     let engine = NullMemoryEngine;
-    let result = engine
-        .subscribe("context", MemoryScope::SelfOnly)
-        .await;
+    let result = engine.subscribe("context", MemoryScope::SelfOnly).await;
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("Phase 5"), "expected Phase 5 message, got: {err}");
+    assert!(
+        err.contains("Phase 5"),
+        "expected Phase 5 message, got: {err}"
+    );
 }
 
 // ──── MemoryScope: serde round-trip ──────────────────────────────────────────
@@ -100,8 +99,7 @@ fn memory_scope_serde_roundtrip() {
     ];
     for scope in scopes {
         let json = serde_json::to_string(&scope).expect("serialize");
-        let _back: memory_core::MemoryScope =
-            serde_json::from_str(&json).expect("deserialize");
+        let _back: memory_core::MemoryScope = serde_json::from_str(&json).expect("deserialize");
     }
 }
 

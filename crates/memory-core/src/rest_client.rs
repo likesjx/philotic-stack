@@ -6,8 +6,7 @@ use tracing::instrument;
 
 use crate::engine::MemoryEngine;
 use crate::types::{
-    ActivationResult, AttentionalLens, Engram, EngramId, EngramRef, LinkKind, MemoryScope,
-    VaultId,
+    ActivationResult, AttentionalLens, Engram, EngramId, EngramRef, LinkKind, MemoryScope, VaultId,
 };
 
 // ──── Config ──────────────────────────────────────────────────────────────────
@@ -38,8 +37,8 @@ pub struct MuninnConfig {
 impl MuninnConfig {
     pub fn local(default_vault: impl Into<String>) -> Self {
         Self {
-            base_url:      "http://127.0.0.1:8475".to_string(),
-            vault_tokens:  HashMap::new(),
+            base_url: "http://127.0.0.1:8475".to_string(),
+            vault_tokens: HashMap::new(),
             default_token: None,
             default_vault: default_vault.into(),
         }
@@ -69,8 +68,8 @@ pub struct VaultResolver {
 impl VaultResolver {
     pub fn resolve(&self, scope: &MemoryScope) -> Vec<VaultId> {
         match scope {
-            MemoryScope::SelfOnly    => vec![format!("self_{}", self.agent_id)],
-            MemoryScope::SharedUser  => vec![format!("user_{}", self.user_id)],
+            MemoryScope::SelfOnly => vec![format!("self_{}", self.agent_id)],
+            MemoryScope::SharedUser => vec![format!("user_{}", self.user_id)],
             MemoryScope::Session(id) => vec![format!("session_{}", id)],
             MemoryScope::CrossScope(scopes) => {
                 scopes.iter().flat_map(|s| self.resolve(s)).collect()
@@ -80,7 +79,10 @@ impl VaultResolver {
 
     /// Returns the primary vault for write operations (first resolved vault).
     pub fn resolve_primary(&self, scope: &MemoryScope) -> VaultId {
-        self.resolve(scope).into_iter().next().unwrap_or_else(|| "default".to_string())
+        self.resolve(scope)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "default".to_string())
     }
 }
 
@@ -88,10 +90,10 @@ impl VaultResolver {
 
 #[derive(Debug, Serialize)]
 struct WriteRequest {
-    vault:      String,
-    concept:    String,
-    content:    String,
-    tags:       Vec<String>,
+    vault: String,
+    concept: String,
+    content: String,
+    tags: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     confidence: Option<f32>,
 }
@@ -103,15 +105,15 @@ struct WriteResponse {
 
 #[derive(Debug, Serialize)]
 struct BatchWriteRequest {
-    vault:   String,
+    vault: String,
     engrams: Vec<BatchItem>,
 }
 
 #[derive(Debug, Serialize)]
 struct BatchItem {
-    concept:    String,
-    content:    String,
-    tags:       Vec<String>,
+    concept: String,
+    content: String,
+    tags: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -121,14 +123,14 @@ struct BatchWriteResponse {
 
 #[derive(Debug, Deserialize)]
 struct BatchResult {
-    id:    Option<String>,
+    id: Option<String>,
     error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct ActivateRequest {
-    vault:       Option<String>,
-    context:     Vec<String>,
+    vault: Option<String>,
+    context: Vec<String>,
     max_results: Option<usize>,
 }
 
@@ -140,40 +142,40 @@ struct ActivateResponse {
 
 #[derive(Debug, Deserialize)]
 struct ActivationItem {
-    id:         String,
-    concept:    String,
-    content:    String,
+    id: String,
+    concept: String,
+    content: String,
     #[serde(default)]
-    tags:       Vec<String>,
+    tags: Vec<String>,
     confidence: f32,
     created_at: i64,
     updated_at: Option<i64>,
     #[serde(default)]
-    metadata:   serde_json::Value,
+    metadata: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]
 struct ReadResponse {
-    id:         String,
-    concept:    String,
-    content:    String,
+    id: String,
+    concept: String,
+    content: String,
     #[serde(default)]
-    tags:       Vec<String>,
+    tags: Vec<String>,
     confidence: f32,
     created_at: i64,
     updated_at: Option<i64>,
     #[serde(default)]
-    metadata:   serde_json::Value,
+    metadata: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
 struct LinkRequest {
-    vault:     String,
+    vault: String,
     source_id: String,
     target_id: String,
-    relation:  String,
+    relation: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    weight:    Option<f32>,
+    weight: Option<f32>,
 }
 
 // ──── Type Conversions ────────────────────────────────────────────────────────
@@ -181,15 +183,15 @@ struct LinkRequest {
 impl From<ActivationItem> for Engram {
     fn from(item: ActivationItem) -> Self {
         Engram {
-            id:         item.id.clone(),
-            vault_id:   String::new(), // not returned by activate; filled by context
-            concept:    item.concept,
-            content:    item.content,
-            tags:       item.tags,
+            id: item.id.clone(),
+            vault_id: String::new(), // not returned by activate; filled by context
+            concept: item.concept,
+            content: item.content,
+            tags: item.tags,
             confidence: item.confidence,
             created_at: item.created_at as u64,
             updated_at: item.updated_at.unwrap_or(item.created_at) as u64,
-            metadata:   item.metadata,
+            metadata: item.metadata,
         }
     }
 }
@@ -197,27 +199,27 @@ impl From<ActivationItem> for Engram {
 impl From<ReadResponse> for Engram {
     fn from(r: ReadResponse) -> Self {
         Engram {
-            id:         r.id.clone(),
-            vault_id:   String::new(), // filled by caller after vault discovery
-            concept:    r.concept,
-            content:    r.content,
-            tags:       r.tags,
+            id: r.id.clone(),
+            vault_id: String::new(), // filled by caller after vault discovery
+            concept: r.concept,
+            content: r.content,
+            tags: r.tags,
             confidence: r.confidence,
             created_at: r.created_at as u64,
             updated_at: r.updated_at.unwrap_or(r.created_at) as u64,
-            metadata:   r.metadata,
+            metadata: r.metadata,
         }
     }
 }
 
 fn link_kind_to_relation(kind: &LinkKind) -> &'static str {
     match kind {
-        LinkKind::Related     => "relates_to",
+        LinkKind::Related => "relates_to",
         LinkKind::Contradicts => "contradicts",
-        LinkKind::Supersedes  => "supersedes",
-        LinkKind::Supports    => "supports",
+        LinkKind::Supersedes => "supersedes",
+        LinkKind::Supports => "supports",
         LinkKind::DerivedFrom => "depends_on",
-        LinkKind::Custom(_)   => "user_defined",
+        LinkKind::Custom(_) => "user_defined",
     }
 }
 
@@ -240,11 +242,11 @@ fn link_kind_to_relation(kind: &LinkKind) -> &'static str {
 ///
 /// Phase 5 will provide an MBP alternative for lower latency.
 pub struct MuninnRestEngine {
-    client:         reqwest::Client,
-    config:         MuninnConfig,
-    resolver:       VaultResolver,
+    client: reqwest::Client,
+    config: MuninnConfig,
+    resolver: VaultResolver,
     /// Active attentional lens. Applied to activate() and remember() calls.
-    lens:           tokio::sync::RwLock<Option<AttentionalLens>>,
+    lens: tokio::sync::RwLock<Option<AttentionalLens>>,
     /// id → vault_id populated by every write. Eliminates vault-discovery
     /// overhead on the read side for the common case.
     id_vault_cache: tokio::sync::RwLock<HashMap<EngramId, VaultId>>,
@@ -253,10 +255,10 @@ pub struct MuninnRestEngine {
 impl MuninnRestEngine {
     pub fn new(config: MuninnConfig, resolver: VaultResolver) -> Self {
         Self {
-            client:         reqwest::Client::new(),
+            client: reqwest::Client::new(),
             config,
             resolver,
-            lens:           tokio::sync::RwLock::new(None),
+            lens: tokio::sync::RwLock::new(None),
             id_vault_cache: tokio::sync::RwLock::new(HashMap::new()),
         }
     }
@@ -268,11 +270,14 @@ impl MuninnRestEngine {
     /// Returns the reqwest RequestBuilder with the correct Authorization header
     /// for the given vault, if a token exists.
     fn with_auth(&self, builder: reqwest::RequestBuilder, vault: &str) -> reqwest::RequestBuilder {
-        let token = self.config.vault_tokens.get(vault)
+        let token = self
+            .config
+            .vault_tokens
+            .get(vault)
             .or(self.config.default_token.as_ref());
         match token {
             Some(t) => builder.bearer_auth(t),
-            None    => builder,
+            None => builder,
         }
     }
 
@@ -303,13 +308,18 @@ impl MuninnRestEngine {
 
     /// Record id → vault in the cache. Called after every write or vault discovery.
     async fn cache_vault(&self, id: &EngramId, vault: &VaultId) {
-        self.id_vault_cache.write().await.insert(id.clone(), vault.clone());
+        self.id_vault_cache
+            .write()
+            .await
+            .insert(id.clone(), vault.clone());
     }
 
     /// Returns all known `(vault_name, token)` pairs, default-token vault first.
     /// Used only for cache-miss fallback on vault-agnostic operations.
     fn vault_token_pairs(&self) -> Vec<(&str, &str)> {
-        let mut pairs: Vec<(&str, &str)> = self.config.vault_tokens
+        let mut pairs: Vec<(&str, &str)> = self
+            .config
+            .vault_tokens
             .iter()
             .map(|(v, t)| (v.as_str(), t.as_str()))
             .collect();
@@ -367,23 +377,24 @@ impl MemoryEngine for MuninnRestEngine {
     #[instrument(skip(self, content, tags), fields(scope = ?scope, concept))]
     async fn remember(
         &self,
-        scope:   MemoryScope,
+        scope: MemoryScope,
         concept: &str,
         content: &str,
-        tags:    Vec<String>,
+        tags: Vec<String>,
     ) -> anyhow::Result<EngramRef> {
         let vault = self.resolver.resolve_primary(&scope);
-        let tags  = self.apply_lens_tags(tags).await;
+        let tags = self.apply_lens_tags(tags).await;
 
         let body = WriteRequest {
-            vault:      vault.clone(),
-            concept:    concept.to_string(),
-            content:    content.to_string(),
+            vault: vault.clone(),
+            concept: concept.to_string(),
+            content: content.to_string(),
             tags,
             confidence: None,
         };
 
-        let resp: WriteResponse = self.with_auth(self.client.post(self.url("/api/engrams")), &vault)
+        let resp: WriteResponse = self
+            .with_auth(self.client.post(self.url("/api/engrams")), &vault)
             .json(&body)
             .send()
             .await?
@@ -392,12 +403,15 @@ impl MemoryEngine for MuninnRestEngine {
             .await?;
 
         self.cache_vault(&resp.id, &vault).await;
-        Ok(EngramRef { id: resp.id, vault_id: vault })
+        Ok(EngramRef {
+            id: resp.id,
+            vault_id: vault,
+        })
     }
 
     async fn remember_batch(
         &self,
-        scope:   MemoryScope,
+        scope: MemoryScope,
         entries: Vec<(String, String, Vec<String>)>,
     ) -> anyhow::Result<Vec<EngramRef>> {
         let vault = self.resolver.resolve_primary(&scope);
@@ -405,11 +419,19 @@ impl MemoryEngine for MuninnRestEngine {
         let mut items = Vec::with_capacity(entries.len());
         for (concept, content, tags) in entries {
             let tags = self.apply_lens_tags(tags).await;
-            items.push(BatchItem { concept, content, tags });
+            items.push(BatchItem {
+                concept,
+                content,
+                tags,
+            });
         }
 
-        let body = BatchWriteRequest { vault: vault.clone(), engrams: items };
-        let resp: BatchWriteResponse = self.with_auth(self.client.post(self.url("/api/engrams/batch")), &vault)
+        let body = BatchWriteRequest {
+            vault: vault.clone(),
+            engrams: items,
+        };
+        let resp: BatchWriteResponse = self
+            .with_auth(self.client.post(self.url("/api/engrams/batch")), &vault)
             .json(&body)
             .send()
             .await?
@@ -428,33 +450,36 @@ impl MemoryEngine for MuninnRestEngine {
                     if let Ok(mut cache) = self.id_vault_cache.try_write() {
                         cache.insert(id.clone(), vault.clone());
                     }
-                    Ok(EngramRef { id, vault_id: vault.clone() })
+                    Ok(EngramRef {
+                        id,
+                        vault_id: vault.clone(),
+                    })
                 }
-                None => anyhow::bail!(
-                    "batch write item failed: {}",
-                    r.error.unwrap_or_default()
-                ),
+                None => anyhow::bail!("batch write item failed: {}", r.error.unwrap_or_default()),
             })
             .collect()
     }
 
     async fn evolve(
         &self,
-        id:      &EngramId,
+        id: &EngramId,
         content: &str,
-        tags:    Option<Vec<String>>,
+        tags: Option<Vec<String>>,
     ) -> anyhow::Result<EngramRef> {
         // MuninnDB REST does not yet expose a direct PATCH endpoint;
         // evolve is available via MCP (muninn_evolve). For now, write the
         // updated content as a new engram and link it as supersedes.
         // Phase 5 (MBP) will replace this with a native evolve call.
-        let existing = self.read(id).await?.ok_or_else(|| {
-            anyhow::anyhow!("evolve: engram not found: {id}")
-        })?;
+        let existing = self
+            .read(id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("evolve: engram not found: {id}"))?;
 
         let effective_tags = tags.unwrap_or_else(|| existing.tags.clone());
         let scope = MemoryScope::SelfOnly; // evolve preserves vault via link
-        let new_ref = self.remember(scope, &existing.concept, content, effective_tags).await?;
+        let new_ref = self
+            .remember(scope, &existing.concept, content, effective_tags)
+            .await?;
 
         self.link(id, &new_ref.id, LinkKind::Supersedes).await?;
 
@@ -477,10 +502,13 @@ impl MemoryEngine for MuninnRestEngine {
         }
 
         // Slow path: vault unknown, try all pairs. None = not found anywhere (idempotent).
-        if let Some((_, resp)) = self.discover_vault(|vault, token| {
-            let url = format!("{}?vault={}", base_url, vault);
-            client.delete(&url).bearer_auth(token)
-        }).await? {
+        if let Some((_, resp)) = self
+            .discover_vault(|vault, token| {
+                let url = format!("{}?vault={}", base_url, vault);
+                client.delete(&url).bearer_auth(token)
+            })
+            .await?
+        {
             resp.error_for_status()?;
         }
         Ok(())
@@ -489,23 +517,24 @@ impl MemoryEngine for MuninnRestEngine {
     #[instrument(skip(self), fields(scope = ?scope))]
     async fn activate(
         &self,
-        context:     &str,
-        scope:       MemoryScope,
+        context: &str,
+        scope: MemoryScope,
         max_results: Option<usize>,
     ) -> anyhow::Result<ActivationResult> {
         let vaults = self.resolver.resolve(&scope);
-        let max    = self.effective_max_results(max_results).await;
+        let max = self.effective_max_results(max_results).await;
 
         let mut all_engrams = Vec::new();
         let mut total = 0usize;
 
         for vault in vaults {
             let body = ActivateRequest {
-                vault:       Some(vault.clone()),
-                context:     vec![context.to_string()],
+                vault: Some(vault.clone()),
+                context: vec![context.to_string()],
                 max_results: max,
             };
-            let resp: ActivateResponse = self.with_auth(self.client.post(self.url("/api/activate")), &vault)
+            let resp: ActivateResponse = self
+                .with_auth(self.client.post(self.url("/api/activate")), &vault)
                 .json(&body)
                 .send()
                 .await?
@@ -529,7 +558,10 @@ impl MemoryEngine for MuninnRestEngine {
             }
         }
 
-        Ok(ActivationResult { engrams: all_engrams, total })
+        Ok(ActivationResult {
+            engrams: all_engrams,
+            total,
+        })
     }
 
     async fn read(&self, id: &EngramId) -> anyhow::Result<Option<Engram>> {
@@ -543,19 +575,30 @@ impl MemoryEngine for MuninnRestEngine {
             if resp.status() == reqwest::StatusCode::NOT_FOUND {
                 return Ok(None);
             }
-            let mut engram: Engram = resp.error_for_status()?.json::<ReadResponse>().await.map(Into::into)?;
+            let mut engram: Engram = resp
+                .error_for_status()?
+                .json::<ReadResponse>()
+                .await
+                .map(Into::into)?;
             engram.vault_id = vault;
             return Ok(Some(engram));
         }
 
         // Slow path: discover vault, cache the result.
-        match self.discover_vault(|vault, token| {
-            let url = format!("{}?vault={}", base_url, vault);
-            client.get(&url).bearer_auth(token)
-        }).await? {
+        match self
+            .discover_vault(|vault, token| {
+                let url = format!("{}?vault={}", base_url, vault);
+                client.get(&url).bearer_auth(token)
+            })
+            .await?
+        {
             None => Ok(None),
             Some((vault, resp)) => {
-                let mut engram: Engram = resp.error_for_status()?.json::<ReadResponse>().await.map(Into::into)?;
+                let mut engram: Engram = resp
+                    .error_for_status()?
+                    .json::<ReadResponse>()
+                    .await
+                    .map(Into::into)?;
                 engram.vault_id = vault.clone();
                 self.cache_vault(id, &vault).await;
                 Ok(Some(engram))
@@ -566,8 +609,8 @@ impl MemoryEngine for MuninnRestEngine {
     async fn link(
         &self,
         from_id: &EngramId,
-        to_id:   &EngramId,
-        kind:    LinkKind,
+        to_id: &EngramId,
+        kind: LinkKind,
     ) -> anyhow::Result<()> {
         let relation = link_kind_to_relation(&kind).to_string();
         let url = self.url("/api/link");
@@ -581,10 +624,13 @@ impl MemoryEngine for MuninnRestEngine {
         } else {
             // Vault unknown — discover via a dummy GET on the source engram.
             let base_url = self.url(&format!("/api/engrams/{from_id}"));
-            match self.discover_vault(|vault, token| {
-                let u = format!("{}?vault={}", base_url, vault);
-                client.get(&u).bearer_auth(token)
-            }).await? {
+            match self
+                .discover_vault(|vault, token| {
+                    let u = format!("{}?vault={}", base_url, vault);
+                    client.get(&u).bearer_auth(token)
+                })
+                .await?
+            {
                 Some((v, _)) => {
                     self.cache_vault(&from_id, &v).await;
                     v
@@ -594,11 +640,11 @@ impl MemoryEngine for MuninnRestEngine {
         };
 
         let body = LinkRequest {
-            vault:     vault.clone(),
+            vault: vault.clone(),
             source_id: from_id.clone(),
             target_id: to_id.clone(),
             relation,
-            weight:    None,
+            weight: None,
         };
         self.with_auth(client.post(&url), &vault)
             .json(&body)
@@ -610,13 +656,17 @@ impl MemoryEngine for MuninnRestEngine {
 
     async fn traverse(
         &self,
-        from_id:    &EngramId,
+        from_id: &EngramId,
         _max_depth: Option<usize>,
     ) -> anyhow::Result<Vec<Engram>> {
         #[derive(Deserialize)]
-        struct LinkItem { target_id: String }
+        struct LinkItem {
+            target_id: String,
+        }
         #[derive(Deserialize)]
-        struct LinksResponse { links: Vec<LinkItem> }
+        struct LinksResponse {
+            links: Vec<LinkItem>,
+        }
 
         let base_url = self.url(&format!("/api/engrams/{from_id}/links"));
         let client = &self.client;
@@ -631,10 +681,13 @@ impl MemoryEngine for MuninnRestEngine {
             (vault, resp)
         } else {
             // Slow path.
-            match self.discover_vault(|vault, token| {
-                let url = format!("{}?vault={}", base_url, vault);
-                client.get(&url).bearer_auth(token)
-            }).await? {
+            match self
+                .discover_vault(|vault, token| {
+                    let url = format!("{}?vault={}", base_url, vault);
+                    client.get(&url).bearer_auth(token)
+                })
+                .await?
+            {
                 None => return Ok(vec![]),
                 Some((vault, resp)) => {
                     self.cache_vault(from_id, &vault).await;
@@ -667,7 +720,7 @@ impl MemoryEngine for MuninnRestEngine {
     async fn subscribe(
         &self,
         _context: &str,
-        _scope:   MemoryScope,
+        _scope: MemoryScope,
     ) -> anyhow::Result<mpsc::Receiver<Engram>> {
         anyhow::bail!("MuninnRestEngine: subscribe not available until Phase 5 MBP transport")
     }

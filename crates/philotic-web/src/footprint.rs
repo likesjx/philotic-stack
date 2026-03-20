@@ -98,9 +98,7 @@ fn find_processes() -> Vec<Process> {
 
     // pgrep -a not available on all platforms; fall back to ps
     let lines = match output {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout).to_string()
-        }
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
         _ => {
             // Fallback: ps aux
             std::process::Command::new("ps")

@@ -275,10 +275,11 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         "skill.revoke".into(),
         ToolDefinition {
             tool_name: "skill.revoke".into(),
-            description: "Removes a skill from a role's toolset profile. The skill's implied tools \
+            description:
+                "Removes a skill from a role's toolset profile. The skill's implied tools \
                           will no longer be available to the role after the next session reset. \
                           Idempotent."
-                .into(),
+                    .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {

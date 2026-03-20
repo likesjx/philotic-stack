@@ -7,8 +7,8 @@ use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
-use tracing::{info, warn};
 use tokio::process::Command as TokioCommand;
+use tracing::{info, warn};
 
 fn local_node_id() -> String {
     std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string())
@@ -432,9 +432,9 @@ fn search_workspace(
 
 fn parse_scope(s: Option<&str>, session_id: &str) -> MemoryScope {
     match s {
-        Some("user")    => MemoryScope::SharedUser,
+        Some("user") => MemoryScope::SharedUser,
         Some("session") => MemoryScope::Session(session_id.to_string()),
-        _               => MemoryScope::SelfOnly,
+        _ => MemoryScope::SelfOnly,
     }
 }
 
@@ -457,10 +457,7 @@ async fn execute_memory_tool(
     session_id: &str,
 ) -> String {
     let engine = memory_engine(config, agent_id, user_id);
-    let scope = parse_scope(
-        arguments.get("scope").and_then(|v| v.as_str()),
-        session_id,
-    );
+    let scope = parse_scope(arguments.get("scope").and_then(|v| v.as_str()), session_id);
 
     match tool_name {
         "memory.recall" => {
@@ -499,7 +496,11 @@ async fn execute_memory_tool(
             let tags: Vec<String> = arguments
                 .get("tags")
                 .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|t| t.as_str().map(str::to_string)).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|t| t.as_str().map(str::to_string))
+                        .collect()
+                })
                 .unwrap_or_default();
 
             match engine.remember(scope, concept, content, tags).await {
@@ -528,13 +529,17 @@ async fn execute_memory_tool(
                 Some(id) => id.to_string(),
                 None => return "memory.link error: missing `to_id`".into(),
             };
-            let kind = match arguments.get("kind").and_then(|v| v.as_str()).unwrap_or("related") {
-                "contradicts"  => memory_core::LinkKind::Contradicts,
-                "supersedes"   => memory_core::LinkKind::Supersedes,
-                "supports"     => memory_core::LinkKind::Supports,
+            let kind = match arguments
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("related")
+            {
+                "contradicts" => memory_core::LinkKind::Contradicts,
+                "supersedes" => memory_core::LinkKind::Supersedes,
+                "supports" => memory_core::LinkKind::Supports,
                 "derived_from" => memory_core::LinkKind::DerivedFrom,
-                "related"      => memory_core::LinkKind::Related,
-                other          => memory_core::LinkKind::Custom(other.to_string()),
+                "related" => memory_core::LinkKind::Related,
+                other => memory_core::LinkKind::Custom(other.to_string()),
             };
             match engine.link(&from_id, &to_id, kind).await {
                 Ok(()) => "linked".into(),
@@ -553,9 +558,7 @@ async fn execute_bash_tool(arguments: &serde_json::Value) -> String {
         Some(cmd) => cmd,
         None => return "bash.exec error: missing `command`".into(),
     };
-    let working_dir = arguments
-        .get("working_dir")
-        .and_then(|v| v.as_str());
+    let working_dir = arguments.get("working_dir").and_then(|v| v.as_str());
     let timeout_secs = arguments
         .get("timeout_secs")
         .and_then(|v| v.as_u64())
@@ -636,28 +639,38 @@ async fn main() -> Result<()> {
         "tool.bash.exec",
     ] {
         let _ = ipc_client
-            .send_request(IpcRequest::SubscribeInbox { role: role.to_string() })
+            .send_request(IpcRequest::SubscribeInbox {
+                role: role.to_string(),
+            })
             .await?;
     }
 
     // Fetch MuninnDB config from the hotel — None if memory is not configured.
-    let muninn_config: Option<MuninnConfig> =
-        match ipc_client.send_request(IpcRequest::FetchMemoryConfig).await {
-            Ok(IpcResponse::MemoryConfig { config_json: Some(json) }) => {
-                match serde_json::from_str::<MuninnConfig>(&json) {
-                    Ok(cfg) => {
-                        info!(endpoint = %cfg.base_url, vaults = cfg.vault_tokens.len(), "Memory tools enabled");
-                        Some(cfg)
-                    }
-                    Err(e) => { warn!("Failed to parse MuninnConfig: {e}"); None }
-                }
+    let muninn_config: Option<MuninnConfig> = match ipc_client
+        .send_request(IpcRequest::FetchMemoryConfig)
+        .await
+    {
+        Ok(IpcResponse::MemoryConfig {
+            config_json: Some(json),
+        }) => match serde_json::from_str::<MuninnConfig>(&json) {
+            Ok(cfg) => {
+                info!(endpoint = %cfg.base_url, vaults = cfg.vault_tokens.len(), "Memory tools enabled");
+                Some(cfg)
             }
-            Ok(IpcResponse::MemoryConfig { config_json: None }) => {
-                info!("Memory tools disabled — hotel has no MuninnDB config");
+            Err(e) => {
+                warn!("Failed to parse MuninnConfig: {e}");
                 None
             }
-            _ => { warn!("Unexpected response to FetchMemoryConfig"); None }
-        };
+        },
+        Ok(IpcResponse::MemoryConfig { config_json: None }) => {
+            info!("Memory tools disabled — hotel has no MuninnDB config");
+            None
+        }
+        _ => {
+            warn!("Unexpected response to FetchMemoryConfig");
+            None
+        }
+    };
 
     info!("Listening for tool execution tasks...");
 
@@ -732,7 +745,15 @@ async fn main() -> Result<()> {
                         .unwrap_or(agent_id);
                     match &muninn_config {
                         Some(cfg) => {
-                            execute_memory_tool(cfg, &tool_name, &arguments, agent_id, user_id, &session_id).await
+                            execute_memory_tool(
+                                cfg,
+                                &tool_name,
+                                &arguments,
+                                agent_id,
+                                user_id,
+                                &session_id,
+                            )
+                            .await
                         }
                         None => format!("{tool_name} error: memory not configured on this hotel"),
                     }

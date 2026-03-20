@@ -313,7 +313,9 @@ mod tests {
     fn parses_preapprove_tool_name() {
         assert_eq!(
             parse_slash_command("/preapprove echo"),
-            Some(SlashCommand::Preapprove { name: "echo".into() })
+            Some(SlashCommand::Preapprove {
+                name: "echo".into()
+            })
         );
     }
 
@@ -321,7 +323,9 @@ mod tests {
     fn parses_preapprove_class_name() {
         assert_eq!(
             parse_slash_command("/preapprove workspace"),
-            Some(SlashCommand::Preapprove { name: "workspace".into() })
+            Some(SlashCommand::Preapprove {
+                name: "workspace".into()
+            })
         );
     }
 

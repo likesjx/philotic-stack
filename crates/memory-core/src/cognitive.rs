@@ -8,8 +8,8 @@ use crate::types::{Engram, EngramId, EngramRef};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContradictionResult {
-    pub in_tension:  bool,
-    pub resolution:  ContradictionResolution,
+    pub in_tension: bool,
+    pub resolution: ContradictionResolution,
     pub explanation: String,
 }
 
@@ -26,49 +26,49 @@ pub enum ContradictionResolution {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Pattern {
     pub description: String,
-    pub engram_ids:  Vec<EngramId>,
-    pub tags:        Vec<String>,
-    pub confidence:  f32,
+    pub engram_ids: Vec<EngramId>,
+    pub tags: Vec<String>,
+    pub confidence: f32,
 }
 
 // ──── Introspection Report ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TagCluster {
-    pub tags:                Vec<String>,
-    pub engram_count:        usize,
+    pub tags: Vec<String>,
+    pub engram_count: usize,
     pub co_occurrence_score: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActivationPattern {
     pub description: String,
-    pub engram_ids:  Vec<EngramId>,
-    pub frequency:   f32,
+    pub engram_ids: Vec<EngramId>,
+    pub frequency: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecayAlert {
-    pub engram_id:       EngramId,
-    pub concept:         String,
+    pub engram_id: EngramId,
+    pub concept: String,
     pub activation_level: f32,
     pub last_accessed_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrossRoleOverlap {
-    pub role_a:           String,
-    pub role_b:           String,
+    pub role_a: String,
+    pub role_b: String,
     pub shared_engram_ids: Vec<EngramId>,
-    pub overlap_score:    f32,
+    pub overlap_score: f32,
 }
 
 /// A self-optimization proposal produced by the introspection skill.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntrospectionProposal {
-    pub signal:       String,
-    pub evidence:     String,
-    pub proposal:     String,
+    pub signal: String,
+    pub evidence: String,
+    pub proposal: String,
     pub autonomy_tier: AutonomyTier,
 }
 
@@ -86,11 +86,11 @@ pub enum AutonomyTier {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntrospectionReport {
-    pub tag_clusters:       Vec<TagCluster>,
+    pub tag_clusters: Vec<TagCluster>,
     pub activation_patterns: Vec<ActivationPattern>,
-    pub decay_alerts:       Vec<DecayAlert>,
+    pub decay_alerts: Vec<DecayAlert>,
     pub cross_role_overlap: Vec<CrossRoleOverlap>,
-    pub proposals:          Vec<IntrospectionProposal>,
+    pub proposals: Vec<IntrospectionProposal>,
 }
 
 // ──── CognitiveEngine ─────────────────────────────────────────────────────────
@@ -110,10 +110,10 @@ pub trait CognitiveEngine: MemoryEngine {
     /// considered, and confidence. Decisions are cognitive acts, not just storage.
     async fn decide(
         &self,
-        concept:      &str,
-        rationale:    &str,
+        concept: &str,
+        rationale: &str,
         alternatives: Vec<String>,
-        confidence:   f32,
+        confidence: f32,
     ) -> anyhow::Result<EngramRef>;
 
     /// Retrieve currently salient cognitive rules given a context.
@@ -132,8 +132,8 @@ pub trait CognitiveEngine: MemoryEngine {
     /// Persist a belief with explicit confidence tracking.
     async fn store_belief(
         &self,
-        concept:    &str,
-        content:    &str,
+        concept: &str,
+        content: &str,
         confidence: f32,
     ) -> anyhow::Result<EngramRef>;
 
@@ -148,10 +148,7 @@ pub trait CognitiveEngine: MemoryEngine {
     /// Analyze a set of engrams for recurring structures — co-occurring tags,
     /// temporal sequences, causal chains.
     /// Powers quiet-hours consolidation and the introspection skill.
-    async fn extract_patterns(
-        &self,
-        engram_ids: &[EngramId],
-    ) -> anyhow::Result<Vec<Pattern>>;
+    async fn extract_patterns(&self, engram_ids: &[EngramId]) -> anyhow::Result<Vec<Pattern>>;
 
     /// Analyze memory patterns — tag co-occurrence, activation clustering,
     /// decay curves, cross-role overlap — and produce a structured report.

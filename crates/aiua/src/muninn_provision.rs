@@ -35,7 +35,7 @@ struct LoginRequest<'a> {
 
 #[derive(Debug, Serialize)]
 struct CreateVaultRequest<'a> {
-    name:   &'a str,
+    name: &'a str,
     public: bool,
 }
 
@@ -43,7 +43,7 @@ struct CreateVaultRequest<'a> {
 struct CreateKeyRequest<'a> {
     vault: &'a str,
     label: &'a str,
-    mode:  &'a str,
+    mode: &'a str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,10 +59,10 @@ struct CreateKeyResponse {
 /// `vault_names` should be pre-derived by the caller (e.g. `self_agent-jane-01`,
 /// `user_jared`). The admin session is established once and reused for all vaults.
 pub async fn provision_muninn_vaults(
-    graph:      &dyn GraphStorage,
-    endpoint:   &str,
-    username:   &str,
-    password:   &str,
+    graph: &dyn GraphStorage,
+    endpoint: &str,
+    username: &str,
+    password: &str,
     vault_names: Vec<String>,
 ) -> Result<()> {
     if vault_names.is_empty() {
@@ -116,13 +116,13 @@ pub async fn provision_muninn_vaults(
 
         // Step 2: Create vault in MuninnDB if it doesn't exist there yet.
         if !existing_muninn.contains(vault_name) {
-            let create_url = format!(
-                "{}/api/admin/vaults/config",
-                endpoint.trim_end_matches('/')
-            );
+            let create_url = format!("{}/api/admin/vaults/config", endpoint.trim_end_matches('/'));
             let resp = client
                 .put(&create_url)
-                .json(&CreateVaultRequest { name: vault_name, public: false })
+                .json(&CreateVaultRequest {
+                    name: vault_name,
+                    public: false,
+                })
                 .send()
                 .await
                 .with_context(|| format!("Failed to create vault {vault_name}"))?;
@@ -142,7 +142,11 @@ pub async fn provision_muninn_vaults(
         let label = format!("aiua-{}", now_secs());
         let resp = client
             .post(&keys_url)
-            .json(&CreateKeyRequest { vault: vault_name, label: &label, mode: "full" })
+            .json(&CreateKeyRequest {
+                vault: vault_name,
+                label: &label,
+                mode: "full",
+            })
             .send()
             .await
             .with_context(|| format!("Failed to mint token for vault {vault_name}"))?;
@@ -150,7 +154,11 @@ pub async fn provision_muninn_vaults(
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            bail!("Failed to mint token for vault {vault_name} ({}): {}", status, body);
+            bail!(
+                "Failed to mint token for vault {vault_name} ({}): {}",
+                status,
+                body
+            );
         }
 
         let key_resp: CreateKeyResponse = resp
@@ -159,25 +167,32 @@ pub async fn provision_muninn_vaults(
             .with_context(|| format!("Failed to parse key response for vault {vault_name}"))?;
 
         // Step 4: Encrypt and store token; add vault_registry entry.
-        let secret_ref = store_secret(graph, SecretInput {
-            plaintext:      key_resp.token,
-            secret_kind:    "muninn_vault_token".to_string(),
-            scope:          "hotel".to_string(),
-            allowed_roles:  vec!["hotel".to_string()],
-            allowed_guests: vec!["hotel".to_string()],
-        })
+        let secret_ref = store_secret(
+            graph,
+            SecretInput {
+                plaintext: key_resp.token,
+                secret_kind: "muninn_vault_token".to_string(),
+                scope: "hotel".to_string(),
+                allowed_roles: vec!["hotel".to_string()],
+                allowed_guests: vec!["hotel".to_string()],
+            },
+        )
         .with_context(|| format!("Failed to store vault token for {vault_name}"))?;
 
-        graph.upsert_vault_registry_entry(&VaultRegistryEntry {
-            vault_name: vault_name.clone(),
-            secret_ref,
-        })
-        .with_context(|| format!("Failed to register vault {vault_name}"))?;
+        graph
+            .upsert_vault_registry_entry(&VaultRegistryEntry {
+                vault_name: vault_name.clone(),
+                secret_ref,
+            })
+            .with_context(|| format!("Failed to register vault {vault_name}"))?;
 
         info!(vault = %vault_name, "Vault provisioned and registered");
     }
 
-    info!(count = vault_names.len(), "MuninnDB vault provisioning complete");
+    info!(
+        count = vault_names.len(),
+        "MuninnDB vault provisioning complete"
+    );
     Ok(())
 }
 
@@ -283,14 +298,17 @@ mod tests {
     fn derive_vault_names_collects_agents_and_users() {
         let mut names = derive_vault_names(&config());
         names.sort();
-        assert_eq!(names, vec![
-            "self_agent-aria-01",
-            "self_agent-jane-01",
-            "self_agent-rex-01",
-            "user_alice",
-            "user_bob",
-            "user_jared",
-        ]);
+        assert_eq!(
+            names,
+            vec![
+                "self_agent-aria-01",
+                "self_agent-jane-01",
+                "self_agent-rex-01",
+                "user_alice",
+                "user_bob",
+                "user_jared",
+            ]
+        );
     }
 
     #[test]

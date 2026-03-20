@@ -7,9 +7,8 @@ pub mod types;
 // ──── Re-exports ──────────────────────────────────────────────────────────────
 
 pub use cognitive::{
-    ActivationPattern, AutonomyTier, ContradictionResolution, ContradictionResult,
-    CrossRoleOverlap, DecayAlert, IntrospectionProposal, IntrospectionReport, Pattern,
-    TagCluster, CognitiveEngine,
+    ActivationPattern, AutonomyTier, CognitiveEngine, ContradictionResolution, ContradictionResult,
+    CrossRoleOverlap, DecayAlert, IntrospectionProposal, IntrospectionReport, Pattern, TagCluster,
 };
 pub use engine::MemoryEngine;
 pub use null::NullMemoryEngine;

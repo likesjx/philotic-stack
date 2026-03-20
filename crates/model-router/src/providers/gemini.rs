@@ -124,8 +124,7 @@ impl GeminiProvider {
              To reply without a tool, output a JSON object with \"display_text\" (your reply, \
              markdown fine) and \"spoken_text\" (conversational version for voice, no markdown).{}\n\n\
              Available tools:\n{}",
-            concept_instruction,
-            tool_list,
+            concept_instruction, tool_list,
         );
 
         let mut properties = json!({
@@ -392,12 +391,12 @@ impl ModelProvider for GeminiProvider {
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_string();
-                    let arguments = tc
-                        .get("arguments")
-                        .cloned()
-                        .unwrap_or_else(|| json!({}));
+                    let arguments = tc.get("arguments").cloned().unwrap_or_else(|| json!({}));
                     if !tool_name.is_empty() {
-                        return Ok(ProviderOutput::ToolCall { tool_name, arguments });
+                        return Ok(ProviderOutput::ToolCall {
+                            tool_name,
+                            arguments,
+                        });
                     }
                 }
             }
@@ -418,12 +417,12 @@ impl ModelProvider for GeminiProvider {
                             .and_then(Value::as_str)
                             .unwrap_or("")
                             .to_string();
-                        let arguments = tc
-                            .get("arguments")
-                            .cloned()
-                            .unwrap_or_else(|| json!({}));
+                        let arguments = tc.get("arguments").cloned().unwrap_or_else(|| json!({}));
                         if !tool_name.is_empty() {
-                            return Ok(ProviderOutput::ToolCall { tool_name, arguments });
+                            return Ok(ProviderOutput::ToolCall {
+                                tool_name,
+                                arguments,
+                            });
                         }
                     }
                 }

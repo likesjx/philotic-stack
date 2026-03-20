@@ -103,7 +103,7 @@ impl WebRtcGuest {
             let signal = WebRtcSignalMessage {
                 session_id: self.session_id.clone(),
                 target_guest_id: "remote-requester".to_string(), // In reality we map this back to the requesting agent id
-                sender_node: "local-aiua-01".to_string(),     // In reality map from node caps
+                sender_node: "local-aiua-01".to_string(),        // In reality map from node caps
                 signal: SignalPayload::Answer(local_desc.sdp),
             };
             let _ = self.signal_tx.send(signal).await;

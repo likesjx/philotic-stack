@@ -22,12 +22,16 @@ die() {
 }
 
 repo_root() {
-    git rev-parse --show-toplevel
+    dirname "$(git rev-parse --path-format=absolute --git-common-dir)"
+}
+
+script_dir() {
+    cd "$(dirname "${BASH_SOURCE[0]}")" && pwd
 }
 
 worktree_path() {
     local slug=$1
-    "$(repo_root)/scripts/codex-worktree.sh" path "${slug}"
+    "$(script_dir)/codex-worktree.sh" path "${slug}"
 }
 
 branch_name() {
@@ -68,7 +72,7 @@ cmd_start() {
     local base_ref=${2:-develop}
     [ -n "${slug}" ] || die "missing slug"
 
-    "$(repo_root)/scripts/codex-worktree.sh" create "${slug}" "${base_ref}"
+    "$(script_dir)/codex-worktree.sh" create "${slug}" "${base_ref}"
 
     local path
     path=$(worktree_path "${slug}")
