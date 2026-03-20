@@ -745,6 +745,30 @@ Seam IDs: `structured-model-envelope`, `hotel-gemini-oauth-flow`
 - [x] Run a full guest-path Gemini OAuth smoke through the materialized model-controller, not just hotel-side validation.
 - [ ] Wire refresh-token persistence and refresh lifecycle behind the hotel vault.
 - [x] Deliver an honest ElevenLabs end-to-end voice path beyond inline-audio/testing mode, including watched-live confirmation that `voice.synthesize` produces canonical audio artifacts instead of a model-router policy refusal.
+- [ ] Add `OpenAIProvider` to `model-router` on the existing provider seam:
+  - `text.generate`
+  - structured outputs
+  - tool calling
+  - image-aware text input where supported
+  - `text.embed`
+- [ ] Extend provider config/auth loading for OpenAI:
+  - API key path
+  - OAuth bearer path
+  - refreshable OAuth path owned by the hotel
+- [ ] Define hotel CLI OAuth UX for OpenAI:
+  - browser launch
+  - temporary localhost callback listener
+  - token exchange
+  - token storage/refresh
+  - guest handoff
+  - validation command
+- [ ] Add the first OpenAI startup smoke through the materialized model-controller guest.
+- [ ] Define provider capability overrides for specialized OpenAI model features:
+  - reasoning effort / depth
+  - verbosity
+  - background mode
+  - built-in tools gated behind explicit provider options
+  - realtime/audio kept as a follow-on slice, not part of the first parity path
 
 ## New Project: Key Vault
 

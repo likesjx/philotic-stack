@@ -3,7 +3,7 @@ title: "Philotic Seam Registry"
 doc_type: workflow
 domain: workflow-docs
 status: active
-last_updated: 2026-03-12
+last_updated: 2026-03-19
 tags:
   - seams
   - ids
@@ -92,6 +92,9 @@ This registry makes the seam layer explicit without forcing every task bullet to
 | `agent-default-toolsets` | `tooling-execution` | [TOOL_MANAGEMENT_PLANE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TOOL_MANAGEMENT_PLANE_PROPOSAL.md) | `docs/task.md` → `Next Project: Tool Assembly and Routed Execution` |
 | `structured-model-envelope` | `tooling-execution` | [MODEL_CONTROLLER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MODEL_CONTROLLER_PROPOSAL.md) | `docs/task.md` → `New Project: Model Controller` |
 | `hotel-gemini-oauth-flow` | `tooling-execution` | [MODEL_CONTROLLER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MODEL_CONTROLLER_PROPOSAL.md) | `docs/task.md` → `New Project: Model Controller` |
+| `openai-provider-contract` | `tooling-execution` | [MODEL_CONTROLLER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MODEL_CONTROLLER_PROPOSAL.md) | `docs/task.md` → `New Project: Model Controller` |
+| `hotel-openai-oauth-flow` | `tooling-execution` | [MODEL_CONTROLLER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MODEL_CONTROLLER_PROPOSAL.md) | `docs/task.md` → `New Project: Model Controller` |
+| `provider-capability-overrides` | `tooling-execution` | [MODEL_CONTROLLER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MODEL_CONTROLLER_PROPOSAL.md) | `docs/task.md` → `New Project: Model Controller` |
 | `context-engine-contract` | `memory-context` | [PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md) | `docs/task.md` → `New Project: Context And Memory Engines` |
 | `deterministic-context-assembly` | `memory-context` | [PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md) | `docs/task.md` → `New Project: Context And Memory Engines` |
 | `wider-client-adoption` | `memory-context` | [MUNINN_MEMORY_PROTOCOL_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MUNINN_MEMORY_PROTOCOL_PROPOSAL.md) | `docs/task.md` → `Next Work Item: Muninn Heuristic Memory Experiment` |

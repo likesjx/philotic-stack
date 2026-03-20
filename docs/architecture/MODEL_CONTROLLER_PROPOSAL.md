@@ -3,7 +3,7 @@ title: "Model Controller Proposal"
 doc_type: proposal
 domain: tooling-execution
 status: accepted-current-slice
-last_updated: 2026-03-12
+last_updated: 2026-03-19
 tags:
   - model-controller
   - models
@@ -26,6 +26,9 @@ implemented_by:
 active_seams:
   - structured-model-envelope
   - hotel-gemini-oauth-flow
+  - openai-provider-contract
+  - hotel-openai-oauth-flow
+  - provider-capability-overrides
 source_of_truth_targets:
   - ARCHITECTURE_STATUS.md
   - ARCHITECTURE.md
@@ -40,6 +43,8 @@ Define a capability-addressed model-controller boundary for Philotic that can:
 - route text generation, voice synthesis, and future multimodal response work through separate materialized model-controller guests
 - support richer ElevenLabs audio capabilities beyond basic TTS
 - support Gemini authentication via hotel-managed OAuth with API key fallback
+- support OpenAI authentication via hotel-managed OAuth or API key, depending on provider path
+- support OpenAI-standard model features without forcing Philotic to adopt OpenAI-specific worldview as its canonical schema
 - keep provider invocation separate from higher-level delivery and transport concerns
 
 ## Core Recommendation
@@ -53,11 +58,13 @@ For the current direction:
 - keep capability routing as the stable interface layer
 - add a `request_class` field so the envelope can distinguish cognitive, transform, synthesis, and embedding work without splitting the controller boundary too early
 - let model-controller implementations handle provider API invocation only
+- add OpenAI as the next first-class provider through the existing `ModelProvider` seam instead of creating a parallel controller stack
 - treat ElevenLabs as an audio-capability provider surface, not just a single `voice.synthesize` endpoint
 - treat native multimodal voice-capable models as a separate response path, not as disguised ElevenLabs TTS
 - let the hotel own OAuth UX, token storage, and token refresh
 - let model-controller guests consume short-lived auth material from the hotel/config path
 - keep API key support as the operational fallback for Gemini
+- keep OpenAI-specific advanced features in explicit provider extensions until they prove they belong in the shared contract
 
 ## Disposition
 
@@ -77,6 +84,7 @@ Pin and prove the first design contract for:
 - a structured model request envelope that separates context layers from routing hints and provider options
 - a structured model response envelope with explicit response channels for optimization-oriented outputs
 - a first `request_class` split so cognitive calls can carry agent context and affordances without forcing every model call to pretend it is part of the reasoning loop
+- a proposal-backed OpenAI provider slice covering standard text/tool/structured-output support, hotel-owned OAuth, and model-specific capability overrides
 
 Current confidence for the implemented structured-envelope slice:
 
@@ -88,6 +96,131 @@ Current confidence for the implemented structured-envelope slice:
 - not yet `watched-live-green` for end-to-end role/context projection in a live session
 
 Linked task surface: [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md)
+
+## OpenAI Provider Recommendation
+
+Philotic should add OpenAI support as the next provider on the existing `model-router` seam, not as a new orchestration layer.
+
+That means:
+
+- keep the canonical Philotic request/response envelope as the system contract
+- add an OpenAI provider adapter that renders that contract into the OpenAI API surface
+- map OpenAI outputs back into Philotic `ProviderOutput` variants
+- keep advanced OpenAI-only behavior in explicit provider extensions rather than leaking it into every call path
+
+The current code seam is already shaped for this:
+
+- `ControllerTask` carries capability, request class, response contract, context, affordances, routing hints, and provider options
+- `ModelProvider` already defines the provider boundary
+- `ProviderOutput` already covers text, tool calls, audio artifacts, and embeddings
+
+So the real work is capability normalization, auth shape, and honest handling of provider-specific features.
+
+### Recommended initial OpenAI slice
+
+Implement one OpenAI provider that supports the shared standard path first:
+
+- `text.generate`
+- tool calling
+- structured outputs
+- image-aware text generation / media analysis where the selected model supports it
+- embeddings
+
+Do not start with realtime, voice-native dialogue, or provider-built-in tools as if they were the same class of work. Those are follow-on slices.
+
+### Why one provider first
+
+The temptation will be to split immediately into:
+
+- `model-controller-openai`
+- `model-controller-openai-realtime`
+- `model-controller-openai-embeddings`
+
+That split may become correct later, but doing it first would be architecture cosplay.
+
+The smallest honest slice is:
+
+- one `OpenAIProvider`
+- one standard OpenAI request renderer
+- one standard response parser
+- provider options for the first specialized features we actually need
+
+If realtime or long-running/background behavior creates materially different lifecycle or streaming pressure later, then split the guest boundary then.
+
+## Provider Standard vs Provider Extensions
+
+Philotic should standardize the common execution contract, not erase provider differences that matter.
+
+### Standardize in the shared contract
+
+These should stay provider-neutral at the Philotic edge:
+
+- capability names like `text.generate`, `voice.synthesize`, `media.analyze`, `text.embed`, `response.generate`
+- `request_class`
+- structured context layers
+- structured response channels
+- tool definitions and tool-call records
+- attachment projection
+- provider selection hints
+
+### Keep in provider extensions first
+
+These should live in `provider_options` until multiple providers justify promotion:
+
+- reasoning effort / depth controls
+- verbosity controls
+- background or deferred response mode
+- provider-native tracing handles
+- OpenAI built-in tools such as web search, file search, code interpreter, or MCP tool surfaces
+- realtime session parameters
+- provider-native audio generation knobs
+
+This is the important guardrail: provider-aware does not mean provider-owned. Philotic should learn from OpenAI's capabilities without letting one vendor's convenience surface become the canonical worldview.
+
+## OpenAI Auth Recommendation
+
+OpenAI auth should support:
+
+- hotel-managed OAuth where the OpenAI product/API path supports it
+- API key fallback
+
+Recommended auth modes:
+
+- `api_key`
+- `oauth_bearer`
+- `oauth_refreshable`
+
+Recommended boundary rule:
+
+- the hotel owns browser login, token exchange, refresh, storage, and validation UX
+- the guest consumes short-lived usable runtime auth material
+- the guest must not become the owner of long-lived OAuth credentials
+
+Acceptance criteria for this seam:
+
+- hotel can start and validate an OpenAI auth flow without requiring guest restarts for every credential refresh
+- model-router/provider config can prefer OAuth auth material over API key fallback when present
+- failure is visible before API-key fallback quietly masks a broken OAuth path
+- refreshable credentials live behind vault references rather than raw config values
+
+## OpenAI Capability Override Recommendation
+
+OpenAI model families expose materially different strengths and knobs.
+
+Philotic should plan for provider-specific capability overrides such as:
+
+- reasoning models with explicit effort controls
+- models that only support a subset of tool or audio behavior
+- realtime/audio-capable models that want a different runtime path
+- built-in tool-enabled models whose behavior should be surfaced intentionally, not accidentally
+
+Recommendation:
+
+- keep the default OpenAI path focused on the standard shared contract
+- add explicit feature gates and provider options for specialized models
+- promote an OpenAI-specific feature into the shared Philotic contract only after at least one more provider or a clearly reusable internal surface wants the same thing
+
+That keeps us from mistaking “OpenAI happens to expose this nicely” for “Philotic should now be this.”
 
 ## Capability Surface
 
@@ -738,10 +871,13 @@ Target operator experience:
 
 - `ansible auth google start --provider gemini`
 - `ansible auth google validate --provider gemini`
+- `ansible auth openai start`
+- `ansible auth openai validate`
 - browser opens automatically
 - hotel captures callback on localhost
 - hotel confirms success
 - Gemini model-controller begins using OAuth
+- OpenAI model-controller begins using OAuth when the configured path supports it
 - if OAuth is unavailable or expires irrecoverably, API key remains the fallback path
 
 Operationally, the hotel should vend short-lived access tokens to the guest rather than permanently copying the long-lived credential into every model process.
@@ -755,6 +891,8 @@ This proposal intentionally does not yet define:
 - secret storage hardening details for refresh tokens
 - exact context-graph schema for model auth material
 - exact normalized envelope for music and sound-effect artifact metadata
+- the final normalization strategy for OpenAI built-in tools versus Philotic-routed tools
+- whether OpenAI realtime deserves its own materialized guest boundary or remains a provider mode inside the existing controller guest
 
 ## Near-Term Slice Recommendation
 
@@ -766,3 +904,6 @@ Implement the next slice in this order:
 4. sketch `voice.dialogue`, `sound.generate`, and `music.generate` as capability stubs
 5. add Gemini auth abstraction with OAuth-capable config shape and API key fallback
 6. add hotel-side OAuth trigger and token handoff design before full implementation
+7. add `OpenAIProvider` on the existing `ModelProvider` seam for text/tool/structured-output support
+8. add hotel-side OpenAI auth trigger, token handoff design, and validation path before full implementation
+9. add provider capability-overrides for reasoning effort and the first specialized OpenAI controls without broadening the shared contract prematurely
