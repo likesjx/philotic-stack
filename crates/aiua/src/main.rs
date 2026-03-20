@@ -16,14 +16,18 @@ use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use clap::{Parser, Subcommand, ValueEnum};
-use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
+use philotic_client::{
+    GuestIdentity, IpcRequest, IpcResponse, OperatorSurfaceQueryHandoff,
+    OperatorTargetGuestInventoryView, OperatorTargetStatusView, PhiloticClient,
+    OPERATOR_SURFACE_QUERY_HANDOFF_KIND, OPERATOR_SURFACE_QUERY_ROLE,
+};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
 mod auth;
@@ -44,7 +48,9 @@ use std::sync::Arc;
 /// When `Some`, all runtime paths (DB, socket) are namespaced to that directory
 /// so that two profiles never collide. When `None`, legacy path behavior applies.
 fn profile_dir() -> Option<PathBuf> {
-    let profile = std::env::var("PHILOTIC_PROFILE").ok().filter(|s| !s.is_empty())?;
+    let profile = std::env::var("PHILOTIC_PROFILE")
+        .ok()
+        .filter(|s| !s.is_empty())?;
     let home = std::env::var("HOME").ok()?;
     Some(PathBuf::from(home).join(".philotic").join(profile))
 }
@@ -67,6 +73,178 @@ pub enum LedgerCommand {
         consumer_node_id: String,
         acked_seq: u64,
     },
+}
+
+async fn run_operator_surface_query_worker(
+    socket_path: String,
+    local_node_id: String,
+    mut shutdown_rx: broadcast::Receiver<()>,
+) {
+    loop {
+        let connect_fut = PhiloticClient::connect_at(
+            &socket_path,
+            GuestIdentity {
+                guest_id: "aiua-operator-surface-query-worker".into(),
+                role: OPERATOR_SURFACE_QUERY_ROLE.into(),
+                supported_tools: Vec::new(),
+            },
+        );
+        let mut client = tokio::select! {
+            _ = shutdown_rx.recv() => return,
+            connect_result = connect_fut => match connect_result {
+                Ok(client) => client,
+                Err(err) => {
+                    warn!("Operator surface query worker failed to connect: {}", err);
+                    tokio::select! {
+                        _ = shutdown_rx.recv() => return,
+                        _ = tokio::time::sleep(tokio::time::Duration::from_millis(250)) => continue,
+                    }
+                }
+            }
+        };
+
+        match client
+            .send_request(IpcRequest::SubscribeInbox {
+                role: OPERATOR_SURFACE_QUERY_ROLE.into(),
+            })
+            .await
+        {
+            Ok(IpcResponse::Standard { ok: true, .. }) => {}
+            Ok(other) => {
+                warn!(
+                    "Operator surface query worker received unexpected subscribe response: {:?}",
+                    other
+                );
+                continue;
+            }
+            Err(err) => {
+                warn!(
+                    "Operator surface query worker failed to subscribe: {}",
+                    err
+                );
+                continue;
+            }
+        }
+
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.recv() => return,
+                task_result = client.recv_task() => match task_result {
+                    Ok(IpcResponse::InboundTask { task_json, .. }) => {
+                        if let Err(err) = handle_operator_surface_query_task(
+                            &mut client,
+                            &local_node_id,
+                            &task_json,
+                        ).await {
+                            warn!("Operator surface query worker failed: {}", err);
+                        }
+                    }
+                    Ok(other) => {
+                        debug!("Operator surface query worker ignoring envelope: {:?}", other);
+                    }
+                    Err(err) => {
+                        warn!("Operator surface query worker disconnected: {}", err);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn handle_operator_surface_query_task(
+    client: &mut PhiloticClient,
+    local_node_id: &str,
+    task_json: &str,
+) -> Result<()> {
+    let payload: OperatorSurfaceQueryHandoff = serde_json::from_str(task_json)
+        .context("failed to decode operator surface query handoff")?;
+    if payload.handoff_kind != OPERATOR_SURFACE_QUERY_HANDOFF_KIND {
+        anyhow::bail!(
+            "unexpected operator surface handoff kind: [{}]",
+            payload.handoff_kind
+        );
+    }
+
+    let hotel = match client
+        .send_request(IpcRequest::GetDesktopMembraneStatus)
+        .await?
+    {
+        IpcResponse::DesktopMembraneStatusView { membrane_status } => membrane_status,
+        other => anyhow::bail!("unexpected desktop membrane status response: {other:?}"),
+    };
+    let reply_json = match payload.surface.as_str() {
+        "operator.targets.guests" => {
+            let guests = match client
+                .send_request(IpcRequest::QueryOperatorTargetGuests {
+                    target_node_id: local_node_id.to_string(),
+                })
+                .await?
+            {
+                IpcResponse::OperatorTargetGuestsView {
+                    operator_target_guests,
+                } => operator_target_guests.guests,
+                other => anyhow::bail!("unexpected operator target guests response: {other:?}"),
+            };
+            serde_json::to_string(&OperatorTargetGuestInventoryView {
+                target_node_id: local_node_id.to_string(),
+                target_hotel: hotel.hotel.clone(),
+                source_hotel: hotel.hotel,
+                observation_kind: "remote-canonical".into(),
+                available: true,
+                pending_remote_query_state: "none".into(),
+                guests,
+                note: Some("derived from the target hotel's canonical guest table".into()),
+            })?
+        }
+        "operator.targets.status" => {
+            serde_json::to_string(&OperatorTargetStatusView {
+                target_node_id: local_node_id.to_string(),
+                target_hotel: hotel.hotel.clone(),
+                source_hotel: hotel.hotel,
+                observation_kind: "remote-canonical".into(),
+                daemon_status: hotel.daemon,
+                freshness_state: "remote-query-now".into(),
+                freshness_age_secs: 0,
+                freshness_ttl_secs: 0,
+                reachability: None,
+                note: Some("derived from the target hotel's canonical status view".into()),
+            })?
+        }
+        "operator.targets.agents" => {
+            serde_json::to_string(
+                &match client
+                    .send_request(IpcRequest::QueryOperatorTargetAgents {
+                        target_node_id: local_node_id.to_string(),
+                    })
+                    .await?
+                {
+                    IpcResponse::OperatorTargetAgentsView {
+                        operator_target_agents,
+                    } => operator_target_agents,
+                    other => anyhow::bail!(
+                        "unexpected operator target agents response: {other:?}"
+                    ),
+                },
+            )?
+        }
+        _ => return Ok(()),
+    };
+
+    match client
+        .send_request(IpcRequest::EmitTask {
+            target_node: payload.reply_to_node,
+            target_role: payload.reply_to_role,
+            target_guest_id: payload.reply_to_guest_id,
+            task_json: reply_json,
+        })
+        .await?
+    {
+        IpcResponse::Standard { ok: true, .. } => Ok(()),
+        other => {
+            anyhow::bail!("unexpected operator surface query reply emit response: {other:?}")
+        }
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -633,7 +811,11 @@ fn raw_agent_config_for_key(
             }
         }
     }
-    if merged.is_empty() { None } else { Some(merged) }
+    if merged.is_empty() {
+        None
+    } else {
+        Some(merged)
+    }
 }
 
 /// Per-agent guests: one philote per agent profile.
@@ -928,10 +1110,7 @@ fn merge_telegram_entries(
     if let Some(bot_token) = telegram.get("bot_token") {
         // Always store the per-agent key so membrane can retrieve it by agent_key.
         if let Some(key) = agent_key {
-            merged.insert(
-                format!("telegram_bot_token_{key}"),
-                bot_token.clone(),
-            );
+            merged.insert(format!("telegram_bot_token_{key}"), bot_token.clone());
         }
         // Also store the global fallback key for single-agent / legacy configs.
         merged.insert("telegram_bot_token".into(), bot_token.clone());
@@ -1057,7 +1236,10 @@ fn deactivate_legacy_managed_guests(
         legacy_guest_ids.insert(format!("philote-{}", profile.agent_key));
         legacy_guest_ids.insert(format!("{hotel_name}:philote-{}", profile.agent_key));
         legacy_guest_ids.insert(format!("hegemon-gateway-{}", profile.agent_key));
-        legacy_guest_ids.insert(format!("{hotel_name}:hegemon-gateway-{}", profile.agent_key));
+        legacy_guest_ids.insert(format!(
+            "{hotel_name}:hegemon-gateway-{}",
+            profile.agent_key
+        ));
     }
 
     let stale = graph
@@ -1303,14 +1485,21 @@ fn seed_toolset_profiles(graph: &dyn GraphStorage) -> anyhow::Result<()> {
                 "workspace.read".into(),
                 "bash.exec".into(),
             ],
-            allowed_classes: vec!["session".into(), "utility".into(), "config".into(), "shell".into()],
+            allowed_classes: vec![
+                "session".into(),
+                "utility".into(),
+                "config".into(),
+                "shell".into(),
+            ],
             allowed_skills: vec![
                 "skill.crafting".into(),
                 "handoff.to_role".into(),
                 "handoff.back".into(),
                 "role.governance".into(),
             ],
-            description: Some("Admin role profile — full skill crafting and role governance authority.".into()),
+            description: Some(
+                "Admin role profile — full skill crafting and role governance authority.".into(),
+            ),
         },
     ];
 
@@ -2056,7 +2245,8 @@ fn startup_test_db_path() -> PathBuf {
 }
 
 fn startup_test_membrane_guests(hotel_name: &str) -> Result<Vec<GuestRecord>> {
-    let graph = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open(startup_test_db_path())?;
+    let graph =
+        ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open(startup_test_db_path())?;
     let mut membranes = graph
         .list_guests(hotel_name, false)?
         .into_iter()
@@ -3278,7 +3468,11 @@ async fn main() -> Result<()> {
         fs::create_dir_all(pdir)
             .with_context(|| format!("create profile dir {}", pdir.display()))?;
         db_path_buf = pdir.join("context.db");
-        info!("Profile: {}  (DB: {})", std::env::var("PHILOTIC_PROFILE").unwrap_or_default(), db_path_buf.display());
+        info!(
+            "Profile: {}  (DB: {})",
+            std::env::var("PHILOTIC_PROFILE").unwrap_or_default(),
+            db_path_buf.display()
+        );
         &db_path_buf
     } else {
         Path::new("aiua_context.db")
@@ -3434,7 +3628,8 @@ async fn main() -> Result<()> {
         let agent_config = loaded_config_json
             .as_ref()
             .and_then(|cfg| raw_agent_config_for_key(cfg, &hotel_name, &profile.agent_key));
-        let identity = agent_identity_record_for_profile(profile, &hotel_name, agent_config.as_ref());
+        let identity =
+            agent_identity_record_for_profile(profile, &hotel_name, agent_config.as_ref());
         graph_storage
             .upsert_agent_identity(&identity)
             .with_context(|| {
@@ -3476,21 +3671,22 @@ async fn main() -> Result<()> {
 
     // Boot-time MuninnDB config load (Slice D).
     // Returns None if no vault registry is configured; guests fall back to NullMemoryEngine.
-    let muninn_config_arc: Option<Arc<memory_core::MuninnConfig>> =
-        match memory::load_muninn_config(graph_arc.as_ref()) {
-            Ok(Some(cfg)) => {
-                info!(endpoint = %cfg.base_url, vaults = cfg.vault_tokens.len(), "MuninnDB configured");
-                Some(Arc::new(cfg))
-            }
-            Ok(None) => {
-                info!("MuninnDB not configured — guests will use NullMemoryEngine");
-                None
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to load MuninnDB config — continuing without memory");
-                None
-            }
-        };
+    let muninn_config_arc: Option<Arc<memory_core::MuninnConfig>> = match memory::load_muninn_config(
+        graph_arc.as_ref(),
+    ) {
+        Ok(Some(cfg)) => {
+            info!(endpoint = %cfg.base_url, vaults = cfg.vault_tokens.len(), "MuninnDB configured");
+            Some(Arc::new(cfg))
+        }
+        Ok(None) => {
+            info!("MuninnDB not configured — guests will use NullMemoryEngine");
+            None
+        }
+        Err(e) => {
+            warn!(error = %e, "Failed to load MuninnDB config — continuing without memory");
+            None
+        }
+    };
 
     if smoke_mode {
         warn!(
@@ -3675,6 +3871,12 @@ async fn main() -> Result<()> {
             error!("Hotel Front Desk (UDS) failed: {}", e);
         }
     });
+
+    tokio::spawn(run_operator_surface_query_worker(
+        hotel.ipc_socket_path.clone(),
+        caps.node_id.clone(),
+        shutdown_rx.resubscribe(),
+    ));
 
     let execution_inbox_tx = daemon.inbox_tx().clone();
     let execution_caps = caps.clone();
@@ -4054,7 +4256,10 @@ mod tests {
         let guests = default_guest_seed("beta-hotel");
         assert_eq!(guests.len(), 5);
         // Membrane is the first guest from hotel_shared_guests
-        let membrane = guests.iter().find(|g| g.role == "membrane").expect("membrane");
+        let membrane = guests
+            .iter()
+            .find(|g| g.role == "membrane")
+            .expect("membrane");
         let config: serde_json::Value = serde_json::from_str(&membrane.config_json).unwrap();
         assert_eq!(
             config["env"]["PHILOTIC_HOTEL_SOCKET"].as_str(),
@@ -4065,8 +4270,11 @@ mod tests {
         assert!(guests.iter().any(|guest| guest.role == "model.elevenlabs"));
         assert!(guests.iter().any(|guest| guest.role == "tool"));
         // Single membrane uses PHILOTIC_AGENT_ROSTER (not per-agent token key)
-        let roster_json = config["env"]["PHILOTIC_AGENT_ROSTER"].as_str().expect("roster");
-        let roster: Vec<serde_json::Value> = serde_json::from_str(roster_json).expect("parse roster");
+        let roster_json = config["env"]["PHILOTIC_AGENT_ROSTER"]
+            .as_str()
+            .expect("roster");
+        let roster: Vec<serde_json::Value> =
+            serde_json::from_str(roster_json).expect("parse roster");
         assert!(!roster.is_empty());
         assert_eq!(roster[0]["agent_key"].as_str(), Some("beta"));
         assert_eq!(roster[0]["agent_id"].as_str(), Some("agent-beta-01"));
@@ -4083,7 +4291,10 @@ mod tests {
                 import_workspace: None,
             },
         );
-        let membrane_guest = guests.iter().find(|g| g.role == "membrane").expect("membrane");
+        let membrane_guest = guests
+            .iter()
+            .find(|g| g.role == "membrane")
+            .expect("membrane");
         let agent_guest = guests.iter().find(|g| g.role == "agent").expect("agent");
         let membrane: serde_json::Value =
             serde_json::from_str(&membrane_guest.config_json).expect("membrane config");
@@ -4091,8 +4302,11 @@ mod tests {
             serde_json::from_str(&agent_guest.config_json).expect("agent config");
 
         // Single membrane uses PHILOTIC_AGENT_ROSTER; agent_id is embedded in the roster
-        let roster_json = membrane["env"]["PHILOTIC_AGENT_ROSTER"].as_str().expect("roster");
-        let roster: Vec<serde_json::Value> = serde_json::from_str(roster_json).expect("parse roster");
+        let roster_json = membrane["env"]["PHILOTIC_AGENT_ROSTER"]
+            .as_str()
+            .expect("roster");
+        let roster: Vec<serde_json::Value> =
+            serde_json::from_str(roster_json).expect("parse roster");
         assert_eq!(roster[0]["agent_key"].as_str(), Some("beacon"));
         assert_eq!(roster[0]["agent_id"].as_str(), Some("agent-beacon-01"));
 
@@ -4260,8 +4474,16 @@ mod tests {
         });
         let entries = extract_context_graph_entries(&config, Some("default"));
         // Per-agent keys must be present
-        assert!(entries.iter().any(|(k, v)| k == "telegram_bot_token_jane" && v.as_str() == Some("jane-token")));
-        assert!(entries.iter().any(|(k, v)| k == "telegram_bot_token_aria" && v.as_str() == Some("aria-token")));
+        assert!(
+            entries
+                .iter()
+                .any(|(k, v)| k == "telegram_bot_token_jane" && v.as_str() == Some("jane-token"))
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|(k, v)| k == "telegram_bot_token_aria" && v.as_str() == Some("aria-token"))
+        );
     }
 
     #[test]
@@ -4273,12 +4495,18 @@ mod tests {
             import_workspace: None,
         };
         let guests = guest_seed_for_profile("default", &profile);
-        let membrane = guests.iter().find(|g| g.role == "membrane").expect("membrane guest");
+        let membrane = guests
+            .iter()
+            .find(|g| g.role == "membrane")
+            .expect("membrane guest");
         let config: serde_json::Value =
             serde_json::from_str(&membrane.config_json).expect("parse membrane config");
         // Token keys are now embedded in PHILOTIC_AGENT_ROSTER; membrane resolves them at runtime
-        let roster_json = config["env"]["PHILOTIC_AGENT_ROSTER"].as_str().expect("roster");
-        let roster: Vec<serde_json::Value> = serde_json::from_str(roster_json).expect("parse roster");
+        let roster_json = config["env"]["PHILOTIC_AGENT_ROSTER"]
+            .as_str()
+            .expect("roster");
+        let roster: Vec<serde_json::Value> =
+            serde_json::from_str(roster_json).expect("parse roster");
         assert_eq!(roster[0]["agent_key"].as_str(), Some("aria"));
         assert_eq!(roster[0]["agent_id"].as_str(), Some("agent-aria"));
     }
@@ -4330,7 +4558,10 @@ mod tests {
             }
             bundle
         };
-        assert_eq!(identity["identity_text"].as_str(), Some("Workspace identity."));
+        assert_eq!(
+            identity["identity_text"].as_str(),
+            Some("Workspace identity.")
+        );
     }
 
     #[test]
@@ -4427,11 +4658,10 @@ mod tests {
                 hotel_name: hotel_name.into(),
                 guest_id: format!("{hotel_name}:philote-jane"),
                 role: "agent".into(),
-                config_json: serde_json::json!({ "command": "target/debug/philote" })
-                    .to_string(),
+                config_json: serde_json::json!({ "command": "target/debug/philote" }).to_string(),
                 is_active: true,
                 active_pid: None,
-            last_active_at: None,
+                last_active_at: None,
             },
             GuestRecord {
                 hotel_name: hotel_name.into(),
@@ -4440,7 +4670,7 @@ mod tests {
                 config_json: serde_json::json!({ "command": "target/debug/hegemon" }).to_string(),
                 is_active: true,
                 active_pid: None,
-            last_active_at: None,
+                last_active_at: None,
             },
         ];
 
