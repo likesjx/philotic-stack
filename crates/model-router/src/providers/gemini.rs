@@ -106,8 +106,23 @@ impl GeminiProvider {
             .map(|t| {
                 let name = t.get("tool_name").and_then(Value::as_str).unwrap_or("?");
                 let desc = t.get("description").and_then(Value::as_str).unwrap_or("");
+                let required = t
+                    .get("input_schema")
+                    .and_then(|schema| schema.get("required"))
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .filter(|text| !text.is_empty());
                 let brief: String = desc.chars().take(120).collect();
-                format!("  {name}: {brief}")
+                match required {
+                    Some(required) => format!("  {name}: {brief} Required arguments: {required}."),
+                    None => format!("  {name}: {brief}"),
+                }
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -129,7 +144,8 @@ impl GeminiProvider {
         let system_text = format!(
             "You are an agent with tools. To invoke a tool, output ONLY a JSON object with \
              a \"tool_call\" key containing \"tool_name\" (string) and \"arguments\" (object). \
-             Do not include display_text when calling a tool.\n\
+             The arguments must satisfy the selected tool's schema and include every required field. \
+             Do not omit required arguments. Do not include display_text when calling a tool.\n\
              To reply without a tool, output a JSON object with \"display_text\" (your reply, \
              markdown fine) and \"spoken_text\" (conversational version for voice, no markdown).{}{}\n\n\
              Available tools:\n{}",
@@ -440,19 +456,8 @@ impl ModelProvider for GeminiProvider {
 
             // Check if model returned a tool_call instead of display_text.
             if let Ok(parsed) = serde_json::from_str::<Value>(&content) {
-                if let Some(tc) = parsed.get("tool_call") {
-                    let tool_name = tc
-                        .get("tool_name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    let arguments = tc
-                        .get("arguments")
-                        .cloned()
-                        .unwrap_or_else(|| json!({}));
-                    if !tool_name.is_empty() {
-                        return Ok(ProviderOutput::ToolCall { tool_name, arguments });
-                    }
+                if let Some(tool_call) = Self::parse_tool_call_candidate(task, &parsed)? {
+                    return Ok(tool_call);
                 }
             }
             // Also check the raw parsed JSON directly (before display_text wrapping).
@@ -466,19 +471,8 @@ impl ModelProvider for GeminiProvider {
                 .and_then(Value::as_str)
             {
                 if let Ok(parsed) = serde_json::from_str::<Value>(raw_text) {
-                    if let Some(tc) = parsed.get("tool_call") {
-                        let tool_name = tc
-                            .get("tool_name")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
-                        let arguments = tc
-                            .get("arguments")
-                            .cloned()
-                            .unwrap_or_else(|| json!({}));
-                        if !tool_name.is_empty() {
-                            return Ok(ProviderOutput::ToolCall { tool_name, arguments });
-                        }
+                    if let Some(tool_call) = Self::parse_tool_call_candidate(task, &parsed)? {
+                        return Ok(tool_call);
                     }
                 }
             }
@@ -515,12 +509,138 @@ impl ModelProvider for GeminiProvider {
     }
 }
 
+impl GeminiProvider {
+    fn parse_tool_call_candidate(
+        task: &ControllerTask,
+        parsed: &Value,
+    ) -> Result<Option<ProviderOutput>> {
+        let Some(tc) = parsed.get("tool_call") else {
+            return Ok(None);
+        };
+
+        let tool_name = tc
+            .get("tool_name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if tool_name.is_empty() {
+            return Ok(None);
+        }
+
+        let arguments = tc
+            .get("arguments")
+            .cloned()
+            .context("tool_call.arguments missing from Gemini response")?;
+        Self::validate_tool_call(task, &tool_name, &arguments)?;
+
+        Ok(Some(ProviderOutput::ToolCall {
+            tool_name,
+            arguments,
+        }))
+    }
+
+    fn validate_tool_call(task: &ControllerTask, tool_name: &str, arguments: &Value) -> Result<()> {
+        let Some(tool_def) = task.tools.iter().find(|tool| {
+            tool.get("tool_name")
+                .and_then(Value::as_str)
+                .map(|name| name == tool_name)
+                .unwrap_or(false)
+        }) else {
+            bail!("Gemini returned unsupported tool_call [{}]", tool_name);
+        };
+
+        let args_obj = arguments
+            .as_object()
+            .with_context(|| format!("tool_call.arguments for [{}] must be an object", tool_name))?;
+
+        let required = tool_def
+            .get("input_schema")
+            .and_then(|schema| schema.get("required"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        for field in required.iter().filter_map(Value::as_str) {
+            let value = args_obj.get(field);
+            if value.is_none() || value.is_some_and(Value::is_null) {
+                bail!(
+                    "Gemini returned invalid tool_call [{}]: missing required argument [{}]",
+                    tool_name,
+                    field
+                );
+            }
+        }
+
+        if let Some(properties) = tool_def
+            .get("input_schema")
+            .and_then(|schema| schema.get("properties"))
+            .and_then(Value::as_object)
+        {
+            for (field, value) in args_obj {
+                let Some(expected_type) = properties
+                    .get(field)
+                    .and_then(|property| property.get("type"))
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+
+                let type_ok = match expected_type {
+                    "string" => value.is_string(),
+                    "integer" => value.as_i64().is_some(),
+                    "number" => value.as_f64().is_some(),
+                    "boolean" => value.is_boolean(),
+                    "array" => value.is_array(),
+                    "object" => value.is_object(),
+                    _ => true,
+                };
+
+                if !type_ok {
+                    bail!(
+                        "Gemini returned invalid tool_call [{}]: argument [{}] did not match expected type [{}]",
+                        tool_name,
+                        field,
+                        expected_type
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{GeminiAuth, GeminiProvider};
     use crate::controller::{
         AttachmentInput, ContextEnvelope, ControllerTask, RequestClass, RoutingHints, TaskKind,
     };
+
+    fn minimal_text_task_with_tools(tools: Vec<serde_json::Value>) -> ControllerTask {
+        ControllerTask {
+            kind: TaskKind::TextGenerate,
+            request_class: RequestClass::Cognitive,
+            provider: None,
+            model: None,
+            prompt: Some("test prompt".into()),
+            text: None,
+            spoken_text: None,
+            display_text: None,
+            voice: None,
+            voice_id: None,
+            output_format: None,
+            language_code: None,
+            response_contract: Default::default(),
+            context: Default::default(),
+            context_projection: Default::default(),
+            affordances: Default::default(),
+            routing_hints: RoutingHints::default(),
+            provider_options: Default::default(),
+            tools,
+        }
+    }
 
     #[test]
     fn prefers_oauth_bearer_over_api_key() {
@@ -746,6 +866,65 @@ mod tests {
         };
 
         assert!(crate::controller::ModelProvider::supports(&provider, &task));
+    }
+
+    #[test]
+    fn rejects_tool_call_missing_required_argument() {
+        let task = minimal_text_task_with_tools(vec![serde_json::json!({
+                "tool_name": "echo",
+                "description": "Echo text",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "text": { "type": "string" }
+                    },
+                    "required": ["text"]
+                }
+            })]);
+
+        let parsed = serde_json::json!({
+            "tool_call": {
+                "tool_name": "echo",
+                "arguments": {}
+            }
+        });
+
+        let err = GeminiProvider::parse_tool_call_candidate(&task, &parsed)
+            .expect_err("missing required argument should fail");
+        assert!(err.to_string().contains("missing required argument [text]"));
+    }
+
+    #[test]
+    fn accepts_tool_call_with_required_argument() {
+        let task = minimal_text_task_with_tools(vec![serde_json::json!({
+                "tool_name": "echo",
+                "description": "Echo text",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "text": { "type": "string" }
+                    },
+                    "required": ["text"]
+                }
+            })]);
+
+        let parsed = serde_json::json!({
+            "tool_call": {
+                "tool_name": "echo",
+                "arguments": { "text": "hello" }
+            }
+        });
+
+        let output = GeminiProvider::parse_tool_call_candidate(&task, &parsed)
+            .expect("valid tool call should parse")
+            .expect("tool call should be present");
+        assert_eq!(
+            output,
+            crate::controller::ProviderOutput::ToolCall {
+                tool_name: "echo".into(),
+                arguments: serde_json::json!({ "text": "hello" })
+            }
+        );
     }
 }
 
