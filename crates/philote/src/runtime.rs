@@ -641,28 +641,38 @@ impl AgentRuntime {
 
                     match serde_json::from_str::<InboundTaskPayload>(&task_json) {
                         Ok(task) if task.is_model_response() => {
+                            let task_ref = task.clone();
                             if let Err(err) = self.handle_model_response(task).await {
                                 error!("Failed to handle model response: {}", err);
+                                let _ = self.emit_error_reply(&task_ref, task_id, err).await;
                             }
                         }
                         Ok(task) if task.is_tool_result() => {
+                            let task_ref = task.clone();
                             if let Err(err) = self.handle_tool_result(task).await {
                                 error!("Failed to handle tool result: {}", err);
+                                let _ = self.emit_error_reply(&task_ref, task_id, err).await;
                             }
                         }
                         Ok(task) if task.action.as_deref() == Some("handoff_bundle") => {
+                            let task_ref = task.clone();
                             if let Err(err) = self.handle_handoff_bundle(task, task_id).await {
                                 error!("Failed to handle handoff_bundle: {}", err);
+                                let _ = self.emit_error_reply(&task_ref, task_id, err).await;
                             }
                         }
                         Ok(task) if task.action.as_deref() == Some("handoff_return") => {
+                            let task_ref = task.clone();
                             if let Err(err) = self.handle_handoff_return(task, task_id).await {
                                 error!("Failed to handle handoff_return: {}", err);
+                                let _ = self.emit_error_reply(&task_ref, task_id, err).await;
                             }
                         }
                         Ok(task) => {
+                            let task_ref = task.clone();
                             if let Err(err) = self.handle_user_message(task, task_id).await {
                                 error!("Failed to handle user message: {}", err);
+                                let _ = self.emit_error_reply(&task_ref, task_id, err).await;
                             }
                         }
                         Err(err) => warn!("Could not parse inbound task payload: {}", err),
@@ -2185,6 +2195,49 @@ impl AgentRuntime {
     ///
     /// Silently skips if there is no active turn or the session is unknown — turn events are
     /// best-effort delivery signals, not transactional guarantees.
+    async fn emit_error_reply(
+        &mut self,
+        task: &InboundTaskPayload,
+        task_id: Uuid,
+        err: anyhow::Error,
+    ) -> Result<()> {
+        let (final_reply_to, final_reply_role, final_reply_guest_id) = (
+            task.final_reply_to
+                .clone()
+                .unwrap_or_else(|| local_node_id()),
+            task.final_reply_role
+                .clone()
+                .unwrap_or_else(|| DEFAULT_REPLY_ROLE.to_string()),
+            task.final_reply_guest_id.clone(),
+        );
+        let session_id = task.session_id_or_default(&self.agent_id);
+        let turn_id = task.turn_id.clone().unwrap_or_else(|| task_id.to_string());
+        let chat_id = task.chat_id.clone().unwrap_or_default();
+
+        let content = format!("⚠️ Agent Error: {}", err);
+
+        let payload = FinalReplyPayload {
+            action: "send_reply",
+            session_id,
+            turn_id,
+            chat_id,
+            content,
+            audio_artifact: None,
+            send_text_caption: false,
+        };
+
+        self.ipc_client
+            .send_request(IpcRequest::EmitTask {
+                target_node: final_reply_to,
+                target_role: final_reply_role,
+                target_guest_id: final_reply_guest_id,
+                task_json: serde_json::to_string(&payload)?,
+            })
+            .await?;
+
+        Ok(())
+    }
+
     async fn emit_turn_event(
         &mut self,
         session_id: &str,
