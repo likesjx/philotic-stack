@@ -668,6 +668,13 @@ impl AgentRuntime {
                                 let _ = self.emit_error_reply(&task_ref, task_id, err).await;
                             }
                         }
+                        Ok(task) if task.action.as_deref() == Some("peer.delegate") => {
+                            let task_ref = task.clone();
+                            if let Err(err) = self.handle_user_message(task, task_id).await {
+                                error!("Failed to handle peer delegation as user message: {}", err);
+                                let _ = self.emit_error_reply(&task_ref, task_id, err).await;
+                            }
+                        }
                         Ok(task) => {
                             let task_ref = task.clone();
                             if let Err(err) = self.handle_user_message(task, task_id).await {
@@ -5129,6 +5136,261 @@ impl AgentRuntime {
                         let err = TaskErrorPayload::transport_error(
                             "philote",
                             format!("handoff.back: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(content),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                })
+                .await
+            }
+
+            "delegate.to_peer" => {
+                let args = payload.arguments.as_object();
+                let target_agent_id = args
+                    .and_then(|a| a.get("target_agent_id"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let task_description = args
+                    .and_then(|a| a.get("task_description"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let context_package = args
+                    .and_then(|a| a.get("context_package"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+
+                let Some(target_agent_id) = target_agent_id else {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "delegate.to_peer: missing required argument 'target_agent_id'".into(),
+                        )
+                        .await;
+                };
+                let Some(task_description) = task_description else {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "delegate.to_peer: missing required argument 'task_description'".into(),
+                        )
+                        .await;
+                };
+                let Some(context_package) = context_package else {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "delegate.to_peer: missing required argument 'context_package'".into(),
+                        )
+                        .await;
+                };
+
+                let expected_artifacts: Vec<String> = args
+                    .and_then(|a| a.get("expected_artifacts"))
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let timeout_secs = args
+                    .and_then(|a| a.get("timeout_secs"))
+                    .and_then(|v| v.as_u64());
+
+                let _ = self
+                    .emit_partial_reply(
+                        &payload.session_id,
+                        format!("Let me hand you over to {} to help with this...", target_agent_id),
+                    )
+                    .await;
+
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::DelegateToPeer {
+                        target_agent_id: target_agent_id.clone(),
+                        task_description,
+                        context_package,
+                        expected_artifacts,
+                        timeout_secs,
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::DelegationAck {
+                        delegation_id,
+                        status,
+                    }) => (
+                        format!("Delegated task to peer '{target_agent_id}' (delegation {delegation_id}, status: {status})."),
+                        None,
+                    ),
+                    Ok(IpcResponse::Error(msg)) => {
+                        let e = TaskErrorPayload::tool_execution(
+                            "delegate.to_peer",
+                            msg,
+                            Some("DELEGATION_REJECTED"),
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => {
+                        let e = TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            "delegate.to_peer: unexpected hotel response",
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("delegate.to_peer: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(content),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                })
+                .await
+            }
+
+            "delegate.to_external_cognitive_peer" => {
+                let args = payload.arguments.as_object();
+                let target_peer_type = args
+                    .and_then(|a| a.get("target_peer_type"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let task_description = args
+                    .and_then(|a| a.get("task_description"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let context_package = args
+                    .and_then(|a| a.get("context_package"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+
+                let Some(target_peer_type) = target_peer_type else {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "delegate.to_external_cognitive_peer: missing required argument 'target_peer_type'".into(),
+                        )
+                        .await;
+                };
+                let Some(task_description) = task_description else {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "delegate.to_external_cognitive_peer: missing required argument 'task_description'".into(),
+                        )
+                        .await;
+                };
+                let Some(context_package) = context_package else {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "delegate.to_external_cognitive_peer: missing required argument 'context_package'".into(),
+                        )
+                        .await;
+                };
+
+                let expected_artifacts: Vec<String> = args
+                    .and_then(|a| a.get("expected_artifacts"))
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::DelegateToExternalPeer {
+                        target_peer_type: target_peer_type.clone(),
+                        task_description,
+                        context_package,
+                        expected_artifacts,
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::DelegationAck {
+                        delegation_id,
+                        status,
+                    }) => (
+                        format!("Delegated task to external peer type '{target_peer_type}' (delegation {delegation_id}, status: {status})."),
+                        None,
+                    ),
+                    Ok(IpcResponse::Error(msg)) => {
+                        let e = TaskErrorPayload::tool_execution(
+                            "delegate.to_external_cognitive_peer",
+                            msg,
+                            Some("DELEGATION_REJECTED"),
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => {
+                        let e = TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            "delegate.to_external_cognitive_peer: unexpected hotel response",
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("delegate.to_external_cognitive_peer: IPC transport error — {e}"),
                         );
                         (err.display_message(), Some(err))
                     }

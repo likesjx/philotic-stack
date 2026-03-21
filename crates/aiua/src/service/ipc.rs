@@ -3210,12 +3210,45 @@ impl IpcServer {
                         }
                     };
                 let task_id = Uuid::new_v4();
+                
+                // Construct the SessionControl envelope for durable mesh ledger tracking
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                    
+                let event = EventEnvelope {
+                    event_id: task_id,
+                    seq: 0,
+                    source_node_id: local_node_id.to_string(),
+                    target_node_id: Some(local_node_id.to_string()),
+                    source_agent_id: identity.guest_id.clone(),
+                    target_agent_id: Some(target_guest_id.clone()),
+                    kind: ansible_mesh_core::event::EventKind::SessionControl,
+                    corr_id: session_id.clone(),
+                    attempt: 0,
+                    created_at: ts,
+                    expires_at: None,
+                    payload: ansible_mesh_core::event::EventPayload::Inline {
+                        data: serde_json::json!({
+                            "action": "session.handoff",
+                            "session_id": session_id,
+                            "role_name": role_name,
+                            "handoff_bundle": handoff_bundle,
+                        })
+                        .to_string(),
+                    },
+                    trace: vec![],
+                };
+                let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(event)).await;
+
                 let task_json = serde_json::json!({
                     "action": "handoff_bundle",
                     "session_id": session_id,
                     "handoff_bundle": handoff_bundle,
                 })
                 .to_string();
+                
                 match Self::queue_or_deliver_guest_task(
                     graph,
                     inboxes,
@@ -3273,6 +3306,37 @@ impl IpcServer {
                         }
                     };
                 let task_id = Uuid::new_v4();
+
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                    
+                let event = EventEnvelope {
+                    event_id: task_id,
+                    seq: 0,
+                    source_node_id: local_node_id.to_string(),
+                    target_node_id: Some(local_node_id.to_string()),
+                    source_agent_id: identity.guest_id.clone(),
+                    target_agent_id: Some(target_guest_id.clone()),
+                    kind: ansible_mesh_core::event::EventKind::SessionControl,
+                    corr_id: session_id.clone(),
+                    attempt: 0,
+                    created_at: ts,
+                    expires_at: None,
+                    payload: ansible_mesh_core::event::EventPayload::Inline {
+                        data: serde_json::json!({
+                            "action": "session.handoff_back",
+                            "session_id": session_id,
+                            "summary": summary,
+                            "from_incarnation_id": identity.guest_id,
+                        })
+                        .to_string(),
+                    },
+                    trace: vec![],
+                };
+                let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(event)).await;
+
                 let task_json = serde_json::json!({
                     "action": "handoff_return",
                     "session_id": session_id,
@@ -3303,6 +3367,117 @@ impl IpcServer {
                         "HANDOFF_DELIVERY_FAILED",
                         err.to_string(),
                     ),
+                }
+            }
+            IpcRequest::DelegateToPeer {
+                target_agent_id,
+                task_description,
+                context_package,
+                expected_artifacts,
+                timeout_secs,
+            } => {
+                let Some(identity) = current_identity.as_ref() else {
+                    return IpcResponse::error(
+                        "delegate_to_peer",
+                        "DELEGATION_UNREGISTERED",
+                        "guest must register before requesting peer delegation",
+                    );
+                };
+
+                let delegation_id = Uuid::new_v4();
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                // Build the mesh envelope for TaskInvoke
+                let env = EventEnvelope {
+                    event_id: delegation_id,
+                    seq: 0,
+                    source_node_id: local_node_id.to_string(),
+                    target_node_id: None, // Router will resolve node for agent_id
+                    source_agent_id: identity.guest_id.clone(),
+                    target_agent_id: Some(target_agent_id.clone()),
+                    kind: ansible_mesh_core::event::EventKind::TaskInvoke,
+                    corr_id: delegation_id.to_string(),
+                    attempt: 0,
+                    created_at: ts,
+                    expires_at: timeout_secs.map(|s| ts + s),
+                    payload: ansible_mesh_core::event::EventPayload::Inline {
+                        data: serde_json::json!({
+                            "action": "peer.delegate",
+                            "content": format!(
+                                "Handoff from peer {}:\n\nTask: {}\n\nContext:\n{}\n\nExpected Artifacts: {:?}",
+                                identity.guest_id, task_description, context_package, expected_artifacts
+                            ),
+                            "task": task_description,
+                            "context": context_package,
+                            "expected_artifacts": expected_artifacts,
+                        })
+                        .to_string(),
+                    },
+                    trace: vec![],
+                };
+
+                let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(env)).await;
+
+                IpcResponse::DelegationAck {
+                    delegation_id: delegation_id.to_string(),
+                    status: "dispatched".into(),
+                }
+            }
+            IpcRequest::DelegateToExternalPeer {
+                target_peer_type,
+                task_description,
+                context_package,
+                expected_artifacts,
+            } => {
+                let Some(identity) = current_identity.as_ref() else {
+                    return IpcResponse::error(
+                        "delegate_to_external_peer",
+                        "DELEGATION_UNREGISTERED",
+                        "guest must register before requesting external delegation",
+                    );
+                };
+
+                let delegation_id = Uuid::new_v4();
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                // Handle external delegation - locally recorded for visibility/trace
+                // even if handled by a specific hotel-side connector later.
+                let env = EventEnvelope {
+                    event_id: delegation_id,
+                    seq: 0,
+                    source_node_id: local_node_id.to_string(),
+                    target_node_id: Some(local_node_id.to_string()),
+                    source_agent_id: identity.guest_id.clone(),
+                    target_agent_id: Some(format!("external:{}", target_peer_type)),
+                    kind: ansible_mesh_core::event::EventKind::TaskInvoke,
+                    corr_id: delegation_id.to_string(),
+                    attempt: 0,
+                    created_at: ts,
+                    expires_at: None,
+                    payload: ansible_mesh_core::event::EventPayload::Inline {
+                        data: serde_json::json!({
+                            "action": "external.delegate",
+                            "peer_type": target_peer_type,
+                            "task": task_description,
+                            "context": context_package,
+                            "expected_artifacts": expected_artifacts,
+                        })
+                        .to_string(),
+                    },
+                    trace: vec![],
+                };
+
+                let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(env)).await;
+
+                IpcResponse::DelegationAck {
+                    delegation_id: delegation_id.to_string(),
+                    status: "dispatched_external".into(),
                 }
             }
             IpcRequest::SpawnSubagent {
