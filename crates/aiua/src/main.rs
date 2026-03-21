@@ -1833,6 +1833,18 @@ fn seed_abstract_skill_catalog(graph: &dyn GraphStorage) -> anyhow::Result<()> {
             }),
             ..Default::default()
         },
+        AbstractSkillRecord {
+            skill_name: "delegate.to_peer".into(),
+            description: "Cross-agent delegation: hand off a bounded task to another trusted peer agent on the mesh instead of changing roles. Best for leveraging a different identity, rather than shifting internal capabilities.".into(),
+            implied_tools: vec!["delegate.to_peer".into()],
+            ..Default::default()
+        },
+        AbstractSkillRecord {
+            skill_name: "delegate.to_external_cognitive_peer".into(),
+            description: "External delegation: hand off a bounded task to an unmanaged external system like Claude Code or Codex. Best when crossing deep security or execution boundaries where managed Philotic actors cannot natively reach.".into(),
+            implied_tools: vec!["delegate.to_external_cognitive_peer".into()],
+            ..Default::default()
+        },
     ];
 
     for skill in &catalog {
@@ -1861,6 +1873,8 @@ fn seed_toolset_profiles(graph: &dyn GraphStorage) -> anyhow::Result<()> {
                 "handoff.back".into(),
                 "role.governance".into(),
                 "role.authoring".into(),
+                "delegate.to_peer".into(),
+                "delegate.to_external_cognitive_peer".into(),
             ],
             description: Some("Default orchestrator role profile.".into()),
         },
@@ -1918,6 +1932,8 @@ fn seed_toolset_profiles(graph: &dyn GraphStorage) -> anyhow::Result<()> {
                 "handoff.back".into(),
                 "role.governance".into(),
                 "role.authoring".into(),
+                "delegate.to_peer".into(),
+                "delegate.to_external_cognitive_peer".into(),
             ],
             description: Some(
                 "Admin role profile — full skill crafting and role governance authority.".into(),
