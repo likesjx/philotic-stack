@@ -3,8 +3,8 @@ use crate::r#loop::{
     AgentAction, ApprovalRequest, ToolCall, ToolResult, TurnPhase, interpret_model_payload,
 };
 use crate::protocol::{
-    FinalReplyPayload, InboundTaskPayload, ModelRequestPayload, TaskRunnerOverlay,
-    ToolExecutionPayload, TransportAttachment, TurnEventPayload,
+    FinalReplyPayload, InboundTaskPayload, ModelRequestPayload, PartialReplyPayload,
+    TaskRunnerOverlay, ToolExecutionPayload, TransportAttachment, TurnEventPayload,
 };
 use crate::session::{
     AgentProfile, MediaRoutingPolicy, SessionState, ToolExecutionRoute, TtsMode,
@@ -1061,6 +1061,20 @@ impl AgentRuntime {
             .filter(|s| !s.trim().is_empty())
             .map(str::to_string);
 
+        let partial_replies = model_result
+            .and_then(|r| r.get("partial_replies"))
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
         let memory_concept = model_result
             .and_then(|r| r.get("memory_concept"))
             .and_then(serde_json::Value::as_str)
@@ -1099,6 +1113,9 @@ impl AgentRuntime {
 
         match action {
             AgentAction::Respond { content } => {
+                for partial in partial_replies {
+                    self.emit_partial_reply(&session_id, partial).await?;
+                }
                 self.complete_agent_response(
                     session_id,
                     turn_id,
@@ -1281,6 +1298,43 @@ impl AgentRuntime {
                 target_role: final_reply_role,
                 target_guest_id: final_reply_guest_id,
                 task_json: serde_json::to_string(&reply_payload)?,
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    async fn emit_partial_reply(&mut self, session_id: &str, content: String) -> Result<()> {
+        let (turn_id, chat_id, final_reply_to, final_reply_role, final_reply_guest_id) = {
+            let Some(state) = self.sessions.get(session_id) else {
+                return Ok(());
+            };
+            let Some(active_turn) = state.active_turn.as_ref() else {
+                return Ok(());
+            };
+            (
+                active_turn.turn_id.clone(),
+                active_turn.chat_id.clone(),
+                active_turn.final_reply_to.clone(),
+                active_turn.final_reply_role.clone(),
+                active_turn.final_reply_guest_id.clone(),
+            )
+        };
+
+        let payload = PartialReplyPayload {
+            action: "partial_reply",
+            session_id: session_id.to_string(),
+            turn_id,
+            chat_id,
+            content,
+        };
+
+        self.ipc_client
+            .send_request(IpcRequest::EmitTask {
+                target_node: final_reply_to,
+                target_role: final_reply_role,
+                target_guest_id: final_reply_guest_id,
+                task_json: serde_json::to_string(&payload)?,
             })
             .await?;
 

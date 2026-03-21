@@ -43,9 +43,10 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use philotic_client::{
     DesktopMembraneAgentView, DesktopMembraneGuestView, DesktopMembraneStatusView,
-    GuestIdentity, IpcRequest, IpcResponse, LeaseEnvelope, OperatorChatTurnReply,
+    GuestIdentity, IpcRequest, IpcResponse, LeaseEnvelope,
     OperatorTargetAgentInventoryView, OperatorTargetGuestInventoryView,
     OperatorTargetStatusView, OperatorTargetView, PhiloticClient,
+    OPERATOR_CHAT_REPLY_ROLE,
 };
 
 // ── Embedded UI assets ────────────────────────────────────────────────────────
@@ -81,6 +82,18 @@ struct OperatorChatTurnBody {
     #[serde(default)]
     conversation_id: Option<String>,
     content: String,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct OperatorChatAcceptedView {
+    accepted: bool,
+    target_node_id: String,
+    target_agent_id: String,
+    operator_session_id: String,
+    conversation_id: String,
+    session_id: String,
+    turn_id: String,
+    delivery_kind: String,
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -663,33 +676,230 @@ async fn handle_mesh_target_agent_chat(
     let operator_session_id = body
         .operator_session_id
         .unwrap_or_else(|| "desktop-membrane".into());
-    match ipc_send_operator_chat_turn(
-        &target_node_id,
-        &agent_id,
-        &operator_session_id,
-        body.conversation_id.as_deref(),
-        &body.content,
-    )
-    .await
-    {
-        Ok(reply) => {
-            let event = json!({
-                "type": "operator_chat:reply",
-                "payload": reply
-            });
-            let _ = state.tx.send(event.to_string());
-            Json(event["payload"].clone()).into_response()
-        }
+
+    let targets = match ipc_desktop_membrane_targets().await {
+        Ok(targets) => targets,
         Err(err) => {
-            let status_code = if err
-                .to_string()
-                .contains("not currently active in the registry")
-            {
-                StatusCode::NOT_FOUND
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            (status_code, Json(json!({"error": err.to_string()}))).into_response()
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": err.to_string()})),
+            )
+                .into_response()
+        }
+    };
+    let Some(target) = targets
+        .iter()
+        .find(|target| target.target_node_id == target_node_id)
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("mesh target [{target_node_id}] is not currently active in the registry")})),
+        )
+            .into_response();
+    };
+    let Some(local_target) = targets.iter().find(|target| target.is_local) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "local operator target is unavailable"})),
+        )
+            .into_response();
+    };
+    let local_node_id = local_target.target_node_id.clone();
+
+    let conversation_id = body
+        .conversation_id
+        .unwrap_or_else(|| format!("operator-chat:{operator_session_id}:{agent_id}"));
+    let session_id = conversation_id.clone();
+    let turn_id = new_operator_chat_id("operator-chat-turn");
+    let accepted = OperatorChatAcceptedView {
+        accepted: true,
+        target_node_id: target_node_id.clone(),
+        target_agent_id: agent_id.clone(),
+        operator_session_id: operator_session_id.clone(),
+        conversation_id: conversation_id.clone(),
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+        delivery_kind: if target.is_local {
+            "local-direct".into()
+        } else {
+            "router-routed".into()
+        },
+    };
+
+    let tx = state.tx.clone();
+    let accepted_for_error = accepted.clone();
+    tokio::spawn(async move {
+        if let Err(err) = stream_operator_chat_turn(
+            tx.clone(),
+            local_node_id,
+            target_node_id,
+            agent_id,
+            operator_session_id,
+            conversation_id,
+            session_id,
+            turn_id,
+            body.content,
+        )
+        .await
+        {
+            let _ = tx.send(
+                json!({
+                    "type": "operator_chat:error",
+                    "payload": {
+                        "target_node_id": accepted_for_error.target_node_id,
+                        "target_agent_id": accepted_for_error.target_agent_id,
+                        "operator_session_id": accepted_for_error.operator_session_id,
+                        "conversation_id": accepted_for_error.conversation_id,
+                        "session_id": accepted_for_error.session_id,
+                        "turn_id": accepted_for_error.turn_id,
+                        "message": err.to_string(),
+                    }
+                })
+                .to_string(),
+            );
+        }
+    });
+
+    (StatusCode::ACCEPTED, Json(json!(accepted))).into_response()
+}
+
+async fn stream_operator_chat_turn(
+    tx: broadcast::Sender<String>,
+    local_node_id: String,
+    target_node_id: String,
+    agent_id: String,
+    operator_session_id: String,
+    conversation_id: String,
+    session_id: String,
+    turn_id: String,
+    content: String,
+) -> Result<()> {
+    let reply_guest_id = new_operator_chat_id("operator-chat");
+    let mut client = connect_client_with_identity(GuestIdentity {
+        guest_id: reply_guest_id.clone(),
+        role: OPERATOR_CHAT_REPLY_ROLE.into(),
+        supported_tools: vec![],
+    })
+    .await?;
+
+    match client
+        .send_request(IpcRequest::SubscribeInbox {
+            role: OPERATOR_CHAT_REPLY_ROLE.into(),
+        })
+        .await?
+    {
+        IpcResponse::Standard { ok: true, .. } => {}
+        other => bail!("unexpected operator chat inbox subscribe response: {other:?}"),
+    }
+
+    match client
+        .send_request(IpcRequest::EmitTask {
+            target_node: target_node_id.clone(),
+            target_role: "agent".into(),
+            target_guest_id: Some(agent_id.clone()),
+            task_json: json!({
+                "source": "operator_chat",
+                "transport": "operator_chat",
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "chat_id": conversation_id,
+                "content": content,
+                "final_reply_to": local_node_id,
+                "final_reply_role": OPERATOR_CHAT_REPLY_ROLE,
+                "final_reply_guest_id": reply_guest_id
+            })
+            .to_string(),
+        })
+        .await?
+    {
+        IpcResponse::Standard { ok: true, .. } => {}
+        other => bail!("unexpected operator chat emit response: {other:?}"),
+    }
+
+    loop {
+        let inbound = tokio::time::timeout(Duration::from_secs(30), client.recv_task())
+            .await
+            .map_err(|_| anyhow!("timed out waiting for operator chat reply"))??;
+        let IpcResponse::InboundTask { task_json, .. } = inbound else {
+            bail!("unexpected operator chat reply envelope: {inbound:?}");
+        };
+        let payload: Value = serde_json::from_str(&task_json)?;
+        let action = payload
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("send_reply");
+        match action {
+            "turn_event" => {
+                let _ = tx.send(
+                    json!({
+                        "type": "operator_chat:turn_event",
+                        "payload": {
+                            "target_node_id": target_node_id,
+                            "target_agent_id": agent_id,
+                            "operator_session_id": operator_session_id,
+                            "conversation_id": payload.get("chat_id").and_then(Value::as_str).unwrap_or(&conversation_id),
+                            "session_id": payload.get("session_id").and_then(Value::as_str).unwrap_or(&session_id),
+                            "turn_id": payload.get("turn_id").and_then(Value::as_str).unwrap_or(&turn_id),
+                            "event": payload.get("event").and_then(Value::as_str).unwrap_or("unknown")
+                        }
+                    })
+                    .to_string(),
+                );
+            }
+            "partial_reply" => {
+                let _ = tx.send(
+                    json!({
+                        "type": "operator_chat:partial_reply",
+                        "payload": {
+                            "target_node_id": target_node_id,
+                            "target_agent_id": agent_id,
+                            "operator_session_id": operator_session_id,
+                            "conversation_id": payload.get("chat_id").and_then(Value::as_str).unwrap_or(&conversation_id),
+                            "session_id": payload.get("session_id").and_then(Value::as_str).unwrap_or(&session_id),
+                            "turn_id": payload.get("turn_id").and_then(Value::as_str).unwrap_or(&turn_id),
+                            "content": payload.get("content").and_then(Value::as_str).unwrap_or_default()
+                        }
+                    })
+                    .to_string(),
+                );
+            }
+            "send_reply" => {
+                let _ = tx.send(
+                    json!({
+                        "type": "operator_chat:reply",
+                        "payload": {
+                            "target_node_id": target_node_id,
+                            "target_agent_id": agent_id,
+                            "operator_session_id": operator_session_id,
+                            "conversation_id": payload.get("chat_id").and_then(Value::as_str).unwrap_or(&conversation_id),
+                            "session_id": payload.get("session_id").and_then(Value::as_str).unwrap_or(&session_id),
+                            "turn_id": payload.get("turn_id").and_then(Value::as_str).unwrap_or(&turn_id),
+                            "reply_action": action,
+                            "content": payload.get("content").and_then(Value::as_str).unwrap_or_default()
+                        }
+                    })
+                    .to_string(),
+                );
+                return Ok(());
+            }
+            other => {
+                let _ = tx.send(
+                    json!({
+                        "type": "operator_chat:event",
+                        "payload": {
+                            "target_node_id": target_node_id,
+                            "target_agent_id": agent_id,
+                            "operator_session_id": operator_session_id,
+                            "conversation_id": payload.get("chat_id").and_then(Value::as_str).unwrap_or(&conversation_id),
+                            "session_id": payload.get("session_id").and_then(Value::as_str).unwrap_or(&session_id),
+                            "turn_id": payload.get("turn_id").and_then(Value::as_str).unwrap_or(&turn_id),
+                            "action": other,
+                            "payload": payload
+                        }
+                    })
+                    .to_string(),
+                );
+            }
         }
     }
 }
@@ -911,41 +1121,23 @@ async fn ipc_desktop_membrane_target_agents(
     }
 }
 
-async fn ipc_send_operator_chat_turn(
-    target_node_id: &str,
-    agent_id: &str,
-    operator_session_id: &str,
-    conversation_id: Option<&str>,
-    content: &str,
-) -> Result<OperatorChatTurnReply> {
-    let mut client = connect_management_client("philotic-web-operator-chat").await?;
-    match client
-        .send_request(IpcRequest::SendOperatorChatTurn {
-            target_node_id: target_node_id.to_string(),
-            target_agent_id: agent_id.to_string(),
-            operator_session_id: operator_session_id.to_string(),
-            conversation_id: conversation_id.map(str::to_string),
-            content: content.to_string(),
-        })
-        .await?
-    {
-        IpcResponse::OperatorChatTurnReply {
-            operator_chat_reply,
-        } => Ok(operator_chat_reply),
-        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
-        other => Err(anyhow!(
-            "unexpected operator chat response: {other:?}"
-        )),
-    }
+fn new_operator_chat_id(prefix: &str) -> String {
+    let mut rng = rand::thread_rng();
+    let suffix = format!("{:016x}", rng.r#gen::<u64>());
+    format!("{prefix}-{suffix}")
 }
 
 async fn connect_management_client(guest_id: &str) -> Result<PhiloticClient> {
-    let socket = crate::start::socket_path("aiua");
-    let identity = GuestIdentity {
+    connect_client_with_identity(GuestIdentity {
         guest_id: guest_id.into(),
         role: "management".into(),
         supported_tools: vec![],
-    };
+    })
+    .await
+}
+
+async fn connect_client_with_identity(identity: GuestIdentity) -> Result<PhiloticClient> {
+    let socket = crate::start::socket_path("aiua");
     PhiloticClient::connect_at(&socket, identity)
         .await
         .map_err(Into::into)

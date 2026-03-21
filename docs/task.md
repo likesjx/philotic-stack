@@ -910,8 +910,16 @@ Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membra
     - [x] add first turn-event observation for operator chat replies
       - `SendOperatorChatTurn` now keeps listening for `turn_event` messages before the final reply
       - observed events are returned in the `OperatorChatTurnReply` envelope
-    - [ ] add live push reply streaming for operator chat while the turn is still in flight
-    - [ ] prove remote-hotel routed operator chat end-to-end
+    - [x] add live push reply streaming for operator chat while the turn is still in flight
+      - desktop chat route now returns `202 Accepted`
+      - `philotic-web` streams `operator_chat:turn_event`, `operator_chat:reply`, and `operator_chat:error` over `/ws` while the routed turn is active
+      - `operator_chat:partial_reply` is now preserved as a non-terminal websocket frame too
+    - [x] prove remote-hotel routed operator chat end-to-end
+      - targeted `aiua` test now runs a local hotel, a remote hotel, and bidirectional bridge relays so a routed operator chat turn leaves local authority, reaches a remote agent, and returns through the local reply inbox
+    - [x] let the lower conversation/model path emit optional partial reply chunks without treating them as final completion
+      - `model-router` can now carry optional `partial_replies` in `model_result.result`
+      - `philote` emits those as `partial_reply` frames before the final `send_reply`
+      - default providers still emit no partial chunks unless they explicitly supply them
 - [x] Make the target guest inventory seam explicit:
   - local target guest inventory uses canonical local hotel reads
   - remote target guest inventory now attempts a direct target-hotel management query over the mesh
@@ -1112,7 +1120,11 @@ Seam IDs: `wider-client-adoption`, `philotic-native-memory-integration`
 - [ ] Telegram streaming: add message length chunking to `membrane` — split at paragraph boundaries before `sendMessage`, shared `send_formatted_text` helper.
 - [x] Telegram streaming Layer 2 protocol: add `TurnEventPayload` to `agent-core/src/protocol.rs` and `emit_turn_event` helper to `AgentRuntime`; emit `waiting_tool`, `waiting_approval` events back to membrane via the existing `EmitTask` path.
 - [x] Telegram streaming Layer 2 membrane: handle `action = "turn_event"` in `InboundTask` dispatch — maintain or cancel typing heartbeat per event type; stop typing on `waiting_approval`.
-- [ ] Telegram streaming partial reply: add `action = "partial_reply"` signal from `philote` once model-router supports chunked output; implement edit-based progressive delivery in `membrane`.
+- [x] Telegram streaming partial reply: teach the lower conversation/model path to emit real `action = "partial_reply"` content chunks, then implement edit-based progressive delivery in `membrane`.
+  - [x] preserve `partial_reply` as a non-terminal transport frame across operator chat and Telegram membrane handling so future producers do not get mistaken for `send_reply`
+  - [x] allow `model-router` / `philote` to carry optional `partial_replies` through the lower conversation path
+  - [x] edit the active Telegram draft message on `partial_reply` and final text completion when possible
+  - [ ] upgrade providers from optional batch partials to native incremental generation
 - [ ] Voice machine design: define STT, TTS, speech-to-speech, transcript generation, and media artifact/session handling.
 - [ ] Nostr communication-plane investigation (`nostr-membrane-contract`): evaluate Nostr as a decentralized/event-native membrane with relay trust classes, addressed-event gating, signature verification, replay defense, and perimeter/sentinel integration before any implementation.
 - [ ] A2A membrane investigation (`a2a-membrane-contract`): evaluate `A2A` as an external agent interoperability membrane with explicit peer trust records, bounded capability exposure, approval semantics for privileged actions, and no inheritance of internal mesh trust.

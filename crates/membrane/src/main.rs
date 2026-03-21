@@ -651,8 +651,9 @@ struct ActiveTurn {
     /// Sending on this channel cancels the typing heartbeat task.
     cancel_typing: oneshot::Sender<()>,
     /// `message_id` of the first message sent for this turn, used for edit-based streaming.
-    #[allow(dead_code)]
     draft_message_id: Option<i64>,
+    /// Telegram thread the turn belongs to, if any.
+    thread_id: Option<String>,
 }
 
 impl ActiveTurn {
@@ -721,6 +722,32 @@ async fn send_telegram_text(
     }
 }
 
+async fn edit_telegram_text(
+    http_client: &reqwest::Client,
+    tg_base: &str,
+    chat_id: &str,
+    message_id: i64,
+    text: &str,
+) -> bool {
+    let formatted = telegram_format_text(text);
+    let edit_url = format!("{tg_base}editMessageText");
+    let payload = json!({
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": formatted.text,
+        "parse_mode": formatted.parse_mode,
+        "disable_web_page_preview": true
+    });
+
+    match http_client.post(&edit_url).json(&payload).send().await {
+        Ok(res) => res.status().is_success(),
+        Err(e) => {
+            error!("editMessageText failed: {}", e);
+            false
+        }
+    }
+}
+
 /// Splits `text` at `\n\n` paragraph boundaries so each chunk fits within `limit` bytes.
 /// Falls back to `\n` line breaks, then hard-splits at `limit` if no breaks are found.
 fn split_at_paragraph_boundary(text: &str, limit: usize) -> Vec<String> {
@@ -746,19 +773,33 @@ fn split_at_paragraph_boundary(text: &str, limit: usize) -> Vec<String> {
     chunks
 }
 
-/// Sends `text` to a Telegram chat, splitting into multiple messages if it exceeds the
-/// 4096-character limit. Splits at paragraph boundaries when possible.
-async fn send_formatted_text(
+async fn upsert_formatted_text(
     http_client: &reqwest::Client,
     tg_base: &str,
     chat_id: &str,
     thread_id: Option<&str>,
+    existing_message_id: Option<i64>,
     text: &str,
-) {
-    const TELEGRAM_MSG_LIMIT: usize = 4096;
-    for chunk in split_at_paragraph_boundary(text, TELEGRAM_MSG_LIMIT) {
-        send_telegram_text(http_client, tg_base, chat_id, thread_id, &chunk).await;
+) -> Option<i64> {
+    let chunks = split_at_paragraph_boundary(text, 4096);
+    let Some(first_chunk) = chunks.first() else {
+        return existing_message_id;
+    };
+
+    let first_message_id = match existing_message_id {
+        Some(message_id)
+            if edit_telegram_text(http_client, tg_base, chat_id, message_id, first_chunk).await =>
+        {
+            Some(message_id)
+        }
+        _ => send_telegram_text(http_client, tg_base, chat_id, thread_id, first_chunk).await,
+    };
+
+    for chunk in chunks.iter().skip(1) {
+        send_telegram_text(http_client, tg_base, chat_id, thread_id, chunk).await;
     }
+
+    first_message_id
 }
 
 /// Commands handled entirely within membrane, before the envelope reaches agent-core.
@@ -1745,6 +1786,7 @@ async fn run_seat_impl(
                                                         ActiveTurn {
                                                             cancel_typing: cancel_tx,
                                                             draft_message_id: None,
+                                                            thread_id: envelope.thread_id.clone(),
                                                         },
                                                     );
                                                 }
@@ -1818,15 +1860,45 @@ async fn run_seat_impl(
                                     }
                                 }
                                 // waiting_tool and waiting_model: typing continues — no action needed.
+                            } else if action == "partial_reply" {
+                                let content = task.get("content").and_then(Value::as_str).unwrap_or_default().to_string();
+                                info!(
+                                    "Partial reply observed for session [{}] ({} chars); typing continues until final reply.",
+                                    session_id,
+                                    content.len()
+                                );
+                                if !chat_id.is_empty() && !content.is_empty() {
+                                    let (draft_message_id, thread_id) = active_turns
+                                        .get(&session_id)
+                                        .map(|active| (active.draft_message_id, active.thread_id.clone()))
+                                        .unwrap_or((None, None));
+                                    if let Some(message_id) = upsert_formatted_text(
+                                        &http_client,
+                                        &tg_base,
+                                        &chat_id,
+                                        thread_id.as_deref(),
+                                        draft_message_id,
+                                        &content,
+                                    ).await {
+                                        if let Some(active) = active_turns.get_mut(&session_id) {
+                                            active.draft_message_id = Some(message_id);
+                                        }
+                                    }
+                                }
                             } else {
                                 // send_reply (or any unrecognised action): deliver to Telegram and
                                 // cancel the typing heartbeat for this session.
-                                if let Some(active) = active_turns.remove(&session_id) {
+                                let (draft_message_id, active_thread_id) = if let Some(active) = active_turns.remove(&session_id) {
+                                    let draft_message_id = active.draft_message_id;
+                                    let active_thread_id = active.thread_id.clone();
                                     active.cancel();
-                                }
+                                    (draft_message_id, active_thread_id)
+                                } else {
+                                    (None, None)
+                                };
 
                                 let content = task.get("content").and_then(|c| c.as_str()).unwrap_or_default().to_string();
-                                let thread_id = task.get("thread_id").and_then(|v| v.as_str()).map(str::to_string);
+                                let thread_id = task.get("thread_id").and_then(|v| v.as_str()).map(str::to_string).or(active_thread_id);
                                 let audio_artifact_json = task.get("audio_artifact").and_then(|a| a.as_str()).map(str::to_string);
                                 let send_text_caption = task.get("send_text_caption").and_then(|v| v.as_bool()).unwrap_or(false);
 
@@ -1834,6 +1906,7 @@ async fn run_seat_impl(
                                     let http_client_clone = http_client.clone();
                                     let tg_base_clone = tg_base.clone();
                                     let thread_id_clone = thread_id.clone();
+                                    let draft_message_id = draft_message_id;
 
                                     tokio::spawn(async move {
                                         // Voice path: send audio first, then optional text caption.
@@ -1873,22 +1946,24 @@ async fn run_seat_impl(
 
                                             // Also send text as a follow-up caption if requested.
                                             if send_text_caption && !content.is_empty() {
-                                                send_formatted_text(
+                                                let _ = upsert_formatted_text(
                                                     &http_client_clone,
                                                     &tg_base_clone,
                                                     &chat_id,
                                                     thread_id_clone.as_deref(),
+                                                    draft_message_id,
                                                     &content,
                                                 ).await;
                                             }
                                         } else if !content.is_empty() {
                                             // Text-only path.
                                             info!("Sending final response back to Telegram Chat [{}]...", chat_id);
-                                            send_formatted_text(
+                                            let _ = upsert_formatted_text(
                                                 &http_client_clone,
                                                 &tg_base_clone,
                                                 &chat_id,
                                                 thread_id_clone.as_deref(),
+                                                draft_message_id,
                                                 &content,
                                             ).await;
                                         }

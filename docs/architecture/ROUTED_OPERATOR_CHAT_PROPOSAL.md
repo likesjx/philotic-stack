@@ -70,10 +70,12 @@ Current truth:
   - shared IPC exposes `SendOperatorChatTurn`
   - `aiua` submits the turn into the canonical agent conversation path via routed `EmitTask`
   - `philotic-web` exposes `POST /api/mesh/targets/:target_node_id/agents/:agent_id/chat` as a thin desktop adapter
-  - the current slice observes `turn_event` messages on that reply path before the first final reply and returns them in the reply envelope
-  - the current slice still does not expose live push streaming while the turn is in flight
+  - `SendOperatorChatTurn` observes `turn_event` messages on that reply path before the first final reply and returns them in the reply envelope
+  - the current desktop adapter now returns `202 Accepted`, then streams in-flight `operator_chat:turn_event`, `operator_chat:partial_reply`, `operator_chat:reply`, and `operator_chat:error` updates over the existing `/ws` channel while the routed turn is in flight
+  - the lower conversation/model path can now optionally carry `partial_replies` in `model_result.result.partial_replies`, which `philote` turns into real `partial_reply` frames before the final reply
+  - default providers still emit no partial chunks unless they explicitly supply them, so progressive delivery is now possible without pretending every provider is already streaming
 
-This still leaves the broader operator-chat seam intentionally incomplete: streaming observation, richer session continuity, and watched remote-hotel chat proof remain follow-on slices.
+This still leaves the broader operator-chat seam intentionally incomplete: richer session continuity, provider-native incremental generation instead of optional batch partials, and watched live remote-hotel proof remain follow-on slices.
 
 ## Why This Needs Its Own Contract
 

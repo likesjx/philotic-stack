@@ -912,6 +912,7 @@ impl IpcServer {
         }
 
         let mut observed_events = Vec::new();
+        let mut observed_partial_replies = Vec::new();
         let payload = loop {
             let reply = tokio::time::timeout(std::time::Duration::from_secs(30), client.recv_task())
                 .await
@@ -927,6 +928,12 @@ impl IpcServer {
             if action == "turn_event" {
                 if let Some(event) = payload.get("event").and_then(serde_json::Value::as_str) {
                     observed_events.push(event.to_string());
+                }
+                continue;
+            }
+            if action == "partial_reply" {
+                if let Some(content) = payload.get("content").and_then(serde_json::Value::as_str) {
+                    observed_partial_replies.push(content.to_string());
                 }
                 continue;
             }
@@ -971,6 +978,7 @@ impl IpcServer {
             },
             reply_action,
             observed_events,
+            observed_partial_replies,
             content: reply_content,
         })
     }
@@ -11421,6 +11429,23 @@ mod tests {
 
             agent
                 .send_request(IpcRequest::EmitTask {
+                    target_node: final_reply_to.clone(),
+                    target_role: final_reply_role.clone(),
+                    target_guest_id: Some(final_reply_guest_id.clone()),
+                    task_json: serde_json::json!({
+                        "action": "partial_reply",
+                        "session_id": session_id,
+                        "turn_id": turn_id,
+                        "chat_id": chat_id,
+                        "content": "hello from partial"
+                    })
+                    .to_string(),
+                })
+                .await
+                .expect("agent emit partial reply");
+
+            agent
+                .send_request(IpcRequest::EmitTask {
                     target_node: final_reply_to,
                     target_role: final_reply_role,
                     target_guest_id: Some(final_reply_guest_id),
@@ -11454,6 +11479,7 @@ mod tests {
         assert_eq!(reply.delivery_kind, "local-direct");
         assert_eq!(reply.reply_action, "send_reply");
         assert_eq!(reply.observed_events, vec!["waiting_model"]);
+        assert_eq!(reply.observed_partial_replies, vec!["hello from partial"]);
         assert_eq!(reply.content, "hello back from agent");
 
         agent_task.await.expect("agent task should finish");
@@ -11465,6 +11491,335 @@ mod tests {
         let _ = server_task.await;
         if Path::new(&socket_path).exists() {
             let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn operator_chat_turn_can_round_trip_through_remote_hotel_bridge() {
+        let _env_guard = ipc_env_guard();
+        let local_socket_path = test_socket_path();
+        let remote_socket_path = format!("{local_socket_path}-remote");
+        let (local_dispatcher_tx, mut local_dispatcher_rx) = mpsc::channel(16);
+        let (remote_dispatcher_tx, mut remote_dispatcher_rx) = mpsc::channel(16);
+
+        let local_graph_store =
+            SqliteGraphStorage::open(":memory:").expect("open local sqlite graph store");
+        local_graph_store
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: local_socket_path.clone(),
+                active_pid: Some(std::process::id().to_string()),
+            })
+            .expect("seed local hotel");
+        local_graph_store
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "remote-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "remote-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9100,
+                blob_port: 9101,
+                execution_port: 9102,
+                ipc_socket_path: remote_socket_path.clone(),
+                active_pid: None,
+            })
+            .expect("seed remote hotel");
+        let local_graph: Arc<dyn GraphStorage> = Arc::new(local_graph_store);
+        let local_registry = Arc::new(RwLock::new(NodeRegistry::new()));
+        local_registry.write().await.update_node(
+            NodeCapabilities {
+                node_id: "remote-aiua-01".into(),
+                roles: vec![ansible_mesh_core::NodeRole::AnsibleNode],
+                models: vec![],
+                tools: vec![],
+                constraints: Default::default(),
+            },
+            vec![CapabilityAdvertisement {
+                hotel_id: "remote-hotel".into(),
+                node_id: "remote-aiua-01".into(),
+                incarnation_id: "remote-hotel:agent-runtime".into(),
+                target_role: "agent".into(),
+                availability_state: "live".into(),
+                selection_hint: Some("remote_operator_chat".into()),
+                latency_hint_ms: Some(12),
+                max_concurrent_jobs: Some(4),
+                active_jobs: 0,
+                queue_depth: 0,
+            }],
+            Some(ExecutionReachability {
+                protocol: "tcp-framed-v1".into(),
+                host: "remote.mesh".into(),
+                port: 9102,
+            }),
+        );
+
+        let remote_graph_store =
+            SqliteGraphStorage::open(":memory:").expect("open remote sqlite graph store");
+        remote_graph_store
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "remote-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "remote-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9100,
+                blob_port: 9101,
+                execution_port: 9102,
+                ipc_socket_path: remote_socket_path.clone(),
+                active_pid: Some(std::process::id().to_string()),
+            })
+            .expect("seed remote hotel");
+        let remote_graph: Arc<dyn GraphStorage> = Arc::new(remote_graph_store);
+
+        let local_server = IpcServer::new(
+            local_socket_path.clone(),
+            "local-aiua-01",
+            local_dispatcher_tx,
+            local_graph,
+        )
+        .with_registry(local_registry);
+        let remote_server = IpcServer::new(
+            remote_socket_path.clone(),
+            "remote-aiua-01",
+            remote_dispatcher_tx,
+            remote_graph,
+        );
+
+        let local_server_task = tokio::spawn(async move {
+            local_server.run().await.expect("local ipc server should run");
+        });
+        let remote_server_task = tokio::spawn(async move {
+            remote_server.run().await.expect("remote ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &local_socket_path);
+        }
+
+        let local_to_remote_bridge = tokio::spawn({
+            let remote_socket_path = remote_socket_path.clone();
+            async move {
+                let mut bridge = PhiloticClient::connect_at(
+                    &remote_socket_path,
+                    GuestIdentity {
+                        guest_id: "bridge-local-to-remote".into(),
+                        role: "management".into(),
+                        supported_tools: Vec::new(),
+                    },
+                )
+                .await
+                .expect("connect local->remote bridge");
+
+                while let Some(command) = local_dispatcher_rx.recv().await {
+                    let LedgerCommand::AppendLocal(env) = command else {
+                        continue;
+                    };
+                    if env.target_node_id.as_deref() != Some("remote-aiua-01") {
+                        continue;
+                    }
+                    let target_role = env
+                        .target_agent_id
+                        .clone()
+                        .unwrap_or_else(|| "agent".into());
+                    let EventPayload::Inline { data } = env.payload else {
+                        continue;
+                    };
+                    bridge
+                        .send_request(IpcRequest::EmitTask {
+                            target_node: "remote-aiua-01".into(),
+                            target_role,
+                            target_guest_id: None,
+                            task_json: data,
+                        })
+                        .await
+                        .expect("relay local->remote operator chat task");
+                }
+            }
+        });
+
+        let remote_to_local_bridge = tokio::spawn({
+            let local_socket_path = local_socket_path.clone();
+            async move {
+                let mut bridge = PhiloticClient::connect_at(
+                    &local_socket_path,
+                    GuestIdentity {
+                        guest_id: "bridge-remote-to-local".into(),
+                        role: "management".into(),
+                        supported_tools: Vec::new(),
+                    },
+                )
+                .await
+                .expect("connect remote->local bridge");
+
+                while let Some(command) = remote_dispatcher_rx.recv().await {
+                    let LedgerCommand::AppendLocal(env) = command else {
+                        continue;
+                    };
+                    if env.target_node_id.as_deref() != Some("local-aiua-01") {
+                        continue;
+                    }
+                    let target_role = env
+                        .target_agent_id
+                        .clone()
+                        .unwrap_or_else(|| OPERATOR_CHAT_REPLY_ROLE.into());
+                    let EventPayload::Inline { data } = env.payload else {
+                        continue;
+                    };
+                    bridge
+                        .send_request(IpcRequest::EmitTask {
+                            target_node: "local-aiua-01".into(),
+                            target_role,
+                            target_guest_id: None,
+                            task_json: data,
+                        })
+                        .await
+                        .expect("relay remote->local operator chat reply");
+                }
+            }
+        });
+
+        let mut management = PhiloticClient::connect(GuestIdentity {
+            guest_id: "operator-chat-test-remote".into(),
+            role: "management".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("management connect");
+        let mut remote_agent = PhiloticClient::connect_at(
+            &remote_socket_path,
+            GuestIdentity {
+                guest_id: "agent-jane-remote".into(),
+                role: "agent".into(),
+                supported_tools: Vec::new(),
+            },
+        )
+        .await
+        .expect("remote agent connect");
+
+        let remote_agent_task = tokio::spawn(async move {
+            let inbound = remote_agent.recv_task().await.expect("remote agent recv task");
+            let IpcResponse::InboundTask { task_json, .. } = inbound else {
+                panic!("unexpected inbound response to remote agent");
+            };
+            let payload: serde_json::Value =
+                serde_json::from_str(&task_json).expect("remote agent payload should decode");
+            assert_eq!(payload["source"], "operator_chat");
+            assert_eq!(payload["transport"], "operator_chat");
+            assert_eq!(payload["content"], "hello across the mesh");
+            let final_reply_to = payload["final_reply_to"]
+                .as_str()
+                .expect("final_reply_to should exist")
+                .to_string();
+            let final_reply_role = payload["final_reply_role"]
+                .as_str()
+                .expect("final_reply_role should exist")
+                .to_string();
+            let session_id = payload["session_id"]
+                .as_str()
+                .expect("session_id should exist")
+                .to_string();
+            let turn_id = payload["turn_id"]
+                .as_str()
+                .expect("turn_id should exist")
+                .to_string();
+            let chat_id = payload["chat_id"]
+                .as_str()
+                .expect("chat_id should exist")
+                .to_string();
+
+            remote_agent
+                .send_request(IpcRequest::EmitTask {
+                    target_node: final_reply_to.clone(),
+                    target_role: final_reply_role.clone(),
+                    target_guest_id: None,
+                    task_json: serde_json::json!({
+                        "action": "turn_event",
+                        "event": "waiting_remote_model",
+                        "session_id": session_id,
+                        "turn_id": turn_id,
+                        "chat_id": chat_id
+                    })
+                    .to_string(),
+                })
+                .await
+                .expect("remote agent emit turn event");
+
+            remote_agent
+                .send_request(IpcRequest::EmitTask {
+                    target_node: final_reply_to,
+                    target_role: final_reply_role,
+                    target_guest_id: None,
+                    task_json: serde_json::json!({
+                        "action": "send_reply",
+                        "session_id": session_id,
+                        "turn_id": turn_id,
+                        "chat_id": chat_id,
+                        "content": "hello back from remote agent"
+                    })
+                    .to_string(),
+                })
+                .await
+                .expect("remote agent emit final reply");
+        });
+
+        let reply = expect_operator_chat_reply(
+            management
+                .send_request(IpcRequest::SendOperatorChatTurn {
+                    target_node_id: "remote-aiua-01".into(),
+                    target_agent_id: "agent-jane-remote".into(),
+                    operator_session_id: "desktop-operator-session-remote".into(),
+                    conversation_id: None,
+                    content: "hello across the mesh".into(),
+                })
+                .await
+                .expect("remote operator chat request"),
+        );
+        assert_eq!(reply.target_node_id, "remote-aiua-01");
+        assert_eq!(reply.target_agent_id, "agent-jane-remote");
+        assert_eq!(reply.target_hotel, "remote-hotel");
+        assert_eq!(reply.delivery_kind, "router-routed");
+        assert_eq!(reply.reply_action, "send_reply");
+        assert_eq!(reply.observed_events, vec!["waiting_remote_model"]);
+        assert_eq!(reply.content, "hello back from remote agent");
+
+        remote_agent_task
+            .await
+            .expect("remote agent task should finish");
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        local_to_remote_bridge.abort();
+        let _ = local_to_remote_bridge.await;
+        remote_to_local_bridge.abort();
+        let _ = remote_to_local_bridge.await;
+        local_server_task.abort();
+        let _ = local_server_task.await;
+        remote_server_task.abort();
+        let _ = remote_server_task.await;
+        if Path::new(&local_socket_path).exists() {
+            let _ = std::fs::remove_file(&local_socket_path);
+        }
+        if Path::new(&remote_socket_path).exists() {
+            let _ = std::fs::remove_file(&remote_socket_path);
         }
     }
 

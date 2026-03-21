@@ -171,6 +171,8 @@ pub struct OperatorChatTurnReply {
     pub reply_action: String,
     #[serde(default)]
     pub observed_events: Vec<String>,
+    #[serde(default)]
+    pub observed_partial_replies: Vec<String>,
     pub content: String,
 }
 
