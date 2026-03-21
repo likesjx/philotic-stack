@@ -1,0 +1,35 @@
+[sandbox]
+name = "dev-unrestricted"
+version = "1.0"
+max_timeout_ms = 120000
+max_concurrent = 16
+
+# WARNING: This policy is for local development only.
+# It provides minimal restrictions and should NEVER be used in production.
+
+[commands]
+allowed = ["*"]
+denied = [
+    "shutdown", "reboot", "mkfs",
+]
+
+[filesystem]
+read_paths = ["/**"]
+write_paths = ["/tmp/**", "./workspace/**", "/home/**"]
+execute_paths = ["/**"]
+
+[environment]
+allowlist = [
+    "PATH", "HOME", "USER", "SHELL",
+    "RUST_LOG", "CARGO_HOME", "RUSTUP_HOME",
+    "LANG", "LC_ALL", "TERM", "EDITOR",
+    "GOPATH", "GOROOT",
+    "NODE_PATH", "NPM_CONFIG_PREFIX",
+]
+forced = { SANDBOX = "1", PHILOTIC_SANDBOXED = "true" }
+
+[network]
+mode = "unrestricted"
+
+[seccomp]
+profile = "network_server"
