@@ -1861,6 +1861,7 @@ fn seed_toolset_profiles(graph: &dyn GraphStorage) -> anyhow::Result<()> {
                 "session.status".into(),
                 "echo".into(),
                 "agent.configure".into(),
+                "role.configure".into(),
                 "skill.register".into(),
                 "subagent.spawn".into(),
                 "workspace.list".into(),

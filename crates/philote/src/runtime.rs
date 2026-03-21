@@ -4975,6 +4975,24 @@ impl AgentRuntime {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
+                
+                let target_focus_framing = args
+                    .and_then(|a| a.get("target_focus_framing"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+
+                let Some(target_focus_framing) = target_focus_framing else {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "handoff.to_role: missing required argument 'target_focus_framing'".into(),
+                        )
+                        .await;
+                };
+
+                let active_goal = active_goal.map(|g| format!("{}\n\nTarget Focus Framing:\n{}", g, target_focus_framing));
+
                 let expected_return_mode = args
                     .and_then(|a| a.get("expected_return_mode"))
                     .and_then(|v| v.as_str())
