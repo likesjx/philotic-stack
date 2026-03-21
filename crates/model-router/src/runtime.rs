@@ -163,7 +163,10 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                 );
 
                 match provider.invoke(&controller_task).await {
-                    Ok(ProviderOutput::ToolCall { tool_name, arguments }) => {
+                    Ok(ProviderOutput::ToolCall {
+                        tool_name,
+                        arguments,
+                    }) => {
                         emit_tool_call_response(
                             &mut ipc_client,
                             &reply,
@@ -244,7 +247,10 @@ fn short_circuit_response(task: &Value, stub_response: Option<&str>) -> Option<S
                     if iteration > 0 {
                         let iter_key = format!("{}:{}", turn_id, iteration);
                         if k == iter_key {
-                            info!("Model controller turn/iteration-aware stub mode returning response for [{}].", iter_key);
+                            info!(
+                                "Model controller turn/iteration-aware stub mode returning response for [{}].",
+                                iter_key
+                            );
                             return Some(parse_stub_response(v));
                         }
                     }
@@ -256,7 +262,10 @@ fn short_circuit_response(task: &Value, stub_response: Option<&str>) -> Option<S
                 }
             }
             if let Some(v) = turn_match {
-                info!("Model controller turn-aware stub mode returning response for [{}].", turn_id);
+                info!(
+                    "Model controller turn-aware stub mode returning response for [{}].",
+                    turn_id
+                );
                 return Some(v);
             }
         }
@@ -271,8 +280,8 @@ fn short_circuit_response(task: &Value, stub_response: Option<&str>) -> Option<S
 fn parse_stub_response(raw: &str) -> StubResponse {
     let trimmed = raw.trim();
     if let Some(json_text) = trimmed.strip_prefix("json:") {
-        let value: Value = serde_json::from_str(json_text)
-            .unwrap_or_else(|_| json!({ "display_text": trimmed }));
+        let value: Value =
+            serde_json::from_str(json_text).unwrap_or_else(|_| json!({ "display_text": trimmed }));
         return StubResponse::Structured(value);
     }
     StubResponse::Text(trimmed.to_string())
@@ -370,11 +379,17 @@ fn validate_stub_prompt(task_value: &Value, stub_value: &Value) -> Result<()> {
 
     let prompt = ControllerTask::from_value(task_value)
         .ok()
-        .and_then(|task| task.composed_prompt_text().or_else(|| task.prompt_text().map(str::to_string)))
+        .and_then(|task| {
+            task.composed_prompt_text()
+                .or_else(|| task.prompt_text().map(str::to_string))
+        })
         .unwrap_or_default();
     for needle in required.iter().filter_map(Value::as_str) {
         if !prompt.contains(needle) {
-            anyhow::bail!("stub validation failed: prompt missing required substring {:?}", needle);
+            anyhow::bail!(
+                "stub validation failed: prompt missing required substring {:?}",
+                needle
+            );
         }
     }
     Ok(())
@@ -508,8 +523,12 @@ fn classify_provider_failure(
     provider: Option<&str>,
     message: &str,
 ) -> TaskErrorPayload {
-    let mut payload =
-        TaskErrorPayload::provider_failure("model-router", capability, provider, message.to_string());
+    let mut payload = TaskErrorPayload::provider_failure(
+        "model-router",
+        capability,
+        provider,
+        message.to_string(),
+    );
 
     let malformed_tool_call = message.contains("tool_call.arguments missing from")
         || message.contains("returned invalid tool_call")

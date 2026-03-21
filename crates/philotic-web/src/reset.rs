@@ -65,7 +65,11 @@ pub async fn run(keep_identity: bool) -> Result<()> {
         for entry in fs::read_dir(&philotic).into_iter().flatten().flatten() {
             let path = entry.path();
             if path.file_name().map(|n| n != "identity").unwrap_or(false) {
-                let _ = if path.is_dir() { fs::remove_dir_all(&path) } else { fs::remove_file(&path) };
+                let _ = if path.is_dir() {
+                    fs::remove_dir_all(&path)
+                } else {
+                    fs::remove_file(&path)
+                };
             }
         }
         println!("  ~/.philotic  cleared (identity preserved)");

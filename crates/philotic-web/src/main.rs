@@ -160,8 +160,11 @@ async fn main() -> Result<()> {
             ServiceAction::Status { hotel } => service::status(hotel).await,
         },
         Command::Footprint { kill } => footprint::run(kill).await,
-        Command::Serve { port, db, config, allow_origins } => {
-            serve::run(port, db, config, allow_origins).await
-        }
+        Command::Serve {
+            port,
+            db,
+            config,
+            allow_origins,
+        } => serve::run(port, db, config, allow_origins).await,
     }
 }

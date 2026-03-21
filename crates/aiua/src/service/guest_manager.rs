@@ -371,7 +371,10 @@ impl GuestManager {
                 // and it has been idle longer than that TTL, deactivate it rather than respawning.
                 // Non-membrane-owner role guests only — membrane-owner guests are never reclaimed by TTL.
                 let ttl_expired = {
-                    let role_incarnations = self.graph.list_role_incarnations_by_guest_id(&rec.guest_id).unwrap_or_default();
+                    let role_incarnations = self
+                        .graph
+                        .list_role_incarnations_by_guest_id(&rec.guest_id)
+                        .unwrap_or_default();
                     if let Some(role_rec) = role_incarnations.first() {
                         if let Some(ttl_secs) = role_rec.inactive_ttl_seconds {
                             if let Some(last_active) = rec.last_active_at {
@@ -395,7 +398,9 @@ impl GuestManager {
                         "Supervisor: Guest [{}] has exceeded its role TTL. Deactivating.",
                         rec.guest_id
                     );
-                    let _ = self.graph.set_guest_active(&self.hotel_name, &rec.guest_id, false);
+                    let _ = self
+                        .graph
+                        .set_guest_active(&self.hotel_name, &rec.guest_id, false);
                     if let Some(pid) = rec.active_pid.as_deref() {
                         let mut mat = self.materializer.lock().await;
                         let _ = mat.reclaim_guest(&rec.guest_id).await;
@@ -821,24 +826,15 @@ mod tests {
             Ok(vec![])
         }
 
-        fn upsert_rule(
-            &self,
-            _rule: &ansible_mesh_core::graph::RuleRecord,
-        ) -> Result<()> {
+        fn upsert_rule(&self, _rule: &ansible_mesh_core::graph::RuleRecord) -> Result<()> {
             Ok(())
         }
 
-        fn get_rule(
-            &self,
-            _rule_id: &str,
-        ) -> Result<Option<ansible_mesh_core::graph::RuleRecord>> {
+        fn get_rule(&self, _rule_id: &str) -> Result<Option<ansible_mesh_core::graph::RuleRecord>> {
             Ok(None)
         }
 
-        fn list_rules(
-            &self,
-            _agent_id: &str,
-        ) -> Result<Vec<ansible_mesh_core::graph::RuleRecord>> {
+        fn list_rules(&self, _agent_id: &str) -> Result<Vec<ansible_mesh_core::graph::RuleRecord>> {
             Ok(vec![])
         }
     }

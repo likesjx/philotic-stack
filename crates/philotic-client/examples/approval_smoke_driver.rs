@@ -65,7 +65,8 @@ async fn main() -> Result<()> {
         let IpcResponse::InboundTask { task_json, .. } = wait_reply else {
             continue;
         };
-        let payload: serde_json::Value = serde_json::from_str(&task_json).context("failed to decode approval prompt")?;
+        let payload: serde_json::Value =
+            serde_json::from_str(&task_json).context("failed to decode approval prompt")?;
         if let Some(content) = payload.get("content").and_then(serde_json::Value::as_str) {
             if !content.is_empty() {
                 wait_content = content.to_string();
@@ -115,7 +116,8 @@ async fn main() -> Result<()> {
         let IpcResponse::InboundTask { task_json, .. } = final_reply else {
             continue;
         };
-        let payload: serde_json::Value = serde_json::from_str(&task_json).context("failed to decode approved reply")?;
+        let payload: serde_json::Value =
+            serde_json::from_str(&task_json).context("failed to decode approved reply")?;
         if let Some(content) = payload.get("content").and_then(serde_json::Value::as_str) {
             if !content.is_empty() {
                 final_content = content.to_string();

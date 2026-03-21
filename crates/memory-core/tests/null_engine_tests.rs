@@ -1,4 +1,4 @@
-use memory_core::{MemoryEngine, MemoryScope, NullMemoryEngine};
+use memory_core::{MemoryEngine, MemoryScope, NullMemoryEngine, RecallContext, RecallTrigger};
 
 // ──── NullMemoryEngine: error contract ───────────────────────────────────────
 //
@@ -19,9 +19,7 @@ async fn null_remember_errors() {
 #[tokio::test]
 async fn null_remember_batch_errors() {
     let engine = NullMemoryEngine;
-    let result = engine
-        .remember_batch(MemoryScope::SharedUser, vec![])
-        .await;
+    let result = engine.remember_batch(MemoryScope::SharedUser, vec![]).await;
     assert!(result.is_err());
 }
 
@@ -32,6 +30,49 @@ async fn null_activate_errors() {
         .activate("some context", MemoryScope::SelfOnly, None)
         .await;
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn null_evaluate_recall_uses_default_policy_without_backend() {
+    let engine = NullMemoryEngine;
+    let decision = engine
+        .evaluate_recall(&RecallContext {
+            trigger: RecallTrigger::UserTurnStart,
+            scope: MemoryScope::SelfOnly,
+            recall_seed_text: "Continue the memory design work".into(),
+            active_goal: None,
+            role_name: None,
+            recent_turns: Vec::new(),
+            local_memory_summaries: Vec::new(),
+            tool_history_summary: Vec::new(),
+            lens: None,
+        })
+        .await
+        .expect("default deterministic policy should not require backend");
+
+    assert!(decision.should_recall());
+    assert_eq!(decision.limit, Some(5));
+}
+
+#[tokio::test]
+async fn null_recall_for_turn_errors_when_activation_is_required() {
+    let engine = NullMemoryEngine;
+    let result = engine
+        .recall_for_turn(&RecallContext {
+            trigger: RecallTrigger::UserTurnStart,
+            scope: MemoryScope::SelfOnly,
+            recall_seed_text: "Continue the memory design work".into(),
+            active_goal: None,
+            role_name: None,
+            recent_turns: Vec::new(),
+            local_memory_summaries: Vec::new(),
+            tool_history_summary: Vec::new(),
+            lens: None,
+        })
+        .await;
+
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("NullMemoryEngine"));
 }
 
 #[tokio::test]
@@ -78,11 +119,12 @@ async fn null_lens_errors() {
 #[tokio::test]
 async fn null_subscribe_errors_with_phase5_message() {
     let engine = NullMemoryEngine;
-    let result = engine
-        .subscribe("context", MemoryScope::SelfOnly)
-        .await;
+    let result = engine.subscribe("context", MemoryScope::SelfOnly).await;
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("Phase 5"), "expected Phase 5 message, got: {err}");
+    assert!(
+        err.contains("Phase 5"),
+        "expected Phase 5 message, got: {err}"
+    );
 }
 
 // ──── MemoryScope: serde round-trip ──────────────────────────────────────────
@@ -100,8 +142,7 @@ fn memory_scope_serde_roundtrip() {
     ];
     for scope in scopes {
         let json = serde_json::to_string(&scope).expect("serialize");
-        let _back: memory_core::MemoryScope =
-            serde_json::from_str(&json).expect("deserialize");
+        let _back: memory_core::MemoryScope = serde_json::from_str(&json).expect("deserialize");
     }
 }
 

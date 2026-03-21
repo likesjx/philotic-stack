@@ -44,7 +44,9 @@ use std::sync::Arc;
 /// When `Some`, all runtime paths (DB, socket) are namespaced to that directory
 /// so that two profiles never collide. When `None`, legacy path behavior applies.
 fn profile_dir() -> Option<PathBuf> {
-    let profile = std::env::var("PHILOTIC_PROFILE").ok().filter(|s| !s.is_empty())?;
+    let profile = std::env::var("PHILOTIC_PROFILE")
+        .ok()
+        .filter(|s| !s.is_empty())?;
     let home = std::env::var("HOME").ok()?;
     Some(PathBuf::from(home).join(".philotic").join(profile))
 }
@@ -69,8 +71,7 @@ pub enum LedgerCommand {
     },
 }
 
-type BeaconInboxReceiver =
-    Arc<Mutex<Option<mpsc::Receiver<ansible_mesh_core::BeaconMessage>>>>;
+type BeaconInboxReceiver = Arc<Mutex<Option<mpsc::Receiver<ansible_mesh_core::BeaconMessage>>>>;
 type WebRtcSignalReceiver =
     Arc<Mutex<Option<mpsc::Receiver<ansible_mesh_core::webrtc::WebRtcSignalMessage>>>>;
 
@@ -592,11 +593,14 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
             while let Some(msg) = inbox_rx.recv().await {
                 match msg.msg_type {
                     ansible_mesh_core::MsgType::MeshEventBatch => {
-                        if let Ok(events) = serde_json::from_slice::<Vec<EventEnvelope>>(&msg.payload) {
+                        if let Ok(events) =
+                            serde_json::from_slice::<Vec<EventEnvelope>>(&msg.payload)
+                        {
                             if !events.is_empty() {
                                 let max_seq = events.iter().map(|e| e.seq).max().unwrap_or(0);
                                 for event in &events {
-                                    IpcServer::deliver_event_envelope(&inbound_inboxes, event).await;
+                                    IpcServer::deliver_event_envelope(&inbound_inboxes, event)
+                                        .await;
                                 }
                                 let _ = dispatcher_inbound_tx
                                     .send(LedgerCommand::CommitInboundBatch {
@@ -910,8 +914,7 @@ fn merged_agent_config(
     hotel_name: &str,
 ) -> Option<(String, serde_json::Map<String, serde_json::Value>)> {
     let selected_hotel = hotel_object(config_json, hotel_name);
-    let selected_key = selected_hotel
-        .and_then(selected_agent_key_for_hotel)?;
+    let selected_key = selected_hotel.and_then(selected_agent_key_for_hotel)?;
     let mut merged = serde_json::Map::new();
 
     if let Some(hotel) = selected_hotel {
@@ -1034,7 +1037,11 @@ fn raw_agent_config_for_key(
             }
         }
     }
-    if merged.is_empty() { None } else { Some(merged) }
+    if merged.is_empty() {
+        None
+    } else {
+        Some(merged)
+    }
 }
 
 /// Per-agent guests: one philote per agent profile.
@@ -1226,7 +1233,10 @@ fn extract_context_graph_entries(
 
     if let Some(hotels) = obj.get("hotels").and_then(serde_json::Value::as_object) {
         if let Some(hotel_name) = hotel_name {
-            if let Some(hotel) = hotels.get(hotel_name).and_then(serde_json::Value::as_object) {
+            if let Some(hotel) = hotels
+                .get(hotel_name)
+                .and_then(serde_json::Value::as_object)
+            {
                 merge_hotel_base_entries(&mut merged, hotel);
             }
         }
@@ -1319,10 +1329,7 @@ fn merge_telegram_entries(
     if let Some(bot_token) = telegram.get("bot_token") {
         // Always store the per-agent key so membrane can retrieve it by agent_key.
         if let Some(key) = agent_key {
-            merged.insert(
-                format!("telegram_bot_token_{key}"),
-                bot_token.clone(),
-            );
+            merged.insert(format!("telegram_bot_token_{key}"), bot_token.clone());
         }
         // Also store the global fallback key for single-agent / legacy configs.
         merged.insert("telegram_bot_token".into(), bot_token.clone());
@@ -1371,7 +1378,11 @@ fn agent_identity_record_for_profile(
     // Merge policy and identity fields from config into bundle.
     if let Some(bundle_obj) = bundle_json.as_object_mut() {
         if let Some(config) = agent_config {
-            for key in ["voice_response_policy", "media_routing_policy", "default_toolset"] {
+            for key in [
+                "voice_response_policy",
+                "media_routing_policy",
+                "default_toolset",
+            ] {
                 if let Some(value) = config.get(key) {
                     bundle_obj.insert(key.to_string(), value.clone());
                 }
@@ -1448,7 +1459,10 @@ fn deactivate_legacy_managed_guests(
         legacy_guest_ids.insert(format!("philote-{}", profile.agent_key));
         legacy_guest_ids.insert(format!("{hotel_name}:philote-{}", profile.agent_key));
         legacy_guest_ids.insert(format!("hegemon-gateway-{}", profile.agent_key));
-        legacy_guest_ids.insert(format!("{hotel_name}:hegemon-gateway-{}", profile.agent_key));
+        legacy_guest_ids.insert(format!(
+            "{hotel_name}:hegemon-gateway-{}",
+            profile.agent_key
+        ));
     }
 
     let stale = graph
@@ -1622,6 +1636,27 @@ fn seed_abstract_skill_catalog(graph: &dyn GraphStorage) -> anyhow::Result<()> {
             implied_tools: vec!["session.status".into(), "agent.configure".into(), "role.configure".into()],
             ..Default::default()
         },
+        AbstractSkillRecord {
+            skill_name: "role.authoring".into(),
+            description: "Create or update roles through role.configure using a complete payload. Gather missing role inputs first, always include role_name and reasoning fields, and optionally hand off into the new role once creation succeeds.".into(),
+            implied_tools: vec![
+                "session.status".into(),
+                "role.configure".into(),
+                "handoff.to_role".into(),
+            ],
+            validation_state: ansible_mesh_core::graph::SkillValidationState::Validated,
+            field_sources: serde_json::json!({
+                "required_fields": [
+                    "role_name",
+                    "toolset_profile",
+                    "reasoning.purpose",
+                    "reasoning.toolset_rationale",
+                    "reasoning.handoff_posture_and_limits"
+                ],
+                "repo_skill_path": "skills/role-authoring/SKILL.md"
+            }),
+            ..Default::default()
+        },
     ];
 
     for skill in &catalog {
@@ -1649,6 +1684,7 @@ fn seed_toolset_profiles(graph: &dyn GraphStorage) -> anyhow::Result<()> {
                 "handoff.to_role".into(),
                 "handoff.back".into(),
                 "role.governance".into(),
+                "role.authoring".into(),
             ],
             description: Some("Default orchestrator role profile.".into()),
         },
@@ -1694,14 +1730,22 @@ fn seed_toolset_profiles(graph: &dyn GraphStorage) -> anyhow::Result<()> {
                 "workspace.read".into(),
                 "bash.exec".into(),
             ],
-            allowed_classes: vec!["session".into(), "utility".into(), "config".into(), "shell".into()],
+            allowed_classes: vec![
+                "session".into(),
+                "utility".into(),
+                "config".into(),
+                "shell".into(),
+            ],
             allowed_skills: vec![
                 "skill.crafting".into(),
                 "handoff.to_role".into(),
                 "handoff.back".into(),
                 "role.governance".into(),
+                "role.authoring".into(),
             ],
-            description: Some("Admin role profile — full skill crafting and role governance authority.".into()),
+            description: Some(
+                "Admin role profile — full skill crafting and role governance authority.".into(),
+            ),
         },
     ];
 
@@ -1747,6 +1791,9 @@ Responsibilities:
 
 Rules:
 - Reason explicitly before creating a role: purpose, toolset, handoff posture, limits.
+- Use the role.authoring skill when preparing a role.configure call so required fields are not omitted.
+- role.configure always requires: role_name, toolset_profile, reasoning.purpose, reasoning.toolset_rationale, and reasoning.handoff_posture_and_limits.
+- After role creation succeeds, hand off into the new role only when the operator asked to use it immediately.
 - Do not bypass the approval gate; if a tool requires operator approval, surface it clearly.
 - Keep soul_text and core identity stable — those changes require operator approval.
 - Use handoff.to_role for sustained specialist work; use subagent.spawn for parallel bounded tasks.
@@ -2448,7 +2495,8 @@ fn startup_test_db_path() -> PathBuf {
 }
 
 fn startup_test_membrane_guests(hotel_name: &str) -> Result<Vec<GuestRecord>> {
-    let graph = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open(startup_test_db_path())?;
+    let graph =
+        ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open(startup_test_db_path())?;
     let mut membranes = graph
         .list_guests(hotel_name, false)?
         .into_iter()
@@ -3682,7 +3730,9 @@ async fn startup_test_emit_graph_tool(
 
     let reply = tokio::time::timeout(tokio::time::Duration::from_secs(15), client.recv_task())
         .await
-        .with_context(|| format!("{tool_name}: timed out waiting for startup graph tool_result"))??;
+        .with_context(|| {
+            format!("{tool_name}: timed out waiting for startup graph tool_result")
+        })??;
 
     let IpcResponse::InboundTask { task_json, .. } = reply else {
         anyhow::bail!("{tool_name}: unexpected startup graph reply envelope: {reply:?}");
@@ -3887,7 +3937,11 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
     info!(
         "Seeding {} agent(s): {}",
         all_profiles.len(),
-        all_profiles.iter().map(|p| p.persona_name.as_str()).collect::<Vec<_>>().join(", ")
+        all_profiles
+            .iter()
+            .map(|p| p.persona_name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     );
 
     let mut all_desired_guests: Vec<GuestRecord> = Vec::new();
@@ -3896,7 +3950,12 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
     }
     all_desired_guests.extend(hotel_shared_guests(hotel_name, &all_profiles));
 
-    deactivate_legacy_managed_guests(&graph_storage, hotel_name, &all_profiles, &all_desired_guests)?;
+    deactivate_legacy_managed_guests(
+        &graph_storage,
+        hotel_name,
+        &all_profiles,
+        &all_desired_guests,
+    )?;
     graph_storage.seed_guests(hotel_name, &all_desired_guests)?;
     info!("Seeded {} guest record(s).", all_desired_guests.len());
 
@@ -3907,8 +3966,7 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
     seed_skill_crafting(&graph_storage)?;
 
     for profile in &all_profiles {
-        let agent_config =
-            raw_agent_config_for_key(&config_json, hotel_name, &profile.agent_key);
+        let agent_config = raw_agent_config_for_key(&config_json, hotel_name, &profile.agent_key);
         let identity =
             agent_identity_record_for_profile(profile, hotel_name, agent_config.as_ref());
         graph_storage
@@ -3987,14 +4045,19 @@ async fn main() -> Result<()> {
         fs::create_dir_all(pdir)
             .with_context(|| format!("create profile dir {}", pdir.display()))?;
         db_path_buf = pdir.join("context.db");
-        info!("Profile: {}  (DB: {})", std::env::var("PHILOTIC_PROFILE").unwrap_or_default(), db_path_buf.display());
+        info!(
+            "Profile: {}  (DB: {})",
+            std::env::var("PHILOTIC_PROFILE").unwrap_or_default(),
+            db_path_buf.display()
+        );
         &db_path_buf
     } else {
         Path::new("aiua_context.db")
     };
     let graph_storage = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open(db_path)?;
 
-    let hotel_name = args.hotel
+    let hotel_name = args
+        .hotel
         .context("--hotel is required unless using a subcommand such as `aiua load`")?;
 
     let seeded_guests = graph_storage.list_guests(&hotel_name, true)?;
@@ -4008,7 +4071,11 @@ async fn main() -> Result<()> {
             "Hotel '{}' booting with {} seeded guest(s): {}",
             hotel_name,
             seeded_guests.len(),
-            seeded_guests.iter().map(|g| g.guest_id.as_str()).collect::<Vec<_>>().join(", ")
+            seeded_guests
+                .iter()
+                .map(|g| g.guest_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
 
@@ -4090,21 +4157,22 @@ async fn main() -> Result<()> {
 
     // Boot-time MuninnDB config load (Slice D).
     // Returns None if no vault registry is configured; guests fall back to NullMemoryEngine.
-    let muninn_config_arc: Option<Arc<memory_core::MuninnConfig>> =
-        match memory::load_muninn_config(graph_arc.as_ref()) {
-            Ok(Some(cfg)) => {
-                info!(endpoint = %cfg.base_url, vaults = cfg.vault_tokens.len(), "MuninnDB configured");
-                Some(Arc::new(cfg))
-            }
-            Ok(None) => {
-                info!("MuninnDB not configured — guests will use NullMemoryEngine");
-                None
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to load MuninnDB config — continuing without memory");
-                None
-            }
-        };
+    let muninn_config_arc: Option<Arc<memory_core::MuninnConfig>> = match memory::load_muninn_config(
+        graph_arc.as_ref(),
+    ) {
+        Ok(Some(cfg)) => {
+            info!(endpoint = %cfg.base_url, vaults = cfg.vault_tokens.len(), "MuninnDB configured");
+            Some(Arc::new(cfg))
+        }
+        Ok(None) => {
+            info!("MuninnDB not configured — guests will use NullMemoryEngine");
+            None
+        }
+        Err(e) => {
+            warn!(error = %e, "Failed to load MuninnDB config — continuing without memory");
+            None
+        }
+    };
 
     if smoke_mode {
         warn!(
@@ -4496,7 +4564,10 @@ mod tests {
         let guests = default_guest_seed("beta-hotel");
         assert_eq!(guests.len(), 6); // membrane, model-gemini, model-elevenlabs, tool-runner, graph-runner, agent
         // Membrane is the first guest from hotel_shared_guests
-        let membrane = guests.iter().find(|g| g.role == "membrane").expect("membrane");
+        let membrane = guests
+            .iter()
+            .find(|g| g.role == "membrane")
+            .expect("membrane");
         let config: serde_json::Value = serde_json::from_str(&membrane.config_json).unwrap();
         assert_eq!(
             config["env"]["PHILOTIC_HOTEL_SOCKET"].as_str(),
@@ -4507,8 +4578,11 @@ mod tests {
         assert!(guests.iter().any(|guest| guest.role == "model.elevenlabs"));
         assert!(guests.iter().any(|guest| guest.role == "tool"));
         // Single membrane uses PHILOTIC_AGENT_ROSTER (not per-agent token key)
-        let roster_json = config["env"]["PHILOTIC_AGENT_ROSTER"].as_str().expect("roster");
-        let roster: Vec<serde_json::Value> = serde_json::from_str(roster_json).expect("parse roster");
+        let roster_json = config["env"]["PHILOTIC_AGENT_ROSTER"]
+            .as_str()
+            .expect("roster");
+        let roster: Vec<serde_json::Value> =
+            serde_json::from_str(roster_json).expect("parse roster");
         assert!(!roster.is_empty());
         assert_eq!(roster[0]["agent_key"].as_str(), Some("beta"));
         assert_eq!(roster[0]["agent_id"].as_str(), Some("agent-beta-01"));
@@ -4525,7 +4599,10 @@ mod tests {
                 import_workspace: None,
             },
         );
-        let membrane_guest = guests.iter().find(|g| g.role == "membrane").expect("membrane");
+        let membrane_guest = guests
+            .iter()
+            .find(|g| g.role == "membrane")
+            .expect("membrane");
         let agent_guest = guests.iter().find(|g| g.role == "agent").expect("agent");
         let membrane: serde_json::Value =
             serde_json::from_str(&membrane_guest.config_json).expect("membrane config");
@@ -4533,8 +4610,11 @@ mod tests {
             serde_json::from_str(&agent_guest.config_json).expect("agent config");
 
         // Single membrane uses PHILOTIC_AGENT_ROSTER; agent_id is embedded in the roster
-        let roster_json = membrane["env"]["PHILOTIC_AGENT_ROSTER"].as_str().expect("roster");
-        let roster: Vec<serde_json::Value> = serde_json::from_str(roster_json).expect("parse roster");
+        let roster_json = membrane["env"]["PHILOTIC_AGENT_ROSTER"]
+            .as_str()
+            .expect("roster");
+        let roster: Vec<serde_json::Value> =
+            serde_json::from_str(roster_json).expect("parse roster");
         assert_eq!(roster[0]["agent_key"].as_str(), Some("beacon"));
         assert_eq!(roster[0]["agent_id"].as_str(), Some("agent-beacon-01"));
 
@@ -4725,8 +4805,16 @@ mod tests {
         });
         let entries = extract_context_graph_entries(&config, Some("default"));
         // Per-agent keys must be present
-        assert!(entries.iter().any(|(k, v)| k == "telegram_bot_token_jane" && v.as_str() == Some("jane-token")));
-        assert!(entries.iter().any(|(k, v)| k == "telegram_bot_token_aria" && v.as_str() == Some("aria-token")));
+        assert!(
+            entries
+                .iter()
+                .any(|(k, v)| k == "telegram_bot_token_jane" && v.as_str() == Some("jane-token"))
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|(k, v)| k == "telegram_bot_token_aria" && v.as_str() == Some("aria-token"))
+        );
     }
 
     #[test]
@@ -4751,7 +4839,11 @@ mod tests {
         });
 
         let entries = extract_context_graph_entries(&config, Some("second-hotel"));
-        assert!(entries.iter().any(|(k, v)| k == "telegram_bot_token_aria" && v.as_str() == Some("coach-token")));
+        assert!(
+            entries
+                .iter()
+                .any(|(k, v)| k == "telegram_bot_token_aria" && v.as_str() == Some("coach-token"))
+        );
         assert!(!entries.iter().any(|(k, _)| k == "telegram_bot_token_bjork"));
     }
 
@@ -4764,12 +4856,18 @@ mod tests {
             import_workspace: None,
         };
         let guests = guest_seed_for_profile("default", &profile);
-        let membrane = guests.iter().find(|g| g.role == "membrane").expect("membrane guest");
+        let membrane = guests
+            .iter()
+            .find(|g| g.role == "membrane")
+            .expect("membrane guest");
         let config: serde_json::Value =
             serde_json::from_str(&membrane.config_json).expect("parse membrane config");
         // Token keys are now embedded in PHILOTIC_AGENT_ROSTER; membrane resolves them at runtime
-        let roster_json = config["env"]["PHILOTIC_AGENT_ROSTER"].as_str().expect("roster");
-        let roster: Vec<serde_json::Value> = serde_json::from_str(roster_json).expect("parse roster");
+        let roster_json = config["env"]["PHILOTIC_AGENT_ROSTER"]
+            .as_str()
+            .expect("roster");
+        let roster: Vec<serde_json::Value> =
+            serde_json::from_str(roster_json).expect("parse roster");
         assert_eq!(roster[0]["agent_key"].as_str(), Some("aria"));
         assert_eq!(roster[0]["agent_id"].as_str(), Some("agent-aria"));
     }
@@ -4821,7 +4919,10 @@ mod tests {
             }
             bundle
         };
-        assert_eq!(identity["identity_text"].as_str(), Some("Workspace identity."));
+        assert_eq!(
+            identity["identity_text"].as_str(),
+            Some("Workspace identity.")
+        );
     }
 
     #[test]
@@ -4918,11 +5019,10 @@ mod tests {
                 hotel_name: hotel_name.into(),
                 guest_id: format!("{hotel_name}:philote-jane"),
                 role: "agent".into(),
-                config_json: serde_json::json!({ "command": "target/debug/philote" })
-                    .to_string(),
+                config_json: serde_json::json!({ "command": "target/debug/philote" }).to_string(),
                 is_active: true,
                 active_pid: None,
-            last_active_at: None,
+                last_active_at: None,
             },
             GuestRecord {
                 hotel_name: hotel_name.into(),
@@ -4931,7 +5031,7 @@ mod tests {
                 config_json: serde_json::json!({ "command": "target/debug/hegemon" }).to_string(),
                 is_active: true,
                 active_pid: None,
-            last_active_at: None,
+                last_active_at: None,
             },
         ];
 

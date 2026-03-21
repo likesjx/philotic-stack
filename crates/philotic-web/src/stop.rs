@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use std::time::Duration;
 use tokio::time::sleep;
 

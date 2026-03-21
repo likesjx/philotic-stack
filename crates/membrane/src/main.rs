@@ -1,6 +1,8 @@
 use anyhow::Result;
 use clap::Parser;
-use philotic_client::{CommandManifestEntry, GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, is_ipc_disconnect};
+use philotic_client::{
+    CommandManifestEntry, GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, is_ipc_disconnect,
+};
 use pulldown_cmark::{
     CodeBlockKind, Event, LinkType, Options, Parser as MarkdownParser, Tag, TagEnd,
 };
@@ -807,7 +809,10 @@ async fn handle_membrane_command(
                 .map(|d| d.as_millis())
                 .unwrap_or(0);
             let new_session_id = match envelope.thread_id.as_deref() {
-                Some(tid) => format!("telegram:{}:{}:{}:{}", envelope.chat_id, tid, epoch_ms, agent_id),
+                Some(tid) => format!(
+                    "telegram:{}:{}:{}:{}",
+                    envelope.chat_id, tid, epoch_ms, agent_id
+                ),
                 None => format!("telegram:{}:{}:{}", envelope.chat_id, epoch_ms, agent_id),
             };
             let session_key = format!(
@@ -1179,7 +1184,10 @@ fn telegram_help_text(agent_cmds: &[CommandManifestEntry]) -> String {
     }
     for entry in agent_cmds {
         if let Some(hint) = &entry.usage_hint {
-            help.push_str(&format!("/{:<9} {} ({})\n", entry.command, entry.description, hint));
+            help.push_str(&format!(
+                "/{:<9} {} ({})\n",
+                entry.command, entry.description, hint
+            ));
         } else {
             help.push_str(&format!("/{:<9} {}\n", entry.command, entry.description));
         }
@@ -1297,23 +1305,23 @@ async fn fetch_agent_command_manifest(
     agent_id: &str,
 ) -> Vec<CommandManifestEntry> {
     let key = format!("__apartment__:{agent_id}:command_manifest");
-    match ipc_client
-        .send_request(IpcRequest::GetConfig { key })
-        .await
-    {
-        Ok(IpcResponse::ConfigData { value_json: Some(json_str), .. }) => {
-            match serde_json::from_str::<Vec<CommandManifestEntry>>(&json_str) {
-                Ok(entries) => {
-                    info!("Fetched {} agent command manifest entries.", entries.len());
-                    entries
-                }
-                Err(e) => {
-                    warn!("Failed to parse agent command manifest: {}", e);
-                    vec![]
-                }
+    match ipc_client.send_request(IpcRequest::GetConfig { key }).await {
+        Ok(IpcResponse::ConfigData {
+            value_json: Some(json_str),
+            ..
+        }) => match serde_json::from_str::<Vec<CommandManifestEntry>>(&json_str) {
+            Ok(entries) => {
+                info!("Fetched {} agent command manifest entries.", entries.len());
+                entries
             }
-        }
-        Ok(IpcResponse::ConfigData { value_json: None, .. }) => {
+            Err(e) => {
+                warn!("Failed to parse agent command manifest: {}", e);
+                vec![]
+            }
+        },
+        Ok(IpcResponse::ConfigData {
+            value_json: None, ..
+        }) => {
             info!("Agent command manifest not yet available; using native commands only.");
             vec![]
         }
@@ -1621,7 +1629,10 @@ async fn run_seat_impl(
                         .query(&[
                             ("offset", off.to_string()),
                             ("timeout", TELEGRAM_POLL_TIMEOUT_SECS.to_string()),
-                            ("allowed_updates", "[\"message\",\"callback_query\"]".to_string()),
+                            (
+                                "allowed_updates",
+                                "[\"message\",\"callback_query\"]".to_string(),
+                            ),
                         ])
                         .send()
                         .await?;
@@ -1902,13 +1913,24 @@ async fn run_seat_impl(
 
         // Renew lease between polls (never mid-poll) to avoid cancelling in-flight HTTP requests.
         if tokio::time::Instant::now() >= next_lease_renewal {
-            match renew_telegram_poll_lease(&mut ipc_client, &poll_lease_key, &target_agent_id, poll_lease_epoch).await {
+            match renew_telegram_poll_lease(
+                &mut ipc_client,
+                &poll_lease_key,
+                &target_agent_id,
+                poll_lease_epoch,
+            )
+            .await
+            {
                 Ok(epoch) => {
                     poll_lease_epoch = epoch;
-                    next_lease_renewal = tokio::time::Instant::now() + Duration::from_secs(TELEGRAM_POLL_LEASE_RENEW_INTERVAL_SECS);
+                    next_lease_renewal = tokio::time::Instant::now()
+                        + Duration::from_secs(TELEGRAM_POLL_LEASE_RENEW_INTERVAL_SECS);
                 }
                 Err(err) => {
-                    warn!("Failed to renew Telegram poll lease [{}]: {}. Seat exiting.", poll_lease_key, err);
+                    warn!(
+                        "Failed to renew Telegram poll lease [{}]: {}. Seat exiting.",
+                        poll_lease_key, err
+                    );
                     let _ = release_telegram_poll_lease(&mut ipc_client, &poll_lease_key).await;
                     return Ok(());
                 }
@@ -1955,7 +1977,10 @@ async fn main() -> Result<()> {
                 let agent_key = entry.get("agent_key").and_then(Value::as_str).unwrap_or("");
                 let agent_id = entry.get("agent_id").and_then(Value::as_str).unwrap_or("");
                 if agent_key.is_empty() || agent_id.is_empty() {
-                    warn!("Skipping roster entry with missing agent_key or agent_id: {}", entry);
+                    warn!(
+                        "Skipping roster entry with missing agent_key or agent_id: {}",
+                        entry
+                    );
                     continue;
                 }
                 // Each seat registers under the per-agent guest_id so that philote reply
@@ -1963,7 +1988,10 @@ async fn main() -> Result<()> {
                 let seat_guest_id = format!("{}-{}", hotel_guest_id, agent_key);
                 let token_key = format!("telegram_bot_token_{}", agent_key);
 
-                info!("Spawning seat for agent [{}] (guest_id: {})", agent_id, seat_guest_id);
+                info!(
+                    "Spawning seat for agent [{}] (guest_id: {})",
+                    agent_id, seat_guest_id
+                );
                 let agent_id = agent_id.to_string();
                 let http = http_client.clone();
                 let tg_api = telegram_api_base.clone();
@@ -2384,13 +2412,11 @@ mod tests {
 
     #[test]
     fn combined_commands_include_native_and_agent_entries() {
-        let agent_cmds = vec![
-            CommandManifestEntry {
-                command: "status".into(),
-                description: "Show status.".into(),
-                usage_hint: None,
-            },
-        ];
+        let agent_cmds = vec![CommandManifestEntry {
+            command: "status".into(),
+            description: "Show status.".into(),
+            usage_hint: None,
+        }];
         let combined = build_combined_telegram_commands(TELEGRAM_MENU_COMMANDS, &agent_cmds);
         let names: Vec<&str> = combined
             .iter()

@@ -99,10 +99,7 @@ impl TaskErrorPayload {
     }
 
     /// A transport-level failure (socket error, serialization failure, etc.).
-    pub fn transport_error(
-        component: impl Into<String>,
-        message: impl Into<String>,
-    ) -> Self {
+    pub fn transport_error(component: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             kind: "transport_error".into(),
             message: message.into(),

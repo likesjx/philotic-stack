@@ -12,7 +12,10 @@ pub struct Identity {
 
 impl Identity {
     pub fn new(id: impl Into<String>) -> Self {
-        Self { id: id.into(), roles: vec![] }
+        Self {
+            id: id.into(),
+            roles: vec![],
+        }
     }
 
     pub fn with_roles(mut self, roles: Vec<String>) -> Self {

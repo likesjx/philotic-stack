@@ -23,7 +23,9 @@ fn db_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            PathBuf::from(home).join(".philotic").join("graph-runner.db")
+            PathBuf::from(home)
+                .join(".philotic")
+                .join("graph-runner.db")
         })
 }
 
@@ -82,11 +84,12 @@ async fn main() -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     info!(path = %path.display(), "Opening graph store");
-    let store: &'static dyn GraphTableStore =
-        Box::leak(Box::new(SqliteGraphStore::open(&path)?));
+    let store: &'static dyn GraphTableStore = Box::leak(Box::new(SqliteGraphStore::open(&path)?));
 
     let iid = instance_id();
-    let all_tools: Vec<String> = GRAPH_TOOLS.iter().chain(TABLE_TOOLS.iter())
+    let all_tools: Vec<String> = GRAPH_TOOLS
+        .iter()
+        .chain(TABLE_TOOLS.iter())
         .map(|s| s.to_string())
         .collect();
     let identity = GuestIdentity {
@@ -106,7 +109,9 @@ async fn main() -> Result<()> {
     }
     // Also subscribe on the general role so the hotel can direct-route by guest ID.
     let _ = ipc_client
-        .send_request(IpcRequest::SubscribeInbox { role: "tool.graph".into() })
+        .send_request(IpcRequest::SubscribeInbox {
+            role: "tool.graph".into(),
+        })
         .await?;
 
     // Register all graphs that already exist in this instance's store.
@@ -188,9 +193,16 @@ async fn main() -> Result<()> {
                 let caller_roles: Vec<String> = task
                     .get("caller_roles")
                     .and_then(serde_json::Value::as_array)
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
                     .unwrap_or_default();
-                let identity = Identity { id: caller_id, roles: caller_roles };
+                let identity = Identity {
+                    id: caller_id,
+                    roles: caller_roles,
+                };
 
                 // Dispatch is synchronous (rusqlite). Spawn a blocking task so the
                 // async loop is not stalled during heavier graph operations.

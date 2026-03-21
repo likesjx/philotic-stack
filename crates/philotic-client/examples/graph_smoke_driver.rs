@@ -13,8 +13,8 @@ const DRIVER_ROLE: &str = "graph.smoke.reply";
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let target_node = std::env::var("PHILOTIC_TARGET_NODE")
-        .unwrap_or_else(|_| "local-aiua-01".to_string());
+    let target_node =
+        std::env::var("PHILOTIC_TARGET_NODE").unwrap_or_else(|_| "local-aiua-01".to_string());
     let graph_name = format!("smoke-graph-{}", uuid::Uuid::new_v4());
 
     let mut client = PhiloticClient::connect(GuestIdentity {
@@ -191,7 +191,10 @@ async fn emit_tool(
     if content["ok"].as_bool() != Some(true) {
         bail!(
             "{tool_name}: tool returned ok=false: {}",
-            content.get("error").and_then(|e| e.as_str()).unwrap_or(content_str)
+            content
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or(content_str)
         );
     }
 

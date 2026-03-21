@@ -32,6 +32,7 @@ pub enum ContextLayerId {
     Session,
     Working,
     Knowledge,
+    RecalledMemory,
 }
 
 impl ContextLayerId {
@@ -42,6 +43,7 @@ impl ContextLayerId {
             Self::Session => "session",
             Self::Working => "working",
             Self::Knowledge => "knowledge",
+            Self::RecalledMemory => "recalled_memory",
         }
     }
 }
@@ -225,6 +227,8 @@ pub struct RoleActivation {
     pub skillset_profile_ref: Option<String>,
     #[serde(default)]
     pub effective_skillset: Vec<String>,
+    #[serde(default)]
+    pub effective_skill_guidance: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_memory_policy: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -258,6 +262,14 @@ pub struct ActivePlan {
     pub status: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecalledMemoryRecord {
+    pub concept: String,
+    pub content: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkingTurn {
     pub task_id: Uuid,
@@ -276,6 +288,8 @@ pub struct WorkingTurn {
     /// Accumulated (tool_call, tool_result) pairs for the current in-flight turn.
     /// Fed back into the model prompt on each re-entry so the model has full context.
     pub working_tool_history: Vec<(ToolCall, ToolResult)>,
+    /// Long-term memories auto-recalled for this turn before the first model request.
+    pub recalled_memories: Vec<RecalledMemoryRecord>,
     /// Current execution plan if the model has declared one. Updated from model
     /// responses; threaded into context on re-entry.
     pub active_plan: Option<ActivePlan>,
@@ -568,6 +582,8 @@ pub struct SessionBindings {
     pub effective_toolset: Vec<String>,
     #[serde(default)]
     pub effective_skillset: Vec<String>,
+    #[serde(default)]
+    pub effective_skill_guidance: Vec<String>,
     #[serde(default)]
     pub effective_workspace_ref: Option<String>,
     #[serde(default)]
@@ -1026,8 +1042,14 @@ impl SessionState {
     }
 
     /// Known approval class names that can be pre-approved by class rather than by tool name.
-    const APPROVAL_CLASSES: &'static [&'static str] =
-        &["session", "workspace", "utility", "capability", "config", "handoff"];
+    const APPROVAL_CLASSES: &'static [&'static str] = &[
+        "session",
+        "workspace",
+        "utility",
+        "capability",
+        "config",
+        "handoff",
+    ];
 
     /// Preapprove a tool name or class name for this session.
     ///
@@ -1035,13 +1057,25 @@ impl SessionState {
     /// added to `preapproved_classes`; otherwise it is added to `preapproved_tools`.
     pub fn preapprove_by_name(&mut self, name: &str) -> String {
         if Self::APPROVAL_CLASSES.contains(&name) {
-            if !self.approval_policy.preapproved_classes.contains(&name.to_string()) {
-                self.approval_policy.preapproved_classes.push(name.to_string());
+            if !self
+                .approval_policy
+                .preapproved_classes
+                .contains(&name.to_string())
+            {
+                self.approval_policy
+                    .preapproved_classes
+                    .push(name.to_string());
             }
             format!("Preapproved: `{name}` (class)")
         } else {
-            if !self.approval_policy.preapproved_tools.contains(&name.to_string()) {
-                self.approval_policy.preapproved_tools.push(name.to_string());
+            if !self
+                .approval_policy
+                .preapproved_tools
+                .contains(&name.to_string())
+            {
+                self.approval_policy
+                    .preapproved_tools
+                    .push(name.to_string());
             }
             format!("Preapproved: `{name}` (tool)")
         }
@@ -1160,7 +1194,9 @@ impl SessionState {
                     .ok_or("settings.context_window.dialogue_window_minutes requires a u32")?;
                 let clamped = (v as u32).clamp(2, 60);
                 self.settings.context_window.dialogue_window_minutes = clamped;
-                Ok(format!("Set settings.context_window.dialogue_window_minutes = {clamped}."))
+                Ok(format!(
+                    "Set settings.context_window.dialogue_window_minutes = {clamped}."
+                ))
             }
             "settings.context_window.dialogue_window_chars" => {
                 let v = value
@@ -1168,14 +1204,18 @@ impl SessionState {
                     .ok_or("settings.context_window.dialogue_window_chars requires a usize")?;
                 let clamped = (v as usize).clamp(1_000, 50_000);
                 self.settings.context_window.dialogue_window_chars = clamped;
-                Ok(format!("Set settings.context_window.dialogue_window_chars = {clamped}."))
+                Ok(format!(
+                    "Set settings.context_window.dialogue_window_chars = {clamped}."
+                ))
             }
             "settings.context_window.include_tool_calls" => {
                 let v = value
                     .as_bool()
                     .ok_or("settings.context_window.include_tool_calls requires a boolean")?;
                 self.settings.context_window.include_tool_calls = v;
-                Ok(format!("Set settings.context_window.include_tool_calls = {v}."))
+                Ok(format!(
+                    "Set settings.context_window.include_tool_calls = {v}."
+                ))
             }
             "settings.memory.memory_window_size" => {
                 let v = value
@@ -1183,14 +1223,18 @@ impl SessionState {
                     .ok_or("settings.memory.memory_window_size requires a usize")?;
                 let clamped = (v as usize).clamp(3, 30);
                 self.settings.memory.memory_window_size = clamped;
-                Ok(format!("Set settings.memory.memory_window_size = {clamped}."))
+                Ok(format!(
+                    "Set settings.memory.memory_window_size = {clamped}."
+                ))
             }
             "settings.memory.long_term_recall_enabled" => {
                 let v = value
                     .as_bool()
                     .ok_or("settings.memory.long_term_recall_enabled requires a boolean")?;
                 self.settings.memory.long_term_recall_enabled = v;
-                Ok(format!("Set settings.memory.long_term_recall_enabled = {v}."))
+                Ok(format!(
+                    "Set settings.memory.long_term_recall_enabled = {v}."
+                ))
             }
             "settings.memory.recall_limit" => {
                 let v = value
@@ -1214,7 +1258,9 @@ impl SessionState {
                     .ok_or("settings.execution.stall_detection_threshold requires a u32")?;
                 let clamped = (v as u32).clamp(1, 10);
                 self.settings.execution.stall_detection_threshold = clamped;
-                Ok(format!("Set settings.execution.stall_detection_threshold = {clamped}."))
+                Ok(format!(
+                    "Set settings.execution.stall_detection_threshold = {clamped}."
+                ))
             }
             "settings.execution.stream_tool_events" => {
                 let v = value
@@ -1416,7 +1462,9 @@ impl SessionState {
     pub fn rebuild_default_tool_assembly(&mut self) {
         // Seed effective_toolset from the profile default when empty.
         // This lets agents have persistent tool grants without per-session /tools add.
-        if self.bindings.effective_toolset.is_empty() && !self.agent_profile.default_toolset.is_empty() {
+        if self.bindings.effective_toolset.is_empty()
+            && !self.agent_profile.default_toolset.is_empty()
+        {
             self.bindings.effective_toolset = self.agent_profile.default_toolset.clone();
         }
         self.tool_assembly = default_tool_assembly_for_bindings(&self.bindings);
@@ -1489,9 +1537,7 @@ impl SessionState {
         };
         format!(
             "Approval policy:\n- auto_approve_all: {}\n- preapproved_tools: {}\n- preapproved_classes: {}\n\nCommands: /preapprove <tool|class>  /preapprove this-session  /approval reset",
-            self.approval_policy.auto_approve_all,
-            tools,
-            classes,
+            self.approval_policy.auto_approve_all, tools, classes,
         )
     }
 
@@ -1566,14 +1612,22 @@ impl SessionState {
         ));
 
         // Instructions (session + working)
-        let instructions = format!("{}\n{}", self.project_session_context(&[]), self.project_working_state());
+        let instructions = format!(
+            "{}\n{}",
+            self.project_session_context(&[]),
+            self.project_working_state()
+        );
         lines.push(format!(
             "instructions   {} chars — session state + working projection",
             instructions.len()
         ));
 
         // Memory (relationship + knowledge)
-        let memory = format!("{}\n{}", self.project_user(""), self.project_knowledge("", &[]));
+        let memory = format!(
+            "{}\n{}",
+            self.project_user(""),
+            self.project_knowledge("", &[])
+        );
         lines.push(format!(
             "memory         {} chars — relationship + knowledge layers",
             memory.len()
@@ -1585,8 +1639,7 @@ impl SessionState {
             .recent_turns
             .iter()
             .map(|t| {
-                t.user_content.len()
-                    + t.assistant_content.as_deref().map(str::len).unwrap_or(0)
+                t.user_content.len() + t.assistant_content.as_deref().map(str::len).unwrap_or(0)
             })
             .sum();
         lines.push(format!(
@@ -1624,7 +1677,10 @@ impl SessionState {
                         .join("\n")
                 })
                 .unwrap_or_default();
-            lines.push(format!("tool_history   {} call(s):\n{}", history_count, history_summary));
+            lines.push(format!(
+                "tool_history   {} call(s):\n{}",
+                history_count, history_summary
+            ));
         } else {
             lines.push("tool_history   (empty — initial turn or no tools called yet)".into());
         }
@@ -1638,7 +1694,7 @@ impl SessionState {
             return all_tools;
         }
 
-        let normalized = user_content.trim().to_ascii_lowercase();
+        let normalized = normalized_turn_text(user_content);
         if normalized.is_empty() {
             return all_tools;
         }
@@ -1716,6 +1772,7 @@ impl SessionState {
         let identity = self.project_agent_self();
         let relationship = self.project_user(user_content);
         let knowledge = self.project_knowledge(user_content, projected_tools);
+        let recalled_memory = self.project_recalled_memory();
         let working = self.project_working_state();
         let session = self.project_session_context(projected_tools);
 
@@ -1783,6 +1840,19 @@ impl SessionState {
             vec!["recent_turns".into(), "agent_profile.memory_summary".into()],
             "memory_candidate",
         );
+        if !recalled_memory.is_empty() {
+            self.push_layer(
+                &mut layers,
+                &mut contributions,
+                ContextLayerId::RecalledMemory,
+                "memory_core:auto_recall",
+                ContextAuthority::Advisory,
+                ContextMutability::StaticForTurn,
+                recalled_memory,
+                vec!["active_turn.recalled_memories".into()],
+                "memory_candidate",
+            );
+        }
 
         ContextProjection {
             conversation_turn: ConversationTurnScope {
@@ -1826,6 +1896,7 @@ impl SessionState {
                 ContextLayerId::Session => "Session projection",
                 ContextLayerId::Working => "Working projection",
                 ContextLayerId::Knowledge => "Knowledge projection",
+                ContextLayerId::RecalledMemory => "Recalled memory projection",
             };
             prompt.push_str(&format!("\n[{title}]\n"));
             prompt.push_str(&layer.rendered_content);
@@ -1867,17 +1938,26 @@ impl SessionState {
             .filter(|layer| {
                 matches!(
                     layer.layer_id,
-                    ContextLayerId::Relationship | ContextLayerId::Knowledge
+                    ContextLayerId::Relationship
+                        | ContextLayerId::Knowledge
+                        | ContextLayerId::RecalledMemory
                 )
             })
             .map(|layer| {
                 let kind = match layer.layer_id {
                     ContextLayerId::Relationship => "relationship",
                     ContextLayerId::Knowledge => "knowledge",
+                    ContextLayerId::RecalledMemory => "recalled_memory",
                     _ => "memory",
                 };
                 projection_item(&layer.rendered_content, &layer.owner, kind)
             })
+            .collect::<Vec<_>>();
+        let recalled_memory = projection
+            .layers
+            .iter()
+            .filter(|layer| layer.layer_id == ContextLayerId::RecalledMemory)
+            .map(|layer| projection_item(&layer.rendered_content, &layer.owner, "recalled_memory"))
             .collect::<Vec<_>>();
 
         // Apply dialogue window: time-based roll-off first, then char-budget.
@@ -1963,6 +2043,7 @@ impl SessionState {
             "instructions": instructions,
             "identity": identity,
             "memory": memory,
+            "recalled_memory": recalled_memory,
             "dialogue_window": dialogue_window,
             "active_turn": {
                 "role": "user",
@@ -2047,6 +2128,12 @@ impl SessionState {
                 self.bindings.effective_skillset.join(", ")
             ));
         }
+        if !self.bindings.effective_skill_guidance.is_empty() {
+            lines.push(format!(
+                "\n[Skill guidance]\n{}",
+                self.bindings.effective_skill_guidance.join("\n\n")
+            ));
+        }
 
         if let Some(role_activation) = self.role_activation.as_ref() {
             // Render the role manifest as a [Governance] block so the agent knows its focus,
@@ -2057,7 +2144,10 @@ impl SessionState {
                 .map(str::trim)
                 .filter(|text| !text.is_empty())
             {
-                lines.push(format!("\n[Governance — {}]\n{}", role_activation.role_name, manifest));
+                lines.push(format!(
+                    "\n[Governance — {}]\n{}",
+                    role_activation.role_name, manifest
+                ));
             } else {
                 lines.push(format!(
                     "Active role posture: {}.",
@@ -2179,6 +2269,25 @@ impl SessionState {
         sections.join("\n\n")
     }
 
+    fn project_recalled_memory(&self) -> String {
+        let Some(turn) = self.active_turn.as_ref() else {
+            return String::new();
+        };
+        if turn.recalled_memories.is_empty() {
+            return String::new();
+        }
+
+        let mut out = String::from("[Recalled memory]\n");
+        for (i, memory) in turn.recalled_memories.iter().enumerate() {
+            out.push_str(&format!("{}. [{}] {}", i + 1, memory.concept, memory.content));
+            if !memory.tags.is_empty() {
+                out.push_str(&format!(" ({})", memory.tags.join(", ")));
+            }
+            out.push('\n');
+        }
+        out.trim_end().to_string()
+    }
+
     fn project_session_context(&self, projected_tools: &[ToolDefinition]) -> String {
         let mut envelope = String::from("[Session envelope]\n");
         envelope.push_str(&format!("Session status: {}.\n", self.status));
@@ -2267,11 +2376,14 @@ impl SessionState {
         }
         if !self.rules.is_empty() {
             envelope.push_str("\n[Rules]\n");
-            envelope.push_str("The following behavioral rules are permanently in effect. \
+            envelope.push_str(
+                "The following behavioral rules are permanently in effect. \
                                They take precedence over all other instructions and are never \
-                               negotiable without explicit operator approval:\n");
+                               negotiable without explicit operator approval:\n",
+            );
             for (i, rule) in self.rules.iter().enumerate() {
-                let desc = rule.get("description")
+                let desc = rule
+                    .get("description")
                     .and_then(|v| v.as_str())
                     .unwrap_or("<unknown rule>");
                 envelope.push_str(&format!("{}. {}\n", i + 1, desc));
@@ -2483,6 +2595,7 @@ impl SessionState {
                 "working_tool_history": turn.working_tool_history.iter().map(|(call, result)| {
                     json!({ "call": call, "result": result })
                 }).collect::<Vec<_>>(),
+                "recalled_memories": turn.recalled_memories,
                 "active_plan": turn.active_plan,
                 "consecutive_step_failures": turn.consecutive_step_failures,
                 "provider_repair_note": turn.provider_repair_note,
@@ -2586,11 +2699,10 @@ impl SessionState {
             .cloned()
             .and_then(|value| serde_json::from_value::<SessionBindings>(value).ok())
             .unwrap_or_default();
-        let tool_assembly = checkpoint
-            .get("tool_assembly")
-            .cloned()
-            .and_then(|value| serde_json::from_value::<ToolAssembly>(value).ok())
-            .unwrap_or_else(|| default_tool_assembly_for_bindings(&bindings));
+        // Always rebuild tool_assembly from bindings — never restore from checkpoint.
+        // The checkpoint may carry stale stub descriptions from a prior binary build.
+        // tool_assembly is a pure derived value from bindings; rebuilding is cheap and correct.
+        let tool_assembly = default_tool_assembly_for_bindings(&bindings);
         let component_route_assembly = checkpoint
             .get("component_route_assembly")
             .cloned()
@@ -2696,6 +2808,11 @@ impl SessionState {
                             .collect()
                     })
                     .unwrap_or_default(),
+                recalled_memories: turn
+                    .get("recalled_memories")
+                    .cloned()
+                    .and_then(|v| serde_json::from_value::<Vec<RecalledMemoryRecord>>(v).ok())
+                    .unwrap_or_default(),
                 active_plan: turn
                     .get("active_plan")
                     .cloned()
@@ -2756,6 +2873,28 @@ impl SessionState {
 fn looks_like_conversational_goal(normalized: &str) -> bool {
     normalized.contains('?')
         || [
+            "thanks",
+            "thank you",
+            "appreciate it",
+            "appreciated",
+            "great",
+            "awesome",
+            "nice",
+            "good job",
+            "working well",
+            "working pretty well",
+            "looks like you're working",
+            "looks like youre working",
+            "still standing by",
+            "got it",
+            "ok",
+            "okay",
+            "cool",
+            "sounds good",
+        ]
+        .iter()
+        .any(|phrase| normalized.contains(phrase))
+        || [
             "what",
             "why",
             "how",
@@ -2771,6 +2910,14 @@ fn looks_like_conversational_goal(normalized: &str) -> bool {
         ]
         .iter()
         .any(|prefix| normalized.starts_with(prefix))
+}
+
+fn normalized_turn_text(user_content: &str) -> String {
+    user_content
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'))
+        .trim()
+        .to_ascii_lowercase()
 }
 
 fn tool_name_matches_goal(tool_name: &str, normalized: &str) -> bool {
@@ -3231,10 +3378,10 @@ mod tests {
     use super::{
         ApprovalPolicy, ComponentExecutionRoute, ComponentRouteAssembly, ComponentRouteBinding,
         ContextAuthority, ContextLayerId, ContextMutability, HookRequest, HookResult,
-        PromotionAction, RefreshRequest, RoleActivation, SessionBindings, SessionState,
-        TaskRunnerBaseConfig, ToolRunnerIncarnationBinding, TransportReplyTargetBinding, TtsMode,
-        VoiceResponsePolicy, WorkingTurn, default_tool_assembly_for_bindings, merge_session_index,
-        session_checkpoint_memory_type,
+        PromotionAction, RecalledMemoryRecord, RefreshRequest, RoleActivation, SessionBindings,
+        SessionState, TaskRunnerBaseConfig, ToolRunnerIncarnationBinding,
+        TransportReplyTargetBinding, TtsMode, VoiceResponsePolicy, WorkingTurn,
+        default_tool_assembly_for_bindings, merge_session_index, session_checkpoint_memory_type,
     };
     use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
     use uuid::Uuid;
@@ -3256,6 +3403,7 @@ mod tests {
             pending_tool_call: None,
             pending_approval: None,
             working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
             active_plan: None,
             consecutive_step_failures: 0,
             provider_repair_note: None,
@@ -3355,6 +3503,7 @@ mod tests {
             pending_tool_call: None,
             pending_approval: None,
             working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
             active_plan: None,
             consecutive_step_failures: 0,
             provider_repair_note: None,
@@ -3463,6 +3612,7 @@ mod tests {
             SessionBindings {
                 effective_toolset: vec!["echo".into(), "workspace.read".into()],
                 effective_skillset: vec!["planning".into()],
+                effective_skill_guidance: Vec::new(),
                 effective_workspace_ref: Some("workspace://main".into()),
                 transport_reply_target: Some(TransportReplyTargetBinding {
                     target_node: "local-aiua-01".into(),
@@ -3599,7 +3749,10 @@ mod tests {
     fn bash_exec_is_in_shell_class_and_requires_approval() {
         use crate::catalog::{tool_catalog, tool_class, tool_requires_approval};
         let catalog = tool_catalog();
-        assert!(catalog.contains_key("bash.exec"), "bash.exec must be in catalog");
+        assert!(
+            catalog.contains_key("bash.exec"),
+            "bash.exec must be in catalog"
+        );
         assert_eq!(tool_class("bash.exec"), Some("shell"));
         assert!(tool_requires_approval("bash.exec"));
     }
@@ -3745,6 +3898,7 @@ mod tests {
         state.bindings = SessionBindings {
             effective_toolset: vec!["echo".into()],
             effective_skillset: vec!["planning".into()],
+            effective_skill_guidance: Vec::new(),
             effective_workspace_ref: Some("workspace://main".into()),
             transport_reply_target: Some(TransportReplyTargetBinding {
                 target_node: "local-aiua-01".into(),
@@ -3766,9 +3920,8 @@ mod tests {
         assert!(prompt.contains("Effective tools: echo."));
         assert!(prompt.contains("Workspace: workspace://main."));
         assert!(
-            prompt.contains(
-                "Delivery target: local-aiua-01 / membrane guest=membrane-telegram-01."
-            )
+            prompt
+                .contains("Delivery target: local-aiua-01 / membrane guest=membrane-telegram-01.")
         );
     }
 
@@ -3834,6 +3987,7 @@ mod tests {
                     content: "hello".into(),
                 },
             )],
+            recalled_memories: Vec::new(),
             active_plan: None,
             consecutive_step_failures: 0,
             provider_repair_note: None,
@@ -3913,6 +4067,7 @@ mod tests {
             pending_tool_call: None,
             pending_approval: None,
             working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
             active_plan: None,
             consecutive_step_failures: 0,
             provider_repair_note: None,
@@ -3986,6 +4141,7 @@ mod tests {
             pending_tool_call: None,
             pending_approval: None,
             working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
             active_plan: None,
             consecutive_step_failures: 0,
             provider_repair_note: None,
@@ -4056,6 +4212,7 @@ mod tests {
             pending_tool_call: None,
             pending_approval: None,
             working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
             active_plan: None,
             consecutive_step_failures: 0,
             provider_repair_note: None,
@@ -4216,11 +4373,7 @@ mod tests {
         assert!(text.contains("Tools: echo."));
         assert!(text.contains("Workspace: workspace://main."));
         assert!(text.contains("Routes: text.generate [legacy] impl=gemini-flash."));
-        assert!(
-            text.contains(
-                "Delivery: local-aiua-01 / membrane guest=membrane-telegram-01."
-            )
-        );
+        assert!(text.contains("Delivery: local-aiua-01 / membrane guest=membrane-telegram-01."));
     }
 
     #[test]
@@ -4454,6 +4607,30 @@ mod tests {
     }
 
     #[test]
+    fn gratitude_turns_project_no_tools_by_default() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.add_tool_binding("subagent.spawn");
+        state.add_tool_binding("echo");
+
+        let projected =
+            state.project_tools_for_turn("Thanks Bjork, I really appreciate it. Looks like you're working pretty well now.");
+        assert!(projected.is_empty());
+    }
+
+    #[test]
+    fn quoted_gratitude_turns_project_no_tools_by_default() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.add_tool_binding("subagent.spawn");
+
+        let projected = state.project_tools_for_turn(
+            "\"Thanks Bjork, I really appreciate it. Looks like you're working pretty well now.\"",
+        );
+        assert!(projected.is_empty());
+    }
+
+    #[test]
     fn explicit_tool_mentions_project_matching_tools() {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
@@ -4509,6 +4686,7 @@ mod tests {
             pending_tool_call: None,
             pending_approval: None,
             working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
             active_plan: None,
             consecutive_step_failures: 0,
             provider_repair_note: None,
@@ -4552,6 +4730,7 @@ mod tests {
             pending_tool_call: None,
             pending_approval: None,
             working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
             active_plan: None,
             consecutive_step_failures: 0,
             provider_repair_note: None,
@@ -4610,6 +4789,7 @@ mod tests {
             pending_tool_call: None,
             pending_approval: None,
             working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
             active_plan: None,
             consecutive_step_failures: 0,
             provider_repair_note: None,
@@ -4669,6 +4849,7 @@ mod tests {
             pending_tool_call: None,
             pending_approval: None,
             working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
             active_plan: None,
             consecutive_step_failures: 0,
             provider_repair_note: None,
@@ -4717,8 +4898,11 @@ mod tests {
     /// Applying a handoff bundle sets role_activation and stashes the summary.
     #[test]
     fn handoff_bundle_applies_role_activation_and_summary() {
-        let mut state =
-            SessionState::new("sess-handoff".into(), "agent-jane-01".into(), "telegram".into());
+        let mut state = SessionState::new(
+            "sess-handoff".into(),
+            "agent-jane-01".into(),
+            "telegram".into(),
+        );
 
         state.role_activation = Some(make_role_activation("researcher"));
         state.last_handoff_summary = Some("Analysing dataset drift in experiment B.".into());
@@ -4736,8 +4920,11 @@ mod tests {
     /// The handoff summary is visible in the session envelope on the first turn.
     #[test]
     fn handoff_summary_appears_in_session_envelope() {
-        let mut state =
-            SessionState::new("sess-handoff".into(), "agent-jane-01".into(), "telegram".into());
+        let mut state = SessionState::new(
+            "sess-handoff".into(),
+            "agent-jane-01".into(),
+            "telegram".into(),
+        );
 
         state.role_activation = Some(make_role_activation("researcher"));
         state.last_handoff_summary = Some("Analysing dataset drift in experiment B.".into());
@@ -4768,8 +4955,11 @@ mod tests {
     /// After clear_handoff_summary, the next context build omits the summary.
     #[test]
     fn handoff_summary_consumed_after_clear() {
-        let mut state =
-            SessionState::new("sess-handoff".into(), "agent-jane-01".into(), "telegram".into());
+        let mut state = SessionState::new(
+            "sess-handoff".into(),
+            "agent-jane-01".into(),
+            "telegram".into(),
+        );
 
         state.role_activation = Some(make_role_activation("researcher"));
         state.last_handoff_summary = Some("Analysing dataset drift in experiment B.".into());
@@ -4813,8 +5003,11 @@ mod tests {
     /// handoff_return clears role_activation, leaving no active role.
     #[test]
     fn handoff_return_clears_role_activation() {
-        let mut state =
-            SessionState::new("sess-handoff".into(), "agent-jane-01".into(), "telegram".into());
+        let mut state = SessionState::new(
+            "sess-handoff".into(),
+            "agent-jane-01".into(),
+            "telegram".into(),
+        );
 
         state.role_activation = Some(make_role_activation("researcher"));
         state.last_handoff_summary = Some("Some prior context.".into());
@@ -4826,7 +5019,10 @@ mod tests {
         state.role_activation = None;
 
         assert_eq!(previous_role.as_deref(), Some("researcher"));
-        assert!(state.role_activation.is_none(), "role must be cleared after return");
+        assert!(
+            state.role_activation.is_none(),
+            "role must be cleared after return"
+        );
 
         let projection = state.build_context_projection("hello");
         let context = state.model_context_from_projection(&projection);
@@ -4847,8 +5043,11 @@ mod tests {
     /// Full cycle: bundle → summary in context → clear → return → clean context.
     #[test]
     fn full_role_handoff_cycle() {
-        let mut state =
-            SessionState::new("sess-cycle".into(), "agent-jane-01".into(), "telegram".into());
+        let mut state = SessionState::new(
+            "sess-cycle".into(),
+            "agent-jane-01".into(),
+            "telegram".into(),
+        );
 
         // 1. handoff_bundle arrives — role applied, summary stashed.
         state.role_activation = Some(make_role_activation("analyst"));
@@ -4891,5 +5090,54 @@ mod tests {
         let turn3 = session_block(&context3);
         assert!(!turn3.contains("Active role:"));
         assert!(!turn3.contains("Handoff context:"));
+    }
+
+    #[test]
+    fn recalled_memory_projects_into_distinct_context_section() {
+        let mut state = SessionState::new(
+            "sess-memory".into(),
+            "agent-jane-01".into(),
+            "telegram".into(),
+        );
+        state.start_turn(WorkingTurn {
+            task_id: Uuid::nil(),
+            turn_id: "turn-memory".into(),
+            chat_id: "chat-memory".into(),
+            user_content: "continue the memory work".into(),
+            final_reply_to: "local-aiua-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase: TurnPhase::Queued,
+            iteration: 0,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            recalled_memories: vec![RecalledMemoryRecord {
+                concept: "memory-architecture".into(),
+                content: "User prefers deterministic bounded recall over broad automatic dumps."
+                    .into(),
+                tags: vec!["memory".into(), "preference".into()],
+            }],
+            active_plan: None,
+            consecutive_step_failures: 0,
+            provider_repair_note: None,
+            provider_repair_attempts: 0,
+            pending_text_reply: None,
+            had_voice_input: false,
+            awaiting_transcription_reentry: false,
+        });
+
+        let projection = state.build_context_projection("continue the memory work");
+        let context = state.model_context_from_projection(&projection);
+        let recalled = context["recalled_memory"]
+            .as_array()
+            .expect("recalled_memory must be an array");
+
+        assert_eq!(recalled.len(), 1);
+        let text = recalled[0]["text"]
+            .as_str()
+            .expect("recalled memory entry should render text");
+        assert!(text.contains("[Recalled memory]"));
+        assert!(text.contains("memory-architecture"));
     }
 }

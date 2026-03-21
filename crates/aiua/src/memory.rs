@@ -13,9 +13,9 @@
 //! Returns `None` from `load_muninn_config` if MuninnDB is not configured
 //! (no vault registry entries). Guests should fall back to `NullMemoryEngine`.
 
+use ansible_mesh_core::storage::GraphStorage;
 use anyhow::Result;
 use memory_core::{MuninnConfig, MuninnRestEngine, VaultResolver};
-use ansible_mesh_core::storage::GraphStorage;
 
 use crate::vault::{SecretAccess, resolve_secret};
 
@@ -38,7 +38,7 @@ pub fn load_muninn_config(graph: &dyn GraphStorage) -> Result<Option<MuninnConfi
 
     // Hotel daemon accesses its own secrets using the "hotel" identity.
     let access = SecretAccess {
-        role:     "hotel".to_string(),
+        role: "hotel".to_string(),
         guest_id: "hotel".to_string(),
     };
 
@@ -70,16 +70,12 @@ pub fn load_muninn_config(graph: &dyn GraphStorage) -> Result<Option<MuninnConfi
 ///
 /// Called at agent session start (Slice E). The `config` is the shared hotel
 /// config loaded by `load_muninn_config`.
-pub fn engine_for_agent(
-    config:   MuninnConfig,
-    agent_id: &str,
-    user_id:  &str,
-) -> MuninnRestEngine {
+pub fn engine_for_agent(config: MuninnConfig, agent_id: &str, user_id: &str) -> MuninnRestEngine {
     MuninnRestEngine::new(
         config,
         VaultResolver {
             agent_id: agent_id.to_string(),
-            user_id:  user_id.to_string(),
+            user_id: user_id.to_string(),
         },
     )
 }
@@ -87,9 +83,9 @@ pub fn engine_for_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vault::{SecretInput, store_secret};
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
     use ansible_mesh_core::storage::VaultRegistryEntry;
-    use crate::vault::{SecretInput, store_secret};
 
     fn open_graph() -> SqliteGraphStorage {
         SqliteGraphStorage::open(":memory:").expect("open in-memory graph")
@@ -106,13 +102,17 @@ mod tests {
     fn vault_registry_with_missing_secret_skips_and_returns_config() {
         let graph = open_graph();
 
-        graph.upsert_vault_registry_entry(&VaultRegistryEntry {
-            vault_name: "self_philote-1".into(),
-            secret_ref: "secret://hotel/default/muninn/does-not-exist".into(),
-        }).unwrap();
+        graph
+            .upsert_vault_registry_entry(&VaultRegistryEntry {
+                vault_name: "self_philote-1".into(),
+                secret_ref: "secret://hotel/default/muninn/does-not-exist".into(),
+            })
+            .unwrap();
 
         // Should not error — skips with a warning, returns Some(config) with empty tokens.
-        let config = load_muninn_config(&graph).unwrap().expect("Some even without valid secret");
+        let config = load_muninn_config(&graph)
+            .unwrap()
+            .expect("Some even without valid secret");
         assert!(config.vault_tokens.is_empty());
     }
 
@@ -120,24 +120,35 @@ mod tests {
     fn vault_registry_with_valid_secret_builds_config() {
         let graph = open_graph();
 
-        let secret_ref = store_secret(&graph, SecretInput {
-            plaintext:      "mk_test-token-abc123".to_string(),
-            secret_kind:    "muninn_vault_token".to_string(),
-            scope:          "hotel".to_string(),
-            allowed_roles:  vec!["hotel".to_string()],
-            allowed_guests: vec!["hotel".to_string()],
-        }).unwrap();
+        let secret_ref = store_secret(
+            &graph,
+            SecretInput {
+                plaintext: "mk_test-token-abc123".to_string(),
+                secret_kind: "muninn_vault_token".to_string(),
+                scope: "hotel".to_string(),
+                allowed_roles: vec!["hotel".to_string()],
+                allowed_guests: vec!["hotel".to_string()],
+            },
+        )
+        .unwrap();
 
-        graph.upsert_vault_registry_entry(&VaultRegistryEntry {
-            vault_name: "self_philote-1".into(),
-            secret_ref: secret_ref.clone(),
-        }).unwrap();
+        graph
+            .upsert_vault_registry_entry(&VaultRegistryEntry {
+                vault_name: "self_philote-1".into(),
+                secret_ref: secret_ref.clone(),
+            })
+            .unwrap();
         graph.set_muninn_endpoint("http://127.0.0.1:8475").unwrap();
 
-        let config = load_muninn_config(&graph).unwrap().expect("Some with valid registry");
+        let config = load_muninn_config(&graph)
+            .unwrap()
+            .expect("Some with valid registry");
         assert_eq!(config.base_url, "http://127.0.0.1:8475");
         assert_eq!(
-            config.vault_tokens.get("self_philote-1").map(String::as_str),
+            config
+                .vault_tokens
+                .get("self_philote-1")
+                .map(String::as_str),
             Some("mk_test-token-abc123")
         );
     }
@@ -151,8 +162,9 @@ mod tests {
         use memory_core::MemoryScope;
         let vaults = memory_core::VaultResolver {
             agent_id: "philote-1".to_string(),
-            user_id:  "jared".to_string(),
-        }.resolve(&MemoryScope::SelfOnly);
+            user_id: "jared".to_string(),
+        }
+        .resolve(&MemoryScope::SelfOnly);
         assert_eq!(vaults, vec!["self_philote-1"]);
         let _ = engine; // no panic
     }

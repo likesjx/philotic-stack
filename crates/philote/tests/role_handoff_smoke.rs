@@ -31,7 +31,10 @@ fn init_tracing() {
 
 async fn write_frame(stream: &mut tokio::net::UnixStream, payload: &[u8]) {
     let len = u32::try_from(payload.len()).expect("frame length fits u32");
-    stream.write_all(&len.to_be_bytes()).await.expect("write header");
+    stream
+        .write_all(&len.to_be_bytes())
+        .await
+        .expect("write header");
     stream.write_all(payload).await.expect("write payload");
 }
 
@@ -106,7 +109,11 @@ async fn connect_runtime(socket_path: &str, agent_id: &str) -> AgentRuntime {
     AgentRuntime::new(client, agent_id)
 }
 
-fn handoff_bundle_task(session_id: &str, to_role: &str, summary: &str) -> (InboundTaskPayload, Uuid) {
+fn handoff_bundle_task(
+    session_id: &str,
+    to_role: &str,
+    summary: &str,
+) -> (InboundTaskPayload, Uuid) {
     let task_id = Uuid::new_v4();
     let bundle = HandoffBundle {
         to_role: Some(to_role.into()),
@@ -161,7 +168,8 @@ async fn handoff_bundle_sets_role_activation_and_summary() {
     eprintln!("[smoke] runtime connected");
 
     let session_id = "sess-smoke-1";
-    let (task, task_id) = handoff_bundle_task(session_id, "researcher", "Investigating Q1 anomaly.");
+    let (task, task_id) =
+        handoff_bundle_task(session_id, "researcher", "Investigating Q1 anomaly.");
 
     eprintln!("[smoke] → handle_handoff_bundle (role=researcher)");
     runtime
@@ -170,7 +178,9 @@ async fn handoff_bundle_sets_role_activation_and_summary() {
         .expect("handle_handoff_bundle must not error");
     eprintln!("[smoke] ✓ handoff_bundle handled");
 
-    let state = runtime.session(session_id).expect("session must exist after handoff");
+    let state = runtime
+        .session(session_id)
+        .expect("session must exist after handoff");
     assert_eq!(
         state.role_activation.as_ref().map(|r| r.role_name.as_str()),
         Some("researcher"),
@@ -218,7 +228,15 @@ async fn handoff_return_clears_role_activation() {
         .handle_handoff_bundle(bundle_task, bundle_id)
         .await
         .expect("handle_handoff_bundle");
-    eprintln!("[smoke] ✓ role active: {:?}", runtime.session(session_id).unwrap().role_activation.as_ref().map(|r| &r.role_name));
+    eprintln!(
+        "[smoke] ✓ role active: {:?}",
+        runtime
+            .session(session_id)
+            .unwrap()
+            .role_activation
+            .as_ref()
+            .map(|r| &r.role_name)
+    );
 
     assert!(
         runtime
@@ -308,7 +326,10 @@ async fn full_handoff_cycle_session_context() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(session_text.contains("Active role: coder."), "role in envelope");
+    assert!(
+        session_text.contains("Active role: coder."),
+        "role in envelope"
+    );
     assert!(
         session_text.contains("Handoff context: Implement the auth fix."),
         "summary in envelope"
@@ -364,7 +385,10 @@ async fn full_handoff_cycle_session_context() {
         .join("\n");
 
     assert!(!turn3_text.contains("Active role:"), "no role after return");
-    assert!(!turn3_text.contains("Handoff context:"), "no summary after return");
+    assert!(
+        !turn3_text.contains("Handoff context:"),
+        "no summary after return"
+    );
 
     drop(runtime);
     let _ = server.await;

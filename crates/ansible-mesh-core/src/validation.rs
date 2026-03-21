@@ -358,7 +358,9 @@ fn validate_skill_name(name: &str, errors: &mut Vec<ValidationError>) {
     if name.len() > 64 {
         errors.push(ValidationError::SkillNameTooLong { len: name.len() });
     }
-    let invalid_chars = !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+    let invalid_chars = !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
     if invalid_chars {
         errors.push(ValidationError::InvalidSkillNameChars {
             skill_name: name.to_string(),
@@ -485,7 +487,8 @@ mod tests {
             skill_name: "data-analyst".to_string(),
             description: "Analyses provided datasets and returns a structured report.".to_string(),
             subagent_kind: "analyst-worker".to_string(),
-            goal_template: "Analyse the dataset at {{dataset_ref}} and produce a report.".to_string(),
+            goal_template: "Analyse the dataset at {{dataset_ref}} and produce a report."
+                .to_string(),
             allowed_tools: vec!["workspace.read".to_string(), "workspace.list".to_string()],
             allowed_skills: vec![],
             iteration_budget: Some(20),
@@ -524,7 +527,9 @@ mod tests {
             },
             HookSubscription {
                 hook_kind: HookKind::TurnCompleted,
-                route: HookRoute::Role { role_name: "supervisor".to_string() },
+                route: HookRoute::Role {
+                    role_name: "supervisor".to_string(),
+                },
                 handler_skill: None,
             },
         ];
@@ -549,7 +554,9 @@ mod tests {
         let mut d = valid_draft();
         d.skill_name = "".to_string();
         let errs = validate_skill_layer1(&d).unwrap_err();
-        assert!(errs.iter().any(|e| matches!(e, ValidationError::EmptySkillName)));
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, ValidationError::EmptySkillName)));
     }
 
     #[test]
@@ -557,7 +564,9 @@ mod tests {
         let mut d = valid_draft();
         d.skill_name = "Data Analyst!".to_string();
         let errs = validate_skill_layer1(&d).unwrap_err();
-        assert!(errs.iter().any(|e| matches!(e, ValidationError::InvalidSkillNameChars { .. })));
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, ValidationError::InvalidSkillNameChars { .. })));
     }
 
     #[test]
@@ -565,7 +574,9 @@ mod tests {
         let mut d = valid_draft();
         d.skill_name = "a".repeat(65);
         let errs = validate_skill_layer1(&d).unwrap_err();
-        assert!(errs.iter().any(|e| matches!(e, ValidationError::SkillNameTooLong { len } if *len == 65)));
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, ValidationError::SkillNameTooLong { len } if *len == 65)));
     }
 
     #[test]
@@ -573,7 +584,9 @@ mod tests {
         let mut d = valid_draft();
         d.description = "   ".to_string();
         let errs = validate_skill_layer1(&d).unwrap_err();
-        assert!(errs.iter().any(|e| matches!(e, ValidationError::EmptyDescription)));
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, ValidationError::EmptyDescription)));
     }
 
     #[test]
@@ -581,7 +594,9 @@ mod tests {
         let mut d = valid_draft();
         d.description = "x".repeat(2049);
         let errs = validate_skill_layer1(&d).unwrap_err();
-        assert!(errs.iter().any(|e| matches!(e, ValidationError::DescriptionTooLong { len } if *len == 2049)));
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, ValidationError::DescriptionTooLong { len } if *len == 2049)));
     }
 
     // ── Mission errors ────────────────────────────────────────────────────────
@@ -591,7 +606,9 @@ mod tests {
         let mut d = valid_draft();
         d.subagent_kind = "".to_string();
         let errs = validate_skill_layer1(&d).unwrap_err();
-        assert!(errs.iter().any(|e| matches!(e, ValidationError::EmptySubagentKind)));
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, ValidationError::EmptySubagentKind)));
     }
 
     #[test]
@@ -599,7 +616,9 @@ mod tests {
         let mut d = valid_draft();
         d.goal_template = " ".to_string();
         let errs = validate_skill_layer1(&d).unwrap_err();
-        assert!(errs.iter().any(|e| matches!(e, ValidationError::EmptyGoalTemplate)));
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, ValidationError::EmptyGoalTemplate)));
     }
 
     // ── Grant errors ──────────────────────────────────────────────────────────
@@ -609,7 +628,9 @@ mod tests {
         let mut d = valid_draft();
         d.allowed_tools = vec!["workspace.read".to_string(), "".to_string()];
         let errs = validate_skill_layer1(&d).unwrap_err();
-        assert!(errs.iter().any(|e| matches!(e, ValidationError::EmptyToolEntry { index: 1 })));
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, ValidationError::EmptyToolEntry { index: 1 })));
     }
 
     #[test]
@@ -617,7 +638,9 @@ mod tests {
         let mut d = valid_draft();
         d.allowed_skills = vec!["".to_string()];
         let errs = validate_skill_layer1(&d).unwrap_err();
-        assert!(errs.iter().any(|e| matches!(e, ValidationError::EmptySkillEntry { index: 0 })));
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, ValidationError::EmptySkillEntry { index: 0 })));
     }
 
     #[test]
@@ -625,7 +648,9 @@ mod tests {
         let mut d = valid_draft();
         d.iteration_budget = Some(0);
         let errs = validate_skill_layer1(&d).unwrap_err();
-        assert!(errs.iter().any(|e| matches!(e, ValidationError::ZeroIterationBudget)));
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, ValidationError::ZeroIterationBudget)));
     }
 
     // ── Lease invariants ──────────────────────────────────────────────────────
@@ -635,7 +660,9 @@ mod tests {
         let mut d = valid_draft();
         d.lease_terms.ttl_seconds = 0;
         let errs = validate_skill_layer1(&d).unwrap_err();
-        assert!(errs.iter().any(|e| matches!(e, ValidationError::ZeroLeaseTtl)));
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, ValidationError::ZeroLeaseTtl)));
     }
 
     #[test]
@@ -646,7 +673,10 @@ mod tests {
         let errs = validate_skill_layer1(&d).unwrap_err();
         assert!(errs.iter().any(|e| matches!(
             e,
-            ValidationError::RenewalIntervalNotLessThanTtl { renewal_interval_seconds: 300, ttl_seconds: 300 }
+            ValidationError::RenewalIntervalNotLessThanTtl {
+                renewal_interval_seconds: 300,
+                ttl_seconds: 300
+            }
         )));
     }
 
@@ -656,10 +686,9 @@ mod tests {
         d.lease_terms.ttl_seconds = 300;
         d.lease_terms.renewal_interval_seconds = Some(400);
         let errs = validate_skill_layer1(&d).unwrap_err();
-        assert!(errs.iter().any(|e| matches!(
-            e,
-            ValidationError::RenewalIntervalNotLessThanTtl { .. }
-        )));
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, ValidationError::RenewalIntervalNotLessThanTtl { .. })));
     }
 
     #[test]
@@ -670,7 +699,10 @@ mod tests {
         let errs = validate_skill_layer1(&d).unwrap_err();
         assert!(errs.iter().any(|e| matches!(
             e,
-            ValidationError::MaxLifetimeLessThanTtl { max_lifetime_seconds: 100, ttl_seconds: 600 }
+            ValidationError::MaxLifetimeLessThanTtl {
+                max_lifetime_seconds: 100,
+                ttl_seconds: 600
+            }
         )));
     }
 
@@ -692,7 +724,9 @@ mod tests {
             },
         ];
         let errs = validate_skill_layer1(&d).unwrap_err();
-        assert!(errs.iter().any(|e| matches!(e, ValidationError::DuplicateHookSubscription { .. })));
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, ValidationError::DuplicateHookSubscription { .. })));
     }
 
     #[test]
@@ -704,7 +738,9 @@ mod tests {
             handler_skill: Some("approval-logger".to_string()),
         }];
         let errs = validate_skill_layer1(&d).unwrap_err();
-        assert!(errs.iter().any(|e| matches!(e, ValidationError::ApprovalNeededHookDiscarded)));
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, ValidationError::ApprovalNeededHookDiscarded)));
     }
 
     #[test]
@@ -716,7 +752,9 @@ mod tests {
             handler_skill: None, // no handler — invalid
         }];
         let errs = validate_skill_layer1(&d).unwrap_err();
-        assert!(errs.iter().any(|e| matches!(e, ValidationError::DiscardedHookWithNoHandler { .. })));
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, ValidationError::DiscardedHookWithNoHandler { .. })));
     }
 
     #[test]
@@ -724,7 +762,9 @@ mod tests {
         let mut d = valid_draft();
         d.completion_route = HookRoute::Discard;
         let errs = validate_skill_layer1(&d).unwrap_err();
-        assert!(errs.iter().any(|e| matches!(e, ValidationError::CompletionRouteMustNotDiscard)));
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, ValidationError::CompletionRouteMustNotDiscard)));
     }
 
     #[test]
@@ -732,7 +772,9 @@ mod tests {
         let mut d = valid_draft();
         d.failure_route = HookRoute::Discard;
         let errs = validate_skill_layer1(&d).unwrap_err();
-        assert!(errs.iter().any(|e| matches!(e, ValidationError::FailureRouteMustNotDiscard)));
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, ValidationError::FailureRouteMustNotDiscard)));
     }
 
     #[test]
@@ -740,17 +782,23 @@ mod tests {
         let mut d = valid_draft();
         d.hook_subscriptions = vec![HookSubscription {
             hook_kind: HookKind::TurnCompleted,
-            route: HookRoute::Role { role_name: "  ".to_string() },
+            route: HookRoute::Role {
+                role_name: "  ".to_string(),
+            },
             handler_skill: None,
         }];
         let errs = validate_skill_layer1(&d).unwrap_err();
-        assert!(errs.iter().any(|e| matches!(e, ValidationError::EmptyRoleNameInRoute { .. })));
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, ValidationError::EmptyRoleNameInRoute { .. })));
     }
 
     #[test]
     fn empty_role_name_in_completion_route() {
         let mut d = valid_draft();
-        d.completion_route = HookRoute::Role { role_name: "".to_string() };
+        d.completion_route = HookRoute::Role {
+            role_name: "".to_string(),
+        };
         let errs = validate_skill_layer1(&d).unwrap_err();
         assert!(errs.iter().any(|e| matches!(
             e,
@@ -761,7 +809,9 @@ mod tests {
     #[test]
     fn empty_role_name_in_failure_route() {
         let mut d = valid_draft();
-        d.failure_route = HookRoute::Role { role_name: "".to_string() };
+        d.failure_route = HookRoute::Role {
+            role_name: "".to_string(),
+        };
         let errs = validate_skill_layer1(&d).unwrap_err();
         assert!(errs.iter().any(|e| matches!(
             e,
@@ -776,7 +826,9 @@ mod tests {
         let mut d = valid_draft();
         d.field_sources = serde_json::Value::Null;
         let errs = validate_skill_layer1(&d).unwrap_err();
-        assert!(errs.iter().any(|e| matches!(e, ValidationError::FieldSourcesNotAnObject)));
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, ValidationError::FieldSourcesNotAnObject)));
     }
 
     #[test]
@@ -784,7 +836,9 @@ mod tests {
         let mut d = valid_draft();
         d.field_sources = json!(["a", "b"]);
         let errs = validate_skill_layer1(&d).unwrap_err();
-        assert!(errs.iter().any(|e| matches!(e, ValidationError::FieldSourcesNotAnObject)));
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, ValidationError::FieldSourcesNotAnObject)));
     }
 
     #[test]
@@ -792,7 +846,9 @@ mod tests {
         let mut d = valid_draft();
         d.field_sources = json!("not-an-object");
         let errs = validate_skill_layer1(&d).unwrap_err();
-        assert!(errs.iter().any(|e| matches!(e, ValidationError::FieldSourcesNotAnObject)));
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, ValidationError::FieldSourcesNotAnObject)));
     }
 
     // ── Multi-error collection ────────────────────────────────────────────────
@@ -818,7 +874,12 @@ mod tests {
         // Should collect: EmptySkillName, EmptyDescription, EmptySubagentKind,
         // EmptyGoalTemplate, EmptyToolEntry, EmptySkillEntry, ZeroIterationBudget,
         // CompletionRouteMustNotDiscard, FailureRouteMustNotDiscard, FieldSourcesNotAnObject
-        assert!(errs.len() >= 10, "expected ≥10 errors, got {}: {:?}", errs.len(), errs);
+        assert!(
+            errs.len() >= 10,
+            "expected ≥10 errors, got {}: {:?}",
+            errs.len(),
+            errs
+        );
     }
 
     // ── apply_validation_to_record ────────────────────────────────────────────

@@ -133,10 +133,10 @@ impl WorkerRuntime {
 
         self.ipc_client
             .send_request(IpcRequest::EmitTask {
-                target_node:    local_node_id(),
-                target_role:    model_role.to_string(),
+                target_node: local_node_id(),
+                target_role: model_role.to_string(),
                 target_guest_id: None,
-                task_json:      serde_json::to_string(&model_request)?,
+                task_json: serde_json::to_string(&model_request)?,
             })
             .await?;
 
@@ -190,8 +190,8 @@ impl WorkerRuntime {
             .ipc_client
             .send_request(IpcRequest::FireSubagentHook {
                 subagent_guest_id: self.worker_id.clone(),
-                hook_kind:         HookKind::TurnCompleted,
-                payload:           serde_json::json!({
+                hook_kind: HookKind::TurnCompleted,
+                payload: serde_json::json!({
                     "completed":       true,
                     "result_summary":  result_summary,
                 }),
@@ -210,8 +210,8 @@ impl WorkerRuntime {
             .ipc_client
             .send_request(IpcRequest::FireSubagentHook {
                 subagent_guest_id: self.worker_id.clone(),
-                hook_kind:         HookKind::TurnCompleted,
-                payload:           serde_json::json!({
+                hook_kind: HookKind::TurnCompleted,
+                payload: serde_json::json!({
                     "completed": false,
                     "error":     error,
                 }),
@@ -241,12 +241,7 @@ impl AgentDriver for WorkerRuntime {
         );
 
         loop {
-            match tokio::time::timeout(
-                Duration::from_secs(5),
-                self.ipc_client.recv_task(),
-            )
-            .await
-            {
+            match tokio::time::timeout(Duration::from_secs(5), self.ipc_client.recv_task()).await {
                 // ── Inbound delegation ──────────────────────────────────
                 Ok(Ok(IpcResponse::InboundTask {
                     task_id,
@@ -263,21 +258,19 @@ impl AgentDriver for WorkerRuntime {
                     // The hotel serialises the `SubagentDelegation` directly as
                     // the `task_json` when routing an `AssignSubagentTask`.
                     match serde_json::from_str::<SubagentDelegation>(&task_json) {
-                        Ok(delegation) => {
-                            match self.execute_delegation(&delegation).await {
-                                Ok(summary) => {
-                                    self.fire_completion(summary).await;
-                                }
-                                Err(err) => {
-                                    error!(
-                                        worker_id = %self.worker_id,
-                                        task_id = %task_id,
-                                        "Delegation execution failed: {}", err
-                                    );
-                                    self.fire_failure(err.to_string()).await;
-                                }
+                        Ok(delegation) => match self.execute_delegation(&delegation).await {
+                            Ok(summary) => {
+                                self.fire_completion(summary).await;
                             }
-                        }
+                            Err(err) => {
+                                error!(
+                                    worker_id = %self.worker_id,
+                                    task_id = %task_id,
+                                    "Delegation execution failed: {}", err
+                                );
+                                self.fire_failure(err.to_string()).await;
+                            }
+                        },
                         Err(err) => {
                             warn!(
                                 worker_id = %self.worker_id,
@@ -326,7 +319,7 @@ async fn main() -> Result<()> {
 
     let identity = GuestIdentity {
         guest_id: wid.clone(),
-        role:     WORKER_ROLE.into(),
+        role: WORKER_ROLE.into(),
         supported_tools: Vec::new(),
     };
 

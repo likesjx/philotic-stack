@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 
 use crate::init::{active_profile, philotic_dir, profile_dir};
@@ -39,18 +39,14 @@ pub async fn install(hotel: String) -> Result<()> {
         .with_context(|| format!("create log dir {}", log_dir.display()))?;
 
     let profile_env = match active_profile() {
-        Some(ref p) => format!(
-            "        <key>PHILOTIC_PROFILE</key>\n        <string>{p}</string>"
-        ),
+        Some(ref p) => format!("        <key>PHILOTIC_PROFILE</key>\n        <string>{p}</string>"),
         None => String::new(),
     };
 
     let env_block = if profile_env.is_empty() {
         String::new()
     } else {
-        format!(
-            "\n    <key>EnvironmentVariables</key>\n    <dict>\n{profile_env}\n    </dict>"
-        )
+        format!("\n    <key>EnvironmentVariables</key>\n    <dict>\n{profile_env}\n    </dict>")
     };
 
     let plist_xml = format!(
@@ -101,7 +97,10 @@ pub async fn install(hotel: String) -> Result<()> {
         .context("launchctl bootstrap")?;
 
     if !status.success() {
-        bail!("launchctl bootstrap failed — check plist at {}", plist.display());
+        bail!(
+            "launchctl bootstrap failed — check plist at {}",
+            plist.display()
+        );
     }
 
     println!("✓ Service '{label}' installed and started.");

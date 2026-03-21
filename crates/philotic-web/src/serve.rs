@@ -27,15 +27,11 @@ use axum::{
     Router,
 };
 use rand::Rng;
-use rust_embed::RustEmbed;
 use rusqlite::Connection;
+use rust_embed::RustEmbed;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::sync::broadcast;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
@@ -65,17 +61,13 @@ pub async fn run(
     config: Option<PathBuf>,
     allow_origins: Option<String>,
 ) -> Result<()> {
-    let db_path = db.unwrap_or_else(|| {
-        match crate::init::active_profile() {
-            Some(_) => crate::init::profile_dir().join("context.db"),
-            None => PathBuf::from("aiua_context.db"),
-        }
+    let db_path = db.unwrap_or_else(|| match crate::init::active_profile() {
+        Some(_) => crate::init::profile_dir().join("context.db"),
+        None => PathBuf::from("aiua_context.db"),
     });
-    let config_path = config.unwrap_or_else(|| {
-        match crate::init::active_profile() {
-            Some(_) => crate::init::profile_dir().join("config.json"),
-            None => PathBuf::from("mesh-config.json"),
-        }
+    let config_path = config.unwrap_or_else(|| match crate::init::active_profile() {
+        Some(_) => crate::init::profile_dir().join("config.json"),
+        None => PathBuf::from("mesh-config.json"),
     });
 
     // Generate session token
@@ -100,16 +92,16 @@ pub async fn run(
 
     let app = Router::new()
         // API routes
-        .route("/api/status",                      get(handle_status))
-        .route("/api/guests",                      get(handle_guests))
-        .route("/api/agents",                      get(handle_agents))
-        .route("/api/sessions",                    get(handle_sessions))
-        .route("/api/apartments/:agent_id",        get(handle_apartment))
-        .route("/api/guests/:guest_id/restart",    post(handle_guest_restart))
-        .route("/api/guests/:guest_id/stop",       post(handle_guest_stop))
-        .route("/ws",                              get(handle_ws))
+        .route("/api/status", get(handle_status))
+        .route("/api/guests", get(handle_guests))
+        .route("/api/agents", get(handle_agents))
+        .route("/api/sessions", get(handle_sessions))
+        .route("/api/apartments/:agent_id", get(handle_apartment))
+        .route("/api/guests/:guest_id/restart", post(handle_guest_restart))
+        .route("/api/guests/:guest_id/stop", post(handle_guest_stop))
+        .route("/ws", get(handle_ws))
         // Embedded UI — index.html gets token injected; all other assets served as-is
-        .route("/",                                get(handle_index))
+        .route("/", get(handle_index))
         .fallback(get(handle_static))
         .layer(cors)
         .with_state(state);
@@ -192,7 +184,11 @@ fn check_auth(headers: &HeaderMap, state: &AppState) -> bool {
 }
 
 fn unauthorized() -> Response {
-    (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response()
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({"error": "unauthorized"})),
+    )
+        .into_response()
 }
 
 // ── GET /api/status ───────────────────────────────────────────────────────────
@@ -306,7 +302,7 @@ fn query_agents(db_path: &PathBuf, config_path: &PathBuf) -> Vec<Value> {
 
     if let Ok(conn) = Connection::open(db_path) {
         if let Ok(mut stmt) = conn.prepare(
-            "SELECT agent_id, persona_name, bundle_json FROM agent_identities ORDER BY agent_id"
+            "SELECT agent_id, persona_name, bundle_json FROM agent_identities ORDER BY agent_id",
         ) {
             if let Ok(rows) = stmt.query_map([], |row| {
                 let agent_id: String = row.get(0)?;
@@ -334,8 +330,7 @@ fn query_agents(db_path: &PathBuf, config_path: &PathBuf) -> Vec<Value> {
         if let Ok(cfg) = serde_json::from_str::<Value>(&raw) {
             if let Some(hotels) = cfg.get("hotels").and_then(|h| h.as_object()) {
                 for (_hotel, hotel_val) in hotels {
-                    if let Some(hotel_agents) =
-                        hotel_val.get("agents").and_then(|a| a.as_object())
+                    if let Some(hotel_agents) = hotel_val.get("agents").and_then(|a| a.as_object())
                     {
                         for (key, agent) in hotel_agents {
                             let agent_id = agent
@@ -390,7 +385,11 @@ async fn handle_apartment(
 
     match query_apartment(&state.db_path, &agent_id) {
         Ok(Some(apt)) => Json(apt).into_response(),
-        Ok(None) => (StatusCode::NOT_FOUND, Json(json!({"error": "no apartment data"}))).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "no apartment data"})),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),

@@ -153,6 +153,7 @@ pub struct ContextEnvelope {
     pub instructions: Vec<ProjectionItem>,
     pub identity: Vec<ProjectionItem>,
     pub memory: Vec<ProjectionItem>,
+    pub recalled_memory: Vec<ProjectionItem>,
     pub dialogue_window: Vec<TurnInput>,
     pub active_turn: Option<TurnInput>,
     pub tool_history: Vec<ToolHistoryEntry>,
@@ -375,6 +376,13 @@ impl ControllerTask {
             }
         }
 
+        if !self.context.recalled_memory.is_empty() {
+            let text = join_projection_items(&self.context.recalled_memory);
+            if !text.is_empty() {
+                sections.push(format!("[Recalled memory]\n{text}"));
+            }
+        }
+
         if !self.context.dialogue_window.is_empty() {
             let dialogue = self
                 .context
@@ -421,7 +429,10 @@ impl ControllerTask {
         }
 
         if let Some(plan) = self.context.active_plan.as_ref() {
-            let goal = plan.get("goal").and_then(Value::as_str).unwrap_or("unknown");
+            let goal = plan
+                .get("goal")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
             let status = plan
                 .get("status")
                 .and_then(Value::as_str)
@@ -821,6 +832,7 @@ fn parse_context(value: Option<&Value>) -> ContextEnvelope {
         instructions: parse_projection_items(object.get("instructions")),
         identity: parse_projection_items(object.get("identity")),
         memory: parse_projection_items(object.get("memory")),
+        recalled_memory: parse_projection_items(object.get("recalled_memory")),
         dialogue_window: parse_turns(object.get("dialogue_window")),
         active_turn: object.get("active_turn").map(parse_turn_input),
         tool_history,
@@ -966,6 +978,7 @@ pub struct TextResult {
     pub follow_up_questions: Vec<String>,
     pub intent_summary: Option<String>,
     pub memory_concept: Option<String>,
+    pub memory_candidate: Option<serde_json::Value>,
     pub active_plan: Option<serde_json::Value>,
 }
 
@@ -979,6 +992,7 @@ pub enum ProviderOutput {
         follow_up_questions: Vec<String>,
         intent_summary: Option<String>,
         memory_concept: Option<String>,
+        memory_candidate: Option<serde_json::Value>,
         active_plan: Option<serde_json::Value>,
     },
     Audio(AudioArtifact),
@@ -1037,6 +1051,7 @@ impl ControllerResponseEnvelope {
                 follow_up_questions,
                 intent_summary,
                 memory_concept,
+                memory_candidate,
                 active_plan,
             } => {
                 let text_result = TextResult {
@@ -1046,6 +1061,7 @@ impl ControllerResponseEnvelope {
                     follow_up_questions,
                     intent_summary,
                     memory_concept,
+                    memory_candidate,
                     active_plan,
                 };
                 let result = serialize_text_result(task, &text_result);
@@ -1143,6 +1159,7 @@ fn serialize_text_result(task: &ControllerTask, result: &TextResult) -> Value {
     let include_questions = channels_requested && task.wants_channel("follow_up_questions");
     let include_intent = channels_requested && task.wants_channel("intent_summary");
     let include_concept = channels_requested && task.wants_channel("memory_concept");
+    let include_memory_candidate = channels_requested && task.wants_channel("memory_candidate");
     let include_plan = channels_requested && task.wants_channel("active_plan");
 
     json!({
@@ -1152,6 +1169,7 @@ fn serialize_text_result(task: &ControllerTask, result: &TextResult) -> Value {
         "follow_up_questions": if include_questions { result.follow_up_questions.clone() } else { Vec::<String>::new() },
         "intent_summary": if include_intent { result.intent_summary.clone() } else { None::<String> },
         "memory_concept": if include_concept { result.memory_concept.clone() } else { None::<String> },
+        "memory_candidate": if include_memory_candidate { result.memory_candidate.clone() } else { None::<Value> },
         "active_plan": if include_plan { result.active_plan.clone() } else { None::<Value> },
     })
 }
@@ -1734,6 +1752,7 @@ mod tests {
                 follow_up_questions: vec!["How can I help next?".into()],
                 intent_summary: Some("Exchange greetings".into()),
                 memory_concept: None,
+                memory_candidate: None,
                 active_plan: None,
             },
         )
@@ -1755,7 +1774,7 @@ mod tests {
                 }
             },
             "response_contract": {
-                "channels": ["spoken_text", "working_memory_delta", "follow_up_questions", "intent_summary"]
+                "channels": ["spoken_text", "working_memory_delta", "follow_up_questions", "intent_summary", "memory_candidate"]
             }
         }))
         .unwrap();
@@ -1771,6 +1790,11 @@ mod tests {
                 follow_up_questions: vec!["How can I help next?".into()],
                 intent_summary: Some("Exchange greetings".into()),
                 memory_concept: None,
+                memory_candidate: Some(json!({
+                    "concept": "greeting-exchange",
+                    "content": "The user greeted the assistant and reopened the collaboration thread.",
+                    "tags": ["greeting", "session"]
+                })),
                 active_plan: None,
             },
         )
@@ -1780,6 +1804,10 @@ mod tests {
         assert_eq!(
             response.result["working_memory_delta"],
             "The user greeted the assistant."
+        );
+        assert_eq!(
+            response.result["memory_candidate"]["concept"],
+            "greeting-exchange"
         );
         assert_eq!(
             response.result["follow_up_questions"],

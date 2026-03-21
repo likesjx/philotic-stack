@@ -1,7 +1,7 @@
 use crate::hub::ModelHandle;
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use ndarray::Array2;
-use ort::session::{Session, builder::GraphOptimizationLevel};
+use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
 use std::sync::Arc;
 use tokenizers::Tokenizer;

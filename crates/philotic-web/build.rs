@@ -21,8 +21,14 @@ fn main() {
     if let Some(ref dir) = desktop_dir {
         // Rerun when JS sources or package.json change
         println!("cargo:rerun-if-changed={}", dir.join("src").display());
-        println!("cargo:rerun-if-changed={}", dir.join("package.json").display());
-        println!("cargo:rerun-if-changed={}", dir.join("vite.config.js").display());
+        println!(
+            "cargo:rerun-if-changed={}",
+            dir.join("package.json").display()
+        );
+        println!(
+            "cargo:rerun-if-changed={}",
+            dir.join("vite.config.js").display()
+        );
 
         build_desktop(dir);
         copy_dist(&dir.join("dist"), &ui_dist_dir);
@@ -102,7 +108,11 @@ fn build_desktop(dir: &Path) {
         .status()
         .expect("Failed to run npm run build");
 
-    assert!(status.success(), "npm run build failed in {}", dir.display());
+    assert!(
+        status.success(),
+        "npm run build failed in {}",
+        dir.display()
+    );
 }
 
 fn copy_dist(src: &Path, dst: &Path) {
@@ -110,7 +120,12 @@ fn copy_dist(src: &Path, dst: &Path) {
         std::fs::remove_dir_all(dst).unwrap();
     }
     copy_dir_all(src, dst).unwrap_or_else(|e| {
-        panic!("Failed to copy {} → {}: {}", src.display(), dst.display(), e)
+        panic!(
+            "Failed to copy {} → {}: {}",
+            src.display(),
+            dst.display(),
+            e
+        )
     });
 }
 

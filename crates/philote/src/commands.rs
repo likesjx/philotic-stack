@@ -11,7 +11,9 @@ pub fn command_manifest(_active_skills: &[String]) -> Vec<CommandManifestEntry> 
         },
         CommandManifestEntry {
             command: "context".into(),
-            description: "Show a breakdown of the current context envelope (sections, sizes, turn history).".into(),
+            description:
+                "Show a breakdown of the current context envelope (sections, sizes, turn history)."
+                    .into(),
             usage_hint: None,
         },
         CommandManifestEntry {
@@ -322,7 +324,9 @@ mod tests {
     fn parses_preapprove_tool_name() {
         assert_eq!(
             parse_slash_command("/preapprove echo"),
-            Some(SlashCommand::Preapprove { name: "echo".into() })
+            Some(SlashCommand::Preapprove {
+                name: "echo".into()
+            })
         );
     }
 
@@ -330,7 +334,9 @@ mod tests {
     fn parses_preapprove_class_name() {
         assert_eq!(
             parse_slash_command("/preapprove workspace"),
-            Some(SlashCommand::Preapprove { name: "workspace".into() })
+            Some(SlashCommand::Preapprove {
+                name: "workspace".into()
+            })
         );
     }
 

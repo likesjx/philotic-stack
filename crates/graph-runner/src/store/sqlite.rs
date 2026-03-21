@@ -37,14 +37,18 @@ pub struct SqliteGraphStore {
 impl SqliteGraphStore {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
-        let store = Self { conn: Mutex::new(conn) };
+        let store = Self {
+            conn: Mutex::new(conn),
+        };
         store.migrate()?;
         Ok(store)
     }
 
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        let store = Self { conn: Mutex::new(conn) };
+        let store = Self {
+            conn: Mutex::new(conn),
+        };
         store.migrate()?;
         Ok(store)
     }
@@ -286,8 +290,7 @@ impl GraphStore for SqliteGraphStore {
         )?;
         let rows = stmt.query_map([], |row| {
             let schema_json: String = row.get("schema_json")?;
-            let schema: GraphSchema =
-                serde_json::from_str(&schema_json).unwrap_or_default();
+            let schema: GraphSchema = serde_json::from_str(&schema_json).unwrap_or_default();
             Ok(GraphMeta {
                 graph_id: row.get("graph_id")?,
                 name: row.get("name")?,
@@ -299,7 +302,8 @@ impl GraphStore for SqliteGraphStore {
                 updated_at: row.get("updated_at")?,
             })
         })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     fn update_schema(&self, graph_id: &str, new_schema: GraphSchema) -> Result<()> {
@@ -308,10 +312,17 @@ impl GraphStore for SqliteGraphStore {
             .ok_or_else(|| anyhow!("graph '{}' not found", graph_id))?;
 
         // Additive-only: reject removal of node types that have live nodes.
-        let existing_node_type_names: HashSet<_> =
-            meta.schema.node_types.iter().map(|t| t.name.as_str()).collect();
-        let new_node_type_names: HashSet<_> =
-            new_schema.node_types.iter().map(|t| t.name.as_str()).collect();
+        let existing_node_type_names: HashSet<_> = meta
+            .schema
+            .node_types
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
+        let new_node_type_names: HashSet<_> = new_schema
+            .node_types
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
 
         for removed in existing_node_type_names.difference(&new_node_type_names) {
             let conn = self.conn.lock().unwrap();
@@ -404,7 +415,12 @@ impl GraphStore for SqliteGraphStore {
         }
     }
 
-    fn list_nodes(&self, graph_id: &str, filter: &NodeFilter, identity: &Identity) -> Result<Vec<Node>> {
+    fn list_nodes(
+        &self,
+        graph_id: &str,
+        filter: &NodeFilter,
+        identity: &Identity,
+    ) -> Result<Vec<Node>> {
         let meta = match self.get_graph(graph_id)? {
             Some(m) => m,
             None => return Ok(vec![]),
@@ -432,7 +448,8 @@ impl GraphStore for SqliteGraphStore {
         }
 
         let mut stmt = conn.prepare(&sql)?;
-        let params_ref: Vec<&dyn rusqlite::ToSql> = param_values.iter().map(|b| b.as_ref()).collect();
+        let params_ref: Vec<&dyn rusqlite::ToSql> =
+            param_values.iter().map(|b| b.as_ref()).collect();
 
         let all_nodes = stmt
             .query_map(params_ref.as_slice(), row_to_node)?
@@ -492,7 +509,11 @@ impl GraphStore for SqliteGraphStore {
                 |r| r.get(0),
             )?;
             if !from_exists {
-                bail!("from_node_id '{}' not found in graph '{}'", input.from_node_id, graph_id);
+                bail!(
+                    "from_node_id '{}' not found in graph '{}'",
+                    input.from_node_id,
+                    graph_id
+                );
             }
             let to_exists: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM nodes WHERE graph_id = ?1 AND node_id = ?2 AND deleted_at IS NULL)",
@@ -500,7 +521,11 @@ impl GraphStore for SqliteGraphStore {
                 |r| r.get(0),
             )?;
             if !to_exists {
-                bail!("to_node_id '{}' not found in graph '{}'", input.to_node_id, graph_id);
+                bail!(
+                    "to_node_id '{}' not found in graph '{}'",
+                    input.to_node_id,
+                    graph_id
+                );
             }
         }
 
@@ -543,9 +568,27 @@ impl GraphStore for SqliteGraphStore {
         if let Some(row) = rows.next()? {
             let edge = row_to_edge(row)?;
             // Check both endpoint visibilities and the edge's own visibility.
-            let from_vis = self.node_is_visible_locked(&conn, graph_id, &edge.from_node_id, &meta.default_visibility, identity);
-            let to_vis = self.node_is_visible_locked(&conn, graph_id, &edge.to_node_id, &meta.default_visibility, identity);
-            if resolve_edge_visibility(&edge.visibility, &meta.default_visibility, from_vis, to_vis, identity) {
+            let from_vis = self.node_is_visible_locked(
+                &conn,
+                graph_id,
+                &edge.from_node_id,
+                &meta.default_visibility,
+                identity,
+            );
+            let to_vis = self.node_is_visible_locked(
+                &conn,
+                graph_id,
+                &edge.to_node_id,
+                &meta.default_visibility,
+                identity,
+            );
+            if resolve_edge_visibility(
+                &edge.visibility,
+                &meta.default_visibility,
+                from_vis,
+                to_vis,
+                identity,
+            ) {
                 Ok(Some(edge))
             } else {
                 Ok(None)
@@ -555,7 +598,12 @@ impl GraphStore for SqliteGraphStore {
         }
     }
 
-    fn list_edges(&self, graph_id: &str, filter: &EdgeFilter, identity: &Identity) -> Result<Vec<Edge>> {
+    fn list_edges(
+        &self,
+        graph_id: &str,
+        filter: &EdgeFilter,
+        identity: &Identity,
+    ) -> Result<Vec<Edge>> {
         let meta = match self.get_graph(graph_id)? {
             Some(m) => m,
             None => return Ok(vec![]),
@@ -591,7 +639,8 @@ impl GraphStore for SqliteGraphStore {
         }
 
         let mut stmt = conn.prepare(&sql)?;
-        let params_ref: Vec<&dyn rusqlite::ToSql> = param_values.iter().map(|b| b.as_ref()).collect();
+        let params_ref: Vec<&dyn rusqlite::ToSql> =
+            param_values.iter().map(|b| b.as_ref()).collect();
         let all_edges = stmt
             .query_map(params_ref.as_slice(), row_to_edge)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -602,7 +651,13 @@ impl GraphStore for SqliteGraphStore {
             if let Some(&v) = vis_cache.get(node_id) {
                 return v;
             }
-            let v = self.node_is_visible_locked(&conn, graph_id, node_id, &meta.default_visibility, identity);
+            let v = self.node_is_visible_locked(
+                &conn,
+                graph_id,
+                node_id,
+                &meta.default_visibility,
+                identity,
+            );
             vis_cache.insert(node_id.to_string(), v);
             v
         };
@@ -612,7 +667,13 @@ impl GraphStore for SqliteGraphStore {
             .filter(|e| {
                 let from_vis = node_visible(&e.from_node_id);
                 let to_vis = node_visible(&e.to_node_id);
-                resolve_edge_visibility(&e.visibility, &meta.default_visibility, from_vis, to_vis, identity)
+                resolve_edge_visibility(
+                    &e.visibility,
+                    &meta.default_visibility,
+                    from_vis,
+                    to_vis,
+                    identity,
+                )
             })
             .collect();
 
@@ -629,7 +690,12 @@ impl GraphStore for SqliteGraphStore {
         Ok(())
     }
 
-    fn traverse(&self, graph_id: &str, query: &TraversalQuery, identity: &Identity) -> Result<TraversalResult> {
+    fn traverse(
+        &self,
+        graph_id: &str,
+        query: &TraversalQuery,
+        identity: &Identity,
+    ) -> Result<TraversalResult> {
         let meta = self
             .get_graph(graph_id)?
             .ok_or_else(|| anyhow!("graph '{}' not found", graph_id))?;
@@ -666,14 +732,24 @@ impl GraphStore for SqliteGraphStore {
 
             match &query.direction {
                 TraversalDirection::Outbound | TraversalDirection::Both => {
-                    let edges = Self::fetch_edges_from_locked(&conn, graph_id, &current_id, query.edge_types.as_deref())?;
+                    let edges = Self::fetch_edges_from_locked(
+                        &conn,
+                        graph_id,
+                        &current_id,
+                        query.edge_types.as_deref(),
+                    )?;
                     candidate_edges.extend(edges);
                 }
                 _ => {}
             }
             match &query.direction {
                 TraversalDirection::Inbound | TraversalDirection::Both => {
-                    let edges = Self::fetch_edges_to_locked(&conn, graph_id, &current_id, query.edge_types.as_deref())?;
+                    let edges = Self::fetch_edges_to_locked(
+                        &conn,
+                        graph_id,
+                        &current_id,
+                        query.edge_types.as_deref(),
+                    )?;
                     candidate_edges.extend(edges);
                 }
                 _ => {}
@@ -681,9 +757,25 @@ impl GraphStore for SqliteGraphStore {
             drop(conn);
 
             for edge in candidate_edges {
-                let from_vis = self.node_raw_visible(graph_id, &edge.from_node_id, &meta.default_visibility, identity);
-                let to_vis = self.node_raw_visible(graph_id, &edge.to_node_id, &meta.default_visibility, identity);
-                if !resolve_edge_visibility(&edge.visibility, &meta.default_visibility, from_vis, to_vis, identity) {
+                let from_vis = self.node_raw_visible(
+                    graph_id,
+                    &edge.from_node_id,
+                    &meta.default_visibility,
+                    identity,
+                );
+                let to_vis = self.node_raw_visible(
+                    graph_id,
+                    &edge.to_node_id,
+                    &meta.default_visibility,
+                    identity,
+                );
+                if !resolve_edge_visibility(
+                    &edge.visibility,
+                    &meta.default_visibility,
+                    from_vis,
+                    to_vis,
+                    identity,
+                ) {
                     continue;
                 }
 
@@ -691,7 +783,11 @@ impl GraphStore for SqliteGraphStore {
                     TraversalDirection::Outbound => edge.to_node_id.clone(),
                     TraversalDirection::Inbound => edge.from_node_id.clone(),
                     TraversalDirection::Both => {
-                        if edge.from_node_id == current_id { edge.to_node_id.clone() } else { edge.from_node_id.clone() }
+                        if edge.from_node_id == current_id {
+                            edge.to_node_id.clone()
+                        } else {
+                            edge.from_node_id.clone()
+                        }
                     }
                 };
 
@@ -708,7 +804,12 @@ impl GraphStore for SqliteGraphStore {
         })
     }
 
-    fn search_nodes(&self, graph_id: &str, query: &str, identity: &Identity) -> Result<Vec<crate::graph::Node>> {
+    fn search_nodes(
+        &self,
+        graph_id: &str,
+        query: &str,
+        identity: &Identity,
+    ) -> Result<Vec<crate::graph::Node>> {
         let meta = match self.get_graph(graph_id)? {
             Some(m) => m,
             None => return Ok(vec![]),
@@ -810,7 +911,10 @@ impl SqliteGraphStore {
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         if let Some(types) = edge_type_filter {
-            Ok(all_edges.into_iter().filter(|e| types.contains(&e.edge_type)).collect())
+            Ok(all_edges
+                .into_iter()
+                .filter(|e| types.contains(&e.edge_type))
+                .collect())
         } else {
             Ok(all_edges)
         }
@@ -886,12 +990,14 @@ impl TableStore for SqliteGraphStore {
         let mut stmt = conn.prepare(sql)?;
         match graph_id {
             Some(_) => {
-                let rows = stmt.query_map([param.as_ref()], row_to_table_meta)?
+                let rows = stmt
+                    .query_map([param.as_ref()], row_to_table_meta)?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 Ok(rows)
             }
             None => {
-                let rows = stmt.query_map([], row_to_table_meta)?
+                let rows = stmt
+                    .query_map([], row_to_table_meta)?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 Ok(rows)
             }
@@ -905,7 +1011,8 @@ impl TableStore for SqliteGraphStore {
         description: Option<String>,
         columns: Option<Vec<ColumnSpec>>,
     ) -> Result<()> {
-        let meta = self.get_table(table_id)?
+        let meta = self
+            .get_table(table_id)?
             .ok_or_else(|| anyhow!("table '{}' not found", table_id))?;
 
         let new_name = name.unwrap_or(meta.name);
@@ -924,7 +1031,11 @@ impl TableStore for SqliteGraphStore {
                     |r| r.get(0),
                 )?;
                 if count > 0 {
-                    bail!("cannot remove column '{}': {} row(s) have data for it", removed, count);
+                    bail!(
+                        "cannot remove column '{}': {} row(s) have data for it",
+                        removed,
+                        count
+                    );
                 }
             }
             cols
@@ -944,14 +1055,18 @@ impl TableStore for SqliteGraphStore {
 
     fn drop_table(&self, table_id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM table_rows WHERE table_id = ?1", params![table_id])?;
+        conn.execute(
+            "DELETE FROM table_rows WHERE table_id = ?1",
+            params![table_id],
+        )?;
         conn.execute("DELETE FROM tables WHERE table_id = ?1", params![table_id])?;
         Ok(())
     }
 
     fn insert_row(&self, table_id: &str, input: RowInput) -> Result<String> {
         // Verify table exists.
-        self.get_table(table_id)?.ok_or_else(|| anyhow!("table '{}' not found", table_id))?;
+        self.get_table(table_id)?
+            .ok_or_else(|| anyhow!("table '{}' not found", table_id))?;
 
         let row_id = input.row_id.unwrap_or_else(new_ulid);
         let now = now_ms();
@@ -980,7 +1095,8 @@ impl TableStore for SqliteGraphStore {
     }
 
     fn update_row(&self, table_id: &str, row_id: &str, patch: serde_json::Value) -> Result<()> {
-        let existing = self.get_row(table_id, row_id)?
+        let existing = self
+            .get_row(table_id, row_id)?
             .ok_or_else(|| anyhow!("row '{}' not found in table '{}'", row_id, table_id))?;
 
         // Shallow merge: patch keys overwrite existing keys.
@@ -1037,9 +1153,9 @@ impl TableStore for SqliteGraphStore {
                     .into_iter()
                     .filter(|row| {
                         if let serde_json::Value::Object(data_map) = &row.data {
-                            filter_map.iter().all(|(k, v)| {
-                                data_map.get(k).map_or(false, |dv| dv == v)
-                            })
+                            filter_map
+                                .iter()
+                                .all(|(k, v)| data_map.get(k).map_or(false, |dv| dv == v))
                         } else {
                             false
                         }
@@ -1076,17 +1192,21 @@ mod tests {
                 description: None,
                 schema: GraphSchema {
                     node_types: vec![
-                        NodeTypeSpec { name: "Research".into(), description: None },
-                        NodeTypeSpec { name: "Goal".into(), description: None },
-                    ],
-                    edge_types: vec![
-                        EdgeTypeSpec {
-                            name: "SUPPORTS".into(),
+                        NodeTypeSpec {
+                            name: "Research".into(),
                             description: None,
-                            allowed_from: None,
-                            allowed_to: None,
+                        },
+                        NodeTypeSpec {
+                            name: "Goal".into(),
+                            description: None,
                         },
                     ],
+                    edge_types: vec![EdgeTypeSpec {
+                        name: "SUPPORTS".into(),
+                        description: None,
+                        allowed_from: None,
+                        allowed_to: None,
+                    }],
                     strict: true,
                 },
                 default_visibility: "public".into(),
@@ -1152,7 +1272,8 @@ mod tests {
                     content: serde_json::json!({ "summary": "important" }),
                     tags: vec!["important".into()],
                     visibility: vec!["public".into()],
-                    creator: "alice".into(), table_ref: None,
+                    creator: "alice".into(),
+                    table_ref: None,
                 },
             )
             .unwrap();
@@ -1175,7 +1296,8 @@ mod tests {
                 content: serde_json::Value::Null,
                 tags: vec![],
                 visibility: vec![],
-                creator: "alice".into(), table_ref: None,
+                creator: "alice".into(),
+                table_ref: None,
             },
         );
         assert!(result.is_err());
@@ -1194,7 +1316,8 @@ mod tests {
             content: serde_json::Value::Null,
             tags: vec![],
             visibility: vec!["public".into()],
-            creator: "alice".into(), table_ref: None,
+            creator: "alice".into(),
+            table_ref: None,
         };
         store.upsert_node(&gid, input()).unwrap();
         let mut updated = input();
@@ -1210,11 +1333,19 @@ mod tests {
         let store = store();
         let gid = public_graph(&store);
         let nid = store
-            .upsert_node(&gid, NodeInput {
-                node_id: None, node_type: "Research".into(), label: "gone".into(),
-                content: serde_json::Value::Null, tags: vec![], visibility: vec!["public".into()],
-                creator: "alice".into(), table_ref: None,
-            })
+            .upsert_node(
+                &gid,
+                NodeInput {
+                    node_id: None,
+                    node_type: "Research".into(),
+                    label: "gone".into(),
+                    content: serde_json::Value::Null,
+                    tags: vec![],
+                    visibility: vec!["public".into()],
+                    creator: "alice".into(),
+                    table_ref: None,
+                },
+            )
             .unwrap();
         store.delete_node(&gid, &nid).unwrap();
         assert!(store.get_node(&gid, &nid, &alice()).unwrap().is_none());
@@ -1227,12 +1358,19 @@ mod tests {
         let store = store();
         let gid = private_graph(&store);
         let nid = store
-            .upsert_node(&gid, NodeInput {
-                node_id: None, node_type: "".into(), label: "secret".into(),
-                content: serde_json::Value::Null, tags: vec![],
-                visibility: vec!["identity:alice".into()],
-                creator: "alice".into(), table_ref: None,
-            })
+            .upsert_node(
+                &gid,
+                NodeInput {
+                    node_id: None,
+                    node_type: "".into(),
+                    label: "secret".into(),
+                    content: serde_json::Value::Null,
+                    tags: vec![],
+                    visibility: vec!["identity:alice".into()],
+                    creator: "alice".into(),
+                    table_ref: None,
+                },
+            )
             .unwrap();
         assert!(store.get_node(&gid, &nid, &alice()).unwrap().is_some());
         assert!(store.get_node(&gid, &nid, &bob()).unwrap().is_none());
@@ -1243,15 +1381,22 @@ mod tests {
         let store = store();
         let gid = private_graph(&store);
         let nid = store
-            .upsert_node(&gid, NodeInput {
-                node_id: None, node_type: "".into(), label: "research-only".into(),
-                content: serde_json::Value::Null, tags: vec![],
-                visibility: vec!["role:researcher".into()],
-                creator: "alice".into(), table_ref: None,
-            })
+            .upsert_node(
+                &gid,
+                NodeInput {
+                    node_id: None,
+                    node_type: "".into(),
+                    label: "research-only".into(),
+                    content: serde_json::Value::Null,
+                    tags: vec![],
+                    visibility: vec!["role:researcher".into()],
+                    creator: "alice".into(),
+                    table_ref: None,
+                },
+            )
             .unwrap();
         assert!(store.get_node(&gid, &nid, &alice()).unwrap().is_some()); // alice has researcher role
-        assert!(store.get_node(&gid, &nid, &bob()).unwrap().is_none());   // bob does not
+        assert!(store.get_node(&gid, &nid, &bob()).unwrap().is_none()); // bob does not
     }
 
     // ── Edge CRUD ─────────────────────────────────────────────────────────────
@@ -1260,22 +1405,51 @@ mod tests {
     fn upsert_and_get_edge() {
         let store = store();
         let gid = public_graph(&store);
-        let n1 = store.upsert_node(&gid, NodeInput {
-            node_id: None, node_type: "Research".into(), label: "A".into(),
-            content: serde_json::Value::Null, tags: vec![], visibility: vec!["public".into()],
-            creator: "alice".into(), table_ref: None,
-        }).unwrap();
-        let n2 = store.upsert_node(&gid, NodeInput {
-            node_id: None, node_type: "Goal".into(), label: "B".into(),
-            content: serde_json::Value::Null, tags: vec![], visibility: vec!["public".into()],
-            creator: "alice".into(), table_ref: None,
-        }).unwrap();
-        let eid = store.upsert_edge(&gid, EdgeInput {
-            edge_id: None, from_node_id: n1.clone(), to_node_id: n2.clone(),
-            edge_type: "SUPPORTS".into(), label: None,
-            content: serde_json::Value::Null, visibility: vec!["public".into()],
-            creator: "alice".into(),
-        }).unwrap();
+        let n1 = store
+            .upsert_node(
+                &gid,
+                NodeInput {
+                    node_id: None,
+                    node_type: "Research".into(),
+                    label: "A".into(),
+                    content: serde_json::Value::Null,
+                    tags: vec![],
+                    visibility: vec!["public".into()],
+                    creator: "alice".into(),
+                    table_ref: None,
+                },
+            )
+            .unwrap();
+        let n2 = store
+            .upsert_node(
+                &gid,
+                NodeInput {
+                    node_id: None,
+                    node_type: "Goal".into(),
+                    label: "B".into(),
+                    content: serde_json::Value::Null,
+                    tags: vec![],
+                    visibility: vec!["public".into()],
+                    creator: "alice".into(),
+                    table_ref: None,
+                },
+            )
+            .unwrap();
+        let eid = store
+            .upsert_edge(
+                &gid,
+                EdgeInput {
+                    edge_id: None,
+                    from_node_id: n1.clone(),
+                    to_node_id: n2.clone(),
+                    edge_type: "SUPPORTS".into(),
+                    label: None,
+                    content: serde_json::Value::Null,
+                    visibility: vec!["public".into()],
+                    creator: "alice".into(),
+                },
+            )
+            .unwrap();
 
         let edge = store.get_edge(&gid, &eid, &alice()).unwrap().unwrap();
         assert_eq!(edge.from_node_id, n1);
@@ -1287,24 +1461,51 @@ mod tests {
     fn edge_hidden_when_endpoint_not_visible() {
         let store = store();
         let gid = private_graph(&store);
-        let n1 = store.upsert_node(&gid, NodeInput {
-            node_id: None, node_type: "".into(), label: "A".into(),
-            content: serde_json::Value::Null, tags: vec![],
-            visibility: vec!["identity:alice".into()], // alice only
-            creator: "alice".into(), table_ref: None,
-        }).unwrap();
-        let n2 = store.upsert_node(&gid, NodeInput {
-            node_id: None, node_type: "".into(), label: "B".into(),
-            content: serde_json::Value::Null, tags: vec![],
-            visibility: vec!["public".into()],
-            creator: "alice".into(), table_ref: None,
-        }).unwrap();
-        let eid = store.upsert_edge(&gid, EdgeInput {
-            edge_id: None, from_node_id: n1, to_node_id: n2,
-            edge_type: "".into(), label: None,
-            content: serde_json::Value::Null, visibility: vec!["public".into()],
-            creator: "alice".into(),
-        }).unwrap();
+        let n1 = store
+            .upsert_node(
+                &gid,
+                NodeInput {
+                    node_id: None,
+                    node_type: "".into(),
+                    label: "A".into(),
+                    content: serde_json::Value::Null,
+                    tags: vec![],
+                    visibility: vec!["identity:alice".into()], // alice only
+                    creator: "alice".into(),
+                    table_ref: None,
+                },
+            )
+            .unwrap();
+        let n2 = store
+            .upsert_node(
+                &gid,
+                NodeInput {
+                    node_id: None,
+                    node_type: "".into(),
+                    label: "B".into(),
+                    content: serde_json::Value::Null,
+                    tags: vec![],
+                    visibility: vec!["public".into()],
+                    creator: "alice".into(),
+                    table_ref: None,
+                },
+            )
+            .unwrap();
+        let eid = store
+            .upsert_edge(
+                &gid,
+                EdgeInput {
+                    edge_id: None,
+                    from_node_id: n1,
+                    to_node_id: n2,
+                    edge_type: "".into(),
+                    label: None,
+                    content: serde_json::Value::Null,
+                    visibility: vec!["public".into()],
+                    creator: "alice".into(),
+                },
+            )
+            .unwrap();
 
         assert!(store.get_edge(&gid, &eid, &alice()).unwrap().is_some());
         assert!(store.get_edge(&gid, &eid, &bob()).unwrap().is_none()); // n1 hidden from bob
@@ -1316,29 +1517,64 @@ mod tests {
     fn traverse_follows_outbound_edges() {
         let store = store();
         let gid = public_graph(&store);
-        let n1 = store.upsert_node(&gid, NodeInput {
-            node_id: None, node_type: "Research".into(), label: "root".into(),
-            content: serde_json::Value::Null, tags: vec![], visibility: vec!["public".into()],
-            creator: "alice".into(), table_ref: None,
-        }).unwrap();
-        let n2 = store.upsert_node(&gid, NodeInput {
-            node_id: None, node_type: "Goal".into(), label: "child".into(),
-            content: serde_json::Value::Null, tags: vec![], visibility: vec!["public".into()],
-            creator: "alice".into(), table_ref: None,
-        }).unwrap();
-        store.upsert_edge(&gid, EdgeInput {
-            edge_id: None, from_node_id: n1.clone(), to_node_id: n2.clone(),
-            edge_type: "SUPPORTS".into(), label: None,
-            content: serde_json::Value::Null, visibility: vec!["public".into()],
-            creator: "alice".into(),
-        }).unwrap();
+        let n1 = store
+            .upsert_node(
+                &gid,
+                NodeInput {
+                    node_id: None,
+                    node_type: "Research".into(),
+                    label: "root".into(),
+                    content: serde_json::Value::Null,
+                    tags: vec![],
+                    visibility: vec!["public".into()],
+                    creator: "alice".into(),
+                    table_ref: None,
+                },
+            )
+            .unwrap();
+        let n2 = store
+            .upsert_node(
+                &gid,
+                NodeInput {
+                    node_id: None,
+                    node_type: "Goal".into(),
+                    label: "child".into(),
+                    content: serde_json::Value::Null,
+                    tags: vec![],
+                    visibility: vec!["public".into()],
+                    creator: "alice".into(),
+                    table_ref: None,
+                },
+            )
+            .unwrap();
+        store
+            .upsert_edge(
+                &gid,
+                EdgeInput {
+                    edge_id: None,
+                    from_node_id: n1.clone(),
+                    to_node_id: n2.clone(),
+                    edge_type: "SUPPORTS".into(),
+                    label: None,
+                    content: serde_json::Value::Null,
+                    visibility: vec!["public".into()],
+                    creator: "alice".into(),
+                },
+            )
+            .unwrap();
 
-        let result = store.traverse(&gid, &TraversalQuery {
-            start_node_id: n1,
-            direction: TraversalDirection::Outbound,
-            max_depth: 2,
-            edge_types: None,
-        }, &alice()).unwrap();
+        let result = store
+            .traverse(
+                &gid,
+                &TraversalQuery {
+                    start_node_id: n1,
+                    direction: TraversalDirection::Outbound,
+                    max_depth: 2,
+                    edge_types: None,
+                },
+                &alice(),
+            )
+            .unwrap();
 
         let node_ids: Vec<_> = result.nodes.iter().map(|n| &n.node_id).collect();
         assert!(node_ids.contains(&&n2));
@@ -1349,25 +1585,44 @@ mod tests {
 
     /// Build a linear chain: n1 → n2 → n3 → n4 in the given graph.
     /// Returns (n1, n2, n3, n4) IDs.
-    fn make_chain(store: &SqliteGraphStore, gid: &str, vis: &str) -> (String, String, String, String) {
+    fn make_chain(
+        store: &SqliteGraphStore,
+        gid: &str,
+        vis: &str,
+    ) -> (String, String, String, String) {
         let mk = |label: &str| NodeInput {
-            node_id: None, node_type: "Research".into(), label: label.into(),
-            content: serde_json::Value::Null, tags: vec![], visibility: vec![vis.into()],
-            creator: "alice".into(), table_ref: None,
+            node_id: None,
+            node_type: "Research".into(),
+            label: label.into(),
+            content: serde_json::Value::Null,
+            tags: vec![],
+            visibility: vec![vis.into()],
+            creator: "alice".into(),
+            table_ref: None,
         };
         let n1 = store.upsert_node(gid, mk("n1")).unwrap();
         let n2 = store.upsert_node(gid, mk("n2")).unwrap();
         let n3 = store.upsert_node(gid, mk("n3")).unwrap();
         let n4 = store.upsert_node(gid, mk("n4")).unwrap();
         let mk_edge = |from: &str, to: &str, etype: &str| EdgeInput {
-            edge_id: None, from_node_id: from.into(), to_node_id: to.into(),
-            edge_type: etype.into(), label: None,
-            content: serde_json::Value::Null, visibility: vec![vis.into()],
+            edge_id: None,
+            from_node_id: from.into(),
+            to_node_id: to.into(),
+            edge_type: etype.into(),
+            label: None,
+            content: serde_json::Value::Null,
+            visibility: vec![vis.into()],
             creator: "alice".into(),
         };
-        store.upsert_edge(gid, mk_edge(&n1, &n2, "SUPPORTS")).unwrap();
-        store.upsert_edge(gid, mk_edge(&n2, &n3, "SUPPORTS")).unwrap();
-        store.upsert_edge(gid, mk_edge(&n3, &n4, "SUPPORTS")).unwrap();
+        store
+            .upsert_edge(gid, mk_edge(&n1, &n2, "SUPPORTS"))
+            .unwrap();
+        store
+            .upsert_edge(gid, mk_edge(&n2, &n3, "SUPPORTS"))
+            .unwrap();
+        store
+            .upsert_edge(gid, mk_edge(&n3, &n4, "SUPPORTS"))
+            .unwrap();
         (n1, n2, n3, n4)
     }
 
@@ -1378,15 +1633,24 @@ mod tests {
         let (n1, _n2, _n3, n4) = make_chain(&store, &gid, "public");
 
         // From n4 inbound: should reach n1 (depth 3)
-        let result = store.traverse(&gid, &TraversalQuery {
-            start_node_id: n4.clone(),
-            direction: TraversalDirection::Inbound,
-            max_depth: 5,
-            edge_types: None,
-        }, &alice()).unwrap();
+        let result = store
+            .traverse(
+                &gid,
+                &TraversalQuery {
+                    start_node_id: n4.clone(),
+                    direction: TraversalDirection::Inbound,
+                    max_depth: 5,
+                    edge_types: None,
+                },
+                &alice(),
+            )
+            .unwrap();
 
         let node_ids: Vec<&String> = result.nodes.iter().map(|n| &n.node_id).collect();
-        assert!(node_ids.contains(&&n1), "inbound traversal from n4 should reach n1");
+        assert!(
+            node_ids.contains(&&n1),
+            "inbound traversal from n4 should reach n1"
+        );
         assert_eq!(result.edges.len(), 3);
     }
 
@@ -1397,17 +1661,32 @@ mod tests {
         let (n1, n2, n3, n4) = make_chain(&store, &gid, "public");
 
         // From n2 both: should reach n1 (inbound) and n3, n4 (outbound)
-        let result = store.traverse(&gid, &TraversalQuery {
-            start_node_id: n2.clone(),
-            direction: TraversalDirection::Both,
-            max_depth: 5,
-            edge_types: None,
-        }, &alice()).unwrap();
+        let result = store
+            .traverse(
+                &gid,
+                &TraversalQuery {
+                    start_node_id: n2.clone(),
+                    direction: TraversalDirection::Both,
+                    max_depth: 5,
+                    edge_types: None,
+                },
+                &alice(),
+            )
+            .unwrap();
 
         let node_ids: Vec<&String> = result.nodes.iter().map(|n| &n.node_id).collect();
-        assert!(node_ids.contains(&&n1), "both traversal should reach n1 inbound");
-        assert!(node_ids.contains(&&n3), "both traversal should reach n3 outbound");
-        assert!(node_ids.contains(&&n4), "both traversal should reach n4 outbound");
+        assert!(
+            node_ids.contains(&&n1),
+            "both traversal should reach n1 inbound"
+        );
+        assert!(
+            node_ids.contains(&&n3),
+            "both traversal should reach n3 outbound"
+        );
+        assert!(
+            node_ids.contains(&&n4),
+            "both traversal should reach n4 outbound"
+        );
     }
 
     #[test]
@@ -1417,58 +1696,107 @@ mod tests {
         let (n1, n2, _n3, n4) = make_chain(&store, &gid, "public");
 
         // max_depth=1 from n1 should only reach n2, not n4
-        let result = store.traverse(&gid, &TraversalQuery {
-            start_node_id: n1.clone(),
-            direction: TraversalDirection::Outbound,
-            max_depth: 1,
-            edge_types: None,
-        }, &alice()).unwrap();
+        let result = store
+            .traverse(
+                &gid,
+                &TraversalQuery {
+                    start_node_id: n1.clone(),
+                    direction: TraversalDirection::Outbound,
+                    max_depth: 1,
+                    edge_types: None,
+                },
+                &alice(),
+            )
+            .unwrap();
 
         let node_ids: Vec<&String> = result.nodes.iter().map(|n| &n.node_id).collect();
         assert!(node_ids.contains(&&n2), "should reach n2 at depth 1");
-        assert!(!node_ids.contains(&&n4), "should NOT reach n4 at depth 1 cap");
+        assert!(
+            !node_ids.contains(&&n4),
+            "should NOT reach n4 at depth 1 cap"
+        );
     }
 
     #[test]
     fn traverse_filters_by_edge_type() {
         let store = store();
         // Use a lenient schema so we can use arbitrary edge types without rejection.
-        let gid = store.create_graph(GraphSpec {
-            name: "lenient".into(), description: None,
-            schema: GraphSchema { node_types: vec![], edge_types: vec![], strict: false },
-            default_visibility: "public".into(), creator: "alice".into(),
-        }).unwrap();
+        let gid = store
+            .create_graph(GraphSpec {
+                name: "lenient".into(),
+                description: None,
+                schema: GraphSchema {
+                    node_types: vec![],
+                    edge_types: vec![],
+                    strict: false,
+                },
+                default_visibility: "public".into(),
+                creator: "alice".into(),
+            })
+            .unwrap();
         let mk = |label: &str| NodeInput {
-            node_id: None, node_type: "Research".into(), label: label.into(),
-            content: serde_json::Value::Null, tags: vec![], visibility: vec!["public".into()],
-            creator: "alice".into(), table_ref: None,
+            node_id: None,
+            node_type: "Research".into(),
+            label: label.into(),
+            content: serde_json::Value::Null,
+            tags: vec![],
+            visibility: vec!["public".into()],
+            creator: "alice".into(),
+            table_ref: None,
         };
         let n1 = store.upsert_node(&gid, mk("src")).unwrap();
         let n2 = store.upsert_node(&gid, mk("via-supports")).unwrap();
         let n3 = store.upsert_node(&gid, mk("via-blocks")).unwrap();
-        store.upsert_edge(&gid, EdgeInput {
-            edge_id: None, from_node_id: n1.clone(), to_node_id: n2.clone(),
-            edge_type: "SUPPORTS".into(), label: None,
-            content: serde_json::Value::Null, visibility: vec!["public".into()],
-            creator: "alice".into(),
-        }).unwrap();
-        store.upsert_edge(&gid, EdgeInput {
-            edge_id: None, from_node_id: n1.clone(), to_node_id: n3.clone(),
-            edge_type: "BLOCKS".into(), label: None,
-            content: serde_json::Value::Null, visibility: vec!["public".into()],
-            creator: "alice".into(),
-        }).unwrap();
+        store
+            .upsert_edge(
+                &gid,
+                EdgeInput {
+                    edge_id: None,
+                    from_node_id: n1.clone(),
+                    to_node_id: n2.clone(),
+                    edge_type: "SUPPORTS".into(),
+                    label: None,
+                    content: serde_json::Value::Null,
+                    visibility: vec!["public".into()],
+                    creator: "alice".into(),
+                },
+            )
+            .unwrap();
+        store
+            .upsert_edge(
+                &gid,
+                EdgeInput {
+                    edge_id: None,
+                    from_node_id: n1.clone(),
+                    to_node_id: n3.clone(),
+                    edge_type: "BLOCKS".into(),
+                    label: None,
+                    content: serde_json::Value::Null,
+                    visibility: vec!["public".into()],
+                    creator: "alice".into(),
+                },
+            )
+            .unwrap();
 
-        let result = store.traverse(&gid, &TraversalQuery {
-            start_node_id: n1.clone(),
-            direction: TraversalDirection::Outbound,
-            max_depth: 2,
-            edge_types: Some(vec!["SUPPORTS".into()]),
-        }, &alice()).unwrap();
+        let result = store
+            .traverse(
+                &gid,
+                &TraversalQuery {
+                    start_node_id: n1.clone(),
+                    direction: TraversalDirection::Outbound,
+                    max_depth: 2,
+                    edge_types: Some(vec!["SUPPORTS".into()]),
+                },
+                &alice(),
+            )
+            .unwrap();
 
         let node_ids: Vec<&String> = result.nodes.iter().map(|n| &n.node_id).collect();
         assert!(node_ids.contains(&&n2), "SUPPORTS edge should be traversed");
-        assert!(!node_ids.contains(&&n3), "BLOCKS edge should be filtered out");
+        assert!(
+            !node_ids.contains(&&n3),
+            "BLOCKS edge should be filtered out"
+        );
     }
 
     #[test]
@@ -1476,53 +1804,117 @@ mod tests {
         let store = store();
         // Private graph: alice-only nodes form a chain n1 → n2(bob-hidden) → n3
         let gid = private_graph(&store);
-        let n1 = store.upsert_node(&gid, NodeInput {
-            node_id: None, node_type: "".into(), label: "n1".into(),
-            content: serde_json::Value::Null, tags: vec![],
-            visibility: vec!["public".into()],
-            creator: "alice".into(), table_ref: None,
-        }).unwrap();
-        let n2 = store.upsert_node(&gid, NodeInput {
-            node_id: None, node_type: "".into(), label: "n2-alice-only".into(),
-            content: serde_json::Value::Null, tags: vec![],
-            visibility: vec!["identity:alice".into()],
-            creator: "alice".into(), table_ref: None,
-        }).unwrap();
-        let n3 = store.upsert_node(&gid, NodeInput {
-            node_id: None, node_type: "".into(), label: "n3".into(),
-            content: serde_json::Value::Null, tags: vec![],
-            visibility: vec!["public".into()],
-            creator: "alice".into(), table_ref: None,
-        }).unwrap();
-        store.upsert_edge(&gid, EdgeInput {
-            edge_id: None, from_node_id: n1.clone(), to_node_id: n2.clone(),
-            edge_type: "".into(), label: None, content: serde_json::Value::Null,
-            visibility: vec!["public".into()], creator: "alice".into(),
-        }).unwrap();
-        store.upsert_edge(&gid, EdgeInput {
-            edge_id: None, from_node_id: n2.clone(), to_node_id: n3.clone(),
-            edge_type: "".into(), label: None, content: serde_json::Value::Null,
-            visibility: vec!["public".into()], creator: "alice".into(),
-        }).unwrap();
+        let n1 = store
+            .upsert_node(
+                &gid,
+                NodeInput {
+                    node_id: None,
+                    node_type: "".into(),
+                    label: "n1".into(),
+                    content: serde_json::Value::Null,
+                    tags: vec![],
+                    visibility: vec!["public".into()],
+                    creator: "alice".into(),
+                    table_ref: None,
+                },
+            )
+            .unwrap();
+        let n2 = store
+            .upsert_node(
+                &gid,
+                NodeInput {
+                    node_id: None,
+                    node_type: "".into(),
+                    label: "n2-alice-only".into(),
+                    content: serde_json::Value::Null,
+                    tags: vec![],
+                    visibility: vec!["identity:alice".into()],
+                    creator: "alice".into(),
+                    table_ref: None,
+                },
+            )
+            .unwrap();
+        let n3 = store
+            .upsert_node(
+                &gid,
+                NodeInput {
+                    node_id: None,
+                    node_type: "".into(),
+                    label: "n3".into(),
+                    content: serde_json::Value::Null,
+                    tags: vec![],
+                    visibility: vec!["public".into()],
+                    creator: "alice".into(),
+                    table_ref: None,
+                },
+            )
+            .unwrap();
+        store
+            .upsert_edge(
+                &gid,
+                EdgeInput {
+                    edge_id: None,
+                    from_node_id: n1.clone(),
+                    to_node_id: n2.clone(),
+                    edge_type: "".into(),
+                    label: None,
+                    content: serde_json::Value::Null,
+                    visibility: vec!["public".into()],
+                    creator: "alice".into(),
+                },
+            )
+            .unwrap();
+        store
+            .upsert_edge(
+                &gid,
+                EdgeInput {
+                    edge_id: None,
+                    from_node_id: n2.clone(),
+                    to_node_id: n3.clone(),
+                    edge_type: "".into(),
+                    label: None,
+                    content: serde_json::Value::Null,
+                    visibility: vec!["public".into()],
+                    creator: "alice".into(),
+                },
+            )
+            .unwrap();
 
         // Alice sees everything
-        let alice_result = store.traverse(&gid, &TraversalQuery {
-            start_node_id: n1.clone(),
-            direction: TraversalDirection::Outbound,
-            max_depth: 5, edge_types: None,
-        }, &alice()).unwrap();
+        let alice_result = store
+            .traverse(
+                &gid,
+                &TraversalQuery {
+                    start_node_id: n1.clone(),
+                    direction: TraversalDirection::Outbound,
+                    max_depth: 5,
+                    edge_types: None,
+                },
+                &alice(),
+            )
+            .unwrap();
         let alice_ids: Vec<&String> = alice_result.nodes.iter().map(|n| &n.node_id).collect();
         assert!(alice_ids.contains(&&n3), "alice should reach n3 through n2");
 
         // Bob can't see n2, so traversal is pruned — n3 is unreachable
-        let bob_result = store.traverse(&gid, &TraversalQuery {
-            start_node_id: n1.clone(),
-            direction: TraversalDirection::Outbound,
-            max_depth: 5, edge_types: None,
-        }, &bob()).unwrap();
+        let bob_result = store
+            .traverse(
+                &gid,
+                &TraversalQuery {
+                    start_node_id: n1.clone(),
+                    direction: TraversalDirection::Outbound,
+                    max_depth: 5,
+                    edge_types: None,
+                },
+                &bob(),
+            )
+            .unwrap();
         let bob_ids: Vec<&String> = bob_result.nodes.iter().map(|n| &n.node_id).collect();
         assert!(!bob_ids.contains(&&n2), "bob should not see n2");
-        assert!(!bob_ids.contains(&&n3), "bob should not reach n3 (path pruned at n2)");
+        assert!(
+            !bob_ids.contains(&&n3),
+            "bob should not reach n3 (path pruned at n2)"
+        );
     }
 
     // ── Full-text search ──────────────────────────────────────────────────────
@@ -1531,18 +1923,36 @@ mod tests {
     fn fts_search_finds_matching_nodes() {
         let store = store();
         let gid = public_graph(&store);
-        let n1 = store.upsert_node(&gid, NodeInput {
-            node_id: None, node_type: "Research".into(),
-            label: "quantum entanglement notes".into(),
-            content: serde_json::json!({ "text": "spooky action at a distance" }),
-            tags: vec![], visibility: vec!["public".into()], creator: "alice".into(), table_ref: None,
-        }).unwrap();
-        let _n2 = store.upsert_node(&gid, NodeInput {
-            node_id: None, node_type: "Goal".into(),
-            label: "improve test coverage".into(),
-            content: serde_json::json!({ "text": "increase branch coverage to 90%" }),
-            tags: vec![], visibility: vec!["public".into()], creator: "alice".into(), table_ref: None,
-        }).unwrap();
+        let n1 = store
+            .upsert_node(
+                &gid,
+                NodeInput {
+                    node_id: None,
+                    node_type: "Research".into(),
+                    label: "quantum entanglement notes".into(),
+                    content: serde_json::json!({ "text": "spooky action at a distance" }),
+                    tags: vec![],
+                    visibility: vec!["public".into()],
+                    creator: "alice".into(),
+                    table_ref: None,
+                },
+            )
+            .unwrap();
+        let _n2 = store
+            .upsert_node(
+                &gid,
+                NodeInput {
+                    node_id: None,
+                    node_type: "Goal".into(),
+                    label: "improve test coverage".into(),
+                    content: serde_json::json!({ "text": "increase branch coverage to 90%" }),
+                    tags: vec![],
+                    visibility: vec!["public".into()],
+                    creator: "alice".into(),
+                    table_ref: None,
+                },
+            )
+            .unwrap();
 
         let results = store.search_nodes(&gid, "quantum", &alice()).unwrap();
         assert_eq!(results.len(), 1);
@@ -1553,17 +1963,31 @@ mod tests {
     fn fts_search_respects_visibility() {
         let store = store();
         let gid = private_graph(&store);
-        let _n1 = store.upsert_node(&gid, NodeInput {
-            node_id: None, node_type: "".into(), label: "secret finding".into(),
-            content: serde_json::json!({ "text": "classified information here" }),
-            tags: vec![], visibility: vec!["identity:alice".into()], creator: "alice".into(), table_ref: None,
-        }).unwrap();
+        let _n1 = store
+            .upsert_node(
+                &gid,
+                NodeInput {
+                    node_id: None,
+                    node_type: "".into(),
+                    label: "secret finding".into(),
+                    content: serde_json::json!({ "text": "classified information here" }),
+                    tags: vec![],
+                    visibility: vec!["identity:alice".into()],
+                    creator: "alice".into(),
+                    table_ref: None,
+                },
+            )
+            .unwrap();
 
         let alice_results = store.search_nodes(&gid, "classified", &alice()).unwrap();
         assert_eq!(alice_results.len(), 1, "alice should find her secret node");
 
         let bob_results = store.search_nodes(&gid, "classified", &bob()).unwrap();
-        assert_eq!(bob_results.len(), 0, "bob should not find alice's secret node");
+        assert_eq!(
+            bob_results.len(),
+            0,
+            "bob should not find alice's secret node"
+        );
     }
 
     // ── Schema update ─────────────────────────────────────────────────────────
@@ -1573,7 +1997,10 @@ mod tests {
         let store = store();
         let gid = public_graph(&store);
         let mut meta = store.get_graph(&gid).unwrap().unwrap();
-        meta.schema.node_types.push(NodeTypeSpec { name: "Decision".into(), description: None });
+        meta.schema.node_types.push(NodeTypeSpec {
+            name: "Decision".into(),
+            description: None,
+        });
         store.update_schema(&gid, meta.schema).unwrap();
         let updated = store.get_graph(&gid).unwrap().unwrap();
         assert_eq!(updated.schema.node_types.len(), 3);
@@ -1583,39 +2010,67 @@ mod tests {
     fn schema_update_cannot_remove_used_type() {
         let store = store();
         let gid = public_graph(&store);
-        store.upsert_node(&gid, NodeInput {
-            node_id: None, node_type: "Research".into(), label: "test".into(),
-            content: serde_json::Value::Null, tags: vec![], visibility: vec!["public".into()],
-            creator: "alice".into(), table_ref: None,
-        }).unwrap();
+        store
+            .upsert_node(
+                &gid,
+                NodeInput {
+                    node_id: None,
+                    node_type: "Research".into(),
+                    label: "test".into(),
+                    content: serde_json::Value::Null,
+                    tags: vec![],
+                    visibility: vec!["public".into()],
+                    creator: "alice".into(),
+                    table_ref: None,
+                },
+            )
+            .unwrap();
         // Try to update schema with Research type removed.
         let schema = GraphSchema {
-            node_types: vec![NodeTypeSpec { name: "Goal".into(), description: None }],
+            node_types: vec![NodeTypeSpec {
+                name: "Goal".into(),
+                description: None,
+            }],
             edge_types: vec![],
             strict: true,
         };
         let result = store.update_schema(&gid, schema);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("cannot remove node type"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("cannot remove node type"));
     }
 
     // ── Table adapter ─────────────────────────────────────────────────────────
 
     fn sample_columns() -> Vec<ColumnSpec> {
         vec![
-            ColumnSpec { name: "title".into(), col_type: "text".into(), description: None, required: true },
-            ColumnSpec { name: "score".into(), col_type: "integer".into(), description: None, required: false },
+            ColumnSpec {
+                name: "title".into(),
+                col_type: "text".into(),
+                description: None,
+                required: true,
+            },
+            ColumnSpec {
+                name: "score".into(),
+                col_type: "integer".into(),
+                description: None,
+                required: false,
+            },
         ]
     }
 
     fn make_table(store: &SqliteGraphStore) -> String {
-        store.create_table(TableSpec {
-            name: "findings".into(),
-            description: Some("research findings".into()),
-            columns: sample_columns(),
-            graph_id: None,
-            creator: "alice".into(),
-        }).expect("create table")
+        store
+            .create_table(TableSpec {
+                name: "findings".into(),
+                description: Some("research findings".into()),
+                columns: sample_columns(),
+                graph_id: None,
+                creator: "alice".into(),
+            })
+            .expect("create table")
     }
 
     #[test]
@@ -1632,14 +2087,24 @@ mod tests {
     fn list_tables_by_graph_id() {
         let store = store();
         let gid = public_graph(&store);
-        store.create_table(TableSpec {
-            name: "linked-table".into(), description: None,
-            columns: vec![], graph_id: Some(gid.clone()), creator: "alice".into(),
-        }).unwrap();
-        store.create_table(TableSpec {
-            name: "standalone".into(), description: None,
-            columns: vec![], graph_id: None, creator: "alice".into(),
-        }).unwrap();
+        store
+            .create_table(TableSpec {
+                name: "linked-table".into(),
+                description: None,
+                columns: vec![],
+                graph_id: Some(gid.clone()),
+                creator: "alice".into(),
+            })
+            .unwrap();
+        store
+            .create_table(TableSpec {
+                name: "standalone".into(),
+                description: None,
+                columns: vec![],
+                graph_id: None,
+                creator: "alice".into(),
+            })
+            .unwrap();
 
         let linked = store.list_tables(Some(&gid)).unwrap();
         assert_eq!(linked.len(), 1);
@@ -1653,11 +2118,16 @@ mod tests {
     fn insert_and_get_row() {
         let store = store();
         let tid = make_table(&store);
-        let rid = store.insert_row(&tid, RowInput {
-            row_id: None,
-            data: serde_json::json!({ "title": "First Finding", "score": 9 }),
-            creator: "alice".into(),
-        }).unwrap();
+        let rid = store
+            .insert_row(
+                &tid,
+                RowInput {
+                    row_id: None,
+                    data: serde_json::json!({ "title": "First Finding", "score": 9 }),
+                    creator: "alice".into(),
+                },
+            )
+            .unwrap();
 
         let row = store.get_row(&tid, &rid).unwrap().unwrap();
         assert_eq!(row.data["title"], "First Finding");
@@ -1668,13 +2138,20 @@ mod tests {
     fn update_row_shallow_merge() {
         let store = store();
         let tid = make_table(&store);
-        let rid = store.insert_row(&tid, RowInput {
-            row_id: None,
-            data: serde_json::json!({ "title": "Old", "score": 1 }),
-            creator: "alice".into(),
-        }).unwrap();
+        let rid = store
+            .insert_row(
+                &tid,
+                RowInput {
+                    row_id: None,
+                    data: serde_json::json!({ "title": "Old", "score": 1 }),
+                    creator: "alice".into(),
+                },
+            )
+            .unwrap();
 
-        store.update_row(&tid, &rid, serde_json::json!({ "title": "New" })).unwrap();
+        store
+            .update_row(&tid, &rid, serde_json::json!({ "title": "New" }))
+            .unwrap();
         let row = store.get_row(&tid, &rid).unwrap().unwrap();
         assert_eq!(row.data["title"], "New");
         assert_eq!(row.data["score"], 1, "unchanged field preserved");
@@ -1684,11 +2161,16 @@ mod tests {
     fn delete_row_hides_it() {
         let store = store();
         let tid = make_table(&store);
-        let rid = store.insert_row(&tid, RowInput {
-            row_id: None,
-            data: serde_json::json!({ "title": "Gone" }),
-            creator: "alice".into(),
-        }).unwrap();
+        let rid = store
+            .insert_row(
+                &tid,
+                RowInput {
+                    row_id: None,
+                    data: serde_json::json!({ "title": "Gone" }),
+                    creator: "alice".into(),
+                },
+            )
+            .unwrap();
         store.delete_row(&tid, &rid).unwrap();
         assert!(store.get_row(&tid, &rid).unwrap().is_none());
     }
@@ -1697,19 +2179,52 @@ mod tests {
     fn query_rows_with_equality_filter() {
         let store = store();
         let tid = make_table(&store);
-        store.insert_row(&tid, RowInput { row_id: None, creator: "alice".into(),
-            data: serde_json::json!({ "title": "Alpha", "score": 10 }) }).unwrap();
-        store.insert_row(&tid, RowInput { row_id: None, creator: "alice".into(),
-            data: serde_json::json!({ "title": "Beta", "score": 5 }) }).unwrap();
-        store.insert_row(&tid, RowInput { row_id: None, creator: "alice".into(),
-            data: serde_json::json!({ "title": "Gamma", "score": 10 }) }).unwrap();
+        store
+            .insert_row(
+                &tid,
+                RowInput {
+                    row_id: None,
+                    creator: "alice".into(),
+                    data: serde_json::json!({ "title": "Alpha", "score": 10 }),
+                },
+            )
+            .unwrap();
+        store
+            .insert_row(
+                &tid,
+                RowInput {
+                    row_id: None,
+                    creator: "alice".into(),
+                    data: serde_json::json!({ "title": "Beta", "score": 5 }),
+                },
+            )
+            .unwrap();
+        store
+            .insert_row(
+                &tid,
+                RowInput {
+                    row_id: None,
+                    creator: "alice".into(),
+                    data: serde_json::json!({ "title": "Gamma", "score": 10 }),
+                },
+            )
+            .unwrap();
 
-        let results = store.query_rows(&tid, &RowQuery {
-            filter: Some(serde_json::json!({ "score": 10 })),
-            limit: None, offset: None,
-        }).unwrap();
+        let results = store
+            .query_rows(
+                &tid,
+                &RowQuery {
+                    filter: Some(serde_json::json!({ "score": 10 })),
+                    limit: None,
+                    offset: None,
+                },
+            )
+            .unwrap();
         assert_eq!(results.len(), 2);
-        let titles: Vec<&str> = results.iter().map(|r| r.data["title"].as_str().unwrap()).collect();
+        let titles: Vec<&str> = results
+            .iter()
+            .map(|r| r.data["title"].as_str().unwrap())
+            .collect();
         assert!(titles.contains(&"Alpha"));
         assert!(titles.contains(&"Gamma"));
     }
@@ -1719,14 +2234,40 @@ mod tests {
         let store = store();
         let tid = make_table(&store);
         for i in 0..5u32 {
-            store.insert_row(&tid, RowInput { row_id: None, creator: "alice".into(),
-                data: serde_json::json!({ "idx": i }) }).unwrap();
+            store
+                .insert_row(
+                    &tid,
+                    RowInput {
+                        row_id: None,
+                        creator: "alice".into(),
+                        data: serde_json::json!({ "idx": i }),
+                    },
+                )
+                .unwrap();
         }
 
-        let page1 = store.query_rows(&tid, &RowQuery { filter: None, limit: Some(2), offset: Some(0) }).unwrap();
+        let page1 = store
+            .query_rows(
+                &tid,
+                &RowQuery {
+                    filter: None,
+                    limit: Some(2),
+                    offset: Some(0),
+                },
+            )
+            .unwrap();
         assert_eq!(page1.len(), 2);
 
-        let page2 = store.query_rows(&tid, &RowQuery { filter: None, limit: Some(2), offset: Some(2) }).unwrap();
+        let page2 = store
+            .query_rows(
+                &tid,
+                &RowQuery {
+                    filter: None,
+                    limit: Some(2),
+                    offset: Some(2),
+                },
+            )
+            .unwrap();
         assert_eq!(page2.len(), 2);
 
         // No overlap between pages
@@ -1739,8 +2280,16 @@ mod tests {
     fn drop_table_removes_rows() {
         let store = store();
         let tid = make_table(&store);
-        store.insert_row(&tid, RowInput { row_id: None, creator: "alice".into(),
-            data: serde_json::json!({ "title": "Doomed" }) }).unwrap();
+        store
+            .insert_row(
+                &tid,
+                RowInput {
+                    row_id: None,
+                    creator: "alice".into(),
+                    data: serde_json::json!({ "title": "Doomed" }),
+                },
+            )
+            .unwrap();
         store.drop_table(&tid).unwrap();
         assert!(store.get_table(&tid).unwrap().is_none());
     }
@@ -1751,11 +2300,21 @@ mod tests {
         let gid = public_graph(&store);
         let tid = make_table(&store);
 
-        let nid = store.upsert_node(&gid, NodeInput {
-            node_id: None, node_type: "Research".into(), label: "dataset anchor".into(),
-            content: serde_json::Value::Null, tags: vec![], visibility: vec!["public".into()],
-            creator: "alice".into(), table_ref: Some(tid.clone()),
-        }).unwrap();
+        let nid = store
+            .upsert_node(
+                &gid,
+                NodeInput {
+                    node_id: None,
+                    node_type: "Research".into(),
+                    label: "dataset anchor".into(),
+                    content: serde_json::Value::Null,
+                    tags: vec![],
+                    visibility: vec!["public".into()],
+                    creator: "alice".into(),
+                    table_ref: Some(tid.clone()),
+                },
+            )
+            .unwrap();
 
         let node = store.get_node(&gid, &nid, &alice()).unwrap().unwrap();
         assert_eq!(node.table_ref.as_deref(), Some(tid.as_str()));
@@ -1770,28 +2329,55 @@ mod tests {
         let store = store();
         let gid = public_graph(&store);
         let mk_node = |label: &str| NodeInput {
-            node_id: None, node_type: "Research".into(), label: label.into(),
-            content: serde_json::Value::Null, tags: vec![], visibility: vec!["public".into()],
-            creator: "alice".into(), table_ref: None,
+            node_id: None,
+            node_type: "Research".into(),
+            label: label.into(),
+            content: serde_json::Value::Null,
+            tags: vec![],
+            visibility: vec!["public".into()],
+            creator: "alice".into(),
+            table_ref: None,
         };
         let n1 = store.upsert_node(&gid, mk_node("A")).unwrap();
         let n2 = store.upsert_node(&gid, mk_node("B")).unwrap();
         let n3 = store.upsert_node(&gid, mk_node("C")).unwrap();
-        store.upsert_edge(&gid, EdgeInput {
-            edge_id: None, from_node_id: n1.clone(), to_node_id: n2.clone(),
-            edge_type: "SUPPORTS".into(), label: None,
-            content: serde_json::Value::Null, visibility: vec!["public".into()],
-            creator: "alice".into(),
-        }).unwrap();
-        store.upsert_edge(&gid, EdgeInput {
-            edge_id: None, from_node_id: n2.clone(), to_node_id: n3.clone(),
-            edge_type: "SUPPORTS".into(), label: None,
-            content: serde_json::Value::Null, visibility: vec!["public".into()],
-            creator: "alice".into(),
-        }).unwrap();
+        store
+            .upsert_edge(
+                &gid,
+                EdgeInput {
+                    edge_id: None,
+                    from_node_id: n1.clone(),
+                    to_node_id: n2.clone(),
+                    edge_type: "SUPPORTS".into(),
+                    label: None,
+                    content: serde_json::Value::Null,
+                    visibility: vec!["public".into()],
+                    creator: "alice".into(),
+                },
+            )
+            .unwrap();
+        store
+            .upsert_edge(
+                &gid,
+                EdgeInput {
+                    edge_id: None,
+                    from_node_id: n2.clone(),
+                    to_node_id: n3.clone(),
+                    edge_type: "SUPPORTS".into(),
+                    label: None,
+                    content: serde_json::Value::Null,
+                    visibility: vec!["public".into()],
+                    creator: "alice".into(),
+                },
+            )
+            .unwrap();
 
-        let nodes = store.list_nodes(&gid, &NodeFilter::default(), &alice()).unwrap();
-        let edges = store.list_edges(&gid, &EdgeFilter::default(), &alice()).unwrap();
+        let nodes = store
+            .list_nodes(&gid, &NodeFilter::default(), &alice())
+            .unwrap();
+        let edges = store
+            .list_edges(&gid, &EdgeFilter::default(), &alice())
+            .unwrap();
         assert_eq!(nodes.len(), 3);
         assert_eq!(edges.len(), 2);
     }
@@ -1799,33 +2385,61 @@ mod tests {
     #[test]
     fn export_rooted_subgraph_via_traversal() {
         let store = store();
-        let gid = store.create_graph(GraphSpec {
-            name: "export-test".into(), description: None,
-            schema: GraphSchema { node_types: vec![], edge_types: vec![], strict: false },
-            default_visibility: "public".into(), creator: "alice".into(),
-        }).unwrap();
+        let gid = store
+            .create_graph(GraphSpec {
+                name: "export-test".into(),
+                description: None,
+                schema: GraphSchema {
+                    node_types: vec![],
+                    edge_types: vec![],
+                    strict: false,
+                },
+                default_visibility: "public".into(),
+                creator: "alice".into(),
+            })
+            .unwrap();
         let mk = |label: &str| NodeInput {
-            node_id: None, node_type: "X".into(), label: label.into(),
-            content: serde_json::Value::Null, tags: vec![], visibility: vec!["public".into()],
-            creator: "alice".into(), table_ref: None,
+            node_id: None,
+            node_type: "X".into(),
+            label: label.into(),
+            content: serde_json::Value::Null,
+            tags: vec![],
+            visibility: vec!["public".into()],
+            creator: "alice".into(),
+            table_ref: None,
         };
         let root = store.upsert_node(&gid, mk("root")).unwrap();
         let child = store.upsert_node(&gid, mk("child")).unwrap();
         let orphan = store.upsert_node(&gid, mk("orphan")).unwrap();
-        store.upsert_edge(&gid, EdgeInput {
-            edge_id: None, from_node_id: root.clone(), to_node_id: child.clone(),
-            edge_type: "HAS".into(), label: None,
-            content: serde_json::Value::Null, visibility: vec!["public".into()],
-            creator: "alice".into(),
-        }).unwrap();
+        store
+            .upsert_edge(
+                &gid,
+                EdgeInput {
+                    edge_id: None,
+                    from_node_id: root.clone(),
+                    to_node_id: child.clone(),
+                    edge_type: "HAS".into(),
+                    label: None,
+                    content: serde_json::Value::Null,
+                    visibility: vec!["public".into()],
+                    creator: "alice".into(),
+                },
+            )
+            .unwrap();
 
         // Traversal from root (both directions, depth 10) should include root + child but not orphan.
-        let result = store.traverse(&gid, &crate::graph::TraversalQuery {
-            start_node_id: root.clone(),
-            direction: crate::graph::TraversalDirection::Both,
-            max_depth: 10,
-            edge_types: None,
-        }, &alice()).unwrap();
+        let result = store
+            .traverse(
+                &gid,
+                &crate::graph::TraversalQuery {
+                    start_node_id: root.clone(),
+                    direction: crate::graph::TraversalDirection::Both,
+                    max_depth: 10,
+                    edge_types: None,
+                },
+                &alice(),
+            )
+            .unwrap();
 
         let node_ids: Vec<_> = result.nodes.iter().map(|n| n.node_id.as_str()).collect();
         assert!(node_ids.contains(&root.as_str()));

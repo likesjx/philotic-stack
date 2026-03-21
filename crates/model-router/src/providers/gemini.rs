@@ -26,7 +26,9 @@ pub struct GeminiProvider {
 impl GeminiProvider {
     fn debug_model_requests_enabled() -> bool {
         matches!(
-            std::env::var("PHILOTIC_DEBUG_MODEL_REQUESTS").ok().as_deref(),
+            std::env::var("PHILOTIC_DEBUG_MODEL_REQUESTS")
+                .ok()
+                .as_deref(),
             Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
         )
     }
@@ -96,10 +98,134 @@ impl GeminiProvider {
         })
     }
 
+    fn gemini_function_aliases(tools: &[serde_json::Value]) -> Vec<(String, String)> {
+        let mut aliases = Vec::with_capacity(tools.len());
+        let mut used = std::collections::HashSet::new();
+
+        for (index, tool) in tools.iter().enumerate() {
+            let original = tool
+                .get("tool_name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if original.is_empty() {
+                continue;
+            }
+
+            let mut alias: String = original
+                .chars()
+                .map(|ch| {
+                    if ch.is_ascii_alphanumeric() || ch == '_' {
+                        ch.to_ascii_lowercase()
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            alias = alias.trim_matches('_').to_string();
+            if alias.is_empty() {
+                alias = format!("tool_{}", index + 1);
+            }
+            if alias
+                .chars()
+                .next()
+                .map(|ch| ch.is_ascii_digit())
+                .unwrap_or(false)
+            {
+                alias = format!("tool_{}", alias);
+            }
+
+            let base = alias.clone();
+            let mut suffix = 2usize;
+            while !used.insert(alias.clone()) {
+                alias = format!("{base}_{suffix}");
+                suffix += 1;
+            }
+
+            aliases.push((alias, original.to_string()));
+        }
+
+        aliases
+    }
+
+    fn normalize_function_parameters(schema: &Value) -> Value {
+        match schema {
+            Value::Object(map) => {
+                let mut normalized = serde_json::Map::new();
+                for (key, value) in map {
+                    let normalized_value = match key.as_str() {
+                        "properties" => Value::Object(
+                            value
+                                .as_object()
+                                .map(|props| {
+                                    props
+                                        .iter()
+                                        .map(|(prop_name, prop_schema)| {
+                                            (
+                                                prop_name.clone(),
+                                                Self::normalize_function_parameters(prop_schema),
+                                            )
+                                        })
+                                        .collect::<serde_json::Map<String, Value>>()
+                                })
+                                .unwrap_or_default(),
+                        ),
+                        "items" => Self::normalize_function_parameters(value),
+                        _ => value.clone(),
+                    };
+                    normalized.insert(key.clone(), normalized_value);
+                }
+
+                if !normalized.contains_key("type") {
+                    let inferred = if normalized.contains_key("properties") {
+                        "object"
+                    } else if normalized.contains_key("items") {
+                        "array"
+                    } else {
+                        "string"
+                    };
+                    normalized.insert("type".into(), Value::String(inferred.into()));
+                }
+
+                Value::Object(normalized)
+            }
+            _ => schema.clone(),
+        }
+    }
+
+    fn function_declarations(tools: &[serde_json::Value]) -> Vec<Value> {
+        let alias_map = Self::gemini_function_aliases(tools);
+        tools
+            .iter()
+            .filter_map(|tool| {
+                let tool_name = tool.get("tool_name").and_then(Value::as_str)?.trim();
+                let alias = alias_map
+                    .iter()
+                    .find_map(|(alias, original)| (original == tool_name).then_some(alias))?;
+                let description = tool
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .unwrap_or(tool_name);
+                let parameters = tool
+                    .get("input_schema")
+                    .map(Self::normalize_function_parameters)
+                    .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
+
+                Some(json!({
+                    "name": alias,
+                    "description": description,
+                    "parameters": parameters
+                }))
+            })
+            .collect()
+    }
+
     /// Build a request payload for turns where tools are available.
     ///
     /// The model must output JSON with either:
-    /// - `display_text` (and optionally `spoken_text`, `memory_concept`) for a text response, OR
+    /// - `display_text` (and optionally `spoken_text`, `memory_candidate`) for a text response, OR
     /// - `tool_call` with `tool_name` + `arguments` to invoke a tool.
     ///
     /// Exactly one of `display_text` or `tool_call` must be present.
@@ -135,46 +261,49 @@ impl GeminiProvider {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let concept_instruction = if wants_concept {
-            " Also include \"memory_concept\": a short kebab-case slug (2–5 words) summarising the exchange."
+        let memory_instruction = if wants_concept {
+            " Also include \"memory_candidate\" with fields: \"concept\" (short kebab-case slug), \
+             \"content\" (compact autobiographical memory text for this exchange), and optional \
+             \"tags\" (array of short strings)."
         } else {
             ""
         };
 
         let plan_instruction = if wants_plan {
-            " When starting a multi-step task, output \"active_plan\" with your goal, steps \
-              (each with id, description, tool_name, status), and overall status. Update step \
-              statuses as you execute. Omit active_plan for single-step responses."
+            " When starting a multi-step task, describe your plan briefly in natural language before or after tool use when helpful."
         } else {
             ""
         };
 
         let system_text = format!(
-            "You are an agent with tools. To invoke a tool, output ONLY a JSON object with \
-             a \"tool_call\" key containing \"tool_name\" (string) and \"arguments\" (object). \
-             The arguments must satisfy the selected tool's schema and include every required field. \
-             Do not omit required arguments. Do not include display_text when calling a tool.\n\
-             To reply without a tool, output a JSON object with \"display_text\" (your reply, \
-             markdown fine) and \"spoken_text\" (conversational version for voice, no markdown).{}{}\n\n\
+            "You are an agent with tools. When a tool is needed, call one of the declared functions \
+             instead of writing a JSON tool_call object by hand. Use function parameters exactly as \
+             declared and include every required field.{}{}\n\
+             When no tool is needed, output a JSON object with \"display_text\" (your reply, markdown fine) \
+             and \"spoken_text\" (conversational version for voice, no markdown).\n\n\
              Available tools:\n{}",
-            concept_instruction,
-            plan_instruction,
-            tool_list,
+            memory_instruction, plan_instruction, tool_list,
         );
 
         let mut properties = json!({
             "display_text": { "type": "STRING" },
-            "spoken_text": { "type": "STRING" },
-            "tool_call": {
+            "spoken_text": { "type": "STRING" }
+        });
+        let required = vec!["display_text", "spoken_text"];
+
+        if wants_concept {
+            properties["memory_candidate"] = json!({
                 "type": "OBJECT",
                 "properties": {
-                    "tool_name": { "type": "STRING" },
-                    "arguments": { "type": "OBJECT" }
-                }
-            }
-        });
-        if wants_concept {
-            properties["memory_concept"] = json!({ "type": "STRING" });
+                    "concept": { "type": "STRING" },
+                    "content": { "type": "STRING" },
+                    "tags": {
+                        "type": "ARRAY",
+                        "items": { "type": "STRING" }
+                    }
+                },
+                "required": ["concept", "content"]
+            });
         }
         if wants_plan {
             properties["active_plan"] = json!({
@@ -207,21 +336,35 @@ impl GeminiProvider {
                 "responseMimeType": "application/json",
                 "responseSchema": {
                     "type": "OBJECT",
-                    "properties": properties
+                    "properties": properties,
+                    "required": required
+                }
+            },
+            "tools": [
+                {
+                    "functionDeclarations": Self::function_declarations(tools)
+                }
+            ],
+            "toolConfig": {
+                "functionCallingConfig": {
+                    "mode": "AUTO"
                 }
             }
         })
     }
 
-    fn structured_text_request_payload(prompt: &str, wants_concept: bool, wants_plan: bool) -> Value {
+    fn structured_text_request_payload(
+        prompt: &str,
+        wants_concept: bool,
+        wants_plan: bool,
+    ) -> Value {
         let system_text = if wants_concept {
-            "When generating your response, produce a JSON object with three fields: \
-             \"display_text\" (your full response formatted for text display, markdown is fine), \
+            "When generating your response, produce a JSON object with \"display_text\" \
+             (your full response formatted for text display, markdown is fine), \
              \"spoken_text\" (a natural, expressive version for voice delivery — no markdown, \
-             conversational tone, written to be heard), and \"memory_concept\" (a short kebab-case \
-             topic slug, 2–5 words, summarising what this exchange is about for the agent's \
-             autobiographical memory — e.g. \"greeting-exchange\", \"code-review-request\", \
-             \"deployment-question\")."
+             conversational tone, written to be heard), and \"memory_candidate\" \
+             (an object with \"concept\" as a short kebab-case topic slug, \"content\" as a compact \
+             autobiographical memory text for this exchange, and optional \"tags\" as an array of strings)."
         } else {
             "When generating your response, produce a JSON object with two fields: \
              \"display_text\" (your full response formatted for text display, \
@@ -236,8 +379,19 @@ impl GeminiProvider {
         let mut required = vec!["display_text", "spoken_text"];
 
         if wants_concept {
-            properties["memory_concept"] = json!({ "type": "STRING" });
-            required.push("memory_concept");
+            properties["memory_candidate"] = json!({
+                "type": "OBJECT",
+                "properties": {
+                    "concept": { "type": "STRING" },
+                    "content": { "type": "STRING" },
+                    "tags": {
+                        "type": "ARRAY",
+                        "items": { "type": "STRING" }
+                    }
+                },
+                "required": ["concept", "content"]
+            });
+            required.push("memory_candidate");
         }
         if wants_plan {
             properties["active_plan"] = json!({
@@ -278,11 +432,17 @@ impl GeminiProvider {
     }
 
     /// Parse a structured JSON response from Gemini.
-    /// Returns `(display_text, spoken_text, memory_concept, active_plan)`.
+    /// Returns `(display_text, spoken_text, memory_concept, memory_candidate, active_plan)`.
     fn parse_structured_response(
         status: reqwest::StatusCode,
         body: Value,
-    ) -> (String, Option<String>, Option<String>, Option<Value>) {
+    ) -> (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<Value>,
+        Option<Value>,
+    ) {
         let raw = Self::parse_response_text(status, body);
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw) {
             let display = parsed
@@ -300,12 +460,21 @@ impl GeminiProvider {
                 .and_then(Value::as_str)
                 .filter(|s| !s.trim().is_empty())
                 .map(str::to_string);
+            let memory_candidate = parsed.get("memory_candidate").cloned();
+            let concept = concept.or_else(|| {
+                memory_candidate
+                    .as_ref()
+                    .and_then(|candidate| candidate.get("concept"))
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string)
+            });
             let active_plan = parsed.get("active_plan").cloned();
             if let Some(display) = display {
-                return (display, spoken, concept, active_plan);
+                return (display, spoken, concept, memory_candidate, active_plan);
             }
         }
-        (raw, None, None, None)
+        (raw, None, None, None, None)
     }
 
     async fn media_request_payload(&self, task: &ControllerTask) -> Result<Value> {
@@ -376,10 +545,11 @@ impl GeminiProvider {
             .and_then(|candidate| candidate.get("content"))
             .and_then(|content| content.get("parts"))
             .and_then(Value::as_array)
-            .and_then(|parts| parts.first())
-            .and_then(|part| part.get("text"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
+            .and_then(|parts| {
+                parts
+                    .iter()
+                    .find_map(|part| part.get("text").and_then(Value::as_str).map(str::to_string))
+            })
             .unwrap_or_else(|| "Gemini returned an empty response.".into())
     }
 
@@ -434,7 +604,12 @@ impl ModelProvider for GeminiProvider {
                     .composed_prompt_text()
                     .context("Gemini text task missing prompt")?;
                 if has_tools {
-                    Self::tool_aware_request_payload(&prompt, &task.tools, wants_concept, wants_plan)
+                    Self::tool_aware_request_payload(
+                        &prompt,
+                        &task.tools,
+                        wants_concept,
+                        wants_plan,
+                    )
                 } else if use_structured {
                     Self::structured_text_request_payload(&prompt, wants_concept, wants_plan)
                 } else {
@@ -484,29 +659,18 @@ impl ModelProvider for GeminiProvider {
         let body = response.json::<Value>().await?;
 
         if use_structured {
-            let (content, spoken_text, memory_concept, active_plan) =
-                Self::parse_structured_response(status, body.clone());
-
-            // Check if model returned a tool_call instead of display_text.
-            if let Ok(parsed) = serde_json::from_str::<Value>(&content) {
-                if let Some(tool_call) = Self::parse_tool_call_candidate(task, &parsed)? {
+            if has_tools {
+                if let Some(tool_call) = Self::parse_native_function_call(task, &body)? {
                     return Ok(tool_call);
                 }
             }
-            // Also check the raw parsed JSON directly (before display_text wrapping).
-            if let Some(raw_text) = body
-                .get("candidates")
-                .and_then(|c| c.get(0))
-                .and_then(|c| c.get("content"))
-                .and_then(|c| c.get("parts"))
-                .and_then(|p| p.get(0))
-                .and_then(|p| p.get("text"))
-                .and_then(Value::as_str)
-            {
-                if let Ok(parsed) = serde_json::from_str::<Value>(raw_text) {
-                    if let Some(tool_call) = Self::parse_tool_call_candidate(task, &parsed)? {
-                        return Ok(tool_call);
-                    }
+
+            let (content, spoken_text, memory_concept, memory_candidate, active_plan) =
+                Self::parse_structured_response(status, body.clone());
+
+            if let Ok(parsed) = serde_json::from_str::<Value>(&content) {
+                if let Some(tool_call) = Self::parse_tool_call_candidate(task, &parsed)? {
+                    return Ok(tool_call);
                 }
             }
 
@@ -521,6 +685,7 @@ impl ModelProvider for GeminiProvider {
                 follow_up_questions: Vec::new(),
                 intent_summary: None,
                 memory_concept,
+                memory_candidate,
                 active_plan,
             })
         } else {
@@ -536,6 +701,7 @@ impl ModelProvider for GeminiProvider {
                 follow_up_questions: Vec::new(),
                 intent_summary: None,
                 memory_concept: None,
+                memory_candidate: None,
                 active_plan: None,
             })
         }
@@ -543,6 +709,60 @@ impl ModelProvider for GeminiProvider {
 }
 
 impl GeminiProvider {
+    fn parse_native_function_call(
+        task: &ControllerTask,
+        body: &Value,
+    ) -> Result<Option<ProviderOutput>> {
+        let alias_map = Self::gemini_function_aliases(&task.tools);
+        let Some(parts) = body
+            .get("candidates")
+            .and_then(Value::as_array)
+            .and_then(|candidates| candidates.first())
+            .and_then(|candidate| candidate.get("content"))
+            .and_then(|content| content.get("parts"))
+            .and_then(Value::as_array)
+        else {
+            return Ok(None);
+        };
+
+        for part in parts {
+            let Some(function_call) = part
+                .get("functionCall")
+                .or_else(|| part.get("function_call"))
+            else {
+                continue;
+            };
+
+            let alias = function_call
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if alias.is_empty() {
+                continue;
+            }
+
+            let tool_name = alias_map
+                .iter()
+                .find_map(|(gemini_alias, original)| {
+                    (gemini_alias == alias).then_some(original.clone())
+                })
+                .unwrap_or_else(|| alias.to_string());
+            let arguments = function_call
+                .get("args")
+                .or_else(|| function_call.get("arguments"))
+                .cloned()
+                .context("functionCall.args missing from Gemini response")?;
+            Self::validate_tool_call(task, &tool_name, &arguments)?;
+            return Ok(Some(ProviderOutput::ToolCall {
+                tool_name,
+                arguments,
+            }));
+        }
+
+        Ok(None)
+    }
+
     fn parse_tool_call_candidate(
         task: &ControllerTask,
         parsed: &Value,
@@ -583,9 +803,9 @@ impl GeminiProvider {
             bail!("Gemini returned unsupported tool_call [{}]", tool_name);
         };
 
-        let args_obj = arguments
-            .as_object()
-            .with_context(|| format!("tool_call.arguments for [{}] must be an object", tool_name))?;
+        let args_obj = arguments.as_object().with_context(|| {
+            format!("tool_call.arguments for [{}] must be an object", tool_name)
+        })?;
 
         let required = tool_def
             .get("input_schema")
@@ -904,16 +1124,16 @@ mod tests {
     #[test]
     fn rejects_tool_call_missing_required_argument() {
         let task = minimal_text_task_with_tools(vec![serde_json::json!({
-                "tool_name": "echo",
-                "description": "Echo text",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "text": { "type": "string" }
-                    },
-                    "required": ["text"]
-                }
-            })]);
+            "tool_name": "echo",
+            "description": "Echo text",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string" }
+                },
+                "required": ["text"]
+            }
+        })]);
 
         let parsed = serde_json::json!({
             "tool_call": {
@@ -930,16 +1150,16 @@ mod tests {
     #[test]
     fn accepts_tool_call_with_required_argument() {
         let task = minimal_text_task_with_tools(vec![serde_json::json!({
-                "tool_name": "echo",
-                "description": "Echo text",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "text": { "type": "string" }
-                    },
-                    "required": ["text"]
-                }
-            })]);
+            "tool_name": "echo",
+            "description": "Echo text",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string" }
+                },
+                "required": ["text"]
+            }
+        })]);
 
         let parsed = serde_json::json!({
             "tool_call": {
@@ -956,6 +1176,80 @@ mod tests {
             crate::controller::ProviderOutput::ToolCall {
                 tool_name: "echo".into(),
                 arguments: serde_json::json!({ "text": "hello" })
+            }
+        );
+    }
+
+    #[test]
+    fn tool_aware_payload_uses_function_declarations_with_required_fields() {
+        let payload = GeminiProvider::tool_aware_request_payload(
+            "hello",
+            &[serde_json::json!({
+                "tool_name": "echo",
+                "description": "Echo text",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "text": {
+                            "type": "string",
+                            "description": "The text to echo back."
+                        }
+                    },
+                    "required": ["text"]
+                }
+            })],
+            false,
+            false,
+        );
+
+        let declaration = &payload["tools"][0]["functionDeclarations"][0];
+        assert_eq!(declaration["name"], "echo");
+        assert_eq!(
+            declaration["parameters"]["required"],
+            serde_json::json!(["text"])
+        );
+        assert_eq!(
+            declaration["parameters"]["properties"]["text"]["type"],
+            serde_json::json!("string")
+        );
+    }
+
+    #[test]
+    fn native_function_call_maps_alias_back_to_original_tool_name() {
+        let task = minimal_text_task_with_tools(vec![serde_json::json!({
+            "tool_name": "session.status",
+            "description": "Session status",
+            "input_schema": {
+                "type": "object",
+                "properties": {}
+            }
+        })]);
+
+        let body = serde_json::json!({
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {
+                                "functionCall": {
+                                    "name": "session_status",
+                                    "args": {}
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        });
+
+        let output = GeminiProvider::parse_native_function_call(&task, &body)
+            .expect("native function call should parse")
+            .expect("tool call should be present");
+        assert_eq!(
+            output,
+            crate::controller::ProviderOutput::ToolCall {
+                tool_name: "session.status".into(),
+                arguments: serde_json::json!({})
             }
         );
     }

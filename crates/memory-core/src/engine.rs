@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
+use crate::recall::{RecallContext, RecallDecision, TurnRecallResult, evaluate_recall};
 use crate::types::{
     ActivationResult, AttentionalLens, Engram, EngramId, EngramRef, LinkKind, MemoryScope,
 };
@@ -22,16 +23,16 @@ pub trait MemoryEngine: Send + Sync {
     /// Returns a lightweight reference to the stored engram.
     async fn remember(
         &self,
-        scope:   MemoryScope,
+        scope: MemoryScope,
         concept: &str,
         content: &str,
-        tags:    Vec<String>,
+        tags: Vec<String>,
     ) -> anyhow::Result<EngramRef>;
 
     /// Store multiple engrams in a single round-trip.
     async fn remember_batch(
         &self,
-        scope:   MemoryScope,
+        scope: MemoryScope,
         entries: Vec<(String, String, Vec<String>)>, // (concept, content, tags)
     ) -> anyhow::Result<Vec<EngramRef>>;
 
@@ -39,9 +40,9 @@ pub trait MemoryEngine: Send + Sync {
     /// The engram's core identity (id, vault) is immutable.
     async fn evolve(
         &self,
-        id:      &EngramId,
+        id: &EngramId,
         content: &str,
-        tags:    Option<Vec<String>>,
+        tags: Option<Vec<String>>,
     ) -> anyhow::Result<EngramRef>;
 
     /// Mark an engram for removal or accelerated decay.
@@ -56,8 +57,8 @@ pub trait MemoryEngine: Send + Sync {
     /// graph traversal, and ACT-R decay scoring.
     async fn activate(
         &self,
-        context:     &str,
-        scope:       MemoryScope,
+        context: &str,
+        scope: MemoryScope,
         max_results: Option<usize>,
     ) -> anyhow::Result<ActivationResult>;
 
@@ -73,8 +74,8 @@ pub trait MemoryEngine: Send + Sync {
     async fn link(
         &self,
         from_id: &EngramId,
-        to_id:   &EngramId,
-        kind:    LinkKind,
+        to_id: &EngramId,
+        kind: LinkKind,
     ) -> anyhow::Result<()>;
 
     /// Walk the association graph from a starting engram.
@@ -82,7 +83,7 @@ pub trait MemoryEngine: Send + Sync {
     /// primes related memories.
     async fn traverse(
         &self,
-        from_id:   &EngramId,
+        from_id: &EngramId,
         max_depth: Option<usize>,
     ) -> anyhow::Result<Vec<Engram>>;
 
@@ -95,6 +96,47 @@ pub trait MemoryEngine: Send + Sync {
     /// Inspect the currently active attentional lens.
     async fn current_lens(&self) -> anyhow::Result<Option<AttentionalLens>>;
 
+    // ── Turn Recall Policy ───────────────────────────────────────────────────
+
+    /// Deterministically decide whether long-term recall should run for this
+    /// runtime context. This is distinct from explicit `memory.recall` tool use:
+    /// it powers bounded turn-start augmentation and recovery-time continuity.
+    async fn evaluate_recall(&self, context: &RecallContext) -> anyhow::Result<RecallDecision> {
+        let mut merged = context.clone();
+        if merged.lens.is_none() {
+            merged.lens = self.current_lens().await.unwrap_or(None);
+        }
+        Ok(evaluate_recall(&merged))
+    }
+
+    /// Run the bounded recall flow for a runtime context. Uses the deterministic
+    /// policy above to decide whether to call `activate()`, then returns both the
+    /// decision metadata and any recalled engrams.
+    async fn recall_for_turn(&self, context: &RecallContext) -> anyhow::Result<TurnRecallResult> {
+        let decision = self.evaluate_recall(context).await?;
+        if !decision.should_recall() {
+            return Ok(TurnRecallResult {
+                decision,
+                engrams: Vec::new(),
+                total: 0,
+            });
+        }
+
+        let query = decision
+            .query
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("recall decision missing query"))?;
+        let activation = self
+            .activate(&query, context.scope.clone(), decision.limit)
+            .await?;
+
+        Ok(TurnRecallResult {
+            decision,
+            engrams: activation.engrams,
+            total: activation.total,
+        })
+    }
+
     // ── Subscription (Phase 5) ────────────────────────────────────────────────
 
     /// Register for real-time activation pushes matching a context.
@@ -105,6 +147,6 @@ pub trait MemoryEngine: Send + Sync {
     async fn subscribe(
         &self,
         context: &str,
-        scope:   MemoryScope,
+        scope: MemoryScope,
     ) -> anyhow::Result<mpsc::Receiver<Engram>>;
 }

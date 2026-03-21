@@ -188,7 +188,8 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                           A delegation skill defines a reusable subagent role with a goal template, \
                           allowed tools, and lifecycle configuration. The hotel validates the skill \
                           structurally and returns the validation outcome. Once registered, the skill \
-                          can be referenced by name when spawning subagents."
+                          can be referenced by name when spawning subagents. Always include \
+                          skill_name, description, subagent_kind, and goal."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -276,10 +277,11 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         "skill.revoke".into(),
         ToolDefinition {
             tool_name: "skill.revoke".into(),
-            description: "Removes a skill from a role's toolset profile. The skill's implied tools \
+            description:
+                "Removes a skill from a role's toolset profile. The skill's implied tools \
                           will no longer be available to the role after the next session reset. \
                           Idempotent."
-                .into(),
+                    .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -461,7 +463,9 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
             tool_name: "role.configure".into(),
             description: "Create or update a role incarnation for the current agent identity. \
                           Requires reasoning about: purpose, toolset, skillset, handoff posture, \
-                          and limits (TTL, iteration caps). Only the orchestrator can use this tool."
+                          and limits (TTL, iteration caps). Only the orchestrator can use this tool. \
+                          Always include role_name, toolset_profile, and the full reasoning object \
+                          with purpose, toolset_rationale, and handoff_posture_and_limits."
                 .into(),
             input_schema: json!({
                 "type": "object",

@@ -1,8 +1,8 @@
 use anyhow::Result;
 use clap::Parser;
 use model_router::controller::ModelProvider;
-use model_router::providers::onnx::OnnxProviderConfig;
 use model_router::providers::OnnxProvider;
+use model_router::providers::onnx::OnnxProviderConfig;
 use model_router::runtime::{ControllerGuestConfig, run_model_controller};
 use model_router::sidecar::run_sidecar;
 use onnx_runner::EmbeddingsConfig;
@@ -14,7 +14,11 @@ const DEFAULT_GUEST_ID: &str = "model-onnx-01";
 const DEFAULT_ROLE: &str = "model.local";
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "ONNX local model controller with Ollama-compat HTTP sidecar")]
+#[command(
+    author,
+    version,
+    about = "ONNX local model controller with Ollama-compat HTTP sidecar"
+)]
 struct Args {
     /// Skip IPC hotel registration and serve the HTTP sidecar only.
     /// Useful for smoke tests and standalone embedding use without a running hotel.

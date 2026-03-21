@@ -1492,10 +1492,7 @@ impl GraphStorage for SqliteGraphStorage {
         })
     }
 
-    fn get_toolset_profile(
-        &self,
-        profile_name: &str,
-    ) -> Result<Option<ToolsetProfileRecord>> {
+    fn get_toolset_profile(&self, profile_name: &str) -> Result<Option<ToolsetProfileRecord>> {
         match self
             .adapter
             .get_node(&format!("toolset_profile:{profile_name}"))?
@@ -1534,7 +1531,11 @@ impl GraphStorage for SqliteGraphStorage {
             .list_nodes_by_kind("rule")?
             .into_iter()
             .map(|node| serde_json::from_value::<RuleRecord>(node.data).map_err(Into::into))
-            .filter(|r| r.as_ref().map(|rule| rule.agent_id == agent_id).unwrap_or(true))
+            .filter(|r| {
+                r.as_ref()
+                    .map(|rule| rule.agent_id == agent_id)
+                    .unwrap_or(true)
+            })
             .collect()
     }
 }

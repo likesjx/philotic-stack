@@ -41,12 +41,7 @@ pub trait GraphStore: Send + Sync {
     fn upsert_node(&self, graph_id: &str, input: NodeInput) -> Result<String>;
 
     /// Returns `None` if the node does not exist or is not visible to `identity`.
-    fn get_node(
-        &self,
-        graph_id: &str,
-        node_id: &str,
-        identity: &Identity,
-    ) -> Result<Option<Node>>;
+    fn get_node(&self, graph_id: &str, node_id: &str, identity: &Identity) -> Result<Option<Node>>;
 
     fn list_nodes(
         &self,
@@ -65,12 +60,7 @@ pub trait GraphStore: Send + Sync {
 
     /// Returns `None` if the edge does not exist or is not visible to `identity`
     /// (including endpoint visibility checks).
-    fn get_edge(
-        &self,
-        graph_id: &str,
-        edge_id: &str,
-        identity: &Identity,
-    ) -> Result<Option<Edge>>;
+    fn get_edge(&self, graph_id: &str, edge_id: &str, identity: &Identity) -> Result<Option<Edge>>;
 
     fn list_edges(
         &self,
@@ -94,12 +84,7 @@ pub trait GraphStore: Send + Sync {
     ) -> Result<TraversalResult>;
 
     /// Full-text search across node labels and content within a graph.
-    fn search_nodes(
-        &self,
-        graph_id: &str,
-        query: &str,
-        identity: &Identity,
-    ) -> Result<Vec<Node>>;
+    fn search_nodes(&self, graph_id: &str, query: &str, identity: &Identity) -> Result<Vec<Node>>;
 }
 
 /// Table adapter storage interface.
@@ -126,7 +111,13 @@ pub trait TableStore: Send + Sync {
 
     /// Update table metadata (name, description, columns). Additive-only on columns —
     /// the implementation must reject removal of columns that have row data.
-    fn update_table(&self, table_id: &str, name: Option<String>, description: Option<String>, columns: Option<Vec<ColumnSpec>>) -> Result<()>;
+    fn update_table(
+        &self,
+        table_id: &str,
+        name: Option<String>,
+        description: Option<String>,
+        columns: Option<Vec<ColumnSpec>>,
+    ) -> Result<()>;
 
     /// Permanently delete a table and all its rows.
     fn drop_table(&self, table_id: &str) -> Result<()>;

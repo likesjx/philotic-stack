@@ -25,8 +25,8 @@
 
 use anyhow::{Context, Result, bail};
 use philotic_client::{
-    GuestIdentity, HookKind, HookRoute, HookSubscription, IpcRequest, IpcResponse,
-    PhiloticClient, SubagentContextPacket, SubagentDelegation, SubagentLeaseTerms,
+    GuestIdentity, HookKind, HookRoute, HookSubscription, IpcRequest, IpcResponse, PhiloticClient,
+    SubagentContextPacket, SubagentDelegation, SubagentLeaseTerms,
 };
 use tokio::time::{Duration, sleep, timeout};
 
@@ -37,8 +37,8 @@ const EXPECTED_RESULT: &str = "smoke ok";
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let _hotel_node = std::env::var("PHILOTIC_TARGET_NODE")
-        .unwrap_or_else(|_| "local-aiua-01".to_string());
+    let _hotel_node =
+        std::env::var("PHILOTIC_TARGET_NODE").unwrap_or_else(|_| "local-aiua-01".to_string());
 
     // ── Phase 1: parent connects ───────────────────────────────────────────────
     println!("[parent] connecting…");
@@ -99,9 +99,7 @@ async fn main() -> Result<()> {
 
     // ── Phase 3: worker connects and accepts lease ─────────────────────────────
     let worker_id = subagent_guest_id.clone();
-    let worker_handle = tokio::spawn(async move {
-        run_worker(worker_id).await
-    });
+    let worker_handle = tokio::spawn(async move { run_worker(worker_id).await });
 
     // Give the worker task time to connect and subscribe before AssignSubagentTask.
     sleep(Duration::from_millis(200)).await;

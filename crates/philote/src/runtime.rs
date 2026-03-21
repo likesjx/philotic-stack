@@ -7,12 +7,18 @@ use crate::protocol::{
     ToolExecutionPayload, TransportAttachment, TurnEventPayload,
 };
 use crate::session::{
-    ActivePlan, AgentProfile, ComponentRouteAssembly, MediaRoutingPolicy, SessionState,
-    ToolExecutionRoute, TtsMode, VoiceResponsePolicy, WorkingTurn, merge_session_index,
+    ActivePlan, AgentProfile, ComponentRouteAssembly, MediaRoutingPolicy, RecalledMemoryRecord,
+    SessionState, ToolExecutionRoute, TtsMode, VoiceResponsePolicy, WorkingTurn,
+    merge_session_index,
 };
 use anyhow::Result;
-use memory_core::{MuninnConfig, MuninnRestEngine, MemoryScope, VaultResolver};
-use philotic_client::{HandoffBundle, IpcRequest, IpcResponse, PhiloticClient, TaskErrorPayload, is_ipc_disconnect};
+use memory_core::{
+    MemoryScope, MuninnConfig, MuninnRestEngine, RecallContext, RecallTrigger, VaultResolver,
+};
+use philotic_client::{
+    HandoffBundle, IpcRequest, IpcResponse, PhiloticClient, TaskErrorPayload, is_ipc_disconnect,
+};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Duration;
 use tracing::{error, info, warn};
@@ -29,7 +35,9 @@ fn local_node_id() -> String {
 
 fn debug_model_requests_enabled() -> bool {
     matches!(
-        std::env::var("PHILOTIC_DEBUG_MODEL_REQUESTS").ok().as_deref(),
+        std::env::var("PHILOTIC_DEBUG_MODEL_REQUESTS")
+            .ok()
+            .as_deref(),
         Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
     )
 }
@@ -55,10 +63,7 @@ fn extract_model_error(task: &InboundTaskPayload) -> Option<String> {
     Some(payload.display_message())
 }
 
-fn should_attempt_provider_repair(
-    error: &TaskErrorPayload,
-    state: Option<&SessionState>,
-) -> bool {
+fn should_attempt_provider_repair(error: &TaskErrorPayload, state: Option<&SessionState>) -> bool {
     error.kind == "provider_failure"
         && error.retryable.unwrap_or(false)
         && error.capability.as_deref() == Some("text.generate")
@@ -72,8 +77,50 @@ fn provider_repair_note(error: &TaskErrorPayload) -> String {
     format!(
         "The previous {provider} response attempted a tool call but returned an invalid tool payload. \
 If you call a tool, output a complete tool_call object with a non-empty arguments object containing every required field. \
-If no tool is needed, reply with display_text and spoken_text only"
+If no tool is needed, reply with structured JSON containing display_text, spoken_text, and memory_candidate"
     )
+}
+
+#[derive(Debug, Clone)]
+struct MemoryCandidate {
+    concept: String,
+    content: String,
+    tags: Vec<String>,
+}
+
+fn parse_memory_candidate(value: Option<&Value>) -> Option<MemoryCandidate> {
+    let candidate = value?;
+    let concept = candidate
+        .get("concept")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let content = candidate
+        .get("content")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let tags = candidate
+        .get("tags")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Some(MemoryCandidate {
+        concept,
+        content,
+        tags,
+    })
 }
 
 fn implementation_to_model_role(implementation: &str) -> String {
@@ -493,7 +540,9 @@ impl AgentRuntime {
                 }
                 Err(e) => warn!("Failed to parse agent profile bundle: {}", e),
             },
-            Ok(IpcResponse::ConfigData { value_json: None, .. }) => {
+            Ok(IpcResponse::ConfigData {
+                value_json: None, ..
+            }) => {
                 info!(agent_id = %self.agent_id, "No agent identity bundle found in hotel — using default profile.");
             }
             Ok(_) | Err(_) => {
@@ -505,16 +554,20 @@ impl AgentRuntime {
     /// Fetch MuninnDB config from hotel IPC and store it for session use.
     async fn fetch_memory_config(&mut self) {
         info!("Requesting MuninnDB config from hotel...");
-        match self.ipc_client.send_request(IpcRequest::FetchMemoryConfig).await {
-            Ok(IpcResponse::MemoryConfig { config_json: Some(json) }) => {
-                match serde_json::from_str::<MuninnConfig>(&json) {
-                    Ok(cfg) => {
-                        info!(endpoint = %cfg.base_url, vaults = cfg.vault_tokens.len(), "MuninnDB config loaded");
-                        self.muninn_config = Some(cfg);
-                    }
-                    Err(e) => warn!("Failed to parse MuninnConfig from hotel: {}", e),
+        match self
+            .ipc_client
+            .send_request(IpcRequest::FetchMemoryConfig)
+            .await
+        {
+            Ok(IpcResponse::MemoryConfig {
+                config_json: Some(json),
+            }) => match serde_json::from_str::<MuninnConfig>(&json) {
+                Ok(cfg) => {
+                    info!(endpoint = %cfg.base_url, vaults = cfg.vault_tokens.len(), "MuninnDB config loaded");
+                    self.muninn_config = Some(cfg);
                 }
-            }
+                Err(e) => warn!("Failed to parse MuninnConfig from hotel: {}", e),
+            },
             Ok(IpcResponse::MemoryConfig { config_json: None }) => {
                 info!("Hotel has no MuninnDB config — running without memory");
             }
@@ -527,10 +580,13 @@ impl AgentRuntime {
     /// Build a `MuninnRestEngine` scoped to the given agent and user.
     fn memory_engine_for(&self, agent_id: &str, user_id: &str) -> Option<MuninnRestEngine> {
         self.muninn_config.clone().map(|cfg| {
-            MuninnRestEngine::new(cfg, VaultResolver {
-                agent_id: agent_id.to_string(),
-                user_id: user_id.to_string(),
-            })
+            MuninnRestEngine::new(
+                cfg,
+                VaultResolver {
+                    agent_id: agent_id.to_string(),
+                    user_id: user_id.to_string(),
+                },
+            )
         })
     }
 
@@ -754,15 +810,7 @@ impl AgentRuntime {
                 .iter()
                 .any(|a| matches!(a.kind.as_str(), "voice" | "audio"));
 
-        let (
-            checkpoint_memory_type,
-            checkpoint_json,
-            index_state,
-            model_prompt,
-            model_context,
-            context_projection,
-            tools_for_model,
-        ) = {
+        {
             let state = self
                 .sessions
                 .get_mut(&session_id)
@@ -780,6 +828,7 @@ impl AgentRuntime {
                 pending_tool_call: None,
                 pending_approval: None,
                 working_tool_history: Vec::new(),
+                recalled_memories: Vec::new(),
                 active_plan: None,
                 consecutive_step_failures: 0,
                 provider_repair_note: None,
@@ -789,7 +838,23 @@ impl AgentRuntime {
                 awaiting_transcription_reentry: false,
             });
             state.set_active_turn_phase(TurnPhase::LoadingContext);
+        }
 
+        self.maybe_auto_recall_turn_memory(&session_id).await?;
+
+        let (
+            checkpoint_memory_type,
+            checkpoint_json,
+            index_state,
+            model_prompt,
+            model_context,
+            context_projection,
+            tools_for_model,
+        ) = {
+            let state = self
+                .sessions
+                .get_mut(&session_id)
+                .expect("session should exist after ensuring and binding transport target");
             let tools_for_model = state.project_tools_for_turn(&content);
             let (model_prompt, model_context, context_projection) =
                 state.model_request_payloads(&content, &tools_for_model);
@@ -999,7 +1064,9 @@ impl AgentRuntime {
             context_projection: Some(context_projection),
             attachments,
             tools_for_model,
-            response_contract: Some(serde_json::json!({ "channels": ["spoken_text", "memory_concept", "active_plan"] })),
+            response_contract: Some(
+                serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan"] }),
+            ),
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
@@ -1135,6 +1202,8 @@ impl AgentRuntime {
             .and_then(serde_json::Value::as_str)
             .filter(|s| !s.trim().is_empty())
             .map(str::to_string);
+        let memory_candidate =
+            parse_memory_candidate(model_result.and_then(|r| r.get("memory_candidate")));
 
         // Capture active_plan from the model response and store it on the turn.
         // Present whenever the model outputs a structured plan — optional on all turns.
@@ -1186,8 +1255,15 @@ impl AgentRuntime {
 
         match action {
             AgentAction::Respond { content } => {
-                self.complete_agent_response(session_id, turn_id, content, spoken_text, memory_concept)
-                    .await
+                self.complete_agent_response(
+                    session_id,
+                    turn_id,
+                    content,
+                    spoken_text,
+                    memory_concept,
+                    memory_candidate,
+                )
+                .await
             }
             AgentAction::ToolCall(tool_call) => {
                 self.handle_tool_call(session_id, turn_id, tool_call).await
@@ -1216,8 +1292,7 @@ impl AgentRuntime {
         let preapproved = if always_require_human {
             false
         } else {
-            self
-                .sessions
+            self.sessions
                 .get(&session_id)
                 .map(|state| {
                     let tool = state
@@ -1283,6 +1358,11 @@ impl AgentRuntime {
         self.sync_session_index(&index_state).await?;
 
         if preapproved {
+            let pending_tool_call = self
+                .sessions
+                .get(&session_id)
+                .and_then(|state| state.active_turn.as_ref())
+                .and_then(|turn| turn.pending_tool_call.clone());
             let _ = self
                 .ipc_client
                 .send_request(IpcRequest::UpdateTask {
@@ -1307,8 +1387,40 @@ impl AgentRuntime {
                 })
                 .await?;
 
+            let reply_payload = FinalReplyPayload {
+                action: "send_reply",
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                chat_id,
+                content: approval.approved_response.clone(),
+                audio_artifact: None,
+                send_text_caption: false,
+            };
+
+            self.ipc_client
+                .send_request(IpcRequest::EmitTask {
+                    target_node: final_reply_to,
+                    target_role: final_reply_role,
+                    target_guest_id: final_reply_guest_id,
+                    task_json: serde_json::to_string(&reply_payload)?,
+                })
+                .await?;
+
+            if let Some(tool_call) = pending_tool_call {
+                return self
+                    .route_tool_call_execution(session_id, turn_id, tool_call)
+                    .await;
+            }
+
             return self
-                .complete_agent_response(session_id, turn_id, approval.approved_response, None, None)
+                .complete_agent_response(
+                    session_id,
+                    turn_id,
+                    approval.approved_response,
+                    None,
+                    None,
+                    None,
+                )
                 .await;
         }
 
@@ -1357,6 +1469,158 @@ impl AgentRuntime {
                 target_role: final_reply_role,
                 target_guest_id: final_reply_guest_id,
                 task_json: serde_json::to_string(&reply_payload)?,
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    async fn route_tool_call_execution(
+        &mut self,
+        session_id: String,
+        turn_id: String,
+        tool_call: ToolCall,
+    ) -> Result<()> {
+        let (checkpoint_memory_type, checkpoint_json, index_state) = {
+            let Some(state) = self.sessions.get_mut(&session_id) else {
+                warn!("Received tool call for unknown session {}", session_id);
+                return Ok(());
+            };
+            let Some(active_turn) = state.active_turn.as_ref() else {
+                warn!(
+                    "Dropping tool call for session {} turn {} with no active turn",
+                    session_id, turn_id
+                );
+                return Ok(());
+            };
+            if active_turn.turn_id != turn_id {
+                warn!(
+                    "Dropping stale tool call for session {}: active={} response={}",
+                    session_id, active_turn.turn_id, turn_id
+                );
+                return Ok(());
+            }
+            state.set_pending_tool_call(tool_call.clone());
+            state.set_active_turn_phase(TurnPhase::WaitingTool);
+            (
+                state.checkpoint_memory_type(),
+                state.checkpoint_json(),
+                state.clone(),
+            )
+        };
+
+        self.ipc_client
+            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
+            .await?;
+        self.sync_session_index(&index_state).await?;
+
+        let _ = self
+            .emit_turn_event(&session_id, "waiting_tool", None)
+            .await;
+
+        // Emit step_started if streaming is enabled.
+        let stream_events = self
+            .sessions
+            .get(&session_id)
+            .map(|s| s.settings.execution.stream_tool_events)
+            .unwrap_or(true);
+        if stream_events {
+            let step_info = Some(tool_call.tool_name.clone());
+            let _ = self
+                .emit_turn_event(&session_id, "step_started", step_info)
+                .await;
+        }
+
+        let (
+            chat_id,
+            final_reply_to,
+            final_reply_role,
+            final_reply_guest_id,
+            workspace_ref,
+            route,
+            session_user_id,
+        ) = {
+            let Some(state) = self.sessions.get(&session_id) else {
+                warn!(
+                    "Tool execution requested for unknown session {}",
+                    session_id
+                );
+                return Ok(());
+            };
+            let route = match Self::execute_bound_tool(state, &tool_call) {
+                Ok(route) => route.clone(),
+                Err(err) => {
+                    return self
+                        .fail_active_turn(session_id, turn_id, err.to_string())
+                        .await;
+                }
+            };
+            let Some(active_turn) = state.active_turn.as_ref() else {
+                warn!(
+                    "Dropping tool execution routing for session {} turn {} after active turn disappeared",
+                    session_id, turn_id
+                );
+                return Ok(());
+            };
+            (
+                active_turn.chat_id.clone(),
+                active_turn.final_reply_to.clone(),
+                active_turn.final_reply_role.clone(),
+                active_turn.final_reply_guest_id.clone(),
+                state.bindings.effective_workspace_ref.clone(),
+                route,
+                state.source.clone(),
+            )
+        };
+
+        let tool_req = ToolExecutionPayload {
+            action: "execute_tool",
+            session_id,
+            turn_id,
+            chat_id,
+            tool_name: tool_call.tool_name,
+            arguments: tool_call.arguments,
+            execution_mode: route.execution_mode.clone(),
+            agent_id: self.agent_id.clone(),
+            user_id: Some(session_user_id),
+            runner_id: route.runner_id.clone(),
+            incarnation_id: route.incarnation_id.clone(),
+            hotel_id: route.hotel_id.clone(),
+            environment_id: route.environment_id.clone(),
+            task_runner_kind: route.task_runner_kind.clone(),
+            task_runner_config: route.task_runner_config.clone(),
+            selection_reason: route.selection_reason.clone(),
+            workspace_ref: workspace_ref.clone(),
+            task_runner_overlay: route
+                .task_runner_kind
+                .as_deref()
+                .map(|kind| TaskRunnerOverlay {
+                    workspace_ref: if kind == "workspace" {
+                        workspace_ref
+                    } else {
+                        None
+                    },
+                    allowed_tools: None,
+                    max_read_bytes: None,
+                    max_search_results: None,
+                }),
+            reply_to: local_node_id(),
+            reply_role: "agent".into(),
+            final_reply_to,
+            final_reply_role,
+            final_reply_guest_id,
+        };
+
+        if route.execution_mode == "local_agent" {
+            return self.execute_local_agent_tool(tool_req).await;
+        }
+
+        self.ipc_client
+            .send_request(IpcRequest::EmitTask {
+                target_node: route.target_node,
+                target_role: route.target_role,
+                target_guest_id: route.incarnation_id.clone(),
+                task_json: serde_json::to_string(&tool_req)?,
             })
             .await?;
 
@@ -1452,7 +1716,10 @@ impl AgentRuntime {
                 )
             } else {
                 (
-                    format!("Tool '{}' requires approval before execution.", tool_call.tool_name),
+                    format!(
+                        "Tool '{}' requires approval before execution.",
+                        tool_call.tool_name
+                    ),
                     format!("Executing {}.", tool_call.tool_name),
                 )
             };
@@ -1472,125 +1739,8 @@ impl AgentRuntime {
                 .await;
         }
 
-        let (checkpoint_memory_type, checkpoint_json, index_state) = {
-            let Some(state) = self.sessions.get_mut(&session_id) else {
-                warn!("Received tool call for unknown session {}", session_id);
-                return Ok(());
-            };
-            state.set_pending_tool_call(tool_call.clone());
-            state.set_active_turn_phase(TurnPhase::WaitingTool);
-            (
-                state.checkpoint_memory_type(),
-                state.checkpoint_json(),
-                state.clone(),
-            )
-        };
-
-        self.ipc_client
-            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
-            .await?;
-        self.sync_session_index(&index_state).await?;
-
-        let _ = self
-            .emit_turn_event(&session_id, "waiting_tool", None)
-            .await;
-
-        // Emit step_started if streaming is enabled.
-        let stream_events = self
-            .sessions
-            .get(&session_id)
-            .map(|s| s.settings.execution.stream_tool_events)
-            .unwrap_or(true);
-        if stream_events {
-            let step_info = Some(tool_call.tool_name.clone());
-            let _ = self
-                .emit_turn_event(&session_id, "step_started", step_info)
-                .await;
-        }
-
-        let (chat_id, final_reply_to, final_reply_role, final_reply_guest_id, workspace_ref, route, session_user_id) = {
-            let Some(state) = self.sessions.get(&session_id) else {
-                warn!(
-                    "Tool execution requested for unknown session {}",
-                    session_id
-                );
-                return Ok(());
-            };
-            let route = match Self::execute_bound_tool(state, &tool_call) {
-                Ok(route) => route.clone(),
-                Err(err) => {
-                    return self
-                        .fail_active_turn(session_id, turn_id, err.to_string())
-                        .await;
-                }
-            };
-            let active_turn = state
-                .active_turn
-                .as_ref()
-                .expect("active turn should exist while routing tool call");
-            (
-                active_turn.chat_id.clone(),
-                active_turn.final_reply_to.clone(),
-                active_turn.final_reply_role.clone(),
-                active_turn.final_reply_guest_id.clone(),
-                state.bindings.effective_workspace_ref.clone(),
-                route,
-                state.source.clone(),
-            )
-        };
-
-        let tool_req = ToolExecutionPayload {
-            action: "execute_tool",
-            session_id,
-            turn_id,
-            chat_id,
-            tool_name: tool_call.tool_name,
-            arguments: tool_call.arguments,
-            execution_mode: route.execution_mode.clone(),
-            agent_id: self.agent_id.clone(),
-            user_id: Some(session_user_id),
-            runner_id: route.runner_id.clone(),
-            incarnation_id: route.incarnation_id.clone(),
-            hotel_id: route.hotel_id.clone(),
-            environment_id: route.environment_id.clone(),
-            task_runner_kind: route.task_runner_kind.clone(),
-            task_runner_config: route.task_runner_config.clone(),
-            selection_reason: route.selection_reason.clone(),
-            workspace_ref: workspace_ref.clone(),
-            task_runner_overlay: route
-                .task_runner_kind
-                .as_deref()
-                .map(|kind| TaskRunnerOverlay {
-                    workspace_ref: if kind == "workspace" {
-                        workspace_ref
-                    } else {
-                        None
-                    },
-                    allowed_tools: None,
-                    max_read_bytes: None,
-                    max_search_results: None,
-                }),
-            reply_to: local_node_id(),
-            reply_role: "agent".into(),
-            final_reply_to,
-            final_reply_role,
-            final_reply_guest_id,
-        };
-
-        if route.execution_mode == "local_agent" {
-            return self.execute_local_agent_tool(tool_req).await;
-        }
-
-        self.ipc_client
-            .send_request(IpcRequest::EmitTask {
-                target_node: route.target_node,
-                target_role: route.target_role,
-                target_guest_id: route.incarnation_id.clone(),
-                task_json: serde_json::to_string(&tool_req)?,
-            })
-            .await?;
-
-        Ok(())
+        self.route_tool_call_execution(session_id, turn_id, tool_call)
+            .await
     }
 
     async fn handle_tool_result(&mut self, task: InboundTaskPayload) -> Result<()> {
@@ -1691,7 +1841,11 @@ impl AgentRuntime {
 
         // Emit step_completed or step_failed event before continuing the loop.
         if stream_events {
-            let event = if step_failed { "step_failed" } else { "step_completed" };
+            let event = if step_failed {
+                "step_failed"
+            } else {
+                "step_completed"
+            };
             let _ = self.emit_turn_event(&session_id, event, None).await;
         }
 
@@ -1699,7 +1853,9 @@ impl AgentRuntime {
             Err(msg) => {
                 if stream_events && !step_failed {
                     // stall/cap hit — emit loop_recovering so observers know we stopped
-                    let _ = self.emit_turn_event(&session_id, "loop_recovering", None).await;
+                    let _ = self
+                        .emit_turn_event(&session_id, "loop_recovering", None)
+                        .await;
                 }
                 self.fail_active_turn(session_id, turn_id, msg).await
             }
@@ -1738,7 +1894,9 @@ impl AgentRuntime {
                     context_projection: Some(context_projection),
                     attachments: Vec::new(),
                     tools_for_model,
-                    response_contract: Some(serde_json::json!({ "channels": ["spoken_text", "memory_concept", "active_plan"] })),
+                    response_contract: Some(
+                        serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan"] }),
+                    ),
                     chat_id,
                     reply_to: local_node_id(),
                     reply_role: "agent".into(),
@@ -1838,7 +1996,9 @@ impl AgentRuntime {
             .await?;
         self.sync_session_index(&index_state).await?;
 
-        let _ = self.emit_turn_event(&session_id, "loop_recovering", None).await;
+        let _ = self
+            .emit_turn_event(&session_id, "loop_recovering", None)
+            .await;
 
         let model_req = ModelRequestPayload {
             action: "generate_text".to_string(),
@@ -1851,7 +2011,9 @@ impl AgentRuntime {
             context_projection: Some(context_projection),
             attachments: Vec::new(),
             tools_for_model,
-            response_contract: Some(serde_json::json!({ "channels": ["spoken_text", "memory_concept", "active_plan"] })),
+            response_contract: Some(
+                serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan"] }),
+            ),
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
@@ -1981,7 +2143,9 @@ impl AgentRuntime {
             context_projection,
             attachments: Vec::new(),
             tools_for_model: reentry.tools_for_model,
-            response_contract: Some(serde_json::json!({ "channels": ["spoken_text", "memory_concept", "active_plan"] })),
+            response_contract: Some(
+                serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan"] }),
+            ),
             chat_id: reentry.chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
@@ -2061,6 +2225,133 @@ impl AgentRuntime {
         Ok(())
     }
 
+    async fn maybe_auto_recall_turn_memory(&mut self, session_id: &str) -> Result<()> {
+        use memory_core::MemoryEngine as _;
+
+        let Some(state) = self.sessions.get(session_id) else {
+            return Ok(());
+        };
+        let Some(active_turn) = state.active_turn.as_ref() else {
+            return Ok(());
+        };
+        if active_turn.user_content.trim_start().starts_with('/') {
+            return Ok(());
+        }
+
+        let recall_context = RecallContext {
+            trigger: RecallTrigger::UserTurnStart,
+            scope: MemoryScope::SelfOnly,
+            recall_seed_text: active_turn.user_content.clone(),
+            active_goal: active_turn.active_plan.as_ref().map(|plan| plan.goal.clone()),
+            role_name: state
+                .role_activation
+                .as_ref()
+                .map(|role| role.role_name.clone()),
+            recent_turns: state
+                .recent_turns
+                .iter()
+                .rev()
+                .take(3)
+                .map(|turn| turn.user_content.clone())
+                .collect(),
+            local_memory_summaries: state
+                .agent_profile
+                .memory_summary
+                .as_deref()
+                .map(|text| vec![text.to_string()])
+                .unwrap_or_default(),
+            tool_history_summary: active_turn
+                .working_tool_history
+                .iter()
+                .map(|(call, _)| call.tool_name.clone())
+                .collect(),
+            lens: None,
+        };
+
+        let Some(engine) = self.memory_engine_for(&self.agent_id, &self.agent_id) else {
+            let decision = memory_core::evaluate_recall(&recall_context);
+            info!(
+                session_id = %session_id,
+                reason = %decision.reason,
+                "Auto recall skipped: no Muninn memory backend configured."
+            );
+            return Ok(());
+        };
+
+        let decision = engine.evaluate_recall(&recall_context).await?;
+        if !decision.should_recall() {
+            info!(
+                session_id = %session_id,
+                reason = %decision.reason,
+                "Auto recall skipped for turn."
+            );
+            let _ = self
+                .emit_turn_event(
+                    session_id,
+                    "memory_auto_recall_skipped",
+                    Some(format!("Skipped auto recall: {}", decision.reason)),
+                )
+                .await;
+            return Ok(());
+        }
+
+        info!(
+            session_id = %session_id,
+            reason = %decision.reason,
+            query = %decision.query.as_deref().unwrap_or(""),
+            limit = ?decision.limit,
+            "Running auto recall for turn."
+        );
+
+        let result = engine.recall_for_turn(&recall_context).await?;
+        let recalled_memories = result
+            .engrams
+            .into_iter()
+            .map(|engram| RecalledMemoryRecord {
+                concept: engram.concept,
+                content: engram.content,
+                tags: engram.tags,
+            })
+            .collect::<Vec<_>>();
+        let recalled_count = recalled_memories.len();
+        let concept_summary = recalled_memories
+            .iter()
+            .take(3)
+            .map(|memory| memory.concept.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        if let Some(state) = self.sessions.get_mut(session_id) {
+            if let Some(active_turn) = state.active_turn.as_mut() {
+                active_turn.recalled_memories = recalled_memories;
+            }
+        }
+
+        info!(
+            session_id = %session_id,
+            total = recalled_count,
+            concepts = %concept_summary,
+            "Auto recall completed for turn."
+        );
+        let _ = self
+            .emit_turn_event(
+                session_id,
+                "memory_auto_recall_completed",
+                Some(format!(
+                    "Recalled {} memory item(s){}",
+                    recalled_count,
+                    if concept_summary.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {concept_summary}")
+                    }
+                )),
+            )
+            .await;
+
+        Ok(())
+    }
+
     async fn complete_agent_response(
         &mut self,
         session_id: String,
@@ -2068,6 +2359,7 @@ impl AgentRuntime {
         content: String,
         spoken_text: Option<String>,
         memory_concept: Option<String>,
+        memory_candidate: Option<MemoryCandidate>,
     ) -> Result<()> {
         let voice_policy = self
             .sessions
@@ -2088,8 +2380,16 @@ impl AgentRuntime {
                 .await;
         }
 
-        self.deliver_text_reply(session_id, turn_id, content, None, false, memory_concept)
-            .await
+        self.deliver_text_reply(
+            session_id,
+            turn_id,
+            content,
+            None,
+            false,
+            memory_concept,
+            memory_candidate,
+        )
+        .await
     }
 
     /// Stashes the text, sets `WaitingVoice`, and emits a `voice.synthesize` task.
@@ -2262,6 +2562,7 @@ impl AgentRuntime {
             audio_artifact,
             voice_policy.caption_enabled(),
             None,
+            None,
         )
         .await
     }
@@ -2275,6 +2576,7 @@ impl AgentRuntime {
         audio_artifact: Option<String>,
         send_text_caption: bool,
         memory_concept: Option<String>,
+        memory_candidate: Option<MemoryCandidate>,
     ) -> Result<()> {
         let (completed_turn, checkpoint_memory_type, checkpoint_json, index_state) = {
             let Some(state) = self.sessions.get_mut(&session_id) else {
@@ -2351,12 +2653,20 @@ impl AgentRuntime {
         // Attend hook (Slice E): fire-and-forget autobiographical memory write.
         if let Some(engine) = self.memory_engine_for(&self.agent_id, &self.agent_id) {
             let agent_id = self.agent_id.clone();
-            let concept = memory_concept.unwrap_or_else(|| format!("turn:{}", attend_turn_id));
-            let content_snapshot = attend_content;
-            let tags = vec![
+            let default_concept =
+                memory_concept.unwrap_or_else(|| format!("turn:{}", attend_turn_id));
+            let memory_candidate = memory_candidate.unwrap_or_else(|| MemoryCandidate {
+                concept: default_concept,
+                content: attend_content.clone(),
+                tags: Vec::new(),
+            });
+            let mut tags = vec![
                 format!("agent:{}", agent_id),
                 format!("session:{}", attend_session_id),
             ];
+            tags.extend(memory_candidate.tags);
+            let concept = memory_candidate.concept;
+            let content_snapshot = memory_candidate.content;
             tokio::spawn(async move {
                 use memory_core::MemoryEngine as _;
                 if let Err(e) = engine
@@ -2477,6 +2787,7 @@ impl AgentRuntime {
                             turn.final_reply_to.clone(),
                             turn.final_reply_role.clone(),
                             turn.final_reply_guest_id.clone(),
+                            turn.pending_tool_call.clone(),
                             approval,
                         )
                     })
@@ -2492,6 +2803,7 @@ impl AgentRuntime {
             original_reply_to,
             original_reply_role,
             original_reply_guest_id,
+            original_pending_tool_call,
             approval,
         )) = pending
         else {
@@ -2637,8 +2949,8 @@ impl AgentRuntime {
 
                 let reply_payload = FinalReplyPayload {
                     action: "send_reply",
-                    session_id,
-                    turn_id: original_turn_id,
+                    session_id: session_id.clone(),
+                    turn_id: original_turn_id.clone(),
                     chat_id: original_chat_id,
                     content: approval.approved_response.clone(),
                     audio_artifact: None,
@@ -2653,6 +2965,12 @@ impl AgentRuntime {
                         task_json: serde_json::to_string(&reply_payload)?,
                     })
                     .await?;
+
+                if let Some(tool_call) = original_pending_tool_call {
+                    return self
+                        .route_tool_call_execution(session_id, original_turn_id, tool_call)
+                        .await;
+                }
             }
             SlashCommand::Deny { note } => {
                 let _ = self
@@ -2769,7 +3087,10 @@ impl AgentRuntime {
         let to_role = match bundle.to_role.as_deref() {
             Some(r) => r.to_string(),
             None => {
-                warn!("handoff_bundle for session [{}] has no to_role; ignoring.", session_id);
+                warn!(
+                    "handoff_bundle for session [{}] has no to_role; ignoring.",
+                    session_id
+                );
                 return Ok(());
             }
         };
@@ -2799,17 +3120,14 @@ impl AgentRuntime {
                 role_addendum: role_config
                     .as_ref()
                     .and_then(|c| c.role_identity_addendum.clone()),
-                role_manifest: role_config
-                    .as_ref()
-                    .and_then(|c| c.role_manifest.clone()),
+                role_manifest: role_config.as_ref().and_then(|c| c.role_manifest.clone()),
                 base_identity_ref: None,
                 activation_requester_class: Some("role_handoff".into()),
                 activation_policy_owner: None,
-                toolset_profile_ref: role_config
-                    .as_ref()
-                    .map(|c| c.toolset_profile.clone()),
+                toolset_profile_ref: role_config.as_ref().map(|c| c.toolset_profile.clone()),
                 skillset_profile_ref: None,
                 effective_skillset: vec![],
+                effective_skill_guidance: vec![],
                 working_memory_policy: None,
                 memory_projection_policy: None,
             };
@@ -2824,7 +3142,8 @@ impl AgentRuntime {
         }
 
         let reply = format!("Switched to role {}.", to_role);
-        self.complete_local_command(session_id, turn_id, reply).await
+        self.complete_local_command(session_id, turn_id, reply)
+            .await
     }
 
     /// Receive an inbound `handoff_return` task — a role is handing control back
@@ -2842,11 +3161,16 @@ impl AgentRuntime {
             self.agent_id, session_id
         );
 
-        self.ensure_session_loaded(&session_id, "handoff_return").await?;
+        self.ensure_session_loaded(&session_id, "handoff_return")
+            .await?;
 
         let previous_role = {
             let state = self.sessions.entry(session_id.clone()).or_insert_with(|| {
-                SessionState::new(session_id.clone(), self.agent_id.clone(), "handoff_return".into())
+                SessionState::new(
+                    session_id.clone(),
+                    self.agent_id.clone(),
+                    "handoff_return".into(),
+                )
             });
             let prev = state.role_activation.as_ref().map(|r| r.role_name.clone());
             state.role_activation = None;
@@ -2857,7 +3181,8 @@ impl AgentRuntime {
             Some(role) => format!("Returned from role {}. Back to orchestrator.", role),
             None => "Back to orchestrator.".into(),
         };
-        self.complete_local_command(session_id, turn_id, reply).await
+        self.complete_local_command(session_id, turn_id, reply)
+            .await
     }
 
     async fn handle_role_command(
@@ -3939,14 +4264,36 @@ impl AgentRuntime {
                         .await;
                 }
 
-                let role_identity_addendum = args.get("role_identity_addendum").and_then(|v| v.as_str()).map(str::to_string);
-                let role_manifest = args.get("role_manifest").and_then(|v| v.as_str()).map(str::to_string);
-                let is_admin = args.get("is_admin").and_then(|v| v.as_bool()).unwrap_or(false);
-                let inactive_ttl_seconds = args.get("inactive_ttl_seconds").and_then(|v| v.as_u64());
-                let iteration_cap = args.get("iteration_cap").and_then(|v| v.as_u64()).map(|v| v as u32);
-                let approval_policy = args.get("approval_policy").and_then(|v| v.as_str()).map(str::to_string);
-                let model_profile = args.get("model_profile").and_then(|v| v.as_str()).map(str::to_string);
-                let context_window_policy = args.get("context_window_policy").and_then(|v| v.as_str()).map(str::to_string);
+                let role_identity_addendum = args
+                    .get("role_identity_addendum")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let role_manifest = args
+                    .get("role_manifest")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let is_admin = args
+                    .get("is_admin")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let inactive_ttl_seconds =
+                    args.get("inactive_ttl_seconds").and_then(|v| v.as_u64());
+                let iteration_cap = args
+                    .get("iteration_cap")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32);
+                let approval_policy = args
+                    .get("approval_policy")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let model_profile = args
+                    .get("model_profile")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let context_window_policy = args
+                    .get("context_window_policy")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
 
                 let req = IpcRequest::ConfigureRole {
                     agent_id: self.agent_id.clone(),
@@ -3965,21 +4312,43 @@ impl AgentRuntime {
 
                 let (content, tool_err) = match self.ipc_client.send_request(req).await {
                     Ok(IpcResponse::ConfigureRoleOk { role_name: name }) => {
-                        self.configured_roles.insert(name.clone(), CachedRoleConfig {
-                            toolset_profile: args.get("toolset_profile")
-                                .and_then(|v| v.as_str()).unwrap_or("default").to_string(),
-                            role_identity_addendum: args.get("role_identity_addendum")
-                                .and_then(|v| v.as_str()).map(str::to_string),
-                            role_manifest: args.get("role_manifest")
-                                .and_then(|v| v.as_str()).map(str::to_string),
-                            iteration_cap: args.get("iteration_cap")
-                                .and_then(|v| v.as_u64()).map(|v| v as u32),
-                            approval_policy: args.get("approval_policy")
-                                .and_then(|v| v.as_str()).map(str::to_string),
-                        });
-                        (format!("Successfully configured role incarnation for '{}'.", name), None)
+                        self.configured_roles.insert(
+                            name.clone(),
+                            CachedRoleConfig {
+                                toolset_profile: args
+                                    .get("toolset_profile")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("default")
+                                    .to_string(),
+                                role_identity_addendum: args
+                                    .get("role_identity_addendum")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string),
+                                role_manifest: args
+                                    .get("role_manifest")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string),
+                                iteration_cap: args
+                                    .get("iteration_cap")
+                                    .and_then(|v| v.as_u64())
+                                    .map(|v| v as u32),
+                                approval_policy: args
+                                    .get("approval_policy")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string),
+                            },
+                        );
+                        (
+                            format!("Successfully configured role incarnation for '{}'.", name),
+                            None,
+                        )
                     }
-                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
                         let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
                         (e.display_message(), Some(e))
                     }
@@ -3988,11 +4357,18 @@ impl AgentRuntime {
                         (e.display_message(), Some(e))
                     }
                     Ok(_) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", "UNEXPECTED_RESPONSE", "role.configure: unexpected hotel response");
+                        let e = TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            "role.configure: unexpected hotel response",
+                        );
                         (e.display_message(), Some(e))
                     }
                     Err(e) => {
-                        let err = TaskErrorPayload::transport_error("philote", format!("role.configure: IPC transport error — {e}"));
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("role.configure: IPC transport error — {e}"),
+                        );
                         (err.display_message(), Some(err))
                     }
                 };
@@ -4046,10 +4422,10 @@ impl AgentRuntime {
                     };
                 }
 
-                let skill_name    = require_str_arg!("skill_name");
-                let description   = require_str_arg!("description");
+                let skill_name = require_str_arg!("skill_name");
+                let description = require_str_arg!("description");
                 let subagent_kind = require_str_arg!("subagent_kind");
-                let goal          = require_str_arg!("goal");
+                let goal = require_str_arg!("goal");
 
                 let str_vec = |key: &str| -> Vec<String> {
                     args.get(key)
@@ -4061,23 +4437,23 @@ impl AgentRuntime {
                         })
                         .unwrap_or_default()
                 };
-                let allowed_tools   = str_vec("allowed_tools");
+                let allowed_tools = str_vec("allowed_tools");
                 let allowed_classes = str_vec("allowed_classes");
 
                 let response = self
                     .ipc_client
                     .send_request(IpcRequest::RegisterSkill {
-                        skill_name:        skill_name.clone(),
+                        skill_name: skill_name.clone(),
                         description,
                         subagent_kind,
                         goal,
                         allowed_tools,
                         allowed_classes,
                         hook_subscriptions: vec![],
-                        completion_route:   Default::default(),
-                        failure_route:      Default::default(),
-                        idle_behavior:      Default::default(),
-                        lease_terms:        Default::default(),
+                        completion_route: Default::default(),
+                        failure_route: Default::default(),
+                        idle_behavior: Default::default(),
+                        lease_terms: Default::default(),
                     })
                     .await;
 
@@ -4103,7 +4479,12 @@ impl AgentRuntime {
                         };
                         (msg, None)
                     }
-                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
                         let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
                         (e.display_message(), Some(e))
                     }
@@ -4112,37 +4493,44 @@ impl AgentRuntime {
                         (e.display_message(), Some(e))
                     }
                     Ok(_) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", "UNEXPECTED_RESPONSE", "skill.register: unexpected hotel response");
+                        let e = TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            "skill.register: unexpected hotel response",
+                        );
                         (e.display_message(), Some(e))
                     }
                     Err(e) => {
-                        let err = TaskErrorPayload::transport_error("philote", format!("skill.register: IPC transport error — {e}"));
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("skill.register: IPC transport error — {e}"),
+                        );
                         (err.display_message(), Some(err))
                     }
                 };
 
                 self.handle_tool_result(InboundTaskPayload {
-                    action:              Some("tool_result".into()),
-                    agent_action:        None,
-                    source:              Some("agent".into()),
-                    session_id:          Some(payload.session_id),
-                    turn_id:             Some(payload.turn_id),
-                    transport:           None,
-                    chat_id:             Some(payload.chat_id),
-                    thread_id:           None,
-                    sender_id:           None,
-                    sender_username:     None,
-                    message_kind:        None,
-                    content:             Some(content),
-                    attachments:         Vec::new(),
-                    command:             None,
-                    callback_data:       None,
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(content),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
                     raw_transport_event: None,
                     error: tool_err,
-                    tool_name:           Some(payload.tool_name),
-                    arguments:           None,
-                    final_reply_to:      Some(payload.final_reply_to),
-                    final_reply_role:    Some(payload.final_reply_role),
+                    tool_name: Some(payload.tool_name),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
                 })
                 .await
@@ -4161,9 +4549,14 @@ impl AgentRuntime {
                             let lines: Vec<String> = skills
                                 .iter()
                                 .map(|s| {
-                                    let name = s.get("skill_name").and_then(|v| v.as_str()).unwrap_or("?");
-                                    let state = s.get("validation_state").and_then(|v| v.as_str()).unwrap_or("?");
-                                    let desc = s.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                                    let name =
+                                        s.get("skill_name").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let state = s
+                                        .get("validation_state")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("?");
+                                    let desc =
+                                        s.get("description").and_then(|v| v.as_str()).unwrap_or("");
                                     let brief: String = desc.chars().take(80).collect();
                                     format!("- {} [{}] — {}", name, state, brief)
                                 })
@@ -4172,7 +4565,12 @@ impl AgentRuntime {
                         };
                         (msg, None)
                     }
-                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
                         let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
                         (e.display_message(), Some(e))
                     }
@@ -4181,37 +4579,44 @@ impl AgentRuntime {
                         (e.display_message(), Some(e))
                     }
                     Ok(_) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", "UNEXPECTED_RESPONSE", "skill.list: unexpected hotel response");
+                        let e = TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            "skill.list: unexpected hotel response",
+                        );
                         (e.display_message(), Some(e))
                     }
                     Err(e) => {
-                        let err = TaskErrorPayload::transport_error("philote", format!("skill.list: IPC transport error — {e}"));
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("skill.list: IPC transport error — {e}"),
+                        );
                         (err.display_message(), Some(err))
                     }
                 };
 
                 self.handle_tool_result(InboundTaskPayload {
-                    action:              Some("tool_result".into()),
-                    agent_action:        None,
-                    source:              Some("agent".into()),
-                    session_id:          Some(payload.session_id),
-                    turn_id:             Some(payload.turn_id),
-                    transport:           None,
-                    chat_id:             Some(payload.chat_id),
-                    thread_id:           None,
-                    sender_id:           None,
-                    sender_username:     None,
-                    message_kind:        None,
-                    content:             Some(content),
-                    attachments:         Vec::new(),
-                    command:             None,
-                    callback_data:       None,
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(content),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
                     raw_transport_event: None,
                     error: tool_err,
-                    tool_name:           Some(payload.tool_name),
-                    arguments:           None,
-                    final_reply_to:      Some(payload.final_reply_to),
-                    final_reply_role:    Some(payload.final_reply_role),
+                    tool_name: Some(payload.tool_name),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
                 })
                 .await
@@ -4261,10 +4666,17 @@ impl AgentRuntime {
                 };
 
                 let (content, tool_err) = match self.ipc_client.send_request(req).await {
-                    Ok(IpcResponse::SkillAssigned { role_name: rn, skill_name: sn, operation }) => {
-                        (format!("Skill '{}' {} role '{}'.", sn, operation, rn), None)
-                    }
-                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                    Ok(IpcResponse::SkillAssigned {
+                        role_name: rn,
+                        skill_name: sn,
+                        operation,
+                    }) => (format!("Skill '{}' {} role '{}'.", sn, operation, rn), None),
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
                         let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
                         (e.display_message(), Some(e))
                     }
@@ -4273,37 +4685,44 @@ impl AgentRuntime {
                         (e.display_message(), Some(e))
                     }
                     Ok(_) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", "UNEXPECTED_RESPONSE", &format!("{op}: unexpected hotel response"));
+                        let e = TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            &format!("{op}: unexpected hotel response"),
+                        );
                         (e.display_message(), Some(e))
                     }
                     Err(e) => {
-                        let err = TaskErrorPayload::transport_error("philote", format!("{op}: IPC transport error — {e}"));
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("{op}: IPC transport error — {e}"),
+                        );
                         (err.display_message(), Some(err))
                     }
                 };
 
                 self.handle_tool_result(InboundTaskPayload {
-                    action:              Some("tool_result".into()),
-                    agent_action:        None,
-                    source:              Some("agent".into()),
-                    session_id:          Some(payload.session_id),
-                    turn_id:             Some(payload.turn_id),
-                    transport:           None,
-                    chat_id:             Some(payload.chat_id),
-                    thread_id:           None,
-                    sender_id:           None,
-                    sender_username:     None,
-                    message_kind:        None,
-                    content:             Some(content),
-                    attachments:         Vec::new(),
-                    command:             None,
-                    callback_data:       None,
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(content),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
                     raw_transport_event: None,
                     error: tool_err,
-                    tool_name:           Some(payload.tool_name),
-                    arguments:           None,
-                    final_reply_to:      Some(payload.final_reply_to),
-                    final_reply_role:    Some(payload.final_reply_role),
+                    tool_name: Some(payload.tool_name),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
                 })
                 .await
@@ -4350,7 +4769,7 @@ impl AgentRuntime {
 
                 let delegation = philotic_client::SubagentDelegation {
                     parent_agent_id: self.agent_id.clone(),
-                    parent_role:     "agent".to_string(),
+                    parent_role: "agent".to_string(),
                     subagent_kind,
                     goal,
                     context_packet: philotic_client::SubagentContextPacket {
@@ -4374,28 +4793,35 @@ impl AgentRuntime {
                     Ok(IpcResponse::SpawnSubagentOk {
                         subagent_guest_id,
                         confirmed_lease,
-                    }) => {
-                        (format!(
+                    }) => (
+                        format!(
                             "Subagent spawned.\nGuest ID: {}\nLease expires at: {} (epoch {})",
                             subagent_guest_id,
                             confirmed_lease.lease_expires_at,
                             confirmed_lease.lease_epoch,
-                        ), None)
-                    }
+                        ),
+                        None,
+                    ),
                     Ok(IpcResponse::SpawnSubagentProposal {
                         subagent_guest_id,
                         confirmed_lease,
                         delta,
-                    }) => {
-                        (format!(
+                    }) => (
+                        format!(
                             "Subagent spawned (TTL adjusted: {}s → {}s).\nGuest ID: {}\nLease expires at: {}",
                             delta.requested_ttl,
                             delta.confirmed_ttl,
                             subagent_guest_id,
                             confirmed_lease.lease_expires_at,
-                        ), None)
-                    }
-                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                        ),
+                        None,
+                    ),
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
                         let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
                         (e.display_message(), Some(e))
                     }
@@ -4404,37 +4830,44 @@ impl AgentRuntime {
                         (e.display_message(), Some(e))
                     }
                     Ok(_) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", "UNEXPECTED_RESPONSE", "subagent.spawn: unexpected hotel response");
+                        let e = TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            "subagent.spawn: unexpected hotel response",
+                        );
                         (e.display_message(), Some(e))
                     }
                     Err(e) => {
-                        let err = TaskErrorPayload::transport_error("philote", format!("subagent.spawn: IPC transport error — {e}"));
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("subagent.spawn: IPC transport error — {e}"),
+                        );
                         (err.display_message(), Some(err))
                     }
                 };
 
                 self.handle_tool_result(InboundTaskPayload {
-                    action:              Some("tool_result".into()),
-                    agent_action:        None,
-                    source:              Some("agent".into()),
-                    session_id:          Some(payload.session_id),
-                    turn_id:             Some(payload.turn_id),
-                    transport:           None,
-                    chat_id:             Some(payload.chat_id),
-                    thread_id:           None,
-                    sender_id:           None,
-                    sender_username:     None,
-                    message_kind:        None,
-                    content:             Some(content),
-                    attachments:         Vec::new(),
-                    command:             None,
-                    callback_data:       None,
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(content),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
                     raw_transport_event: None,
                     error: tool_err,
-                    tool_name:           Some(payload.tool_name),
-                    arguments:           None,
-                    final_reply_to:      Some(payload.final_reply_to),
-                    final_reply_role:    Some(payload.final_reply_role),
+                    tool_name: Some(payload.tool_name),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
                 })
                 .await
@@ -4523,45 +4956,59 @@ impl AgentRuntime {
                     })
                     .await
                 {
-                    Ok(IpcResponse::HandoffAck { handoff_guest_id, .. }) => {
-                        (format!("Handed off to role '{role_name}' (guest {handoff_guest_id})."), None)
-                    }
+                    Ok(IpcResponse::HandoffAck {
+                        handoff_guest_id, ..
+                    }) => (
+                        format!("Handed off to role '{role_name}' (guest {handoff_guest_id})."),
+                        None,
+                    ),
                     Ok(IpcResponse::Error(msg)) => {
-                        let e = TaskErrorPayload::tool_execution("handoff.to_role", msg, Some("HANDOFF_REJECTED"));
+                        let e = TaskErrorPayload::tool_execution(
+                            "handoff.to_role",
+                            msg,
+                            Some("HANDOFF_REJECTED"),
+                        );
                         (e.display_message(), Some(e))
                     }
                     Ok(_) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", "UNEXPECTED_RESPONSE", "handoff.to_role: unexpected hotel response");
+                        let e = TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            "handoff.to_role: unexpected hotel response",
+                        );
                         (e.display_message(), Some(e))
                     }
                     Err(e) => {
-                        let err = TaskErrorPayload::transport_error("philote", format!("handoff.to_role: IPC transport error — {e}"));
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("handoff.to_role: IPC transport error — {e}"),
+                        );
                         (err.display_message(), Some(err))
                     }
                 };
 
                 self.handle_tool_result(InboundTaskPayload {
-                    action:               Some("tool_result".into()),
-                    agent_action:         None,
-                    source:               Some("agent".into()),
-                    session_id:           Some(payload.session_id),
-                    turn_id:              Some(payload.turn_id),
-                    transport:            None,
-                    chat_id:              Some(payload.chat_id),
-                    thread_id:            None,
-                    sender_id:            None,
-                    sender_username:      None,
-                    message_kind:         None,
-                    content:              Some(content),
-                    attachments:          Vec::new(),
-                    command:              None,
-                    callback_data:        None,
-                    raw_transport_event:  None,
-                    error:                tool_err,
-                    tool_name:            Some(payload.tool_name),
-                    arguments:            None,
-                    final_reply_to:       Some(payload.final_reply_to),
-                    final_reply_role:     Some(payload.final_reply_role),
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(content),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
                 })
                 .await
@@ -4598,45 +5045,61 @@ impl AgentRuntime {
                     })
                     .await
                 {
-                    Ok(IpcResponse::HandoffBackAck { handoff_guest_id, .. }) => {
-                        (format!("Returned control (from guest {handoff_guest_id}). Summary: {summary}"), None)
-                    }
+                    Ok(IpcResponse::HandoffBackAck {
+                        handoff_guest_id, ..
+                    }) => (
+                        format!(
+                            "Returned control (from guest {handoff_guest_id}). Summary: {summary}"
+                        ),
+                        None,
+                    ),
                     Ok(IpcResponse::Error(msg)) => {
-                        let e = TaskErrorPayload::tool_execution("handoff.back", msg, Some("HANDOFF_BACK_REJECTED"));
+                        let e = TaskErrorPayload::tool_execution(
+                            "handoff.back",
+                            msg,
+                            Some("HANDOFF_BACK_REJECTED"),
+                        );
                         (e.display_message(), Some(e))
                     }
                     Ok(_) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", "UNEXPECTED_RESPONSE", "handoff.back: unexpected hotel response");
+                        let e = TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            "handoff.back: unexpected hotel response",
+                        );
                         (e.display_message(), Some(e))
                     }
                     Err(e) => {
-                        let err = TaskErrorPayload::transport_error("philote", format!("handoff.back: IPC transport error — {e}"));
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("handoff.back: IPC transport error — {e}"),
+                        );
                         (err.display_message(), Some(err))
                     }
                 };
 
                 self.handle_tool_result(InboundTaskPayload {
-                    action:               Some("tool_result".into()),
-                    agent_action:         None,
-                    source:               Some("agent".into()),
-                    session_id:           Some(payload.session_id),
-                    turn_id:              Some(payload.turn_id),
-                    transport:            None,
-                    chat_id:              Some(payload.chat_id),
-                    thread_id:            None,
-                    sender_id:            None,
-                    sender_username:      None,
-                    message_kind:         None,
-                    content:              Some(content),
-                    attachments:          Vec::new(),
-                    command:              None,
-                    callback_data:        None,
-                    raw_transport_event:  None,
-                    error:                tool_err,
-                    tool_name:            Some(payload.tool_name),
-                    arguments:            None,
-                    final_reply_to:       Some(payload.final_reply_to),
-                    final_reply_role:     Some(payload.final_reply_role),
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(content),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
                 })
                 .await
@@ -4692,27 +5155,27 @@ impl AgentRuntime {
                 };
 
                 self.handle_tool_result(InboundTaskPayload {
-                    action:              Some("tool_result".into()),
-                    agent_action:        None,
-                    source:              Some("agent".into()),
-                    session_id:          Some(payload.session_id),
-                    turn_id:             Some(payload.turn_id),
-                    transport:           None,
-                    chat_id:             Some(payload.chat_id),
-                    thread_id:           None,
-                    sender_id:           None,
-                    sender_username:     None,
-                    message_kind:        None,
-                    content:             Some(content),
-                    attachments:         Vec::new(),
-                    command:             None,
-                    callback_data:       None,
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(content),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
                     raw_transport_event: None,
-                    error:               tool_err,
-                    tool_name:           Some(payload.tool_name),
-                    arguments:           None,
-                    final_reply_to:      Some(payload.final_reply_to),
-                    final_reply_role:    Some(payload.final_reply_role),
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
                 })
                 .await
@@ -4742,7 +5205,10 @@ impl AgentRuntime {
 
                 let content = match self.memory_engine_for(&self.agent_id, &self.agent_id) {
                     None => "Memory unavailable: MuninnDB not configured.".to_string(),
-                    Some(engine) => match engine.activate(&query, MemoryScope::SelfOnly, Some(limit)).await {
+                    Some(engine) => match engine
+                        .activate(&query, MemoryScope::SelfOnly, Some(limit))
+                        .await
+                    {
                         Err(e) => format!("memory.recall error: {e}"),
                         Ok(result) if result.engrams.is_empty() => {
                             "No relevant memories found.".to_string()
@@ -4764,27 +5230,27 @@ impl AgentRuntime {
                 };
 
                 self.handle_tool_result(InboundTaskPayload {
-                    action:              Some("tool_result".into()),
-                    agent_action:        None,
-                    source:              Some("agent".into()),
-                    session_id:          Some(payload.session_id),
-                    turn_id:             Some(payload.turn_id),
-                    transport:           None,
-                    chat_id:             Some(payload.chat_id),
-                    thread_id:           None,
-                    sender_id:           None,
-                    sender_username:     None,
-                    message_kind:        None,
-                    content:             Some(content),
-                    attachments:         Vec::new(),
-                    command:             None,
-                    callback_data:       None,
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(content),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
                     raw_transport_event: None,
-                    error:               None,
-                    tool_name:           Some(payload.tool_name),
-                    arguments:           None,
-                    final_reply_to:      Some(payload.final_reply_to),
-                    final_reply_role:    Some(payload.final_reply_role),
+                    error: None,
+                    tool_name: Some(payload.tool_name),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
                 })
                 .await
@@ -4822,33 +5288,35 @@ impl AgentRuntime {
                         .remember(MemoryScope::SelfOnly, &concept, &content_str, tags)
                         .await
                     {
-                        Ok(engram_ref) => format!("Stored memory '{}' (id: {}).", concept, engram_ref.id),
+                        Ok(engram_ref) => {
+                            format!("Stored memory '{}' (id: {}).", concept, engram_ref.id)
+                        }
                         Err(e) => format!("memory.remember error: {e}"),
                     },
                 };
 
                 self.handle_tool_result(InboundTaskPayload {
-                    action:              Some("tool_result".into()),
-                    agent_action:        None,
-                    source:              Some("agent".into()),
-                    session_id:          Some(payload.session_id),
-                    turn_id:             Some(payload.turn_id),
-                    transport:           None,
-                    chat_id:             Some(payload.chat_id),
-                    thread_id:           None,
-                    sender_id:           None,
-                    sender_username:     None,
-                    message_kind:        None,
-                    content:             Some(result_text),
-                    attachments:         Vec::new(),
-                    command:             None,
-                    callback_data:       None,
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(result_text),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
                     raw_transport_event: None,
-                    error:               None,
-                    tool_name:           Some(payload.tool_name),
-                    arguments:           None,
-                    final_reply_to:      Some(payload.final_reply_to),
-                    final_reply_role:    Some(payload.final_reply_role),
+                    error: None,
+                    tool_name: Some(payload.tool_name),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
                 })
                 .await
@@ -4898,10 +5366,16 @@ impl AgentRuntime {
                                 "rationale": rationale,
                             }));
                         }
-                        format!("Rule stored permanently (id: {rule_id}). It will be injected into every future cognitive turn.")
+                        format!(
+                            "Rule stored permanently (id: {rule_id}). It will be injected into every future cognitive turn."
+                        )
                     }
-                    Ok(IpcResponse::Standard { ok: true, message, .. }) => message,
-                    Ok(IpcResponse::Standard { ok: false, message, .. }) => {
+                    Ok(IpcResponse::Standard {
+                        ok: true, message, ..
+                    }) => message,
+                    Ok(IpcResponse::Standard {
+                        ok: false, message, ..
+                    }) => {
                         format!("rule.propose: hotel rejected — {message}")
                     }
                     Ok(_) => "rule.propose: unexpected response from hotel.".into(),
@@ -4909,27 +5383,27 @@ impl AgentRuntime {
                 };
 
                 self.handle_tool_result(InboundTaskPayload {
-                    action:              Some("tool_result".into()),
-                    agent_action:        None,
-                    source:              Some("agent".into()),
-                    session_id:          Some(payload.session_id),
-                    turn_id:             Some(payload.turn_id),
-                    transport:           None,
-                    chat_id:             Some(payload.chat_id),
-                    thread_id:           None,
-                    sender_id:           None,
-                    sender_username:     None,
-                    message_kind:        None,
-                    content:             Some(result_text),
-                    attachments:         Vec::new(),
-                    command:             None,
-                    callback_data:       None,
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(result_text),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
                     raw_transport_event: None,
-                    error:               None,
-                    tool_name:           Some(payload.tool_name),
-                    arguments:           None,
-                    final_reply_to:      Some(payload.final_reply_to),
-                    final_reply_role:    Some(payload.final_reply_role),
+                    error: None,
+                    tool_name: Some(payload.tool_name),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
                 })
                 .await
@@ -5047,13 +5521,17 @@ impl AgentRuntime {
             _ => None,
         };
 
-        let Some(state) = self.sessions.get_mut(session_id) else { return };
+        let Some(state) = self.sessions.get_mut(session_id) else {
+            return;
+        };
         let Some(snapshot) = snapshot else { return };
         Self::merge_snapshot_bindings(state, &snapshot);
     }
 
     fn merge_snapshot_bindings(state: &mut SessionState, snapshot: &serde_json::Value) {
-        let Some(bindings) = snapshot.get("bindings") else { return };
+        let Some(bindings) = snapshot.get("bindings") else {
+            return;
+        };
         let new_toolset: Option<Vec<String>> = bindings
             .get("effective_toolset")
             .and_then(|v| serde_json::from_value(v.clone()).ok());
@@ -5117,7 +5595,12 @@ impl AgentRuntime {
                     == Some(session_id)
                 {
                     if let Some(mut state) = SessionState::from_checkpoint(&checkpoint) {
-                        Self::fetch_and_inject_rules(&mut self.ipc_client, &self.agent_id, &mut state).await;
+                        Self::fetch_and_inject_rules(
+                            &mut self.ipc_client,
+                            &self.agent_id,
+                            &mut state,
+                        )
+                        .await;
                         self.sessions.insert(session_id.to_string(), state);
                         return Ok(());
                     }
@@ -5194,7 +5677,7 @@ async fn run_bash_command(
     timeout_secs: u64,
 ) -> Result<serde_json::Value> {
     use tokio::process::Command;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     let mut cmd = Command::new("sh");
     cmd.arg("-c").arg(&command);
@@ -5231,8 +5714,8 @@ async fn run_bash_command(
 mod tests {
     use super::{
         AgentRuntime, DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE, extract_model_error,
-        extract_model_error_payload, format_role_command_reply,
-        format_roles_report, media_analysis_attachments, normalized_user_content,
+        extract_model_error_payload, format_role_command_reply, format_roles_report,
+        media_analysis_attachments, normalized_user_content, parse_memory_candidate,
         resolve_media_routing, resolve_model_execution_target, should_attempt_provider_repair,
     };
     use crate::commands::SlashCommand;
@@ -5291,14 +5774,8 @@ mod tests {
 
     #[test]
     fn implementation_names_map_to_model_roles() {
-        assert_eq!(
-            super::implementation_to_model_role("gemini"),
-            "model"
-        );
-        assert_eq!(
-            super::implementation_to_model_role("gemini-flash"),
-            "model"
-        );
+        assert_eq!(super::implementation_to_model_role("gemini"), "model");
+        assert_eq!(super::implementation_to_model_role("gemini-flash"), "model");
         assert_eq!(
             super::implementation_to_model_role("elevenlabs-v1"),
             "model.elevenlabs"
@@ -5488,7 +5965,9 @@ mod tests {
             final_reply_guest_id: None,
             error: Some(TaskErrorPayload {
                 kind: "provider_failure".into(),
-                message: "Provider invocation failed: tool_call.arguments missing from Gemini response".into(),
+                message:
+                    "Provider invocation failed: tool_call.arguments missing from Gemini response"
+                        .into(),
                 code: Some("MODEL_INVALID_TOOL_CALL".into()),
                 component: Some("model-router".into()),
                 provider: Some("gemini".into()),
@@ -5497,7 +5976,8 @@ mod tests {
             }),
         };
 
-        let error = extract_model_error_payload(&payload).expect("structured payload should be extracted");
+        let error =
+            extract_model_error_payload(&payload).expect("structured payload should be extracted");
         assert_eq!(error.retryable, Some(true));
         assert_eq!(error.code.as_deref(), Some("MODEL_INVALID_TOOL_CALL"));
     }
@@ -5506,7 +5986,8 @@ mod tests {
     fn retryable_provider_failure_allows_single_repair_attempt() {
         let error = TaskErrorPayload {
             kind: "provider_failure".into(),
-            message: "Provider invocation failed: tool_call.arguments missing from Gemini response".into(),
+            message: "Provider invocation failed: tool_call.arguments missing from Gemini response"
+                .into(),
             code: Some("MODEL_INVALID_TOOL_CALL".into()),
             component: Some("model-router".into()),
             provider: Some("gemini".into()),
@@ -5529,6 +6010,7 @@ mod tests {
             pending_tool_call: None,
             pending_approval: None,
             working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
             active_plan: None,
             consecutive_step_failures: 0,
             provider_repair_note: None,
@@ -5541,6 +6023,23 @@ mod tests {
         assert!(should_attempt_provider_repair(&error, Some(&state)));
         state.increment_provider_repair_attempts();
         assert!(!should_attempt_provider_repair(&error, Some(&state)));
+    }
+
+    #[test]
+    fn parses_memory_candidate_from_model_result() {
+        let candidate = parse_memory_candidate(Some(&serde_json::json!({
+            "concept": "ready-for-task-selection",
+            "content": "The assistant confirmed readiness and offered the next work options.",
+            "tags": ["status", "readiness"]
+        })))
+        .expect("memory candidate should parse");
+
+        assert_eq!(candidate.concept, "ready-for-task-selection");
+        assert_eq!(
+            candidate.content,
+            "The assistant confirmed readiness and offered the next work options."
+        );
+        assert_eq!(candidate.tags, vec!["status", "readiness"]);
     }
 
     #[test]
@@ -5990,7 +6489,9 @@ mod tests {
         assert!(super::command_bypasses_turn_start(&SlashCommand::Status));
         assert!(super::command_bypasses_turn_start(&SlashCommand::Context));
         assert!(!super::command_bypasses_turn_start(&SlashCommand::Pause));
-        assert!(!super::command_bypasses_turn_start(&SlashCommand::Approve { note: None }));
+        assert!(!super::command_bypasses_turn_start(
+            &SlashCommand::Approve { note: None }
+        ));
     }
 
     // ── bash.exec tests ──────────────────────────────────────────────────────
