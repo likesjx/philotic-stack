@@ -3,8 +3,8 @@ use crate::r#loop::{
     AgentAction, ApprovalRequest, ToolCall, ToolResult, TurnPhase, interpret_model_payload,
 };
 use crate::protocol::{
-    FinalReplyPayload, InboundTaskPayload, ModelRequestPayload, TaskRunnerOverlay,
-    ToolExecutionPayload, TransportAttachment, TurnEventPayload,
+    FinalReplyPayload, InboundTaskPayload, ModelRequestPayload, PartialReplyPayload,
+    TaskRunnerOverlay, ToolExecutionPayload, TransportAttachment, TurnEventPayload,
 };
 use crate::session::{
     ActivePlan, AgentProfile, ComponentRouteAssembly, MediaRoutingPolicy, RecalledMemoryRecord,
@@ -1065,7 +1065,7 @@ impl AgentRuntime {
             attachments,
             tools_for_model,
             response_contract: Some(
-                serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan"] }),
+                serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan", "memory_concept"] }),
             ),
             chat_id,
             reply_to: local_node_id(),
@@ -1197,6 +1197,20 @@ impl AgentRuntime {
             .filter(|s| !s.trim().is_empty())
             .map(str::to_string);
 
+        let partial_replies = model_result
+            .and_then(|r| r.get("partial_replies"))
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
         let memory_concept = model_result
             .and_then(|r| r.get("memory_concept"))
             .and_then(serde_json::Value::as_str)
@@ -1255,6 +1269,9 @@ impl AgentRuntime {
 
         match action {
             AgentAction::Respond { content } => {
+                for partial in partial_replies {
+                    self.emit_partial_reply(&session_id, partial).await?;
+                }
                 self.complete_agent_response(
                     session_id,
                     turn_id,
@@ -1475,48 +1492,140 @@ impl AgentRuntime {
         Ok(())
     }
 
-    async fn route_tool_call_execution(
+    async fn emit_partial_reply(&mut self, session_id: &str, content: String) -> Result<()> {
+        let (turn_id, chat_id, final_reply_to, final_reply_role, final_reply_guest_id) = {
+            let Some(state) = self.sessions.get(session_id) else {
+                return Ok(());
+            };
+            let Some(active_turn) = state.active_turn.as_ref() else {
+                return Ok(());
+            };
+            (
+                active_turn.turn_id.clone(),
+                active_turn.chat_id.clone(),
+                active_turn.final_reply_to.clone(),
+                active_turn.final_reply_role.clone(),
+                active_turn.final_reply_guest_id.clone(),
+            )
+        };
+
+        let payload = PartialReplyPayload {
+            action: "partial_reply",
+            session_id: session_id.to_string(),
+            turn_id,
+            chat_id,
+            content,
+        };
+
+        self.ipc_client
+            .send_request(IpcRequest::EmitTask {
+                target_node: final_reply_to,
+                target_role: final_reply_role,
+                target_guest_id: final_reply_guest_id,
+                task_json: serde_json::to_string(&payload)?,
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    fn route_tool_call_execution(
         &mut self,
         session_id: String,
         turn_id: String,
         tool_call: ToolCall,
-    ) -> Result<()> {
-        let (checkpoint_memory_type, checkpoint_json, index_state) = {
-            let Some(state) = self.sessions.get_mut(&session_id) else {
-                warn!("Received tool call for unknown session {}", session_id);
-                return Ok(());
-            };
-            let Some(active_turn) = state.active_turn.as_ref() else {
-                warn!(
-                    "Dropping tool call for session {} turn {} with no active turn",
-                    session_id, turn_id
-                );
-                return Ok(());
-            };
-            if active_turn.turn_id != turn_id {
-                warn!(
-                    "Dropping stale tool call for session {}: active={} response={}",
-                    session_id, active_turn.turn_id, turn_id
-                );
-                return Ok(());
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async move {
+        // Agent-level approval enforcement: if the tool's policy annotation marks it as
+        // requiring approval, and the current approval policy does not preapprove it,
+        // synthesize an ApprovalRequest before executing. This runs independently of
+        // whether the model itself requested approval — it is the agent's safety gate.
+        let force_approval = self
+            .sessions
+            .get(&session_id)
+            .map(|state| {
+                let requires = state
+                    .tool_assembly
+                    .policy_annotations
+                    .get(&tool_call.tool_name)
+                    .map(|a| a.approval_required)
+                    .unwrap_or(false);
+                if requires {
+                    let synthetic = ApprovalRequest {
+                        approval_id: None,
+                        reason: format!(
+                            "Tool '{}' requires approval before execution.",
+                            tool_call.tool_name
+                        ),
+                        approved_response: format!("Executing {}.", tool_call.tool_name),
+                    };
+                    !state.approval_policy_allows(&synthetic, Some(&tool_call))
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false);
+
+        // Admin role creation requires live operator approval regardless of any approval policy.
+        // This check runs before the normal force_approval gate so it can set always_require_human.
+        let is_admin_role_creation = tool_call.tool_name == "role.configure"
+            && tool_call
+                .arguments
+                .get("is_admin")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+        // rule.propose always requires live operator approval — cannot be preapproved or bypassed.
+        // Rules are durable and permanently affect agent behavior, so human confirmation is required.
+        let is_rule_propose = tool_call.tool_name == "rule.propose";
+
+        if is_admin_role_creation || is_rule_propose || force_approval {
+            // Set pending_tool_call so the approval handler can read it for class lookup.
+            if let Some(state) = self.sessions.get_mut(&session_id) {
+                state.set_pending_tool_call(tool_call.clone());
             }
-            state.set_pending_tool_call(tool_call.clone());
-            state.set_active_turn_phase(TurnPhase::WaitingTool);
-            (
-                state.checkpoint_memory_type(),
-                state.checkpoint_json(),
-                state.clone(),
-            )
-        };
-
-        self.ipc_client
-            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
-            .await?;
-        self.sync_session_index(&index_state).await?;
-
-        let _ = self
-            .emit_turn_event(&session_id, "waiting_tool", None)
-            .await;
+            let role_name_hint = if is_admin_role_creation {
+                tool_call
+                    .arguments
+                    .get("role_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string()
+            } else {
+                String::new()
+            };
+            let (reason, approved_response) = if is_admin_role_creation {
+                (
+                    format!(
+                        "Admin role '{}' creation requires your explicit live approval. \
+                         This cannot be preapproved or bypassed by policy.",
+                        role_name_hint
+                    ),
+                    format!("Admin role '{}' approved.", role_name_hint),
+                )
+            } else if is_rule_propose {
+                (
+                    "Rule proposal requires your explicit live approval.".to_string(),
+                    "Rule proposal approved.".to_string(),
+                )
+            } else {
+                (
+                    format!(
+                        "Tool '{}' requires approval before execution.",
+                        tool_call.tool_name
+                    ),
+                    format!("Executing {}.", tool_call.tool_name),
+                )
+            };
+            let synthetic = ApprovalRequest {
+                approval_id: Some(uuid::Uuid::new_v4().to_string()),
+                reason,
+                approved_response,
+            };
+            return self
+                .handle_approval_request(session_id, turn_id, synthetic, is_admin_role_creation || is_rule_propose)
+                .await;
+        }
 
         // Emit step_started if streaming is enabled.
         let stream_events = self
@@ -1530,7 +1639,6 @@ impl AgentRuntime {
                 .emit_turn_event(&session_id, "step_started", step_info)
                 .await;
         }
-
         let (
             chat_id,
             final_reply_to,
@@ -1615,16 +1723,17 @@ impl AgentRuntime {
             return self.execute_local_agent_tool(tool_req).await;
         }
 
-        self.ipc_client
-            .send_request(IpcRequest::EmitTask {
-                target_node: route.target_node,
-                target_role: route.target_role,
-                target_guest_id: route.incarnation_id.clone(),
-                task_json: serde_json::to_string(&tool_req)?,
-            })
-            .await?;
+            self.ipc_client
+                .send_request(IpcRequest::EmitTask {
+                    target_node: route.target_node,
+                    target_role: route.target_role,
+                    target_guest_id: route.incarnation_id.clone(),
+                    task_json: serde_json::to_string(&tool_req)?,
+                })
+                .await?;
 
-        Ok(())
+            Ok(())
+        })
     }
 
     async fn handle_tool_call(
@@ -1633,112 +1742,6 @@ impl AgentRuntime {
         turn_id: String,
         tool_call: ToolCall,
     ) -> Result<()> {
-        // Agent-level approval enforcement: if the tool's policy annotation marks it as
-        // requiring approval, and the current approval policy does not preapprove it,
-        // synthesize an ApprovalRequest before executing. This runs independently of
-        // whether the model itself requested approval — it is the agent's safety gate.
-        let force_approval = self
-            .sessions
-            .get(&session_id)
-            .map(|state| {
-                let requires = state
-                    .tool_assembly
-                    .policy_annotations
-                    .get(&tool_call.tool_name)
-                    .map(|a| a.approval_required)
-                    .unwrap_or(false);
-                if requires {
-                    let synthetic = ApprovalRequest {
-                        approval_id: None,
-                        reason: format!(
-                            "Tool '{}' requires approval before execution.",
-                            tool_call.tool_name
-                        ),
-                        approved_response: format!("Executing {}.", tool_call.tool_name),
-                    };
-                    !state.approval_policy_allows(&synthetic, Some(&tool_call))
-                } else {
-                    false
-                }
-            })
-            .unwrap_or(false);
-
-        // Admin role creation requires live operator approval regardless of any approval policy.
-        // This check runs before the normal force_approval gate so it can set always_require_human.
-        let is_admin_role_creation = tool_call.tool_name == "role.configure"
-            && tool_call
-                .arguments
-                .get("is_admin")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-
-        // rule.propose always requires live operator approval — cannot be preapproved or bypassed.
-        // Rules are durable and permanently affect agent behavior, so human confirmation is required.
-        let is_rule_propose = tool_call.tool_name == "rule.propose";
-
-        if is_admin_role_creation || is_rule_propose || force_approval {
-            // Set pending_tool_call so the approval handler can read it for class lookup.
-            if let Some(state) = self.sessions.get_mut(&session_id) {
-                state.set_pending_tool_call(tool_call.clone());
-            }
-            let role_name_hint = if is_admin_role_creation {
-                tool_call
-                    .arguments
-                    .get("role_name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown")
-                    .to_string()
-            } else {
-                String::new()
-            };
-            let (reason, approved_response) = if is_admin_role_creation {
-                (
-                    format!(
-                        "Admin role '{}' creation requires your explicit live approval. \
-                         This cannot be preapproved or bypassed by policy.",
-                        role_name_hint
-                    ),
-                    format!("Admin role '{}' approved.", role_name_hint),
-                )
-            } else if is_rule_propose {
-                let desc = tool_call
-                    .arguments
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("<no description>");
-                (
-                    format!(
-                        "The agent proposes a permanent behavioral rule: \"{desc}\"\n\
-                         Rules are durable — they persist across all future sessions and cannot \
-                         be removed without explicit operator action. Approve to store this rule."
-                    ),
-                    "Rule approved and stored permanently.".into(),
-                )
-            } else {
-                (
-                    format!(
-                        "Tool '{}' requires approval before execution.",
-                        tool_call.tool_name
-                    ),
-                    format!("Executing {}.", tool_call.tool_name),
-                )
-            };
-            let synthetic = ApprovalRequest {
-                approval_id: Some(uuid::Uuid::new_v4().to_string()),
-                reason,
-                approved_response,
-            };
-            // rule.propose and admin role creation both require always_require_human = true.
-            return self
-                .handle_approval_request(
-                    session_id,
-                    turn_id,
-                    synthetic,
-                    is_admin_role_creation || is_rule_propose,
-                )
-                .await;
-        }
-
         self.route_tool_call_execution(session_id, turn_id, tool_call)
             .await
     }
@@ -2144,7 +2147,7 @@ impl AgentRuntime {
             attachments: Vec::new(),
             tools_for_model: reentry.tools_for_model,
             response_contract: Some(
-                serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan"] }),
+                serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan", "memory_concept"] }),
             ),
             chat_id: reentry.chat_id,
             reply_to: local_node_id(),

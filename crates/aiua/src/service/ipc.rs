@@ -7,16 +7,27 @@ use crate::service::lease::{
 use crate::vault::{SecretAccess, resolve_secret};
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
 use ansible_mesh_core::graph::{AbstractSkillRecord, SkillValidationState};
-use ansible_mesh_core::registry::{CapabilityAdvertisement, NodeRegistry};
+use ansible_mesh_core::registry::{
+    CapabilityAdvertisement, ExecutionReachability, NodeRegistry, NodeStatus,
+};
 use ansible_mesh_core::storage::{
-    GraphStorage, SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,
+    GraphStorage, GuestRecord, HotelRecord, SessionEventRecord, SessionParticipantRecord,
+    SessionRecord, SessionTurnRecord,
 };
 use ansible_mesh_core::validation::{
     SkillDraft, apply_validation_to_record, validate_skill_layer1,
 };
 use philotic_client::{
-    GuestIdentity, HookRoute, HookSubscription, IpcRequest, IpcResponse, LeaseEnvelope,
-    LeaseStatus, SubagentDelegation,
+    DesktopMembraneAgentView, DesktopMembraneGuestView, DesktopMembraneStatusView,
+    DesktopMembraneTargetGuestInventoryView, DesktopMembraneTargetReachabilityView,
+    DesktopMembraneTargetStatusView, DesktopMembraneTargetView, GuestIdentity,
+    HookRoute, HookSubscription, IpcRequest, IpcResponse, LeaseEnvelope, LeaseStatus,
+    OperatorAgentView, OperatorChatTurnReply, OperatorSurfaceQueryHandoff,
+    OperatorTargetAgentInventoryView, OperatorTargetGuestInventoryView,
+    OperatorTargetStatusView, OperatorTargetView, PhiloticClient, SubagentDelegation,
+    OPERATOR_CHAT_REPLY_ROLE,
+    OPERATOR_SURFACE_QUERY_HANDOFF_KIND, OPERATOR_SURFACE_QUERY_REPLY_ROLE,
+    OPERATOR_SURFACE_QUERY_ROLE,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -27,9 +38,6 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{error, info, warn};
 use uuid::Uuid;
-
-#[cfg(test)]
-use ansible_mesh_core::registry::ExecutionReachability;
 
 pub(crate) type InboxRegistry = Arc<Mutex<HashMap<String, Vec<RoleSubscriber>>>>;
 
@@ -64,6 +72,11 @@ pub(crate) struct RoleSubscriber {
 const TELEGRAM_POLL_LEASE_TTL_SECS: u64 = 45;
 #[cfg(test)]
 const TELEGRAM_POLL_LEASE_TTL_SECS: u64 = 1;
+
+#[cfg(not(test))]
+const DESKTOP_MEMBRANE_LEASE_TTL_SECS: u64 = 45;
+#[cfg(test)]
+const DESKTOP_MEMBRANE_LEASE_TTL_SECS: u64 = 1;
 
 #[derive(Default)]
 struct SessionEnvelope {
@@ -128,6 +141,7 @@ pub struct IpcServer {
     parked_inbound: Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
     materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
     telegram_poll_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
+    desktop_membrane_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
     subagent_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
     subagent_hooks: SubagentHookRegistry,
     registry: Arc<RwLock<NodeRegistry>>,
@@ -200,6 +214,39 @@ impl LeaseObserver for LoggingSubagentLeaseObserver {
     }
 }
 
+struct LoggingDesktopMembraneLeaseObserver;
+
+impl LeaseObserver for LoggingDesktopMembraneLeaseObserver {
+    fn on_event(&mut self, event: &LeaseObserverEvent) {
+        match event.kind {
+            LeaseObserverEventKind::Granted => info!(
+                "Desktop membrane lease [{}] granted to guest [{}] epoch {}.",
+                event.lease.lease_scope, event.lease.owner_guest_id, event.lease.lease_epoch
+            ),
+            LeaseObserverEventKind::Released => info!(
+                "Desktop membrane lease [{}] released by guest [{}].",
+                event.lease.lease_scope, event.lease.owner_guest_id
+            ),
+            LeaseObserverEventKind::Renewed => info!(
+                "Desktop membrane lease [{}] renewed by guest [{}] epoch {}.",
+                event.lease.lease_scope, event.lease.owner_guest_id, event.lease.lease_epoch
+            ),
+            LeaseObserverEventKind::Expired => info!(
+                "Desktop membrane lease [{}] expired for guest [{}] epoch {}.",
+                event.lease.lease_scope, event.lease.owner_guest_id, event.lease.lease_epoch
+            ),
+            LeaseObserverEventKind::StaleOwnerDropped => info!(
+                "Stale desktop membrane lease [{}] dropped for guest [{}].",
+                event.lease.lease_scope, event.lease.owner_guest_id
+            ),
+            LeaseObserverEventKind::Revoked => info!(
+                "Desktop membrane lease [{}] revoked for guest [{}] epoch {}.",
+                event.lease.lease_scope, event.lease.owner_guest_id, event.lease.lease_epoch
+            ),
+        }
+    }
+}
+
 impl IpcServer {
     fn telegram_poll_lease(
         lease_key: &str,
@@ -224,6 +271,34 @@ impl IpcServer {
             metadata: serde_json::json!({
                 "agent_id": agent_id,
                 "authority_node_id": local_node_id,
+            }),
+        }
+    }
+
+    fn desktop_membrane_lease(
+        lease_key: &str,
+        authority_hotel: &str,
+        local_node_id: &str,
+        owner_guest_id: &str,
+        port: u16,
+    ) -> LeaseEnvelope {
+        LeaseEnvelope {
+            lease_type: "desktop_membrane".into(),
+            lease_scope: lease_key.to_string(),
+            authority_hotel: authority_hotel.to_string(),
+            authority_component: Some("aiua".into()),
+            owner_guest_id: owner_guest_id.to_string(),
+            owner_hotel: Some(authority_hotel.to_string()),
+            owner_component_type: Some("membrane.desktop".into()),
+            lease_epoch: 0,
+            lease_expires_at: 0,
+            last_heartbeat_at: 0,
+            status: LeaseStatus::Active,
+            delegated_from: None,
+            metadata: serde_json::json!({
+                "authority_node_id": local_node_id,
+                "port": port,
+                "surface": "operator-desktop",
             }),
         }
     }
@@ -270,6 +345,859 @@ impl IpcServer {
                 .find(|hotel| hotel.capabilities.node_id == local_node_id)
                 .map(|hotel| hotel.hotel_name)
         })
+    }
+
+    fn desktop_membrane_status_view(
+        graph: &dyn GraphStorage,
+        local_node_id: &str,
+    ) -> anyhow::Result<DesktopMembraneStatusView> {
+        let hotel_name = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
+            anyhow::anyhow!("local hotel record missing for node [{local_node_id}]")
+        })?;
+        let daemon = match graph.get_hotel(&hotel_name)? {
+            Some(hotel) if Self::hotel_record_pid_is_live(&hotel) => "running",
+            _ => "stopped",
+        };
+        Ok(DesktopMembraneStatusView {
+            hotel: hotel_name,
+            daemon: daemon.into(),
+        })
+    }
+
+    async fn desktop_membrane_target_status_view(
+        registry: &Arc<RwLock<NodeRegistry>>,
+        graph: &dyn GraphStorage,
+        local_node_id: &str,
+        target_node_id: &str,
+    ) -> anyhow::Result<DesktopMembraneTargetStatusView> {
+        let source_hotel = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
+            anyhow::anyhow!("local hotel record missing for node [{local_node_id}]")
+        })?;
+
+        if target_node_id == local_node_id {
+            let local_status = Self::desktop_membrane_status_view(graph, local_node_id)?;
+            return Ok(DesktopMembraneTargetStatusView {
+                target_node_id: local_node_id.to_string(),
+                target_hotel: local_status.hotel.clone(),
+                source_hotel,
+                observation_kind: "local-canonical".into(),
+                daemon_status: local_status.daemon,
+                freshness_state: "local-now".into(),
+                freshness_age_secs: 0,
+                freshness_ttl_secs: 0,
+                reachability: None,
+                note: Some("derived from the local hotel record".into()),
+            });
+        }
+
+        let guard = registry.read().await;
+        let status = guard.get_node(target_node_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "mesh target [{target_node_id}] is not currently active in the registry"
+            )
+        })?;
+        let target_hotel = Self::target_hotel_name(graph, status, &source_hotel);
+        let reachability = status
+            .execution_reachability
+            .as_ref()
+            .map(Self::desktop_membrane_target_reachability_view);
+        let freshness_age_secs = status.last_seen.elapsed().as_secs();
+        drop(guard);
+
+        match Self::query_remote_desktop_membrane_status(
+            graph,
+            local_node_id,
+            target_node_id,
+            &target_hotel,
+        )
+        .await
+        {
+            Ok(view) => return Ok(view),
+            Err(err) => {
+                return Ok(DesktopMembraneTargetStatusView {
+                    target_node_id: target_node_id.to_string(),
+                    target_hotel,
+                    source_hotel,
+                    observation_kind: "remote-heartbeat-observed".into(),
+                    daemon_status: "observed-reachable".into(),
+                    freshness_state: "heartbeat-fresh".into(),
+                    freshness_age_secs,
+                    freshness_ttl_secs: NodeRegistry::freshness_ttl_secs(),
+                    reachability,
+                    note: Some(format!(
+                        "derived from local heartbeat registry observation after remote query failed: {}",
+                        err
+                    )),
+                });
+            }
+        }
+    }
+
+    fn desktop_membrane_guest_views(
+        graph: &dyn GraphStorage,
+        local_node_id: &str,
+    ) -> anyhow::Result<Vec<DesktopMembraneGuestView>> {
+        let hotel_name = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
+            anyhow::anyhow!("local hotel record missing for node [{local_node_id}]")
+        })?;
+        let mut guests = graph.list_guests(&hotel_name, false)?;
+        guests.sort_by(|left, right| right.last_active_at.cmp(&left.last_active_at));
+        Ok(guests
+            .into_iter()
+            .map(Self::desktop_membrane_guest_view)
+            .collect())
+    }
+
+    async fn desktop_membrane_target_guest_inventory_view(
+        registry: &Arc<RwLock<NodeRegistry>>,
+        graph: &dyn GraphStorage,
+        local_node_id: &str,
+        target_node_id: &str,
+    ) -> anyhow::Result<DesktopMembraneTargetGuestInventoryView> {
+        let source_hotel = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
+            anyhow::anyhow!("local hotel record missing for node [{local_node_id}]")
+        })?;
+
+        if target_node_id == local_node_id {
+            let guests = Self::desktop_membrane_guest_views(graph, local_node_id)?;
+            return Ok(DesktopMembraneTargetGuestInventoryView {
+                target_node_id: target_node_id.to_string(),
+                target_hotel: source_hotel.clone(),
+                source_hotel,
+                observation_kind: "local-canonical".into(),
+                available: true,
+                pending_remote_query_state: "none".into(),
+                guests,
+                note: Some("derived from the local hotel guest table".into()),
+            });
+        }
+
+        let guard = registry.read().await;
+        let status = guard.get_node(target_node_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "mesh target [{target_node_id}] is not currently active in the registry"
+            )
+        })?;
+        let target_hotel = Self::target_hotel_name(graph, status, &source_hotel);
+        drop(guard);
+
+        match Self::query_remote_desktop_membrane_guests(
+            graph,
+            local_node_id,
+            target_node_id,
+            &target_hotel,
+        )
+        .await
+        {
+            Ok(view) => Ok(view),
+            Err(err) => Ok(DesktopMembraneTargetGuestInventoryView {
+                target_node_id: target_node_id.to_string(),
+                target_hotel,
+                source_hotel,
+                observation_kind: "remote-query-failed".into(),
+                available: false,
+                pending_remote_query_state: "error".into(),
+                guests: Vec::new(),
+                note: Some(format!(
+                    "remote guest inventory query failed: {}; management-plane fallback remains required until the remote query path is healthy",
+                    err
+                )),
+            }),
+        }
+    }
+
+    async fn operator_target_agent_inventory_view(
+        registry: &Arc<RwLock<NodeRegistry>>,
+        graph: &dyn GraphStorage,
+        local_node_id: &str,
+        target_node_id: &str,
+    ) -> anyhow::Result<OperatorTargetAgentInventoryView> {
+        let source_hotel = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
+            anyhow::anyhow!("local hotel record missing for node [{local_node_id}]")
+        })?;
+
+        if target_node_id == local_node_id {
+            return Ok(OperatorTargetAgentInventoryView {
+                target_node_id: target_node_id.to_string(),
+                target_hotel: source_hotel.clone(),
+                source_hotel,
+                observation_kind: "local-canonical".into(),
+                available: true,
+                pending_remote_query_state: "none".into(),
+                agents: Self::operator_agent_views(graph, local_node_id)?,
+                note: Some("derived from the local hotel's canonical agent identities".into()),
+            });
+        }
+
+        let guard = registry.read().await;
+        let status = guard.get_node(target_node_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "mesh target [{target_node_id}] is not currently active in the registry"
+            )
+        })?;
+        let target_hotel = Self::target_hotel_name(graph, status, &source_hotel);
+        drop(guard);
+
+        match Self::query_remote_operator_target_agents(
+            graph,
+            local_node_id,
+            target_node_id,
+            &target_hotel,
+        )
+        .await
+        {
+            Ok(view) => Ok(view),
+            Err(err) => Ok(OperatorTargetAgentInventoryView {
+                target_node_id: target_node_id.to_string(),
+                target_hotel,
+                source_hotel,
+                observation_kind: "remote-query-failed".into(),
+                available: false,
+                pending_remote_query_state: "error".into(),
+                agents: Vec::new(),
+                note: Some(format!(
+                    "remote target agent inventory requires a target-hotel operator query: {}",
+                    err
+                )),
+            }),
+        }
+    }
+
+    async fn query_remote_desktop_membrane_guests(
+        graph: &dyn GraphStorage,
+        local_node_id: &str,
+        target_node_id: &str,
+        target_hotel: &str,
+    ) -> anyhow::Result<DesktopMembraneTargetGuestInventoryView> {
+        let source_hotel = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
+            anyhow::anyhow!("local hotel record missing for node [{local_node_id}]")
+        })?;
+        let socket_path = graph
+            .get_hotel(&source_hotel)?
+            .map(|hotel| hotel.ipc_socket_path)
+            .ok_or_else(|| anyhow::anyhow!("local hotel [{}] record missing", source_hotel))?;
+        let reply_guest_id = format!("operator-surface-query-{}", Uuid::new_v4());
+        let reply_role = OPERATOR_SURFACE_QUERY_REPLY_ROLE;
+        let mut client = PhiloticClient::connect_at(
+            &socket_path,
+            GuestIdentity {
+                guest_id: reply_guest_id.clone(),
+                role: reply_role.into(),
+                supported_tools: Vec::new(),
+            },
+        )
+        .await?;
+        match client
+            .send_request(IpcRequest::SubscribeInbox {
+                role: reply_role.into(),
+            })
+            .await?
+        {
+            IpcResponse::Standard { ok: true, .. } => {}
+            other => anyhow::bail!("unexpected query reply inbox subscribe response: {other:?}"),
+        }
+        let task_json = serde_json::to_string(&OperatorSurfaceQueryHandoff {
+            handoff_kind: OPERATOR_SURFACE_QUERY_HANDOFF_KIND.into(),
+            surface: "operator.targets.guests".into(),
+            request_id: Uuid::new_v4().to_string(),
+            source_hotel: source_hotel.clone(),
+            target_hotel: target_hotel.to_string(),
+            target_node_id: target_node_id.to_string(),
+            caller_kind: "operator_surface_adapter".into(),
+            caller_id: local_node_id.to_string(),
+            visibility_scope: "operator".into(),
+            grant_scope: "default".into(),
+            intent: "query target guest inventory".into(),
+            payload: serde_json::json!({
+                "target_node_id": target_node_id,
+            }),
+            reply_to_node: local_node_id.to_string(),
+            reply_to_role: reply_role.into(),
+            reply_to_guest_id: Some(reply_guest_id),
+            session_id: None,
+            trace: None,
+        })?;
+        match client
+            .send_request(IpcRequest::EmitTask {
+                target_node: target_node_id.to_string(),
+                target_role: OPERATOR_SURFACE_QUERY_ROLE.into(),
+                target_guest_id: None,
+                task_json,
+            })
+            .await?
+        {
+            IpcResponse::Standard { ok: true, .. } => {}
+            other => anyhow::bail!("unexpected remote guest query emit response: {other:?}"),
+        }
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(1), client.recv_task())
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for remote guest inventory reply"))??;
+        let IpcResponse::InboundTask { task_json, .. } = reply else {
+            anyhow::bail!("unexpected remote guest inventory reply envelope: {reply:?}");
+        };
+        let view: OperatorTargetGuestInventoryView = serde_json::from_str(&task_json)?;
+        if view.target_node_id != target_node_id {
+            anyhow::bail!(
+                "remote guest inventory reply target mismatch: expected [{}], got [{}]",
+                target_node_id,
+                view.target_node_id
+            );
+        }
+        if view.target_hotel != target_hotel {
+            anyhow::bail!(
+                "remote guest inventory reply hotel mismatch: expected [{}], got [{}]",
+                target_hotel,
+                view.target_hotel
+            );
+        }
+        Ok(view)
+    }
+
+    async fn query_remote_desktop_membrane_status(
+        graph: &dyn GraphStorage,
+        local_node_id: &str,
+        target_node_id: &str,
+        target_hotel: &str,
+    ) -> anyhow::Result<DesktopMembraneTargetStatusView> {
+        let source_hotel = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
+            anyhow::anyhow!("local hotel record missing for node [{local_node_id}]")
+        })?;
+        let socket_path = graph
+            .get_hotel(&source_hotel)?
+            .map(|hotel| hotel.ipc_socket_path)
+            .ok_or_else(|| anyhow::anyhow!("local hotel [{}] record missing", source_hotel))?;
+        let reply_guest_id = format!("operator-surface-query-{}", Uuid::new_v4());
+        let reply_role = OPERATOR_SURFACE_QUERY_REPLY_ROLE;
+        let mut client = PhiloticClient::connect_at(
+            &socket_path,
+            GuestIdentity {
+                guest_id: reply_guest_id.clone(),
+                role: reply_role.into(),
+                supported_tools: Vec::new(),
+            },
+        )
+        .await?;
+        match client
+            .send_request(IpcRequest::SubscribeInbox {
+                role: reply_role.into(),
+            })
+            .await?
+        {
+            IpcResponse::Standard { ok: true, .. } => {}
+            other => anyhow::bail!("unexpected query reply inbox subscribe response: {other:?}"),
+        }
+        let task_json = serde_json::to_string(&OperatorSurfaceQueryHandoff {
+            handoff_kind: OPERATOR_SURFACE_QUERY_HANDOFF_KIND.into(),
+            surface: "operator.targets.status".into(),
+            request_id: Uuid::new_v4().to_string(),
+            source_hotel: source_hotel.clone(),
+            target_hotel: target_hotel.to_string(),
+            target_node_id: target_node_id.to_string(),
+            caller_kind: "operator_surface_adapter".into(),
+            caller_id: local_node_id.to_string(),
+            visibility_scope: "operator".into(),
+            grant_scope: "default".into(),
+            intent: "query target daemon status".into(),
+            payload: serde_json::json!({
+                "target_node_id": target_node_id,
+            }),
+            reply_to_node: local_node_id.to_string(),
+            reply_to_role: reply_role.into(),
+            reply_to_guest_id: Some(reply_guest_id),
+            session_id: None,
+            trace: None,
+        })?;
+        match client
+            .send_request(IpcRequest::EmitTask {
+                target_node: target_node_id.to_string(),
+                target_role: OPERATOR_SURFACE_QUERY_ROLE.into(),
+                target_guest_id: None,
+                task_json,
+            })
+            .await?
+        {
+            IpcResponse::Standard { ok: true, .. } => {}
+            other => anyhow::bail!("unexpected remote status query emit response: {other:?}"),
+        }
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(1), client.recv_task())
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for remote target status reply"))??;
+        let IpcResponse::InboundTask { task_json, .. } = reply else {
+            anyhow::bail!("unexpected remote target status reply envelope: {reply:?}");
+        };
+        let view: OperatorTargetStatusView = serde_json::from_str(&task_json)?;
+        if view.target_node_id != target_node_id {
+            anyhow::bail!(
+                "remote target status reply target mismatch: expected [{}], got [{}]",
+                target_node_id,
+                view.target_node_id
+            );
+        }
+        if view.target_hotel != target_hotel {
+            anyhow::bail!(
+                "remote target status reply hotel mismatch: expected [{}], got [{}]",
+                target_hotel,
+                view.target_hotel
+            );
+        }
+        Ok(view)
+    }
+
+    async fn query_remote_operator_target_agents(
+        graph: &dyn GraphStorage,
+        local_node_id: &str,
+        target_node_id: &str,
+        target_hotel: &str,
+    ) -> anyhow::Result<OperatorTargetAgentInventoryView> {
+        let source_hotel = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
+            anyhow::anyhow!("local hotel record missing for node [{local_node_id}]")
+        })?;
+        let socket_path = graph
+            .get_hotel(&source_hotel)?
+            .map(|hotel| hotel.ipc_socket_path)
+            .ok_or_else(|| anyhow::anyhow!("local hotel [{}] record missing", source_hotel))?;
+        let reply_guest_id = format!("operator-surface-query-{}", Uuid::new_v4());
+        let reply_role = OPERATOR_SURFACE_QUERY_REPLY_ROLE;
+        let mut client = PhiloticClient::connect_at(
+            &socket_path,
+            GuestIdentity {
+                guest_id: reply_guest_id.clone(),
+                role: reply_role.into(),
+                supported_tools: Vec::new(),
+            },
+        )
+        .await?;
+        match client
+            .send_request(IpcRequest::SubscribeInbox {
+                role: reply_role.into(),
+            })
+            .await?
+        {
+            IpcResponse::Standard { ok: true, .. } => {}
+            other => anyhow::bail!("unexpected query reply inbox subscribe response: {other:?}"),
+        }
+        let task_json = serde_json::to_string(&OperatorSurfaceQueryHandoff {
+            handoff_kind: OPERATOR_SURFACE_QUERY_HANDOFF_KIND.into(),
+            surface: "operator.targets.agents".into(),
+            request_id: Uuid::new_v4().to_string(),
+            source_hotel: source_hotel.clone(),
+            target_hotel: target_hotel.to_string(),
+            target_node_id: target_node_id.to_string(),
+            caller_kind: "operator_surface_adapter".into(),
+            caller_id: local_node_id.to_string(),
+            visibility_scope: "operator".into(),
+            grant_scope: "default".into(),
+            intent: "query target agent inventory".into(),
+            payload: serde_json::json!({
+                "target_node_id": target_node_id,
+            }),
+            reply_to_node: local_node_id.to_string(),
+            reply_to_role: reply_role.into(),
+            reply_to_guest_id: Some(reply_guest_id),
+            session_id: None,
+            trace: None,
+        })?;
+        match client
+            .send_request(IpcRequest::EmitTask {
+                target_node: target_node_id.to_string(),
+                target_role: OPERATOR_SURFACE_QUERY_ROLE.into(),
+                target_guest_id: None,
+                task_json,
+            })
+            .await?
+        {
+            IpcResponse::Standard { ok: true, .. } => {}
+            other => anyhow::bail!("unexpected remote agent query emit response: {other:?}"),
+        }
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(1), client.recv_task())
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for remote target agent reply"))??;
+        let IpcResponse::InboundTask { task_json, .. } = reply else {
+            anyhow::bail!("unexpected remote target agent reply envelope: {reply:?}");
+        };
+        let view: OperatorTargetAgentInventoryView = serde_json::from_str(&task_json)?;
+        if view.target_node_id != target_node_id {
+            anyhow::bail!(
+                "remote target agents reply target mismatch: expected [{}], got [{}]",
+                target_node_id,
+                view.target_node_id
+            );
+        }
+        if view.target_hotel != target_hotel {
+            anyhow::bail!(
+                "remote target agents reply hotel mismatch: expected [{}], got [{}]",
+                target_hotel,
+                view.target_hotel
+            );
+        }
+        Ok(view)
+    }
+
+    async fn send_operator_chat_turn(
+        registry: &Arc<RwLock<NodeRegistry>>,
+        graph: &dyn GraphStorage,
+        local_node_id: &str,
+        target_node_id: &str,
+        target_agent_id: &str,
+        operator_session_id: &str,
+        conversation_id: Option<&str>,
+        content: &str,
+    ) -> anyhow::Result<OperatorChatTurnReply> {
+        let source_hotel = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
+            anyhow::anyhow!("local hotel record missing for node [{local_node_id}]")
+        })?;
+        let target_hotel = if target_node_id == local_node_id {
+            source_hotel.clone()
+        } else {
+            let guard = registry.read().await;
+            let status = guard.get_node(target_node_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "mesh target [{target_node_id}] is not currently active in the registry"
+                )
+            })?;
+            Self::target_hotel_name(graph, status, &source_hotel)
+        };
+        let socket_path = graph
+            .get_hotel(&source_hotel)?
+            .map(|hotel| hotel.ipc_socket_path)
+            .ok_or_else(|| anyhow::anyhow!("local hotel [{}] record missing", source_hotel))?;
+        let reply_guest_id = format!("operator-chat-{}", Uuid::new_v4());
+        let reply_role = OPERATOR_CHAT_REPLY_ROLE;
+        let mut client = PhiloticClient::connect_at(
+            &socket_path,
+            GuestIdentity {
+                guest_id: reply_guest_id.clone(),
+                role: reply_role.into(),
+                supported_tools: Vec::new(),
+            },
+        )
+        .await?;
+        match client
+            .send_request(IpcRequest::SubscribeInbox {
+                role: reply_role.into(),
+            })
+            .await?
+        {
+            IpcResponse::Standard { ok: true, .. } => {}
+            other => anyhow::bail!("unexpected operator chat inbox subscribe response: {other:?}"),
+        }
+
+        let conversation_id = conversation_id
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("operator-chat:{operator_session_id}:{target_agent_id}"));
+        let turn_id = format!("operator-chat-turn-{}", Uuid::new_v4());
+        let session_id = conversation_id.clone();
+
+        match client
+            .send_request(IpcRequest::EmitTask {
+                target_node: target_node_id.to_string(),
+                target_role: "agent".into(),
+                target_guest_id: Some(target_agent_id.to_string()),
+                task_json: serde_json::json!({
+                    "source": "operator_chat",
+                    "transport": "operator_chat",
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "chat_id": conversation_id,
+                    "content": content,
+                    "final_reply_to": local_node_id,
+                    "final_reply_role": reply_role,
+                    "final_reply_guest_id": reply_guest_id
+                }).to_string(),
+            })
+            .await?
+        {
+            IpcResponse::Standard { ok: true, .. } => {}
+            other => anyhow::bail!("unexpected operator chat emit response: {other:?}"),
+        }
+
+        let mut observed_events = Vec::new();
+        let mut observed_partial_replies = Vec::new();
+        let payload = loop {
+            let reply = tokio::time::timeout(std::time::Duration::from_secs(30), client.recv_task())
+                .await
+                .map_err(|_| anyhow::anyhow!("timed out waiting for operator chat reply"))??;
+            let IpcResponse::InboundTask { task_json, .. } = reply else {
+                anyhow::bail!("unexpected operator chat reply envelope: {reply:?}");
+            };
+            let payload: serde_json::Value = serde_json::from_str(&task_json)?;
+            let action = payload
+                .get("action")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("send_reply");
+            if action == "turn_event" {
+                if let Some(event) = payload.get("event").and_then(serde_json::Value::as_str) {
+                    observed_events.push(event.to_string());
+                }
+                continue;
+            }
+            if action == "partial_reply" {
+                if let Some(content) = payload.get("content").and_then(serde_json::Value::as_str) {
+                    observed_partial_replies.push(content.to_string());
+                }
+                continue;
+            }
+            break payload;
+        };
+        let reply_action = payload
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("send_reply")
+            .to_string();
+        let reply_content = payload
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        Ok(OperatorChatTurnReply {
+            source_hotel,
+            target_hotel,
+            target_node_id: target_node_id.to_string(),
+            target_agent_id: target_agent_id.to_string(),
+            operator_session_id: operator_session_id.to_string(),
+            conversation_id: payload
+                .get("chat_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(&conversation_id)
+                .to_string(),
+            session_id: payload
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(&session_id)
+                .to_string(),
+            turn_id: payload
+                .get("turn_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(&turn_id)
+                .to_string(),
+            delivery_kind: if target_node_id == local_node_id {
+                "local-direct".into()
+            } else {
+                "router-routed".into()
+            },
+            reply_action,
+            observed_events,
+            observed_partial_replies,
+            content: reply_content,
+        })
+    }
+
+    fn desktop_membrane_guest_view(guest: GuestRecord) -> DesktopMembraneGuestView {
+        let pid_live = guest
+            .active_pid
+            .as_deref()
+            .and_then(|pid| pid.parse::<u32>().ok())
+            .map(Self::pid_exists)
+            .unwrap_or(false);
+        let status = if guest.is_active && pid_live {
+            "running"
+        } else if guest.is_active {
+            "stopped"
+        } else {
+            "inactive"
+        };
+
+        DesktopMembraneGuestView {
+            name: Self::guest_role_display_name(&guest.role),
+            guest_id: guest.guest_id,
+            role: guest.role,
+            pid: guest.active_pid,
+            status: status.into(),
+            uptime: None,
+        }
+    }
+
+    fn operator_agent_views(
+        graph: &dyn GraphStorage,
+        local_node_id: &str,
+    ) -> anyhow::Result<Vec<OperatorAgentView>> {
+        let hotel_name = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
+            anyhow::anyhow!("local hotel record missing for node [{local_node_id}]")
+        })?;
+        let mut agents = graph
+            .list_agent_identities()?
+            .into_iter()
+            .filter(|identity| identity.authority_hotel == hotel_name)
+            .map(Self::desktop_membrane_agent_view)
+            .collect::<Vec<_>>();
+        agents.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
+        Ok(agents)
+    }
+
+    fn desktop_membrane_agent_views(
+        graph: &dyn GraphStorage,
+        local_node_id: &str,
+    ) -> anyhow::Result<Vec<DesktopMembraneAgentView>> {
+        Self::operator_agent_views(graph, local_node_id)
+    }
+
+    fn operator_agent_view(
+        identity: ansible_mesh_core::storage::AgentIdentityRecord,
+    ) -> OperatorAgentView {
+        let toolset_tags = identity
+            .bundle_json
+            .get("toolset_tags")
+            .and_then(serde_json::Value::as_array)
+            .map(|tags| {
+                tags.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        OperatorAgentView {
+            agent_id: identity.agent_id,
+            persona_name: identity.persona_name,
+            authority_hotel: identity.authority_hotel,
+            toolset_tags,
+            active_session: false,
+        }
+    }
+
+    fn desktop_membrane_agent_view(
+        identity: ansible_mesh_core::storage::AgentIdentityRecord,
+    ) -> DesktopMembraneAgentView {
+        Self::operator_agent_view(identity)
+    }
+
+    async fn desktop_membrane_target_views(
+        registry: &Arc<RwLock<NodeRegistry>>,
+        graph: &dyn GraphStorage,
+        local_node_id: &str,
+    ) -> anyhow::Result<Vec<DesktopMembraneTargetView>> {
+        let source_hotel = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
+            anyhow::anyhow!("local hotel record missing for node [{local_node_id}]")
+        })?;
+        let freshness_ttl_secs = NodeRegistry::freshness_ttl_secs();
+        let guard = registry.read().await;
+        let mut targets = guard
+            .active_nodes()
+            .map(|status| {
+                Self::desktop_membrane_target_view(
+                    graph,
+                    status,
+                    local_node_id,
+                    &source_hotel,
+                    freshness_ttl_secs,
+                )
+            })
+            .collect::<Vec<_>>();
+        targets.sort_by(|left, right| {
+            left.is_local
+                .cmp(&right.is_local)
+                .reverse()
+                .then_with(|| left.target_hotel.cmp(&right.target_hotel))
+                .then_with(|| left.target_node_id.cmp(&right.target_node_id))
+        });
+        Ok(targets)
+    }
+
+    fn desktop_membrane_target_view(
+        graph: &dyn GraphStorage,
+        status: &NodeStatus,
+        local_node_id: &str,
+        source_hotel: &str,
+        freshness_ttl_secs: u64,
+    ) -> DesktopMembraneTargetView {
+        let target_hotel = Self::target_hotel_name(graph, status, source_hotel);
+        let mut advertised_roles = status
+            .advertisements
+            .iter()
+            .map(|advertisement| advertisement.target_role.clone())
+            .collect::<Vec<_>>();
+        advertised_roles.sort();
+        advertised_roles.dedup();
+
+        DesktopMembraneTargetView {
+            target_node_id: status.capabilities.node_id.clone(),
+            target_hotel,
+            source_hotel: source_hotel.to_string(),
+            is_local: status.capabilities.node_id == local_node_id,
+            roles: status
+                .capabilities
+                .roles
+                .iter()
+                .map(Self::node_role_display_name)
+                .collect(),
+            models: status.capabilities.models.clone(),
+            tools: status.capabilities.tools.clone(),
+            advertised_roles,
+            freshness_state: "heartbeat-fresh".into(),
+            freshness_age_secs: status.last_seen.elapsed().as_secs(),
+            freshness_ttl_secs,
+            reachability: status
+                .execution_reachability
+                .as_ref()
+                .map(Self::desktop_membrane_target_reachability_view),
+        }
+    }
+
+    fn target_hotel_name(
+        graph: &dyn GraphStorage,
+        status: &NodeStatus,
+        source_hotel: &str,
+    ) -> String {
+        status
+            .advertisements
+            .first()
+            .map(|advertisement| advertisement.hotel_id.clone())
+            .or_else(|| {
+                graph.list_hotels().ok().and_then(|hotels| {
+                    hotels
+                        .into_iter()
+                        .find(|hotel| hotel.capabilities.node_id == status.capabilities.node_id)
+                        .map(|hotel| hotel.hotel_name)
+                })
+            })
+            .unwrap_or_else(|| source_hotel.to_string())
+    }
+
+    fn desktop_membrane_target_reachability_view(
+        reachability: &ExecutionReachability,
+    ) -> DesktopMembraneTargetReachabilityView {
+        DesktopMembraneTargetReachabilityView {
+            protocol: reachability.protocol.clone(),
+            host: reachability.host.clone(),
+            port: reachability.port,
+        }
+    }
+
+    fn node_role_display_name(role: &ansible_mesh_core::NodeRole) -> String {
+        match role {
+            ansible_mesh_core::NodeRole::PersonalDevice => "personal-device".into(),
+            ansible_mesh_core::NodeRole::BatteryConstrained => "battery-constrained".into(),
+            ansible_mesh_core::NodeRole::ModelNode => "model-node".into(),
+            ansible_mesh_core::NodeRole::McpNode => "mcp-node".into(),
+            ansible_mesh_core::NodeRole::StorageNode => "storage-node".into(),
+            ansible_mesh_core::NodeRole::ModelManager => "model-manager".into(),
+            ansible_mesh_core::NodeRole::AnsibleNode => "ansible-node".into(),
+            ansible_mesh_core::NodeRole::InfraController => "infra-controller".into(),
+            ansible_mesh_core::NodeRole::Other(other) => other.clone(),
+        }
+    }
+
+    fn guest_role_display_name(role: &str) -> String {
+        role.split('.')
+            .last()
+            .map(|segment| {
+                let mut chars = segment.chars();
+                match chars.next() {
+                    None => String::new(),
+                    Some(first) => first.to_uppercase().to_string() + chars.as_str(),
+                }
+            })
+            .unwrap_or_else(|| role.to_string())
+    }
+
+    fn hotel_record_pid_is_live(hotel: &HotelRecord) -> bool {
+        hotel
+            .active_pid
+            .as_deref()
+            .and_then(|pid| pid.parse::<u32>().ok())
+            .map(Self::pid_exists)
+            .unwrap_or(false)
     }
 
     fn hotel_may_poll_for_agent(
@@ -385,6 +1313,7 @@ impl IpcServer {
             parked_inbound: Arc::new(Mutex::new(HashMap::new())),
             materialization_requester: None,
             telegram_poll_leases: Arc::new(Mutex::new(RuntimeLeaseRegistry::default())),
+            desktop_membrane_leases: Arc::new(Mutex::new(RuntimeLeaseRegistry::default())),
             subagent_leases: Arc::new(Mutex::new(RuntimeLeaseRegistry::default())),
             subagent_hooks: Arc::new(Mutex::new(HashMap::new())),
             registry: Arc::new(RwLock::new(NodeRegistry::new())),
@@ -434,6 +1363,7 @@ impl IpcServer {
                     let parked_inbound = self.parked_inbound.clone();
                     let materialization_requester = self.materialization_requester.clone();
                     let telegram_poll_leases = self.telegram_poll_leases.clone();
+                    let desktop_membrane_leases = self.desktop_membrane_leases.clone();
                     let subagent_leases = self.subagent_leases.clone();
                     let subagent_hooks = self.subagent_hooks.clone();
                     let registry = self.registry.clone();
@@ -448,6 +1378,7 @@ impl IpcServer {
                             parked_inbound,
                             materialization_requester,
                             telegram_poll_leases,
+                            desktop_membrane_leases,
                             subagent_leases,
                             subagent_hooks,
                             registry,
@@ -475,6 +1406,7 @@ impl IpcServer {
         parked_inbound: Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
         materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
         telegram_poll_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
+        desktop_membrane_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
         subagent_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
         subagent_hooks: SubagentHookRegistry,
         registry: Arc<RwLock<NodeRegistry>>,
@@ -506,6 +1438,7 @@ impl IpcServer {
                 Ok(None) => {
                     Self::remove_subscriptions(&inboxes, conn_id, &subscribed_roles).await;
                     Self::remove_telegram_poll_leases(&telegram_poll_leases, conn_id).await;
+                    Self::remove_desktop_membrane_leases(&desktop_membrane_leases, conn_id).await;
                     let _ = write_task.await;
                     return Ok(());
                 }
@@ -531,6 +1464,7 @@ impl IpcServer {
                             &parked_inbound,
                             materialization_requester.as_deref(),
                             &telegram_poll_leases,
+                            &desktop_membrane_leases,
                             &subagent_leases,
                             &subagent_hooks,
                             &registry,
@@ -558,6 +1492,7 @@ impl IpcServer {
                 Err(e) => {
                     Self::remove_subscriptions(&inboxes, conn_id, &subscribed_roles).await;
                     Self::remove_telegram_poll_leases(&telegram_poll_leases, conn_id).await;
+                    Self::remove_desktop_membrane_leases(&desktop_membrane_leases, conn_id).await;
                     let _ = write_task.await;
                     return Err(e.into());
                 }
@@ -614,6 +1549,22 @@ impl IpcServer {
             .map(|lease| lease.lease_scope)
             .collect();
         let mut observer = LoggingLeaseObserver;
+        for scope in scopes {
+            let _ = guard.release(&scope, conn_id, &mut observer);
+        }
+    }
+
+    async fn remove_desktop_membrane_leases(
+        desktop_membrane_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
+        conn_id: Uuid,
+    ) {
+        let mut guard = desktop_membrane_leases.lock().await;
+        let scopes: Vec<String> = guard
+            .active_leases_for_connection(conn_id)
+            .into_iter()
+            .map(|lease| lease.lease_scope)
+            .collect();
+        let mut observer = LoggingDesktopMembraneLeaseObserver;
         for scope in scopes {
             let _ = guard.release(&scope, conn_id, &mut observer);
         }
@@ -1170,6 +2121,7 @@ impl IpcServer {
         parked_inbound: &Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
         materialization_requester: Option<&dyn GuestMaterializationRequester>,
         telegram_poll_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
+        desktop_membrane_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
         subagent_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
         subagent_hooks: &SubagentHookRegistry,
         registry: &Arc<RwLock<NodeRegistry>>,
@@ -1747,6 +2699,336 @@ impl IpcServer {
                             lease,
                         }
                     }
+                }
+            }
+            IpcRequest::AcquireDesktopMembraneLease { lease_key, port } => {
+                let Some(identity) = current_identity.as_ref() else {
+                    return IpcResponse::error(
+                        "desktop_membrane_lease",
+                        "LEASE_UNREGISTERED",
+                        "guest must register before acquiring a desktop membrane lease",
+                    );
+                };
+                let Some(local_hotel_name) = Self::local_hotel_name(graph, local_node_id) else {
+                    return IpcResponse::error(
+                        "desktop_membrane_lease",
+                        "LEASE_AUTHORITY_UNKNOWN",
+                        format!(
+                            "current hotel authority could not be resolved for node [{}]",
+                            local_node_id
+                        ),
+                    );
+                };
+
+                let candidate = Self::desktop_membrane_lease(
+                    &lease_key,
+                    &local_hotel_name,
+                    local_node_id,
+                    &identity.guest_id,
+                    port,
+                );
+                let mut guard = desktop_membrane_leases.lock().await;
+                let mut observer = LoggingDesktopMembraneLeaseObserver;
+                match guard.acquire(
+                    conn_id,
+                    candidate,
+                    DESKTOP_MEMBRANE_LEASE_TTL_SECS,
+                    unix_ts(),
+                    &mut observer,
+                ) {
+                    LeaseAcquireOutcome::Granted(lease) => IpcResponse::DesktopMembraneLease {
+                        desktop_granted: true,
+                        desktop_lease: Some(lease),
+                    },
+                    LeaseAcquireOutcome::Denied(lease) => {
+                        info!(
+                            "Desktop membrane lease [{}] denied for guest [{}]; held by [{}] epoch {}.",
+                            lease.lease_scope,
+                            identity.guest_id,
+                            lease.owner_guest_id,
+                            lease.lease_epoch
+                        );
+                        IpcResponse::DesktopMembraneLease {
+                            desktop_granted: false,
+                            desktop_lease: Some(lease),
+                        }
+                    }
+                }
+            }
+            IpcRequest::GetDesktopMembraneLeaseOwner { lease_key } => {
+                let guard = desktop_membrane_leases.lock().await;
+                if let Some(existing) = guard.inspect(&lease_key) {
+                    IpcResponse::DesktopMembraneLeaseStatus {
+                        desktop_active: true,
+                        desktop_lease: Some(existing),
+                    }
+                } else {
+                    IpcResponse::DesktopMembraneLeaseStatus {
+                        desktop_active: false,
+                        desktop_lease: None,
+                    }
+                }
+            }
+            IpcRequest::GetDesktopMembraneStatus => {
+                match Self::desktop_membrane_status_view(graph, local_node_id) {
+                    Ok(membrane_status) => {
+                        IpcResponse::DesktopMembraneStatusView { membrane_status }
+                    }
+                    Err(err) => IpcResponse::error(
+                        "desktop_membrane_status",
+                        "DESKTOP_MEMBRANE_STATUS_ERROR",
+                        err.to_string(),
+                    ),
+                }
+            }
+            IpcRequest::GetDesktopMembraneTargetStatus { target_node_id } => {
+                match Self::desktop_membrane_target_status_view(
+                    registry,
+                    graph,
+                    local_node_id,
+                    &target_node_id,
+                )
+                .await
+                {
+                    Ok(membrane_target_status) => IpcResponse::DesktopMembraneTargetStatusView {
+                        membrane_target_status,
+                    },
+                    Err(err) => IpcResponse::error(
+                        "desktop_membrane_target_status",
+                        "DESKTOP_MEMBRANE_TARGET_STATUS_ERROR",
+                        err.to_string(),
+                    ),
+                }
+            }
+            IpcRequest::QueryOperatorTargets => {
+                match Self::desktop_membrane_target_views(registry, graph, local_node_id).await {
+                    Ok(operator_targets) => IpcResponse::OperatorTargetsView { operator_targets },
+                    Err(err) => IpcResponse::error(
+                        "operator_targets",
+                        "OPERATOR_TARGETS_ERROR",
+                        err.to_string(),
+                    ),
+                }
+            }
+            IpcRequest::QueryOperatorTargetStatus { target_node_id } => {
+                match Self::desktop_membrane_target_status_view(
+                    registry,
+                    graph,
+                    local_node_id,
+                    &target_node_id,
+                )
+                .await
+                {
+                    Ok(operator_target_status) => IpcResponse::OperatorTargetStatusView {
+                        operator_target_status,
+                    },
+                    Err(err) => IpcResponse::error(
+                        "operator_target_status",
+                        "OPERATOR_TARGET_STATUS_ERROR",
+                        err.to_string(),
+                    ),
+                }
+            }
+            IpcRequest::ListDesktopMembraneGuests => {
+                match Self::desktop_membrane_guest_views(graph, local_node_id) {
+                    Ok(membrane_guests) => {
+                        IpcResponse::DesktopMembraneGuestsView { membrane_guests }
+                    }
+                    Err(err) => IpcResponse::error(
+                        "desktop_membrane_guests",
+                        "DESKTOP_MEMBRANE_GUESTS_ERROR",
+                        err.to_string(),
+                    ),
+                }
+            }
+            IpcRequest::ListDesktopMembraneTargetGuests { target_node_id } => {
+                match Self::desktop_membrane_target_guest_inventory_view(
+                    registry,
+                    graph,
+                    local_node_id,
+                    &target_node_id,
+                )
+                .await
+                {
+                    Ok(membrane_target_guests) => IpcResponse::DesktopMembraneTargetGuestsView {
+                        membrane_target_guests,
+                    },
+                    Err(err) => IpcResponse::error(
+                        "desktop_membrane_target_guests",
+                        "DESKTOP_MEMBRANE_TARGET_GUESTS_ERROR",
+                        err.to_string(),
+                    ),
+                }
+            }
+            IpcRequest::QueryOperatorTargetGuests { target_node_id } => {
+                match Self::desktop_membrane_target_guest_inventory_view(
+                    registry,
+                    graph,
+                    local_node_id,
+                    &target_node_id,
+                )
+                .await
+                {
+                    Ok(operator_target_guests) => IpcResponse::OperatorTargetGuestsView {
+                        operator_target_guests,
+                    },
+                    Err(err) => IpcResponse::error(
+                        "operator_target_guests",
+                        "OPERATOR_TARGET_GUESTS_ERROR",
+                        err.to_string(),
+                    ),
+                }
+            }
+            IpcRequest::QueryOperatorTargetAgents { target_node_id } => {
+                match Self::operator_target_agent_inventory_view(
+                    registry,
+                    graph,
+                    local_node_id,
+                    &target_node_id,
+                )
+                .await
+                {
+                    Ok(operator_target_agents) => IpcResponse::OperatorTargetAgentsView {
+                        operator_target_agents,
+                    },
+                    Err(err) => IpcResponse::error(
+                        "operator_target_agents",
+                        "OPERATOR_TARGET_AGENTS_ERROR",
+                        err.to_string(),
+                    ),
+                }
+            }
+            IpcRequest::SendOperatorChatTurn {
+                target_node_id,
+                target_agent_id,
+                operator_session_id,
+                conversation_id,
+                content,
+            } => {
+                match Self::send_operator_chat_turn(
+                    registry,
+                    graph,
+                    local_node_id,
+                    &target_node_id,
+                    &target_agent_id,
+                    &operator_session_id,
+                    conversation_id.as_deref(),
+                    &content,
+                )
+                .await
+                {
+                    Ok(operator_chat_reply) => IpcResponse::OperatorChatTurnReply {
+                        operator_chat_reply,
+                    },
+                    Err(err) => IpcResponse::error(
+                        "operator_chat",
+                        "OPERATOR_CHAT_ERROR",
+                        err.to_string(),
+                    ),
+                }
+            }
+            IpcRequest::ListDesktopMembraneAgents => {
+                match Self::desktop_membrane_agent_views(graph, local_node_id) {
+                    Ok(membrane_agents) => {
+                        IpcResponse::DesktopMembraneAgentsView { membrane_agents }
+                    }
+                    Err(err) => IpcResponse::error(
+                        "desktop_membrane_agents",
+                        "DESKTOP_MEMBRANE_AGENTS_ERROR",
+                        err.to_string(),
+                    ),
+                }
+            }
+            IpcRequest::ListDesktopMembraneTargets => {
+                match Self::desktop_membrane_target_views(registry, graph, local_node_id).await {
+                    Ok(membrane_targets) => {
+                        IpcResponse::DesktopMembraneTargetsView { membrane_targets }
+                    }
+                    Err(err) => IpcResponse::error(
+                        "desktop_membrane_targets",
+                        "DESKTOP_MEMBRANE_TARGETS_ERROR",
+                        err.to_string(),
+                    ),
+                }
+            }
+            IpcRequest::RenewDesktopMembraneLease {
+                lease_key,
+                lease_epoch,
+            } => {
+                let Some(identity) = current_identity.as_ref() else {
+                    return IpcResponse::error(
+                        "desktop_membrane_lease",
+                        "LEASE_UNREGISTERED",
+                        "guest must register before renewing a desktop membrane lease",
+                    );
+                };
+
+                let mut guard = desktop_membrane_leases.lock().await;
+                let mut observer = LoggingDesktopMembraneLeaseObserver;
+                match guard.renew(
+                    &lease_key,
+                    conn_id,
+                    lease_epoch,
+                    DESKTOP_MEMBRANE_LEASE_TTL_SECS,
+                    unix_ts(),
+                    &mut observer,
+                ) {
+                    LeaseRenewOutcome::Renewed(lease) => IpcResponse::DesktopMembraneLease {
+                        desktop_granted: true,
+                        desktop_lease: Some(lease),
+                    },
+                    LeaseRenewOutcome::Lost(lease) => {
+                        if let Some(ref lease) = lease {
+                            info!(
+                                "Desktop membrane lease [{}] renew denied for guest [{}]; held by [{}] epoch {}.",
+                                lease.lease_scope,
+                                identity.guest_id,
+                                lease.owner_guest_id,
+                                lease.lease_epoch
+                            );
+                        }
+                        IpcResponse::DesktopMembraneLease {
+                            desktop_granted: false,
+                            desktop_lease: lease,
+                        }
+                    }
+                }
+            }
+            IpcRequest::ReleaseDesktopMembraneLease { lease_key } => {
+                let Some(identity) = current_identity.as_ref() else {
+                    return IpcResponse::error(
+                        "desktop_membrane_lease",
+                        "LEASE_UNREGISTERED",
+                        "guest must register before releasing a desktop membrane lease",
+                    );
+                };
+
+                let mut guard = desktop_membrane_leases.lock().await;
+                let mut observer = LoggingDesktopMembraneLeaseObserver;
+                match guard.inspect(&lease_key) {
+                    Some(existing) if existing.owner_guest_id == identity.guest_id => {
+                        if guard.release(&lease_key, conn_id, &mut observer).is_some() {
+                            IpcResponse::success("desktop_membrane_lease_release", None)
+                        } else {
+                            IpcResponse::error(
+                                "desktop_membrane_lease_release",
+                                "LEASE_NOT_OWNER",
+                                format!(
+                                    "guest [{}] does not hold the active connection for lease [{}]",
+                                    identity.guest_id, lease_key
+                                ),
+                            )
+                        }
+                    }
+                    Some(existing) => IpcResponse::error(
+                        "desktop_membrane_lease_release",
+                        "LEASE_NOT_OWNER",
+                        format!(
+                            "guest [{}] cannot release lease [{}] owned by [{}]",
+                            identity.guest_id, lease_key, existing.owner_guest_id
+                        ),
+                    ),
+                    None => IpcResponse::success("desktop_membrane_lease_release", None),
                 }
             }
             IpcRequest::ReleaseTelegramPollLease { lease_key } => {
@@ -4474,6 +5756,125 @@ mod tests {
         }
     }
 
+    fn expect_desktop_membrane_lease(response: IpcResponse) -> (bool, Option<LeaseEnvelope>) {
+        match response {
+            IpcResponse::DesktopMembraneLease {
+                desktop_granted,
+                desktop_lease,
+            } => (desktop_granted, desktop_lease),
+            other => panic!("unexpected desktop membrane lease response: {other:?}"),
+        }
+    }
+
+    fn expect_desktop_membrane_status(response: IpcResponse) -> (bool, Option<LeaseEnvelope>) {
+        match response {
+            IpcResponse::DesktopMembraneLeaseStatus {
+                desktop_active,
+                desktop_lease,
+            } => (desktop_active, desktop_lease),
+            other => panic!("unexpected desktop membrane lease status response: {other:?}"),
+        }
+    }
+
+    fn expect_desktop_membrane_view_status(response: IpcResponse) -> DesktopMembraneStatusView {
+        match response {
+            IpcResponse::DesktopMembraneStatusView { membrane_status } => membrane_status,
+            other => panic!("unexpected desktop membrane status view response: {other:?}"),
+        }
+    }
+
+    fn expect_desktop_membrane_target_status(
+        response: IpcResponse,
+    ) -> DesktopMembraneTargetStatusView {
+        match response {
+            IpcResponse::DesktopMembraneTargetStatusView {
+                membrane_target_status,
+            } => membrane_target_status,
+            other => panic!("unexpected desktop membrane target status response: {other:?}"),
+        }
+    }
+
+    fn expect_desktop_membrane_target_guest_inventory(
+        response: IpcResponse,
+    ) -> DesktopMembraneTargetGuestInventoryView {
+        match response {
+            IpcResponse::DesktopMembraneTargetGuestsView {
+                membrane_target_guests,
+            } => membrane_target_guests,
+            other => panic!("unexpected desktop membrane target guests response: {other:?}"),
+        }
+    }
+
+    fn expect_desktop_membrane_guest_views(response: IpcResponse) -> Vec<DesktopMembraneGuestView> {
+        match response {
+            IpcResponse::DesktopMembraneGuestsView { membrane_guests } => membrane_guests,
+            other => panic!("unexpected desktop membrane guests view response: {other:?}"),
+        }
+    }
+
+    fn expect_desktop_membrane_agent_views(response: IpcResponse) -> Vec<DesktopMembraneAgentView> {
+        match response {
+            IpcResponse::DesktopMembraneAgentsView { membrane_agents } => membrane_agents,
+            other => panic!("unexpected desktop membrane agents view response: {other:?}"),
+        }
+    }
+
+    fn expect_desktop_membrane_target_views(
+        response: IpcResponse,
+    ) -> Vec<DesktopMembraneTargetView> {
+        match response {
+            IpcResponse::DesktopMembraneTargetsView { membrane_targets } => membrane_targets,
+            other => panic!("unexpected desktop membrane targets view response: {other:?}"),
+        }
+    }
+
+    fn expect_operator_target_views(response: IpcResponse) -> Vec<OperatorTargetView> {
+        match response {
+            IpcResponse::OperatorTargetsView { operator_targets } => operator_targets,
+            other => panic!("unexpected operator targets view response: {other:?}"),
+        }
+    }
+
+    fn expect_operator_target_status(response: IpcResponse) -> OperatorTargetStatusView {
+        match response {
+            IpcResponse::OperatorTargetStatusView {
+                operator_target_status,
+            } => operator_target_status,
+            other => panic!("unexpected operator target status response: {other:?}"),
+        }
+    }
+
+    fn expect_operator_target_guests(
+        response: IpcResponse,
+    ) -> OperatorTargetGuestInventoryView {
+        match response {
+            IpcResponse::OperatorTargetGuestsView {
+                operator_target_guests,
+            } => operator_target_guests,
+            other => panic!("unexpected operator target guests response: {other:?}"),
+        }
+    }
+
+    fn expect_operator_target_agents(
+        response: IpcResponse,
+    ) -> OperatorTargetAgentInventoryView {
+        match response {
+            IpcResponse::OperatorTargetAgentsView {
+                operator_target_agents,
+            } => operator_target_agents,
+            other => panic!("unexpected operator target agents response: {other:?}"),
+        }
+    }
+
+    fn expect_operator_chat_reply(response: IpcResponse) -> OperatorChatTurnReply {
+        match response {
+            IpcResponse::OperatorChatTurnReply {
+                operator_chat_reply,
+            } => operator_chat_reply,
+            other => panic!("unexpected operator chat reply response: {other:?}"),
+        }
+    }
+
     #[derive(Default)]
     struct TestGraphStorage;
 
@@ -4549,6 +5950,9 @@ mod tests {
         }
         fn upsert_agent_identity(&self, _identity: &AgentIdentityRecord) -> anyhow::Result<()> {
             Ok(())
+        }
+        fn list_agent_identities(&self) -> anyhow::Result<Vec<AgentIdentityRecord>> {
+            Ok(vec![])
         }
         fn get_agent_identity(
             &self,
@@ -9212,6 +10616,1592 @@ mod tests {
         let _ = server_task.await;
         if Path::new(&socket_path).exists() {
             let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn desktop_membrane_lease_disconnect_allows_takeover() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        graph_store
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+            })
+            .expect("seed local hotel");
+        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let lease_key = "desktop:local-hotel:operator-surface";
+
+        let mut primary = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-desktop-01".into(),
+            role: "management".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("primary connect");
+
+        let mut secondary = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-desktop-02".into(),
+            role: "management".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("secondary connect");
+
+        let granted = primary
+            .send_request(IpcRequest::AcquireDesktopMembraneLease {
+                lease_key: lease_key.into(),
+                port: 7700,
+            })
+            .await
+            .expect("primary lease request");
+        let (granted, lease) = expect_desktop_membrane_lease(granted);
+        let lease = lease.expect("lease envelope");
+        assert!(granted);
+        assert_eq!(lease.metadata["port"], 7700);
+        assert_eq!(lease.lease_epoch, 1);
+        assert_eq!(lease.owner_guest_id, "membrane-desktop-01");
+
+        let denied = secondary
+            .send_request(IpcRequest::AcquireDesktopMembraneLease {
+                lease_key: lease_key.into(),
+                port: 7701,
+            })
+            .await
+            .expect("secondary lease request");
+        let (granted, lease) = expect_desktop_membrane_lease(denied);
+        let lease = lease.expect("lease envelope");
+        assert!(!granted);
+        assert_eq!(lease.metadata["port"], 7700);
+        assert_eq!(lease.lease_epoch, 1);
+        assert_eq!(lease.owner_guest_id, "membrane-desktop-01");
+
+        drop(primary);
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let after_disconnect = secondary
+            .send_request(IpcRequest::AcquireDesktopMembraneLease {
+                lease_key: lease_key.into(),
+                port: 7701,
+            })
+            .await
+            .expect("secondary re-acquire after disconnect");
+        let (granted, lease) = expect_desktop_membrane_lease(after_disconnect);
+        let lease = lease.expect("lease envelope");
+        assert!(granted);
+        assert_eq!(lease.metadata["port"], 7701);
+        assert_eq!(lease.lease_epoch, 2);
+        assert_eq!(lease.owner_guest_id, "membrane-desktop-02");
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn desktop_membrane_lease_can_be_renewed_by_owner() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        graph_store
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+            })
+            .expect("seed local hotel");
+        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-desktop-01".into(),
+            role: "management".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("desktop connect");
+
+        let acquired = client
+            .send_request(IpcRequest::AcquireDesktopMembraneLease {
+                lease_key: "desktop:local-hotel:operator-surface".into(),
+                port: 7700,
+            })
+            .await
+            .expect("acquire lease");
+        let (granted, lease) = expect_desktop_membrane_lease(acquired);
+        let lease = lease.expect("lease envelope");
+        assert!(granted);
+        let epoch = lease.lease_epoch;
+
+        let renewed = client
+            .send_request(IpcRequest::RenewDesktopMembraneLease {
+                lease_key: "desktop:local-hotel:operator-surface".into(),
+                lease_epoch: epoch,
+            })
+            .await
+            .expect("renew lease");
+        let (granted, lease) = expect_desktop_membrane_lease(renewed);
+        let lease = lease.expect("lease envelope");
+        assert!(granted);
+        assert_eq!(lease.lease_epoch, epoch);
+        assert_eq!(lease.owner_guest_id, "membrane-desktop-01");
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn desktop_membrane_lease_release_allows_immediate_takeover() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        graph_store
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+            })
+            .expect("seed local hotel");
+        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut primary = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-desktop-01".into(),
+            role: "management".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("primary connect");
+        let mut secondary = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-desktop-02".into(),
+            role: "management".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("secondary connect");
+
+        primary
+            .send_request(IpcRequest::AcquireDesktopMembraneLease {
+                lease_key: "desktop:local-hotel:operator-surface".into(),
+                port: 7700,
+            })
+            .await
+            .expect("acquire lease");
+
+        let release = primary
+            .send_request(IpcRequest::ReleaseDesktopMembraneLease {
+                lease_key: "desktop:local-hotel:operator-surface".into(),
+            })
+            .await
+            .expect("release lease");
+        match release {
+            IpcResponse::Standard { ok, .. } => assert!(ok),
+            other => panic!("unexpected release response: {other:?}"),
+        }
+
+        let takeover = secondary
+            .send_request(IpcRequest::AcquireDesktopMembraneLease {
+                lease_key: "desktop:local-hotel:operator-surface".into(),
+                port: 7701,
+            })
+            .await
+            .expect("takeover acquire");
+        let (granted, lease) = expect_desktop_membrane_lease(takeover);
+        let lease = lease.expect("lease envelope");
+        assert!(granted);
+        assert_eq!(lease.lease_epoch, 2);
+        assert_eq!(lease.metadata["port"], 7701);
+        assert_eq!(lease.owner_guest_id, "membrane-desktop-02");
+
+        let status = secondary
+            .send_request(IpcRequest::GetDesktopMembraneLeaseOwner {
+                lease_key: "desktop:local-hotel:operator-surface".into(),
+            })
+            .await
+            .expect("query lease owner");
+        let (active, lease) = expect_desktop_membrane_status(status);
+        assert!(active);
+        assert_eq!(
+            lease.expect("lease envelope").owner_guest_id,
+            "membrane-desktop-02"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn desktop_membrane_status_view_comes_from_hotel_record() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        graph_store
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: Some(std::process::id().to_string()),
+            })
+            .expect("seed local hotel");
+        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut membrane = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-local".into(),
+            role: "management".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("membrane connect");
+
+        let response = membrane
+            .send_request(IpcRequest::GetDesktopMembraneStatus)
+            .await
+            .expect("desktop membrane status request");
+        let status = expect_desktop_membrane_view_status(response);
+        assert_eq!(status.hotel, "local-hotel");
+        assert_eq!(status.daemon, "running");
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn desktop_membrane_guest_views_come_from_graph_storage() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        graph_store
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: Some(std::process::id().to_string()),
+            })
+            .expect("seed local hotel");
+        graph_store
+            .seed_guests(
+                "local-hotel",
+                &[
+                    GuestRecord {
+                        hotel_name: "local-hotel".into(),
+                        guest_id: "local-hotel:membrane-gateway".into(),
+                        role: "membrane".into(),
+                        config_json: "{}".into(),
+                        is_active: true,
+                        active_pid: Some(std::process::id().to_string()),
+                        last_active_at: Some(50),
+                    },
+                    GuestRecord {
+                        hotel_name: "local-hotel".into(),
+                        guest_id: "local-hotel:model-router-gemini".into(),
+                        role: "model.gemini".into(),
+                        config_json: "{}".into(),
+                        is_active: true,
+                        active_pid: None,
+                        last_active_at: Some(25),
+                    },
+                ],
+            )
+            .expect("seed guests");
+        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut membrane = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-local".into(),
+            role: "management".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("membrane connect");
+
+        let response = membrane
+            .send_request(IpcRequest::ListDesktopMembraneGuests)
+            .await
+            .expect("desktop membrane guests request");
+        let guests = expect_desktop_membrane_guest_views(response);
+        assert_eq!(guests.len(), 2);
+        assert_eq!(guests[0].guest_id, "local-hotel:membrane-gateway");
+        assert_eq!(guests[0].name, "Membrane");
+        assert_eq!(guests[0].status, "running");
+        assert_eq!(guests[1].guest_id, "local-hotel:model-router-gemini");
+        assert_eq!(guests[1].name, "Gemini");
+        assert_eq!(guests[1].status, "stopped");
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn desktop_membrane_agent_views_are_redacted_and_local_hotel_scoped() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        graph_store
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: Some(std::process::id().to_string()),
+            })
+            .expect("seed local hotel");
+        graph_store
+            .upsert_agent_identity(&AgentIdentityRecord {
+                agent_id: "agent-jane-01".into(),
+                persona_name: "Jane".into(),
+                authority_hotel: "local-hotel".into(),
+                bundle_json: serde_json::json!({
+                    "system_prompt": "top secret",
+                    "toolset_tags": ["orchestrator", "desktop"]
+                }),
+            })
+            .expect("seed local agent");
+        graph_store
+            .upsert_agent_identity(&AgentIdentityRecord {
+                agent_id: "agent-remote-01".into(),
+                persona_name: "Remote".into(),
+                authority_hotel: "remote-hotel".into(),
+                bundle_json: serde_json::json!({
+                    "system_prompt": "should not leak",
+                    "toolset_tags": ["remote"]
+                }),
+            })
+            .expect("seed remote agent");
+        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut membrane = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-local".into(),
+            role: "management".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("membrane connect");
+
+        let response = membrane
+            .send_request(IpcRequest::ListDesktopMembraneAgents)
+            .await
+            .expect("desktop membrane agents request");
+        let agents = expect_desktop_membrane_agent_views(response);
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].agent_id, "agent-jane-01");
+        assert_eq!(agents[0].persona_name, "Jane");
+        assert_eq!(agents[0].authority_hotel, "local-hotel");
+        assert_eq!(
+            agents[0].toolset_tags,
+            vec!["orchestrator".to_string(), "desktop".to_string()]
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn desktop_membrane_target_views_include_source_and_freshness_attribution() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        graph_store
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: Some(std::process::id().to_string()),
+            })
+            .expect("seed local hotel");
+        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let registry = Arc::new(RwLock::new(NodeRegistry::new()));
+        registry.write().await.update_node(
+            NodeCapabilities {
+                node_id: "local-aiua-01".into(),
+                roles: vec![ansible_mesh_core::NodeRole::PersonalDevice],
+                models: vec![],
+                tools: vec!["tool.local.status@1".into()],
+                constraints: Default::default(),
+            },
+            vec![CapabilityAdvertisement {
+                hotel_id: "local-hotel".into(),
+                node_id: "local-aiua-01".into(),
+                incarnation_id: "local-hotel:membrane".into(),
+                target_role: "management".into(),
+                availability_state: "live".into(),
+                selection_hint: Some("local".into()),
+                latency_hint_ms: Some(2),
+                max_concurrent_jobs: Some(8),
+                active_jobs: 0,
+                queue_depth: 0,
+            }],
+            Some(ExecutionReachability {
+                protocol: "unix".into(),
+                host: "127.0.0.1".into(),
+                port: 0,
+            }),
+        );
+        registry.write().await.update_node(
+            NodeCapabilities {
+                node_id: "remote-aiua-01".into(),
+                roles: vec![ansible_mesh_core::NodeRole::AnsibleNode],
+                models: vec!["model.gemini-2.5-pro@2026.1".into()],
+                tools: vec!["tool.remote.restart@1".into()],
+                constraints: Default::default(),
+            },
+            vec![CapabilityAdvertisement {
+                hotel_id: "remote-hotel".into(),
+                node_id: "remote-aiua-01".into(),
+                incarnation_id: "remote-hotel:model-router".into(),
+                target_role: "model".into(),
+                availability_state: "live".into(),
+                selection_hint: Some("remote_fallback".into()),
+                latency_hint_ms: Some(12),
+                max_concurrent_jobs: Some(4),
+                active_jobs: 1,
+                queue_depth: 0,
+            }],
+            Some(ExecutionReachability {
+                protocol: "tcp-framed-v1".into(),
+                host: "remote.mesh".into(),
+                port: 9002,
+            }),
+        );
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph)
+            .with_registry(registry);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut membrane = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-local".into(),
+            role: "management".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("membrane connect");
+
+        let response = membrane
+            .send_request(IpcRequest::ListDesktopMembraneTargets)
+            .await
+            .expect("desktop membrane targets request");
+        let targets = expect_desktop_membrane_target_views(response);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].target_node_id, "local-aiua-01");
+        assert_eq!(targets[0].target_hotel, "local-hotel");
+        assert_eq!(targets[0].source_hotel, "local-hotel");
+        assert!(targets[0].is_local);
+        assert_eq!(targets[0].roles, vec!["personal-device".to_string()]);
+        assert_eq!(targets[0].advertised_roles, vec!["management".to_string()]);
+        assert_eq!(targets[0].freshness_state, "heartbeat-fresh");
+        assert!(targets[0].freshness_age_secs <= targets[0].freshness_ttl_secs);
+
+        assert_eq!(targets[1].target_node_id, "remote-aiua-01");
+        assert_eq!(targets[1].target_hotel, "remote-hotel");
+        assert_eq!(targets[1].source_hotel, "local-hotel");
+        assert!(!targets[1].is_local);
+        assert_eq!(targets[1].roles, vec!["ansible-node".to_string()]);
+        assert_eq!(
+            targets[1]
+                .reachability
+                .as_ref()
+                .expect("remote reachability")
+                .host,
+            "remote.mesh"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn desktop_membrane_target_status_distinguishes_local_from_remote_observation() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        graph_store
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: Some(std::process::id().to_string()),
+            })
+            .expect("seed local hotel");
+        graph_store
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "remote-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "remote-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9100,
+                blob_port: 9101,
+                execution_port: 9102,
+                ipc_socket_path: "/tmp/remote-aiua.sock".into(),
+                active_pid: None,
+            })
+            .expect("seed remote hotel");
+        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let registry = Arc::new(RwLock::new(NodeRegistry::new()));
+        registry.write().await.update_node(
+            NodeCapabilities {
+                node_id: "remote-aiua-01".into(),
+                roles: vec![ansible_mesh_core::NodeRole::AnsibleNode],
+                models: vec![],
+                tools: vec![],
+                constraints: Default::default(),
+            },
+            vec![CapabilityAdvertisement {
+                hotel_id: "remote-hotel".into(),
+                node_id: "remote-aiua-01".into(),
+                incarnation_id: "remote-hotel:model-router".into(),
+                target_role: "model".into(),
+                availability_state: "live".into(),
+                selection_hint: Some("remote_fallback".into()),
+                latency_hint_ms: Some(12),
+                max_concurrent_jobs: Some(4),
+                active_jobs: 1,
+                queue_depth: 0,
+            }],
+            Some(ExecutionReachability {
+                protocol: "tcp-framed-v1".into(),
+                host: "remote.mesh".into(),
+                port: 9102,
+            }),
+        );
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph)
+            .with_registry(registry);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut membrane = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-local".into(),
+            role: "management".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("membrane connect");
+
+        let local_response = membrane
+            .send_request(IpcRequest::GetDesktopMembraneTargetStatus {
+                target_node_id: "local-aiua-01".into(),
+            })
+            .await
+            .expect("local target status request");
+        let local_status = expect_desktop_membrane_target_status(local_response);
+        assert_eq!(local_status.observation_kind, "local-canonical");
+        assert_eq!(local_status.daemon_status, "running");
+        assert_eq!(local_status.target_hotel, "local-hotel");
+
+        let remote_response = membrane
+            .send_request(IpcRequest::GetDesktopMembraneTargetStatus {
+                target_node_id: "remote-aiua-01".into(),
+            })
+            .await
+            .expect("remote target status request");
+        let remote_status = expect_desktop_membrane_target_status(remote_response);
+        assert_eq!(remote_status.observation_kind, "remote-heartbeat-observed");
+        assert_eq!(remote_status.daemon_status, "observed-reachable");
+        assert_eq!(remote_status.target_hotel, "remote-hotel");
+        assert_eq!(remote_status.source_hotel, "local-hotel");
+        assert_eq!(
+            remote_status
+                .reachability
+                .as_ref()
+                .expect("remote reachability")
+                .host,
+            "remote.mesh"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn desktop_membrane_target_guest_inventory_reports_failed_remote_query_when_unreachable()
+    {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        graph_store
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: Some(std::process::id().to_string()),
+            })
+            .expect("seed local hotel");
+        graph_store
+            .seed_guests(
+                "local-hotel",
+                &[GuestRecord {
+                    hotel_name: "local-hotel".into(),
+                    guest_id: "local-hotel:membrane-gateway".into(),
+                    role: "membrane".into(),
+                    config_json: "{}".into(),
+                    is_active: true,
+                    active_pid: Some(std::process::id().to_string()),
+                    last_active_at: Some(50),
+                }],
+            )
+            .expect("seed local guests");
+        graph_store
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "remote-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "remote-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9100,
+                blob_port: 9101,
+                execution_port: 9102,
+                ipc_socket_path: "/tmp/remote-aiua.sock".into(),
+                active_pid: None,
+            })
+            .expect("seed remote hotel");
+        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let registry = Arc::new(RwLock::new(NodeRegistry::new()));
+        registry.write().await.update_node(
+            NodeCapabilities {
+                node_id: "remote-aiua-01".into(),
+                roles: vec![ansible_mesh_core::NodeRole::AnsibleNode],
+                models: vec![],
+                tools: vec![],
+                constraints: Default::default(),
+            },
+            vec![CapabilityAdvertisement {
+                hotel_id: "remote-hotel".into(),
+                node_id: "remote-aiua-01".into(),
+                incarnation_id: "remote-hotel:model-router".into(),
+                target_role: "model".into(),
+                availability_state: "live".into(),
+                selection_hint: Some("remote_fallback".into()),
+                latency_hint_ms: Some(12),
+                max_concurrent_jobs: Some(4),
+                active_jobs: 1,
+                queue_depth: 0,
+            }],
+            Some(ExecutionReachability {
+                protocol: "tcp-framed-v1".into(),
+                host: "remote.mesh".into(),
+                port: 9102,
+            }),
+        );
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph)
+            .with_registry(registry);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut membrane = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-local".into(),
+            role: "management".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("membrane connect");
+
+        let local_response = membrane
+            .send_request(IpcRequest::ListDesktopMembraneTargetGuests {
+                target_node_id: "local-aiua-01".into(),
+            })
+            .await
+            .expect("local target guests request");
+        let local_inventory = expect_desktop_membrane_target_guest_inventory(local_response);
+        assert!(local_inventory.available);
+        assert_eq!(local_inventory.observation_kind, "local-canonical");
+        assert_eq!(local_inventory.guests.len(), 1);
+
+        let remote_response = membrane
+            .send_request(IpcRequest::ListDesktopMembraneTargetGuests {
+                target_node_id: "remote-aiua-01".into(),
+            })
+            .await
+            .expect("remote target guests request");
+        let remote_inventory = expect_desktop_membrane_target_guest_inventory(remote_response);
+        assert!(!remote_inventory.available);
+        assert_eq!(remote_inventory.observation_kind, "remote-query-failed");
+        assert_eq!(remote_inventory.pending_remote_query_state, "error");
+        assert!(remote_inventory.guests.is_empty());
+        assert_eq!(remote_inventory.target_hotel, "remote-hotel");
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn operator_target_surface_requests_reuse_membrane_target_logic() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        graph_store
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: Some(std::process::id().to_string()),
+            })
+            .expect("seed local hotel");
+        graph_store
+            .seed_guests(
+                "local-hotel",
+                &[GuestRecord {
+                    hotel_name: "local-hotel".into(),
+                    guest_id: "local-hotel:membrane-gateway".into(),
+                    role: "membrane".into(),
+                    config_json: "{}".into(),
+                    is_active: true,
+                    active_pid: Some(std::process::id().to_string()),
+                    last_active_at: Some(50),
+                }],
+            )
+            .expect("seed local guests");
+        graph_store
+            .upsert_agent_identity(&AgentIdentityRecord {
+                agent_id: "agent-jane-01".into(),
+                persona_name: "Jane".into(),
+                authority_hotel: "local-hotel".into(),
+                bundle_json: serde_json::json!({
+                    "toolset_tags": ["shell", "memory"]
+                }),
+            })
+            .expect("seed local agent identity");
+        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let registry = Arc::new(RwLock::new(NodeRegistry::new()));
+        registry.write().await.update_node(
+            NodeCapabilities {
+                node_id: "local-aiua-01".into(),
+                roles: vec![ansible_mesh_core::NodeRole::PersonalDevice],
+                models: vec![],
+                tools: vec![],
+                constraints: Default::default(),
+            },
+            vec![CapabilityAdvertisement {
+                hotel_id: "local-hotel".into(),
+                node_id: "local-aiua-01".into(),
+                incarnation_id: "local-hotel:membrane".into(),
+                target_role: "management".into(),
+                availability_state: "live".into(),
+                selection_hint: Some("local".into()),
+                latency_hint_ms: Some(1),
+                max_concurrent_jobs: Some(4),
+                active_jobs: 0,
+                queue_depth: 0,
+            }],
+            Some(ExecutionReachability {
+                protocol: "unix".into(),
+                host: "127.0.0.1".into(),
+                port: 0,
+            }),
+        );
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph)
+            .with_registry(registry);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "operator-surface-test".into(),
+            role: "management".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("management connect");
+
+        let targets = expect_operator_target_views(
+            client
+                .send_request(IpcRequest::QueryOperatorTargets)
+                .await
+                .expect("operator targets request"),
+        );
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].target_node_id, "local-aiua-01");
+
+        let status = expect_operator_target_status(
+            client
+                .send_request(IpcRequest::QueryOperatorTargetStatus {
+                    target_node_id: "local-aiua-01".into(),
+                })
+                .await
+                .expect("operator target status request"),
+        );
+        assert_eq!(status.observation_kind, "local-canonical");
+        assert_eq!(status.target_hotel, "local-hotel");
+
+        let guests = expect_operator_target_guests(
+            client
+                .send_request(IpcRequest::QueryOperatorTargetGuests {
+                    target_node_id: "local-aiua-01".into(),
+                })
+                .await
+                .expect("operator target guests request"),
+        );
+        assert!(guests.available);
+        assert_eq!(guests.guests.len(), 1);
+        assert_eq!(guests.guests[0].guest_id, "local-hotel:membrane-gateway");
+
+        let agents = expect_operator_target_agents(
+            client
+                .send_request(IpcRequest::QueryOperatorTargetAgents {
+                    target_node_id: "local-aiua-01".into(),
+                })
+                .await
+                .expect("operator target agents request"),
+        );
+        assert!(agents.available);
+        assert_eq!(agents.observation_kind, "local-canonical");
+        assert_eq!(agents.agents.len(), 1);
+        assert_eq!(agents.agents[0].agent_id, "agent-jane-01");
+        assert_eq!(agents.agents[0].authority_hotel, "local-hotel");
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn operator_chat_turn_reuses_agent_conversation_path() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        graph_store
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: Some(std::process::id().to_string()),
+            })
+            .expect("seed local hotel");
+        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let registry = Arc::new(RwLock::new(NodeRegistry::new()));
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph)
+            .with_registry(registry);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut management = PhiloticClient::connect(GuestIdentity {
+            guest_id: "operator-chat-test".into(),
+            role: "management".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("management connect");
+        let mut agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane-01".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("agent connect");
+
+        let agent_task = tokio::spawn(async move {
+            let inbound = agent.recv_task().await.expect("agent recv task");
+            let IpcResponse::InboundTask { task_json, .. } = inbound else {
+                panic!("unexpected inbound response to agent");
+            };
+            let payload: serde_json::Value =
+                serde_json::from_str(&task_json).expect("agent payload should decode");
+            assert_eq!(payload["source"], "operator_chat");
+            assert_eq!(payload["transport"], "operator_chat");
+            assert_eq!(payload["content"], "hello from desktop operator");
+            let final_reply_to = payload["final_reply_to"]
+                .as_str()
+                .expect("final_reply_to should exist")
+                .to_string();
+            let final_reply_role = payload["final_reply_role"]
+                .as_str()
+                .expect("final_reply_role should exist")
+                .to_string();
+            let final_reply_guest_id = payload["final_reply_guest_id"]
+                .as_str()
+                .expect("final_reply_guest_id should exist")
+                .to_string();
+            let session_id = payload["session_id"]
+                .as_str()
+                .expect("session_id should exist")
+                .to_string();
+            let turn_id = payload["turn_id"]
+                .as_str()
+                .expect("turn_id should exist")
+                .to_string();
+            let chat_id = payload["chat_id"]
+                .as_str()
+                .expect("chat_id should exist")
+                .to_string();
+
+            agent
+                .send_request(IpcRequest::EmitTask {
+                    target_node: final_reply_to.clone(),
+                    target_role: final_reply_role.clone(),
+                    target_guest_id: Some(final_reply_guest_id.clone()),
+                    task_json: serde_json::json!({
+                        "action": "turn_event",
+                        "event": "waiting_model",
+                        "session_id": session_id,
+                        "turn_id": turn_id,
+                        "chat_id": chat_id
+                    })
+                    .to_string(),
+                })
+                .await
+                .expect("agent emit turn event");
+
+            agent
+                .send_request(IpcRequest::EmitTask {
+                    target_node: final_reply_to.clone(),
+                    target_role: final_reply_role.clone(),
+                    target_guest_id: Some(final_reply_guest_id.clone()),
+                    task_json: serde_json::json!({
+                        "action": "partial_reply",
+                        "session_id": session_id,
+                        "turn_id": turn_id,
+                        "chat_id": chat_id,
+                        "content": "hello from partial"
+                    })
+                    .to_string(),
+                })
+                .await
+                .expect("agent emit partial reply");
+
+            agent
+                .send_request(IpcRequest::EmitTask {
+                    target_node: final_reply_to,
+                    target_role: final_reply_role,
+                    target_guest_id: Some(final_reply_guest_id),
+                    task_json: serde_json::json!({
+                        "action": "send_reply",
+                        "session_id": session_id,
+                        "turn_id": turn_id,
+                        "chat_id": chat_id,
+                        "content": "hello back from agent"
+                    })
+                    .to_string(),
+                })
+                .await
+                .expect("agent emit final reply");
+        });
+
+        let reply = expect_operator_chat_reply(
+            management
+                .send_request(IpcRequest::SendOperatorChatTurn {
+                    target_node_id: "local-aiua-01".into(),
+                    target_agent_id: "agent-jane-01".into(),
+                    operator_session_id: "desktop-operator-session-1".into(),
+                    conversation_id: None,
+                    content: "hello from desktop operator".into(),
+                })
+                .await
+                .expect("operator chat request"),
+        );
+        assert_eq!(reply.target_node_id, "local-aiua-01");
+        assert_eq!(reply.target_agent_id, "agent-jane-01");
+        assert_eq!(reply.delivery_kind, "local-direct");
+        assert_eq!(reply.reply_action, "send_reply");
+        assert_eq!(reply.observed_events, vec!["waiting_model"]);
+        assert_eq!(reply.observed_partial_replies, vec!["hello from partial"]);
+        assert_eq!(reply.content, "hello back from agent");
+
+        agent_task.await.expect("agent task should finish");
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn operator_chat_turn_can_round_trip_through_remote_hotel_bridge() {
+        let _env_guard = ipc_env_guard();
+        let local_socket_path = test_socket_path();
+        let remote_socket_path = format!("{local_socket_path}-remote");
+        let (local_dispatcher_tx, mut local_dispatcher_rx) = mpsc::channel(16);
+        let (remote_dispatcher_tx, mut remote_dispatcher_rx) = mpsc::channel(16);
+
+        let local_graph_store =
+            SqliteGraphStorage::open(":memory:").expect("open local sqlite graph store");
+        local_graph_store
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: local_socket_path.clone(),
+                active_pid: Some(std::process::id().to_string()),
+            })
+            .expect("seed local hotel");
+        local_graph_store
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "remote-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "remote-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9100,
+                blob_port: 9101,
+                execution_port: 9102,
+                ipc_socket_path: remote_socket_path.clone(),
+                active_pid: None,
+            })
+            .expect("seed remote hotel");
+        let local_graph: Arc<dyn GraphStorage> = Arc::new(local_graph_store);
+        let local_registry = Arc::new(RwLock::new(NodeRegistry::new()));
+        local_registry.write().await.update_node(
+            NodeCapabilities {
+                node_id: "remote-aiua-01".into(),
+                roles: vec![ansible_mesh_core::NodeRole::AnsibleNode],
+                models: vec![],
+                tools: vec![],
+                constraints: Default::default(),
+            },
+            vec![CapabilityAdvertisement {
+                hotel_id: "remote-hotel".into(),
+                node_id: "remote-aiua-01".into(),
+                incarnation_id: "remote-hotel:agent-runtime".into(),
+                target_role: "agent".into(),
+                availability_state: "live".into(),
+                selection_hint: Some("remote_operator_chat".into()),
+                latency_hint_ms: Some(12),
+                max_concurrent_jobs: Some(4),
+                active_jobs: 0,
+                queue_depth: 0,
+            }],
+            Some(ExecutionReachability {
+                protocol: "tcp-framed-v1".into(),
+                host: "remote.mesh".into(),
+                port: 9102,
+            }),
+        );
+
+        let remote_graph_store =
+            SqliteGraphStorage::open(":memory:").expect("open remote sqlite graph store");
+        remote_graph_store
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "remote-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "remote-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9100,
+                blob_port: 9101,
+                execution_port: 9102,
+                ipc_socket_path: remote_socket_path.clone(),
+                active_pid: Some(std::process::id().to_string()),
+            })
+            .expect("seed remote hotel");
+        let remote_graph: Arc<dyn GraphStorage> = Arc::new(remote_graph_store);
+
+        let local_server = IpcServer::new(
+            local_socket_path.clone(),
+            "local-aiua-01",
+            local_dispatcher_tx,
+            local_graph,
+        )
+        .with_registry(local_registry);
+        let remote_server = IpcServer::new(
+            remote_socket_path.clone(),
+            "remote-aiua-01",
+            remote_dispatcher_tx,
+            remote_graph,
+        );
+
+        let local_server_task = tokio::spawn(async move {
+            local_server.run().await.expect("local ipc server should run");
+        });
+        let remote_server_task = tokio::spawn(async move {
+            remote_server.run().await.expect("remote ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &local_socket_path);
+        }
+
+        let local_to_remote_bridge = tokio::spawn({
+            let remote_socket_path = remote_socket_path.clone();
+            async move {
+                let mut bridge = PhiloticClient::connect_at(
+                    &remote_socket_path,
+                    GuestIdentity {
+                        guest_id: "bridge-local-to-remote".into(),
+                        role: "management".into(),
+                        supported_tools: Vec::new(),
+                    },
+                )
+                .await
+                .expect("connect local->remote bridge");
+
+                while let Some(command) = local_dispatcher_rx.recv().await {
+                    let LedgerCommand::AppendLocal(env) = command else {
+                        continue;
+                    };
+                    if env.target_node_id.as_deref() != Some("remote-aiua-01") {
+                        continue;
+                    }
+                    let target_role = env
+                        .target_agent_id
+                        .clone()
+                        .unwrap_or_else(|| "agent".into());
+                    let EventPayload::Inline { data } = env.payload else {
+                        continue;
+                    };
+                    bridge
+                        .send_request(IpcRequest::EmitTask {
+                            target_node: "remote-aiua-01".into(),
+                            target_role,
+                            target_guest_id: None,
+                            task_json: data,
+                        })
+                        .await
+                        .expect("relay local->remote operator chat task");
+                }
+            }
+        });
+
+        let remote_to_local_bridge = tokio::spawn({
+            let local_socket_path = local_socket_path.clone();
+            async move {
+                let mut bridge = PhiloticClient::connect_at(
+                    &local_socket_path,
+                    GuestIdentity {
+                        guest_id: "bridge-remote-to-local".into(),
+                        role: "management".into(),
+                        supported_tools: Vec::new(),
+                    },
+                )
+                .await
+                .expect("connect remote->local bridge");
+
+                while let Some(command) = remote_dispatcher_rx.recv().await {
+                    let LedgerCommand::AppendLocal(env) = command else {
+                        continue;
+                    };
+                    if env.target_node_id.as_deref() != Some("local-aiua-01") {
+                        continue;
+                    }
+                    let target_role = env
+                        .target_agent_id
+                        .clone()
+                        .unwrap_or_else(|| OPERATOR_CHAT_REPLY_ROLE.into());
+                    let EventPayload::Inline { data } = env.payload else {
+                        continue;
+                    };
+                    bridge
+                        .send_request(IpcRequest::EmitTask {
+                            target_node: "local-aiua-01".into(),
+                            target_role,
+                            target_guest_id: None,
+                            task_json: data,
+                        })
+                        .await
+                        .expect("relay remote->local operator chat reply");
+                }
+            }
+        });
+
+        let mut management = PhiloticClient::connect(GuestIdentity {
+            guest_id: "operator-chat-test-remote".into(),
+            role: "management".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("management connect");
+        let mut remote_agent = PhiloticClient::connect_at(
+            &remote_socket_path,
+            GuestIdentity {
+                guest_id: "agent-jane-remote".into(),
+                role: "agent".into(),
+                supported_tools: Vec::new(),
+            },
+        )
+        .await
+        .expect("remote agent connect");
+
+        let remote_agent_task = tokio::spawn(async move {
+            let inbound = remote_agent.recv_task().await.expect("remote agent recv task");
+            let IpcResponse::InboundTask { task_json, .. } = inbound else {
+                panic!("unexpected inbound response to remote agent");
+            };
+            let payload: serde_json::Value =
+                serde_json::from_str(&task_json).expect("remote agent payload should decode");
+            assert_eq!(payload["source"], "operator_chat");
+            assert_eq!(payload["transport"], "operator_chat");
+            assert_eq!(payload["content"], "hello across the mesh");
+            let final_reply_to = payload["final_reply_to"]
+                .as_str()
+                .expect("final_reply_to should exist")
+                .to_string();
+            let final_reply_role = payload["final_reply_role"]
+                .as_str()
+                .expect("final_reply_role should exist")
+                .to_string();
+            let session_id = payload["session_id"]
+                .as_str()
+                .expect("session_id should exist")
+                .to_string();
+            let turn_id = payload["turn_id"]
+                .as_str()
+                .expect("turn_id should exist")
+                .to_string();
+            let chat_id = payload["chat_id"]
+                .as_str()
+                .expect("chat_id should exist")
+                .to_string();
+
+            remote_agent
+                .send_request(IpcRequest::EmitTask {
+                    target_node: final_reply_to.clone(),
+                    target_role: final_reply_role.clone(),
+                    target_guest_id: None,
+                    task_json: serde_json::json!({
+                        "action": "turn_event",
+                        "event": "waiting_remote_model",
+                        "session_id": session_id,
+                        "turn_id": turn_id,
+                        "chat_id": chat_id
+                    })
+                    .to_string(),
+                })
+                .await
+                .expect("remote agent emit turn event");
+
+            remote_agent
+                .send_request(IpcRequest::EmitTask {
+                    target_node: final_reply_to,
+                    target_role: final_reply_role,
+                    target_guest_id: None,
+                    task_json: serde_json::json!({
+                        "action": "send_reply",
+                        "session_id": session_id,
+                        "turn_id": turn_id,
+                        "chat_id": chat_id,
+                        "content": "hello back from remote agent"
+                    })
+                    .to_string(),
+                })
+                .await
+                .expect("remote agent emit final reply");
+        });
+
+        let reply = expect_operator_chat_reply(
+            management
+                .send_request(IpcRequest::SendOperatorChatTurn {
+                    target_node_id: "remote-aiua-01".into(),
+                    target_agent_id: "agent-jane-remote".into(),
+                    operator_session_id: "desktop-operator-session-remote".into(),
+                    conversation_id: None,
+                    content: "hello across the mesh".into(),
+                })
+                .await
+                .expect("remote operator chat request"),
+        );
+        assert_eq!(reply.target_node_id, "remote-aiua-01");
+        assert_eq!(reply.target_agent_id, "agent-jane-remote");
+        assert_eq!(reply.target_hotel, "remote-hotel");
+        assert_eq!(reply.delivery_kind, "router-routed");
+        assert_eq!(reply.reply_action, "send_reply");
+        assert_eq!(reply.observed_events, vec!["waiting_remote_model"]);
+        assert_eq!(reply.content, "hello back from remote agent");
+
+        remote_agent_task
+            .await
+            .expect("remote agent task should finish");
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        local_to_remote_bridge.abort();
+        let _ = local_to_remote_bridge.await;
+        remote_to_local_bridge.abort();
+        let _ = remote_to_local_bridge.await;
+        local_server_task.abort();
+        let _ = local_server_task.await;
+        remote_server_task.abort();
+        let _ = remote_server_task.await;
+        if Path::new(&local_socket_path).exists() {
+            let _ = std::fs::remove_file(&local_socket_path);
+        }
+        if Path::new(&remote_socket_path).exists() {
+            let _ = std::fs::remove_file(&remote_socket_path);
         }
     }
 

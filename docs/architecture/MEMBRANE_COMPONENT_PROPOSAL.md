@@ -1,3 +1,31 @@
+---
+title: "Membrane Component Proposal"
+doc_type: proposal
+domain: membrane-transport
+status: accepted-current-slice
+last_updated: 2026-03-19
+tags:
+  - membrane
+  - transport
+  - component-boundary
+  - sessions
+related_docs:
+  - ARCHITECTURE_STATUS.md
+  - MEMBRANE_EXTERNAL_AGENT_AND_EVENT_TRANSPORT_PROPOSAL.md
+  - TELEGRAM_INTEGRATION_PROPOSAL.md
+  - DESKTOP_MEMBRANE_PROPOSAL.md
+task_refs:
+  - docs/task.md
+proposal_id: membrane-component
+implements: []
+implemented_by: []
+active_seams:
+  - active-membrane-routing
+  - desktop-membrane-boundary
+source_of_truth_targets:
+  - ARCHITECTURE_STATUS.md
+---
+
 # Membrane Component Proposal
 
 ## Goal

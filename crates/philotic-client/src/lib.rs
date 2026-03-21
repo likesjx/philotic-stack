@@ -16,6 +16,166 @@ pub struct GuestIdentity {
     pub supported_tools: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesktopMembraneStatusView {
+    pub hotel: String,
+    pub daemon: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesktopMembraneGuestView {
+    pub guest_id: String,
+    pub name: String,
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<String>,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uptime: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorAgentView {
+    pub agent_id: String,
+    pub persona_name: String,
+    pub authority_hotel: String,
+    #[serde(default)]
+    pub toolset_tags: Vec<String>,
+    #[serde(default)]
+    pub active_session: bool,
+}
+
+pub type DesktopMembraneAgentView = OperatorAgentView;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTargetReachabilityView {
+    pub protocol: String,
+    pub host: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTargetView {
+    pub target_node_id: String,
+    pub target_hotel: String,
+    pub source_hotel: String,
+    #[serde(default)]
+    pub is_local: bool,
+    #[serde(default)]
+    pub roles: Vec<String>,
+    #[serde(default)]
+    pub models: Vec<String>,
+    #[serde(default)]
+    pub tools: Vec<String>,
+    #[serde(default)]
+    pub advertised_roles: Vec<String>,
+    pub freshness_state: String,
+    pub freshness_age_secs: u64,
+    pub freshness_ttl_secs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reachability: Option<OperatorTargetReachabilityView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTargetStatusView {
+    pub target_node_id: String,
+    pub target_hotel: String,
+    pub source_hotel: String,
+    pub observation_kind: String,
+    pub daemon_status: String,
+    pub freshness_state: String,
+    pub freshness_age_secs: u64,
+    pub freshness_ttl_secs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reachability: Option<OperatorTargetReachabilityView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTargetGuestInventoryView {
+    pub target_node_id: String,
+    pub target_hotel: String,
+    pub source_hotel: String,
+    pub observation_kind: String,
+    pub available: bool,
+    pub pending_remote_query_state: String,
+    #[serde(default)]
+    pub guests: Vec<DesktopMembraneGuestView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTargetAgentInventoryView {
+    pub target_node_id: String,
+    pub target_hotel: String,
+    pub source_hotel: String,
+    pub observation_kind: String,
+    pub available: bool,
+    pub pending_remote_query_state: String,
+    #[serde(default)]
+    pub agents: Vec<OperatorAgentView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+pub type DesktopMembraneTargetReachabilityView = OperatorTargetReachabilityView;
+pub type DesktopMembraneTargetView = OperatorTargetView;
+pub type DesktopMembraneTargetStatusView = OperatorTargetStatusView;
+pub type DesktopMembraneTargetGuestInventoryView = OperatorTargetGuestInventoryView;
+pub type DesktopMembraneTargetAgentInventoryView = OperatorTargetAgentInventoryView;
+
+pub const OPERATOR_SURFACE_QUERY_ROLE: &str = "management.operator_surface_query";
+pub const OPERATOR_SURFACE_QUERY_REPLY_ROLE: &str = "management.operator_surface_query.reply";
+pub const OPERATOR_SURFACE_QUERY_HANDOFF_KIND: &str = "operator_surface_query";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OperatorSurfaceQueryHandoff {
+    pub handoff_kind: String,
+    pub surface: String,
+    pub request_id: String,
+    pub source_hotel: String,
+    pub target_hotel: String,
+    pub target_node_id: String,
+    pub caller_kind: String,
+    pub caller_id: String,
+    pub visibility_scope: String,
+    pub grant_scope: String,
+    pub intent: String,
+    #[serde(default)]
+    pub payload: serde_json::Value,
+    pub reply_to_node: String,
+    pub reply_to_role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_guest_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace: Option<String>,
+}
+
+pub const OPERATOR_CHAT_REPLY_ROLE: &str = "management.operator_chat.reply";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorChatTurnReply {
+    pub source_hotel: String,
+    pub target_hotel: String,
+    pub target_node_id: String,
+    pub target_agent_id: String,
+    pub operator_session_id: String,
+    pub conversation_id: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub delivery_kind: String,
+    pub reply_action: String,
+    #[serde(default)]
+    pub observed_events: Vec<String>,
+    #[serde(default)]
+    pub observed_partial_replies: Vec<String>,
+    pub content: String,
+}
+
 /// A single entry in an agent's command manifest — describes one slash command the agent handles.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandManifestEntry {
@@ -395,15 +555,57 @@ pub enum IpcRequest {
         lease_key: String,
         agent_id: String,
     },
+    AcquireDesktopMembraneLease {
+        lease_key: String,
+        port: u16,
+    },
     GetTelegramPollLeaseOwner {
         lease_key: String,
     },
+    GetDesktopMembraneLeaseOwner {
+        lease_key: String,
+    },
+    GetDesktopMembraneStatus,
+    GetDesktopMembraneTargetStatus {
+        target_node_id: String,
+    },
+    QueryOperatorTargets,
+    QueryOperatorTargetStatus {
+        target_node_id: String,
+    },
+    QueryOperatorTargetGuests {
+        target_node_id: String,
+    },
+    QueryOperatorTargetAgents {
+        target_node_id: String,
+    },
+    SendOperatorChatTurn {
+        target_node_id: String,
+        target_agent_id: String,
+        operator_session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation_id: Option<String>,
+        content: String,
+    },
+    ListDesktopMembraneGuests,
+    ListDesktopMembraneTargetGuests {
+        target_node_id: String,
+    },
+    ListDesktopMembraneAgents,
+    ListDesktopMembraneTargets,
     RenewTelegramPollLease {
         lease_key: String,
         agent_id: String,
         lease_epoch: u64,
     },
+    RenewDesktopMembraneLease {
+        lease_key: String,
+        lease_epoch: u64,
+    },
     ReleaseTelegramPollLease {
+        lease_key: String,
+    },
+    ReleaseDesktopMembraneLease {
         lease_key: String,
     },
     HandoffToRole {
@@ -578,9 +780,50 @@ pub enum IpcResponse {
         granted: bool,
         lease: Option<LeaseEnvelope>,
     },
+    DesktopMembraneLease {
+        desktop_granted: bool,
+        desktop_lease: Option<LeaseEnvelope>,
+    },
     TelegramPollLeaseStatus {
         active: bool,
         lease: Option<LeaseEnvelope>,
+    },
+    DesktopMembraneLeaseStatus {
+        desktop_active: bool,
+        desktop_lease: Option<LeaseEnvelope>,
+    },
+    DesktopMembraneStatusView {
+        membrane_status: DesktopMembraneStatusView,
+    },
+    DesktopMembraneTargetStatusView {
+        membrane_target_status: DesktopMembraneTargetStatusView,
+    },
+    OperatorTargetsView {
+        operator_targets: Vec<OperatorTargetView>,
+    },
+    OperatorTargetStatusView {
+        operator_target_status: OperatorTargetStatusView,
+    },
+    OperatorTargetGuestsView {
+        operator_target_guests: OperatorTargetGuestInventoryView,
+    },
+    OperatorTargetAgentsView {
+        operator_target_agents: OperatorTargetAgentInventoryView,
+    },
+    OperatorChatTurnReply {
+        operator_chat_reply: OperatorChatTurnReply,
+    },
+    DesktopMembraneGuestsView {
+        membrane_guests: Vec<DesktopMembraneGuestView>,
+    },
+    DesktopMembraneTargetGuestsView {
+        membrane_target_guests: DesktopMembraneTargetGuestInventoryView,
+    },
+    DesktopMembraneAgentsView {
+        membrane_agents: Vec<DesktopMembraneAgentView>,
+    },
+    DesktopMembraneTargetsView {
+        membrane_targets: Vec<DesktopMembraneTargetView>,
     },
     HandoffAck {
         handoff_guest_id: String,

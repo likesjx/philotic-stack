@@ -905,6 +905,136 @@ Seam IDs: `runtime-authority-leases`
 - [x] Harden the startup dual-poller handoff so clearing dead guest PIDs cannot accidentally reactivate a retired poller.
 - [ ] Decide which next non-Telegram runtime seam should adopt the lease archetype first.
 
+## New Project: Desktop Membrane
+
+Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membrane-view-models`
+
+- [x] Analyze the current `philotic-web serve` and embedded `jaredlikes-desktop` coupling.
+- [x] Write [DESKTOP_MEMBRANE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DESKTOP_MEMBRANE_PROPOSAL.md).
+- [x] Define the first `desktop_membrane` authority lease scope and owner identity.
+- [x] Acquire the desktop membrane lease before `philotic-web serve` exposes privileged routes.
+- [x] Renew the lease while an authenticated local operator session is active.
+- [x] Release the lease on clean shutdown and fail closed on lost lease or hotel disconnect.
+- [x] Remove unauthenticated token injection from the embedded desktop bootstrap.
+- [x] Replace websocket query-string token auth with a bounded same-session attach mechanism.
+- [x] Stop persisting injected desktop session credentials by default.
+- [ ] Replace direct SQLite/config reads in `serve` with the first hotel-owned read models for:
+  - [x] service status
+  - [x] guests
+  - [x] redacted agents
+- [x] Decide that apartment inspection does not belong in the default desktop membrane surface; if it returns later, it should come back only as a shaped hotel-owned diagnostic view.
+- [ ] Define the first mesh-aware desktop routing contract for:
+  - [x] local-hotel reads
+  - [x] remote single-target inventory routing with source/freshness attribution
+  - mesh-aggregate reads
+- [ ] Define the first target selection and attribution model so desktop views can show:
+  - [x] source hotel
+  - [x] freshness
+  - pending remote action state
+- [ ] Define the first remote-target read models for:
+  - [x] target inventory / mesh targets
+  - [x] target hotel status (local-canonical, remote-canonical when query succeeds, heartbeat-observed fallback when it does not)
+  - [x] target guest inventory
+  - [x] bounded target agent inventory
+- [ ] Extract the plug-and-play membrane boundary before adding more operator surface:
+  - [x] write [OPERATOR_MEMBRANE_PLUGIN_BOUNDARY_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OPERATOR_MEMBRANE_PLUGIN_BOUNDARY_PROPOSAL.md)
+  - [x] define reusable operator surface planes separate from desktop-specific route names
+  - [x] define the first target-oriented operator surface family:
+    - `operator.targets.list`
+    - `operator.targets.status`
+    - `operator.targets.guests`
+    - `operator.targets.agents`
+  - [x] define caller-aware redaction/posture/grant semantics so agents and automation can query the same surfaces when allowed
+  - [x] define the first router-mediated handoff envelope for non-local operator surface execution
+  - [x] land the first generic operator target IPC contract for:
+    - `operator.targets.list`
+    - `operator.targets.status`
+    - `operator.targets.guests`
+  - [x] identify which current `desktop_membrane.*` IPC/query contracts are acceptable transitional adapters versus core-boundary drift
+    - acceptable transitional adapters:
+      - desktop HTTP route shapes in `philotic-web` for targets, target status, and target guests
+    - unacceptable core-boundary drift:
+      - new desktop-specific shared IPC variants where generic operator surface names can be used
+      - new desktop-specific daemon worker/action families for operator surface execution
+      - resuming remote agent inventory or operator chat on fresh `desktop_membrane.*` contracts
+  - [ ] move desktop-specific operator feature assembly out of `aiua` bootstrap and shared IPC enums
+    - first extraction foothold landed:
+      - routed target status/guest queries now use shared `OperatorSurfaceQueryHandoff`
+      - daemon worker role is now generic `management.operator_surface_query`
+      - remote target status/guest execution no longer depends on desktop-named action aliases
+      - shared target payload structs are now operator-owned, with `DesktopMembraneTarget*` names retained only as compatibility aliases
+      - `operator.targets.agents` now exists as a bounded redacted target-agent inventory surface with local canonical reads and routed remote queries
+    - still remaining:
+      - move more operator feature assembly out of `aiua` bootstrap
+      - reduce desktop-specific shared IPC view naming beyond the remaining compatibility aliases
+  - [x] resume remote agent inventory only after the extracted operator seam exists
+  - [ ] resume operator chat only after the extracted operator seam exists:
+    - [x] define routed operator chat as a membrane ingress into the same canonical agent conversation path used by Telegram
+    - [x] require local and remote chat turns to hand off through the router rather than desktop-specific transport choreography
+    - [x] keep operator control-plane queries (`operator.targets.*`) separate from agent conversation surfaces
+    - [x] preserve the same chat surface even if backing authority moves from hotel-local state to a graph-runner-backed authority
+    - [x] land the first thin desktop adapter route:
+      - `POST /api/mesh/targets/:target_node_id/agents/:agent_id/chat`
+      - routes through `SendOperatorChatTurn`
+      - reuses the canonical agent conversation path via routed `EmitTask`
+    - [x] add first turn-event observation for operator chat replies
+      - `SendOperatorChatTurn` now keeps listening for `turn_event` messages before the final reply
+      - observed events are returned in the `OperatorChatTurnReply` envelope
+    - [x] add live push reply streaming for operator chat while the turn is still in flight
+      - desktop chat route now returns `202 Accepted`
+      - `philotic-web` streams `operator_chat:turn_event`, `operator_chat:reply`, and `operator_chat:error` over `/ws` while the routed turn is active
+      - `operator_chat:partial_reply` is now preserved as a non-terminal websocket frame too
+    - [x] prove remote-hotel routed operator chat end-to-end
+      - targeted `aiua` test now runs a local hotel, a remote hotel, and bidirectional bridge relays so a routed operator chat turn leaves local authority, reaches a remote agent, and returns through the local reply inbox
+    - [x] let the lower conversation/model path emit optional partial reply chunks without treating them as final completion
+      - `model-router` can now carry optional `partial_replies` in `model_result.result`
+      - `philote` emits those as `partial_reply` frames before the final `send_reply`
+      - default providers still emit no partial chunks unless they explicitly supply them
+- [x] Make the target guest inventory seam explicit:
+  - local target guest inventory uses canonical local hotel reads
+  - remote target guest inventory now attempts a direct target-hotel management query over the mesh
+  - when that query cannot complete, the membrane returns an explicit `remote-query-failed` state instead of inventing guest truth from registry observation
+- [ ] Keep remote target truth hotel-owned:
+  - no direct local cache treated as canonical
+  - no browser-direct remote `aiua` protocol
+  - no local mutation simulation standing in for target execution
+- [ ] Define the first desktop-aware operator session posture flow for mesh-wide admin work.
+- [ ] Define which remote actions require explicit target-scoped grants versus elevated session posture alone.
+- [ ] Define the first high-trust remote action ceremonies for:
+  - secret rotation
+  - node shutdown/restart
+  - mesh topology mutation
+  - guest migration
+- [ ] Define the first mesh-aggregate read models for:
+  - node inventory
+  - topology view
+  - cross-node operation progress
+  - grant/elevation status summaries
+- [ ] Define the desktop UI asset source-of-truth split between:
+  - `jaredlikes-desktop` source ownership
+  - `philotic-web` embedding/runtime ownership
+  - release pipeline provenance ownership
+- [ ] Define the frontend development workflow for:
+  - frontend-first local iteration
+  - integrated membrane development
+  - embedded release-shape verification
+- [ ] Define the UI asset build contract:
+  - deterministic `dist` expectations
+  - asset manifest format
+  - embedded build metadata surfaced at runtime
+- [ ] Teach `philotic-web` embedding to record and expose:
+  - UI build id
+  - desktop source revision
+  - asset hash
+  - build timestamp
+- [ ] Define release gating for embedded desktop assets so stable releases reject:
+  - placeholder UI
+  - stale `ui-dist`
+  - missing provenance metadata
+  - unknown/dirty desktop source state
+- [ ] Define the CI/release workflow for acquiring desktop UI assets explicitly rather than relying on opportunistic sibling-repo discovery.
+- [ ] Add integrated release-shape verification that proves the embedded assets served by `philotic-web` match the recorded asset manifest.
+
 ## Next Project: Tool Assembly and Routed Execution
 
 - [ ] Review [TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md).
@@ -1060,7 +1190,11 @@ Seam IDs: `wider-client-adoption`, `philotic-native-memory-integration`
 - [ ] Telegram streaming: add message length chunking to `membrane` — split at paragraph boundaries before `sendMessage`, shared `send_formatted_text` helper.
 - [x] Telegram streaming Layer 2 protocol: add `TurnEventPayload` to `agent-core/src/protocol.rs` and `emit_turn_event` helper to `AgentRuntime`; emit `waiting_tool`, `waiting_approval` events back to membrane via the existing `EmitTask` path.
 - [x] Telegram streaming Layer 2 membrane: handle `action = "turn_event"` in `InboundTask` dispatch — maintain or cancel typing heartbeat per event type; stop typing on `waiting_approval`.
-- [ ] Telegram streaming partial reply: add `action = "partial_reply"` signal from `philote` once model-router supports chunked output; implement edit-based progressive delivery in `membrane`.
+- [x] Telegram streaming partial reply: teach the lower conversation/model path to emit real `action = "partial_reply"` content chunks, then implement edit-based progressive delivery in `membrane`.
+  - [x] preserve `partial_reply` as a non-terminal transport frame across operator chat and Telegram membrane handling so future producers do not get mistaken for `send_reply`
+  - [x] allow `model-router` / `philote` to carry optional `partial_replies` through the lower conversation path
+  - [x] edit the active Telegram draft message on `partial_reply` and final text completion when possible
+  - [ ] upgrade providers from optional batch partials to native incremental generation
 - [ ] Voice machine design: define STT, TTS, speech-to-speech, transcript generation, and media artifact/session handling.
 - [ ] Nostr communication-plane investigation (`nostr-membrane-contract`): evaluate Nostr as a decentralized/event-native membrane with relay trust classes, addressed-event gating, signature verification, replay defense, and perimeter/sentinel integration before any implementation.
 - [ ] A2A membrane investigation (`a2a-membrane-contract`): evaluate `A2A` as an external agent interoperability membrane with explicit peer trust records, bounded capability exposure, approval semantics for privileged actions, and no inheritance of internal mesh trust.

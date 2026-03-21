@@ -974,6 +974,7 @@ pub struct AudioArtifact {
 pub struct TextResult {
     pub display_text: Option<String>,
     pub spoken_text: Option<String>,
+    pub partial_replies: Vec<String>,
     pub working_memory_delta: Option<String>,
     pub follow_up_questions: Vec<String>,
     pub intent_summary: Option<String>,
@@ -988,6 +989,7 @@ pub enum ProviderOutput {
         content: String,
         display_text: Option<String>,
         spoken_text: Option<String>,
+        partial_replies: Vec<String>,
         working_memory_delta: Option<String>,
         follow_up_questions: Vec<String>,
         intent_summary: Option<String>,
@@ -1047,6 +1049,7 @@ impl ControllerResponseEnvelope {
                 content,
                 display_text,
                 spoken_text,
+                partial_replies,
                 working_memory_delta,
                 follow_up_questions,
                 intent_summary,
@@ -1057,6 +1060,7 @@ impl ControllerResponseEnvelope {
                 let text_result = TextResult {
                     display_text: display_text.or_else(|| Some(content.clone())),
                     spoken_text,
+                    partial_replies,
                     working_memory_delta,
                     follow_up_questions,
                     intent_summary,
@@ -1155,6 +1159,7 @@ impl ControllerResponseEnvelope {
 fn serialize_text_result(task: &ControllerTask, result: &TextResult) -> Value {
     let channels_requested = !task.response_contract.channels.is_empty();
     let include_spoken = channels_requested && task.wants_channel("spoken_text");
+    let include_partial = channels_requested && task.wants_channel("partial_replies");
     let include_memory = channels_requested && task.wants_channel("working_memory_delta");
     let include_questions = channels_requested && task.wants_channel("follow_up_questions");
     let include_intent = channels_requested && task.wants_channel("intent_summary");
@@ -1165,6 +1170,7 @@ fn serialize_text_result(task: &ControllerTask, result: &TextResult) -> Value {
     json!({
         "display_text": result.display_text,
         "spoken_text": if include_spoken { result.spoken_text.clone() } else { None::<String> },
+        "partial_replies": if include_partial { result.partial_replies.clone() } else { Vec::<String>::new() },
         "working_memory_delta": if include_memory { result.working_memory_delta.clone() } else { None::<String> },
         "follow_up_questions": if include_questions { result.follow_up_questions.clone() } else { Vec::<String>::new() },
         "intent_summary": if include_intent { result.intent_summary.clone() } else { None::<String> },
@@ -1748,6 +1754,7 @@ mod tests {
                 content: "Hello back".into(),
                 display_text: None,
                 spoken_text: Some("Hello back, warmly.".into()),
+                partial_replies: vec!["Hello".into(), "Hello back".into()],
                 working_memory_delta: Some("The user greeted the assistant.".into()),
                 follow_up_questions: vec!["How can I help next?".into()],
                 intent_summary: Some("Exchange greetings".into()),
@@ -1761,6 +1768,7 @@ mod tests {
         assert_eq!(response.content, "Hello back");
         assert_eq!(response.result["display_text"], "Hello back");
         assert!(response.result["spoken_text"].is_null());
+        assert_eq!(response.result["partial_replies"], json!([]));
         assert_eq!(response.result["follow_up_questions"], json!([]));
     }
 
@@ -1774,7 +1782,7 @@ mod tests {
                 }
             },
             "response_contract": {
-                "channels": ["spoken_text", "working_memory_delta", "follow_up_questions", "intent_summary", "memory_candidate"]
+                "channels": ["spoken_text", "partial_replies", "working_memory_delta", "follow_up_questions", "intent_summary", "memory_candidate"]
             }
         }))
         .unwrap();
@@ -1786,6 +1794,7 @@ mod tests {
                 content: "Hello back".into(),
                 display_text: Some("Hello back".into()),
                 spoken_text: Some("Hello back, warmly.".into()),
+                partial_replies: vec!["Hello".into(), "Hello back".into()],
                 working_memory_delta: Some("The user greeted the assistant.".into()),
                 follow_up_questions: vec!["How can I help next?".into()],
                 intent_summary: Some("Exchange greetings".into()),
@@ -1801,6 +1810,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.result["spoken_text"], "Hello back, warmly.");
+        assert_eq!(response.result["partial_replies"], json!(["Hello", "Hello back"]));
         assert_eq!(
             response.result["working_memory_delta"],
             "The user greeted the assistant."

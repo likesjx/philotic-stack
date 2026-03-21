@@ -1107,6 +1107,24 @@ impl GraphStorage for SqliteGraphStorage {
         }
     }
 
+    fn list_agent_identities(&self) -> Result<Vec<crate::storage::AgentIdentityRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT agent_id, persona_name, authority_hotel, bundle_json FROM agent_identities ORDER BY agent_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let bundle_json: String = row.get(3)?;
+            Ok(crate::storage::AgentIdentityRecord {
+                agent_id: row.get(0)?,
+                persona_name: row.get(1)?,
+                authority_hotel: row.get(2)?,
+                bundle_json: serde_json::from_str(&bundle_json)
+                    .unwrap_or_else(|_| serde_json::json!({})),
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     fn sync_apartment(
         &self,
         agent_id: &str,

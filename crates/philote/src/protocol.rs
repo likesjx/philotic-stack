@@ -120,6 +120,15 @@ pub struct FinalReplyPayload {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct PartialReplyPayload {
+    pub action: &'static str,
+    pub session_id: String,
+    pub turn_id: String,
+    pub chat_id: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct TurnEventPayload {
     pub action: &'static str,
     /// Value of `TurnPhase::as_str()` for the new phase.

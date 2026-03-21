@@ -674,6 +674,12 @@ mod tests {
             Ok(())
         }
 
+        fn list_agent_identities(
+            &self,
+        ) -> Result<Vec<ansible_mesh_core::storage::AgentIdentityRecord>> {
+            Ok(vec![])
+        }
+
         fn get_agent_identity(
             &self,
             _agent_id: &str,

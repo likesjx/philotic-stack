@@ -1,27 +1,35 @@
 //! `philotic-web serve` — local management HTTP + WebSocket server.
 //!
-//! Generates a random session token on startup, prints it, and requires it
-//! on every request as `Authorization: Bearer <token>`.
+//! Generates a random session token on startup, binds it to a same-origin
+//! session cookie for the embedded UI, and still accepts
+//! `Authorization: Bearer <token>` as an explicit transitional compatibility
+//! path.
 //!
 //! REST endpoints:
 //!   GET  /api/status
 //!   GET  /api/guests
 //!   GET  /api/agents
+//!   GET  /api/mesh/targets
+//!   GET  /api/mesh/targets/:target_node_id/status
+//!   GET  /api/mesh/targets/:target_node_id/guests
+//!   GET  /api/mesh/targets/:target_node_id/agents
+//!   POST /api/mesh/targets/:target_node_id/agents/:agent_id/chat
 //!   GET  /api/sessions    (stub — returns [] until session table exists)
-//!   GET  /api/apartments/:agent_id
+//!   GET  /api/apartments/:agent_id   (disabled by default for the desktop membrane)
 //!   POST /api/guests/:guest_id/restart
 //!   POST /api/guests/:guest_id/stop
 //!
 //! WebSocket:
-//!   GET  /ws?token=<token>  — live push of guest/session state changes
+//!   GET  /ws  — live push of guest/session state changes
+//!              auth via same-origin cookie
 
-use anyhow::Result;
+use anyhow::{anyhow, bail, Context, Result};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, Query, State,
+        Path, State,
     },
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{get, post},
     Router,
@@ -31,9 +39,17 @@ use rusqlite::Connection;
 use rust_embed::RustEmbed;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
-use tokio::sync::broadcast;
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use tokio::sync::{broadcast, watch, Mutex};
 use tower_http::cors::{AllowOrigin, CorsLayer};
+
+use philotic_client::{
+    DesktopMembraneAgentView, DesktopMembraneGuestView, DesktopMembraneStatusView,
+    GuestIdentity, IpcRequest, IpcResponse, LeaseEnvelope,
+    OperatorTargetAgentInventoryView, OperatorTargetGuestInventoryView,
+    OperatorTargetStatusView, OperatorTargetView, PhiloticClient,
+    OPERATOR_CHAT_REPLY_ROLE,
+};
 
 // ── Embedded UI assets ────────────────────────────────────────────────────────
 
@@ -41,27 +57,57 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 #[folder = "ui-dist/"]
 struct UiAssets;
 
+const AUTH_COOKIE_NAME: &str = "philotic_session";
+const AUTH_COOKIE_MAX_AGE_SECS: u64 = 60 * 60 * 8;
+const HEADER_COOP: &str = "cross-origin-opener-policy";
+const HEADER_CORP: &str = "cross-origin-resource-policy";
+
 // ── State shared across request handlers ─────────────────────────────────────
 
 #[derive(Clone)]
 struct AppState {
     token: Arc<String>,
-    port: u16,
-    db_path: Arc<PathBuf>,
-    config_path: Arc<PathBuf>,
+    db_path: PathBuf,
     /// Broadcast channel for WebSocket push events
     tx: broadcast::Sender<String>,
+}
+
+#[derive(Clone)]
+struct DesktopMembraneLeaseHandle {
+    client: Arc<Mutex<PhiloticClient>>,
+    lease_key: Arc<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct OperatorChatTurnBody {
+    #[serde(default)]
+    operator_session_id: Option<String>,
+    #[serde(default)]
+    conversation_id: Option<String>,
+    content: String,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct OperatorChatAcceptedView {
+    accepted: bool,
+    target_node_id: String,
+    target_agent_id: String,
+    operator_session_id: String,
+    conversation_id: String,
+    session_id: String,
+    turn_id: String,
+    delivery_kind: String,
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
 pub async fn run(
     port: u16,
-    db: Option<PathBuf>,
+    _db: Option<PathBuf>,
     config: Option<PathBuf>,
     allow_origins: Option<String>,
 ) -> Result<()> {
-    let db_path = db.unwrap_or_else(|| match crate::init::active_profile() {
+    let db_path = _db.unwrap_or_else(|| match crate::init::active_profile() {
         Some(_) => crate::init::profile_dir().join("context.db"),
         None => PathBuf::from("aiua_context.db"),
     });
@@ -69,6 +115,9 @@ pub async fn run(
         Some(_) => crate::init::profile_dir().join("config.json"),
         None => PathBuf::from("mesh-config.json"),
     });
+    let hotel = read_hotel_name(&config_path);
+    let lease_key = desktop_membrane_lease_key(&hotel);
+    let lease_handle = acquire_desktop_membrane_lease(&lease_key, port).await?;
 
     // Generate session token
     let token: String = {
@@ -81,9 +130,7 @@ pub async fn run(
 
     let state = AppState {
         token: Arc::new(token.clone()),
-        port,
-        db_path: Arc::new(db_path),
-        config_path: Arc::new(config_path),
+        db_path,
         tx,
     };
 
@@ -95,12 +142,29 @@ pub async fn run(
         .route("/api/status", get(handle_status))
         .route("/api/guests", get(handle_guests))
         .route("/api/agents", get(handle_agents))
+        .route("/api/mesh/targets", get(handle_mesh_targets))
+        .route(
+            "/api/mesh/targets/:target_node_id/status",
+            get(handle_mesh_target_status),
+        )
+        .route(
+            "/api/mesh/targets/:target_node_id/guests",
+            get(handle_mesh_target_guests),
+        )
+        .route(
+            "/api/mesh/targets/:target_node_id/agents",
+            get(handle_mesh_target_agents),
+        )
+        .route(
+            "/api/mesh/targets/:target_node_id/agents/:agent_id/chat",
+            post(handle_mesh_target_agent_chat),
+        )
         .route("/api/sessions", get(handle_sessions))
         .route("/api/apartments/:agent_id", get(handle_apartment))
         .route("/api/guests/:guest_id/restart", post(handle_guest_restart))
         .route("/api/guests/:guest_id/stop", post(handle_guest_stop))
         .route("/ws", get(handle_ws))
-        // Embedded UI — index.html gets token injected; all other assets served as-is
+        // Embedded UI — index.html gets token injected; cookie auth bootstrap; all other assets served as-is
         .route("/", get(handle_index))
         .fallback(get(handle_static))
         .layer(cors)
@@ -108,12 +172,17 @@ pub async fn run(
 
     let addr = format!("127.0.0.1:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let renew_handle = tokio::spawn(run_desktop_membrane_lease_renewal(
+        lease_handle.clone(),
+        shutdown_tx.clone(),
+    ));
 
     println!("philotic-web serve");
     println!("──────────────────────────────────────────");
     println!("  http://127.0.0.1:{port}");
     println!();
-    println!("  Session token: {token}");
+    println!("  Debug token: {token}");
     println!();
     println!("  Press Ctrl-C to stop.");
 
@@ -122,35 +191,254 @@ pub async fn run(
         .arg(format!("http://127.0.0.1:{port}"))
         .spawn();
 
-    axum::serve(listener, app).await?;
+    let shutdown_reason = wait_for_shutdown(shutdown_rx);
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_reason)
+        .await?;
+
+    let _ = shutdown_tx.send(true);
+    let _ = renew_handle.await;
+    release_desktop_membrane_lease(&lease_handle).await?;
     Ok(())
+}
+
+fn desktop_membrane_lease_key(hotel: &str) -> String {
+    format!("desktop:{hotel}:operator-surface")
+}
+
+async fn acquire_desktop_membrane_lease(
+    lease_key: &str,
+    port: u16,
+) -> Result<DesktopMembraneLeaseHandle> {
+    let socket = crate::start::socket_path("aiua");
+    let identity = GuestIdentity {
+        guest_id: format!("philotic-web-membrane-{port}"),
+        role: "management".into(),
+        supported_tools: vec![],
+    };
+    let mut client = PhiloticClient::connect_at(&socket, identity)
+        .await
+        .with_context(|| format!("connect to hotel at {socket} for desktop membrane lease"))?;
+
+    let response = client
+        .send_request(IpcRequest::AcquireDesktopMembraneLease {
+            lease_key: lease_key.to_string(),
+            port,
+        })
+        .await
+        .context("acquire desktop membrane lease")?;
+
+    let lease = match response {
+        IpcResponse::DesktopMembraneLease {
+            desktop_granted: true,
+            desktop_lease: Some(lease),
+        } => lease,
+        IpcResponse::DesktopMembraneLease {
+            desktop_granted: false,
+            desktop_lease: Some(lease),
+        } => {
+            bail!(
+                "desktop membrane lease [{}] is already held by [{}] (epoch {})",
+                lease.lease_scope,
+                lease.owner_guest_id,
+                lease.lease_epoch
+            );
+        }
+        other => {
+            return Err(anyhow!(
+                "unexpected desktop membrane lease response: {other:?}"
+            ))
+        }
+    };
+
+    println!(
+        "  Desktop membrane lease: {} (owner {}, epoch {})",
+        lease.lease_scope, lease.owner_guest_id, lease.lease_epoch
+    );
+
+    Ok(DesktopMembraneLeaseHandle {
+        client: Arc::new(Mutex::new(client)),
+        lease_key: Arc::new(lease.lease_scope),
+    })
+}
+
+async fn release_desktop_membrane_lease(handle: &DesktopMembraneLeaseHandle) -> Result<()> {
+    let mut client = handle.client.lock().await;
+    let response = client
+        .send_request(IpcRequest::ReleaseDesktopMembraneLease {
+            lease_key: handle.lease_key.as_str().to_string(),
+        })
+        .await
+        .context("release desktop membrane lease")?;
+
+    match response {
+        IpcResponse::Standard { ok: true, .. } => Ok(()),
+        IpcResponse::Standard { message, .. } => {
+            Err(anyhow!("desktop membrane lease release failed: {message}"))
+        }
+        other => Err(anyhow!(
+            "unexpected desktop membrane lease release response: {other:?}"
+        )),
+    }
+}
+
+async fn run_desktop_membrane_lease_renewal(
+    handle: DesktopMembraneLeaseHandle,
+    shutdown_tx: watch::Sender<bool>,
+) {
+    let mut shutdown_rx = shutdown_tx.subscribe();
+    let mut epoch = match current_desktop_membrane_lease(&handle).await {
+        Ok(lease) => lease.lease_epoch,
+        Err(err) => {
+            eprintln!("desktop membrane lease startup check failed: {err:#}");
+            let _ = shutdown_tx.send(true);
+            return;
+        }
+    };
+    let mut interval = tokio::time::interval(Duration::from_secs(15));
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                match renew_desktop_membrane_lease(&handle, epoch).await {
+                    Ok(lease) => {
+                        epoch = lease.lease_epoch;
+                    }
+                    Err(err) => {
+                        eprintln!("desktop membrane lease renewal lost: {err:#}");
+                        let _ = shutdown_tx.send(true);
+                        return;
+                    }
+                }
+            }
+            changed = shutdown_rx.changed() => {
+                if changed.is_ok() && *shutdown_rx.borrow() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn current_desktop_membrane_lease(
+    handle: &DesktopMembraneLeaseHandle,
+) -> Result<LeaseEnvelope> {
+    let mut client = handle.client.lock().await;
+    let response = client
+        .send_request(IpcRequest::GetDesktopMembraneLeaseOwner {
+            lease_key: handle.lease_key.as_str().to_string(),
+        })
+        .await
+        .context("query desktop membrane lease owner")?;
+
+    match response {
+        IpcResponse::DesktopMembraneLeaseStatus {
+            desktop_active: true,
+            desktop_lease: Some(lease),
+        } => Ok(lease),
+        IpcResponse::DesktopMembraneLeaseStatus { .. } => Err(anyhow!(
+            "desktop membrane lease [{}] is no longer active",
+            handle.lease_key
+        )),
+        other => Err(anyhow!(
+            "unexpected desktop membrane lease status response: {other:?}"
+        )),
+    }
+}
+
+async fn renew_desktop_membrane_lease(
+    handle: &DesktopMembraneLeaseHandle,
+    lease_epoch: u64,
+) -> Result<LeaseEnvelope> {
+    let mut client = handle.client.lock().await;
+    let response = client
+        .send_request(IpcRequest::RenewDesktopMembraneLease {
+            lease_key: handle.lease_key.as_str().to_string(),
+            lease_epoch,
+        })
+        .await
+        .context("renew desktop membrane lease")?;
+
+    match response {
+        IpcResponse::DesktopMembraneLease {
+            desktop_granted: true,
+            desktop_lease: Some(lease),
+        } => Ok(lease),
+        IpcResponse::DesktopMembraneLease {
+            desktop_granted: false,
+            desktop_lease: Some(lease),
+        } => Err(anyhow!(
+            "desktop membrane lease [{}] moved to [{}] (epoch {})",
+            lease.lease_scope,
+            lease.owner_guest_id,
+            lease.lease_epoch
+        )),
+        IpcResponse::DesktopMembraneLease {
+            desktop_granted: false,
+            desktop_lease: None,
+        } => Err(anyhow!(
+            "desktop membrane lease [{}] renew was denied without an owner",
+            handle.lease_key
+        )),
+        other => Err(anyhow!(
+            "unexpected desktop membrane lease renew response: {other:?}"
+        )),
+    }
+}
+
+async fn wait_for_shutdown(mut shutdown_rx: watch::Receiver<bool>) {
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        changed = shutdown_rx.changed() => {
+            if changed.is_ok() && *shutdown_rx.borrow() {
+                return;
+            }
+        }
+    }
 }
 
 // ── Embedded UI handlers ──────────────────────────────────────────────────────
 
-/// Serve `index.html` with the session token injected as a JS global.
-/// The desktop reads `window.__PHILOTIC_AIUA_TOKEN__` on startup and
-/// auto-connects — the token is never visible in the URL or browser history.
+/// Serve `index.html` and bind the session token as a same-origin cookie.
 async fn handle_index(State(state): State<AppState>) -> Response {
     let html = match UiAssets::get("index.html") {
         Some(f) => String::from_utf8_lossy(f.data.as_ref()).into_owned(),
         None => return (StatusCode::NOT_FOUND, "UI not built").into_response(),
     };
 
-    let injection = format!(
-        "<script>window.__PHILOTIC_AIUA_TOKEN__={:?};window.__PHILOTIC_AIUA_URL__={:?};</script>",
-        state.token.as_str(),
-        format!("http://127.0.0.1:{}", state.port),
-    );
-
-    let html = html.replace("</head>", &format!("{injection}</head>"));
-
-    (
+    let mut response = (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
         html,
     )
-        .into_response()
+        .into_response();
+    let headers = response.headers_mut();
+    headers.insert(header::SET_COOKIE, auth_cookie_header(&state));
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(no_store_header_value()),
+    );
+    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        HeaderName::from_static(HEADER_COOP),
+        HeaderValue::from_static("same-origin"),
+    );
+    headers.insert(
+        HeaderName::from_static(HEADER_CORP),
+        HeaderValue::from_static("same-origin"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss:; object-src 'none'; frame-ancestors 'none'; base-uri 'self'",
+        ),
+    );
+    response
 }
 
 /// Serve any other embedded asset (JS, CSS, icons, etc.).
@@ -160,12 +448,27 @@ async fn handle_static(State(state): State<AppState>, uri: axum::http::Uri) -> R
 
     if let Some(asset) = UiAssets::get(path) {
         let mime = asset.metadata.mimetype();
-        (
+        let mut response = (
             StatusCode::OK,
             [(header::CONTENT_TYPE, mime)],
             asset.data.into_owned(),
         )
-            .into_response()
+            .into_response();
+        let headers = response.headers_mut();
+        headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+        headers.insert(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("no-referrer"),
+        );
+        headers.insert(
+            HeaderName::from_static(HEADER_COOP),
+            HeaderValue::from_static("same-origin"),
+        );
+        headers.insert(
+            HeaderName::from_static(HEADER_CORP),
+            HeaderValue::from_static("same-origin"),
+        );
+        response
     } else {
         // SPA fallback — let the client-side router handle it
         handle_index(State(state)).await
@@ -175,12 +478,37 @@ async fn handle_static(State(state): State<AppState>, uri: axum::http::Uri) -> R
 // ── Auth helper ───────────────────────────────────────────────────────────────
 
 fn check_auth(headers: &HeaderMap, state: &AppState) -> bool {
+    header_bearer_token(headers)
+        .or_else(|| cookie_token(headers, AUTH_COOKIE_NAME))
+        .map(|token| token == state.token.as_str())
+        .unwrap_or(false)
+}
+
+fn header_bearer_token(headers: &HeaderMap) -> Option<&str> {
     headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|t| t == state.token.as_str())
-        .unwrap_or(false)
+}
+
+fn cookie_token<'a>(headers: &'a HeaderMap, cookie_name: &str) -> Option<&'a str> {
+    let cookie_header = headers.get(header::COOKIE)?.to_str().ok()?;
+    cookie_header.split(';').map(str::trim).find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        (name == cookie_name).then_some(value)
+    })
+}
+
+fn auth_cookie_header(state: &AppState) -> HeaderValue {
+    HeaderValue::from_str(&format!(
+        "{AUTH_COOKIE_NAME}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={AUTH_COOKIE_MAX_AGE_SECS}",
+        state.token
+    ))
+    .expect("session cookie should be a valid header value")
+}
+
+fn no_store_header_value() -> &'static str {
+    "no-store, no-cache, must-revalidate, private"
 }
 
 fn unauthorized() -> Response {
@@ -198,17 +526,21 @@ async fn handle_status(headers: HeaderMap, State(state): State<AppState>) -> Res
         return unauthorized();
     }
 
-    let daemon_alive = crate::start::read_pid()
-        .map(|pid| crate::start::process_alive(pid))
-        .unwrap_or(false);
-
-    let hotel = read_hotel_name(&state.config_path);
+    let status = match ipc_desktop_membrane_status().await {
+        Ok(status) => status,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": err.to_string()})),
+            )
+                .into_response();
+        }
+    };
 
     Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
-        "hotel": hotel,
-        "daemon": if daemon_alive { "running" } else { "stopped" },
-        "db": state.db_path.display().to_string(),
+        "hotel": status.hotel,
+        "daemon": status.daemon,
     }))
     .into_response()
 }
@@ -220,7 +552,7 @@ async fn handle_guests(headers: HeaderMap, State(state): State<AppState>) -> Res
         return unauthorized();
     }
 
-    match query_guests(&state.db_path) {
+    match ipc_desktop_membrane_guests().await {
         Ok(guests) => Json(guests).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -230,61 +562,6 @@ async fn handle_guests(headers: HeaderMap, State(state): State<AppState>) -> Res
     }
 }
 
-fn query_guests(db_path: &PathBuf) -> Result<Vec<Value>> {
-    let conn = Connection::open(db_path)?;
-    let mut stmt = conn.prepare(
-        "SELECT guest_id, role, is_active, last_seen, active_pid FROM materialized_guests ORDER BY last_seen DESC"
-    )?;
-
-    let rows = stmt.query_map([], |row| {
-        let guest_id: String = row.get(0)?;
-        let role: String = row.get(1)?;
-        let is_active: bool = row.get(2)?;
-        let last_seen: Option<String> = row.get(3)?;
-        let active_pid: Option<String> = row.get(4)?;
-
-        // Check if process is actually alive
-        let pid_alive = active_pid
-            .as_ref()
-            .and_then(|p| p.parse::<u32>().ok())
-            .map(|pid| crate::start::process_alive(pid))
-            .unwrap_or(false);
-
-        let status = if is_active && pid_alive {
-            "running"
-        } else if is_active {
-            "stopped"
-        } else {
-            "inactive"
-        };
-
-        Ok(json!({
-            "guest_id": guest_id,
-            "name": role_to_name(&role),
-            "role": role,
-            "pid": active_pid,
-            "status": status,
-            "last_seen": last_seen,
-        }))
-    })?;
-
-    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-}
-
-fn role_to_name(role: &str) -> String {
-    // Convert "model.gemini" → "Gemini", "agent.jane" → "Jane", etc.
-    role.split('.')
-        .last()
-        .map(|s| {
-            let mut c = s.chars();
-            match c.next() {
-                None => String::new(),
-                Some(f) => f.to_uppercase().to_string() + c.as_str(),
-            }
-        })
-        .unwrap_or_else(|| role.to_string())
-}
-
 // ── GET /api/agents ───────────────────────────────────────────────────────────
 
 async fn handle_agents(headers: HeaderMap, State(state): State<AppState>) -> Response {
@@ -292,73 +569,347 @@ async fn handle_agents(headers: HeaderMap, State(state): State<AppState>) -> Res
         return unauthorized();
     }
 
-    let agents = query_agents(&state.db_path, &state.config_path);
-    Json(agents).into_response()
+    match ipc_desktop_membrane_agents().await {
+        Ok(agents) => Json(agents).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
-fn query_agents(db_path: &PathBuf, config_path: &PathBuf) -> Vec<Value> {
-    // Start with agent_identities from SQLite
-    let mut agents: Vec<Value> = Vec::new();
+// ── GET /api/mesh/targets ────────────────────────────────────────────────────
 
-    if let Ok(conn) = Connection::open(db_path) {
-        if let Ok(mut stmt) = conn.prepare(
-            "SELECT agent_id, persona_name, bundle_json FROM agent_identities ORDER BY agent_id",
-        ) {
-            if let Ok(rows) = stmt.query_map([], |row| {
-                let agent_id: String = row.get(0)?;
-                let persona_name: String = row.get(1)?;
-                let bundle_json: String = row.get(2)?;
-                Ok((agent_id, persona_name, bundle_json))
-            }) {
-                for row in rows.flatten() {
-                    let (agent_id, persona_name, bundle_json) = row;
-                    let bundle: Value = serde_json::from_str(&bundle_json).unwrap_or(Value::Null);
-                    agents.push(json!({
-                        "agent_id": agent_id,
-                        "persona_name": persona_name,
-                        "system_prompt": bundle.get("system_prompt"),
-                        "toolset_tags": bundle.get("toolset_tags").and_then(|v| v.as_array()).cloned().unwrap_or_default(),
-                        "active_session": false,  // TODO: join with sessions when table exists
-                    }));
-                }
-            }
-        }
+async fn handle_mesh_targets(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
     }
 
-    // Supplement with mesh-config.json for any agents not yet in the DB
-    if let Ok(raw) = std::fs::read_to_string(config_path) {
-        if let Ok(cfg) = serde_json::from_str::<Value>(&raw) {
-            if let Some(hotels) = cfg.get("hotels").and_then(|h| h.as_object()) {
-                for (_hotel, hotel_val) in hotels {
-                    if let Some(hotel_agents) = hotel_val.get("agents").and_then(|a| a.as_object())
-                    {
-                        for (key, agent) in hotel_agents {
-                            let agent_id = agent
-                                .get("agent_id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or(key.as_str())
-                                .to_string();
+    match ipc_desktop_membrane_targets().await {
+        Ok(targets) => Json(targets).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
 
-                            // Skip if already in DB results
-                            if agents.iter().any(|a| a["agent_id"] == agent_id) {
-                                continue;
-                            }
+async fn handle_mesh_target_status(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(target_node_id): Path<String>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
 
-                            agents.push(json!({
-                                "agent_id": agent_id,
-                                "persona_name": agent.get("persona_name"),
-                                "system_prompt": agent.get("system_prompt"),
-                                "toolset_tags": agent.get("toolset_tags").and_then(|v| v.as_array()).cloned().unwrap_or_default(),
-                                "active_session": false,
-                            }));
-                        }
+    match ipc_desktop_membrane_target_status(&target_node_id).await {
+        Ok(status) => Json(status).into_response(),
+        Err(err) => {
+            let status_code = if err
+                .to_string()
+                .contains("not currently active in the registry")
+            {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status_code, Json(json!({"error": err.to_string()}))).into_response()
+        }
+    }
+}
+
+async fn handle_mesh_target_guests(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(target_node_id): Path<String>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+
+    match ipc_desktop_membrane_target_guests(&target_node_id).await {
+        Ok(guests) => Json(guests).into_response(),
+        Err(err) => {
+            let status_code = if err
+                .to_string()
+                .contains("not currently active in the registry")
+            {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status_code, Json(json!({"error": err.to_string()}))).into_response()
+        }
+    }
+}
+
+async fn handle_mesh_target_agents(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(target_node_id): Path<String>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+
+    match ipc_desktop_membrane_target_agents(&target_node_id).await {
+        Ok(agents) => Json(agents).into_response(),
+        Err(err) => {
+            let status_code = if err
+                .to_string()
+                .contains("not currently active in the registry")
+            {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status_code, Json(json!({"error": err.to_string()}))).into_response()
+        }
+    }
+}
+
+async fn handle_mesh_target_agent_chat(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path((target_node_id, agent_id)): Path<(String, String)>,
+    axum::Json(body): axum::Json<OperatorChatTurnBody>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+
+    let operator_session_id = body
+        .operator_session_id
+        .unwrap_or_else(|| "desktop-membrane".into());
+
+    let targets = match ipc_desktop_membrane_targets().await {
+        Ok(targets) => targets,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": err.to_string()})),
+            )
+                .into_response()
+        }
+    };
+    let Some(target) = targets
+        .iter()
+        .find(|target| target.target_node_id == target_node_id)
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("mesh target [{target_node_id}] is not currently active in the registry")})),
+        )
+            .into_response();
+    };
+    let Some(local_target) = targets.iter().find(|target| target.is_local) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "local operator target is unavailable"})),
+        )
+            .into_response();
+    };
+    let local_node_id = local_target.target_node_id.clone();
+
+    let conversation_id = body
+        .conversation_id
+        .unwrap_or_else(|| format!("operator-chat:{operator_session_id}:{agent_id}"));
+    let session_id = conversation_id.clone();
+    let turn_id = new_operator_chat_id("operator-chat-turn");
+    let accepted = OperatorChatAcceptedView {
+        accepted: true,
+        target_node_id: target_node_id.clone(),
+        target_agent_id: agent_id.clone(),
+        operator_session_id: operator_session_id.clone(),
+        conversation_id: conversation_id.clone(),
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+        delivery_kind: if target.is_local {
+            "local-direct".into()
+        } else {
+            "router-routed".into()
+        },
+    };
+
+    let tx = state.tx.clone();
+    let accepted_for_error = accepted.clone();
+    tokio::spawn(async move {
+        if let Err(err) = stream_operator_chat_turn(
+            tx.clone(),
+            local_node_id,
+            target_node_id,
+            agent_id,
+            operator_session_id,
+            conversation_id,
+            session_id,
+            turn_id,
+            body.content,
+        )
+        .await
+        {
+            let _ = tx.send(
+                json!({
+                    "type": "operator_chat:error",
+                    "payload": {
+                        "target_node_id": accepted_for_error.target_node_id,
+                        "target_agent_id": accepted_for_error.target_agent_id,
+                        "operator_session_id": accepted_for_error.operator_session_id,
+                        "conversation_id": accepted_for_error.conversation_id,
+                        "session_id": accepted_for_error.session_id,
+                        "turn_id": accepted_for_error.turn_id,
+                        "message": err.to_string(),
                     }
-                }
+                })
+                .to_string(),
+            );
+        }
+    });
+
+    (StatusCode::ACCEPTED, Json(json!(accepted))).into_response()
+}
+
+async fn stream_operator_chat_turn(
+    tx: broadcast::Sender<String>,
+    local_node_id: String,
+    target_node_id: String,
+    agent_id: String,
+    operator_session_id: String,
+    conversation_id: String,
+    session_id: String,
+    turn_id: String,
+    content: String,
+) -> Result<()> {
+    let reply_guest_id = new_operator_chat_id("operator-chat");
+    let mut client = connect_client_with_identity(GuestIdentity {
+        guest_id: reply_guest_id.clone(),
+        role: OPERATOR_CHAT_REPLY_ROLE.into(),
+        supported_tools: vec![],
+    })
+    .await?;
+
+    match client
+        .send_request(IpcRequest::SubscribeInbox {
+            role: OPERATOR_CHAT_REPLY_ROLE.into(),
+        })
+        .await?
+    {
+        IpcResponse::Standard { ok: true, .. } => {}
+        other => bail!("unexpected operator chat inbox subscribe response: {other:?}"),
+    }
+
+    match client
+        .send_request(IpcRequest::EmitTask {
+            target_node: target_node_id.clone(),
+            target_role: "agent".into(),
+            target_guest_id: Some(agent_id.clone()),
+            task_json: json!({
+                "source": "operator_chat",
+                "transport": "operator_chat",
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "chat_id": conversation_id,
+                "content": content,
+                "final_reply_to": local_node_id,
+                "final_reply_role": OPERATOR_CHAT_REPLY_ROLE,
+                "final_reply_guest_id": reply_guest_id
+            })
+            .to_string(),
+        })
+        .await?
+    {
+        IpcResponse::Standard { ok: true, .. } => {}
+        other => bail!("unexpected operator chat emit response: {other:?}"),
+    }
+
+    loop {
+        let inbound = tokio::time::timeout(Duration::from_secs(30), client.recv_task())
+            .await
+            .map_err(|_| anyhow!("timed out waiting for operator chat reply"))??;
+        let IpcResponse::InboundTask { task_json, .. } = inbound else {
+            bail!("unexpected operator chat reply envelope: {inbound:?}");
+        };
+        let payload: Value = serde_json::from_str(&task_json)?;
+        let action = payload
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("send_reply");
+        match action {
+            "turn_event" => {
+                let _ = tx.send(
+                    json!({
+                        "type": "operator_chat:turn_event",
+                        "payload": {
+                            "target_node_id": target_node_id,
+                            "target_agent_id": agent_id,
+                            "operator_session_id": operator_session_id,
+                            "conversation_id": payload.get("chat_id").and_then(Value::as_str).unwrap_or(&conversation_id),
+                            "session_id": payload.get("session_id").and_then(Value::as_str).unwrap_or(&session_id),
+                            "turn_id": payload.get("turn_id").and_then(Value::as_str).unwrap_or(&turn_id),
+                            "event": payload.get("event").and_then(Value::as_str).unwrap_or("unknown")
+                        }
+                    })
+                    .to_string(),
+                );
+            }
+            "partial_reply" => {
+                let _ = tx.send(
+                    json!({
+                        "type": "operator_chat:partial_reply",
+                        "payload": {
+                            "target_node_id": target_node_id,
+                            "target_agent_id": agent_id,
+                            "operator_session_id": operator_session_id,
+                            "conversation_id": payload.get("chat_id").and_then(Value::as_str).unwrap_or(&conversation_id),
+                            "session_id": payload.get("session_id").and_then(Value::as_str).unwrap_or(&session_id),
+                            "turn_id": payload.get("turn_id").and_then(Value::as_str).unwrap_or(&turn_id),
+                            "content": payload.get("content").and_then(Value::as_str).unwrap_or_default()
+                        }
+                    })
+                    .to_string(),
+                );
+            }
+            "send_reply" => {
+                let _ = tx.send(
+                    json!({
+                        "type": "operator_chat:reply",
+                        "payload": {
+                            "target_node_id": target_node_id,
+                            "target_agent_id": agent_id,
+                            "operator_session_id": operator_session_id,
+                            "conversation_id": payload.get("chat_id").and_then(Value::as_str).unwrap_or(&conversation_id),
+                            "session_id": payload.get("session_id").and_then(Value::as_str).unwrap_or(&session_id),
+                            "turn_id": payload.get("turn_id").and_then(Value::as_str).unwrap_or(&turn_id),
+                            "reply_action": action,
+                            "content": payload.get("content").and_then(Value::as_str).unwrap_or_default()
+                        }
+                    })
+                    .to_string(),
+                );
+                return Ok(());
+            }
+            other => {
+                let _ = tx.send(
+                    json!({
+                        "type": "operator_chat:event",
+                        "payload": {
+                            "target_node_id": target_node_id,
+                            "target_agent_id": agent_id,
+                            "operator_session_id": operator_session_id,
+                            "conversation_id": payload.get("chat_id").and_then(Value::as_str).unwrap_or(&conversation_id),
+                            "session_id": payload.get("session_id").and_then(Value::as_str).unwrap_or(&session_id),
+                            "turn_id": payload.get("turn_id").and_then(Value::as_str).unwrap_or(&turn_id),
+                            "action": other,
+                            "payload": payload
+                        }
+                    })
+                    .to_string(),
+                );
             }
         }
     }
-
-    agents
 }
 
 // ── GET /api/sessions ─────────────────────────────────────────────────────────
@@ -500,16 +1051,7 @@ async fn handle_guest_stop(
 }
 
 async fn ipc_guest_action(guest_id: &str, action: &str) -> Result<()> {
-    use philotic_client::{GuestIdentity, IpcRequest, PhiloticClient};
-
-    let socket = crate::start::socket_path("aiua");
-
-    let identity = GuestIdentity {
-        guest_id: "philotic-web-mgmt".into(),
-        role: "management".into(),
-        supported_tools: vec![],
-    };
-    let mut client = PhiloticClient::connect_at(&socket, identity).await?;
+    let mut client = connect_management_client("philotic-web-mgmt").await?;
 
     // Publish a management action to the hotel
     let payload = serde_json::json!({
@@ -526,26 +1068,153 @@ async fn ipc_guest_action(guest_id: &str, action: &str) -> Result<()> {
     Ok(())
 }
 
-// ── WebSocket /ws ─────────────────────────────────────────────────────────────
-
-#[derive(Deserialize)]
-struct WsQuery {
-    token: Option<String>,
+async fn ipc_desktop_membrane_status() -> Result<DesktopMembraneStatusView> {
+    let mut client = connect_management_client("philotic-web-status").await?;
+    match client
+        .send_request(IpcRequest::GetDesktopMembraneStatus)
+        .await?
+    {
+        IpcResponse::DesktopMembraneStatusView { membrane_status } => Ok(membrane_status),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected desktop membrane status response: {other:?}"
+        )),
+    }
 }
+
+async fn ipc_desktop_membrane_guests() -> Result<Vec<DesktopMembraneGuestView>> {
+    let mut client = connect_management_client("philotic-web-guests").await?;
+    match client
+        .send_request(IpcRequest::ListDesktopMembraneGuests)
+        .await?
+    {
+        IpcResponse::DesktopMembraneGuestsView { membrane_guests } => Ok(membrane_guests),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected desktop membrane guests response: {other:?}"
+        )),
+    }
+}
+
+async fn ipc_desktop_membrane_agents() -> Result<Vec<DesktopMembraneAgentView>> {
+    let mut client = connect_management_client("philotic-web-agents").await?;
+    match client
+        .send_request(IpcRequest::ListDesktopMembraneAgents)
+        .await?
+    {
+        IpcResponse::DesktopMembraneAgentsView { membrane_agents } => Ok(membrane_agents),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected desktop membrane agents response: {other:?}"
+        )),
+    }
+}
+
+async fn ipc_desktop_membrane_targets() -> Result<Vec<OperatorTargetView>> {
+    let mut client = connect_management_client("philotic-web-mesh-targets").await?;
+    match client.send_request(IpcRequest::QueryOperatorTargets).await? {
+        IpcResponse::OperatorTargetsView { operator_targets } => Ok(operator_targets),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected desktop membrane targets response: {other:?}"
+        )),
+    }
+}
+
+async fn ipc_desktop_membrane_target_status(
+    target_node_id: &str,
+) -> Result<OperatorTargetStatusView> {
+    let mut client = connect_management_client("philotic-web-mesh-target-status").await?;
+    match client
+        .send_request(IpcRequest::QueryOperatorTargetStatus {
+            target_node_id: target_node_id.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::OperatorTargetStatusView {
+            operator_target_status,
+        } => Ok(operator_target_status),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected desktop membrane target status response: {other:?}"
+        )),
+    }
+}
+
+async fn ipc_desktop_membrane_target_guests(
+    target_node_id: &str,
+) -> Result<OperatorTargetGuestInventoryView> {
+    let mut client = connect_management_client("philotic-web-mesh-target-guests").await?;
+    match client
+        .send_request(IpcRequest::QueryOperatorTargetGuests {
+            target_node_id: target_node_id.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::OperatorTargetGuestsView {
+            operator_target_guests,
+        } => Ok(operator_target_guests),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected desktop membrane target guests response: {other:?}"
+        )),
+    }
+}
+
+async fn ipc_desktop_membrane_target_agents(
+    target_node_id: &str,
+) -> Result<OperatorTargetAgentInventoryView> {
+    let mut client = connect_management_client("philotic-web-mesh-target-agents").await?;
+    match client
+        .send_request(IpcRequest::QueryOperatorTargetAgents {
+            target_node_id: target_node_id.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::OperatorTargetAgentsView {
+            operator_target_agents,
+        } => Ok(operator_target_agents),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected desktop membrane target agents response: {other:?}"
+        )),
+    }
+}
+
+fn new_operator_chat_id(prefix: &str) -> String {
+    let mut rng = rand::thread_rng();
+    let suffix = format!("{:016x}", rng.r#gen::<u64>());
+    format!("{prefix}-{suffix}")
+}
+
+async fn connect_management_client(guest_id: &str) -> Result<PhiloticClient> {
+    connect_client_with_identity(GuestIdentity {
+        guest_id: guest_id.into(),
+        role: "management".into(),
+        supported_tools: vec![],
+    })
+    .await
+}
+
+async fn connect_client_with_identity(identity: GuestIdentity) -> Result<PhiloticClient> {
+    let socket = crate::start::socket_path("aiua");
+    PhiloticClient::connect_at(&socket, identity)
+        .await
+        .map_err(Into::into)
+}
+
+// ── WebSocket /ws ─────────────────────────────────────────────────────────────
 
 async fn handle_ws(
     ws: WebSocketUpgrade,
-    Query(params): Query<WsQuery>,
+    headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Response {
-    // Auth via query param (browsers can't set headers on WS upgrade)
-    let authed = params
-        .token
-        .as_deref()
+    let cookie_authed = cookie_token(&headers, AUTH_COOKIE_NAME)
         .map(|t| t == state.token.as_str())
         .unwrap_or(false);
 
-    if !authed {
+    if !cookie_authed {
         return unauthorized();
     }
 
@@ -586,16 +1255,19 @@ async fn ws_handler(mut socket: WebSocket, state: AppState) {
 fn build_cors(allow_origins: Option<&str>) -> CorsLayer {
     use axum::http::{header, Method};
 
-    let origins: Vec<axum::http::HeaderValue> = allow_origins
-        .unwrap_or("http://localhost:5173")
-        .split(',')
-        .filter_map(|o| o.trim().parse().ok())
-        .collect();
-
-    CorsLayer::new()
-        .allow_origin(AllowOrigin::list(origins))
+    let layer = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::COOKIE]);
+
+    if let Some(origins) = allow_origins {
+        let parsed: Vec<HeaderValue> = origins
+            .split(',')
+            .filter_map(|origin| origin.trim().parse().ok())
+            .collect();
+        layer.allow_origin(AllowOrigin::list(parsed))
+    } else {
+        layer
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

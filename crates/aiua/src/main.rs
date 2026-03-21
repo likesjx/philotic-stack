@@ -16,14 +16,18 @@ use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use clap::{Parser, Subcommand, ValueEnum};
-use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
+use philotic_client::{
+    GuestIdentity, IpcRequest, IpcResponse, OperatorSurfaceQueryHandoff,
+    OperatorTargetGuestInventoryView, OperatorTargetStatusView, PhiloticClient,
+    OPERATOR_SURFACE_QUERY_HANDOFF_KIND, OPERATOR_SURFACE_QUERY_ROLE,
+};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::net::{SocketAddr, TcpListener, UdpSocket as StdUdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
 mod auth;
@@ -97,6 +101,178 @@ struct MeshRuntimeContext {
     inbox_rx: BeaconInboxReceiver,
     webrtc_signal_tx: mpsc::Sender<ansible_mesh_core::webrtc::WebRtcSignalMessage>,
     webrtc_signal_rx: WebRtcSignalReceiver,
+}
+
+async fn run_operator_surface_query_worker(
+    socket_path: String,
+    local_node_id: String,
+    mut shutdown_rx: broadcast::Receiver<()>,
+) {
+    loop {
+        let connect_fut = PhiloticClient::connect_at(
+            &socket_path,
+            GuestIdentity {
+                guest_id: "aiua-operator-surface-query-worker".into(),
+                role: OPERATOR_SURFACE_QUERY_ROLE.into(),
+                supported_tools: Vec::new(),
+            },
+        );
+        let mut client = tokio::select! {
+            _ = shutdown_rx.recv() => return,
+            connect_result = connect_fut => match connect_result {
+                Ok(client) => client,
+                Err(err) => {
+                    warn!("Operator surface query worker failed to connect: {}", err);
+                    tokio::select! {
+                        _ = shutdown_rx.recv() => return,
+                        _ = tokio::time::sleep(tokio::time::Duration::from_millis(250)) => continue,
+                    }
+                }
+            }
+        };
+
+        match client
+            .send_request(IpcRequest::SubscribeInbox {
+                role: OPERATOR_SURFACE_QUERY_ROLE.into(),
+            })
+            .await
+        {
+            Ok(IpcResponse::Standard { ok: true, .. }) => {}
+            Ok(other) => {
+                warn!(
+                    "Operator surface query worker received unexpected subscribe response: {:?}",
+                    other
+                );
+                continue;
+            }
+            Err(err) => {
+                warn!(
+                    "Operator surface query worker failed to subscribe: {}",
+                    err
+                );
+                continue;
+            }
+        }
+
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.recv() => return,
+                task_result = client.recv_task() => match task_result {
+                    Ok(IpcResponse::InboundTask { task_json, .. }) => {
+                        if let Err(err) = handle_operator_surface_query_task(
+                            &mut client,
+                            &local_node_id,
+                            &task_json,
+                        ).await {
+                            warn!("Operator surface query worker failed: {}", err);
+                        }
+                    }
+                    Ok(other) => {
+                        debug!("Operator surface query worker ignoring envelope: {:?}", other);
+                    }
+                    Err(err) => {
+                        warn!("Operator surface query worker disconnected: {}", err);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn handle_operator_surface_query_task(
+    client: &mut PhiloticClient,
+    local_node_id: &str,
+    task_json: &str,
+) -> Result<()> {
+    let payload: OperatorSurfaceQueryHandoff = serde_json::from_str(task_json)
+        .context("failed to decode operator surface query handoff")?;
+    if payload.handoff_kind != OPERATOR_SURFACE_QUERY_HANDOFF_KIND {
+        anyhow::bail!(
+            "unexpected operator surface handoff kind: [{}]",
+            payload.handoff_kind
+        );
+    }
+
+    let hotel = match client
+        .send_request(IpcRequest::GetDesktopMembraneStatus)
+        .await?
+    {
+        IpcResponse::DesktopMembraneStatusView { membrane_status } => membrane_status,
+        other => anyhow::bail!("unexpected desktop membrane status response: {other:?}"),
+    };
+    let reply_json = match payload.surface.as_str() {
+        "operator.targets.guests" => {
+            let guests = match client
+                .send_request(IpcRequest::QueryOperatorTargetGuests {
+                    target_node_id: local_node_id.to_string(),
+                })
+                .await?
+            {
+                IpcResponse::OperatorTargetGuestsView {
+                    operator_target_guests,
+                } => operator_target_guests.guests,
+                other => anyhow::bail!("unexpected operator target guests response: {other:?}"),
+            };
+            serde_json::to_string(&OperatorTargetGuestInventoryView {
+                target_node_id: local_node_id.to_string(),
+                target_hotel: hotel.hotel.clone(),
+                source_hotel: hotel.hotel,
+                observation_kind: "remote-canonical".into(),
+                available: true,
+                pending_remote_query_state: "none".into(),
+                guests,
+                note: Some("derived from the target hotel's canonical guest table".into()),
+            })?
+        }
+        "operator.targets.status" => {
+            serde_json::to_string(&OperatorTargetStatusView {
+                target_node_id: local_node_id.to_string(),
+                target_hotel: hotel.hotel.clone(),
+                source_hotel: hotel.hotel,
+                observation_kind: "remote-canonical".into(),
+                daemon_status: hotel.daemon,
+                freshness_state: "remote-query-now".into(),
+                freshness_age_secs: 0,
+                freshness_ttl_secs: 0,
+                reachability: None,
+                note: Some("derived from the target hotel's canonical status view".into()),
+            })?
+        }
+        "operator.targets.agents" => {
+            serde_json::to_string(
+                &match client
+                    .send_request(IpcRequest::QueryOperatorTargetAgents {
+                        target_node_id: local_node_id.to_string(),
+                    })
+                    .await?
+                {
+                    IpcResponse::OperatorTargetAgentsView {
+                        operator_target_agents,
+                    } => operator_target_agents,
+                    other => anyhow::bail!(
+                        "unexpected operator target agents response: {other:?}"
+                    ),
+                },
+            )?
+        }
+        _ => return Ok(()),
+    };
+
+    match client
+        .send_request(IpcRequest::EmitTask {
+            target_node: payload.reply_to_node,
+            target_role: payload.reply_to_role,
+            target_guest_id: payload.reply_to_guest_id,
+            task_json: reply_json,
+        })
+        .await?
+    {
+        IpcResponse::Standard { ok: true, .. } => Ok(()),
+        other => {
+            anyhow::bail!("unexpected operator surface query reply emit response: {other:?}")
+        }
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -4351,6 +4527,12 @@ async fn main() -> Result<()> {
             error!("Hotel Front Desk (UDS) failed: {}", e);
         }
     });
+
+    tokio::spawn(run_operator_surface_query_worker(
+        hotel.ipc_socket_path.clone(),
+        caps.node_id.clone(),
+        shutdown_rx.resubscribe(),
+    ));
 
     let mesh_runtime = MeshRuntimeContext {
         hotel_name: hotel_name.clone(),

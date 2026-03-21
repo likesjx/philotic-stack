@@ -647,14 +647,9 @@ impl ModelProvider for GeminiProvider {
             }
         }
 
-        let response = self
-            .apply_auth_headers(
-                self.http_client
-                    .post(self.endpoint_url(task.model.as_deref())?),
-            )?
-            .json(&payload)
-            .send()
-            .await?;
+        let url = self.endpoint_url(task.model.as_deref())?;
+        let req = self.http_client.post(url).json(&payload);
+        let response = self.apply_auth_headers(req)?.send().await?;
         let status = response.status();
         let body = response.json::<Value>().await?;
 
@@ -681,6 +676,7 @@ impl ModelProvider for GeminiProvider {
                 display_text: Some(content.clone()),
                 content,
                 spoken_text,
+                partial_replies: Vec::new(),
                 working_memory_delta: None,
                 follow_up_questions: Vec::new(),
                 intent_summary: None,
@@ -697,6 +693,7 @@ impl ModelProvider for GeminiProvider {
                 display_text: Some(content.clone()),
                 content,
                 spoken_text: None,
+                partial_replies: Vec::new(),
                 working_memory_delta: None,
                 follow_up_questions: Vec::new(),
                 intent_summary: None,

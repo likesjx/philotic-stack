@@ -255,6 +255,7 @@ pub trait GraphStorage: Send + Sync {
     // ── Agent identity bundles ───────────────────────────────────────
 
     fn upsert_agent_identity(&self, identity: &AgentIdentityRecord) -> Result<()>;
+    fn list_agent_identities(&self) -> Result<Vec<AgentIdentityRecord>>;
     fn get_agent_identity(&self, agent_id: &str) -> Result<Option<AgentIdentityRecord>>;
 
     // ── Memory apartments ────────────────────────────────────────────
