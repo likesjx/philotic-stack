@@ -1064,6 +1064,7 @@ fn hotel_object<'a>(
         .as_object()
 }
 
+#[allow(dead_code)]
 fn selected_agent_key_for_hotel(
     hotel: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<String> {
@@ -1085,6 +1086,7 @@ fn selected_agent_key_for_hotel(
     None
 }
 
+#[allow(dead_code)]
 fn merged_agent_config(
     config_json: &serde_json::Value,
     hotel_name: &str,
@@ -1114,6 +1116,7 @@ fn merged_agent_config(
     Some((selected_key, merged))
 }
 
+#[allow(dead_code)]
 fn agent_profile_from_config(
     config_json: &serde_json::Value,
     hotel_name: &str,
@@ -1669,7 +1672,6 @@ fn deactivate_legacy_managed_guests(
                         "agent"
                             | "hegemon"
                             | "membrane"
-                            | "model"
                             | "model"
                             | "model.elevenlabs"
                             | "tool"

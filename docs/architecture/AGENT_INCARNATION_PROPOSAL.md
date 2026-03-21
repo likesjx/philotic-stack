@@ -223,7 +223,11 @@ Those belong to the agent/home-hotel membrane boundary, not the currently active
 
 ## Handoff Skill
 
-Handoff is not a raw IPC call — it is a **defined skill** that incarnations invoke to signal and execute a role transition. This makes handoff parametric, introspectable, and extensible.
+Handoff is not a raw standalone IPC call — it is a **defined skill** that incarnations invoke to signal and execute a role transition. This makes handoff parametric, introspectable, and extensible.
+
+> [!NOTE] 
+> **Transitional Architecture**: Currently, `HandoffToRole` is implemented as a local `IpcRequest` that bypasses the mesh router (`ansible-mesh-core`). This is acceptable while an agent's session is strictly anchored to a single "Home Hotel" node. However, to support future multi-node role splitting (e.g., orchestrator on a local mac, a heavy researcher role on a GPU server), same-identity handoff **must** eventually be routed as a formal `EventKind::SessionControl` payload over the mesh ledger. This ensures session state mutations and handoff bundles remain securely recorded and properly routed across hotel boundaries.
+
 
 For same-identity role transitions, the default semantic meaning is now:
 

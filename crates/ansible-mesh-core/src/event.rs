@@ -59,6 +59,8 @@ pub enum EventKind {
     MemoryOp,
     /// Capability availability advertisement.
     CapabilityPublish,
+    /// Administrative control plane mutations (e.g., Session role handoffs)
+    SessionControl,
 }
 
 /// The payload definition. Large files must use `BlobRef`.

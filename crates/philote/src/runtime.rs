@@ -488,6 +488,7 @@ fn format_roles_report(active_incarnation_id: Option<&str>, roles: &[serde_json:
 /// Locally cached role configuration, populated when `role.configure` succeeds.
 /// Used to reconstruct `RoleActivation` on inbound handoff without an IPC round-trip.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct CachedRoleConfig {
     toolset_profile: String,
     role_identity_addendum: Option<String>,

@@ -70,6 +70,7 @@ pub fn load_muninn_config(graph: &dyn GraphStorage) -> Result<Option<MuninnConfi
 ///
 /// Called at agent session start (Slice E). The `config` is the shared hotel
 /// config loaded by `load_muninn_config`.
+#[allow(dead_code)]
 pub fn engine_for_agent(config: MuninnConfig, agent_id: &str, user_id: &str) -> MuninnRestEngine {
     MuninnRestEngine::new(
         config,

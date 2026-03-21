@@ -37,7 +37,6 @@ use axum::{
 use rand::Rng;
 use rusqlite::Connection;
 use rust_embed::RustEmbed;
-use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::{broadcast, watch, Mutex};

@@ -401,7 +401,7 @@ impl GuestManager {
                     let _ = self
                         .graph
                         .set_guest_active(&self.hotel_name, &rec.guest_id, false);
-                    if let Some(pid) = rec.active_pid.as_deref() {
+                    if let Some(_pid) = rec.active_pid.as_deref() {
                         let mut mat = self.materializer.lock().await;
                         let _ = mat.reclaim_guest(&rec.guest_id).await;
                         drop(mat);

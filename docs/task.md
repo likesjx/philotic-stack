@@ -169,12 +169,12 @@ Seam IDs: `role-incarnation-records`, `active-membrane-routing`, `handoff-skill`
 
 ### Governed Workflow Skills
 - [x] Write [GOVERNED_WORKFLOW_SKILLS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GOVERNED_WORKFLOW_SKILLS_PROPOSAL.md).
-- [ ] Define the first `WorkflowSkillRecord` boundary and decide when it should supersede plain `AbstractSkillRecord` for governed flows.
-- [ ] Specify target-boundary classes and rules for:
-  - same-agent role handoff / context shift
-  - peer Philotic agent delegation
-  - external cognitive peer handoff (Claude Code, Codex, similar)
-- [ ] Define bounded context packaging and return contracts for peer/external workflows so they do not quietly inherit same-identity handoff assumptions.
+- [x] Define the first `WorkflowSkillRecord` boundary and decide when it should supersede plain `AbstractSkillRecord` for governed flows (added to `ansible-mesh-core` graph/storage traits).
+- [x] Specify target-boundary classes and rules for:
+  - same-agent role handoff / context shift (`handoff.to_role` updated with required `target_focus_framing`)
+  - peer Philotic agent delegation (added `delegate.to_peer`)
+  - external cognitive peer handoff (added `delegate.to_external_cognitive_peer`)
+- [x] Define bounded context packaging and return contracts for peer/external workflows so they do not quietly inherit same-identity handoff assumptions.
 
 ### Inactive TTL + On-Demand Rematerialization
 - [x] Add `inactive_ttl_seconds` to `RoleIncarnationRecord`.

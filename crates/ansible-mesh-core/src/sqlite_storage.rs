@@ -1501,6 +1501,33 @@ impl GraphStorage for SqliteGraphStorage {
             .collect()
     }
 
+    fn upsert_workflow_skill(&self, skill: &crate::graph::WorkflowSkillRecord) -> Result<()> {
+        self.adapter.upsert_node(&GraphNode {
+            node_key: format!("workflow_skill:{}", skill.workflow_name),
+            kind: "workflow_skill".into(),
+            label: Some(skill.workflow_name.clone()),
+            data: serde_json::to_value(skill)?,
+        })
+    }
+
+    fn get_workflow_skill(&self, workflow_name: &str) -> Result<Option<crate::graph::WorkflowSkillRecord>> {
+        match self
+            .adapter
+            .get_node(&format!("workflow_skill:{workflow_name}"))?
+        {
+            Some(node) => Ok(Some(serde_json::from_value(node.data)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn list_workflow_skills(&self) -> Result<Vec<crate::graph::WorkflowSkillRecord>> {
+        self.adapter
+            .list_nodes_by_kind("workflow_skill")?
+            .into_iter()
+            .map(|node| serde_json::from_value(node.data).map_err(Into::into))
+            .collect()
+    }
+
     fn upsert_toolset_profile(&self, profile: &ToolsetProfileRecord) -> Result<()> {
         self.adapter.upsert_node(&GraphNode {
             node_key: format!("toolset_profile:{}", profile.profile_name),

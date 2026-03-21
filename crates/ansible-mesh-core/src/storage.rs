@@ -8,7 +8,7 @@
 use crate::event::EventEnvelope;
 use crate::graph::{
     AbstractSkillRecord, AbstractToolRecord, GraphEdge, GraphNode, RoleIncarnationRecord,
-    RuleRecord, ToolsetProfileRecord,
+    RuleRecord, ToolsetProfileRecord, WorkflowSkillRecord,
 };
 use crate::NodeCapabilities;
 use anyhow::Result;
@@ -323,6 +323,17 @@ pub trait GraphStorage: Send + Sync {
 
     /// List all abstract skill definitions in the catalog.
     fn list_abstract_skills(&self) -> Result<Vec<AbstractSkillRecord>>;
+
+    // ── Workflow skill catalog (shareable governed workflows) ─────────────
+
+    /// Upsert a shared governed workflow skill definition.
+    fn upsert_workflow_skill(&self, skill: &WorkflowSkillRecord) -> Result<()>;
+
+    /// Load a single workflow skill definition.
+    fn get_workflow_skill(&self, workflow_name: &str) -> Result<Option<WorkflowSkillRecord>>;
+
+    /// List all workflow skill definitions in the catalog.
+    fn list_workflow_skills(&self) -> Result<Vec<WorkflowSkillRecord>>;
 
     // ── Toolset profiles (role provisioning bundles) ─────────────────────
 

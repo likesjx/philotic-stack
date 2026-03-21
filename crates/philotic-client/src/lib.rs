@@ -619,6 +619,22 @@ pub enum IpcRequest {
         #[serde(default)]
         return_to: Option<String>,
     },
+    DelegateToPeer {
+        target_agent_id: String,
+        task_description: String,
+        context_package: String,
+        #[serde(default)]
+        expected_artifacts: Vec<String>,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+    },
+    DelegateToExternalPeer {
+        target_peer_type: String,
+        task_description: String,
+        context_package: String,
+        #[serde(default)]
+        expected_artifacts: Vec<String>,
+    },
     SpawnSubagent {
         session_id: String,
         delegation: SubagentDelegation,
@@ -832,6 +848,10 @@ pub enum IpcResponse {
     HandoffBackAck {
         handoff_guest_id: String,
         became_active: bool,
+    },
+    DelegationAck {
+        delegation_id: String,
+        status: String,
     },
     SpawnSubagentOk {
         subagent_guest_id: String,

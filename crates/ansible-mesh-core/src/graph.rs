@@ -115,6 +115,29 @@ pub struct AbstractSkillRecord {
     pub field_sources: serde_json::Value,
 }
 
+/// A governed workflow record defining an advanced process like handoff or delegation.
+///
+/// Node kind: `workflow_skill`. Node key: `workflow_skill:{workflow_name}`.
+/// Sits "above" `AbstractSkillRecord` to handle target selection, context
+/// packaging, and governance for operations crossing identity/process boundaries.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct WorkflowSkillRecord {
+    pub workflow_name: String,
+    pub workflow_kind: String, // e.g., "handoff.to_role", "delegate.to_peer"
+    pub owner_scope: String,   // e.g., "orchestrator", "admin"
+    pub target_class: String,  // e.g., "same_identity_role", "peer_agent"
+    pub description: String,
+    #[serde(default)]
+    pub target_selection_policy: serde_json::Value,
+    #[serde(default)]
+    pub context_requirements: serde_json::Value,
+    #[serde(default)]
+    pub return_contract: serde_json::Value,
+    #[serde(default)]
+    pub governance: serde_json::Value,
+    pub rollout_state: String, // e.g., "draft", "active"
+}
+
 /// A named bundle of allowed tools, tool classes, and skills granted to a role.
 ///
 /// Node kind: `toolset_profile`. Node key: `toolset_profile:{profile_name}`.

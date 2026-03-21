@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 
-use crate::init::{active_profile, philotic_dir, profile_dir};
+use crate::init::{active_profile, profile_dir};
 use crate::start::find_aiua_binary;
 
 fn plist_label(hotel: &str) -> String {

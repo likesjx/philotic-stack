@@ -24,7 +24,7 @@ use philotic_client::{
     HookRoute, HookSubscription, IpcRequest, IpcResponse, LeaseEnvelope, LeaseStatus,
     OperatorAgentView, OperatorChatTurnReply, OperatorSurfaceQueryHandoff,
     OperatorTargetAgentInventoryView, OperatorTargetGuestInventoryView,
-    OperatorTargetStatusView, OperatorTargetView, PhiloticClient, SubagentDelegation,
+    OperatorTargetStatusView, PhiloticClient, SubagentDelegation,
     OPERATOR_CHAT_REPLY_ROLE,
     OPERATOR_SURFACE_QUERY_HANDOFF_KIND, OPERATOR_SURFACE_QUERY_REPLY_ROLE,
     OPERATOR_SURFACE_QUERY_ROLE,
@@ -44,6 +44,7 @@ pub(crate) type InboxRegistry = Arc<Mutex<HashMap<String, Vec<RoleSubscriber>>>>
 /// Per-subagent hook routing record stored in the hotel's in-memory registry.
 /// Created at SpawnSubagent time; dropped on ReleaseSubagent or lease expiry.
 #[derive(Clone)]
+#[allow(dead_code)]
 struct SubagentHookRecord {
     /// Which persona agent spawned this subagent (for PersonaAgent route).
     persona_guest_id: String,

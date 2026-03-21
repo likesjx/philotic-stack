@@ -1100,7 +1100,7 @@ impl TableStore for SqliteGraphStore {
             .ok_or_else(|| anyhow!("row '{}' not found in table '{}'", row_id, table_id))?;
 
         // Shallow merge: patch keys overwrite existing keys.
-        let mut merged = match existing.data {
+        let merged = match existing.data {
             serde_json::Value::Object(mut map) => {
                 if let serde_json::Value::Object(patch_map) = patch {
                     for (k, v) in patch_map {

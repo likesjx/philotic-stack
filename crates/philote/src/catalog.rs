@@ -412,6 +412,10 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                         "type": "string",
                         "description": "Compact summary of relevant working context for the target role."
                     },
+                    "target_focus_framing": {
+                        "type": "string",
+                        "description": "Specific natural language instructions framing what the target role should focus on upon waking."
+                    },
                     "expected_return_mode": {
                         "type": "string",
                         "enum": ["required", "optional", "none"],
@@ -423,7 +427,7 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                         "description": "Actions completed before yielding (e.g. 'committed changes', 'closed open files')."
                     }
                 },
-                "required": ["role_name", "reason"]
+                "required": ["role_name", "reason", "target_focus_framing"]
             }),
             class: Some("handoff".into()),
         },
@@ -454,6 +458,83 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                 "required": ["summary"]
             }),
             class: Some("handoff".into()),
+        },
+    );
+
+    m.insert(
+        "delegate.to_peer".into(),
+        ToolDefinition {
+            tool_name: "delegate.to_peer".into(),
+            description: "Delegates a bounded task to a peer Philotic agent on the mesh. \
+                          Crosses an identity boundary. Requires explicitly packaging a bounded \
+                          context, goal, and clear return contract expectations. Used when \
+                          a different agent's expertise or trust domain is needed, rather than \
+                          your own active roles. Requires operator approval."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "target_agent_id": {
+                        "type": "string",
+                        "description": "The unique ID of the peer agent to delegate to (e.g., 'jane')."
+                    },
+                    "task_description": {
+                        "type": "string",
+                        "description": "Natural language description of the delegated task."
+                    },
+                    "context_package": {
+                        "type": "string",
+                        "description": "Explicit context snapshot necessary for the peer to execute the task."
+                    },
+                    "expected_artifacts": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "List of artifacts or outcomes expected back"
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "description": "Implicit contract SLA before the delegation is considered stalled."
+                    }
+                },
+                "required": ["target_agent_id", "task_description", "context_package"]
+            }),
+            class: Some("delegate".into()),
+        },
+    );
+
+    m.insert(
+        "delegate.to_external_cognitive_peer".into(),
+        ToolDefinition {
+            tool_name: "delegate.to_external_cognitive_peer".into(),
+            description: "Delegates a bounded task to an external cognitive peer (e.g., Claude Code, \
+                          Codex) that operates outside the Philotic mesh. Crosses both identity and \
+                          runtime trust boundaries. Requires explicit packaging, bounds, and a clear \
+                          return expectation. Requires operator approval."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "target_peer_type": {
+                        "type": "string",
+                        "description": "The type or identifier of the external peer (e.g., 'claude_code', 'codex_worktree')."
+                    },
+                    "task_description": {
+                        "type": "string",
+                        "description": "Natural language description of the delegated task."
+                    },
+                    "context_package": {
+                        "type": "string",
+                        "description": "Explicit context snapshot necessary for the peer to execute the task."
+                    },
+                    "expected_artifacts": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "List of artifacts or outcomes expected back"
+                    }
+                },
+                "required": ["target_peer_type", "task_description", "context_package"]
+            }),
+            class: Some("delegate".into()),
         },
     );
 
