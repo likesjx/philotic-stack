@@ -1,5 +1,5 @@
 use crate::session::{TaskRunnerBaseConfig, ToolDefinition};
-use philotic_client::TaskErrorPayload;
+use philotic_client::{HandoffBundle, TaskErrorPayload};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -48,6 +48,8 @@ pub struct InboundTaskPayload {
     pub message_kind: Option<String>,
     #[serde(default)]
     pub content: Option<String>,
+    #[serde(default)]
+    pub handoff_bundle: Option<HandoffBundle>,
     #[serde(default)]
     pub attachments: Vec<TransportAttachment>,
     #[serde(default)]

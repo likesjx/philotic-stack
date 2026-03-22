@@ -3146,12 +3146,7 @@ impl AgentRuntime {
         let session_id = task.session_id_or_default(&self.agent_id);
         let turn_id = task.turn_id.clone().unwrap_or_else(|| task_id.to_string());
 
-        let bundle: HandoffBundle = match task
-            .agent_action
-            .as_ref()
-            .and_then(|v| v.get("handoff_bundle"))
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-        {
+        let bundle: HandoffBundle = match task.handoff_bundle {
             Some(b) => b,
             None => {
                 warn!(
@@ -4189,6 +4184,7 @@ impl AgentRuntime {
                 self.handle_tool_result(InboundTaskPayload {
                     action: Some("tool_result".into()),
                     agent_action: None,
+                    handoff_bundle: None,
                     source: Some("agent".into()),
                     session_id: Some(payload.session_id),
                     turn_id: Some(payload.turn_id),
@@ -4283,6 +4279,7 @@ impl AgentRuntime {
                 self.handle_tool_result(InboundTaskPayload {
                     action: Some("tool_result".into()),
                     agent_action: None,
+                    handoff_bundle: None,
                     source: Some("agent".into()),
                     session_id: Some(payload.session_id),
                     turn_id: Some(payload.turn_id),
@@ -4464,6 +4461,7 @@ impl AgentRuntime {
                 self.handle_tool_result(InboundTaskPayload {
                     action: Some("tool_result".into()),
                     agent_action: None,
+                    handoff_bundle: None,
                     source: Some("agent".into()),
                     session_id: Some(payload.session_id),
                     turn_id: Some(payload.turn_id),
@@ -4600,6 +4598,7 @@ impl AgentRuntime {
                 self.handle_tool_result(InboundTaskPayload {
                     action: Some("tool_result".into()),
                     agent_action: None,
+                    handoff_bundle: None,
                     source: Some("agent".into()),
                     session_id: Some(payload.session_id),
                     turn_id: Some(payload.turn_id),
@@ -4686,6 +4685,7 @@ impl AgentRuntime {
                 self.handle_tool_result(InboundTaskPayload {
                     action: Some("tool_result".into()),
                     agent_action: None,
+                    handoff_bundle: None,
                     source: Some("agent".into()),
                     session_id: Some(payload.session_id),
                     turn_id: Some(payload.turn_id),
@@ -4792,6 +4792,7 @@ impl AgentRuntime {
                 self.handle_tool_result(InboundTaskPayload {
                     action: Some("tool_result".into()),
                     agent_action: None,
+                    handoff_bundle: None,
                     source: Some("agent".into()),
                     session_id: Some(payload.session_id),
                     turn_id: Some(payload.turn_id),
@@ -4937,6 +4938,7 @@ impl AgentRuntime {
                 self.handle_tool_result(InboundTaskPayload {
                     action: Some("tool_result".into()),
                     agent_action: None,
+                    handoff_bundle: None,
                     source: Some("agent".into()),
                     session_id: Some(payload.session_id),
                     turn_id: Some(payload.turn_id),
@@ -5096,6 +5098,7 @@ impl AgentRuntime {
                 self.handle_tool_result(InboundTaskPayload {
                     action: Some("tool_result".into()),
                     agent_action: None,
+                    handoff_bundle: None,
                     source: Some("agent".into()),
                     session_id: Some(payload.session_id),
                     turn_id: Some(payload.turn_id),
@@ -5187,6 +5190,7 @@ impl AgentRuntime {
                 self.handle_tool_result(InboundTaskPayload {
                     action: Some("tool_result".into()),
                     agent_action: None,
+                    handoff_bundle: None,
                     source: Some("agent".into()),
                     session_id: Some(payload.session_id),
                     turn_id: Some(payload.turn_id),
@@ -5322,6 +5326,7 @@ impl AgentRuntime {
                 self.handle_tool_result(InboundTaskPayload {
                     action: Some("tool_result".into()),
                     agent_action: None,
+                    handoff_bundle: None,
                     source: Some("agent".into()),
                     session_id: Some(payload.session_id),
                     turn_id: Some(payload.turn_id),
@@ -5444,6 +5449,7 @@ impl AgentRuntime {
                 self.handle_tool_result(InboundTaskPayload {
                     action: Some("tool_result".into()),
                     agent_action: None,
+                    handoff_bundle: None,
                     source: Some("agent".into()),
                     session_id: Some(payload.session_id),
                     turn_id: Some(payload.turn_id),
@@ -5520,6 +5526,7 @@ impl AgentRuntime {
                 self.handle_tool_result(InboundTaskPayload {
                     action: Some("tool_result".into()),
                     agent_action: None,
+                    handoff_bundle: None,
                     source: Some("agent".into()),
                     session_id: Some(payload.session_id),
                     turn_id: Some(payload.turn_id),
@@ -5595,6 +5602,7 @@ impl AgentRuntime {
                 self.handle_tool_result(InboundTaskPayload {
                     action: Some("tool_result".into()),
                     agent_action: None,
+                    handoff_bundle: None,
                     source: Some("agent".into()),
                     session_id: Some(payload.session_id),
                     turn_id: Some(payload.turn_id),
@@ -5661,6 +5669,7 @@ impl AgentRuntime {
                 self.handle_tool_result(InboundTaskPayload {
                     action: Some("tool_result".into()),
                     agent_action: None,
+                    handoff_bundle: None,
                     source: Some("agent".into()),
                     session_id: Some(payload.session_id),
                     turn_id: Some(payload.turn_id),
@@ -5748,6 +5757,7 @@ impl AgentRuntime {
                 self.handle_tool_result(InboundTaskPayload {
                     action: Some("tool_result".into()),
                     agent_action: None,
+                    handoff_bundle: None,
                     source: Some("agent".into()),
                     session_id: Some(payload.session_id),
                     turn_id: Some(payload.turn_id),
@@ -6306,6 +6316,7 @@ mod tests {
     fn extract_model_error_payload_preserves_retryable_flag() {
         let payload = InboundTaskPayload {
             agent_action: None,
+                    handoff_bundle: None,
             action: None,
             source: None,
             session_id: None,
@@ -6511,6 +6522,7 @@ mod tests {
         let task = InboundTaskPayload {
             action: None,
             agent_action: None,
+                    handoff_bundle: None,
             source: Some("telegram".into()),
             session_id: None,
             turn_id: None,
@@ -6551,6 +6563,7 @@ mod tests {
         let task = InboundTaskPayload {
             action: None,
             agent_action: None,
+                    handoff_bundle: None,
             source: Some("telegram".into()),
             session_id: None,
             turn_id: None,
@@ -6597,6 +6610,7 @@ mod tests {
         let task = InboundTaskPayload {
             action: None,
             agent_action: None,
+                    handoff_bundle: None,
             source: Some("telegram".into()),
             session_id: None,
             turn_id: None,
@@ -6630,6 +6644,7 @@ mod tests {
         let task = InboundTaskPayload {
             action: None,
             agent_action: None,
+                    handoff_bundle: None,
             source: Some("telegram".into()),
             session_id: None,
             turn_id: None,
