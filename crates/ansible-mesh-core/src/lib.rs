@@ -6,6 +6,7 @@ pub mod agent;
 pub mod authz;
 pub mod beacon;
 pub mod cursor;
+pub mod domain;
 pub mod event;
 pub mod graph;
 pub mod graph_tools;
