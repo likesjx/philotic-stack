@@ -435,9 +435,11 @@ Model revised: three-kind taxonomy (conversational/worker/subagent) replaced wit
 - [ ] Default to orchestrator incarnation if active ID is unregistered; buffer inbound during materialization.
 
 ### Handoff Skill + Membrane Switching
-- [ ] Implement `HandoffToRole { role_name, handoff_bundle }` and `HandoffBack { summary, return_to? }` IPC actions.
-- [ ] Define the first handoff skill shape: trigger patterns, context bundle assembly, cleanup steps.
-- [ ] Add `/role <name>` and `/back` slash commands for manual membrane switching.
+- [x] Implement `HandoffToRole { role_name, handoff_bundle }` and `HandoffBack { summary, return_to? }` IPC actions.
+- [x] Define the first handoff skill shape: trigger patterns, context bundle assembly, cleanup steps.
+- [x] Add `/role <name>` and `/back` slash commands for manual membrane switching.
+- [x] Fix handoff turn termination: call `complete_local_command` on success to prevent model continuation hallucinations.
+- [x] Exempt `handoff.back` from mandatory operator approval for fluid returns.
 
 ### Inactive TTL + On-Demand Rematerialization
 - [x] Add `inactive_ttl_seconds` to `RoleIncarnationRecord`.
