@@ -1442,8 +1442,9 @@ impl AgentRuntime {
                 .await?;
 
             if let Some(tool_call) = pending_tool_call {
+                // bypass_approval=true: preapproved path, no re-gate needed.
                 return self
-                    .route_tool_call_execution(session_id, turn_id, tool_call)
+                    .route_tool_call_execution(session_id, turn_id, tool_call, true)
                     .await;
             }
 
@@ -1552,41 +1553,51 @@ impl AgentRuntime {
         session_id: String,
         turn_id: String,
         tool_call: ToolCall,
+        // When `true`, the approval gate is skipped entirely — the caller has already
+        // obtained a manual or preapproved resolution and must not re-gate the tool.
+        bypass_approval: bool,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
         // Agent-level approval enforcement: if the tool's policy annotation marks it as
         // requiring approval, and the current approval policy does not preapprove it,
         // synthesize an ApprovalRequest before executing. This runs independently of
         // whether the model itself requested approval — it is the agent's safety gate.
-        let force_approval = self
-            .sessions
-            .get(&session_id)
-            .map(|state| {
-                let requires = state
-                    .tool_assembly
-                    .policy_annotations
-                    .get(&tool_call.tool_name)
-                    .map(|a| a.approval_required)
-                    .unwrap_or(false);
-                if requires {
-                    let synthetic = ApprovalRequest {
-                        approval_id: None,
-                        reason: format!(
-                            "Tool '{}' requires approval before execution.",
-                            tool_call.tool_name
-                        ),
-                        approved_response: format!("Executing {}.", tool_call.tool_name),
-                    };
-                    !state.approval_policy_allows(&synthetic, Some(&tool_call))
-                } else {
-                    false
-                }
-            })
-            .unwrap_or(false);
+        // Skipped when bypass_approval is true (i.e. we are resuming after a resolution).
+        let force_approval = if bypass_approval {
+            false
+        } else {
+            self
+                .sessions
+                .get(&session_id)
+                .map(|state| {
+                    let requires = state
+                        .tool_assembly
+                        .policy_annotations
+                        .get(&tool_call.tool_name)
+                        .map(|a| a.approval_required)
+                        .unwrap_or(false);
+                    if requires {
+                        let synthetic = ApprovalRequest {
+                            approval_id: None,
+                            reason: format!(
+                                "Tool '{}' requires approval before execution.",
+                                tool_call.tool_name
+                            ),
+                            approved_response: format!("Executing {}.", tool_call.tool_name),
+                        };
+                        !state.approval_policy_allows(&synthetic, Some(&tool_call))
+                    } else {
+                        false
+                    }
+                })
+                .unwrap_or(false)
+        };
 
         // Admin role creation requires live operator approval regardless of any approval policy.
         // This check runs before the normal force_approval gate so it can set always_require_human.
-        let is_admin_role_creation = tool_call.tool_name == "role.configure"
+        // Bypassed when bypass_approval is true (already resolved by the operator).
+        let is_admin_role_creation = !bypass_approval
+            && tool_call.tool_name == "role.configure"
             && tool_call
                 .arguments
                 .get("is_admin")
@@ -1595,7 +1606,8 @@ impl AgentRuntime {
 
         // rule.propose always requires live operator approval — cannot be preapproved or bypassed.
         // Rules are durable and permanently affect agent behavior, so human confirmation is required.
-        let is_rule_propose = tool_call.tool_name == "rule.propose";
+        // (bypass_approval does NOT bypass rule.propose — that one is unconditional.)
+        let is_rule_propose = !bypass_approval && tool_call.tool_name == "rule.propose";
 
         if is_admin_role_creation || is_rule_propose || force_approval {
             // Set pending_tool_call so the approval handler can read it for class lookup.
@@ -1760,7 +1772,8 @@ impl AgentRuntime {
         turn_id: String,
         tool_call: ToolCall,
     ) -> Result<()> {
-        self.route_tool_call_execution(session_id, turn_id, tool_call)
+        // bypass_approval=false: this is the normal model-driven path; gate applies.
+        self.route_tool_call_execution(session_id, turn_id, tool_call, false)
             .await
     }
 
@@ -3031,8 +3044,9 @@ impl AgentRuntime {
                     .await?;
 
                 if let Some(tool_call) = original_pending_tool_call {
+                    // bypass_approval=true: this tool was already manually approved above.
                     return self
-                        .route_tool_call_execution(session_id, original_turn_id, tool_call)
+                        .route_tool_call_execution(session_id, original_turn_id, tool_call, true)
                         .await;
                 }
             }
