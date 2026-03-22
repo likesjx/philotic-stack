@@ -51,6 +51,9 @@ pub fn tool_class(tool_name: &str) -> Option<&'static str> {
 /// of what the model requests. Tools in class "config", "handoff", or "shell" require
 /// approval by default; others do not unless explicitly flagged.
 pub fn tool_requires_approval(tool_name: &str) -> bool {
+    if tool_name == "handoff.back" {
+        return false;
+    }
     matches!(
         tool_class(tool_name),
         Some("config") | Some("handoff") | Some("shell")

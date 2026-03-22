@@ -5095,32 +5095,37 @@ impl AgentRuntime {
                     }
                 };
 
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    agent_action: None,
-                    handoff_bundle: None,
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    transport: None,
-                    chat_id: Some(payload.chat_id),
-                    thread_id: None,
-                    sender_id: None,
-                    sender_username: None,
-                    message_kind: None,
-                    content: Some(content),
-                    attachments: Vec::new(),
-                    command: None,
-                    callback_data: None,
-                    raw_transport_event: None,
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    arguments: None,
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                })
-                .await
+                if let Some(err) = tool_err {
+                    self.handle_tool_result(InboundTaskPayload {
+                        action: Some("tool_result".into()),
+                        agent_action: None,
+                        handoff_bundle: None,
+                        source: Some("agent".into()),
+                        session_id: Some(payload.session_id),
+                        turn_id: Some(payload.turn_id),
+                        transport: None,
+                        chat_id: Some(payload.chat_id),
+                        thread_id: None,
+                        sender_id: None,
+                        sender_username: None,
+                        message_kind: None,
+                        content: Some(content),
+                        attachments: Vec::new(),
+                        command: None,
+                        callback_data: None,
+                        raw_transport_event: None,
+                        error: Some(err),
+                        tool_name: Some(payload.tool_name),
+                        arguments: None,
+                        final_reply_to: Some(payload.final_reply_to),
+                        final_reply_role: Some(payload.final_reply_role),
+                        final_reply_guest_id: payload.final_reply_guest_id,
+                    })
+                    .await
+                } else {
+                    self.complete_local_command(payload.session_id, payload.turn_id, content)
+                        .await
+                }
             }
 
             "handoff.back" => {
@@ -5187,32 +5192,37 @@ impl AgentRuntime {
                     }
                 };
 
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    agent_action: None,
-                    handoff_bundle: None,
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    transport: None,
-                    chat_id: Some(payload.chat_id),
-                    thread_id: None,
-                    sender_id: None,
-                    sender_username: None,
-                    message_kind: None,
-                    content: Some(content),
-                    attachments: Vec::new(),
-                    command: None,
-                    callback_data: None,
-                    raw_transport_event: None,
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    arguments: None,
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                })
-                .await
+                if let Some(err) = tool_err {
+                    self.handle_tool_result(InboundTaskPayload {
+                        action: Some("tool_result".into()),
+                        agent_action: None,
+                        handoff_bundle: None,
+                        source: Some("agent".into()),
+                        session_id: Some(payload.session_id),
+                        turn_id: Some(payload.turn_id),
+                        transport: None,
+                        chat_id: Some(payload.chat_id),
+                        thread_id: None,
+                        sender_id: None,
+                        sender_username: None,
+                        message_kind: None,
+                        content: Some(content),
+                        attachments: Vec::new(),
+                        command: None,
+                        callback_data: None,
+                        raw_transport_event: None,
+                        error: Some(err),
+                        tool_name: Some(payload.tool_name),
+                        arguments: None,
+                        final_reply_to: Some(payload.final_reply_to),
+                        final_reply_role: Some(payload.final_reply_role),
+                        final_reply_guest_id: payload.final_reply_guest_id,
+                    })
+                    .await
+                } else {
+                    self.complete_local_command(payload.session_id, payload.turn_id, content)
+                        .await
+                }
             }
 
             "delegate.to_peer" => {
