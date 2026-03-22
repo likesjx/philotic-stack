@@ -4373,10 +4373,20 @@ impl AgentRuntime {
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
 
+                // Read the active persona role from session state to pass as calling authority.
+                // Falls back to "orchestrator" when no role is active (default persona).
+                let calling_role = self
+                    .sessions
+                    .get(&payload.session_id)
+                    .and_then(|s| s.role_activation.as_ref())
+                    .map(|r| r.role_name.clone())
+                    .unwrap_or_else(|| "orchestrator".to_string());
+
                 let req = IpcRequest::ConfigureRole {
                     agent_id: self.agent_id.clone(),
                     role_name: role_name.clone(),
                     guest_id: self.agent_id.clone(),
+                    calling_role,
                     toolset_profile,
                     role_identity_addendum,
                     role_manifest,

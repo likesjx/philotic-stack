@@ -3762,6 +3762,7 @@ impl IpcServer {
                 agent_id,
                 role_name,
                 guest_id,
+                calling_role,
                 toolset_profile,
                 role_identity_addendum,
                 role_manifest,
@@ -3779,11 +3780,14 @@ impl IpcServer {
                         "guest must register before configuring roles",
                     );
                 };
-                if identity.role != "orchestrator" {
+                // Check the agent's active persona role, not the IPC process type.
+                // The IPC process type is always "agent" for philote — what matters
+                // is the session-level persona role ("orchestrator") passed explicitly.
+                if calling_role != "orchestrator" {
                     return IpcResponse::error(
                         "configure_role",
                         "CONFIGURE_FORBIDDEN",
-                        "only orchestrator guests may configure role incarnations",
+                        "only agents operating in the orchestrator persona may configure role incarnations",
                     );
                 }
                 if !identity.guest_id.starts_with(&agent_id) {
@@ -12419,6 +12423,7 @@ mod tests {
                 agent_id: "agent-jane-01".into(),
                 role_name: "developer".into(),
                 guest_id: "agent-jane-01:developer".into(),
+                calling_role: "orchestrator".into(),
                 toolset_profile: "developer".into(),
                 role_identity_addendum: Some("Addendum".into()),
                 role_manifest: None,
@@ -12477,6 +12482,7 @@ mod tests {
                 agent_id: "agent-bob-01".into(), // Different agent!
                 role_name: "developer".into(),
                 guest_id: "agent-bob-01:developer".into(),
+                calling_role: "orchestrator".into(),
                 toolset_profile: "developer".into(),
                 role_identity_addendum: None,
                 role_manifest: None,

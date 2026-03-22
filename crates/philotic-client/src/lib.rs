@@ -737,6 +737,10 @@ pub enum IpcRequest {
         agent_id: String,
         role_name: String,
         guest_id: String,
+        /// The active persona role of the calling agent (e.g. "orchestrator").
+        /// Distinct from the IPC process role ("agent") — this is the session-level
+        /// persona role stored in the context graph, checked server-side for authority.
+        calling_role: String,
         toolset_profile: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         role_identity_addendum: Option<String>,
