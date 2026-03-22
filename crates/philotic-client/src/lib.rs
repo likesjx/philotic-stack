@@ -623,6 +623,9 @@ pub enum IpcRequest {
         target_agent_id: String,
         task_description: String,
         context_package: String,
+        chat_id: String,
+        #[serde(default)]
+        source: Option<String>,
         #[serde(default)]
         expected_artifacts: Vec<String>,
         #[serde(default)]

@@ -3374,6 +3374,8 @@ impl IpcServer {
                 target_agent_id,
                 task_description,
                 context_package,
+                chat_id,
+                source,
                 expected_artifacts,
                 timeout_secs,
             } => {
@@ -3391,6 +3393,9 @@ impl IpcServer {
                     .unwrap_or_default()
                     .as_secs();
 
+                // Generate a derived session_id ensuring isolation but persistence to the same chat
+                let session_id = format!("{}:peer:{}", chat_id, target_agent_id);
+
                 // Build the mesh envelope for TaskInvoke
                 let env = EventEnvelope {
                     event_id: delegation_id,
@@ -3407,6 +3412,9 @@ impl IpcServer {
                     payload: ansible_mesh_core::event::EventPayload::Inline {
                         data: serde_json::json!({
                             "action": "peer.delegate",
+                            "session_id": session_id,
+                            "chat_id": chat_id,
+                            "source": source.unwrap_or_else(|| "peer".into()),
                             "content": format!(
                                 "Handoff from peer {}:\n\nTask: {}\n\nContext:\n{}\n\nExpected Artifacts: {:?}",
                                 identity.guest_id, task_description, context_package, expected_artifacts

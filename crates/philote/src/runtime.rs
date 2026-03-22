@@ -5256,6 +5256,8 @@ impl AgentRuntime {
                         target_agent_id: target_agent_id.clone(),
                         task_description,
                         context_package,
+                        chat_id: payload.chat_id.clone(),
+                        source: Some("peer".into()),
                         expected_artifacts,
                         timeout_secs,
                     })
