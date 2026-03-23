@@ -4251,8 +4251,8 @@ async fn main() -> Result<()> {
     } else {
         Path::new("aiua_context.db")
     };
-    let graph_storage = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open(db_path)?;
-    let graph_domain_arc = Arc::new(GraphDomain::new(Arc::new(graph_storage.adapter())));
+    let _graph_storage = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open(db_path)?;
+    let graph_domain_arc = Arc::new(GraphDomain::new(Arc::new(_graph_storage.adapter())));
 
     let hotel_name = args
         .hotel
@@ -4351,8 +4351,6 @@ async fn main() -> Result<()> {
         hotel_name, caps.node_id, addr
     );
 
-    let graph_arc: Arc<dyn ansible_mesh_core::storage::GraphStorage> = Arc::new(graph_storage);
-
     // Boot-time MuninnDB config load (Slice D).
     // Returns None if no vault registry is configured; guests fall back to NullMemoryEngine.
     let muninn_config_arc: Option<Arc<memory_core::MuninnConfig>> = match memory::load_muninn_config(
@@ -4384,9 +4382,8 @@ async fn main() -> Result<()> {
             hotel.ipc_socket_path.clone(),
             caps.node_id.clone(),
             dispatcher_tx,
-            graph_arc.clone(),
+            graph_domain_arc.clone(),
         )
-        .with_graph_domain(graph_domain_arc.clone())
         .with_memory_config(muninn_config_arc.clone());
         tokio::spawn(async move {
             if let Err(e) = ipc_server.run().await {
@@ -4538,9 +4535,8 @@ async fn main() -> Result<()> {
         socket_path,
         caps.node_id.clone(),
         dispatcher_tx.clone(),
-        graph_arc.clone(),
+        graph_domain_arc.clone(),
     )
-    .with_graph_domain(graph_domain_arc.clone())
     .with_memory_config(muninn_config_arc)
     .with_materialization_requester(guest_manager.clone())
     .with_registry(registry.clone());

@@ -1,6 +1,5 @@
 use crate::LedgerCommand;
 use crate::service::guest_manager::GuestMaterializationRequester;
-use crate::vault::store_secret;
 use crate::service::lease::{
     LeaseAcquireOutcome, LeaseObserver, LeaseObserverEvent, LeaseObserverEventKind, LeaseProvider,
     LeaseRenewOutcome, RuntimeLeaseRegistry,
@@ -13,7 +12,7 @@ use ansible_mesh_core::registry::{
     CapabilityAdvertisement, ExecutionReachability, NodeRegistry, NodeStatus,
 };
 use ansible_mesh_core::storage::{
-    GraphStorage, GuestRecord, HotelRecord, SessionEventRecord, SessionParticipantRecord,
+    GuestRecord, HotelRecord, SessionEventRecord, SessionParticipantRecord,
     SessionRecord, SessionTurnRecord,
 };
 use ansible_mesh_core::validation::{
@@ -139,8 +138,7 @@ pub struct IpcServer {
     socket_path: String,
     local_node_id: String,
     dispatcher_tx: mpsc::Sender<LedgerCommand>,
-    graph: Arc<dyn GraphStorage>,
-    graph_domain: Option<Arc<GraphDomain>>,
+    graph: Arc<GraphDomain>,
     inboxes: InboxRegistry,
     parked_inbound: Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
     materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
@@ -342,7 +340,7 @@ impl IpcServer {
             .unwrap_or(false)
     }
 
-    fn local_hotel_name(graph: &dyn GraphStorage, local_node_id: &str) -> Option<String> {
+    fn local_hotel_name(graph: &GraphDomain, local_node_id: &str) -> Option<String> {
         graph.list_hotels().ok().and_then(|hotels| {
             hotels
                 .into_iter()
@@ -352,7 +350,7 @@ impl IpcServer {
     }
 
     fn desktop_membrane_status_view(
-        graph: &dyn GraphStorage,
+        graph: &GraphDomain,
         local_node_id: &str,
     ) -> anyhow::Result<DesktopMembraneStatusView> {
         let hotel_name = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
@@ -370,7 +368,7 @@ impl IpcServer {
 
     async fn desktop_membrane_target_status_view(
         registry: &Arc<RwLock<NodeRegistry>>,
-        graph: &dyn GraphStorage,
+        graph: &GraphDomain,
         local_node_id: &str,
         target_node_id: &str,
     ) -> anyhow::Result<DesktopMembraneTargetStatusView> {
@@ -438,7 +436,7 @@ impl IpcServer {
     }
 
     fn desktop_membrane_guest_views(
-        graph: &dyn GraphStorage,
+        graph: &GraphDomain,
         local_node_id: &str,
     ) -> anyhow::Result<Vec<DesktopMembraneGuestView>> {
         let hotel_name = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
@@ -454,7 +452,7 @@ impl IpcServer {
 
     async fn desktop_membrane_target_guest_inventory_view(
         registry: &Arc<RwLock<NodeRegistry>>,
-        graph: &dyn GraphStorage,
+        graph: &GraphDomain,
         local_node_id: &str,
         target_node_id: &str,
     ) -> anyhow::Result<DesktopMembraneTargetGuestInventoryView> {
@@ -512,7 +510,7 @@ impl IpcServer {
 
     async fn operator_target_agent_inventory_view(
         registry: &Arc<RwLock<NodeRegistry>>,
-        graph: &dyn GraphStorage,
+        graph: &GraphDomain,
         local_node_id: &str,
         target_node_id: &str,
     ) -> anyhow::Result<OperatorTargetAgentInventoryView> {
@@ -568,7 +566,7 @@ impl IpcServer {
     }
 
     async fn query_remote_desktop_membrane_guests(
-        graph: &dyn GraphStorage,
+        graph: &GraphDomain,
         local_node_id: &str,
         target_node_id: &str,
         target_hotel: &str,
@@ -658,7 +656,7 @@ impl IpcServer {
     }
 
     async fn query_remote_desktop_membrane_status(
-        graph: &dyn GraphStorage,
+        graph: &GraphDomain,
         local_node_id: &str,
         target_node_id: &str,
         target_hotel: &str,
@@ -748,7 +746,7 @@ impl IpcServer {
     }
 
     async fn query_remote_operator_target_agents(
-        graph: &dyn GraphStorage,
+        graph: &GraphDomain,
         local_node_id: &str,
         target_node_id: &str,
         target_hotel: &str,
@@ -839,7 +837,7 @@ impl IpcServer {
 
     async fn send_operator_chat_turn(
         registry: &Arc<RwLock<NodeRegistry>>,
-        graph: &dyn GraphStorage,
+        graph: &GraphDomain,
         local_node_id: &str,
         target_node_id: &str,
         target_agent_id: &str,
@@ -1013,7 +1011,7 @@ impl IpcServer {
     }
 
     fn operator_agent_views(
-        graph: &dyn GraphStorage,
+        graph: &GraphDomain,
         local_node_id: &str,
     ) -> anyhow::Result<Vec<OperatorAgentView>> {
         let hotel_name = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
@@ -1030,7 +1028,7 @@ impl IpcServer {
     }
 
     fn desktop_membrane_agent_views(
-        graph: &dyn GraphStorage,
+        graph: &GraphDomain,
         local_node_id: &str,
     ) -> anyhow::Result<Vec<DesktopMembraneAgentView>> {
         Self::operator_agent_views(graph, local_node_id)
@@ -1068,7 +1066,7 @@ impl IpcServer {
 
     async fn desktop_membrane_target_views(
         registry: &Arc<RwLock<NodeRegistry>>,
-        graph: &dyn GraphStorage,
+        graph: &GraphDomain,
         local_node_id: &str,
     ) -> anyhow::Result<Vec<DesktopMembraneTargetView>> {
         let source_hotel = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
@@ -1099,7 +1097,7 @@ impl IpcServer {
     }
 
     fn desktop_membrane_target_view(
-        graph: &dyn GraphStorage,
+        graph: &GraphDomain,
         status: &NodeStatus,
         local_node_id: &str,
         source_hotel: &str,
@@ -1139,7 +1137,7 @@ impl IpcServer {
     }
 
     fn target_hotel_name(
-        graph: &dyn GraphStorage,
+        graph: &GraphDomain,
         status: &NodeStatus,
         source_hotel: &str,
     ) -> String {
@@ -1219,7 +1217,7 @@ impl IpcServer {
     }
 
     fn telegram_poll_lease_owner_is_live(
-        graph: &dyn GraphStorage,
+        graph: &GraphDomain,
         local_node_id: &str,
         owner_guest_id: &str,
     ) -> bool {
@@ -1256,7 +1254,7 @@ impl IpcServer {
 
     fn drop_stale_telegram_poll_lease_if_needed(
         guard: &mut RuntimeLeaseRegistry,
-        graph: &dyn GraphStorage,
+        graph: &GraphDomain,
         local_node_id: &str,
         lease_key: &str,
     ) {
@@ -1306,14 +1304,13 @@ impl IpcServer {
         socket_path: impl Into<String>,
         local_node_id: impl Into<String>,
         dispatcher_tx: mpsc::Sender<LedgerCommand>,
-        graph: Arc<dyn GraphStorage>,
+        graph: Arc<GraphDomain>,
     ) -> Self {
         Self {
             socket_path: socket_path.into(),
             local_node_id: local_node_id.into(),
             dispatcher_tx,
             graph,
-            graph_domain: None,
             inboxes: Arc::new(Mutex::new(HashMap::new())),
             parked_inbound: Arc::new(Mutex::new(HashMap::new())),
             materialization_requester: None,
@@ -1328,11 +1325,6 @@ impl IpcServer {
 
     pub fn with_memory_config(mut self, config: Option<Arc<memory_core::MuninnConfig>>) -> Self {
         self.muninn_config = config;
-        self
-    }
-
-    pub fn with_graph_domain(mut self, domain: Arc<GraphDomain>) -> Self {
-        self.graph_domain = Some(domain);
         self
     }
 
@@ -1369,7 +1361,6 @@ impl IpcServer {
                     let dispatcher = self.dispatcher_tx.clone();
                     let local_node_id = self.local_node_id.clone();
                     let graph = self.graph.clone();
-                    let graph_domain = self.graph_domain.clone();
                     let inboxes = self.inboxes.clone();
                     let parked_inbound = self.parked_inbound.clone();
                     let materialization_requester = self.materialization_requester.clone();
@@ -1385,7 +1376,6 @@ impl IpcServer {
                             local_node_id,
                             dispatcher,
                             graph,
-                            graph_domain,
                             inboxes,
                             parked_inbound,
                             materialization_requester,
@@ -1413,8 +1403,7 @@ impl IpcServer {
         stream: UnixStream,
         local_node_id: String,
         dispatcher_tx: mpsc::Sender<LedgerCommand>,
-        graph: Arc<dyn GraphStorage>,
-        graph_domain: Option<Arc<GraphDomain>>,
+        graph: Arc<GraphDomain>,
         inboxes: InboxRegistry,
         parked_inbound: Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
         materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
@@ -1473,7 +1462,6 @@ impl IpcServer {
                             &local_node_id,
                             &dispatcher_tx,
                             graph.as_ref(),
-                            graph_domain.as_deref(),
                             &inboxes,
                             &parked_inbound,
                             materialization_requester.as_deref(),
@@ -1619,7 +1607,7 @@ impl IpcServer {
     #[allow(clippy::too_many_arguments)]
     async fn handle_spawn_subagent(
         local_node_id: &str,
-        graph: &dyn GraphStorage,
+        graph: &GraphDomain,
         inboxes: &InboxRegistry,
         materialization_requester: Option<&dyn GuestMaterializationRequester>,
         subagent_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
@@ -1874,7 +1862,7 @@ impl IpcServer {
     }
 
     fn configured_local_guest_exists(
-        graph: &dyn GraphStorage,
+        graph: &GraphDomain,
         local_node_id: &str,
         guest_id: &str,
     ) -> bool {
@@ -1888,7 +1876,7 @@ impl IpcServer {
     }
 
     async fn resolve_agent_route(
-        graph: &dyn GraphStorage,
+        graph: &GraphDomain,
         inboxes: &InboxRegistry,
         local_node_id: &str,
         target_role: &str,
@@ -1985,7 +1973,7 @@ impl IpcServer {
     }
 
     fn resolve_orchestrator_guest_id(
-        graph: &dyn GraphStorage,
+        graph: &GraphDomain,
         session: &SessionRecord,
         live_agent_guests: &[String],
     ) -> Option<String> {
@@ -2006,7 +1994,7 @@ impl IpcServer {
     }
 
     fn update_session_active_incarnation(
-        graph: &dyn GraphStorage,
+        graph: &GraphDomain,
         session_id: &str,
         guest_id: &str,
     ) -> anyhow::Result<()> {
@@ -2020,7 +2008,7 @@ impl IpcServer {
     }
 
     fn resolve_role_guest_id(
-        graph: &dyn GraphStorage,
+        graph: &GraphDomain,
         session_id: &str,
         role_name: &str,
     ) -> anyhow::Result<String> {
@@ -2041,7 +2029,7 @@ impl IpcServer {
     }
 
     async fn queue_or_deliver_guest_task(
-        graph: &dyn GraphStorage,
+        graph: &GraphDomain,
         inboxes: &InboxRegistry,
         parked_inbound: &Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
         materialization_requester: Option<&dyn GuestMaterializationRequester>,
@@ -2130,8 +2118,7 @@ impl IpcServer {
         req: IpcRequest,
         local_node_id: &str,
         dispatcher_tx: &mpsc::Sender<LedgerCommand>,
-        graph: &dyn GraphStorage,
-        graph_domain: Option<&GraphDomain>,
+        graph: &GraphDomain,
         inboxes: &InboxRegistry,
         parked_inbound: &Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
         materialization_requester: Option<&dyn GuestMaterializationRequester>,
@@ -2289,15 +2276,8 @@ impl IpcServer {
                     );
                 };
 
-                let Some(ref domain) = graph_domain else {
-                    return IpcResponse::error(
-                        "secret",
-                        "SECRET_DOMAIN_UNAVAILABLE",
-                        "vault domain not configured",
-                    );
-                };
                 match resolve_secret(
-                    domain,
+                    graph,
                     &secret_ref,
                     &SecretAccess {
                         role: identity.role.clone(),
@@ -4287,7 +4267,7 @@ impl IpcServer {
     }
 
     fn record_apartment_checkpoint(
-        graph: &dyn GraphStorage,
+        graph: &GraphDomain,
         agent_id: &str,
         memory_type: &str,
         content_json: &serde_json::Value,
@@ -4355,7 +4335,7 @@ impl IpcServer {
     }
 
     fn record_session_activity_from_value(
-        graph: &dyn GraphStorage,
+        graph: &GraphDomain,
         payload: &serde_json::Value,
         request_event_id: Option<Uuid>,
         turn_status: Option<&str>,
@@ -4504,7 +4484,7 @@ impl IpcServer {
     }
 
     fn upsert_tool_runner_registry_entry(
-        graph: &dyn GraphStorage,
+        graph: &GraphDomain,
         identity: &philotic_client::GuestIdentity,
     ) -> anyhow::Result<()> {
         let mut registry = load_tool_runner_registry(graph)?;
@@ -4531,7 +4511,7 @@ impl IpcServer {
     }
 
     fn append_explicit_approval_events(
-        graph: &dyn GraphStorage,
+        graph: &GraphDomain,
         session_id: &str,
         turn_id: Option<&str>,
         component_id: &str,
@@ -4663,7 +4643,7 @@ impl IpcServer {
     }
 
     async fn compose_session_snapshot(
-        graph: &dyn GraphStorage,
+        graph: &GraphDomain,
         inboxes: &InboxRegistry,
         registry: &Arc<RwLock<NodeRegistry>>,
         local_node_id: &str,
@@ -5034,7 +5014,7 @@ async fn live_role_subscribers(
 }
 
 fn load_tool_runner_registry(
-    graph: &dyn GraphStorage,
+    graph: &GraphDomain,
 ) -> anyhow::Result<Vec<ToolRunnerRegistryEntry>> {
     let Some(raw) = graph.get_config_value("tool_runner_registry")? else {
         return Ok(Vec::new());
@@ -6085,7 +6065,47 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct TestGraphStorage;
+    struct TestGraphAdapter;
+
+    impl ansible_mesh_core::storage::GraphAdapter for TestGraphAdapter {
+        fn upsert_node(
+            &self,
+            _node: &ansible_mesh_core::graph::GraphNode,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn get_node(
+            &self,
+            _node_key: &str,
+        ) -> anyhow::Result<Option<ansible_mesh_core::graph::GraphNode>> {
+            Ok(None)
+        }
+        fn delete_node(&self, _node_key: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn list_nodes_by_kind(
+            &self,
+            _kind: &str,
+        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::GraphNode>> {
+            Ok(vec![])
+        }
+        fn upsert_edge(
+            &self,
+            _edge: &ansible_mesh_core::graph::GraphEdge,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn delete_edge(&self, _edge_key: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn list_edges_from(
+            &self,
+            _src_node_key: &str,
+            _edge_kind: Option<&str>,
+        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::GraphEdge>> {
+            Ok(vec![])
+        }
+    }
 
     #[derive(Default)]
     struct MockMaterializationRequester {
@@ -6097,247 +6117,6 @@ mod tests {
         async fn ensure_guest_active(&self, _guest_id: &str) -> anyhow::Result<bool> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(true)
-        }
-    }
-
-    impl GraphStorage for TestGraphStorage {
-        fn load_node_capabilities(&self) -> anyhow::Result<Option<NodeCapabilities>> {
-            Ok(None)
-        }
-        fn save_node_capabilities(&self, _caps: &NodeCapabilities) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn get_config_value(&self, _key: &str) -> anyhow::Result<Option<String>> {
-            Ok(None)
-        }
-        fn set_config_value(&self, _key: &str, _value_json: &str) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn upsert_secret(&self, _secret: &SecretRecord) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn get_secret(&self, _secret_ref: &str) -> anyhow::Result<Option<SecretRecord>> {
-            Ok(None)
-        }
-        fn get_hotel(&self, _hotel_name: &str) -> anyhow::Result<Option<HotelRecord>> {
-            Ok(None)
-        }
-        fn list_hotels(&self) -> anyhow::Result<Vec<HotelRecord>> {
-            Ok(vec![])
-        }
-        fn upsert_hotel(&self, _hotel: &HotelRecord) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn set_hotel_pid(&self, _hotel_name: &str, _pid: Option<&str>) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn list_guests(
-            &self,
-            _hotel_name: &str,
-            _active_only: bool,
-        ) -> anyhow::Result<Vec<GuestRecord>> {
-            Ok(vec![])
-        }
-        fn set_guest_pid(
-            &self,
-            _hotel_name: &str,
-            _guest_id: &str,
-            _pid: Option<&str>,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn set_guest_active(
-            &self,
-            _hotel_name: &str,
-            _guest_id: &str,
-            _active: bool,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn seed_guests(&self, _hotel_name: &str, _guests: &[GuestRecord]) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn upsert_agent_identity(&self, _identity: &AgentIdentityRecord) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn list_agent_identities(&self) -> anyhow::Result<Vec<AgentIdentityRecord>> {
-            Ok(vec![])
-        }
-        fn get_agent_identity(
-            &self,
-            _agent_id: &str,
-        ) -> anyhow::Result<Option<AgentIdentityRecord>> {
-            Ok(None)
-        }
-        fn sync_apartment(
-            &self,
-            _agent_id: &str,
-            _memory_type: &str,
-            _content_json: &serde_json::Value,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn get_apartment(
-            &self,
-            _agent_id: &str,
-            _memory_type: &str,
-        ) -> anyhow::Result<Option<serde_json::Value>> {
-            Ok(None)
-        }
-        fn upsert_session(&self, _session: &SessionRecord) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn get_session(&self, _session_id: &str) -> anyhow::Result<Option<SessionRecord>> {
-            Ok(None)
-        }
-        fn upsert_role_incarnation(&self, _role: &RoleIncarnationRecord) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn get_role_incarnation(
-            &self,
-            _agent_id: &str,
-            _role_name: &str,
-        ) -> anyhow::Result<Option<RoleIncarnationRecord>> {
-            Ok(None)
-        }
-        fn list_role_incarnations(
-            &self,
-            _agent_id: &str,
-        ) -> anyhow::Result<Vec<RoleIncarnationRecord>> {
-            Ok(vec![])
-        }
-        fn upsert_session_participant(
-            &self,
-            _participant: &SessionParticipantRecord,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn list_session_participants(
-            &self,
-            _session_id: &str,
-        ) -> anyhow::Result<Vec<SessionParticipantRecord>> {
-            Ok(vec![])
-        }
-        fn upsert_session_turn(&self, _turn: &SessionTurnRecord) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn get_session_turn(
-            &self,
-            _session_id: &str,
-            _turn_id: &str,
-        ) -> anyhow::Result<Option<SessionTurnRecord>> {
-            Ok(None)
-        }
-        fn list_session_turns(
-            &self,
-            _session_id: &str,
-            _limit: usize,
-        ) -> anyhow::Result<Vec<SessionTurnRecord>> {
-            Ok(vec![])
-        }
-        fn append_session_event(&self, _event: &SessionEventRecord) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn list_session_events(
-            &self,
-            _session_id: &str,
-            _limit: usize,
-        ) -> anyhow::Result<Vec<SessionEventRecord>> {
-            Ok(vec![])
-        }
-
-        fn upsert_abstract_tool(
-            &self,
-            _tool: &ansible_mesh_core::graph::AbstractToolRecord,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn get_abstract_tool(
-            &self,
-            _tool_name: &str,
-        ) -> anyhow::Result<Option<ansible_mesh_core::graph::AbstractToolRecord>> {
-            Ok(None)
-        }
-
-        fn list_abstract_tools(
-            &self,
-        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::AbstractToolRecord>> {
-            Ok(vec![])
-        }
-
-        fn upsert_abstract_skill(
-            &self,
-            _skill: &ansible_mesh_core::graph::AbstractSkillRecord,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn get_abstract_skill(
-            &self,
-            _skill_name: &str,
-        ) -> anyhow::Result<Option<ansible_mesh_core::graph::AbstractSkillRecord>> {
-            Ok(None)
-        }
-
-        fn list_abstract_skills(
-            &self,
-        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::AbstractSkillRecord>> {
-            Ok(vec![])
-        }
-
-        fn list_role_incarnations_by_guest_id(
-            &self,
-            _guest_id: &str,
-        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::RoleIncarnationRecord>> {
-            Ok(vec![])
-        }
-
-        fn set_guest_last_active(
-            &self,
-            _hotel_name: &str,
-            _guest_id: &str,
-            _epoch: u64,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn upsert_toolset_profile(
-            &self,
-            _profile: &ansible_mesh_core::graph::ToolsetProfileRecord,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn get_toolset_profile(
-            &self,
-            _profile_name: &str,
-        ) -> anyhow::Result<Option<ansible_mesh_core::graph::ToolsetProfileRecord>> {
-            Ok(None)
-        }
-
-        fn list_toolset_profiles(
-            &self,
-        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::ToolsetProfileRecord>> {
-            Ok(vec![])
-        }
-
-        fn upsert_rule(&self, _rule: &ansible_mesh_core::graph::RuleRecord) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn get_rule(
-            &self,
-            _rule_id: &str,
-        ) -> anyhow::Result<Option<ansible_mesh_core::graph::RuleRecord>> {
-            Ok(None)
-        }
-
-        fn list_rules(
-            &self,
-            _agent_id: &str,
-        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::RuleRecord>> {
-            Ok(vec![])
         }
     }
 
@@ -6358,7 +6137,7 @@ mod tests {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
         let (dispatcher_tx, mut dispatcher_rx) = mpsc::channel(8);
-        let graph: Arc<dyn GraphStorage> = Arc::new(TestGraphStorage);
+        let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -6452,7 +6231,7 @@ mod tests {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
-        let graph: Arc<dyn GraphStorage> = Arc::new(TestGraphStorage);
+        let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -6561,7 +6340,7 @@ mod tests {
                 updated_at: 2,
             })
             .expect("session should seed");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -6682,7 +6461,7 @@ mod tests {
                 updated_at: 2,
             })
             .expect("session should seed");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -6788,7 +6567,7 @@ mod tests {
                 updated_at: 2,
             })
             .expect("session should seed");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -6914,7 +6693,7 @@ mod tests {
             .expect("session should seed");
 
         let requester = Arc::new(MockMaterializationRequester::default());
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph)
             .with_materialization_requester(requester.clone());
 
@@ -7021,7 +6800,7 @@ mod tests {
                 turn_loop_config: TurnLoopConfig::default(),
             })
             .expect("developer role should seed");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(
             socket_path.clone(),
             "local-aiua-01",
@@ -7202,7 +6981,7 @@ mod tests {
             .expect("developer role should seed");
 
         let requester = Arc::new(MockMaterializationRequester::default());
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(
             socket_path.clone(),
             "local-aiua-01",
@@ -7329,7 +7108,7 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -7416,7 +7195,7 @@ mod tests {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
-        let graph: Arc<dyn GraphStorage> = Arc::new(TestGraphStorage);
+        let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -7502,7 +7281,7 @@ mod tests {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
         let (dispatcher_tx, mut dispatcher_rx) = mpsc::channel(8);
-        let graph: Arc<dyn GraphStorage> = Arc::new(TestGraphStorage);
+        let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -7572,7 +7351,7 @@ mod tests {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
-        let graph: Arc<dyn GraphStorage> = Arc::new(TestGraphStorage);
+        let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
         let registry = Arc::new(RwLock::new(NodeRegistry::new()));
         registry.write().await.update_node(
             NodeCapabilities {
@@ -7663,15 +7442,13 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        let graph_domain = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(
             socket_path.clone(),
             "local-aiua-01",
             dispatcher_tx,
             graph.clone(),
-        )
-        .with_graph_domain(graph_domain.clone());
+        );
 
         let vault_key = base64::engine::general_purpose::STANDARD.encode([5u8; 32]);
         unsafe {
@@ -7680,7 +7457,7 @@ mod tests {
         }
 
         let secret_ref = store_secret(
-            &graph_domain,
+            &graph,
             SecretInput {
                 secret_kind: "gemini-access-token".into(),
                 scope: "hotel".into(),
@@ -7739,7 +7516,7 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -7811,7 +7588,7 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         graph_store
@@ -7937,7 +7714,7 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         // Seed profile with known allowed_tools and allowed_skills.
@@ -8057,7 +7834,7 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         graph_store
@@ -8133,7 +7910,7 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         graph_store
@@ -8240,7 +8017,7 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let registry = Arc::new(RwLock::new(NodeRegistry::new()));
         registry.write().await.update_node(
             NodeCapabilities {
@@ -8360,7 +8137,7 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let registry = Arc::new(RwLock::new(NodeRegistry::new()));
         registry.write().await.update_node(
             NodeCapabilities {
@@ -8493,7 +8270,7 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let registry = Arc::new(RwLock::new(NodeRegistry::new()));
         registry.write().await.update_node(
             NodeCapabilities {
@@ -8618,7 +8395,7 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         graph_store
@@ -8735,7 +8512,7 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         graph_store
@@ -8880,7 +8657,7 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         graph_store
@@ -9022,7 +8799,7 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let registry = Arc::new(RwLock::new(NodeRegistry::new()));
         registry.write().await.update_node(
             NodeCapabilities {
@@ -9141,7 +8918,7 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -9186,7 +8963,7 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         graph_store
@@ -9283,7 +9060,7 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         for session_id in ["sess-1", "sess-2"] {
@@ -9430,7 +9207,7 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -9504,7 +9281,7 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -9577,7 +9354,7 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -9664,7 +9441,7 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, mut dispatcher_rx) = mpsc::channel(16);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -9914,7 +9691,7 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, mut dispatcher_rx) = mpsc::channel(16);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -10207,7 +9984,7 @@ mod tests {
                 bundle_json: serde_json::json!({}),
             })
             .expect("seed local agent identity");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -10323,7 +10100,7 @@ mod tests {
                 bundle_json: serde_json::json!({}),
             })
             .expect("seed remote-owned agent identity");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -10406,7 +10183,7 @@ mod tests {
                 }),
             })
             .expect("seed delegated remote-owned agent identity");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -10481,7 +10258,7 @@ mod tests {
                 bundle_json: serde_json::json!({}),
             })
             .expect("seed local agent identity");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -10568,7 +10345,7 @@ mod tests {
                 bundle_json: serde_json::json!({}),
             })
             .expect("seed local agent identity");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -10662,7 +10439,7 @@ mod tests {
                 bundle_json: serde_json::json!({}),
             })
             .expect("seed local agent identity");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -10776,7 +10553,7 @@ mod tests {
                 }],
             )
             .expect("seed membrane guest");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -10853,7 +10630,7 @@ mod tests {
                 active_pid: None,
             })
             .expect("seed local hotel");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -10961,7 +10738,7 @@ mod tests {
                 active_pid: None,
             })
             .expect("seed local hotel");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -11039,7 +10816,7 @@ mod tests {
                 active_pid: None,
             })
             .expect("seed local hotel");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -11145,7 +10922,7 @@ mod tests {
                 active_pid: Some(std::process::id().to_string()),
             })
             .expect("seed local hotel");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -11231,7 +11008,7 @@ mod tests {
                 ],
             )
             .expect("seed guests");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -11319,7 +11096,7 @@ mod tests {
                 }),
             })
             .expect("seed remote agent");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -11386,7 +11163,7 @@ mod tests {
                 active_pid: Some(std::process::id().to_string()),
             })
             .expect("seed local hotel");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let registry = Arc::new(RwLock::new(NodeRegistry::new()));
         registry.write().await.update_node(
             NodeCapabilities {
@@ -11539,7 +11316,7 @@ mod tests {
                 active_pid: None,
             })
             .expect("seed remote hotel");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let registry = Arc::new(RwLock::new(NodeRegistry::new()));
         registry.write().await.update_node(
             NodeCapabilities {
@@ -11683,7 +11460,7 @@ mod tests {
                 active_pid: None,
             })
             .expect("seed remote hotel");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let registry = Arc::new(RwLock::new(NodeRegistry::new()));
         registry.write().await.update_node(
             NodeCapabilities {
@@ -11812,7 +11589,7 @@ mod tests {
                 }),
             })
             .expect("seed local agent identity");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let registry = Arc::new(RwLock::new(NodeRegistry::new()));
         registry.write().await.update_node(
             NodeCapabilities {
@@ -11939,7 +11716,7 @@ mod tests {
                 active_pid: Some(std::process::id().to_string()),
             })
             .expect("seed local hotel");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let registry = Arc::new(RwLock::new(NodeRegistry::new()));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph)
             .with_registry(registry);
@@ -12131,7 +11908,7 @@ mod tests {
                 active_pid: None,
             })
             .expect("seed remote hotel");
-        let local_graph: Arc<dyn GraphStorage> = Arc::new(local_graph_store);
+        let local_graph = Arc::new(GraphDomain::new(Arc::new(local_graph_store.adapter())));
         let local_registry = Arc::new(RwLock::new(NodeRegistry::new()));
         local_registry.write().await.update_node(
             NodeCapabilities {
@@ -12179,7 +11956,7 @@ mod tests {
                 active_pid: Some(std::process::id().to_string()),
             })
             .expect("seed remote hotel");
-        let remote_graph: Arc<dyn GraphStorage> = Arc::new(remote_graph_store);
+        let remote_graph = Arc::new(GraphDomain::new(Arc::new(remote_graph_store.adapter())));
 
         let local_server = IpcServer::new(
             local_socket_path.clone(),
@@ -12421,7 +12198,7 @@ mod tests {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
         let (dispatcher_tx, _) = mpsc::channel(8);
-        let graph: Arc<dyn ansible_mesh_core::storage::GraphStorage> = Arc::new(TestGraphStorage);
+        let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -12480,7 +12257,7 @@ mod tests {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
         let (dispatcher_tx, _) = mpsc::channel(8);
-        let graph: Arc<dyn ansible_mesh_core::storage::GraphStorage> = Arc::new(TestGraphStorage);
+        let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
