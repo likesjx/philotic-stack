@@ -3,7 +3,7 @@ use ansible_mesh_core::graph::{AbstractSkillRecord, AbstractToolRecord, ToolsetP
 use ansible_mesh_core::heartbeat::emit_heartbeat;
 use ansible_mesh_core::registry::{CapabilityAdvertisement, ExecutionReachability, NodeRegistry};
 use ansible_mesh_core::storage::{
-    AgentIdentityRecord, CursorStorage, EventStorage, GraphStorage, GuestRecord, HotelRecord,
+    AgentIdentityRecord, CursorStorage, EventStorage, GuestRecord, HotelRecord,
 };
 use ansible_mesh_core::{NodeCapabilities, NodeRole};
 use anyhow::{Context, Result};

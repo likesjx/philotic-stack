@@ -8,7 +8,7 @@ used across the Philotic Stack. Every other crate depends on this one.
 | Module           | Key Types                                                         | Description                                                     |
 | ---------------- | ----------------------------------------------------------------- | --------------------------------------------------------------- |
 | `event`          | `EventEnvelope`, `EventKind`, `EventPayload`, `TerminalErrorCode` | The canonical inter-hotel event model                           |
-| `storage`        | `EventStorage`, `CursorStorage`, `GraphStorage`, `GuestRecord`    | DB-agnostic trait contracts                                     |
+| `storage`        | `EventStorage`, `CursorStorage`, `GraphStorage`, `GraphAdapter`, `GuestRecord` | DB-agnostic trait contracts                          |
 | `sqlite_storage` | `SqliteEventStorage`, `SqliteCursorStorage`, `SqliteGraphStorage` | SQLite implementations of all storage traits                    |
 | `ledger`         | `EventLedger`                                                     | Concrete append-only SQLite event log (used by mesh dispatcher) |
 | `cursor`         | `CursorTracker`                                                   | Per-node ACK cursor table                                       |
@@ -50,9 +50,9 @@ All consumers (`GuestManager`, `IpcServer`, hotel `main.rs`) receive
 Implement the three traits in a new crate and drop in at startup:
 
 ```rust
-// ansible/src/main.rs
-let graph_storage = MyCustomStorage::open(db_path)?;
-let graph_arc: Arc<dyn GraphStorage> = Arc::new(graph_storage);
+// aiua/src/main.rs
+let adapter = MyCustomAdapter::open(db_path)?;
+let graph_domain = Arc::new(GraphDomain::new(Arc::new(adapter)));
 ```
 
 Candidates: PebbleDB, RocksDB, TiKV, Postgres.
