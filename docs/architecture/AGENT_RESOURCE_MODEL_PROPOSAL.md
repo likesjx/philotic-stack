@@ -61,7 +61,9 @@ Six interconnected components compose this model:
 
 ## Disposition
 
-Proposed. No implementation slices started.
+`accepted for current slice` — Seam 1 (`agent-resource-broker`) shipped on
+`codex/agent-resource-model` (commit a2aeb33). IPC types are live; hotel
+broker handler stubbed NOT_IMPLEMENTED pending Seam 2.
 
 This proposal supersedes the implicit static-guest-list model in the current
 `materialized_guests` configuration surface. It does not conflict with active
@@ -72,8 +74,8 @@ the resource substrate those features sit on top of.
 
 ## Current Slice
 
-None started. See **Implementation Sequence** below for the recommended seam
-ordering.
+**Seam 1 complete.** See **Implementation Sequence** below; Seam 2
+(`demand-derived-materialization`) is next.
 
 ---
 
