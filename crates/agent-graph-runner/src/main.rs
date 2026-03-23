@@ -13,7 +13,7 @@
 //! | `PHILOTIC_IPC_SOCKET`      | `/tmp/philotic-aiua.sock`          | Hotel UDS socket path          |
 //! | `PHILOTIC_AGENT_GRAPH_DB`  | `~/.philotic/agent-graph-{id}.db` | Per-agent SQLite path          |
 
-mod tools;
+use agent_graph_runner::tools;
 
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -3,13 +3,15 @@ use crate::controller::{
     ProviderRegistry, TaskKind,
 };
 use anyhow::Result;
+use ansible_mesh_core::router_trace::{RouterTraceStorage, RouterTrainingRecord, SqliteRouterTraceStorage};
 use philotic_client::{
     GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, TaskErrorPayload, is_ipc_disconnect,
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
+use ulid::Ulid;
 
 fn local_node_id() -> String {
     std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string())
@@ -68,6 +70,27 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
         .timeout(Duration::from_secs(60))
         .build()?;
     let stub_response = std::env::var("PHILOTIC_MODEL_ROUTER_STUB_RESPONSE").ok();
+
+    // Open the router training-tap trace store if configured.
+    let trace_store: Option<Arc<dyn RouterTraceStorage>> =
+        match std::env::var("PHILOTIC_ROUTER_TRACE_DB") {
+            Ok(path) => {
+                if let Some(parent) = std::path::Path::new(&path).parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                match SqliteRouterTraceStorage::open(&path) {
+                    Ok(store) => {
+                        info!(path = %path, "router training-tap trace store opened");
+                        Some(Arc::new(store))
+                    }
+                    Err(e) => {
+                        warn!(path = %path, "failed to open router trace store: {e}");
+                        None
+                    }
+                }
+            }
+            Err(_) => None,
+        };
 
     info!(
         "Listening for inbound model tasks on role [{}] from the Philotic Web...",
@@ -162,11 +185,25 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                     provider.id()
                 );
 
+                let dispatch_start = Instant::now();
+                let provider_id = provider.id().to_string();
+                let task_kind = controller_task.kind.as_str().to_string();
+
                 match provider.invoke(&controller_task).await {
                     Ok(ProviderOutput::ToolCall {
                         tool_name,
                         arguments,
                     }) => {
+                        let latency_ms = dispatch_start.elapsed().as_millis() as u64;
+                        record_routing_trace(
+                            trace_store.as_deref(),
+                            &reply,
+                            &provider_id,
+                            &task_kind,
+                            "tool_call",
+                            None,
+                            latency_ms,
+                        );
                         emit_tool_call_response(
                             &mut ipc_client,
                             &reply,
@@ -177,6 +214,16 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                         .await?;
                     }
                     Ok(output) => {
+                        let latency_ms = dispatch_start.elapsed().as_millis() as u64;
+                        record_routing_trace(
+                            trace_store.as_deref(),
+                            &reply,
+                            &provider_id,
+                            &task_kind,
+                            "success",
+                            None,
+                            latency_ms,
+                        );
                         let response = ControllerResponseEnvelope::from_output(
                             &controller_task,
                             provider.id(),
@@ -185,6 +232,22 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                         emit_text_response(&mut ipc_client, &reply, response).await?;
                     }
                     Err(err) => {
+                        let latency_ms = dispatch_start.elapsed().as_millis() as u64;
+                        let failure_code = classify_provider_failure(
+                            Some(task_kind.as_str()),
+                            Some(provider_id.as_str()),
+                            &err.to_string(),
+                        )
+                        .code;
+                        record_routing_trace(
+                            trace_store.as_deref(),
+                            &reply,
+                            &provider_id,
+                            &task_kind,
+                            "failure",
+                            failure_code.as_deref(),
+                            latency_ms,
+                        );
                         error!("Provider invocation failed: {}", err);
                         emit_failure(
                             &mut ipc_client,
@@ -540,6 +603,46 @@ fn classify_provider_failure(
     }
 
     payload
+}
+
+// ── Training-tap helper ───────────────────────────────────────────────────────
+
+fn now_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Record a routing decision into the training-tap store, if one is open.
+///
+/// Failures to write are logged as warnings and do not abort the request path.
+fn record_routing_trace(
+    store: Option<&dyn RouterTraceStorage>,
+    reply: &ReplyRoute,
+    provider_id: &str,
+    task_kind: &str,
+    outcome: &str,
+    failure_code: Option<&str>,
+    latency_ms: u64,
+) {
+    let Some(store) = store else { return };
+    let record = RouterTrainingRecord {
+        trace_id: Ulid::new().to_string(),
+        agent_id: String::new(), // populated below if available from session context
+        session_id: reply.session_id.clone(),
+        turn_id: reply.turn_id.clone(),
+        provider_id: provider_id.to_string(),
+        model_id: None,
+        task_kind: task_kind.to_string(),
+        outcome: outcome.to_string(),
+        failure_code: failure_code.map(str::to_string),
+        latency_ms: Some(latency_ms),
+        timestamp: now_epoch_secs(),
+    };
+    if let Err(e) = store.record_trace(&record) {
+        warn!(provider = %provider_id, outcome = %outcome, "router trace write failed: {e}");
+    }
 }
 
 impl ReplyRoute {

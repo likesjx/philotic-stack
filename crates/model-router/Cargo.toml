@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0"
+ansible-mesh-core = { path = "../ansible-mesh-core" }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["json"] }
 base64 = "0.22"
@@ -17,3 +18,4 @@ serde_json = "1.0"
 tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "time"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
+ulid = "1"

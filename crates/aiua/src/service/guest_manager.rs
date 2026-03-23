@@ -843,6 +843,26 @@ mod tests {
         fn list_rules(&self, _agent_id: &str) -> Result<Vec<ansible_mesh_core::graph::RuleRecord>> {
             Ok(vec![])
         }
+
+        fn upsert_workflow_skill(
+            &self,
+            _skill: &ansible_mesh_core::graph::WorkflowSkillRecord,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn get_workflow_skill(
+            &self,
+            _workflow_name: &str,
+        ) -> Result<Option<ansible_mesh_core::graph::WorkflowSkillRecord>> {
+            Ok(None)
+        }
+
+        fn list_workflow_skills(
+            &self,
+        ) -> Result<Vec<ansible_mesh_core::graph::WorkflowSkillRecord>> {
+            Ok(vec![])
+        }
     }
 
     struct MockMaterializer {

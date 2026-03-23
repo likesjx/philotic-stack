@@ -23,6 +23,8 @@ pub enum ResourceType {
     ToolRunner,
     /// Per-agent graph store and cognitive state tool-runner.
     AgentGraph,
+    /// Router observability listener (training-tap subscriber).
+    RouterListener,
 }
 
 /// A static resource declaration stored on an agent identity record.

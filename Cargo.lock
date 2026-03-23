@@ -53,6 +53,7 @@ dependencies = [
  "philotic-client",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -2171,6 +2172,7 @@ dependencies = [
 name = "model-router"
 version = "0.1.0"
 dependencies = [
+ "ansible-mesh-core",
  "anyhow",
  "async-trait",
  "axum 0.8.8",
@@ -2184,6 +2186,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "ulid",
 ]
 
 [[package]]

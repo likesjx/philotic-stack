@@ -61,7 +61,7 @@ Six interconnected components compose this model:
 
 ## Disposition
 
-`accepted for current slice` — Seams 1–4 shipped on `codex/agent-resource-model`.
+`accepted for current slice` — Seams 1–5 shipped on `codex/agent-resource-model`. DEF-003 fixed.
 
 - Seam 1 (`agent-resource-broker`, commit a2aeb33): IPC types live; hotel handler
   stubs both request variants NOT_IMPLEMENTED.
@@ -81,7 +81,7 @@ the resource substrate those features sit on top of.
 
 ## Current Slice
 
-**Seams 1–4 complete.** B1 workstream shipped.
+**Seams 1–5 complete.** B1 workstream shipped. DEF-003 fixed (110 aiua tests now pass).
 Seam 2 remains labeled transitional — `materialize_all` still runs alongside
 the demand-derived registry; full replacement lands after mesh-sync is proven in production.
 

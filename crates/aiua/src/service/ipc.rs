@@ -5935,8 +5935,8 @@ mod tests {
     };
     use base64::Engine;
     use philotic_client::{
-        GuestIdentity, HandoffBundle, HookKind, PhiloticClient, SubagentCompletionContract,
-        SubagentContextPacket, SubagentDelegation,
+        GuestIdentity, HandoffBundle, HookKind, OperatorTargetView, PhiloticClient,
+        SubagentCompletionContract, SubagentContextPacket, SubagentDelegation,
     };
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -6328,6 +6328,26 @@ mod tests {
             &self,
             _agent_id: &str,
         ) -> anyhow::Result<Vec<ansible_mesh_core::graph::RuleRecord>> {
+            Ok(vec![])
+        }
+
+        fn upsert_workflow_skill(
+            &self,
+            _skill: &ansible_mesh_core::graph::WorkflowSkillRecord,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn get_workflow_skill(
+            &self,
+            _workflow_name: &str,
+        ) -> anyhow::Result<Option<ansible_mesh_core::graph::WorkflowSkillRecord>> {
+            Ok(None)
+        }
+
+        fn list_workflow_skills(
+            &self,
+        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::WorkflowSkillRecord>> {
             Ok(vec![])
         }
     }

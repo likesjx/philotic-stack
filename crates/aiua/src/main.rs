@@ -1412,10 +1412,12 @@ fn extract_context_graph_entries(
 
     if let Some(hotels) = obj.get("hotels").and_then(serde_json::Value::as_object) {
         if let Some(hotel_name) = hotel_name {
-            if let Some(hotel) = hotels
+            // Prefer the named hotel; fall back to "default" for shared/overlay config.
+            let hotel_obj = hotels
                 .get(hotel_name)
-                .and_then(serde_json::Value::as_object)
-            {
+                .or_else(|| hotels.get("default"))
+                .and_then(serde_json::Value::as_object);
+            if let Some(hotel) = hotel_obj {
                 merge_hotel_base_entries(&mut merged, hotel);
             }
         }
