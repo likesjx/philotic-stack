@@ -1,5 +1,6 @@
+use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::registry::NodeRegistry;
-use ansible_mesh_core::storage::{CursorStorage, EventStorage, GraphStorage};
+use ansible_mesh_core::storage::{CursorStorage, EventStorage};
 use ansible_mesh_core::{BeaconMessage, MsgType};
 use anyhow::Result;
 use std::sync::Arc;
@@ -16,7 +17,7 @@ pub async fn outbound_dispatcher(
     ledger: Arc<dyn EventStorage>,
     tracker: Arc<dyn CursorStorage>,
     _udp_socket: Arc<UdpSocket>,
-    graph: Arc<dyn GraphStorage>,
+    graph: Arc<GraphDomain>,
     registry: Arc<RwLock<NodeRegistry>>,
     local_node_id: String,
     mut shutdown_rx: broadcast::Receiver<()>,
@@ -51,7 +52,7 @@ pub async fn outbound_dispatcher(
 }
 
 async fn execution_targets(
-    graph: &dyn GraphStorage,
+    graph: &GraphDomain,
     registry: &Arc<RwLock<NodeRegistry>>,
     local_node_id: &str,
 ) -> Result<Vec<(String, String)>> {

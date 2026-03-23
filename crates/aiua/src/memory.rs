@@ -13,7 +13,7 @@
 //! Returns `None` from `load_muninn_config` if MuninnDB is not configured
 //! (no vault registry entries). Guests should fall back to `NullMemoryEngine`.
 
-use ansible_mesh_core::storage::GraphStorage;
+use ansible_mesh_core::domain::GraphDomain;
 use anyhow::Result;
 use memory_core::{MuninnConfig, MuninnRestEngine, VaultResolver};
 
@@ -23,7 +23,7 @@ use crate::vault::{SecretAccess, resolve_secret};
 ///
 /// Reads `muninn_endpoint` and decrypts each entry in `vault_registry`.
 /// Returns `None` if the vault registry is empty (MuninnDB not configured).
-pub fn load_muninn_config(graph: &dyn GraphStorage) -> Result<Option<MuninnConfig>> {
+pub fn load_muninn_config(graph: &GraphDomain) -> Result<Option<MuninnConfig>> {
     let registry = graph.get_vault_registry()?;
     if registry.is_empty() {
         return Ok(None);
@@ -85,25 +85,29 @@ pub fn engine_for_agent(config: MuninnConfig, agent_id: &str, user_id: &str) -> 
 mod tests {
     use super::*;
     use crate::vault::{SecretInput, store_secret};
+    use ansible_mesh_core::domain::GraphDomain;
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
     use ansible_mesh_core::storage::VaultRegistryEntry;
+    use std::sync::Arc;
 
-    fn open_graph() -> SqliteGraphStorage {
-        SqliteGraphStorage::open(":memory:").expect("open in-memory graph")
+    fn open_domain() -> (SqliteGraphStorage, GraphDomain) {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open in-memory graph");
+        let domain = GraphDomain::new(Arc::new(storage.adapter()));
+        (storage, domain)
     }
 
     #[test]
     fn no_vault_registry_returns_none() {
-        let graph = open_graph();
-        let result = load_muninn_config(&graph).unwrap();
+        let (_storage, domain) = open_domain();
+        let result = load_muninn_config(&domain).unwrap();
         assert!(result.is_none());
     }
 
     #[test]
     fn vault_registry_with_missing_secret_skips_and_returns_config() {
-        let graph = open_graph();
+        let (_storage, domain) = open_domain();
 
-        graph
+        domain
             .upsert_vault_registry_entry(&VaultRegistryEntry {
                 vault_name: "self_philote-1".into(),
                 secret_ref: "secret://hotel/default/muninn/does-not-exist".into(),
@@ -111,7 +115,7 @@ mod tests {
             .unwrap();
 
         // Should not error — skips with a warning, returns Some(config) with empty tokens.
-        let config = load_muninn_config(&graph)
+        let config = load_muninn_config(&domain)
             .unwrap()
             .expect("Some even without valid secret");
         assert!(config.vault_tokens.is_empty());
@@ -119,10 +123,10 @@ mod tests {
 
     #[test]
     fn vault_registry_with_valid_secret_builds_config() {
-        let graph = open_graph();
+        let (_storage, domain) = open_domain();
 
         let secret_ref = store_secret(
-            &graph,
+            &domain,
             SecretInput {
                 plaintext: "mk_test-token-abc123".to_string(),
                 secret_kind: "muninn_vault_token".to_string(),
@@ -133,15 +137,15 @@ mod tests {
         )
         .unwrap();
 
-        graph
+        domain
             .upsert_vault_registry_entry(&VaultRegistryEntry {
                 vault_name: "self_philote-1".into(),
                 secret_ref: secret_ref.clone(),
             })
             .unwrap();
-        graph.set_muninn_endpoint("http://127.0.0.1:8475").unwrap();
+        domain.set_muninn_endpoint("http://127.0.0.1:8475").unwrap();
 
-        let config = load_muninn_config(&graph)
+        let config = load_muninn_config(&domain)
             .unwrap()
             .expect("Some with valid registry");
         assert_eq!(config.base_url, "http://127.0.0.1:8475");

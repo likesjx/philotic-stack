@@ -1,6 +1,7 @@
 use crate::vault::{SecretAccess, resolve_secret};
 use crate::vault::{SecretInput, store_secret};
-use ansible_mesh_core::storage::GraphStorage;
+use ansible_mesh_core::domain::GraphDomain;
+use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -168,8 +169,9 @@ async fn run_google_auth_validate(args: GoogleValidateArgs) -> Result<()> {
     }
 
     let graph = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open("aiua_context.db")?;
-    let token = load_gemini_access_token(&graph)?;
-    let project_id = graph
+    let graph_domain = GraphDomain::new(Arc::new(graph.adapter()));
+    let token = load_gemini_access_token(&graph_domain)?;
+    let project_id = graph_domain
         .get_config_value("gemini_oauth_project_id")?
         .and_then(|value_json| serde_json::from_str::<String>(&value_json).ok());
 
@@ -400,9 +402,10 @@ fn resolve_client_secret(args: &GoogleStartArgs) -> Option<String> {
 
 fn persist_gemini_oauth_config(args: &GoogleStartArgs, token: &GoogleTokenResponse) -> Result<()> {
     let graph = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open("aiua_context.db")?;
+    let domain = GraphDomain::new(Arc::new(graph.adapter()));
 
     let access_token_ref = store_secret(
-        &graph,
+        &domain,
         SecretInput {
             secret_kind: "gemini-access-token".into(),
             scope: "hotel".into(),
@@ -411,7 +414,7 @@ fn persist_gemini_oauth_config(args: &GoogleStartArgs, token: &GoogleTokenRespon
             plaintext: token.access_token.clone(),
         },
     )?;
-    graph.set_config_value(
+    domain.set_config_value(
         "gemini_oauth_access_token_ref",
         &serde_json::to_string(&access_token_ref)?,
     )?;
@@ -421,7 +424,7 @@ fn persist_gemini_oauth_config(args: &GoogleStartArgs, token: &GoogleTokenRespon
         .as_deref()
         .filter(|value| !value.trim().is_empty())
     {
-        graph.set_config_value(
+        domain.set_config_value(
             "gemini_oauth_project_id",
             &serde_json::to_string(project_id)?,
         )?;
@@ -433,18 +436,18 @@ fn persist_gemini_oauth_config(args: &GoogleStartArgs, token: &GoogleTokenRespon
             .unwrap_or_default()
             .as_secs()
             + expires_in;
-        graph.set_config_value(
+        domain.set_config_value(
             "gemini_oauth_access_token_expires_at",
             &expires_at.to_string(),
         )?;
     }
 
     if let Some(scope) = token.scope.as_deref() {
-        graph.set_config_value("gemini_oauth_scope", &serde_json::to_string(scope)?)?;
+        domain.set_config_value("gemini_oauth_scope", &serde_json::to_string(scope)?)?;
     }
 
     if let Some(token_type) = token.token_type.as_deref() {
-        graph.set_config_value(
+        domain.set_config_value(
             "gemini_oauth_token_type",
             &serde_json::to_string(token_type)?,
         )?;
@@ -453,7 +456,7 @@ fn persist_gemini_oauth_config(args: &GoogleStartArgs, token: &GoogleTokenRespon
     if let Some(refresh_token) = token.refresh_token.as_deref() {
         if args.insecure_store_refresh_token {
             let refresh_token_ref = store_secret(
-                &graph,
+                &domain,
                 SecretInput {
                     secret_kind: "gemini-refresh-token".into(),
                     scope: "hotel".into(),
@@ -462,7 +465,7 @@ fn persist_gemini_oauth_config(args: &GoogleStartArgs, token: &GoogleTokenRespon
                     plaintext: refresh_token.to_string(),
                 },
             )?;
-            graph.set_config_value(
+            domain.set_config_value(
                 "gemini_oauth_refresh_token_ref",
                 &serde_json::to_string(&refresh_token_ref)?,
             )?;
@@ -477,9 +480,7 @@ fn persist_gemini_oauth_config(args: &GoogleStartArgs, token: &GoogleTokenRespon
     Ok(())
 }
 
-fn load_gemini_access_token(
-    graph: &ansible_mesh_core::sqlite_storage::SqliteGraphStorage,
-) -> Result<String> {
+fn load_gemini_access_token(graph: &GraphDomain) -> Result<String> {
     if let Some(value_json) = graph.get_config_value("gemini_oauth_access_token")? {
         return serde_json::from_str::<String>(&value_json)
             .context("failed to decode legacy gemini_oauth_access_token");

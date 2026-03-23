@@ -55,6 +55,7 @@ fn profile_dir() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".philotic").join(profile))
 }
 
+use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::event::EventEnvelope;
 use auth::AuthCommand;
 use vault::{SecretInput, store_secret};
@@ -91,6 +92,7 @@ struct MeshRuntimeContext {
     enable_rust_auth: bool,
     enable_rust_dispatcher: bool,
     graph: Arc<dyn ansible_mesh_core::storage::GraphStorage>,
+    graph_domain: Arc<GraphDomain>,
     registry: Arc<RwLock<NodeRegistry>>,
     ledger: Arc<dyn EventStorage>,
     tracker: Arc<dyn CursorStorage>,
@@ -673,7 +675,7 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
             ctx.ledger.clone(),
             ctx.tracker.clone(),
             daemon.socket(),
-            ctx.graph.clone(),
+            ctx.graph_domain.clone(),
             ctx.registry.clone(),
             ctx.caps.node_id.clone(),
             ctx.shutdown_tx.subscribe(),
@@ -2028,7 +2030,7 @@ fn seed_orchestrator_roles(
 }
 
 fn enable_guest_test_overrides(
-    graph: &dyn GraphStorage,
+    graph: &GraphDomain,
     hotel_name: &str,
     test: StartupTest,
 ) -> Result<()> {
@@ -4070,6 +4072,7 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
         Path::new("aiua_context.db")
     };
     let graph_storage = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open(db_path)?;
+    let graph_domain = GraphDomain::new(Arc::new(graph_storage.adapter()));
     let hotel = reconcile_hotel_record(&graph_storage, hotel_name)?;
     graph_storage.upsert_hotel(&hotel)?;
 
@@ -4113,11 +4116,11 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
             .get("admin_password")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        graph_storage.set_muninn_endpoint(endpoint)?;
+        graph_domain.set_muninn_endpoint(endpoint)?;
         let vault_names = muninn_provision::derive_vault_names(&config_json);
         if !vault_names.is_empty() {
             muninn_provision::provision_muninn_vaults(
-                &graph_storage,
+                &graph_domain,
                 endpoint,
                 username,
                 password,
@@ -4250,6 +4253,7 @@ async fn main() -> Result<()> {
         Path::new("aiua_context.db")
     };
     let graph_storage = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open(db_path)?;
+    let graph_domain_arc = Arc::new(GraphDomain::new(Arc::new(graph_storage.adapter())));
 
     let hotel_name = args
         .hotel
@@ -4291,7 +4295,7 @@ async fn main() -> Result<()> {
 
     if let Some(test) = startup_test {
         prepare_startup_test_binaries(test)?;
-        enable_guest_test_overrides(&graph_storage, &hotel_name, test)?;
+        enable_guest_test_overrides(&graph_domain_arc, &hotel_name, test)?;
     }
 
     if let Some(active_pid) = hotel.active_pid.as_deref() {
@@ -4353,7 +4357,7 @@ async fn main() -> Result<()> {
     // Boot-time MuninnDB config load (Slice D).
     // Returns None if no vault registry is configured; guests fall back to NullMemoryEngine.
     let muninn_config_arc: Option<Arc<memory_core::MuninnConfig>> = match memory::load_muninn_config(
-        graph_arc.as_ref(),
+        &graph_domain_arc,
     ) {
         Ok(Some(cfg)) => {
             info!(endpoint = %cfg.base_url, vaults = cfg.vault_tokens.len(), "MuninnDB configured");
@@ -4383,6 +4387,7 @@ async fn main() -> Result<()> {
             dispatcher_tx,
             graph_arc.clone(),
         )
+        .with_graph_domain(graph_domain_arc.clone())
         .with_memory_config(muninn_config_arc.clone());
         tokio::spawn(async move {
             if let Err(e) = ipc_server.run().await {
@@ -4536,6 +4541,7 @@ async fn main() -> Result<()> {
         dispatcher_tx.clone(),
         graph_arc.clone(),
     )
+    .with_graph_domain(graph_domain_arc.clone())
     .with_memory_config(muninn_config_arc)
     .with_materialization_requester(guest_manager.clone())
     .with_registry(registry.clone());
@@ -4564,6 +4570,7 @@ async fn main() -> Result<()> {
         enable_rust_auth: execution_enable_rust_auth,
         enable_rust_dispatcher: flags.enable_rust_dispatcher,
         graph: graph_arc.clone(),
+        graph_domain: graph_domain_arc.clone(),
         registry: registry.clone(),
         ledger: ledger.clone(),
         tracker: tracker.clone(),
@@ -4696,8 +4703,10 @@ mod tests {
         hotel_base_port, hotel_ipc_socket_path, local_capability_advertisements,
         nearest_available_base_port, resolve_runtime_ports, startup_test_gemini_base_url,
     };
+    use ansible_mesh_core::domain::GraphDomain;
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
     use ansible_mesh_core::storage::{GraphStorage, GuestRecord, HotelRecord};
+    use std::sync::Arc;
 
     #[test]
     fn guest_supervision_defaults_disabled() {
@@ -5265,16 +5274,17 @@ mod tests {
 
     #[test]
     fn text_startup_test_injects_stub_response_into_model_guest() {
-        let graph = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph_domain = GraphDomain::new(Arc::new(storage.adapter()));
         let guests = default_guest_seed("startup-test-hotel");
-        graph
+        storage
             .seed_guests("startup-test-hotel", &guests)
             .expect("seed guests");
 
-        enable_guest_test_overrides(&graph, "startup-test-hotel", StartupTest::TextRoundTrip)
+        enable_guest_test_overrides(&graph_domain, "startup-test-hotel", StartupTest::TextRoundTrip)
             .expect("apply startup overrides");
 
-        let stored = graph
+        let stored = storage
             .list_guests("startup-test-hotel", false)
             .expect("list guests");
         let model = stored
@@ -5292,20 +5302,21 @@ mod tests {
 
     #[test]
     fn gemini_oauth_startup_test_injects_fake_base_url_into_model_guest() {
-        let graph = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph_domain = GraphDomain::new(Arc::new(storage.adapter()));
         let guests = default_guest_seed("startup-test-hotel");
-        graph
+        storage
             .seed_guests("startup-test-hotel", &guests)
             .expect("seed guests");
 
         enable_guest_test_overrides(
-            &graph,
+            &graph_domain,
             "startup-test-hotel",
             StartupTest::GeminiOAuthRoundTrip,
         )
         .expect("apply startup overrides");
 
-        let stored = graph
+        let stored = storage
             .list_guests("startup-test-hotel", false)
             .expect("list guests");
         let model = stored

@@ -1,10 +1,12 @@
 use crate::LedgerCommand;
 use crate::service::guest_manager::GuestMaterializationRequester;
+use crate::vault::store_secret;
 use crate::service::lease::{
     LeaseAcquireOutcome, LeaseObserver, LeaseObserverEvent, LeaseObserverEventKind, LeaseProvider,
     LeaseRenewOutcome, RuntimeLeaseRegistry,
 };
 use crate::vault::{SecretAccess, resolve_secret};
+use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
 use ansible_mesh_core::graph::{AbstractSkillRecord, SkillValidationState};
 use ansible_mesh_core::registry::{
@@ -138,6 +140,7 @@ pub struct IpcServer {
     local_node_id: String,
     dispatcher_tx: mpsc::Sender<LedgerCommand>,
     graph: Arc<dyn GraphStorage>,
+    graph_domain: Option<Arc<GraphDomain>>,
     inboxes: InboxRegistry,
     parked_inbound: Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
     materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
@@ -1310,6 +1313,7 @@ impl IpcServer {
             local_node_id: local_node_id.into(),
             dispatcher_tx,
             graph,
+            graph_domain: None,
             inboxes: Arc::new(Mutex::new(HashMap::new())),
             parked_inbound: Arc::new(Mutex::new(HashMap::new())),
             materialization_requester: None,
@@ -1324,6 +1328,11 @@ impl IpcServer {
 
     pub fn with_memory_config(mut self, config: Option<Arc<memory_core::MuninnConfig>>) -> Self {
         self.muninn_config = config;
+        self
+    }
+
+    pub fn with_graph_domain(mut self, domain: Arc<GraphDomain>) -> Self {
+        self.graph_domain = Some(domain);
         self
     }
 
@@ -1360,6 +1369,7 @@ impl IpcServer {
                     let dispatcher = self.dispatcher_tx.clone();
                     let local_node_id = self.local_node_id.clone();
                     let graph = self.graph.clone();
+                    let graph_domain = self.graph_domain.clone();
                     let inboxes = self.inboxes.clone();
                     let parked_inbound = self.parked_inbound.clone();
                     let materialization_requester = self.materialization_requester.clone();
@@ -1375,6 +1385,7 @@ impl IpcServer {
                             local_node_id,
                             dispatcher,
                             graph,
+                            graph_domain,
                             inboxes,
                             parked_inbound,
                             materialization_requester,
@@ -1403,6 +1414,7 @@ impl IpcServer {
         local_node_id: String,
         dispatcher_tx: mpsc::Sender<LedgerCommand>,
         graph: Arc<dyn GraphStorage>,
+        graph_domain: Option<Arc<GraphDomain>>,
         inboxes: InboxRegistry,
         parked_inbound: Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
         materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
@@ -1461,6 +1473,7 @@ impl IpcServer {
                             &local_node_id,
                             &dispatcher_tx,
                             graph.as_ref(),
+                            graph_domain.as_deref(),
                             &inboxes,
                             &parked_inbound,
                             materialization_requester.as_deref(),
@@ -2118,6 +2131,7 @@ impl IpcServer {
         local_node_id: &str,
         dispatcher_tx: &mpsc::Sender<LedgerCommand>,
         graph: &dyn GraphStorage,
+        graph_domain: Option<&GraphDomain>,
         inboxes: &InboxRegistry,
         parked_inbound: &Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
         materialization_requester: Option<&dyn GuestMaterializationRequester>,
@@ -2275,8 +2289,15 @@ impl IpcServer {
                     );
                 };
 
+                let Some(ref domain) = graph_domain else {
+                    return IpcResponse::error(
+                        "secret",
+                        "SECRET_DOMAIN_UNAVAILABLE",
+                        "vault domain not configured",
+                    );
+                };
                 match resolve_secret(
-                    graph,
+                    domain,
                     &secret_ref,
                     &SecretAccess {
                         role: identity.role.clone(),
@@ -7642,13 +7663,15 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store.clone());
+        let graph_domain = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let graph: Arc<dyn GraphStorage> = Arc::new(graph_store);
         let server = IpcServer::new(
             socket_path.clone(),
             "local-aiua-01",
             dispatcher_tx,
             graph.clone(),
-        );
+        )
+        .with_graph_domain(graph_domain.clone());
 
         let vault_key = base64::engine::general_purpose::STANDARD.encode([5u8; 32]);
         unsafe {
@@ -7657,7 +7680,7 @@ mod tests {
         }
 
         let secret_ref = store_secret(
-            graph.as_ref(),
+            &graph_domain,
             SecretInput {
                 secret_kind: "gemini-access-token".into(),
                 scope: "hotel".into(),
