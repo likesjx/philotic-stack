@@ -2068,6 +2068,11 @@ fn enable_guest_test_overrides(
                 &serde_json::Value::String(STARTUP_TEST_GEMINI_API_KEY.into()).to_string(),
             )?;
 
+            // Clear vault registry so the startup test uses NullMemoryEngine.
+            // This prevents philote from trying to activate against a real Muninn
+            // instance when the hotel was seeded from a production mesh-config.json.
+            graph.set_config_value("vault_registry", &serde_json::json!([]).to_string())?;
+
             for guest in &mut guests {
                 if guest.role != "model" {
                     continue;

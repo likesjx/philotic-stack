@@ -108,7 +108,7 @@ async fn main() -> Result<()> {
         chat_id,
         "bindings-turn-4",
         "/status",
-        "Skillset: planning.",
+        "Skills: planning.",
         &target_node,
     )
     .await?;
