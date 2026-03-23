@@ -285,7 +285,7 @@ profile = "shell_executor"
     async fn env_filtered_and_forced() {
         let policy = test_policy();
         let mut env = HashMap::new();
-        env.insert("PATH".into(), "/usr/bin".into());
+        env.insert("PATH".into(), "/usr/bin:/bin".into());
         env.insert("SECRET".into(), "should_not_appear".into());
 
         let req = ExecuteCommandRequest {

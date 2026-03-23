@@ -236,6 +236,18 @@ smoke-embed:
 smoke-graph-runner:
     bash scripts/smoke-graph-runner-roundtrip.sh
 
+# Run the agent-graph-runner live smoke (write + declare + sync round-trip, Seams 3 & 4)
+smoke-agent-graph:
+    bash scripts/smoke-agent-graph-roundtrip.sh
+
+# Run the agent-graph-runner cargo integration tests (tool dispatch without live hotel, Seams 3 & 4)
+test-agent-graph:
+    cargo test -p agent-graph-runner --test smoke -- --nocapture
+
+# Run the router trace cargo tests (RouterTraceStorage unit coverage, Seam 5)
+test-router-trace:
+    cargo test -p ansible-mesh-core -- router_trace --nocapture
+
 # Run the trusted vertical-slice verification suite
 verify-vertical-slice:
     cargo test -p philotic-client -- --nocapture

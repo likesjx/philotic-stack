@@ -5299,14 +5299,14 @@ mod tests {
         let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
         let graph_domain = GraphDomain::new(Arc::new(storage.adapter()));
         let guests = default_guest_seed("startup-test-hotel");
-        storage
+        graph_domain
             .seed_guests("startup-test-hotel", &guests)
             .expect("seed guests");
 
         enable_guest_test_overrides(&graph_domain, "startup-test-hotel", StartupTest::TextRoundTrip)
             .expect("apply startup overrides");
 
-        let stored = storage
+        let stored = graph_domain
             .list_guests("startup-test-hotel", false)
             .expect("list guests");
         let model = stored
@@ -5327,7 +5327,7 @@ mod tests {
         let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
         let graph_domain = GraphDomain::new(Arc::new(storage.adapter()));
         let guests = default_guest_seed("startup-test-hotel");
-        storage
+        graph_domain
             .seed_guests("startup-test-hotel", &guests)
             .expect("seed guests");
 
@@ -5338,7 +5338,7 @@ mod tests {
         )
         .expect("apply startup overrides");
 
-        let stored = storage
+        let stored = graph_domain
             .list_guests("startup-test-hotel", false)
             .expect("list guests");
         let model = stored

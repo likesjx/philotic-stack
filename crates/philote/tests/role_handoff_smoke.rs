@@ -126,9 +126,7 @@ fn handoff_bundle_task(
         action: Some("handoff_bundle".into()),
         session_id: Some(session_id.into()),
         turn_id: Some(format!("turn-{}", task_id.simple())),
-        agent_action: Some(serde_json::json!({
-            "handoff_bundle": serde_json::to_value(&bundle).unwrap()
-        })),
+        handoff_bundle: Some(bundle),
         ..Default::default()
     };
     (task, task_id)

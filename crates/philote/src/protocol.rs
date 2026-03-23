@@ -252,6 +252,7 @@ mod tests {
             final_reply_to: None,
             final_reply_role: None,
             final_reply_guest_id: None,
+            handoff_bundle: None,
             error: None,
         };
 
@@ -285,6 +286,7 @@ mod tests {
             final_reply_to: None,
             final_reply_role: None,
             final_reply_guest_id: None,
+            handoff_bundle: None,
             error: None,
         };
 
@@ -315,6 +317,7 @@ mod tests {
             final_reply_to: None,
             final_reply_role: None,
             final_reply_guest_id: None,
+            handoff_bundle: None,
             error: None,
         };
 
@@ -398,6 +401,7 @@ mod tests {
             final_reply_to: None,
             final_reply_role: None,
             final_reply_guest_id: None,
+            handoff_bundle: None,
             error: None,
         };
 

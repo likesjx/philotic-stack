@@ -5931,8 +5931,8 @@ mod tests {
     use ansible_mesh_core::registry::{CapabilityAdvertisement, NodeRegistry};
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
     use ansible_mesh_core::storage::{
-        AgentIdentityRecord, GuestRecord, HotelRecord, SecretRecord, SessionEventRecord,
-        SessionParticipantRecord, SessionRecord, SessionTurnRecord,
+        AgentIdentityRecord, GuestRecord, GraphStorage, HotelRecord, SecretRecord,
+        SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,
     };
     use base64::Engine;
     use philotic_client::{
@@ -6131,6 +6131,9 @@ mod tests {
             Ok(true)
         }
     }
+
+    #[derive(Default)]
+    struct TestGraphStorage;
 
     impl GraphStorage for TestGraphStorage {
         fn load_node_capabilities(&self) -> anyhow::Result<Option<NodeCapabilities>> {
@@ -6596,7 +6599,8 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        graph_store
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
             .upsert_session(&SessionRecord {
                 session_id: "sess-role-route".into(),
                 session_kind: "conversation".into(),
@@ -6612,7 +6616,6 @@ mod tests {
                 updated_at: 2,
             })
             .expect("session should seed");
-        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -6704,7 +6707,8 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        graph_store
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
             .upsert_role_incarnation(&RoleIncarnationRecord {
                 agent_id: "agent-jane-01".into(),
                 role_name: "orchestrator".into(),
@@ -6717,7 +6721,7 @@ mod tests {
                 turn_loop_config: TurnLoopConfig::default(),
             })
             .expect("orchestrator role should seed");
-        graph_store
+        graph
             .upsert_session(&SessionRecord {
                 session_id: "sess-role-fallback".into(),
                 session_kind: "conversation".into(),
@@ -6733,7 +6737,6 @@ mod tests {
                 updated_at: 2,
             })
             .expect("session should seed");
-        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -6810,7 +6813,8 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        graph_store
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
             .upsert_role_incarnation(&RoleIncarnationRecord {
                 agent_id: "agent-jane-01".into(),
                 role_name: "orchestrator".into(),
@@ -6823,7 +6827,7 @@ mod tests {
                 turn_loop_config: TurnLoopConfig::default(),
             })
             .expect("orchestrator role should seed");
-        graph_store
+        graph
             .upsert_session(&SessionRecord {
                 session_id: "sess-role-default".into(),
                 session_kind: "conversation".into(),
@@ -6839,7 +6843,6 @@ mod tests {
                 updated_at: 2,
             })
             .expect("session should seed");
-        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -6916,7 +6919,8 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        graph_store
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
             .upsert_hotel(&HotelRecord {
                 hotel_name: "local-hotel".into(),
                 capabilities: NodeCapabilities {
@@ -6933,7 +6937,7 @@ mod tests {
                 active_pid: None,
             })
             .expect("seed local hotel");
-        graph_store
+        graph
             .seed_guests(
                 "local-hotel",
                 &[GuestRecord {
@@ -6947,7 +6951,7 @@ mod tests {
                 }],
             )
             .expect("seed developer guest");
-        graph_store
+        graph
             .upsert_session(&SessionRecord {
                 session_id: "sess-role-park".into(),
                 session_kind: "conversation".into(),
@@ -6965,7 +6969,6 @@ mod tests {
             .expect("session should seed");
 
         let requester = Arc::new(MockMaterializationRequester::default());
-        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph)
             .with_materialization_requester(requester.clone());
 
@@ -7043,7 +7046,8 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        graph_store
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
             .upsert_session(&SessionRecord {
                 session_id: "sess-handoff-live".into(),
                 session_kind: "conversation".into(),
@@ -7059,7 +7063,7 @@ mod tests {
                 updated_at: 2,
             })
             .expect("session should seed");
-        graph_store
+        graph
             .upsert_role_incarnation(&RoleIncarnationRecord {
                 agent_id: "agent-jane-01".into(),
                 role_name: "developer".into(),
@@ -7072,7 +7076,6 @@ mod tests {
                 turn_loop_config: TurnLoopConfig::default(),
             })
             .expect("developer role should seed");
-        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(
             socket_path.clone(),
             "local-aiua-01",
@@ -7191,7 +7194,8 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        graph_store
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
             .upsert_hotel(&HotelRecord {
                 hotel_name: "local-hotel".into(),
                 capabilities: NodeCapabilities {
@@ -7208,7 +7212,7 @@ mod tests {
                 active_pid: None,
             })
             .expect("seed local hotel");
-        graph_store
+        graph
             .seed_guests(
                 "local-hotel",
                 &[GuestRecord {
@@ -7222,7 +7226,7 @@ mod tests {
                 }],
             )
             .expect("seed developer guest");
-        graph_store
+        graph
             .upsert_session(&SessionRecord {
                 session_id: "sess-handoff-park".into(),
                 session_kind: "conversation".into(),
@@ -7238,7 +7242,7 @@ mod tests {
                 updated_at: 2,
             })
             .expect("session should seed");
-        graph_store
+        graph
             .upsert_role_incarnation(&RoleIncarnationRecord {
                 agent_id: "agent-jane-01".into(),
                 role_name: "developer".into(),
@@ -7253,7 +7257,6 @@ mod tests {
             .expect("developer role should seed");
 
         let requester = Arc::new(MockMaterializationRequester::default());
-        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(
             socket_path.clone(),
             "local-aiua-01",
@@ -7789,7 +7792,7 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");
@@ -7826,20 +7829,20 @@ mod tests {
             .await
             .expect("emit task");
 
-        let session = graph_store
+        let session = graph
             .get_session("telegram:123:agent-jane-01")
             .expect("session lookup should work")
             .expect("session should exist");
         assert_eq!(session.channel_kind.as_deref(), Some("telegram"));
 
-        let turns = graph_store
+        let turns = graph
             .list_session_turns("telegram:123:agent-jane-01", 10)
             .expect("turn listing should work");
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].turn_id, "telegram-update-1");
         assert_eq!(turns[0].user_message_json["content"], "hello from telegram");
 
-        let events = graph_store
+        let events = graph
             .list_session_events("telegram:123:agent-jane-01", 10)
             .expect("event listing should work");
         assert!(!events.is_empty(), "session events should be recorded");
@@ -7861,9 +7864,9 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
 
-        graph_store
+        graph
             .upsert_agent_identity(&AgentIdentityRecord {
                 agent_id: "agent-jane-01".into(),
                 persona_name: "Jane".into(),
@@ -7875,7 +7878,7 @@ mod tests {
                 }),
             })
             .expect("agent identity should seed");
-        graph_store
+        graph
             .upsert_session(&SessionRecord {
                 session_id: "sess-1".into(),
                 session_kind: "conversation".into(),
@@ -7891,7 +7894,7 @@ mod tests {
                 updated_at: 2,
             })
             .expect("session should seed");
-        graph_store
+        graph
             .upsert_session_turn(&SessionTurnRecord {
                 turn_id: "turn-1".into(),
                 session_id: "sess-1".into(),
@@ -7904,7 +7907,7 @@ mod tests {
                 completed_at: Some(2),
             })
             .expect("turn should seed");
-        graph_store
+        graph
             .upsert_role_incarnation(&RoleIncarnationRecord {
                 agent_id: "agent-jane-01".into(),
                 role_name: "developer".into(),
@@ -7987,10 +7990,10 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
 
         // Seed profile with known allowed_tools and allowed_skills.
-        graph_store
+        graph
             .upsert_toolset_profile(&ansible_mesh_core::graph::ToolsetProfileRecord {
                 profile_name: "codex".into(),
                 allowed_tools: vec!["session.status".into(), "workspace.read".into()],
@@ -7999,7 +8002,7 @@ mod tests {
                 description: None,
             })
             .expect("toolset profile should seed");
-        graph_store
+        graph
             .upsert_agent_identity(&AgentIdentityRecord {
                 agent_id: "agent-jane-01".into(),
                 persona_name: "Jane".into(),
@@ -8008,7 +8011,7 @@ mod tests {
             })
             .expect("agent identity");
         // Session with active_incarnation_id but NO bindings in summary_json.
-        graph_store
+        graph
             .upsert_session(&SessionRecord {
                 session_id: "sess-seed".into(),
                 session_kind: "conversation".into(),
@@ -8024,7 +8027,7 @@ mod tests {
                 updated_at: 2,
             })
             .expect("session");
-        graph_store
+        graph
             .upsert_role_incarnation(&RoleIncarnationRecord {
                 agent_id: "agent-jane-01".into(),
                 role_name: "codex".into(),
@@ -8107,9 +8110,9 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
 
-        graph_store
+        graph
             .upsert_session(&SessionRecord {
                 session_id: "sess-approval".into(),
                 session_kind: "conversation".into(),
@@ -8183,9 +8186,9 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
 
-        graph_store
+        graph
             .upsert_session(&SessionRecord {
                 session_id: "sess-bindings".into(),
                 session_kind: "conversation".into(),
@@ -8317,10 +8320,10 @@ mod tests {
                 port: 9002,
             }),
         );
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph)
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone())
             .with_registry(registry);
 
-        graph_store
+        graph
             .upsert_session(&SessionRecord {
                 session_id: "sess-remote-model".into(),
                 session_kind: "conversation".into(),
@@ -8437,10 +8440,10 @@ mod tests {
                 port: 9002,
             }),
         );
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph)
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone())
             .with_registry(registry);
 
-        graph_store
+        graph
             .upsert_session(&SessionRecord {
                 session_id: "sess-local-model".into(),
                 session_kind: "conversation".into(),
@@ -8570,19 +8573,19 @@ mod tests {
                 port: 9002,
             }),
         );
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph)
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone())
             .with_registry(registry);
 
         let mut hotel = crate::default_hotel_record("local");
         hotel.ipc_socket_path = socket_path.clone();
-        graph_store.upsert_hotel(&hotel).expect("hotel should seed");
-        graph_store
+        graph.upsert_hotel(&hotel).expect("hotel should seed");
+        graph
             .seed_guests("local", &crate::default_guest_seed("local"))
             .expect("local guests should seed");
-        graph_store
+        graph
             .set_guest_pid("local", "local:model-controller-gemini", Some("4242"))
             .expect("local model guest pid should seed");
-        graph_store
+        graph
             .upsert_session(&SessionRecord {
                 session_id: "sess-local-active-guest".into(),
                 session_kind: "conversation".into(),
@@ -8668,9 +8671,9 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
 
-        graph_store
+        graph
             .upsert_session(&SessionRecord {
                 session_id: "sess-workspace-policy".into(),
                 session_kind: "conversation".into(),
@@ -8697,7 +8700,7 @@ mod tests {
                 updated_at: 2,
             })
             .expect("session should seed");
-        graph_store
+        graph
             .set_config_value(
                 "tool_runner_registry",
                 &serde_json::json!([
@@ -8785,9 +8788,9 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
 
-        graph_store
+        graph
             .upsert_session(&SessionRecord {
                 session_id: "sess-incarnations".into(),
                 session_kind: "conversation".into(),
@@ -8830,7 +8833,7 @@ mod tests {
                 updated_at: 2,
             })
             .expect("session should seed");
-        graph_store
+        graph
             .set_config_value(
                 "tool_runner_registry",
                 &serde_json::json!([
@@ -8930,9 +8933,9 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
 
-        graph_store
+        graph
             .upsert_session(&SessionRecord {
                 session_id: "sess-pref-env".into(),
                 session_kind: "conversation".into(),
@@ -8976,7 +8979,7 @@ mod tests {
                 updated_at: 2,
             })
             .expect("session should seed");
-        graph_store
+        graph
             .set_config_value(
                 "tool_runner_registry",
                 &serde_json::json!([
@@ -9103,10 +9106,10 @@ mod tests {
                 port: 9002,
             }),
         );
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph)
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone())
             .with_registry(registry);
 
-        graph_store
+        graph
             .upsert_session(&SessionRecord {
                 session_id: "sess-remote-tool".into(),
                 session_kind: "conversation".into(),
@@ -9191,7 +9194,7 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");
@@ -9210,7 +9213,7 @@ mod tests {
         .await
         .expect("tool connect");
 
-        let raw = graph_store
+        let raw = graph
             .get_config_value("tool_runner_registry")
             .expect("registry lookup should work")
             .expect("registry should exist");
@@ -9236,9 +9239,9 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
 
-        graph_store
+        graph
             .upsert_session(&SessionRecord {
                 session_id: "sess-dormant-runner".into(),
                 session_kind: "conversation".into(),
@@ -9258,7 +9261,7 @@ mod tests {
                 updated_at: 2,
             })
             .expect("session should seed");
-        graph_store
+        graph
             .set_config_value(
                 "tool_runner_registry",
                 &serde_json::json!([
@@ -9333,10 +9336,10 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
 
         for session_id in ["sess-1", "sess-2"] {
-            graph_store
+            graph
                 .upsert_session(&SessionRecord {
                     session_id: session_id.into(),
                     session_kind: "conversation".into(),
@@ -9363,7 +9366,7 @@ mod tests {
             )
             .expect("agent identity should seed");
 
-        graph_store
+        graph
             .sync_apartment(
                 "agent-jane-01",
                 "short",
@@ -9376,7 +9379,7 @@ mod tests {
                 }),
             )
             .expect("session index should seed");
-        graph_store
+        graph
             .sync_apartment(
                 "agent-jane-01",
                 "short_session:sess-1",
@@ -9400,7 +9403,7 @@ mod tests {
                 }),
             )
             .expect("session checkpoint should seed");
-        graph_store
+        graph
             .sync_apartment(
                 "agent-jane-01",
                 "short_session:sess-2",
@@ -9480,7 +9483,7 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");
@@ -9523,7 +9526,7 @@ mod tests {
             .await
             .expect("update task should succeed");
 
-        let events = graph_store
+        let events = graph
             .list_session_events("sess-approval-events", 20)
             .expect("event listing should work");
         assert!(
@@ -9554,7 +9557,7 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");
@@ -9592,7 +9595,7 @@ mod tests {
             .await
             .expect("update task should succeed");
 
-        let session = graph_store
+        let session = graph
             .get_session("sess-policy-events")
             .expect("session lookup should work")
             .expect("session should exist");
@@ -9601,7 +9604,7 @@ mod tests {
             true
         );
 
-        let events = graph_store
+        let events = graph
             .list_session_events("sess-policy-events", 20)
             .expect("event listing should work");
         assert!(
@@ -9627,7 +9630,7 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");
@@ -9667,7 +9670,7 @@ mod tests {
             .await
             .expect("update task should succeed");
 
-        let session = graph_store
+        let session = graph
             .get_session("sess-lifecycle")
             .expect("session lookup should work")
             .expect("session should exist");
@@ -9678,7 +9681,7 @@ mod tests {
         );
         assert!(session.summary_json["tool_assembly"]["execution_routes"]["echo"].is_null());
 
-        let events = graph_store
+        let events = graph
             .list_session_events("sess-lifecycle", 20)
             .expect("event listing should work");
         assert!(
@@ -9714,7 +9717,7 @@ mod tests {
         let (dispatcher_tx, mut dispatcher_rx) = mpsc::channel(16);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");
@@ -9917,7 +9920,7 @@ mod tests {
             other => panic!("unexpected final response to membrane: {other:?}"),
         }
 
-        let turn = graph_store
+        let turn = graph
             .get_session_turn(session_id, turn_id)
             .expect("turn lookup should work")
             .expect("turn should exist");
@@ -9964,7 +9967,7 @@ mod tests {
         let (dispatcher_tx, mut dispatcher_rx) = mpsc::channel(16);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");
@@ -10175,7 +10178,7 @@ mod tests {
             other => panic!("unexpected final response to membrane: {other:?}"),
         }
 
-        let turn = graph_store
+        let turn = graph
             .get_session_turn(session_id, turn_id)
             .expect("turn lookup should work")
             .expect("turn should exist");
@@ -10188,7 +10191,7 @@ mod tests {
             Some("Tool echo says: hello structured tool")
         );
 
-        let events = graph_store
+        let events = graph
             .list_session_events(session_id, 20)
             .expect("event listing should work");
         assert!(
@@ -10231,7 +10234,8 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        graph_store
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
             .upsert_hotel(&HotelRecord {
                 hotel_name: "local-hotel".into(),
                 capabilities: NodeCapabilities {
@@ -10248,7 +10252,7 @@ mod tests {
                 active_pid: None,
             })
             .expect("seed local hotel");
-        graph_store
+        graph
             .upsert_agent_identity(&AgentIdentityRecord {
                 agent_id: "agent-jane-01".into(),
                 persona_name: "Jane".into(),
@@ -10256,7 +10260,6 @@ mod tests {
                 bundle_json: serde_json::json!({}),
             })
             .expect("seed local agent identity");
-        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -10347,7 +10350,8 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        graph_store
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
             .upsert_hotel(&HotelRecord {
                 hotel_name: "local-hotel".into(),
                 capabilities: NodeCapabilities {
@@ -10364,7 +10368,7 @@ mod tests {
                 active_pid: None,
             })
             .expect("seed local hotel");
-        graph_store
+        graph
             .upsert_agent_identity(&AgentIdentityRecord {
                 agent_id: "agent-aria-01".into(),
                 persona_name: "Aria".into(),
@@ -10372,7 +10376,6 @@ mod tests {
                 bundle_json: serde_json::json!({}),
             })
             .expect("seed remote-owned agent identity");
-        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -10428,7 +10431,8 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        graph_store
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
             .upsert_hotel(&HotelRecord {
                 hotel_name: "local-hotel".into(),
                 capabilities: NodeCapabilities {
@@ -10445,7 +10449,7 @@ mod tests {
                 active_pid: None,
             })
             .expect("seed local hotel");
-        graph_store
+        graph
             .upsert_agent_identity(&AgentIdentityRecord {
                 agent_id: "agent-aria-01".into(),
                 persona_name: "Aria".into(),
@@ -10455,7 +10459,6 @@ mod tests {
                 }),
             })
             .expect("seed delegated remote-owned agent identity");
-        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -10505,7 +10508,8 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        graph_store
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
             .upsert_hotel(&HotelRecord {
                 hotel_name: "local-hotel".into(),
                 capabilities: NodeCapabilities {
@@ -10522,7 +10526,7 @@ mod tests {
                 active_pid: None,
             })
             .expect("seed local hotel");
-        graph_store
+        graph
             .upsert_agent_identity(&AgentIdentityRecord {
                 agent_id: "agent-jane-01".into(),
                 persona_name: "Jane".into(),
@@ -10530,7 +10534,6 @@ mod tests {
                 bundle_json: serde_json::json!({}),
             })
             .expect("seed local agent identity");
-        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -10592,7 +10595,8 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        graph_store
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
             .upsert_hotel(&HotelRecord {
                 hotel_name: "local-hotel".into(),
                 capabilities: NodeCapabilities {
@@ -10609,7 +10613,7 @@ mod tests {
                 active_pid: None,
             })
             .expect("seed local hotel");
-        graph_store
+        graph
             .upsert_agent_identity(&AgentIdentityRecord {
                 agent_id: "agent-jane-01".into(),
                 persona_name: "Jane".into(),
@@ -10617,7 +10621,6 @@ mod tests {
                 bundle_json: serde_json::json!({}),
             })
             .expect("seed local agent identity");
-        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -10686,7 +10689,8 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        graph_store
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
             .upsert_hotel(&HotelRecord {
                 hotel_name: "local-hotel".into(),
                 capabilities: NodeCapabilities {
@@ -10703,7 +10707,7 @@ mod tests {
                 active_pid: None,
             })
             .expect("seed local hotel");
-        graph_store
+        graph
             .upsert_agent_identity(&AgentIdentityRecord {
                 agent_id: "agent-jane-01".into(),
                 persona_name: "Jane".into(),
@@ -10711,7 +10715,6 @@ mod tests {
                 bundle_json: serde_json::json!({}),
             })
             .expect("seed local agent identity");
-        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -10786,7 +10789,8 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        graph_store
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
             .upsert_hotel(&HotelRecord {
                 hotel_name: "local-hotel".into(),
                 capabilities: NodeCapabilities {
@@ -10803,7 +10807,7 @@ mod tests {
                 active_pid: None,
             })
             .expect("seed local hotel");
-        graph_store
+        graph
             .upsert_agent_identity(&AgentIdentityRecord {
                 agent_id: "agent-jane-01".into(),
                 persona_name: "Jane".into(),
@@ -10811,7 +10815,7 @@ mod tests {
                 bundle_json: serde_json::json!({}),
             })
             .expect("seed local agent identity");
-        graph_store
+        graph
             .seed_guests(
                 "local-hotel",
                 &[GuestRecord {
@@ -10825,8 +10829,7 @@ mod tests {
                 }],
             )
             .expect("seed membrane guest");
-        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");
@@ -10855,7 +10858,7 @@ mod tests {
         let (granted, _lease) = expect_telegram_poll_lease(acquired);
         assert!(granted);
 
-        graph_store
+        graph
             .set_guest_pid("local-hotel", "membrane-telegram-01", None)
             .expect("clear membrane guest pid");
 
@@ -10885,7 +10888,8 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        graph_store
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
             .upsert_hotel(&HotelRecord {
                 hotel_name: "local-hotel".into(),
                 capabilities: NodeCapabilities {
@@ -10902,7 +10906,6 @@ mod tests {
                 active_pid: None,
             })
             .expect("seed local hotel");
-        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -10993,7 +10996,8 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        graph_store
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
             .upsert_hotel(&HotelRecord {
                 hotel_name: "local-hotel".into(),
                 capabilities: NodeCapabilities {
@@ -11010,7 +11014,6 @@ mod tests {
                 active_pid: None,
             })
             .expect("seed local hotel");
-        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -11071,7 +11074,8 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        graph_store
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
             .upsert_hotel(&HotelRecord {
                 hotel_name: "local-hotel".into(),
                 capabilities: NodeCapabilities {
@@ -11088,7 +11092,6 @@ mod tests {
                 active_pid: None,
             })
             .expect("seed local hotel");
-        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -11177,7 +11180,8 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        graph_store
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
             .upsert_hotel(&HotelRecord {
                 hotel_name: "local-hotel".into(),
                 capabilities: NodeCapabilities {
@@ -11194,7 +11198,6 @@ mod tests {
                 active_pid: Some(std::process::id().to_string()),
             })
             .expect("seed local hotel");
-        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -11238,7 +11241,8 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        graph_store
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
             .upsert_hotel(&HotelRecord {
                 hotel_name: "local-hotel".into(),
                 capabilities: NodeCapabilities {
@@ -11255,7 +11259,7 @@ mod tests {
                 active_pid: Some(std::process::id().to_string()),
             })
             .expect("seed local hotel");
-        graph_store
+        graph
             .seed_guests(
                 "local-hotel",
                 &[
@@ -11280,7 +11284,6 @@ mod tests {
                 ],
             )
             .expect("seed guests");
-        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -11329,7 +11332,8 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        graph_store
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
             .upsert_hotel(&HotelRecord {
                 hotel_name: "local-hotel".into(),
                 capabilities: NodeCapabilities {
@@ -11346,7 +11350,7 @@ mod tests {
                 active_pid: Some(std::process::id().to_string()),
             })
             .expect("seed local hotel");
-        graph_store
+        graph
             .upsert_agent_identity(&AgentIdentityRecord {
                 agent_id: "agent-jane-01".into(),
                 persona_name: "Jane".into(),
@@ -11357,7 +11361,7 @@ mod tests {
                 }),
             })
             .expect("seed local agent");
-        graph_store
+        graph
             .upsert_agent_identity(&AgentIdentityRecord {
                 agent_id: "agent-remote-01".into(),
                 persona_name: "Remote".into(),
@@ -11368,7 +11372,6 @@ mod tests {
                 }),
             })
             .expect("seed remote agent");
-        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -11418,7 +11421,8 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        graph_store
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
             .upsert_hotel(&HotelRecord {
                 hotel_name: "local-hotel".into(),
                 capabilities: NodeCapabilities {
@@ -11435,7 +11439,6 @@ mod tests {
                 active_pid: Some(std::process::id().to_string()),
             })
             .expect("seed local hotel");
-        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let registry = Arc::new(RwLock::new(NodeRegistry::new()));
         registry.write().await.update_node(
             NodeCapabilities {
@@ -11554,7 +11557,8 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        graph_store
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
             .upsert_hotel(&HotelRecord {
                 hotel_name: "local-hotel".into(),
                 capabilities: NodeCapabilities {
@@ -11571,7 +11575,7 @@ mod tests {
                 active_pid: Some(std::process::id().to_string()),
             })
             .expect("seed local hotel");
-        graph_store
+        graph
             .upsert_hotel(&HotelRecord {
                 hotel_name: "remote-hotel".into(),
                 capabilities: NodeCapabilities {
@@ -11588,7 +11592,6 @@ mod tests {
                 active_pid: None,
             })
             .expect("seed remote hotel");
-        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let registry = Arc::new(RwLock::new(NodeRegistry::new()));
         registry.write().await.update_node(
             NodeCapabilities {
@@ -11684,7 +11687,8 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        graph_store
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
             .upsert_hotel(&HotelRecord {
                 hotel_name: "local-hotel".into(),
                 capabilities: NodeCapabilities {
@@ -11701,7 +11705,7 @@ mod tests {
                 active_pid: Some(std::process::id().to_string()),
             })
             .expect("seed local hotel");
-        graph_store
+        graph
             .seed_guests(
                 "local-hotel",
                 &[GuestRecord {
@@ -11715,7 +11719,7 @@ mod tests {
                 }],
             )
             .expect("seed local guests");
-        graph_store
+        graph
             .upsert_hotel(&HotelRecord {
                 hotel_name: "remote-hotel".into(),
                 capabilities: NodeCapabilities {
@@ -11732,7 +11736,6 @@ mod tests {
                 active_pid: None,
             })
             .expect("seed remote hotel");
-        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let registry = Arc::new(RwLock::new(NodeRegistry::new()));
         registry.write().await.update_node(
             NodeCapabilities {
@@ -11820,7 +11823,8 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        graph_store
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
             .upsert_hotel(&HotelRecord {
                 hotel_name: "local-hotel".into(),
                 capabilities: NodeCapabilities {
@@ -11837,7 +11841,7 @@ mod tests {
                 active_pid: Some(std::process::id().to_string()),
             })
             .expect("seed local hotel");
-        graph_store
+        graph
             .seed_guests(
                 "local-hotel",
                 &[GuestRecord {
@@ -11851,7 +11855,7 @@ mod tests {
                 }],
             )
             .expect("seed local guests");
-        graph_store
+        graph
             .upsert_agent_identity(&AgentIdentityRecord {
                 agent_id: "agent-jane-01".into(),
                 persona_name: "Jane".into(),
@@ -11861,7 +11865,6 @@ mod tests {
                 }),
             })
             .expect("seed local agent identity");
-        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let registry = Arc::new(RwLock::new(NodeRegistry::new()));
         registry.write().await.update_node(
             NodeCapabilities {
@@ -11971,7 +11974,8 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(16);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
-        graph_store
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
             .upsert_hotel(&HotelRecord {
                 hotel_name: "local-hotel".into(),
                 capabilities: NodeCapabilities {
@@ -11988,7 +11992,6 @@ mod tests {
                 active_pid: Some(std::process::id().to_string()),
             })
             .expect("seed local hotel");
-        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let registry = Arc::new(RwLock::new(NodeRegistry::new()));
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph)
             .with_registry(registry);
@@ -12146,7 +12149,8 @@ mod tests {
 
         let local_graph_store =
             SqliteGraphStorage::open(":memory:").expect("open local sqlite graph store");
-        local_graph_store
+        let local_graph = Arc::new(GraphDomain::new(Arc::new(local_graph_store.adapter())));
+        local_graph
             .upsert_hotel(&HotelRecord {
                 hotel_name: "local-hotel".into(),
                 capabilities: NodeCapabilities {
@@ -12163,7 +12167,7 @@ mod tests {
                 active_pid: Some(std::process::id().to_string()),
             })
             .expect("seed local hotel");
-        local_graph_store
+        local_graph
             .upsert_hotel(&HotelRecord {
                 hotel_name: "remote-hotel".into(),
                 capabilities: NodeCapabilities {
@@ -12180,7 +12184,6 @@ mod tests {
                 active_pid: None,
             })
             .expect("seed remote hotel");
-        let local_graph = Arc::new(GraphDomain::new(Arc::new(local_graph_store.adapter())));
         let local_registry = Arc::new(RwLock::new(NodeRegistry::new()));
         local_registry.write().await.update_node(
             NodeCapabilities {
@@ -12211,7 +12214,8 @@ mod tests {
 
         let remote_graph_store =
             SqliteGraphStorage::open(":memory:").expect("open remote sqlite graph store");
-        remote_graph_store
+        let remote_graph = Arc::new(GraphDomain::new(Arc::new(remote_graph_store.adapter())));
+        remote_graph
             .upsert_hotel(&HotelRecord {
                 hotel_name: "remote-hotel".into(),
                 capabilities: NodeCapabilities {
@@ -12228,7 +12232,6 @@ mod tests {
                 active_pid: Some(std::process::id().to_string()),
             })
             .expect("seed remote hotel");
-        let remote_graph = Arc::new(GraphDomain::new(Arc::new(remote_graph_store.adapter())));
 
         let local_server = IpcServer::new(
             local_socket_path.clone(),
