@@ -515,6 +515,26 @@ impl SqliteGraphStorage {
         Ok(s)
     }
 
+    /// Open an in-memory SQLite database. Useful for tests.
+    pub fn open_in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory()
+            .context("Failed to open in-memory GraphStorage SQLite DB")?;
+        let conn = Arc::new(Mutex::new(conn));
+        let adapter = SqliteGraphAdapter::new(conn.clone());
+        let s = Self { conn, adapter };
+        s.init_schema()?;
+        Ok(s)
+    }
+
+    /// Return a clone of the inner [`SqliteGraphAdapter`].
+    ///
+    /// Used to construct a [`crate::domain::GraphDomain`] backed by this
+    /// storage instance — the adapter implements `GraphAdapter` and can be
+    /// wrapped in `Arc<dyn GraphAdapter>`.
+    pub fn adapter(&self) -> SqliteGraphAdapter {
+        self.adapter.clone()
+    }
+
     fn init_schema(&self) -> Result<()> {
         debug!("Initializing GraphStorage schema");
         let conn = self.conn.lock().unwrap();

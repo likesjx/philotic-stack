@@ -393,6 +393,8 @@ Interpret `SVE refresh` as:
 - re-read [AGENTS.md](/Users/jaredlikes/code/philotic-stack/AGENTS.md)
 - re-read [docs/architecture/README.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/README.md)
 - re-read [docs/architecture/ARCHITECTURE_STATUS.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE_STATUS.md)
+- re-read [docs/architecture/ARCH_RULES.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCH_RULES.md)
+- re-read [docs/architecture/ROADMAP.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ROADMAP.md)
 - re-read [docs/architecture/DOC_TAGGING_FRONTMATTER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DOC_TAGGING_FRONTMATTER_PROPOSAL.md)
 - re-read [docs/process/WORKFLOW.md](/Users/jaredlikes/code/philotic-stack/docs/process/WORKFLOW.md)
 - apply the current repo-local SVE skill/process stack before continuing

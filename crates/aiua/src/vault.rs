@@ -1,6 +1,7 @@
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
-use ansible_mesh_core::storage::{GraphStorage, SecretRecord};
+use ansible_mesh_core::domain::GraphDomain;
+use ansible_mesh_core::storage::SecretRecord;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -28,7 +29,7 @@ pub struct SecretInput {
     pub plaintext: String,
 }
 
-pub fn store_secret(graph: &dyn GraphStorage, input: SecretInput) -> Result<String> {
+pub fn store_secret(graph: &GraphDomain, input: SecretInput) -> Result<String> {
     let (ciphertext_b64, nonce_b64) = encrypt(&input.plaintext)?;
     let now = now_secs();
     let secret_ref = format!(
@@ -53,7 +54,7 @@ pub fn store_secret(graph: &dyn GraphStorage, input: SecretInput) -> Result<Stri
 }
 
 pub fn resolve_secret(
-    graph: &dyn GraphStorage,
+    graph: &GraphDomain,
     secret_ref: &str,
     access: &SecretAccess,
 ) -> Result<Option<String>> {
@@ -260,8 +261,10 @@ mod tests {
     use super::{
         SecretAccess, SecretInput, decode_root_key, resolve_secret, store_secret, vault_key_account,
     };
+    use ansible_mesh_core::domain::GraphDomain;
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
     use base64::Engine;
+    use std::sync::Arc;
 
     fn set_test_key() {
         let key = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
@@ -273,7 +276,8 @@ mod tests {
     #[test]
     fn vault_round_trips_secret_with_role_policy() {
         set_test_key();
-        let graph = SqliteGraphStorage::open(":memory:").unwrap();
+        let storage = SqliteGraphStorage::open(":memory:").unwrap();
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
         let secret_ref = store_secret(
             &graph,
             SecretInput {

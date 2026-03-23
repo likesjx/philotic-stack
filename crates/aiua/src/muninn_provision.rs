@@ -17,7 +17,8 @@
 //! are skipped. New vaults (e.g. a second agent added later) are provisioned
 //! on the next run.
 
-use ansible_mesh_core::storage::{GraphStorage, VaultRegistryEntry};
+use ansible_mesh_core::domain::GraphDomain;
+use ansible_mesh_core::storage::VaultRegistryEntry;
 use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -59,7 +60,7 @@ struct CreateKeyResponse {
 /// `vault_names` should be pre-derived by the caller (e.g. `self_agent-jane-01`,
 /// `user_jared`). The admin session is established once and reused for all vaults.
 pub async fn provision_muninn_vaults(
-    graph: &dyn GraphStorage,
+    graph: &GraphDomain,
     endpoint: &str,
     username: &str,
     password: &str,

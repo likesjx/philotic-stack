@@ -1,5 +1,5 @@
+use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::materializer::Materializer;
-use ansible_mesh_core::storage::GraphStorage;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use rusqlite::types::ValueRef;
@@ -188,7 +188,7 @@ impl Materializer for LocalProcessMaterializer {
 /// A centralized orchestrator for materializing and dematerializing Guests via a plugin Materializer interface.
 pub struct GuestManager {
     hotel_name: String,
-    graph: Arc<dyn GraphStorage>,
+    graph: Arc<GraphDomain>,
     materializer: Arc<Mutex<Box<dyn Materializer>>>,
 }
 
@@ -200,7 +200,7 @@ pub trait GuestMaterializationRequester: Send + Sync {
 impl GuestManager {
     pub fn new(
         hotel_name: impl Into<String>,
-        graph: Arc<dyn GraphStorage>,
+        graph: Arc<GraphDomain>,
         materializer: Box<dyn Materializer>,
     ) -> Self {
         Self {
@@ -210,12 +210,12 @@ impl GuestManager {
         }
     }
 
-    fn clear_guest_pid(graph: &dyn GraphStorage, hotel_name: &str, guest_id: &str) {
+    fn clear_guest_pid(graph: &GraphDomain, hotel_name: &str, guest_id: &str) {
         let _ = graph.set_guest_pid(hotel_name, guest_id, None);
     }
 
     fn refresh_guest_record(
-        graph: &dyn GraphStorage,
+        graph: &GraphDomain,
         hotel_name: &str,
         guest_id: &str,
     ) -> Result<Option<ansible_mesh_core::storage::GuestRecord>> {
@@ -513,336 +513,110 @@ impl GuestMaterializationRequester for GuestManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ansible_mesh_core::NodeCapabilities;
-    use ansible_mesh_core::graph::RoleIncarnationRecord;
-    use ansible_mesh_core::storage::{
-        GuestRecord, SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,
-    };
+    use ansible_mesh_core::domain::GraphDomain;
+    use ansible_mesh_core::graph::{GraphEdge, GraphNode};
+    use ansible_mesh_core::storage::{GuestRecord, GraphAdapter};
     use anyhow::Result;
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    #[derive(Default)]
-    struct TestGraphStorage {
-        guests: StdMutex<Vec<GuestRecord>>,
-        list_guests_calls: AtomicUsize,
+    /// Minimal `GraphAdapter` that stores nodes in memory.
+    /// Tracks calls to `list_nodes_by_kind("guest")` so we can simulate
+    /// the race condition in `reconcile_all_skips_respawn_when_guest_was_removed_after_snapshot`.
+    struct TestGraphAdapter {
+        nodes: StdMutex<HashMap<String, GraphNode>>,
+        list_guest_calls: AtomicUsize,
         clear_guests_on_second_list: bool,
     }
 
-    impl TestGraphStorage {
+    impl TestGraphAdapter {
         fn with_guests(guests: Vec<GuestRecord>) -> Self {
+            let mut nodes = HashMap::new();
+            for rec in &guests {
+                let key = format!("guest:{}:{}", rec.hotel_name, rec.guest_id);
+                nodes.insert(
+                    key.clone(),
+                    GraphNode {
+                        node_key: key,
+                        kind: "guest".to_string(),
+                        label: Some(rec.guest_id.clone()),
+                        data: serde_json::to_value(rec).unwrap(),
+                    },
+                );
+            }
             Self {
-                guests: StdMutex::new(guests),
-                list_guests_calls: AtomicUsize::new(0),
+                nodes: StdMutex::new(nodes),
+                list_guest_calls: AtomicUsize::new(0),
                 clear_guests_on_second_list: false,
             }
         }
 
         fn with_guests_cleared_on_second_list(guests: Vec<GuestRecord>) -> Self {
-            Self {
-                guests: StdMutex::new(guests),
-                list_guests_calls: AtomicUsize::new(0),
-                clear_guests_on_second_list: true,
-            }
+            let mut adapter = Self::with_guests(guests);
+            adapter.clear_guests_on_second_list = true;
+            adapter
         }
     }
 
-    impl GraphStorage for TestGraphStorage {
-        fn load_node_capabilities(&self) -> Result<Option<NodeCapabilities>> {
-            Ok(None)
-        }
-
-        fn save_node_capabilities(&self, _caps: &NodeCapabilities) -> Result<()> {
+    impl GraphAdapter for TestGraphAdapter {
+        fn upsert_node(&self, node: &GraphNode) -> Result<()> {
+            self.nodes
+                .lock()
+                .unwrap()
+                .insert(node.node_key.clone(), node.clone());
             Ok(())
         }
 
-        fn get_config_value(&self, _key: &str) -> Result<Option<String>> {
-            Ok(None)
+        fn get_node(&self, node_key: &str) -> Result<Option<GraphNode>> {
+            Ok(self.nodes.lock().unwrap().get(node_key).cloned())
         }
 
-        fn set_config_value(&self, _key: &str, _value_json: &str) -> Result<()> {
+        fn delete_node(&self, node_key: &str) -> Result<()> {
+            self.nodes.lock().unwrap().remove(node_key);
             Ok(())
         }
 
-        fn upsert_secret(&self, _secret: &ansible_mesh_core::storage::SecretRecord) -> Result<()> {
-            Ok(())
-        }
-
-        fn get_secret(
-            &self,
-            _secret_ref: &str,
-        ) -> Result<Option<ansible_mesh_core::storage::SecretRecord>> {
-            Ok(None)
-        }
-
-        fn get_hotel(
-            &self,
-            _hotel_name: &str,
-        ) -> Result<Option<ansible_mesh_core::storage::HotelRecord>> {
-            Ok(None)
-        }
-
-        fn list_hotels(&self) -> Result<Vec<ansible_mesh_core::storage::HotelRecord>> {
-            Ok(vec![])
-        }
-
-        fn upsert_hotel(&self, _hotel: &ansible_mesh_core::storage::HotelRecord) -> Result<()> {
-            Ok(())
-        }
-
-        fn set_hotel_pid(&self, _hotel_name: &str, _pid: Option<&str>) -> Result<()> {
-            Ok(())
-        }
-
-        fn list_guests(&self, hotel_name: &str, active_only: bool) -> Result<Vec<GuestRecord>> {
-            let call_index = self.list_guests_calls.fetch_add(1, Ordering::SeqCst);
-            if self.clear_guests_on_second_list && call_index >= 1 {
-                self.guests.lock().unwrap().clear();
+        fn list_nodes_by_kind(&self, kind: &str) -> Result<Vec<GraphNode>> {
+            if kind == "guest" {
+                let call_index = self.list_guest_calls.fetch_add(1, Ordering::SeqCst);
+                if self.clear_guests_on_second_list && call_index >= 1 {
+                    self.nodes
+                        .lock()
+                        .unwrap()
+                        .retain(|_, n| n.kind != "guest");
+                }
             }
-            let guests = self.guests.lock().unwrap();
-            if active_only {
-                Ok(guests
-                    .iter()
-                    .filter(|g| g.hotel_name == hotel_name && g.is_active)
-                    .cloned()
-                    .collect())
-            } else {
-                Ok(guests
-                    .iter()
-                    .filter(|g| g.hotel_name == hotel_name)
-                    .cloned()
-                    .collect())
-            }
+            Ok(self
+                .nodes
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|n| n.kind == kind)
+                .cloned()
+                .collect())
         }
 
-        fn set_guest_pid(&self, hotel_name: &str, guest_id: &str, pid: Option<&str>) -> Result<()> {
-            let mut guests = self.guests.lock().unwrap();
-            let rec = guests
-                .iter_mut()
-                .find(|g| g.hotel_name == hotel_name && g.guest_id == guest_id)
-                .expect("guest should exist");
-            rec.active_pid = pid.map(|value| value.to_string());
+        fn upsert_edge(&self, _edge: &GraphEdge) -> Result<()> {
             Ok(())
         }
 
-        fn set_guest_active(&self, hotel_name: &str, guest_id: &str, active: bool) -> Result<()> {
-            let mut guests = self.guests.lock().unwrap();
-            if let Some(rec) = guests
-                .iter_mut()
-                .find(|g| g.hotel_name == hotel_name && g.guest_id == guest_id)
-            {
-                rec.is_active = active;
-            }
+        fn delete_edge(&self, _edge_key: &str) -> Result<()> {
             Ok(())
         }
 
-        fn set_guest_last_active(
+        fn list_edges_from(
             &self,
-            hotel_name: &str,
-            guest_id: &str,
-            epoch: u64,
-        ) -> Result<()> {
-            let mut guests = self.guests.lock().unwrap();
-            if let Some(rec) = guests
-                .iter_mut()
-                .find(|g| g.hotel_name == hotel_name && g.guest_id == guest_id)
-            {
-                rec.last_active_at = Some(epoch);
-            }
-            Ok(())
-        }
-
-        fn list_role_incarnations_by_guest_id(
-            &self,
-            _guest_id: &str,
-        ) -> Result<Vec<ansible_mesh_core::graph::RoleIncarnationRecord>> {
+            _src_node_key: &str,
+            _edge_kind: Option<&str>,
+        ) -> Result<Vec<GraphEdge>> {
             Ok(vec![])
         }
+    }
 
-        fn seed_guests(&self, _hotel_name: &str, guests: &[GuestRecord]) -> Result<()> {
-            let mut stored = self.guests.lock().unwrap();
-            *stored = guests.to_vec();
-            Ok(())
-        }
-
-        fn upsert_agent_identity(
-            &self,
-            _identity: &ansible_mesh_core::storage::AgentIdentityRecord,
-        ) -> Result<()> {
-            Ok(())
-        }
-
-        fn list_agent_identities(
-            &self,
-        ) -> Result<Vec<ansible_mesh_core::storage::AgentIdentityRecord>> {
-            Ok(vec![])
-        }
-
-        fn get_agent_identity(
-            &self,
-            _agent_id: &str,
-        ) -> Result<Option<ansible_mesh_core::storage::AgentIdentityRecord>> {
-            Ok(None)
-        }
-
-        fn sync_apartment(
-            &self,
-            _agent_id: &str,
-            _memory_type: &str,
-            _content_json: &serde_json::Value,
-        ) -> Result<()> {
-            Ok(())
-        }
-
-        fn get_apartment(
-            &self,
-            _agent_id: &str,
-            _memory_type: &str,
-        ) -> Result<Option<serde_json::Value>> {
-            Ok(None)
-        }
-
-        fn upsert_session(&self, _session: &SessionRecord) -> Result<()> {
-            Ok(())
-        }
-
-        fn get_session(&self, _session_id: &str) -> Result<Option<SessionRecord>> {
-            Ok(None)
-        }
-
-        fn upsert_role_incarnation(&self, _role: &RoleIncarnationRecord) -> Result<()> {
-            Ok(())
-        }
-
-        fn get_role_incarnation(
-            &self,
-            _agent_id: &str,
-            _role_name: &str,
-        ) -> Result<Option<RoleIncarnationRecord>> {
-            Ok(None)
-        }
-
-        fn list_role_incarnations(&self, _agent_id: &str) -> Result<Vec<RoleIncarnationRecord>> {
-            Ok(vec![])
-        }
-
-        fn upsert_session_participant(
-            &self,
-            _participant: &SessionParticipantRecord,
-        ) -> Result<()> {
-            Ok(())
-        }
-
-        fn list_session_participants(
-            &self,
-            _session_id: &str,
-        ) -> Result<Vec<SessionParticipantRecord>> {
-            Ok(vec![])
-        }
-
-        fn upsert_session_turn(&self, _turn: &SessionTurnRecord) -> Result<()> {
-            Ok(())
-        }
-
-        fn get_session_turn(
-            &self,
-            _session_id: &str,
-            _turn_id: &str,
-        ) -> Result<Option<SessionTurnRecord>> {
-            Ok(None)
-        }
-
-        fn list_session_turns(
-            &self,
-            _session_id: &str,
-            _limit: usize,
-        ) -> Result<Vec<SessionTurnRecord>> {
-            Ok(vec![])
-        }
-
-        fn append_session_event(&self, _event: &SessionEventRecord) -> Result<()> {
-            Ok(())
-        }
-
-        fn list_session_events(
-            &self,
-            _session_id: &str,
-            _limit: usize,
-        ) -> Result<Vec<SessionEventRecord>> {
-            Ok(vec![])
-        }
-
-        fn upsert_abstract_tool(
-            &self,
-            _tool: &ansible_mesh_core::graph::AbstractToolRecord,
-        ) -> Result<()> {
-            Ok(())
-        }
-
-        fn get_abstract_tool(
-            &self,
-            _tool_name: &str,
-        ) -> Result<Option<ansible_mesh_core::graph::AbstractToolRecord>> {
-            Ok(None)
-        }
-
-        fn list_abstract_tools(&self) -> Result<Vec<ansible_mesh_core::graph::AbstractToolRecord>> {
-            Ok(vec![])
-        }
-
-        fn upsert_abstract_skill(
-            &self,
-            _skill: &ansible_mesh_core::graph::AbstractSkillRecord,
-        ) -> Result<()> {
-            Ok(())
-        }
-
-        fn get_abstract_skill(
-            &self,
-            _skill_name: &str,
-        ) -> Result<Option<ansible_mesh_core::graph::AbstractSkillRecord>> {
-            Ok(None)
-        }
-
-        fn list_abstract_skills(
-            &self,
-        ) -> Result<Vec<ansible_mesh_core::graph::AbstractSkillRecord>> {
-            Ok(vec![])
-        }
-
-        fn upsert_toolset_profile(
-            &self,
-            _profile: &ansible_mesh_core::graph::ToolsetProfileRecord,
-        ) -> Result<()> {
-            Ok(())
-        }
-
-        fn get_toolset_profile(
-            &self,
-            _profile_name: &str,
-        ) -> Result<Option<ansible_mesh_core::graph::ToolsetProfileRecord>> {
-            Ok(None)
-        }
-
-        fn list_toolset_profiles(
-            &self,
-        ) -> Result<Vec<ansible_mesh_core::graph::ToolsetProfileRecord>> {
-            Ok(vec![])
-        }
-
-        fn upsert_rule(&self, _rule: &ansible_mesh_core::graph::RuleRecord) -> Result<()> {
-            Ok(())
-        }
-
-        fn get_rule(&self, _rule_id: &str) -> Result<Option<ansible_mesh_core::graph::RuleRecord>> {
-            Ok(None)
-        }
-
-        fn list_rules(&self, _agent_id: &str) -> Result<Vec<ansible_mesh_core::graph::RuleRecord>> {
-            Ok(vec![])
-        }
+    fn make_domain(adapter: TestGraphAdapter) -> Arc<GraphDomain> {
+        Arc::new(GraphDomain::new(Arc::new(adapter)))
     }
 
     struct MockMaterializer {
@@ -938,16 +712,15 @@ mod tests {
     #[tokio::test]
     async fn reconcile_all_does_not_respawn_healthy_active_guest() {
         let pid = std::process::id().to_string();
-        let graph: Arc<dyn GraphStorage> =
-            Arc::new(TestGraphStorage::with_guests(vec![GuestRecord {
-                hotel_name: "test-hotel".into(),
-                guest_id: "guest-1".into(),
-                role: "agent".into(),
-                config_json: json!({ "command": "target/debug/philote" }).to_string(),
-                is_active: true,
-                active_pid: Some(pid.clone()),
-                last_active_at: None,
-            }]));
+        let graph = make_domain(TestGraphAdapter::with_guests(vec![GuestRecord {
+            hotel_name: "test-hotel".into(),
+            guest_id: "guest-1".into(),
+            role: "agent".into(),
+            config_json: json!({ "command": "target/debug/philote" }).to_string(),
+            is_active: true,
+            active_pid: Some(pid.clone()),
+            last_active_at: None,
+        }]));
 
         let mock = MockMaterializer::new(HashMap::from([(pid.clone(), true)]));
         let spawn_count = mock.spawn_count.clone();
@@ -969,16 +742,15 @@ mod tests {
     #[tokio::test]
     async fn reconcile_all_respawns_active_guest_when_status_check_disagrees() {
         let pid = "424242".to_string();
-        let graph: Arc<dyn GraphStorage> =
-            Arc::new(TestGraphStorage::with_guests(vec![GuestRecord {
-                hotel_name: "test-hotel".into(),
-                guest_id: "guest-2".into(),
-                role: "membrane".into(),
-                config_json: json!({ "command": "target/debug/membrane" }).to_string(),
-                is_active: true,
-                active_pid: Some(pid.clone()),
-                last_active_at: None,
-            }]));
+        let graph = make_domain(TestGraphAdapter::with_guests(vec![GuestRecord {
+            hotel_name: "test-hotel".into(),
+            guest_id: "guest-2".into(),
+            role: "membrane".into(),
+            config_json: json!({ "command": "target/debug/membrane" }).to_string(),
+            is_active: true,
+            active_pid: Some(pid.clone()),
+            last_active_at: None,
+        }]));
 
         let mock = MockMaterializer::new(HashMap::from([(pid.clone(), false)]));
         let spawn_count = mock.spawn_count.clone();
@@ -999,7 +771,7 @@ mod tests {
     #[tokio::test]
     async fn reconcile_all_skips_respawn_when_guest_was_removed_after_snapshot() {
         let pid = "424243".to_string();
-        let graph = Arc::new(TestGraphStorage::with_guests_cleared_on_second_list(vec![
+        let graph = make_domain(TestGraphAdapter::with_guests_cleared_on_second_list(vec![
             GuestRecord {
                 hotel_name: "test-hotel".into(),
                 guest_id: "guest-3".into(),
