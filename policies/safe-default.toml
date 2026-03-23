@@ -1,0 +1,46 @@
+[sandbox]
+name = "safe-default"
+version = "1.0"
+max_timeout_ms = 30000
+max_concurrent = 4
+
+[commands]
+allowed = [
+    "ls", "cat", "head", "tail", "grep", "find",
+    "git", "cargo", "rustc",
+    "wc", "sort", "uniq", "diff", "tr", "cut",
+    "basename", "dirname", "realpath",
+    "echo", "printf", "true", "false", "test",
+]
+denied = [
+    "sudo", "su", "chmod", "chown", "mount", "umount",
+    "rm", "mkfs", "dd", "shutdown", "reboot",
+]
+
+[filesystem]
+read_paths = [
+    "/tmp/philotic/**",
+    "./workspace/**",
+    "/usr/lib/**",
+    "/lib/**",
+    "/etc/ssl/certs/**",
+]
+write_paths = [
+    "./workspace/output/**",
+    "/tmp/philotic/scratch/**",
+]
+execute_paths = [
+    "/usr/bin/**",
+    "/usr/local/bin/**",
+    "/bin/**",
+]
+
+[environment]
+allowlist = ["PATH", "HOME", "RUST_LOG", "CARGO_HOME", "RUSTUP_HOME", "LANG", "TERM"]
+forced = { SANDBOX = "1", PHILOTIC_SANDBOXED = "true" }
+
+[network]
+mode = "none"
+
+[seccomp]
+profile = "shell_executor"

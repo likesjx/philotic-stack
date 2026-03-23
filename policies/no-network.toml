@@ -1,0 +1,55 @@
+[sandbox]
+name = "no-network"
+version = "1.0"
+max_timeout_ms = 60000
+max_concurrent = 8
+
+[commands]
+allowed = [
+    "ls", "cat", "head", "tail", "grep", "find",
+    "git", "cargo", "rustc", "rustfmt", "clippy-driver",
+    "wc", "sort", "uniq", "diff", "tr", "cut",
+    "basename", "dirname", "realpath",
+    "echo", "printf", "true", "false", "test",
+    "cp", "mv", "mkdir", "touch", "ln",
+    "tar", "gzip", "gunzip", "bzip2",
+    "sed", "awk",
+]
+denied = [
+    "sudo", "su", "chmod", "chown", "mount", "umount",
+    "rm", "mkfs", "dd", "shutdown", "reboot",
+    "curl", "wget", "nc", "ncat", "ssh", "scp", "rsync",
+]
+
+[filesystem]
+read_paths = [
+    "/tmp/philotic/**",
+    "./workspace/**",
+    "/usr/lib/**",
+    "/lib/**",
+    "/etc/ssl/certs/**",
+    "/etc/alternatives/**",
+]
+write_paths = [
+    "./workspace/**",
+    "/tmp/philotic/**",
+]
+execute_paths = [
+    "/usr/bin/**",
+    "/usr/local/bin/**",
+    "/bin/**",
+]
+
+[environment]
+allowlist = [
+    "PATH", "HOME", "USER",
+    "RUST_LOG", "CARGO_HOME", "RUSTUP_HOME",
+    "LANG", "LC_ALL", "TERM",
+]
+forced = { SANDBOX = "1", PHILOTIC_SANDBOXED = "true" }
+
+[network]
+mode = "none"
+
+[seccomp]
+profile = "file_processor"

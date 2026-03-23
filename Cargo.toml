@@ -11,5 +11,6 @@ members = [
     "crates/memory-core",
     "crates/philotic-web",
     "crates/graph-runner",
+    "crates/philotic-sandbox",
 ]
 resolver = "2"
