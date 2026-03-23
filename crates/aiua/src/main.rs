@@ -4529,7 +4529,7 @@ async fn main() -> Result<()> {
     let materializer = Box::new(crate::service::guest_manager::LocalProcessMaterializer::new());
     let guest_manager = Arc::new(crate::service::guest_manager::GuestManager::new(
         hotel_name.clone(),
-        graph_arc.clone(),
+        graph_domain_arc.clone(),
         materializer,
     ));
 
