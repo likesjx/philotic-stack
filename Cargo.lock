@@ -2566,6 +2566,7 @@ dependencies = [
 name = "philotic-client"
 version = "0.1.0"
 dependencies = [
+ "ansible-mesh-core",
  "anyhow",
  "async-trait",
  "base64 0.22.1",

@@ -1,4 +1,8 @@
 use anyhow::{Context, Result};
+pub use ansible_mesh_core::resources::{
+    ResourceDenied, ResourceGranted, ResourceMaterializing, ResourceReleased, ResourceRequest,
+    ResourceRevoked, ResourceType,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::io::ErrorKind;
@@ -782,6 +786,15 @@ pub enum IpcRequest {
     ListRules {
         agent_id: String,
     },
+    /// Agent declares a need for a resource; hotel responds with
+    /// [`IpcResponse::ResourceGranted`], [`IpcResponse::ResourceDenied`], or
+    /// [`IpcResponse::ResourceMaterializing`].
+    ResourceRequest(ResourceRequest),
+    /// Agent notifies the hotel that it no longer needs a resource instance.
+    ///
+    /// The hotel decrements the tenant count; zero-tenant instances may be
+    /// torn down per their teardown policy.
+    ResourceReleased(ResourceReleased),
 }
 
 /// Represents the canonical response from the local Ansible back to the Guest via IPC.
@@ -932,6 +945,28 @@ pub enum IpcResponse {
     /// Response to [`IpcRequest::ListRules`].
     RuleList {
         rules: Vec<serde_json::Value>,
+    },
+    /// Hotel → agent: the requested resource is live and the binding is active.
+    /// Response to [`IpcRequest::ResourceRequest`].
+    ResourceGranted {
+        resource_granted: ResourceGranted,
+    },
+    /// Hotel → agent: the resource request was refused.
+    /// Response to [`IpcRequest::ResourceRequest`].
+    ResourceDenied {
+        resource_denied: ResourceDenied,
+    },
+    /// Hotel → agent: the resource is being materialised; a `ResourceGranted`
+    /// will follow asynchronously once the instance is ready.
+    /// Response to [`IpcRequest::ResourceRequest`].
+    ResourceMaterializing {
+        resource_materializing: ResourceMaterializing,
+    },
+    /// Hotel → agent: the hotel is withdrawing a previously issued grant.
+    /// Pushed without a corresponding request; agents must stop using the
+    /// resource immediately.
+    ResourceRevoked {
+        resource_revoked: ResourceRevoked,
     },
 }
 

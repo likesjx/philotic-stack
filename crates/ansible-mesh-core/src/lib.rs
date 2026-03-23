@@ -15,6 +15,7 @@ pub mod materializer;
 pub mod meshops;
 pub mod model_manager;
 pub mod registry;
+pub mod resources;
 pub mod runtime;
 pub mod sqlite_storage;
 pub mod storage;

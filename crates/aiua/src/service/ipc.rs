@@ -4262,6 +4262,18 @@ impl IpcServer {
                     IpcResponse::error("list_rules", "STORAGE_ERROR", err.to_string())
                 }
             },
+            // Resource broker seam (agent-resource-broker). No callers yet;
+            // hotel-side broker will be wired in the demand-derived-materialization seam.
+            IpcRequest::ResourceRequest(_req) => IpcResponse::error(
+                "resource_request",
+                "NOT_IMPLEMENTED",
+                "resource broker not yet wired",
+            ),
+            IpcRequest::ResourceReleased(_rel) => IpcResponse::error(
+                "resource_released",
+                "NOT_IMPLEMENTED",
+                "resource broker not yet wired",
+            ),
         }
     }
 
