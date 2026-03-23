@@ -25,6 +25,22 @@ pub enum ResourceType {
     AgentGraph,
 }
 
+/// A static resource declaration stored on an agent identity record.
+///
+/// These are replayed as synthetic `ResourceRequest`s by the hotel boot reconciliation
+/// loop to derive the guest set on startup. Agents do not need to include their own
+/// `agent_id` here — it is always the owning agent's ID.
+///
+/// Stored under `bundle_json["static_resource_declarations"]` on `AgentIdentityRecord`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceDeclaration {
+    /// The type of resource this agent always needs when active.
+    pub resource_type: ResourceType,
+    /// Optional opaque config hint passed to the materializer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_hint: Option<String>,
+}
+
 /// Agent → hotel: declare a need for a resource.
 ///
 /// The hotel broker will either grant immediately (`ResourceGranted`),
