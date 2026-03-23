@@ -68,6 +68,9 @@ Six interconnected components compose this model:
 - Seam 2 (`demand-derived-materialization`, commit 73e7467): `ResourceDeclaration`
   type added; `ResourceRegistry` + `boot_reconcile` in `aiua`; transitional boot
   call logs demand-derived set alongside existing `materialize_all` path.
+- Seam 3 (`agent-graph-toolrunner`, commit dbac5d3): `AgentGraphStorage` trait +
+  `SqliteAgentGraphStorage` (per-agent embedded SQLite); new `agent-graph-runner`
+  crate with `agent.graph.*` tool surface and experience trace auto-recording.
 
 This proposal supersedes the implicit static-guest-list model in the current
 `materialized_guests` configuration surface. It does not conflict with active
@@ -78,9 +81,9 @@ the resource substrate those features sit on top of.
 
 ## Current Slice
 
-**Seams 1–2 complete (transitional).** Seam 3 (`agent-graph-toolrunner`) is
-next. Seam 2 is labeled transitional — the `materialize_all` path still runs;
-full replacement of `materialized_guests` is the Seam 3+ milestone.
+**Seams 1–3 complete.** Seam 4 (`agent-graph-mesh-sync`) is next.
+Seam 2 remains labeled transitional — `materialize_all` still runs alongside
+the demand-derived registry; full replacement lands after mesh-sync is proven.
 
 ---
 
