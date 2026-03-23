@@ -35,3 +35,9 @@ Tracked defects and known technical debt. Each entry carries status, severity, s
 **Found**: 2026-03-10
 
 `GraphStorage` trait methods for `AbstractToolRecord` (`upsert_abstract_tool`, `get_abstract_tool`, `list_abstract_tools`) are defined in the trait but not fully wired in `SqliteGraphStorage`. Causes compile error in the `ansible` crate. Does not affect `aiua`, `philote`, or `model-router` builds. In-progress slice (Gap 3).
+
+## DEF-003: `aiua` has no library target — unit tests in binary modules cannot be run
+
+**Severity**: medium | **Effort**: 2pts
+
+`aiua` is configured as a binary-only crate. Test mocks in the binary test target have pre-existing compilation failures (missing `OperatorTargetView`, incomplete `GraphStorage` mock impls), which prevents `cargo test -p aiua` from running any tests including newly-added unit tests in `resource_registry.rs`. The tests compile correctly under `cargo check` but cannot be executed in CI or locally. Fix: add a `[lib]` target to `aiua`, move unit-testable modules there, isolate binary-only wiring in `main.rs`. Separate slice; orthogonal to the agent-resource-model workstream.
