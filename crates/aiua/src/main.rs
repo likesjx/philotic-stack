@@ -91,7 +91,6 @@ struct MeshRuntimeContext {
     db_path: String,
     enable_rust_auth: bool,
     enable_rust_dispatcher: bool,
-    graph: Arc<dyn ansible_mesh_core::storage::GraphStorage>,
     graph_domain: Arc<GraphDomain>,
     registry: Arc<RwLock<NodeRegistry>>,
     ledger: Arc<dyn EventStorage>,
@@ -586,7 +585,7 @@ fn default_hotel_record(hotel_name: &str) -> HotelRecord {
 }
 
 fn mesh_targets_for_graph(
-    graph: &dyn GraphStorage,
+    graph: &GraphDomain,
     local_node_id: &str,
 ) -> Result<Vec<(String, String)>> {
     Ok(graph
@@ -603,7 +602,7 @@ fn mesh_targets_for_graph(
 }
 
 fn mesh_target_addr_for_node(
-    graph: &dyn GraphStorage,
+    graph: &GraphDomain,
     target_node_id: &str,
 ) -> Result<Option<String>> {
     Ok(graph
@@ -614,7 +613,7 @@ fn mesh_target_addr_for_node(
 }
 
 fn execution_reachability_for_hotel(
-    graph: &dyn GraphStorage,
+    graph: &GraphDomain,
     hotel: &HotelRecord,
 ) -> ExecutionReachability {
     let host = graph
@@ -707,7 +706,7 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
 
     {
         let heartbeat_socket = daemon.socket();
-        let heartbeat_graph = ctx.graph.clone();
+        let heartbeat_graph = ctx.graph_domain.clone();
         let heartbeat_hotel = ctx.hotel.clone();
         let heartbeat_caps = ctx.caps.clone();
         let mut heartbeat_shutdown = ctx.shutdown_tx.subscribe();
@@ -762,7 +761,7 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
     {
         let dispatcher_inbound_tx = ctx.dispatcher_tx.clone();
         let inbound_socket = daemon.socket();
-        let inbound_graph = ctx.graph.clone();
+        let inbound_graph = ctx.graph_domain.clone();
         let inbound_inboxes = ctx.ipc_inboxes.clone();
         let inbound_local_node_id = ctx.caps.node_id.clone();
         let mesh_auth_inbound = ansible_mesh_core::authz::MeshAuth::new(&ctx.mesh_psk);
@@ -940,7 +939,7 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
 }
 
 fn local_capability_advertisements(
-    graph: &dyn GraphStorage,
+    graph: &GraphDomain,
     hotel: &HotelRecord,
 ) -> Result<Vec<CapabilityAdvertisement>> {
     let tool_runner_registry = graph
@@ -1593,7 +1592,7 @@ fn agent_identity_record_for_profile(
     }
 }
 
-fn reconcile_hotel_record(graph: &dyn GraphStorage, hotel_name: &str) -> Result<HotelRecord> {
+fn reconcile_hotel_record(graph: &GraphDomain, hotel_name: &str) -> Result<HotelRecord> {
     let Some(mut hotel) = graph.get_hotel(hotel_name)? else {
         let hotel = default_hotel_record(hotel_name);
         graph.upsert_hotel(&hotel)?;
@@ -1622,7 +1621,7 @@ fn reconcile_hotel_record(graph: &dyn GraphStorage, hotel_name: &str) -> Result<
 }
 
 fn deactivate_legacy_managed_guests(
-    graph: &dyn GraphStorage,
+    graph: &GraphDomain,
     hotel_name: &str,
     profiles: &[AgentProfile],
     desired_guests: &[GuestRecord],
@@ -1698,7 +1697,7 @@ fn deactivate_legacy_managed_guests(
 /// Uses upsert semantics — safe to call on every startup. Tools not already
 /// present are inserted; existing entries are updated to the current definition.
 /// Operator-added or tool-runner-provided tools with distinct names are unaffected.
-fn seed_abstract_tool_catalog(graph: &dyn GraphStorage) -> anyhow::Result<()> {
+fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
     let catalog = [
         AbstractToolRecord {
             tool_name: "session.status".into(),
@@ -1796,7 +1795,7 @@ fn seed_abstract_tool_catalog(graph: &dyn GraphStorage) -> anyhow::Result<()> {
 /// These skills are prompt-facing posture records first; their implied tool
 /// grants stay intentionally narrow until the governed handoff and role
 /// provisioning layers are fully wired.
-fn seed_abstract_skill_catalog(graph: &dyn GraphStorage) -> anyhow::Result<()> {
+fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
     let catalog = [
         AbstractSkillRecord {
             skill_name: "handoff.to_role".into(),
@@ -1857,7 +1856,7 @@ fn seed_abstract_skill_catalog(graph: &dyn GraphStorage) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn seed_toolset_profiles(graph: &dyn GraphStorage) -> anyhow::Result<()> {
+fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
     let profiles = [
         ToolsetProfileRecord {
             profile_name: "orchestrator".into(),
@@ -1952,7 +1951,7 @@ fn seed_toolset_profiles(graph: &dyn GraphStorage) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn seed_skill_crafting(graph: &dyn GraphStorage) -> anyhow::Result<()> {
+fn seed_skill_crafting(graph: &GraphDomain) -> anyhow::Result<()> {
     use ansible_mesh_core::graph::{AbstractSkillRecord, SkillValidationState};
     let skill = AbstractSkillRecord {
         skill_name: "skill.crafting".into(),
@@ -2006,7 +2005,7 @@ Approval posture:
 /// turn, breaking the chicken-and-egg where role.configure requires tools that only appear
 /// after a role exists.
 fn seed_orchestrator_roles(
-    graph: &dyn GraphStorage,
+    graph: &GraphDomain,
     profiles: &[AgentProfile],
 ) -> anyhow::Result<()> {
     for profile in profiles {
@@ -4018,7 +4017,7 @@ fn pid_exists(pid: u32) -> bool {
 
 async fn stabilize_startup_test_guests(
     guest_manager: &Arc<crate::service::guest_manager::GuestManager>,
-    graph: &Arc<dyn ansible_mesh_core::storage::GraphStorage>,
+    graph: &Arc<GraphDomain>,
     hotel_name: &str,
     shutdown_rx: &tokio::sync::broadcast::Receiver<()>,
 ) -> Result<()> {
@@ -4073,8 +4072,8 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
     };
     let graph_storage = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open(db_path)?;
     let graph_domain = GraphDomain::new(Arc::new(graph_storage.adapter()));
-    let hotel = reconcile_hotel_record(&graph_storage, hotel_name)?;
-    graph_storage.upsert_hotel(&hotel)?;
+    let hotel = reconcile_hotel_record(&graph_domain, hotel_name)?;
+    graph_domain.upsert_hotel(&hotel)?;
 
     let config_data = fs::read_to_string(file).context("Failed to read config file")?;
     let config_json: serde_json::Value =
@@ -4090,7 +4089,7 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
             } else {
                 value.to_string()
             };
-            graph_storage.set_config_value(&key, &val_str)?;
+            graph_domain.set_config_value(&key, &val_str)?;
             count += 1;
         }
         info!("Injected {} config key(s) into Context Graph.", count);
@@ -4149,25 +4148,25 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
     all_desired_guests.extend(hotel_shared_guests(hotel_name, &all_profiles));
 
     deactivate_legacy_managed_guests(
-        &graph_storage,
+        &graph_domain,
         hotel_name,
         &all_profiles,
         &all_desired_guests,
     )?;
-    graph_storage.seed_guests(hotel_name, &all_desired_guests)?;
+    graph_domain.seed_guests(hotel_name, &all_desired_guests)?;
     info!("Seeded {} guest record(s).", all_desired_guests.len());
 
-    seed_orchestrator_roles(&graph_storage, &all_profiles)?;
-    seed_abstract_tool_catalog(&graph_storage)?;
-    seed_abstract_skill_catalog(&graph_storage)?;
-    seed_toolset_profiles(&graph_storage)?;
-    seed_skill_crafting(&graph_storage)?;
+    seed_orchestrator_roles(&graph_domain, &all_profiles)?;
+    seed_abstract_tool_catalog(&graph_domain)?;
+    seed_abstract_skill_catalog(&graph_domain)?;
+    seed_toolset_profiles(&graph_domain)?;
+    seed_skill_crafting(&graph_domain)?;
 
     for profile in &all_profiles {
         let agent_config = raw_agent_config_for_key(&config_json, hotel_name, &profile.agent_key);
         let identity =
             agent_identity_record_for_profile(profile, hotel_name, agent_config.as_ref());
-        graph_storage
+        graph_domain
             .upsert_agent_identity(&identity)
             .with_context(|| format!("Failed to upsert identity for {}", identity.agent_id))?;
         info!("Identity seeded for agent '{}'.", identity.agent_id);
@@ -4259,7 +4258,7 @@ async fn main() -> Result<()> {
         .hotel
         .context("--hotel is required unless using a subcommand such as `aiua load`")?;
 
-    let seeded_guests = graph_storage.list_guests(&hotel_name, true)?;
+    let seeded_guests = graph_domain_arc.list_guests(&hotel_name, true)?;
     if seeded_guests.is_empty() {
         warn!(
             "Hotel '{}' has no seeded guests. Run `aiua load --file <config.json> --hotel {}` to provision.",
@@ -4279,19 +4278,19 @@ async fn main() -> Result<()> {
     }
 
     let startup_test = args.test;
-    if graph_storage.get_hotel(&hotel_name)?.is_none() {
+    if graph_domain_arc.get_hotel(&hotel_name)?.is_none() {
         info!(
             "Hotel '{}' is missing from the Context Graph. Run `aiua load` to provision.",
             hotel_name
         );
     }
 
-    let mut hotel = reconcile_hotel_record(&graph_storage, &hotel_name)?;
+    let mut hotel = reconcile_hotel_record(&graph_domain_arc, &hotel_name)?;
 
-    seed_abstract_tool_catalog(&graph_storage)?;
-    seed_abstract_skill_catalog(&graph_storage)?;
-    seed_toolset_profiles(&graph_storage)?;
-    seed_skill_crafting(&graph_storage)?;
+    seed_abstract_tool_catalog(&graph_domain_arc)?;
+    seed_abstract_skill_catalog(&graph_domain_arc)?;
+    seed_toolset_profiles(&graph_domain_arc)?;
+    seed_skill_crafting(&graph_domain_arc)?;
 
     if let Some(test) = startup_test {
         prepare_startup_test_binaries(test)?;
@@ -4308,12 +4307,12 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        graph_storage.set_hotel_pid(&hotel_name, None)?;
+        graph_domain_arc.set_hotel_pid(&hotel_name, None)?;
         hotel.active_pid = None;
     }
 
     let smoke_mode = smoke_mode_enabled();
-    let mesh_enabled = !smoke_mode && graph_storage.list_hotels()?.len() > 1;
+    let mesh_enabled = !smoke_mode && graph_domain_arc.list_hotels()?.len() > 1;
 
     if !smoke_mode {
         let (resolved_mesh_port, resolved_blob_port, resolved_execution_port) =
@@ -4336,12 +4335,12 @@ async fn main() -> Result<()> {
             hotel.mesh_port = resolved_mesh_port;
             hotel.blob_port = resolved_blob_port;
             hotel.execution_port = resolved_execution_port;
-            graph_storage.upsert_hotel(&hotel)?;
+            graph_domain_arc.upsert_hotel(&hotel)?;
         }
     }
 
     let current_pid = std::process::id().to_string();
-    graph_storage.set_hotel_pid(&hotel_name, Some(&current_pid))?;
+    graph_domain_arc.set_hotel_pid(&hotel_name, Some(&current_pid))?;
     hotel.active_pid = Some(current_pid.clone());
 
     let caps = hotel.capabilities.clone();
@@ -4396,7 +4395,7 @@ async fn main() -> Result<()> {
         });
 
         tokio::signal::ctrl_c().await?;
-        let _ = graph_arc.set_hotel_pid(&hotel_name, None);
+        let _ = graph_domain_arc.set_hotel_pid(&hotel_name, None);
         info!("Ansible smoke-mode shutdown complete.");
         return Ok(());
     }
@@ -4569,7 +4568,6 @@ async fn main() -> Result<()> {
         db_path: db_path.to_string_lossy().to_string(),
         enable_rust_auth: execution_enable_rust_auth,
         enable_rust_dispatcher: flags.enable_rust_dispatcher,
-        graph: graph_arc.clone(),
         graph_domain: graph_domain_arc.clone(),
         registry: registry.clone(),
         ledger: ledger.clone(),
@@ -4585,7 +4583,7 @@ async fn main() -> Result<()> {
 
     if mesh_enabled {
         if let Err(e) = activate_mesh_runtime(mesh_runtime.clone()).await {
-            let _ = graph_arc.set_hotel_pid(&hotel_name, None);
+            let _ = graph_domain_arc.set_hotel_pid(&hotel_name, None);
             return Err(e);
         }
     } else {
@@ -4594,7 +4592,7 @@ async fn main() -> Result<()> {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
             loop {
                 interval.tick().await;
-                match mesh_runtime_watcher.graph.list_hotels() {
+                match mesh_runtime_watcher.graph_domain.list_hotels() {
                     Ok(hotels) if hotels.len() > 1 => {
                         info!(
                             hotel = %mesh_runtime_watcher.hotel_name,
@@ -4635,7 +4633,7 @@ async fn main() -> Result<()> {
     }
 
     if startup_test.is_some() {
-        stabilize_startup_test_guests(&guest_manager, &graph_arc, &hotel_name, &shutdown_rx)
+        stabilize_startup_test_guests(&guest_manager, &graph_domain_arc, &hotel_name, &shutdown_rx)
             .await?;
     }
 
@@ -4663,7 +4661,7 @@ async fn main() -> Result<()> {
         .await;
         let _ = shutdown_tx.send(());
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        let _ = graph_arc.set_hotel_pid(&hotel_name, None);
+        let _ = graph_domain_arc.set_hotel_pid(&hotel_name, None);
         return test_result;
     }
 
@@ -4684,10 +4682,10 @@ async fn main() -> Result<()> {
     warn!("Ctrl-C received! Initiating shutdown of all Materialized Guests...");
     let _ = shutdown_tx.send(());
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-    let _ = graph_arc.set_hotel_pid(&hotel_name, None);
+    let _ = graph_domain_arc.set_hotel_pid(&hotel_name, None);
     info!("Ansible Daemon shutdown complete.");
 
-    let _ = graph_arc.set_hotel_pid(&hotel_name, None);
+    let _ = graph_domain_arc.set_hotel_pid(&hotel_name, None);
 
     Ok(())
 }
@@ -4705,7 +4703,7 @@ mod tests {
     };
     use ansible_mesh_core::domain::GraphDomain;
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
-    use ansible_mesh_core::storage::{GraphStorage, GuestRecord, HotelRecord};
+    use ansible_mesh_core::storage::{GuestRecord, HotelRecord};
     use std::sync::Arc;
 
     #[test]
@@ -4837,7 +4835,8 @@ mod tests {
 
     #[test]
     fn local_capability_advertisements_include_hotel_scoped_incarnations() {
-        let graph = SqliteGraphStorage::open(":memory:").expect("open sqlite graph");
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite graph");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
         let hotel = default_hotel_record("aria-architect-hotel");
         let guests = default_guest_seed("aria-architect-hotel");
         graph
@@ -4861,7 +4860,8 @@ mod tests {
 
     #[test]
     fn execution_reachability_prefers_configured_host() {
-        let graph = SqliteGraphStorage::open(":memory:").expect("open sqlite graph");
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite graph");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
         graph
             .set_config_value("execution_host", &serde_json::json!("jane-vps").to_string())
             .expect("set execution host");
@@ -5220,7 +5220,8 @@ mod tests {
 
     #[test]
     fn deactivate_legacy_managed_guests_disables_hotel_prefixed_hegemon_ids() {
-        let graph = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
         let hotel_name = "startup-test-hotel";
         let profile = default_agent_profile_for_hotel(hotel_name);
         let desired = guest_seed_for_profile(hotel_name, &profile);
