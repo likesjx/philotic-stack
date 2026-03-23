@@ -5,7 +5,7 @@
 //! result to send back as the tool call reply.
 
 use ansible_mesh_core::agent_graph_storage::{
-    AgentExperienceTrace, AgentGraphStorage, AgentResourceGrant, AgentToolPreference,
+    AgentExperienceTrace, AgentGraphSnapshot, AgentGraphStorage, AgentToolPreference,
 };
 use ansible_mesh_core::resources::{ResourceDeclaration, ResourceType};
 use serde_json::{Value, json};
@@ -23,6 +23,7 @@ pub fn dispatch(
         "agent.graph.write" => agent_graph_write(storage, args, agent_id),
         "agent.graph.declare" => agent_graph_declare(storage, args, agent_id),
         "agent.graph.recall" => agent_graph_recall(storage, args),
+        "agent.graph.sync" => agent_graph_sync(storage, args, agent_id),
         _ => json!({"ok": false, "error": format!("{tool_name}: unsupported agent.graph tool")})
             .to_string(),
     }
@@ -91,6 +92,7 @@ fn agent_graph_write(storage: &dyn AgentGraphStorage, args: &Value, agent_id: &s
                 tool_name: tool_name.to_string(),
                 preference_level,
                 config_json,
+                updated_at: 0, // upsert_tool_preference sets now_epoch() when 0
             };
             match storage.upsert_tool_preference(&pref) {
                 Ok(()) => json!({"ok": true}).to_string(),
@@ -154,6 +156,36 @@ fn agent_graph_recall(storage: &dyn AgentGraphStorage, args: &Value) -> String {
     };
     match result {
         Ok(traces) => json!({"ok": true, "traces": traces}).to_string(),
+        Err(e) => json!({"ok": false, "error": e.to_string()}).to_string(),
+    }
+}
+
+// ── agent.graph.sync ──────────────────────────────────────────────────────────
+
+/// Apply an inbound mesh snapshot with LWW conflict resolution.
+///
+/// Args: an `AgentGraphSnapshot` JSON object (serialised by the sending hotel).
+///
+/// This is the receive-side of the `EventKind::AgentGraphSync` mesh transport.
+/// The hotel delivers it as an `InboundTask` to the `agent-graph` guest; the
+/// existing dispatch loop calls here without special-casing.
+fn agent_graph_sync(storage: &dyn AgentGraphStorage, args: &Value, _agent_id: &str) -> String {
+    let snapshot: AgentGraphSnapshot = match serde_json::from_value(args.clone()) {
+        Ok(s) => s,
+        Err(e) => {
+            return json!({"ok": false, "error": format!("invalid snapshot payload: {e}")})
+                .to_string()
+        }
+    };
+    match storage.apply_snapshot(&snapshot) {
+        Ok(result) => json!({
+            "ok": true,
+            "preferences_applied": result.preferences_applied,
+            "preferences_skipped": result.preferences_skipped,
+            "declarations_applied": result.declarations_applied,
+            "declarations_skipped": result.declarations_skipped,
+        })
+        .to_string(),
         Err(e) => json!({"ok": false, "error": e.to_string()}).to_string(),
     }
 }

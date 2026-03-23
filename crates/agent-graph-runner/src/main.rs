@@ -58,6 +58,7 @@ const AGENT_GRAPH_TOOLS: &[&str] = &[
     "agent.graph.write",
     "agent.graph.declare",
     "agent.graph.recall",
+    "agent.graph.sync",
 ];
 
 // ── CLI ───────────────────────────────────────────────────────────────────────

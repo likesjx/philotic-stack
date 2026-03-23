@@ -57,6 +57,9 @@ pub struct AgentToolPreference {
     pub preference_level: i32,
     #[serde(default)]
     pub config_json: serde_json::Value,
+    /// Unix epoch (seconds) of last write — used for LWW mesh sync.
+    #[serde(default)]
+    pub updated_at: u64,
 }
 
 /// A single entry in the agent experience ledger.
@@ -77,6 +80,59 @@ pub struct AgentExperienceTrace {
     pub outcome_detail: Option<String>,
     /// Unix epoch (seconds).
     pub timestamp: u64,
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Mesh-sync snapshot types (Seam 4)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// A tool preference entry inside an `AgentGraphSnapshot`.
+///
+/// Mirrors `AgentToolPreference` but omits `agent_id` (implicit from the
+/// snapshot envelope) and carries the LWW timestamp.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotPreference {
+    pub tool_name: String,
+    pub preference_level: i32,
+    #[serde(default)]
+    pub config_json: serde_json::Value,
+    pub updated_at: u64,
+}
+
+/// A resource declaration entry inside an `AgentGraphSnapshot`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotDeclaration {
+    pub resource_type: ResourceType,
+    #[serde(default)]
+    pub config_hint: Option<String>,
+    pub updated_at: u64,
+}
+
+/// Portable snapshot of an agent's cognitive configuration for mesh propagation.
+///
+/// # Two-tier authority invariant
+///
+/// Resource **grants** are intentionally excluded. Grants are hotel-CG-owned;
+/// only the issuing hotel writes them. Accepting grants from peer mesh nodes
+/// would violate the authority boundary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentGraphSnapshot {
+    pub agent_id: String,
+    /// Node ID of the exporting hotel.
+    pub source_node_id: String,
+    /// Unix epoch (seconds) when the snapshot was taken.
+    pub exported_at: u64,
+    pub preferences: Vec<SnapshotPreference>,
+    pub declarations: Vec<SnapshotDeclaration>,
+}
+
+/// Summary of what changed when `apply_snapshot` was called.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeResult {
+    pub preferences_applied: usize,
+    pub preferences_skipped: usize,
+    pub declarations_applied: usize,
+    pub declarations_skipped: usize,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -137,6 +193,23 @@ pub trait AgentGraphStorage: Send + Sync {
         event_type: &str,
         limit: usize,
     ) -> Result<Vec<AgentExperienceTrace>>;
+
+    // ── Mesh sync (Seam 4) ───────────────────────────────────────────────────
+
+    /// Export the agent's cognitive configuration as a portable snapshot.
+    ///
+    /// Grants are excluded — see `AgentGraphSnapshot` for the authority
+    /// boundary rationale.
+    fn export_snapshot(&self, source_node_id: &str) -> Result<AgentGraphSnapshot>;
+
+    /// Apply an inbound mesh snapshot using Last-Writer-Wins conflict resolution.
+    ///
+    /// For each preference and declaration: if the snapshot's `updated_at`
+    /// is strictly greater than the locally stored value, the local record is
+    /// overwritten; otherwise it is skipped.
+    ///
+    /// Grants in the snapshot (there are none by design) are never applied.
+    fn apply_snapshot(&self, snapshot: &AgentGraphSnapshot) -> Result<MergeResult>;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -182,6 +255,7 @@ impl SqliteAgentGraphStorage {
                 tool_name        TEXT NOT NULL,
                 preference_level INTEGER NOT NULL DEFAULT 0,
                 config_json      TEXT NOT NULL DEFAULT '{}',
+                updated_at       INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (agent_id, tool_name)
             );
 
@@ -189,6 +263,7 @@ impl SqliteAgentGraphStorage {
                 agent_id      TEXT NOT NULL,
                 resource_type TEXT NOT NULL,
                 config_hint   TEXT,
+                updated_at    INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (agent_id, resource_type)
             );
 
@@ -212,6 +287,14 @@ impl SqliteAgentGraphStorage {
             COMMIT;
             ",
         )?;
+        // Idempotent migrations for existing databases that predate updated_at.
+        // ALTER TABLE ADD COLUMN errors if the column already exists — swallow it.
+        let _ = conn.execute_batch(
+            "ALTER TABLE tool_preferences ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0;",
+        );
+        let _ = conn.execute_batch(
+            "ALTER TABLE resource_declarations ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0;",
+        );
         Ok(())
     }
 
@@ -284,13 +367,19 @@ impl AgentGraphStorage for SqliteAgentGraphStorage {
     fn upsert_tool_preference(&self, pref: &AgentToolPreference) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let config = serde_json::to_string(&pref.config_json)?;
+        let updated_at = if pref.updated_at > 0 {
+            pref.updated_at
+        } else {
+            Self::now_epoch()
+        };
         conn.execute(
-            "INSERT INTO tool_preferences (agent_id, tool_name, preference_level, config_json)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO tool_preferences (agent_id, tool_name, preference_level, config_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(agent_id, tool_name) DO UPDATE SET
                preference_level = excluded.preference_level,
-               config_json = excluded.config_json",
-            params![pref.agent_id, pref.tool_name, pref.preference_level, config],
+               config_json = excluded.config_json,
+               updated_at = excluded.updated_at",
+            params![pref.agent_id, pref.tool_name, pref.preference_level, config, updated_at],
         )?;
         Ok(())
     }
@@ -298,7 +387,7 @@ impl AgentGraphStorage for SqliteAgentGraphStorage {
     fn list_tool_preferences(&self) -> Result<Vec<AgentToolPreference>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT agent_id, tool_name, preference_level, config_json
+            "SELECT agent_id, tool_name, preference_level, config_json, updated_at
              FROM tool_preferences WHERE agent_id = ?1 ORDER BY tool_name",
         )?;
         let rows = stmt.query_map(params![self.agent_id], |row| {
@@ -307,16 +396,18 @@ impl AgentGraphStorage for SqliteAgentGraphStorage {
                 row.get::<_, String>(1)?,
                 row.get::<_, i32>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, u64>(4)?,
             ))
         })?;
         let mut prefs = Vec::new();
         for row in rows {
-            let (agent_id, tool_name, level, cfg_str) = row?;
+            let (agent_id, tool_name, level, cfg_str, updated_at) = row?;
             prefs.push(AgentToolPreference {
                 agent_id,
                 tool_name,
                 preference_level: level,
                 config_json: serde_json::from_str(&cfg_str).unwrap_or_default(),
+                updated_at,
             });
         }
         Ok(prefs)
@@ -325,7 +416,7 @@ impl AgentGraphStorage for SqliteAgentGraphStorage {
     fn get_tool_preference(&self, tool_name: &str) -> Result<Option<AgentToolPreference>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT agent_id, tool_name, preference_level, config_json
+            "SELECT agent_id, tool_name, preference_level, config_json, updated_at
              FROM tool_preferences WHERE agent_id = ?1 AND tool_name = ?2",
         )?;
         let mut rows = stmt.query(params![self.agent_id, tool_name])?;
@@ -336,6 +427,7 @@ impl AgentGraphStorage for SqliteAgentGraphStorage {
                 tool_name: row.get(1)?,
                 preference_level: row.get(2)?,
                 config_json: serde_json::from_str(&cfg_str).unwrap_or_default(),
+                updated_at: row.get(4)?,
             }));
         }
         Ok(None)
@@ -346,12 +438,14 @@ impl AgentGraphStorage for SqliteAgentGraphStorage {
     fn upsert_resource_declaration(&self, decl: &ResourceDeclaration) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let rt = serde_json::to_string(&decl.resource_type)?;
+        let updated_at = Self::now_epoch();
         conn.execute(
-            "INSERT INTO resource_declarations (agent_id, resource_type, config_hint)
-             VALUES (?1, ?2, ?3)
+            "INSERT INTO resource_declarations (agent_id, resource_type, config_hint, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(agent_id, resource_type) DO UPDATE SET
-               config_hint = excluded.config_hint",
-            params![self.agent_id, rt, decl.config_hint],
+               config_hint = excluded.config_hint,
+               updated_at = excluded.updated_at",
+            params![self.agent_id, rt, decl.config_hint, updated_at],
         )?;
         Ok(())
     }
@@ -433,6 +527,134 @@ impl AgentGraphStorage for SqliteAgentGraphStorage {
              ORDER BY timestamp DESC LIMIT ?3",
         )?;
         self.collect_traces(&mut stmt, params![self.agent_id, event_type, limit as i64])
+    }
+
+    // ── Mesh sync (Seam 4) ───────────────────────────────────────────────────
+
+    fn export_snapshot(&self, source_node_id: &str) -> Result<AgentGraphSnapshot> {
+        let conn = self.conn.lock().unwrap();
+
+        // Export tool preferences with timestamps.
+        let mut pref_stmt = conn.prepare(
+            "SELECT tool_name, preference_level, config_json, updated_at
+             FROM tool_preferences WHERE agent_id = ?1",
+        )?;
+        let pref_rows = pref_stmt.query_map(params![self.agent_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i32>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, u64>(3)?,
+            ))
+        })?;
+        let mut preferences = Vec::new();
+        for row in pref_rows {
+            let (tool_name, preference_level, cfg_str, updated_at) = row?;
+            preferences.push(SnapshotPreference {
+                tool_name,
+                preference_level,
+                config_json: serde_json::from_str(&cfg_str).unwrap_or_default(),
+                updated_at,
+            });
+        }
+
+        // Export resource declarations with timestamps.
+        let mut decl_stmt = conn.prepare(
+            "SELECT resource_type, config_hint, updated_at
+             FROM resource_declarations WHERE agent_id = ?1",
+        )?;
+        let decl_rows = decl_stmt.query_map(params![self.agent_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, u64>(2)?,
+            ))
+        })?;
+        let mut declarations = Vec::new();
+        for row in decl_rows {
+            let (rt_str, config_hint, updated_at) = row?;
+            let resource_type: ResourceType = serde_json::from_str(&rt_str)
+                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+            declarations.push(SnapshotDeclaration {
+                resource_type,
+                config_hint,
+                updated_at,
+            });
+        }
+
+        Ok(AgentGraphSnapshot {
+            agent_id: self.agent_id.clone(),
+            source_node_id: source_node_id.to_string(),
+            exported_at: Self::now_epoch(),
+            preferences,
+            declarations,
+        })
+    }
+
+    fn apply_snapshot(&self, snapshot: &AgentGraphSnapshot) -> Result<MergeResult> {
+        let conn = self.conn.lock().unwrap();
+        let mut preferences_applied = 0usize;
+        let mut preferences_skipped = 0usize;
+        let mut declarations_applied = 0usize;
+        let mut declarations_skipped = 0usize;
+
+        for pref in &snapshot.preferences {
+            // LWW: only apply if incoming updated_at is strictly greater than stored.
+            let config_str = serde_json::to_string(&pref.config_json)
+                .unwrap_or_else(|_| "{}".to_string());
+            let rows_changed = conn.execute(
+                "INSERT INTO tool_preferences (agent_id, tool_name, preference_level, config_json, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(agent_id, tool_name) DO UPDATE SET
+                   preference_level = excluded.preference_level,
+                   config_json = excluded.config_json,
+                   updated_at = excluded.updated_at
+                 WHERE excluded.updated_at > tool_preferences.updated_at",
+                params![
+                    snapshot.agent_id,
+                    pref.tool_name,
+                    pref.preference_level,
+                    config_str,
+                    pref.updated_at
+                ],
+            )?;
+            if rows_changed > 0 {
+                preferences_applied += 1;
+            } else {
+                preferences_skipped += 1;
+            }
+        }
+
+        for decl in &snapshot.declarations {
+            let rt_str = serde_json::to_string(&decl.resource_type)
+                .unwrap_or_else(|_| "\"unknown\"".to_string());
+            let rows_changed = conn.execute(
+                "INSERT INTO resource_declarations (agent_id, resource_type, config_hint, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(agent_id, resource_type) DO UPDATE SET
+                   config_hint = excluded.config_hint,
+                   updated_at = excluded.updated_at
+                 WHERE excluded.updated_at > resource_declarations.updated_at",
+                params![
+                    snapshot.agent_id,
+                    rt_str,
+                    decl.config_hint,
+                    decl.updated_at
+                ],
+            )?;
+            if rows_changed > 0 {
+                declarations_applied += 1;
+            } else {
+                declarations_skipped += 1;
+            }
+        }
+
+        Ok(MergeResult {
+            preferences_applied,
+            preferences_skipped,
+            declarations_applied,
+            declarations_skipped,
+        })
     }
 }
 
@@ -533,6 +755,7 @@ mod tests {
             tool_name: "bash.exec".into(),
             preference_level: 1,
             config_json: serde_json::json!({"timeout_secs": 30}),
+            updated_at: 0,
         };
         s.upsert_tool_preference(&pref).unwrap();
         let got = s.get_tool_preference("bash.exec").unwrap().unwrap();
@@ -548,6 +771,7 @@ mod tests {
             tool_name: "dangerous.tool".into(),
             preference_level: -1,
             config_json: serde_json::json!({}),
+            updated_at: 0,
         })
         .unwrap();
         let prefs = s.list_tool_preferences().unwrap();
@@ -656,5 +880,152 @@ mod tests {
         s.record_experience_trace(&trace).unwrap();
         s.record_experience_trace(&trace).unwrap(); // should not error
         assert_eq!(s.list_experience_traces(10).unwrap().len(), 1);
+    }
+
+    // ── mesh sync (Seam 4) ────────────────────────────────────────────────────
+
+    #[test]
+    fn export_snapshot_round_trip() {
+        let (s, _f) = open_tmp("aria");
+        s.upsert_tool_preference(&AgentToolPreference {
+            agent_id: "aria".into(),
+            tool_name: "bash.exec".into(),
+            preference_level: 1,
+            config_json: serde_json::json!({"timeout_secs": 30}),
+            updated_at: 1_000,
+        })
+        .unwrap();
+        s.upsert_resource_declaration(&ResourceDeclaration {
+            resource_type: ResourceType::ModelRouter,
+            config_hint: Some("gemini".into()),
+        })
+        .unwrap();
+
+        let snap = s.export_snapshot("node-a").unwrap();
+        assert_eq!(snap.agent_id, "aria");
+        assert_eq!(snap.source_node_id, "node-a");
+        assert_eq!(snap.preferences.len(), 1);
+        assert_eq!(snap.preferences[0].tool_name, "bash.exec");
+        assert_eq!(snap.declarations.len(), 1);
+        assert_eq!(snap.declarations[0].resource_type, ResourceType::ModelRouter);
+    }
+
+    #[test]
+    fn apply_snapshot_lww_newer_wins() {
+        let (local, _f) = open_tmp("aria");
+        // Seed local with old value.
+        local
+            .upsert_tool_preference(&AgentToolPreference {
+                agent_id: "aria".into(),
+                tool_name: "bash.exec".into(),
+                preference_level: 0,
+                config_json: serde_json::json!({}),
+                updated_at: 500,
+            })
+            .unwrap();
+
+        // Snapshot has a newer timestamp — should win.
+        let snap = AgentGraphSnapshot {
+            agent_id: "aria".into(),
+            source_node_id: "node-b".into(),
+            exported_at: 2_000,
+            preferences: vec![SnapshotPreference {
+                tool_name: "bash.exec".into(),
+                preference_level: 1,
+                config_json: serde_json::json!({"timeout_secs": 60}),
+                updated_at: 1_000,
+            }],
+            declarations: vec![],
+        };
+
+        let result = local.apply_snapshot(&snap).unwrap();
+        assert_eq!(result.preferences_applied, 1);
+        assert_eq!(result.preferences_skipped, 0);
+
+        let pref = local.get_tool_preference("bash.exec").unwrap().unwrap();
+        assert_eq!(pref.preference_level, 1);
+        assert_eq!(pref.config_json["timeout_secs"], 60);
+    }
+
+    #[test]
+    fn apply_snapshot_lww_older_skipped() {
+        let (local, _f) = open_tmp("aria");
+        // Seed local with newer value.
+        local
+            .upsert_tool_preference(&AgentToolPreference {
+                agent_id: "aria".into(),
+                tool_name: "bash.exec".into(),
+                preference_level: 1,
+                config_json: serde_json::json!({"timeout_secs": 60}),
+                updated_at: 2_000,
+            })
+            .unwrap();
+
+        // Snapshot has an older timestamp — local should win.
+        let snap = AgentGraphSnapshot {
+            agent_id: "aria".into(),
+            source_node_id: "node-b".into(),
+            exported_at: 1_000,
+            preferences: vec![SnapshotPreference {
+                tool_name: "bash.exec".into(),
+                preference_level: -1,
+                config_json: serde_json::json!({}),
+                updated_at: 500,
+            }],
+            declarations: vec![],
+        };
+
+        let result = local.apply_snapshot(&snap).unwrap();
+        assert_eq!(result.preferences_applied, 0);
+        assert_eq!(result.preferences_skipped, 1);
+
+        // Local value unchanged.
+        let pref = local.get_tool_preference("bash.exec").unwrap().unwrap();
+        assert_eq!(pref.preference_level, 1);
+    }
+
+    #[test]
+    fn apply_snapshot_authority_invariant_grants_excluded() {
+        // Snapshots have no grants field — this test confirms the type itself
+        // enforces the invariant and apply_snapshot only touches preferences
+        // and declarations.
+        let (local, _f) = open_tmp("aria");
+        let snap = AgentGraphSnapshot {
+            agent_id: "aria".into(),
+            source_node_id: "node-b".into(),
+            exported_at: 1_000,
+            preferences: vec![],
+            declarations: vec![SnapshotDeclaration {
+                resource_type: ResourceType::ToolRunner,
+                config_hint: None,
+                updated_at: 1_000,
+            }],
+        };
+        let result = local.apply_snapshot(&snap).unwrap();
+        assert_eq!(result.declarations_applied, 1);
+        // No grants were touched — grants list is still empty.
+        assert!(local.list_resource_grants().unwrap().is_empty());
+    }
+
+    #[test]
+    fn apply_snapshot_new_preference_inserted() {
+        let (local, _f) = open_tmp("aria");
+        // No existing data.
+        let snap = AgentGraphSnapshot {
+            agent_id: "aria".into(),
+            source_node_id: "node-b".into(),
+            exported_at: 1_000,
+            preferences: vec![SnapshotPreference {
+                tool_name: "new.tool".into(),
+                preference_level: 1,
+                config_json: serde_json::json!({}),
+                updated_at: 500,
+            }],
+            declarations: vec![],
+        };
+        let result = local.apply_snapshot(&snap).unwrap();
+        assert_eq!(result.preferences_applied, 1);
+        let pref = local.get_tool_preference("new.tool").unwrap().unwrap();
+        assert_eq!(pref.preference_level, 1);
     }
 }
