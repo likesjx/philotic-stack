@@ -10,6 +10,7 @@ members = [
     "crates/ansible-mesh-core",
     "crates/memory-core",
     "crates/philotic-web",
+    "crates/agent-graph-runner",
     "crates/graph-runner",
     "crates/philotic-sandbox",
 ]

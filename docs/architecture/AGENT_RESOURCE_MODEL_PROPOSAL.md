@@ -61,7 +61,21 @@ Six interconnected components compose this model:
 
 ## Disposition
 
-Proposed. No implementation slices started.
+`accepted for current slice` — Seams 1–5 shipped on `codex/agent-resource-model`. DEF-003 fixed.
+
+- Seam 1 (`agent-resource-broker`, commit a2aeb33): IPC types live; hotel handler
+  stubs both request variants NOT_IMPLEMENTED.
+- Seam 2 (`demand-derived-materialization`, commit 73e7467): `ResourceDeclaration`
+  type added; `ResourceRegistry` + `boot_reconcile` in `aiua`; transitional boot
+  call logs demand-derived set alongside existing `materialize_all` path.
+- Seam 3 (`agent-graph-toolrunner`, commit dbac5d3): `AgentGraphStorage` trait +
+  `SqliteAgentGraphStorage` (per-agent embedded SQLite); new `agent-graph-runner`
+  crate with `agent.graph.*` tool surface and experience trace auto-recording.
+- Seam 4 (`agent-graph-mesh-sync`, commit 3f2f566): LWW snapshot export/import,
+  `EventKind::AgentGraphSync`, two-tier authority invariant (grants excluded).
+- Seam 5 (`router-training-tap`, commit 4eb153b): `RouterTrainingRecord` +
+  `SqliteRouterTraceStorage`, model-router wired to `PHILOTIC_ROUTER_TRACE_DB`,
+  `ResourceType::RouterListener`.
 
 This proposal supersedes the implicit static-guest-list model in the current
 `materialized_guests` configuration surface. It does not conflict with active
@@ -72,8 +86,9 @@ the resource substrate those features sit on top of.
 
 ## Current Slice
 
-None started. See **Implementation Sequence** below for the recommended seam
-ordering.
+**Seams 1–5 complete.** B1 workstream shipped. DEF-003 fixed (110 aiua tests now pass).
+Seam 2 remains labeled transitional — `materialize_all` still runs alongside
+the demand-derived registry; full replacement lands after mesh-sync is proven in production.
 
 ---
 

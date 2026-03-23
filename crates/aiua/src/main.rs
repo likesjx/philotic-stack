@@ -1413,10 +1413,12 @@ fn extract_context_graph_entries(
 
     if let Some(hotels) = obj.get("hotels").and_then(serde_json::Value::as_object) {
         if let Some(hotel_name) = hotel_name {
-            if let Some(hotel) = hotels
+            // Prefer the named hotel; fall back to "default" for shared/overlay config.
+            let hotel_obj = hotels
                 .get(hotel_name)
-                .and_then(serde_json::Value::as_object)
-            {
+                .or_else(|| hotels.get("default"))
+                .and_then(serde_json::Value::as_object);
+            if let Some(hotel) = hotel_obj {
                 merge_hotel_base_entries(&mut merged, hotel);
             }
         }
@@ -2691,8 +2693,9 @@ fn startup_test_db_path() -> PathBuf {
 }
 
 fn startup_test_membrane_guests(hotel_name: &str) -> Result<Vec<GuestRecord>> {
-    let graph =
+    let storage =
         ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open(startup_test_db_path())?;
+    let graph = ansible_mesh_core::domain::GraphDomain::new(std::sync::Arc::new(storage.adapter()));
     let mut membranes = graph
         .list_guests(hotel_name, false)?
         .into_iter()
@@ -4613,6 +4616,28 @@ async fn main() -> Result<()> {
                 }
             }
         });
+    }
+
+    // RESOURCE BROKER BOOT RECONCILIATION (transitional — Seam 2 / demand-derived-materialization)
+    // Reads agents from the context graph, replays their static_resource_declarations through the
+    // resource registry, and logs the demand-derived guest set. Does not yet replace the
+    // materialize_all path below; that replacement lands when the registry is proven stable.
+    {
+        use crate::service::resource_registry::{ResourceRegistry, boot_reconcile};
+        let mut resource_registry = ResourceRegistry::new();
+        match graph_domain_arc.list_agent_identities() {
+            Ok(agents) => {
+                let results = boot_reconcile(&mut resource_registry, &agents);
+                info!(
+                    agents_with_declarations = results.len(),
+                    resource_instances = resource_registry.instance_count(),
+                    "demand-derived-materialization: reconciliation complete (transitional)"
+                );
+            }
+            Err(e) => {
+                warn!("demand-derived-materialization: could not load agent identities: {e}");
+            }
+        }
     }
 
     // MATERIALIZATION LOOP: Spin up all guests defined in the DB as child processes

@@ -3,6 +3,7 @@ use uuid::Uuid;
 
 pub mod adapter;
 pub mod agent;
+pub mod agent_graph_storage;
 pub mod authz;
 pub mod beacon;
 pub mod cursor;
@@ -16,6 +17,8 @@ pub mod materializer;
 pub mod meshops;
 pub mod model_manager;
 pub mod registry;
+pub mod resources;
+pub mod router_trace;
 pub mod runtime;
 pub mod sqlite_storage;
 pub mod storage;

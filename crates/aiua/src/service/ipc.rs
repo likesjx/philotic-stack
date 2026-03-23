@@ -4263,6 +4263,18 @@ impl IpcServer {
                     IpcResponse::error("list_rules", "STORAGE_ERROR", err.to_string())
                 }
             },
+            // Resource broker seam (agent-resource-broker). No callers yet;
+            // hotel-side broker will be wired in the demand-derived-materialization seam.
+            IpcRequest::ResourceRequest(_req) => IpcResponse::error(
+                "resource_request",
+                "NOT_IMPLEMENTED",
+                "resource broker not yet wired",
+            ),
+            IpcRequest::ResourceReleased(_rel) => IpcResponse::error(
+                "resource_released",
+                "NOT_IMPLEMENTED",
+                "resource broker not yet wired",
+            ),
         }
     }
 
@@ -5924,8 +5936,8 @@ mod tests {
     };
     use base64::Engine;
     use philotic_client::{
-        GuestIdentity, HandoffBundle, HookKind, PhiloticClient, SubagentCompletionContract,
-        SubagentContextPacket, SubagentDelegation,
+        GuestIdentity, HandoffBundle, HookKind, OperatorTargetView, PhiloticClient,
+        SubagentCompletionContract, SubagentContextPacket, SubagentDelegation,
     };
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -6120,6 +6132,266 @@ mod tests {
         }
     }
 
+    impl GraphStorage for TestGraphStorage {
+        fn load_node_capabilities(&self) -> anyhow::Result<Option<NodeCapabilities>> {
+            Ok(None)
+        }
+        fn save_node_capabilities(&self, _caps: &NodeCapabilities) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn get_config_value(&self, _key: &str) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        fn set_config_value(&self, _key: &str, _value_json: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn upsert_secret(&self, _secret: &SecretRecord) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn get_secret(&self, _secret_ref: &str) -> anyhow::Result<Option<SecretRecord>> {
+            Ok(None)
+        }
+        fn get_hotel(&self, _hotel_name: &str) -> anyhow::Result<Option<HotelRecord>> {
+            Ok(None)
+        }
+        fn list_hotels(&self) -> anyhow::Result<Vec<HotelRecord>> {
+            Ok(vec![])
+        }
+        fn upsert_hotel(&self, _hotel: &HotelRecord) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn set_hotel_pid(&self, _hotel_name: &str, _pid: Option<&str>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn list_guests(
+            &self,
+            _hotel_name: &str,
+            _active_only: bool,
+        ) -> anyhow::Result<Vec<GuestRecord>> {
+            Ok(vec![])
+        }
+        fn set_guest_pid(
+            &self,
+            _hotel_name: &str,
+            _guest_id: &str,
+            _pid: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn set_guest_active(
+            &self,
+            _hotel_name: &str,
+            _guest_id: &str,
+            _active: bool,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn seed_guests(&self, _hotel_name: &str, _guests: &[GuestRecord]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn upsert_agent_identity(&self, _identity: &AgentIdentityRecord) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn list_agent_identities(&self) -> anyhow::Result<Vec<AgentIdentityRecord>> {
+            Ok(vec![])
+        }
+        fn get_agent_identity(
+            &self,
+            _agent_id: &str,
+        ) -> anyhow::Result<Option<AgentIdentityRecord>> {
+            Ok(None)
+        }
+        fn sync_apartment(
+            &self,
+            _agent_id: &str,
+            _memory_type: &str,
+            _content_json: &serde_json::Value,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn get_apartment(
+            &self,
+            _agent_id: &str,
+            _memory_type: &str,
+        ) -> anyhow::Result<Option<serde_json::Value>> {
+            Ok(None)
+        }
+        fn upsert_session(&self, _session: &SessionRecord) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn get_session(&self, _session_id: &str) -> anyhow::Result<Option<SessionRecord>> {
+            Ok(None)
+        }
+        fn upsert_role_incarnation(&self, _role: &RoleIncarnationRecord) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn get_role_incarnation(
+            &self,
+            _agent_id: &str,
+            _role_name: &str,
+        ) -> anyhow::Result<Option<RoleIncarnationRecord>> {
+            Ok(None)
+        }
+        fn list_role_incarnations(
+            &self,
+            _agent_id: &str,
+        ) -> anyhow::Result<Vec<RoleIncarnationRecord>> {
+            Ok(vec![])
+        }
+        fn upsert_session_participant(
+            &self,
+            _participant: &SessionParticipantRecord,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn list_session_participants(
+            &self,
+            _session_id: &str,
+        ) -> anyhow::Result<Vec<SessionParticipantRecord>> {
+            Ok(vec![])
+        }
+        fn upsert_session_turn(&self, _turn: &SessionTurnRecord) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn get_session_turn(
+            &self,
+            _session_id: &str,
+            _turn_id: &str,
+        ) -> anyhow::Result<Option<SessionTurnRecord>> {
+            Ok(None)
+        }
+        fn list_session_turns(
+            &self,
+            _session_id: &str,
+            _limit: usize,
+        ) -> anyhow::Result<Vec<SessionTurnRecord>> {
+            Ok(vec![])
+        }
+        fn append_session_event(&self, _event: &SessionEventRecord) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn list_session_events(
+            &self,
+            _session_id: &str,
+            _limit: usize,
+        ) -> anyhow::Result<Vec<SessionEventRecord>> {
+            Ok(vec![])
+        }
+
+        fn upsert_abstract_tool(
+            &self,
+            _tool: &ansible_mesh_core::graph::AbstractToolRecord,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn get_abstract_tool(
+            &self,
+            _tool_name: &str,
+        ) -> anyhow::Result<Option<ansible_mesh_core::graph::AbstractToolRecord>> {
+            Ok(None)
+        }
+
+        fn list_abstract_tools(
+            &self,
+        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::AbstractToolRecord>> {
+            Ok(vec![])
+        }
+
+        fn upsert_abstract_skill(
+            &self,
+            _skill: &ansible_mesh_core::graph::AbstractSkillRecord,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn get_abstract_skill(
+            &self,
+            _skill_name: &str,
+        ) -> anyhow::Result<Option<ansible_mesh_core::graph::AbstractSkillRecord>> {
+            Ok(None)
+        }
+
+        fn list_abstract_skills(
+            &self,
+        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::AbstractSkillRecord>> {
+            Ok(vec![])
+        }
+
+        fn list_role_incarnations_by_guest_id(
+            &self,
+            _guest_id: &str,
+        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::RoleIncarnationRecord>> {
+            Ok(vec![])
+        }
+
+        fn set_guest_last_active(
+            &self,
+            _hotel_name: &str,
+            _guest_id: &str,
+            _epoch: u64,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn upsert_toolset_profile(
+            &self,
+            _profile: &ansible_mesh_core::graph::ToolsetProfileRecord,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn get_toolset_profile(
+            &self,
+            _profile_name: &str,
+        ) -> anyhow::Result<Option<ansible_mesh_core::graph::ToolsetProfileRecord>> {
+            Ok(None)
+        }
+
+        fn list_toolset_profiles(
+            &self,
+        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::ToolsetProfileRecord>> {
+            Ok(vec![])
+        }
+
+        fn upsert_rule(&self, _rule: &ansible_mesh_core::graph::RuleRecord) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn get_rule(
+            &self,
+            _rule_id: &str,
+        ) -> anyhow::Result<Option<ansible_mesh_core::graph::RuleRecord>> {
+            Ok(None)
+        }
+
+        fn list_rules(
+            &self,
+            _agent_id: &str,
+        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::RuleRecord>> {
+            Ok(vec![])
+        }
+
+        fn upsert_workflow_skill(
+            &self,
+            _skill: &ansible_mesh_core::graph::WorkflowSkillRecord,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn get_workflow_skill(
+            &self,
+            _workflow_name: &str,
+        ) -> anyhow::Result<Option<ansible_mesh_core::graph::WorkflowSkillRecord>> {
+            Ok(None)
+        }
+
+        fn list_workflow_skills(
+            &self,
+        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::WorkflowSkillRecord>> {
+            Ok(vec![])
+        }
+    }
     fn test_socket_path() -> String {
         format!("/tmp/ipc-e2e-{}.sock", Uuid::new_v4().simple())
     }

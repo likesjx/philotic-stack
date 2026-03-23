@@ -44,6 +44,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-graph-runner"
+version = "0.1.0"
+dependencies = [
+ "ansible-mesh-core",
+ "anyhow",
+ "clap",
+ "philotic-client",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "ulid",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -109,6 +126,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",
@@ -2185,6 +2203,7 @@ dependencies = [
 name = "model-router"
 version = "0.1.0"
 dependencies = [
+ "ansible-mesh-core",
  "anyhow",
  "async-trait",
  "axum 0.8.8",
@@ -2198,6 +2217,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "ulid",
 ]
 
 [[package]]
@@ -2597,6 +2617,7 @@ dependencies = [
 name = "philotic-client"
 version = "0.1.0"
 dependencies = [
+ "ansible-mesh-core",
  "anyhow",
  "async-trait",
  "base64 0.22.1",
