@@ -61,9 +61,13 @@ Six interconnected components compose this model:
 
 ## Disposition
 
-`accepted for current slice` — Seam 1 (`agent-resource-broker`) shipped on
-`codex/agent-resource-model` (commit a2aeb33). IPC types are live; hotel
-broker handler stubbed NOT_IMPLEMENTED pending Seam 2.
+`accepted for current slice` — Seams 1–2 shipped on `codex/agent-resource-model`.
+
+- Seam 1 (`agent-resource-broker`, commit a2aeb33): IPC types live; hotel handler
+  stubs both request variants NOT_IMPLEMENTED.
+- Seam 2 (`demand-derived-materialization`, commit 73e7467): `ResourceDeclaration`
+  type added; `ResourceRegistry` + `boot_reconcile` in `aiua`; transitional boot
+  call logs demand-derived set alongside existing `materialize_all` path.
 
 This proposal supersedes the implicit static-guest-list model in the current
 `materialized_guests` configuration surface. It does not conflict with active
@@ -74,8 +78,9 @@ the resource substrate those features sit on top of.
 
 ## Current Slice
 
-**Seam 1 complete.** See **Implementation Sequence** below; Seam 2
-(`demand-derived-materialization`) is next.
+**Seams 1–2 complete (transitional).** Seam 3 (`agent-graph-toolrunner`) is
+next. Seam 2 is labeled transitional — the `materialize_all` path still runs;
+full replacement of `materialized_guests` is the Seam 3+ milestone.
 
 ---
 
