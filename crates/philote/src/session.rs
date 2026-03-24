@@ -2414,6 +2414,21 @@ impl SessionState {
                 "Tool history entries in local working state: {}.",
                 turn.working_tool_history.len()
             ));
+            lines.push("\n[Tool call history]".into());
+            for (i, (call, result)) in turn.working_tool_history.iter().enumerate() {
+                let args = serde_json::to_string(&call.arguments).unwrap_or_default();
+                lines.push(format!(
+                    "Call {n}: {name}({args})\nResult {n}: {content}",
+                    n = i + 1,
+                    name = call.tool_name,
+                    content = result.content,
+                ));
+            }
+            lines.push(
+                "Review the above tool results and continue. \
+                 Call another tool if needed, or respond to the user if you have enough information."
+                    .into(),
+            );
         }
         if turn.pending_tool_call.is_some() {
             lines.push("A tool call is pending.".into());
