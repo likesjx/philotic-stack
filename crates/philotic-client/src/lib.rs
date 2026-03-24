@@ -3,6 +3,7 @@ pub use ansible_mesh_core::resources::{
     ResourceDenied, ResourceGranted, ResourceMaterializing, ResourceReleased, ResourceRequest,
     ResourceRevoked, ResourceType,
 };
+pub use ansible_mesh_core::storage::ComponentManifest;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::io::ErrorKind;
@@ -795,6 +796,16 @@ pub enum IpcRequest {
     /// The hotel decrements the tenant count; zero-tenant instances may be
     /// torn down per their teardown policy.
     ResourceReleased(ResourceReleased),
+    /// Register (or update) a component with the hotel.
+    ///
+    /// The hotel upserts a `GuestRecord` into `materialized_guests`, stores the
+    /// `component_config` blob under `node_config["component:{guest_id}"]`, and
+    /// materializes (spawns) the guest if `auto_start` is true.
+    ///
+    /// Responds with [`IpcResponse::ComponentRegistered`].
+    RegisterComponent {
+        manifest: ComponentManifest,
+    },
 }
 
 /// Represents the canonical response from the local Ansible back to the Guest via IPC.
@@ -967,6 +978,11 @@ pub enum IpcResponse {
     /// resource immediately.
     ResourceRevoked {
         resource_revoked: ResourceRevoked,
+    },
+    /// Response to [`IpcRequest::RegisterComponent`].
+    ComponentRegistered {
+        registered_guest_id: String,
+        registered_role: String,
     },
 }
 

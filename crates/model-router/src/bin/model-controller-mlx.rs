@@ -9,6 +9,9 @@ use std::sync::Arc;
 const DEFAULT_GUEST_ID: &str = "model-mlx-01";
 const DEFAULT_ROLE: &str = "model.mlx";
 
+/// Default IPC socket path (matches aiua convention for the "default" hotel).
+const DEFAULT_SOCKET_PATH: &str = "/tmp/philotic-aiua.sock";
+
 #[derive(Parser, Debug)]
 #[command(
     author,
@@ -16,7 +19,7 @@ const DEFAULT_ROLE: &str = "model.mlx";
     about = "MLX local model controller (multi-model fleet via mlx_lm.server)"
 )]
 struct Args {
-    /// Path to the MLX fleet config JSON (overrides PHILOTIC_MLX_CONFIG).
+    /// Path to the MLX fleet config JSON (overrides PHILOTIC_MLX_CONFIG and hotel readback).
     #[arg(long, env = "PHILOTIC_MLX_CONFIG")]
     config: Option<String>,
 
@@ -27,6 +30,10 @@ struct Args {
     /// Role announced to the hotel.
     #[arg(long, env = "PHILOTIC_MLX_ROLE", default_value = DEFAULT_ROLE)]
     role: String,
+
+    /// Path to the hotel IPC socket (used to fetch component config when --config is absent).
+    #[arg(long, env = "PHILOTIC_SOCKET", default_value = DEFAULT_SOCKET_PATH)]
+    socket: String,
 
     /// Discover mode: start fleet, print loaded models, then exit.
     /// Useful for smoke testing without a running hotel.
@@ -40,10 +47,38 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // Load fleet config from CLI arg or PHILOTIC_MLX_CONFIG env var.
-    let fleet_config = match args.config {
-        Some(ref path) => MlxFleetConfig::from_json_file(path)?,
-        None => MlxFleetConfig::from_env()?,
+    // Config resolution priority:
+    //   1. --config / PHILOTIC_MLX_CONFIG (explicit file path)
+    //   2. Hotel IPC readback via GetConfig { key: "component:{guest_id}" }
+    //   3. PHILOTIC_MLX_CONFIG env var (legacy env-only path, caught by from_env())
+    let fleet_config = if let Some(ref path) = args.config {
+        MlxFleetConfig::from_json_file(path)?
+    } else {
+        match MlxFleetConfig::from_hotel(&args.socket, &args.guest_id).await {
+            Ok(Some(cfg)) => {
+                tracing::info!(
+                    guest_id = %args.guest_id,
+                    socket = %args.socket,
+                    "fleet config loaded from hotel",
+                );
+                cfg
+            }
+            Ok(None) => {
+                tracing::info!(
+                    guest_id = %args.guest_id,
+                    "no hotel config found for component; falling back to PHILOTIC_MLX_CONFIG",
+                );
+                MlxFleetConfig::from_env()?
+            }
+            Err(e) => {
+                tracing::warn!(
+                    guest_id = %args.guest_id,
+                    "hotel config readback failed ({}); falling back to PHILOTIC_MLX_CONFIG",
+                    e,
+                );
+                MlxFleetConfig::from_env()?
+            }
+        }
     };
 
     let health_interval = fleet_config.health_check_interval_secs;

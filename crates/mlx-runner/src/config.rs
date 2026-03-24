@@ -52,6 +52,30 @@ impl MlxFleetConfig {
             .map_err(|_| anyhow::anyhow!("PHILOTIC_MLX_CONFIG not set; provide a fleet config JSON path"))?;
         Self::from_json_file(&path)
     }
+
+    /// Try to fetch fleet config from the local hotel IPC (via `GetConfig { key: "component:{guest_id}" }`).
+    /// Returns `Ok(Some(config))` on success, `Ok(None)` if the key is not set.
+    /// Falls back gracefully on connection failure so the binary remains usable without a running hotel.
+    pub async fn from_hotel(socket_path: &str, guest_id: &str) -> anyhow::Result<Option<Self>> {
+        use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
+        let identity = GuestIdentity {
+            guest_id: format!("{guest_id}-cfg-probe"),
+            role: "model.mlx".to_string(),
+            supported_tools: vec![],
+        };
+        let mut client = PhiloticClient::connect_at(socket_path, identity).await?;
+        let key = format!("component:{guest_id}");
+        let resp = client.send_request(IpcRequest::GetConfig { key }).await?;
+        match resp {
+            IpcResponse::ConfigData { value_json: Some(json), .. } => {
+                let config: Self = serde_json::from_str(&json)
+                    .map_err(|e| anyhow::anyhow!("failed to parse fleet config from hotel: {e}"))?;
+                Ok(Some(config))
+            }
+            IpcResponse::ConfigData { value_json: None, .. } => Ok(None),
+            other => anyhow::bail!("unexpected response from hotel for GetConfig: {:?}", other),
+        }
+    }
 }
 
 /// Per-model instance configuration.

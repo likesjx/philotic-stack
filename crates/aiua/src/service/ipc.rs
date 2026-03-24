@@ -12,7 +12,7 @@ use ansible_mesh_core::registry::{
     CapabilityAdvertisement, ExecutionReachability, NodeRegistry, NodeStatus,
 };
 use ansible_mesh_core::storage::{
-    GuestRecord, HotelRecord, SessionEventRecord, SessionParticipantRecord,
+    ComponentManifest, GuestRecord, HotelRecord, SessionEventRecord, SessionParticipantRecord,
     SessionRecord, SessionTurnRecord,
 };
 use ansible_mesh_core::validation::{
@@ -4275,6 +4275,70 @@ impl IpcServer {
                 "NOT_IMPLEMENTED",
                 "resource broker not yet wired",
             ),
+            IpcRequest::RegisterComponent { manifest } => {
+                Self::handle_register_component(graph, materialization_requester, manifest).await
+            }
+        }
+    }
+
+    async fn handle_register_component(
+        graph: &GraphDomain,
+        materialization_requester: Option<&dyn GuestMaterializationRequester>,
+        manifest: ComponentManifest,
+    ) -> IpcResponse {
+        let guest_id = manifest.guest_id.clone();
+        let role = manifest.role.clone();
+
+        // Build the spawn config blob expected by LocalProcessMaterializer.
+        let config_json = serde_json::json!({
+            "command": manifest.command,
+            "args": manifest.args,
+            "env": manifest.env,
+        });
+
+        let record = GuestRecord {
+            hotel_name: manifest.hotel.clone(),
+            guest_id: guest_id.clone(),
+            role: role.clone(),
+            config_json: config_json.to_string(),
+            is_active: manifest.auto_start,
+            active_pid: None,
+            last_active_at: None,
+        };
+
+        if let Err(e) = graph.upsert_guest(&record) {
+            error!("RegisterComponent: failed to upsert guest {}: {}", guest_id, e);
+            return IpcResponse::error("register_component", "UPSERT_FAILED", e.to_string());
+        }
+
+        // Store component-specific config for readback via GetConfig.
+        if !manifest.component_config.is_null() {
+            let config_key = format!("component:{}", guest_id);
+            if let Err(e) = graph.set_config_value(&config_key, &manifest.component_config.to_string()) {
+                warn!("RegisterComponent: failed to store component config for {}: {}", guest_id, e);
+            }
+        }
+
+        info!(
+            guest_id = %guest_id,
+            role = %role,
+            hotel = %manifest.hotel,
+            auto_start = manifest.auto_start,
+            "component registered",
+        );
+
+        // Trigger immediate materialization if auto_start.
+        if manifest.auto_start {
+            if let Some(requester) = materialization_requester {
+                if let Err(e) = requester.ensure_guest_active(&guest_id).await {
+                    warn!("RegisterComponent: ensure_guest_active failed for {}: {}", guest_id, e);
+                }
+            }
+        }
+
+        IpcResponse::ComponentRegistered {
+            registered_guest_id: guest_id,
+            registered_role: role,
         }
     }
 
