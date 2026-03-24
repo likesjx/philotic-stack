@@ -70,6 +70,13 @@ impl ScriptedLoopExecutor {
         self.tool_sequence_cursor += 1;
     }
 
+    /// Advance past a completed tool_sequence step without overwriting the
+    /// accumulated tool results already stored in step_outputs by record_tool_result.
+    pub fn advance_past_tool_sequence(&mut self) {
+        self.step_cursor += 1;
+        self.tool_sequence_cursor = 0;
+    }
+
     /// Accumulate a tool result into the current tool_sequence step's output array.
     pub fn record_tool_result(&mut self, result: Value) {
         if let Some(step) = self.script.steps.get(self.step_cursor) {

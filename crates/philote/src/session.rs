@@ -937,6 +937,26 @@ impl SessionState {
             .unwrap_or(false)
     }
 
+    pub fn with_scripted_executor_mut<F>(&mut self, f: F)
+    where
+        F: FnOnce(&mut crate::scripted_loop::ScriptedLoopExecutor),
+    {
+        if let Some(turn) = self.active_turn.as_mut() {
+            if let Some(exec) = turn.scripted_loop_context.as_mut() {
+                f(exec);
+            }
+        }
+    }
+
+    pub fn scripted_executor_advance(
+        &self,
+    ) -> Option<crate::scripted_loop::ScriptedLoopDecision> {
+        self.active_turn
+            .as_ref()
+            .and_then(|t| t.scripted_loop_context.as_ref())
+            .map(|exec| exec.advance())
+    }
+
     pub fn prepare_transcription_reentry(&mut self, transcript: &str) -> Option<ModelReentryPlan> {
         let normalized = transcript.trim();
         if normalized.is_empty() {
@@ -3446,8 +3466,11 @@ mod tests {
             checkpoint["active_turn"]["final_reply_guest_id"],
             "membrane-telegram-01"
         );
-        assert!(checkpoint["component_route_assembly"].is_object());
-        assert!(checkpoint["tool_assembly"].is_object());
+        // component_route_assembly and tool_assembly are hotel-computed and intentionally
+        // excluded from the checkpoint to prevent circular growth. They are re-injected
+        // by compose_session_snapshot on every turn.
+        assert!(checkpoint.get("component_route_assembly").is_none());
+        assert!(checkpoint.get("tool_assembly").is_none());
     }
 
     #[test]
@@ -3469,7 +3492,10 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_round_trip_preserves_component_route_assembly() {
+    fn checkpoint_does_not_persist_component_route_assembly() {
+        // component_route_assembly is hotel-computed (injected on every turn via
+        // compose_session_snapshot). It must NOT survive a checkpoint round-trip;
+        // that would cause unbounded circular payload growth.
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.component_route_assembly = ComponentRouteAssembly {
@@ -3489,16 +3515,15 @@ mod tests {
         };
 
         let checkpoint = state.checkpoint_json();
+        // The field should not appear in the checkpoint at all.
+        assert!(checkpoint.get("component_route_assembly").is_none());
+
         let restored =
             SessionState::from_checkpoint(&checkpoint).expect("checkpoint should restore");
-        let route = restored
+        // After restore, routes are gone — the hotel re-injects them on the next turn.
+        assert!(restored
             .resolve_component_execution_route("text.generate")
-            .expect("component route should restore");
-        assert_eq!(route.target_node, "aria-node");
-        assert_eq!(
-            route.incarnation_id.as_deref(),
-            Some("aria-architect-hotel:model-controller-gemini")
-        );
+            .is_none());
     }
 
     #[test]
