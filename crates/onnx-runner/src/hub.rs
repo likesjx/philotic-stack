@@ -2,6 +2,19 @@ use anyhow::{Context, Result};
 use hf_hub::api::sync::Api;
 use std::path::PathBuf;
 
+/// A resolved local path set for a Whisper ONNX model downloaded from HF Hub.
+#[derive(Debug, Clone)]
+pub struct WhisperHandle {
+    /// Local path to the encoder ONNX file.
+    pub encoder_path: PathBuf,
+    /// Local path to the decoder ONNX file (non-merged, no past KV).
+    pub decoder_path: PathBuf,
+    /// Local path to `tokenizer.json`.
+    pub tokenizer_path: PathBuf,
+    /// Provenance token: `"{repo}@{sha8}"`.
+    pub model_gen: String,
+}
+
 /// A resolved local path to a downloaded model file, with provenance.
 #[derive(Debug, Clone)]
 pub struct ModelHandle {
@@ -80,6 +93,78 @@ impl ModelCache {
 
         Ok(ModelHandle {
             model_path,
+            tokenizer_path,
+            model_gen,
+        })
+    }
+
+    /// Download (or serve from cache) the Whisper encoder + decoder for `repo_id`.
+    ///
+    /// Expects the repo to follow the `onnx-community/whisper-*` layout:
+    /// - `onnx/encoder_model.onnx` (or `_quantized`)
+    /// - `onnx/decoder_model.onnx` (without past KV cache)
+    /// - `tokenizer.json`
+    ///
+    /// Returns a [`WhisperHandle`] with local paths and a `model_gen` token.
+    pub fn pull_whisper(&self, repo_id: &str, prefer_quantized: bool) -> Result<WhisperHandle> {
+        let repo = self.api.model(repo_id.to_string());
+
+        let encoder_primary = if prefer_quantized {
+            "onnx/encoder_model_quantized.onnx"
+        } else {
+            "onnx/encoder_model.onnx"
+        };
+        let encoder_fallback = if prefer_quantized {
+            "onnx/encoder_model.onnx"
+        } else {
+            "onnx/encoder_model_quantized.onnx"
+        };
+
+        let encoder_path = repo
+            .get(encoder_primary)
+            .or_else(|_| repo.get(encoder_fallback))
+            .with_context(|| format!("could not download Whisper encoder from {}", repo_id))?;
+
+        let decoder_primary = if prefer_quantized {
+            "onnx/decoder_model_quantized.onnx"
+        } else {
+            "onnx/decoder_model.onnx"
+        };
+        let decoder_fallback = if prefer_quantized {
+            "onnx/decoder_model.onnx"
+        } else {
+            "onnx/decoder_model_quantized.onnx"
+        };
+
+        let decoder_path = repo
+            .get(decoder_primary)
+            .or_else(|_| repo.get(decoder_fallback))
+            .with_context(|| format!("could not download Whisper decoder from {}", repo_id))?;
+
+        let tokenizer_path = repo
+            .get("tokenizer.json")
+            .with_context(|| format!("could not download tokenizer.json from {}", repo_id))?;
+
+        let sha8 = encoder_path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .map(|s| s.chars().take(8).collect::<String>())
+            .unwrap_or_else(|| "unknown".into());
+
+        let model_gen = format!("{}@{}", repo_id, sha8);
+
+        tracing::info!(
+            repo_id,
+            model_gen,
+            ?encoder_path,
+            ?decoder_path,
+            "whisper model resolved from hub cache"
+        );
+
+        Ok(WhisperHandle {
+            encoder_path,
+            decoder_path,
             tokenizer_path,
             model_gen,
         })
