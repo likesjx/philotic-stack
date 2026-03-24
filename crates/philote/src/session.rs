@@ -2606,18 +2606,19 @@ impl SessionState {
             })
         });
 
+        // agent_profile, component_route_assembly, and tool_assembly are hotel-computed
+        // and injected fresh by compose_session_snapshot on every turn. Persisting them
+        // in the checkpoint causes unbounded circular growth: checkpoint → session.summary_json
+        // → next snapshot → checkpoint. Only philote-owned state belongs here.
         json!({
             "session_id": self.session_id,
             "agent_id": self.agent_id,
             "source": self.source,
             "active_incarnation_id": self.active_incarnation_id,
             "role_activation": self.role_activation,
-            "agent_profile": self.agent_profile,
             "status": self.status,
             "approval_policy": self.approval_policy,
             "bindings": self.bindings,
-            "component_route_assembly": self.component_route_assembly,
-            "tool_assembly": self.tool_assembly,
             "active_turn": active_turn,
             "recent_turns": self.recent_turns.iter().map(|turn| {
                 json!({

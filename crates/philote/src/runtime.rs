@@ -4382,7 +4382,7 @@ impl AgentRuntime {
                 let req = IpcRequest::ConfigureRole {
                     agent_id: self.agent_id.clone(),
                     role_name: role_name.clone(),
-                    guest_id: self.agent_id.clone(),
+                    guest_id: format!("{}:{}", self.agent_id, role_name),
                     calling_role,
                     toolset_profile,
                     role_identity_addendum,
