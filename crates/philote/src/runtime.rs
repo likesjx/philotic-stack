@@ -495,6 +495,7 @@ struct CachedRoleConfig {
     role_manifest: Option<String>,
     iteration_cap: Option<u32>,
     approval_policy: Option<String>,
+    turn_loop_config: ansible_mesh_core::graph::TurnLoopConfig,
 }
 
 pub struct AgentRuntime {
@@ -854,8 +855,27 @@ impl AgentRuntime {
                 pending_text_reply: None,
                 had_voice_input,
                 awaiting_transcription_reentry: false,
+                scripted_loop_context: None,
             });
             state.set_active_turn_phase(TurnPhase::LoadingContext);
+
+            // Activate scripted loop if the current role has a loop_script configured.
+            if let Some(loop_script) = state
+                .role_activation
+                .as_ref()
+                .and_then(|ra| ra.turn_loop_config.as_ref())
+                .and_then(|tlc| tlc.loop_script.clone())
+            {
+                if let Some(turn) = state.active_turn.as_mut() {
+                    tracing::debug!(
+                        session_id = %state.session_id,
+                        variant = %loop_script.variant,
+                        "scripted turn loop activated"
+                    );
+                    turn.scripted_loop_context =
+                        Some(crate::scripted_loop::ScriptedLoopExecutor::new(loop_script));
+                }
+            }
         }
 
         self.maybe_auto_recall_turn_memory(&session_id).await?;
@@ -1283,6 +1303,32 @@ impl AgentRuntime {
                     .await
                 }
             };
+        }
+
+        // Scripted loop fork: when the turn is running under a LoopScript,
+        // model responses are consumed by the ScriptedLoopExecutor rather than
+        // dispatched through the standard AgentAction match below.
+        // Full routing (ParkForApproval, ExecuteNextTool, etc.) is implemented
+        // in handle_scripted_loop_model_response — stubbed here until Phase 1b.
+        let is_scripted = self
+            .sessions
+            .get(&session_id)
+            .and_then(|s| s.active_turn.as_ref())
+            .map(|t| t.scripted_loop_context.is_some())
+            .unwrap_or(false);
+
+        if is_scripted {
+            let model_result_owned = model_result.cloned();
+            return self
+                .handle_scripted_loop_model_response(
+                    session_id,
+                    turn_id,
+                    model_result_owned,
+                    spoken_text,
+                    memory_concept,
+                    memory_candidate,
+                )
+                .await;
         }
 
         match action {
@@ -1798,6 +1844,55 @@ impl AgentRuntime {
             .get(&session_id)
             .map(|s| s.settings.execution.stream_tool_events)
             .unwrap_or(true);
+
+        // Scripted-loop fork: if this turn is running under a LoopScript, accumulate
+        // the tool result into the executor and dispatch the next scripted action
+        // instead of re-entering the open-ended model loop.
+        let is_scripted_turn = self
+            .sessions
+            .get(&session_id)
+            .and_then(|s| s.active_turn.as_ref())
+            .map(|t| t.scripted_loop_context.is_some())
+            .unwrap_or(false);
+
+        if is_scripted_turn {
+            let (checkpoint_memory_type, checkpoint_json, index_state) = {
+                let Some(state) = self.sessions.get_mut(&session_id) else {
+                    return Ok(());
+                };
+                let tool_call = state
+                    .active_turn
+                    .as_ref()
+                    .and_then(|t| t.pending_tool_call.clone())
+                    .unwrap_or_else(|| ToolCall {
+                        tool_name: tool_result.tool_name.clone(),
+                        arguments: serde_json::json!({}),
+                    });
+                state.push_tool_history(tool_call, tool_result.clone());
+                state.clear_pending_tool_call();
+                let result_value = Value::String(tool_result.content.clone());
+                state.with_scripted_executor_mut(|exec| {
+                    exec.record_tool_result(result_value);
+                    exec.advance_tool_cursor();
+                });
+                (
+                    state.checkpoint_memory_type(),
+                    state.checkpoint_json(),
+                    state.clone(),
+                )
+            };
+            if stream_events {
+                let event = if step_failed { "step_failed" } else { "step_completed" };
+                let _ = self.emit_turn_event(&session_id, event, None).await;
+            }
+            self.ipc_client
+                .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
+                .await?;
+            self.sync_session_index(&index_state).await?;
+            return self
+                .scripted_dispatch_after_advance(session_id, turn_id, None, None, None)
+                .await;
+        }
 
         // Pair the result with the pending tool call, push to history, check iteration cap.
         let loop_outcome = {
@@ -2839,6 +2934,357 @@ impl AgentRuntime {
         Ok(())
     }
 
+    // ── Scripted-loop routing ───────────────────────────────────────────────
+
+    /// Entry point called by handle_model_response when the turn is running under
+    /// a LoopScript. Parses the model content (tries JSON, falls back to string),
+    /// records it as the current step output, then dispatches the next decision.
+    async fn handle_scripted_loop_model_response(
+        &mut self,
+        session_id: String,
+        turn_id: String,
+        model_result: Option<Value>,
+        spoken_text: Option<String>,
+        memory_concept: Option<String>,
+        memory_candidate: Option<MemoryCandidate>,
+    ) -> Result<()> {
+        // Extract the primary text from the model result.
+        let raw_text = model_result
+            .as_ref()
+            .and_then(|r| {
+                r.get("display_text")
+                    .or_else(|| r.get("content"))
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or("")
+            .to_string();
+
+        // Try to parse as JSON; fall back to a plain string value.
+        let output_value: Value = serde_json::from_str(&raw_text)
+            .unwrap_or(Value::String(raw_text));
+
+        {
+            let Some(state) = self.sessions.get_mut(&session_id) else {
+                return Ok(());
+            };
+            state.with_scripted_executor_mut(|exec| exec.record_step_output(output_value));
+        }
+
+        self.scripted_dispatch_after_advance(
+            session_id,
+            turn_id,
+            spoken_text,
+            memory_concept,
+            memory_candidate,
+        )
+        .await
+    }
+
+    /// Read the current ScriptedLoopDecision and route to the correct leaf handler.
+    fn scripted_dispatch_after_advance(
+        &mut self,
+        session_id: String,
+        turn_id: String,
+        spoken_text: Option<String>,
+        memory_concept: Option<String>,
+        memory_candidate: Option<MemoryCandidate>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        use crate::scripted_loop::ScriptedLoopDecision;
+        Box::pin(async move {
+            let decision = self
+                .sessions
+                .get(&session_id)
+                .and_then(|s| s.scripted_executor_advance());
+
+            match decision {
+                None => {
+                    self.fail_active_turn(
+                        session_id,
+                        turn_id,
+                        "Scripted loop executor missing".into(),
+                    )
+                    .await
+                }
+                Some(ScriptedLoopDecision::EmitModelCall { phase, .. }) => {
+                    self.scripted_emit_model_call(session_id, turn_id, phase)
+                        .await
+                }
+                Some(ScriptedLoopDecision::ParkForApproval {
+                    gate,
+                    surface_as,
+                    reject_action,
+                }) => {
+                    self.scripted_park_for_approval(
+                        session_id,
+                        turn_id,
+                        gate,
+                        surface_as,
+                        reject_action,
+                    )
+                    .await
+                }
+                Some(ScriptedLoopDecision::ExecuteNextTool {
+                    tool_name,
+                    arguments,
+                }) => {
+                    let tool_call = ToolCall {
+                        tool_name,
+                        arguments,
+                    };
+                    self.scripted_dispatch_next_tool(session_id, turn_id, tool_call)
+                        .await
+                }
+                Some(ScriptedLoopDecision::ToolSequenceComplete) => {
+                    {
+                        let Some(state) = self.sessions.get_mut(&session_id) else {
+                            return Ok(());
+                        };
+                        state.with_scripted_executor_mut(|exec| {
+                            exec.advance_past_tool_sequence()
+                        });
+                    }
+                    self.scripted_dispatch_after_advance(
+                        session_id,
+                        turn_id,
+                        spoken_text,
+                        memory_concept,
+                        memory_candidate,
+                    )
+                    .await
+                }
+                Some(ScriptedLoopDecision::ForceCheckpoint) => {
+                    let (checkpoint_memory_type, checkpoint_json, index_state) = {
+                        let Some(state) = self.sessions.get_mut(&session_id) else {
+                            return Ok(());
+                        };
+                        // Record a null output for the checkpoint step and advance.
+                        state.with_scripted_executor_mut(|exec| {
+                            exec.record_step_output(Value::Null)
+                        });
+                        (
+                            state.checkpoint_memory_type(),
+                            state.checkpoint_json(),
+                            state.clone(),
+                        )
+                    };
+                    self.ipc_client
+                        .sync_apartment(
+                            &self.agent_id,
+                            &checkpoint_memory_type,
+                            checkpoint_json,
+                        )
+                        .await?;
+                    self.sync_session_index(&index_state).await?;
+                    self.scripted_dispatch_after_advance(
+                        session_id,
+                        turn_id,
+                        spoken_text,
+                        memory_concept,
+                        memory_candidate,
+                    )
+                    .await
+                }
+                Some(ScriptedLoopDecision::Complete { final_output }) => {
+                    let content = match &final_output {
+                        Value::String(s) => s.clone(),
+                        Value::Null => String::new(),
+                        other => other.to_string(),
+                    };
+                    self.complete_agent_response(
+                        session_id,
+                        turn_id,
+                        content,
+                        spoken_text,
+                        memory_concept,
+                        memory_candidate,
+                    )
+                    .await
+                }
+                Some(ScriptedLoopDecision::Fail { reason }) => {
+                    self.fail_active_turn(session_id, turn_id, reason).await
+                }
+            }
+        })
+    }
+
+    /// Emit a model request for a scripted loop model_call step.
+    async fn scripted_emit_model_call(
+        &mut self,
+        session_id: String,
+        turn_id: String,
+        phase: String,
+    ) -> Result<()> {
+        let (
+            prompt,
+            context,
+            context_projection,
+            tools,
+            task_id,
+            user_content,
+            chat_id,
+            final_reply_to,
+            final_reply_role,
+            final_reply_guest_id,
+            checkpoint_memory_type,
+            checkpoint_json,
+            index_state,
+        ) = {
+            let Some(state) = self.sessions.get_mut(&session_id) else {
+                return Ok(());
+            };
+            let Some((prompt, context, context_projection, tools)) =
+                state.build_reentry_context_envelope()
+            else {
+                return self
+                    .fail_active_turn(
+                        session_id,
+                        turn_id,
+                        "scripted_emit_model_call: no active turn context".into(),
+                    )
+                    .await;
+            };
+            let turn = state.active_turn.as_mut().expect("turn exists after envelope");
+            turn.iteration += 1;
+            turn.phase = TurnPhase::WaitingModel;
+            let task_id = turn.task_id;
+            let user_content = turn.user_content.clone();
+            let chat_id = turn.chat_id.clone();
+            let final_reply_to = turn.final_reply_to.clone();
+            let final_reply_role = turn.final_reply_role.clone();
+            let final_reply_guest_id = turn.final_reply_guest_id.clone();
+            (
+                prompt,
+                context,
+                context_projection,
+                tools,
+                task_id,
+                user_content,
+                chat_id,
+                final_reply_to,
+                final_reply_role,
+                final_reply_guest_id,
+                state.checkpoint_memory_type(),
+                state.checkpoint_json(),
+                state.clone(),
+            )
+        };
+
+        let _ = self
+            .ipc_client
+            .send_request(IpcRequest::UpdateTask {
+                task_id,
+                state: "waiting_model".into(),
+                payload: serde_json::json!({
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "phase": phase,
+                }),
+            })
+            .await?;
+
+        self.ipc_client
+            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
+            .await?;
+        self.sync_session_index(&index_state).await?;
+
+        let model_req = ModelRequestPayload {
+            action: "generate_text".to_string(),
+            request_class: Some("cognitive".to_string()),
+            session_id: session_id.clone(),
+            turn_id,
+            prompt,
+            user_content,
+            context: Some(context),
+            context_projection: Some(context_projection),
+            attachments: Vec::new(),
+            tools_for_model: tools,
+            response_contract: Some(
+                serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan"] }),
+            ),
+            chat_id,
+            reply_to: local_node_id(),
+            reply_role: "agent".into(),
+            final_reply_to,
+            final_reply_role,
+            final_reply_guest_id,
+        };
+
+        let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
+            self.sessions.get(&session_id),
+            "text.generate",
+            DEFAULT_TEXT_MODEL_ROLE,
+        );
+
+        info!(
+            "Scripted loop [{}] emitting model call for phase '{}'",
+            session_id, phase
+        );
+        self.ipc_client
+            .send_request(IpcRequest::EmitTask {
+                target_node,
+                target_role,
+                target_guest_id,
+                task_json: serde_json::to_string(&model_req)?,
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    /// Park the turn waiting for operator plan approval.
+    /// Uses the approval_id sentinel "scripted_gate:<gate>" so that
+    /// handle_approval_command can route the resolution back to the scripted executor.
+    async fn scripted_park_for_approval(
+        &mut self,
+        session_id: String,
+        turn_id: String,
+        gate: String,
+        _surface_as: String,
+        _reject_action: String,
+    ) -> Result<()> {
+        // Surface the plan content as the approval reason.
+        let plan_content = self
+            .sessions
+            .get(&session_id)
+            .and_then(|s| s.active_turn.as_ref())
+            .and_then(|t| t.scripted_loop_context.as_ref())
+            .and_then(|exec| {
+                let input_path = exec
+                    .script
+                    .steps
+                    .get(exec.step_cursor)
+                    .and_then(|s| s.input.as_deref())
+                    .unwrap_or("");
+                exec.resolve_input(input_path)
+            })
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "Plan ready for review.".to_string());
+
+        let approval = ApprovalRequest {
+            approval_id: Some(format!("scripted_gate:{}", gate)),
+            reason: plan_content,
+            approved_response: "Plan approved. Executing now.".to_string(),
+        };
+
+        self.handle_approval_request(session_id, turn_id, approval, false)
+            .await
+    }
+
+    /// Dispatch the next tool in a scripted tool_sequence step.
+    /// bypass_approval=true — the operator already approved the full plan.
+    async fn scripted_dispatch_next_tool(
+        &mut self,
+        session_id: String,
+        turn_id: String,
+        tool_call: ToolCall,
+    ) -> Result<()> {
+        if let Some(state) = self.sessions.get_mut(&session_id) {
+            state.set_pending_tool_call(tool_call.clone());
+        }
+        self.route_tool_call_execution(session_id, turn_id, tool_call, true)
+            .await
+    }
+
     async fn handle_approval_command(
         &mut self,
         command_task_id: Uuid,
@@ -3043,6 +3489,30 @@ impl AgentRuntime {
                     })
                     .await?;
 
+                // Scripted gate: record approval as the current step's output and
+                // let the executor drive what comes next.
+                if approval
+                    .approval_id
+                    .as_deref()
+                    .map(|id| id.starts_with("scripted_gate:"))
+                    .unwrap_or(false)
+                {
+                    if let Some(state) = self.sessions.get_mut(&session_id) {
+                        state.with_scripted_executor_mut(|exec| {
+                            exec.record_step_output(serde_json::json!({"approved": true}));
+                        });
+                    }
+                    return self
+                        .scripted_dispatch_after_advance(
+                            session_id,
+                            original_turn_id,
+                            None,
+                            None,
+                            None,
+                        )
+                        .await;
+                }
+
                 if let Some(tool_call) = original_pending_tool_call {
                     // bypass_approval=true: this tool was already manually approved above.
                     return self
@@ -3093,8 +3563,8 @@ impl AgentRuntime {
 
                 let reply_payload = FinalReplyPayload {
                     action: "send_reply",
-                    session_id,
-                    turn_id: original_turn_id,
+                    session_id: session_id.clone(),
+                    turn_id: original_turn_id.clone(),
                     chat_id: original_chat_id,
                     content: format!("Denied: {}", approval.reason),
                     audio_artifact: None,
@@ -3109,6 +3579,22 @@ impl AgentRuntime {
                         task_json: serde_json::to_string(&reply_payload)?,
                     })
                     .await?;
+
+                // Scripted gate denial: fail the turn (default reject_action = fail_turn).
+                if approval
+                    .approval_id
+                    .as_deref()
+                    .map(|id| id.starts_with("scripted_gate:"))
+                    .unwrap_or(false)
+                {
+                    return self
+                        .fail_active_turn(
+                            session_id,
+                            original_turn_id,
+                            format!("Plan rejected: {}", approval.reason),
+                        )
+                        .await;
+                }
             }
             SlashCommand::Ping
             | SlashCommand::Status
@@ -3203,6 +3689,9 @@ impl AgentRuntime {
                 effective_skill_guidance: vec![],
                 working_memory_policy: None,
                 memory_projection_policy: None,
+                turn_loop_config: role_config
+                    .as_ref()
+                    .map(|c| c.turn_loop_config.clone()),
             };
 
             state.role_activation = Some(activation);
@@ -4421,6 +4910,12 @@ impl AgentRuntime {
                                     .get("approval_policy")
                                     .and_then(|v| v.as_str())
                                     .map(str::to_string),
+                                turn_loop_config: args
+                                    .get("turn_loop_config")
+                                    .and_then(|v| {
+                                        serde_json::from_value::<ansible_mesh_core::graph::TurnLoopConfig>(v.clone()).ok()
+                                    })
+                                    .unwrap_or_default(),
                             },
                         );
                         (
@@ -6403,6 +6898,7 @@ mod tests {
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
         });
 
         assert!(should_attempt_provider_repair(&error, Some(&state)));
