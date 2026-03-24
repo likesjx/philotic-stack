@@ -31,26 +31,39 @@ Interactive HTML version (with hover tooltips): [`docs/philotic-architecture-dia
 
 ## Crates
 
-| Crate                                                     | Role                                                       |
-| --------------------------------------------------------- | ---------------------------------------------------------- |
-| [`aiua`](crates/aiua/README.md)                     | Hotel daemon — guest materialization, IPC, mesh routing    |
-| [`ansible-mesh-core`](crates/ansible-mesh-core/README.md) | Core primitives, traits, event types, storage abstractions |
-| [`philotic-client`](crates/philotic-client/README.md)     | Guest SDK — IPC client for hotel communication             |
-| [`membrane`](crates/membrane/README.md)                     | Telegram/external protocol gateway guest                   |
-| [`philote`](crates/philote/README.md)               | Persona/agent cognitive loop guest                         |
-| [`model-router`](crates/model-router/README.md)           | LLM model provider routing guest                           |
+| Crate                                                     | Role                                                             |
+| --------------------------------------------------------- | ---------------------------------------------------------------- |
+| [`aiua`](crates/aiua/README.md)                           | Hotel daemon — guest materialization, IPC, mesh routing          |
+| [`ansible-mesh-core`](crates/ansible-mesh-core/README.md) | Core primitives, traits, event types, storage abstractions       |
+| [`philotic-client`](crates/philotic-client/README.md)     | Guest SDK — IPC client for hotel communication                   |
+| [`membrane`](crates/membrane/README.md)                   | Telegram/external protocol gateway guest                         |
+| [`philote`](crates/philote/README.md)                     | Persona/agent cognitive loop guest                               |
+| [`model-router`](crates/model-router/README.md)           | Multi-provider LLM/TTS routing guest (Gemini, ElevenLabs, etc.)  |
+| [`philotic-web`](crates/philotic-web/README.md)           | Next.js Desktop/Operator UI surface                              |
+| [`tool-runner`](crates/tool-runner/README.md)             | Workspace tool execution guest                                   |
+
+## The Agent Fleet
+
+The default Philotic stack materializes a fleet of specialized agents, each with a distinct persona and mission:
+
+- **Jane (The Assistant)**: Warm, capable, and direct. Your primary point of contact for daily help.
+- **Aria (The Architect)**: Technical lead and development specialist. Manages the stack itself.
+- **Beacon (The Chief of Staff)**: Keeper of goals, projects, and commitments. Ensures clarity and focus.
+- **Hermes (The Communicator)**: Specialized in routing, summaries, and correspondence.
+- **Astrid (The Librarian)**: Archivist of knowledge and organization. Manages documentation and vault systems.
 
 ## Key Design Principles
 
 - **Hotel = source of truth.** The Context Graph SQLite DB owns all state.
-- **Security first, especially at the perimeter.** External communication surfaces should default to minimal trust, narrow authority, and explicit policy.
-- **IPC for intra-hotel.** All local communication uses Unix Domain Sockets.
-- **Mesh for inter-hotel.** All cross-machine communication is event-based UDP with durable delivery.
-- **Storage is swappable.** All persistence goes through `Arc<dyn GraphStorage>` — SQLite today, PebbleDB tomorrow.
+- **Security first, especially at the perimeter.** External communication surfaces default to minimal trust and explicit policy.
+- **IPC for intra-hotel.** All local communication uses Unix Domain Sockets (`/tmp/philotic-aiua.sock`).
+- **Mesh for inter-hotel.** Cross-machine coordination uses UDP Gossip/Beacons (Control Plane) and TCP Exec-Transport (Data Plane).
+- **Storage is swappable.** Persistence abstractions (`GraphStorage`) allow for SQLite today, specialized DBs tomorrow.
 - **Guests are crash-safe.** The supervisor loop auto-respawns dead guests every 5s.
-- **Memory is eventually consistent.** Guests write optimistically; the hotel resolves conflicts via Last-Writer-Wins CRDT.
+- **Memory is eventually consistent.** Guests write optimistically; the hotel resolves conflicts via Last-Writer-Wins.
 
 ## Documentation
 
-- **[Full Architecture Reference](docs/architecture/ARCHITECTURE.md)** — complete system design, data flows, component reference
-- **[Port Blueprint](docs/architecture/PORT_BLUEPRINT.md)** — migration plan from legacy OpenClaw Ansible plugin model
+- **[Full Architecture Reference](docs/architecture/ARCHITECTURE.md)** — system design, data flows, component reference.
+- **[Architecture Status](docs/architecture/ARCHITECTURE_STATUS.md)** — live status of implemented vs. transitional features.
+- **[Port Blueprint](docs/architecture/PORT_BLUEPRINT.md)** — migration plan from legacy OpenClaw models.
