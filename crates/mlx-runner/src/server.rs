@@ -12,22 +12,42 @@ pub struct MlxServerHandle {
 }
 
 impl MlxServerHandle {
-    /// Verify that `mlx_lm` is importable. Call before spawning to fail fast.
+    /// Resolve the Python interpreter to use: `python3` if available, else `python`.
+    /// Public so other modules (e.g. whisper.rs) can reuse the same detection.
+    pub fn python_bin() -> &'static str {
+        // On macOS / modern Linux there is often no bare `python`, only `python3`.
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            "python3"
+        } else {
+            "python"
+        }
+    }
+
+    /// Verify that `mlx_lm` is importable. Call before spawning managed instances to fail fast.
     pub fn check_available() -> Result<()> {
-        let status = Command::new("python")
+        let python = Self::python_bin();
+        let status = Command::new(python)
             .args(["-c", "import mlx_lm"])
             .status()
-            .context("failed to invoke python to check mlx_lm availability")?;
+            .with_context(|| format!("failed to invoke {python} to check mlx_lm availability"))?;
         if !status.success() {
             anyhow::bail!("`mlx_lm` is not installed or not importable. Install with: pip install mlx-lm");
         }
         Ok(())
     }
 
-    /// Spawn `python -m mlx_lm.server --model <repo> --port <port> [extra_args...]`.
+    /// Spawn `python3 -m mlx_lm.server --model <repo> --port <port> [extra_args...]`.
     pub fn spawn(repo_id: &str, port: u16, extra_args: &[String]) -> Result<Self> {
-        info!(repo_id, port, "spawning mlx_lm.server");
-        let child = Command::new("python")
+        let python = Self::python_bin();
+        info!(repo_id, port, python, "spawning mlx_lm.server");
+        let child = Command::new(python)
             .args(["-m", "mlx_lm.server", "--model", repo_id, "--port", &port.to_string()])
             .args(extra_args)
             .spawn()

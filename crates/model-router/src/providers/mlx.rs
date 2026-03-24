@@ -97,6 +97,30 @@ impl MlxProvider {
         })
     }
 
+    /// Return a human-readable summary of the fleet state (for --discover mode).
+    pub async fn fleet_summary(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        for inst in self.text_models.iter().chain(self.multimodal_models.iter()) {
+            let health = inst.health().await;
+            let loaded = inst.discovered_model_id.as_deref().unwrap_or("unknown");
+            let class = format!("{:?}", inst.class()).to_lowercase();
+            lines.push(format!(
+                "[{class}] priority={} configured={} loaded={} health={:?}",
+                inst.priority(),
+                inst.config.repo_id,
+                loaded,
+                health,
+            ));
+        }
+        for h in &self.transcribe_handles {
+            lines.push(format!(
+                "[transcribe] priority={} repo={}",
+                h.priority, h.repo_id
+            ));
+        }
+        lines
+    }
+
     /// Spawn the background health-check ticker.
     pub fn spawn_health_ticker(provider: Arc<MlxProvider>, interval_secs: u64) {
         let interval = Duration::from_secs(interval_secs);

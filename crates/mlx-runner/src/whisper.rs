@@ -24,14 +24,15 @@ impl MlxWhisperHandle {
     }
 
     /// Transcribe an audio file. Returns the full transcript text.
-    /// Spawns `python -m mlx_whisper --model <repo> --output-format json <audio_path>`.
+    /// Spawns `python3 -m mlx_whisper --model <repo> --output-format json <audio_path>`.
     pub fn transcribe(&self, audio_path: &Path) -> Result<TranscribeOutput> {
         info!(
             repo_id = %self.repo_id,
             path = %audio_path.display(),
             "running mlx_whisper transcription"
         );
-        let output = Command::new("python")
+        let python = crate::server::MlxServerHandle::python_bin();
+        let output = Command::new(python)
             .args([
                 "-m",
                 "mlx_whisper",

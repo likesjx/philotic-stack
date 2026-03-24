@@ -27,6 +27,11 @@ struct Args {
     /// Role announced to the hotel.
     #[arg(long, env = "PHILOTIC_MLX_ROLE", default_value = DEFAULT_ROLE)]
     role: String,
+
+    /// Discover mode: start fleet, print loaded models, then exit.
+    /// Useful for smoke testing without a running hotel.
+    #[arg(long)]
+    discover: bool,
 }
 
 #[tokio::main]
@@ -56,6 +61,16 @@ async fn main() -> Result<()> {
 
     // Build the provider fleet (starts managed instances, attaches to running ones).
     let provider = Arc::new(MlxProvider::from_config(fleet_config).await?);
+
+    // --discover: print what's loaded and exit without connecting to hotel.
+    if args.discover {
+        let summary = provider.fleet_summary().await;
+        for entry in &summary {
+            println!("{}", entry);
+        }
+        tracing::info!("discover mode: exiting after fleet startup");
+        return Ok(());
+    }
 
     // Spawn background health ticker.
     MlxProvider::spawn_health_ticker(Arc::clone(&provider), health_interval);
