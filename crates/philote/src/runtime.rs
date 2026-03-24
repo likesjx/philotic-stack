@@ -495,6 +495,7 @@ struct CachedRoleConfig {
     role_manifest: Option<String>,
     iteration_cap: Option<u32>,
     approval_policy: Option<String>,
+    turn_loop_config: ansible_mesh_core::graph::TurnLoopConfig,
 }
 
 pub struct AgentRuntime {
@@ -854,8 +855,27 @@ impl AgentRuntime {
                 pending_text_reply: None,
                 had_voice_input,
                 awaiting_transcription_reentry: false,
+                scripted_loop_context: None,
             });
             state.set_active_turn_phase(TurnPhase::LoadingContext);
+
+            // Activate scripted loop if the current role has a loop_script configured.
+            if let Some(loop_script) = state
+                .role_activation
+                .as_ref()
+                .and_then(|ra| ra.turn_loop_config.as_ref())
+                .and_then(|tlc| tlc.loop_script.clone())
+            {
+                if let Some(turn) = state.active_turn.as_mut() {
+                    tracing::debug!(
+                        session_id = %state.session_id,
+                        variant = %loop_script.variant,
+                        "scripted turn loop activated"
+                    );
+                    turn.scripted_loop_context =
+                        Some(crate::scripted_loop::ScriptedLoopExecutor::new(loop_script));
+                }
+            }
         }
 
         self.maybe_auto_recall_turn_memory(&session_id).await?;
@@ -1283,6 +1303,28 @@ impl AgentRuntime {
                     .await
                 }
             };
+        }
+
+        // Scripted loop fork: when the turn is running under a LoopScript,
+        // model responses are consumed by the ScriptedLoopExecutor rather than
+        // dispatched through the standard AgentAction match below.
+        // Full routing (ParkForApproval, ExecuteNextTool, etc.) is implemented
+        // in handle_scripted_loop_model_response — stubbed here until Phase 1b.
+        let is_scripted = self
+            .sessions
+            .get(&session_id)
+            .and_then(|s| s.active_turn.as_ref())
+            .map(|t| t.scripted_loop_context.is_some())
+            .unwrap_or(false);
+
+        if is_scripted {
+            tracing::debug!(
+                session_id = %session_id,
+                turn_id = %turn_id,
+                "scripted loop model response received — routing to scripted executor (Phase 1b)"
+            );
+            // TODO Phase 1b: dispatch to handle_scripted_loop_model_response.
+            // Fall through to standard loop for now so turns complete without breaking.
         }
 
         match action {
@@ -3203,6 +3245,9 @@ impl AgentRuntime {
                 effective_skill_guidance: vec![],
                 working_memory_policy: None,
                 memory_projection_policy: None,
+                turn_loop_config: role_config
+                    .as_ref()
+                    .map(|c| c.turn_loop_config.clone()),
             };
 
             state.role_activation = Some(activation);
@@ -4421,6 +4466,12 @@ impl AgentRuntime {
                                     .get("approval_policy")
                                     .and_then(|v| v.as_str())
                                     .map(str::to_string),
+                                turn_loop_config: args
+                                    .get("turn_loop_config")
+                                    .and_then(|v| {
+                                        serde_json::from_value::<ansible_mesh_core::graph::TurnLoopConfig>(v.clone()).ok()
+                                    })
+                                    .unwrap_or_default(),
                             },
                         );
                         (
@@ -6403,6 +6454,7 @@ mod tests {
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
         });
 
         assert!(should_attempt_provider_repair(&error, Some(&state)));

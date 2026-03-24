@@ -3843,6 +3843,7 @@ impl IpcServer {
                         approval_policy,
                         model_profile,
                         context_window_policy,
+                        loop_script: None,
                     },
                 };
 
@@ -4873,6 +4874,7 @@ impl IpcServer {
                         .unwrap_or_else(|| serde_json::json!([])),
                     "working_memory_policy": "role_local",
                     "memory_projection_policy": "shared_identity_role_scoped",
+                    "turn_loop_config": serde_json::to_value(&role_record.turn_loop_config).unwrap_or_default(),
                 }))
             })
             .unwrap_or(serde_json::Value::Null);

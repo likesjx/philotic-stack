@@ -132,7 +132,7 @@ pub struct ContextBudget {
     pub trimmed_sections: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextProjection {
     pub conversation_turn: ConversationTurnScope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -176,7 +176,7 @@ pub struct PromotionAction {
     pub source_refs: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HookRequest {
     pub hook_name: String,
     pub scope: String,
@@ -205,7 +205,7 @@ pub struct HookResult {
     pub diagnostics: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct RoleActivation {
     pub role_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -237,6 +237,10 @@ pub struct RoleActivation {
     /// knows its focus, rules, tools, delegation posture, and approval constraints.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_manifest: Option<String>,
+    /// Turn loop configuration for this role. When loop_script is present,
+    /// philote runs the scripted step tree instead of the standard loop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_loop_config: Option<ansible_mesh_core::graph::TurnLoopConfig>,
 }
 
 /// A single step inside an `ActivePlan`. Tracks the description, optional bound
@@ -308,6 +312,10 @@ pub struct WorkingTurn {
     /// True when a voice transcription result should be routed back into the
     /// normal reasoning loop instead of finalized as the assistant reply.
     pub awaiting_transcription_reentry: bool,
+    /// Present when this turn is executing under a LoopScript rather than
+    /// the standard tool re-entry loop. Persisted through approval-gate
+    /// re-entry via checkpoint_json.
+    pub scripted_loop_context: Option<crate::scripted_loop::ScriptedLoopExecutor>,
 }
 
 #[derive(Debug, Clone)]
@@ -2603,6 +2611,7 @@ impl SessionState {
                 "pending_text_reply": turn.pending_text_reply,
                 "had_voice_input": turn.had_voice_input,
                 "awaiting_transcription_reentry": turn.awaiting_transcription_reentry,
+                "scripted_loop_context": turn.scripted_loop_context,
             })
         });
 
@@ -2842,6 +2851,10 @@ impl SessionState {
                     .get("awaiting_transcription_reentry")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
+                scripted_loop_context: turn
+                    .get("scripted_loop_context")
+                    .cloned()
+                    .and_then(|v| serde_json::from_value(v).ok()),
             })
         });
 
@@ -3412,6 +3425,7 @@ mod tests {
             pending_text_reply: Some("hello back".into()),
             had_voice_input: true,
             awaiting_transcription_reentry: true,
+            scripted_loop_context: None,
         });
 
         let checkpoint = state.checkpoint_json();
@@ -3512,6 +3526,7 @@ mod tests {
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
         });
 
         state.complete_active_turn("hi".into());
@@ -3996,6 +4011,7 @@ mod tests {
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
         });
 
         let projection = state.build_context_projection("status");
@@ -4076,6 +4092,7 @@ mod tests {
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
         });
 
         let prompt = state.build_prompt("status");
@@ -4150,6 +4167,7 @@ mod tests {
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
         });
 
         let bundle = state.build_same_identity_handoff_bundle(
@@ -4221,6 +4239,7 @@ mod tests {
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
         });
 
         let delegation = state.build_subagent_delegation(
@@ -4695,6 +4714,7 @@ mod tests {
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
         });
         let index = merge_session_index(None, &first);
         assert_eq!(index["active_sessions"].as_array().unwrap().len(), 1);
@@ -4739,6 +4759,7 @@ mod tests {
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: true,
+            scripted_loop_context: None,
         });
 
         state.push_tool_history(
@@ -4798,6 +4819,7 @@ mod tests {
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
         });
 
         state.push_tool_history(
@@ -4858,6 +4880,7 @@ mod tests {
             pending_text_reply: None,
             had_voice_input: true,
             awaiting_transcription_reentry: true,
+            scripted_loop_context: None,
         });
 
         let reentry = state
@@ -5126,6 +5149,7 @@ mod tests {
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
         });
 
         let projection = state.build_context_projection("continue the memory work");
