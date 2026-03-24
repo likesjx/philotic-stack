@@ -2200,6 +2200,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlx-runner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures",
+ "philotic-client",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "model-router"
 version = "0.1.0"
 dependencies = [
@@ -2209,6 +2223,8 @@ dependencies = [
  "axum 0.8.8",
  "base64 0.22.1",
  "clap",
+ "futures",
+ "mlx-runner",
  "onnx-runner",
  "philotic-client",
  "reqwest",

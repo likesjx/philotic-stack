@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+mod component;
 mod footprint;
 mod init;
 mod load;
@@ -101,6 +102,12 @@ enum Command {
         kill: Option<String>,
     },
 
+    /// Manage registered components (model controllers, tool runners, etc.)
+    Component {
+        #[command(subcommand)]
+        action: ComponentAction,
+    },
+
     /// Start the local management web server (REST + WebSocket)
     Serve {
         /// Port to listen on (default: 7700)
@@ -118,6 +125,24 @@ enum Command {
         /// Allowed CORS origins, comma-separated (default: http://localhost:5173)
         #[arg(long)]
         allow_origins: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ComponentAction {
+    /// Register (or update) a component from a ComponentManifest JSON file.
+    ///
+    /// Example: phil component add mlx-fleet.json
+    Add {
+        /// Path to the ComponentManifest JSON file.
+        manifest: std::path::PathBuf,
+    },
+    /// List registered components.
+    List,
+    /// Deactivate a registered component (sets is_active=false).
+    Remove {
+        /// Guest ID of the component to remove.
+        guest_id: String,
     },
 }
 
@@ -160,6 +185,11 @@ async fn main() -> Result<()> {
             ServiceAction::Status { hotel } => service::status(hotel).await,
         },
         Command::Footprint { kill } => footprint::run(kill).await,
+        Command::Component { action } => match action {
+            ComponentAction::Add { manifest } => component::add(manifest).await,
+            ComponentAction::List => component::list().await,
+            ComponentAction::Remove { guest_id } => component::remove(guest_id).await,
+        },
         Command::Serve {
             port,
             db,

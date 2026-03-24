@@ -5,11 +5,13 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0"
+futures = "0.3"
 ansible-mesh-core = { path = "../ansible-mesh-core" }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["json"] }
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive", "env"] }
+mlx-runner = { path = "../mlx-runner" }
 onnx-runner = { path = "../onnx-runner" }
 philotic-client = { path = "../philotic-client" }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }

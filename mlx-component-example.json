@@ -1,0 +1,25 @@
+{
+  "guest_id": "model-mlx-01",
+  "role": "model.mlx",
+  "hotel": "default",
+  "command": "model-controller-mlx",
+  "args": [
+    "--guest-id", "model-mlx-01",
+    "--role", "model.mlx"
+  ],
+  "env": {},
+  "component_config": {
+    "health_check_interval_secs": 300,
+    "models": [
+      {
+        "class": "text",
+        "repo_id": "mlx-community/Qwen2.5-0.5B-Instruct-4bit",
+        "mode": "attached",
+        "host": "127.0.0.1",
+        "port": 11434,
+        "priority": 100
+      }
+    ]
+  },
+  "auto_start": true
+}

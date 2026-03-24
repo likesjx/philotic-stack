@@ -13,6 +13,7 @@ use crate::graph::{
 use crate::NodeCapabilities;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 // ──────────────────────────────────────────────────────────────────────
 // EventStorage – manages the durable mesh_events log
@@ -66,6 +67,37 @@ pub struct GuestRecord {
     /// Unix epoch (seconds) of the last time this guest was activated or spawned.
     /// Used by the supervisor TTL check for role incarnation guests.
     pub last_active_at: Option<u64>,
+}
+
+/// A declarative description of a component for registration with the hotel.
+/// Written by `philotic-web component add`; read by aiua to upsert a GuestRecord.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComponentManifest {
+    /// Unique guest identifier (e.g. "model-mlx-01").
+    pub guest_id: String,
+    /// Role announced to the hotel (e.g. "model.mlx").
+    pub role: String,
+    /// Hotel name to register with (e.g. "default").
+    pub hotel: String,
+    /// Spawn command for the component binary (resolved via PHILOTIC_BIN_DIR or PATH).
+    pub command: String,
+    /// Command-line arguments passed to the binary.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Environment variables injected into the spawned process.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Component-specific configuration blob stored in node_config under
+    /// `component:{guest_id}` and fetched by the binary via `IpcRequest::GetConfig`.
+    #[serde(default)]
+    pub component_config: serde_json::Value,
+    /// If true, the hotel materializes (spawns) the guest immediately after upsert.
+    #[serde(default = "default_auto_start")]
+    pub auto_start: bool,
+}
+
+fn default_auto_start() -> bool {
+    true
 }
 
 /// A named hotel runtime record stored in the Context Graph.
