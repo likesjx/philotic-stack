@@ -3432,8 +3432,11 @@ mod tests {
             checkpoint["active_turn"]["final_reply_guest_id"],
             "membrane-telegram-01"
         );
-        assert!(checkpoint["component_route_assembly"].is_object());
-        assert!(checkpoint["tool_assembly"].is_object());
+        // component_route_assembly and tool_assembly are intentionally omitted from
+        // checkpoint_json() — they are hotel-injected fresh on every turn to prevent
+        // circular checkpoint growth. Verify they are absent here.
+        assert!(checkpoint["component_route_assembly"].is_null());
+        assert!(checkpoint["tool_assembly"].is_null());
     }
 
     #[test]
@@ -3455,7 +3458,11 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_round_trip_preserves_component_route_assembly() {
+    fn checkpoint_round_trip_strips_component_route_assembly() {
+        // component_route_assembly is intentionally NOT persisted in checkpoints.
+        // It is hotel-injected fresh via compose_session_snapshot on every turn.
+        // This test verifies that a populated assembly is stripped during checkpoint_json()
+        // and that restoring from the checkpoint gives an empty assembly (the hotel re-injects).
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.component_route_assembly = ComponentRouteAssembly {
@@ -3475,16 +3482,13 @@ mod tests {
         };
 
         let checkpoint = state.checkpoint_json();
+        // Assembly must be absent from the persisted checkpoint.
+        assert!(checkpoint["component_route_assembly"].is_null());
+
         let restored =
             SessionState::from_checkpoint(&checkpoint).expect("checkpoint should restore");
-        let route = restored
-            .resolve_component_execution_route("text.generate")
-            .expect("component route should restore");
-        assert_eq!(route.target_node, "aria-node");
-        assert_eq!(
-            route.incarnation_id.as_deref(),
-            Some("aria-architect-hotel:model-controller-gemini")
-        );
+        // After restore the assembly is empty — the hotel re-injects it at snapshot time.
+        assert!(restored.component_route_assembly.execution_routes.is_empty());
     }
 
     #[test]
