@@ -13,5 +13,6 @@ members = [
     "crates/agent-graph-runner",
     "crates/graph-runner",
     "crates/philotic-sandbox",
+    "crates/mlx-runner",
 ]
 resolver = "2"
