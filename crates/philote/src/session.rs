@@ -132,7 +132,7 @@ pub struct ContextBudget {
     pub trimmed_sections: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextProjection {
     pub conversation_turn: ConversationTurnScope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -176,7 +176,7 @@ pub struct PromotionAction {
     pub source_refs: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HookRequest {
     pub hook_name: String,
     pub scope: String,
@@ -205,7 +205,7 @@ pub struct HookResult {
     pub diagnostics: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct RoleActivation {
     pub role_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -237,6 +237,10 @@ pub struct RoleActivation {
     /// knows its focus, rules, tools, delegation posture, and approval constraints.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_manifest: Option<String>,
+    /// Turn loop configuration for this role. When loop_script is present,
+    /// philote runs the scripted step tree instead of the standard loop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_loop_config: Option<ansible_mesh_core::graph::TurnLoopConfig>,
 }
 
 /// A single step inside an `ActivePlan`. Tracks the description, optional bound
@@ -308,6 +312,10 @@ pub struct WorkingTurn {
     /// True when a voice transcription result should be routed back into the
     /// normal reasoning loop instead of finalized as the assistant reply.
     pub awaiting_transcription_reentry: bool,
+    /// Present when this turn is executing under a LoopScript rather than
+    /// the standard tool re-entry loop. Persisted through approval-gate
+    /// re-entry via checkpoint_json.
+    pub scripted_loop_context: Option<crate::scripted_loop::ScriptedLoopExecutor>,
 }
 
 #[derive(Debug, Clone)]
@@ -927,6 +935,26 @@ impl SessionState {
             .as_ref()
             .map(|turn| turn.awaiting_transcription_reentry)
             .unwrap_or(false)
+    }
+
+    pub fn with_scripted_executor_mut<F>(&mut self, f: F)
+    where
+        F: FnOnce(&mut crate::scripted_loop::ScriptedLoopExecutor),
+    {
+        if let Some(turn) = self.active_turn.as_mut() {
+            if let Some(exec) = turn.scripted_loop_context.as_mut() {
+                f(exec);
+            }
+        }
+    }
+
+    pub fn scripted_executor_advance(
+        &self,
+    ) -> Option<crate::scripted_loop::ScriptedLoopDecision> {
+        self.active_turn
+            .as_ref()
+            .and_then(|t| t.scripted_loop_context.as_ref())
+            .map(|exec| exec.advance())
     }
 
     pub fn prepare_transcription_reentry(&mut self, transcript: &str) -> Option<ModelReentryPlan> {
@@ -1889,6 +1917,7 @@ impl SessionState {
 
     fn render_prompt_from_projection(&self, projection: &ContextProjection) -> String {
         let mut prompt = String::new();
+        prompt.push_str(&format!("[System]\nCurrent date and time (UTC): {}\n", utc_datetime_string()));
         for layer in &projection.layers {
             let title = match layer.layer_id {
                 ContextLayerId::Identity => "Agent self projection",
@@ -2618,6 +2647,7 @@ impl SessionState {
                 "pending_text_reply": turn.pending_text_reply,
                 "had_voice_input": turn.had_voice_input,
                 "awaiting_transcription_reentry": turn.awaiting_transcription_reentry,
+                "scripted_loop_context": turn.scripted_loop_context,
             })
         });
 
@@ -2857,6 +2887,10 @@ impl SessionState {
                     .get("awaiting_transcription_reentry")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
+                scripted_loop_context: turn
+                    .get("scripted_loop_context")
+                    .cloned()
+                    .and_then(|v| serde_json::from_value(v).ok()),
             })
         });
 
@@ -3366,6 +3400,31 @@ fn current_unix_ts() -> u64 {
         .as_secs()
 }
 
+/// Format current UTC time as "YYYY-MM-DD HH:MM:SS UTC" using only std.
+fn utc_datetime_string() -> String {
+    let secs = current_unix_ts();
+    // Days since Unix epoch → Gregorian calendar (proleptic, no leap-second awareness)
+    let days = secs / 86400;
+    let time_of_day = secs % 86400;
+    let hh = time_of_day / 3600;
+    let mm = (time_of_day % 3600) / 60;
+    let ss = time_of_day % 60;
+
+    // Gregorian date calculation (algorithm from http://howardhinnant.github.io/date_algorithms.html)
+    let z = days as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC", y, m, d, hh, mm, ss)
+}
+
 /// Apply a set / append / remove operation to a `Vec<String>` field.
 fn apply_string_list_op(list: &mut Vec<String>, item: &str, operation: &str) -> Result<(), String> {
     match operation {
@@ -3427,6 +3486,7 @@ mod tests {
             pending_text_reply: Some("hello back".into()),
             had_voice_input: true,
             awaiting_transcription_reentry: true,
+            scripted_loop_context: None,
         });
 
         let checkpoint = state.checkpoint_json();
@@ -3447,11 +3507,11 @@ mod tests {
             checkpoint["active_turn"]["final_reply_guest_id"],
             "membrane-telegram-01"
         );
-        // component_route_assembly and tool_assembly are intentionally omitted from
-        // checkpoint_json() — they are hotel-injected fresh on every turn to prevent
-        // circular checkpoint growth. Verify they are absent here.
-        assert!(checkpoint["component_route_assembly"].is_null());
-        assert!(checkpoint["tool_assembly"].is_null());
+        // component_route_assembly and tool_assembly are hotel-computed and intentionally
+        // excluded from the checkpoint to prevent circular growth. They are re-injected
+        // by compose_session_snapshot on every turn.
+        assert!(checkpoint.get("component_route_assembly").is_none());
+        assert!(checkpoint.get("tool_assembly").is_none());
     }
 
     #[test]
@@ -3473,11 +3533,10 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_round_trip_strips_component_route_assembly() {
-        // component_route_assembly is intentionally NOT persisted in checkpoints.
-        // It is hotel-injected fresh via compose_session_snapshot on every turn.
-        // This test verifies that a populated assembly is stripped during checkpoint_json()
-        // and that restoring from the checkpoint gives an empty assembly (the hotel re-injects).
+    fn checkpoint_does_not_persist_component_route_assembly() {
+        // component_route_assembly is hotel-computed (injected on every turn via
+        // compose_session_snapshot). It must NOT survive a checkpoint round-trip;
+        // that would cause unbounded circular payload growth.
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.component_route_assembly = ComponentRouteAssembly {
@@ -3497,13 +3556,15 @@ mod tests {
         };
 
         let checkpoint = state.checkpoint_json();
-        // Assembly must be absent from the persisted checkpoint.
-        assert!(checkpoint["component_route_assembly"].is_null());
+        // The field should not appear in the checkpoint at all.
+        assert!(checkpoint.get("component_route_assembly").is_none());
 
         let restored =
             SessionState::from_checkpoint(&checkpoint).expect("checkpoint should restore");
-        // After restore the assembly is empty — the hotel re-injects it at snapshot time.
-        assert!(restored.component_route_assembly.execution_routes.is_empty());
+        // After restore, routes are gone — the hotel re-injects them on the next turn.
+        assert!(restored
+            .resolve_component_execution_route("text.generate")
+            .is_none());
     }
 
     #[test]
@@ -3531,6 +3592,7 @@ mod tests {
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
         });
 
         state.complete_active_turn("hi".into());
@@ -4015,6 +4077,7 @@ mod tests {
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
         });
 
         let projection = state.build_context_projection("status");
@@ -4095,6 +4158,7 @@ mod tests {
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
         });
 
         let prompt = state.build_prompt("status");
@@ -4169,6 +4233,7 @@ mod tests {
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
         });
 
         let bundle = state.build_same_identity_handoff_bundle(
@@ -4240,6 +4305,7 @@ mod tests {
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
         });
 
         let delegation = state.build_subagent_delegation(
@@ -4714,6 +4780,7 @@ mod tests {
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
         });
         let index = merge_session_index(None, &first);
         assert_eq!(index["active_sessions"].as_array().unwrap().len(), 1);
@@ -4758,6 +4825,7 @@ mod tests {
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: true,
+            scripted_loop_context: None,
         });
 
         state.push_tool_history(
@@ -4817,6 +4885,7 @@ mod tests {
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
         });
 
         state.push_tool_history(
@@ -4877,6 +4946,7 @@ mod tests {
             pending_text_reply: None,
             had_voice_input: true,
             awaiting_transcription_reentry: true,
+            scripted_loop_context: None,
         });
 
         let reentry = state
@@ -5145,6 +5215,7 @@ mod tests {
             pending_text_reply: None,
             had_voice_input: false,
             awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
         });
 
         let projection = state.build_context_projection("continue the memory work");

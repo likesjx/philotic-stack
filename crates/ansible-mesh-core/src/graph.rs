@@ -158,8 +158,28 @@ pub struct ToolsetProfileRecord {
     pub description: Option<String>,
 }
 
+/// A single step in a LoopScript.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct LoopStep {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub step_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
+    #[serde(default)]
+    pub config: serde_json::Value,
+}
+
+/// A scripted turn loop tree — an ordered list of steps that replaces the
+/// hard-coded tool re-entry loop when present on a role's TurnLoopConfig.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct LoopScript {
+    pub variant: String,
+    pub steps: Vec<LoopStep>,
+}
+
 /// Per-role runtime loop controls for a role incarnation.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct TurnLoopConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub iteration_cap: Option<u32>,
@@ -169,12 +189,16 @@ pub struct TurnLoopConfig {
     pub model_profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window_policy: Option<String>,
+    /// When present, philote runs the scripted step tree instead of the
+    /// standard hard-coded tool re-entry loop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_script: Option<LoopScript>,
 }
 
 /// A long-lived named role incarnation for an agent.
 ///
 /// Node kind: `role_incarnation`. Node key: `role_incarnation:{agent_id}:{role_name}`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RoleIncarnationRecord {
     pub agent_id: String,
     pub role_name: String,
