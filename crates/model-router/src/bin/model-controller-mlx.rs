@@ -56,8 +56,11 @@ async fn main() -> Result<()> {
         "model-controller-mlx starting"
     );
 
-    // Check mlx_lm is available before trying to spawn any managed instances.
-    mlx_runner::server::MlxServerHandle::check_available()?;
+    // Check mlx_lm is importable only if the fleet needs Python (managed instances or transcribe).
+    if fleet_config.needs_python() {
+        let python_path = fleet_config.require_python_path()?;
+        mlx_runner::server::MlxServerHandle::check_available(python_path)?;
+    }
 
     // Build the provider fleet (starts managed instances, attaches to running ones).
     let provider = Arc::new(MlxProvider::from_config(fleet_config).await?);

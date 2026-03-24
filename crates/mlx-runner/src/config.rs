@@ -7,7 +7,32 @@ pub struct MlxFleetConfig {
     /// How often to run background health checks, in seconds. Default: 300.
     #[serde(default = "default_health_interval")]
     pub health_check_interval_secs: u64,
+    /// Python interpreter path for managed instances and whisper subprocess.
+    /// Required when any model has mode=managed or class=transcribe.
+    /// Example: "/usr/local/bin/python3" or "/home/user/.venv/bin/python".
+    /// Omit for attached-only fleets — no Python needed.
+    pub python_path: Option<String>,
     pub models: Vec<MlxModelConfig>,
+}
+
+impl MlxFleetConfig {
+    /// Return the python interpreter path, or an error if it is required but absent.
+    pub fn require_python_path(&self) -> anyhow::Result<&str> {
+        self.python_path
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!(
+                "fleet config requires `python_path` for managed instances or transcribe, \
+                 but it is not set. Add e.g. \"python_path\": \"/usr/local/bin/python3\" \
+                 to your fleet config."
+            ))
+    }
+
+    /// True if any configured model requires a Python subprocess.
+    pub fn needs_python(&self) -> bool {
+        self.models.iter().any(|m| {
+            m.mode == MlxMode::Managed || m.class == MlxModelClass::Transcribe
+        })
+    }
 }
 
 fn default_health_interval() -> u64 {
@@ -76,11 +101,13 @@ pub enum MlxModelClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MlxMode {
-    /// Controller spawns and supervises the mlx_lm.server subprocess.
+    /// Controller attaches to an already-running server at host:port (default).
+    /// The user is responsible for starting and managing the mlx_lm.server process.
     #[default]
-    Managed,
-    /// Controller attaches to an already-running server at host:port.
     Attached,
+    /// Controller spawns and supervises the mlx_lm.server subprocess.
+    /// Requires `python_path` to be set in the fleet config.
+    Managed,
 }
 
 /// Which server binary serves this model. Accommodates future mlx_vlm support.

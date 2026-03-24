@@ -41,8 +41,11 @@ trap cleanup EXIT
 # ── Prerequisites ─────────────────────────────────────────────────────────────
 
 step "Checking prerequisites"
-python3 -c "import mlx_lm" 2>/dev/null || fail "mlx_lm not installed — run: pip install mlx-lm"
-pass "mlx_lm importable"
+# For attached-only smoke, the controller binary has no Python dependency.
+# mlx_lm must be available for starting the server, but not for the controller itself.
+python3 -c "import mlx_lm" 2>/dev/null \
+  || fail "mlx_lm not installed — needed to start smoke server. Run: pip3 install mlx-lm"
+pass "mlx_lm importable (smoke server only — controller itself has no Python dependency)"
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 

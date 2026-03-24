@@ -17,6 +17,8 @@ pub struct MlxProvider {
     text_models: Vec<Arc<MlxModelInstance>>,
     multimodal_models: Vec<Arc<MlxModelInstance>>,
     transcribe_handles: Vec<Arc<MlxWhisperHandle>>,
+    /// Python interpreter path, stored for whisper subprocess invocation.
+    python_path: Option<String>,
 }
 
 impl MlxProvider {
@@ -47,25 +49,34 @@ impl MlxProvider {
             }
         }
 
+        // python_path is only needed for managed instances; None is fine for attached-only fleets.
+        let python_path: Option<String> = config.python_path.clone();
+
         // Start text and multimodal instances in parallel.
         let text_results = futures::future::join_all(
-            text_cfgs.into_iter().map(|cfg| async move {
-                let repo_id = cfg.repo_id.clone();
-                MlxModelInstance::start(cfg)
-                    .await
-                    .map(Arc::new)
-                    .map_err(|e| (repo_id, e))
+            text_cfgs.into_iter().map(|cfg| {
+                let py = python_path.clone();
+                async move {
+                    let repo_id = cfg.repo_id.clone();
+                    MlxModelInstance::start(cfg, py.as_deref())
+                        .await
+                        .map(Arc::new)
+                        .map_err(|e| (repo_id, e))
+                }
             }),
         )
         .await;
 
         let mm_results = futures::future::join_all(
-            mm_cfgs.into_iter().map(|cfg| async move {
-                let repo_id = cfg.repo_id.clone();
-                MlxModelInstance::start(cfg)
-                    .await
-                    .map(Arc::new)
-                    .map_err(|e| (repo_id, e))
+            mm_cfgs.into_iter().map(|cfg| {
+                let py = python_path.clone();
+                async move {
+                    let repo_id = cfg.repo_id.clone();
+                    MlxModelInstance::start(cfg, py.as_deref())
+                        .await
+                        .map(Arc::new)
+                        .map_err(|e| (repo_id, e))
+                }
             }),
         )
         .await;
@@ -94,6 +105,7 @@ impl MlxProvider {
             text_models,
             multimodal_models,
             transcribe_handles,
+            python_path,
         })
     }
 
@@ -272,8 +284,10 @@ impl MlxProvider {
             .and_then(|v| v.as_str())
             .context("AudioTranscribe task missing provider_options.audio_path")?;
 
+        let python_path = self.python_path.as_deref()
+            .context("AudioTranscribe requires python_path in fleet config")?;
         let path = std::path::Path::new(audio_path);
-        let output = handle.transcribe(path).context("mlx_whisper transcription failed")?;
+        let output = handle.transcribe(python_path, path).context("mlx_whisper transcription failed")?;
 
         Ok(ProviderOutput::Text {
             content: output.text.clone(),

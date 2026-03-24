@@ -39,8 +39,9 @@ pub struct MlxModelInstance {
 
 impl MlxModelInstance {
     /// Start or attach to an instance according to its config.
+    /// `python_path` is required when mode is Managed; ignored for Attached.
     /// Performs startup health check and model discovery.
-    pub async fn start(config: MlxModelConfig) -> Result<Self> {
+    pub async fn start(config: MlxModelConfig, python_path: Option<&str>) -> Result<Self> {
         let port = config
             .port
             .ok_or_else(|| anyhow::anyhow!("model {} has no port configured", config.repo_id))?;
@@ -49,7 +50,12 @@ impl MlxModelInstance {
 
         let server = match config.mode {
             MlxMode::Managed => {
-                let handle = MlxServerHandle::spawn(&config.repo_id, port, &config.extra_args)
+                let python_path = python_path
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "model {} requires managed mode but fleet config has no python_path",
+                        config.repo_id
+                    ))?;
+                let handle = MlxServerHandle::spawn(python_path, &config.repo_id, port, &config.extra_args)
                     .with_context(|| format!("failed to spawn server for {}", config.repo_id))?;
                 handle
                     .wait_ready(Duration::from_secs(120))

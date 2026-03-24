@@ -12,46 +12,30 @@ pub struct MlxServerHandle {
 }
 
 impl MlxServerHandle {
-    /// Resolve the Python interpreter to use: `python3` if available, else `python`.
-    /// Public so other modules (e.g. whisper.rs) can reuse the same detection.
-    pub fn python_bin() -> &'static str {
-        // On macOS / modern Linux there is often no bare `python`, only `python3`.
-        if std::process::Command::new("python3")
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-        {
-            "python3"
-        } else {
-            "python"
-        }
-    }
-
-    /// Verify that `mlx_lm` is importable. Call before spawning managed instances to fail fast.
-    pub fn check_available() -> Result<()> {
-        let python = Self::python_bin();
-        let status = Command::new(python)
+    /// Verify that `mlx_lm` is importable using the given Python interpreter.
+    /// Only call this for fleets that have managed instances or transcribe class.
+    pub fn check_available(python_path: &str) -> Result<()> {
+        let status = Command::new(python_path)
             .args(["-c", "import mlx_lm"])
             .status()
-            .with_context(|| format!("failed to invoke {python} to check mlx_lm availability"))?;
+            .with_context(|| format!("failed to invoke `{python_path}` — is it correct?"))?;
         if !status.success() {
-            anyhow::bail!("`mlx_lm` is not installed or not importable. Install with: pip install mlx-lm");
+            anyhow::bail!(
+                "`mlx_lm` is not importable via `{python_path}`. \
+                 Install with: {python_path} -m pip install mlx-lm"
+            );
         }
         Ok(())
     }
 
-    /// Spawn `python3 -m mlx_lm.server --model <repo> --port <port> [extra_args...]`.
-    pub fn spawn(repo_id: &str, port: u16, extra_args: &[String]) -> Result<Self> {
-        let python = Self::python_bin();
-        info!(repo_id, port, python, "spawning mlx_lm.server");
-        let child = Command::new(python)
+    /// Spawn `<python_path> -m mlx_lm.server --model <repo> --port <port> [extra_args...]`.
+    pub fn spawn(python_path: &str, repo_id: &str, port: u16, extra_args: &[String]) -> Result<Self> {
+        info!(repo_id, port, python_path, "spawning mlx_lm.server");
+        let child = Command::new(python_path)
             .args(["-m", "mlx_lm.server", "--model", repo_id, "--port", &port.to_string()])
             .args(extra_args)
             .spawn()
-            .with_context(|| format!("failed to spawn mlx_lm.server for {repo_id}"))?;
+            .with_context(|| format!("failed to spawn mlx_lm.server for {repo_id} via {python_path}"))?;
         Ok(Self {
             child,
             port,
