@@ -51,7 +51,7 @@ start-aiua hotel:
 
 # Rebuild the local runtime binaries that the hotel materializes during watched UAT.
 build-runtime:
-    cargo build -p aiua -p philote -p membrane -p model-router -p tool-runner -p graph-runner
+    cargo build -p aiua -p philote -p membrane -p model-router -p tool-runner -p graph-runner -p philotic-web
 
 # Kill local Philotic hotel/guest binaries from this checkout and clear stale sockets.
 kill-local-stack:
@@ -62,6 +62,7 @@ kill-local-stack:
     @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/model-controller-elevenlabs" || true
     @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/tool-runner" || true
     @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/graph-runner" || true
+    @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/model-controller-mlx" || true
     @rm -f /tmp/philotic-default.sock /tmp/philotic-local-telegram.sock /tmp/philotic-aria-architect-hotel.sock /tmp/philotic-startup-test-hotel.sock
 
 # Rebuild first, then kill stale local runtime processes/sockets, then start one hotel cleanly.
@@ -224,9 +225,13 @@ smoke-session-control:
 smoke-session-bindings:
     ./scripts/smoke-session-bindings-roundtrip.sh
 
-# Run the structured cognitive startup smoke
+# Run the structured cognitive startup smoke (fake Gemini — no live credentials needed)
 smoke-cognitive:
     bash scripts/smoke-cognitive-roundtrip.sh
+
+# Run the cognitive re-entry smoke (session resume + turn loop continuation)
+smoke-cognitive-reentry:
+    bash scripts/smoke-cognitive-reentry-roundtrip.sh
 
 # Run the ONNX embedding sidecar smoke (downloads model on first run, ~300 MB)
 smoke-embed:
@@ -240,6 +245,26 @@ smoke-graph-runner:
 smoke-agent-graph:
     bash scripts/smoke-agent-graph-roundtrip.sh
 
+# Run the model-controller roundtrip smoke (requires mesh-config.json with model credentials)
+smoke-model-controller:
+    bash scripts/smoke-model-controller-roundtrip.sh
+
+# Run the auto-recall smoke (session memory persistence + retrieval)
+smoke-auto-recall:
+    bash scripts/smoke-auto-recall.sh
+
+# Run the remote-model roundtrip smoke (requires two running hotels + model credentials)
+smoke-remote-model:
+    bash scripts/smoke-remote-model-roundtrip.sh
+
+# Run the Gemini OAuth roundtrip smoke (requires live Gemini OAuth credentials)
+smoke-gemini-oauth:
+    bash scripts/smoke-gemini-oauth-roundtrip.sh
+
+# Run the MLX model controller smoke (requires mlx_lm installed + Apple Silicon)
+smoke-mlx:
+    bash scripts/smoke-mlx-controller.sh
+
 # Run the agent-graph-runner cargo integration tests (tool dispatch without live hotel, Seams 3 & 4)
 test-agent-graph:
     cargo test -p agent-graph-runner --test smoke -- --nocapture
@@ -248,35 +273,67 @@ test-agent-graph:
 test-router-trace:
     cargo test -p ansible-mesh-core -- router_trace --nocapture
 
-# Run the trusted vertical-slice verification suite
-verify-vertical-slice:
+# ── UAT Suites ────────────────────────────────────────────────────────────────
+
+# Core unit + integration test suite (no binaries, fast)
+test-suite:
     cargo test -p philotic-client -- --nocapture
     cargo test -p philote -- --nocapture
     cargo test -p aiua -- --nocapture
+    cargo test -p agent-graph-runner --test smoke -- --nocapture
+    cargo test -p ansible-mesh-core -- router_trace --nocapture
+
+# Full binary smoke suite (no external credentials or large model downloads)
+# Covers: routing, approval flows, session lifecycle, cognitive loop, graph runner,
+#         agent graph, subagent, cognitive re-entry.
+smoke-suite:
     ./scripts/smoke-routed-tool-roundtrip.sh
     ./scripts/smoke-approval-roundtrip.sh
+    ./scripts/smoke-deny-roundtrip.sh
+    ./scripts/smoke-approve-steer-roundtrip.sh
+    ./scripts/smoke-deny-redirect-roundtrip.sh
+    ./scripts/smoke-preapprove-roundtrip.sh
     ./scripts/smoke-session-control-roundtrip.sh
     ./scripts/smoke-session-bindings-roundtrip.sh
+    ./scripts/smoke-subagent-roundtrip.sh
+    bash scripts/smoke-cognitive-roundtrip.sh
+    bash scripts/smoke-cognitive-reentry-roundtrip.sh
+    bash scripts/smoke-graph-runner-roundtrip.sh
+    bash scripts/smoke-agent-graph-roundtrip.sh
+
+# Run the trusted vertical-slice verification suite (test-suite + smoke-suite)
+verify-vertical-slice:
+    just test-suite
+    just smoke-suite
 
 # Print the operator checklist for the current trusted vertical slice
 operator-checklist:
-    @echo "Philotic Vertical Slice Operator Checklist"
+    @echo "Philotic Stack UAT Checklist"
     @echo ""
-    @echo "1. Run: just verify-vertical-slice"
-    @echo "2. If you need extra approval-path confidence, also run:"
-    @echo "   - just smoke-deny"
-    @echo "   - just smoke-approve-steer"
-    @echo "   - just smoke-deny-redirect"
-    @echo "   - just smoke-preapprove"
-    @echo "3. For watched-live confidence, start a hotel and verify:"
-    @echo "   - guest processes are alive"
-    @echo "   - guests actually register/subscribe"
-    @echo "   - routed tool flow succeeds"
-    @echo "4. Record the highest honest confidence level:"
-    @echo "   - test-green"
-    @echo "   - smoke-green"
-    @echo "   - watched-live-green"
-    @echo "5. Note any assumption-vs-reality gaps before closing the slice"
+    @echo "── Tier 1: No external deps (run always) ──────────────────────"
+    @echo "  just verify-vertical-slice"
+    @echo "    = just test-suite  (unit + integration tests)"
+    @echo "    + just smoke-suite (binary roundtrip smokes)"
+    @echo ""
+    @echo "── Tier 2: External credentials required ───────────────────────"
+    @echo "  just smoke-model-controller   # mesh-config.json + Gemini key"
+    @echo "  just smoke-auto-recall        # running hotel + agent session"
+    @echo "  just smoke-gemini-oauth       # live Gemini OAuth flow"
+    @echo "  just smoke-remote-model       # two live hotels"
+    @echo ""
+    @echo "── Tier 3: Hardware / large download ───────────────────────────"
+    @echo "  just smoke-embed              # ~300 MB ONNX model download"
+    @echo "  just smoke-mlx                # Apple Silicon + mlx_lm installed"
+    @echo ""
+    @echo "── Watched-live UAT ────────────────────────────────────────────"
+    @echo "  just uat                      # start local-telegram hotel"
+    @echo "  Verify: guests alive, registered, routed tool flow succeeds"
+    @echo ""
+    @echo "── Confidence levels ───────────────────────────────────────────"
+    @echo "  test-green        (just test-suite passes)"
+    @echo "  smoke-green       (just smoke-suite passes)"
+    @echo "  uat-green         (verify-vertical-slice + tier-2 passes)"
+    @echo "  watched-live-green (live hotel + telegram confirms end-to-end)"
 
 # Build release binaries locally (MacBook Air) and push them to mbp-jane via SCP.
 # mbp-jane is a separate machine — it has no repo, only runs Cellar-installed binaries.
@@ -286,7 +343,7 @@ jane-push:
     set -euo pipefail
     REMOTE=mbp-jane
     REMOTE_CELLAR=/opt/homebrew/Cellar/aiua/0.1.0-alpha/bin
-    BINS="aiua philote membrane model-router model-controller-gemini model-controller-elevenlabs philote-worker tool-runner graph-runner"
+    BINS="aiua philote membrane model-router model-controller-gemini model-controller-elevenlabs model-controller-mlx philote-worker tool-runner graph-runner philotic-web"
     # Safety guard: verify we are actually talking to mbp-jane before touching anything.
     # mbp-jane's system hostname is "MacBookPro" — the SSH alias is just our local label.
     ACTUAL_HOST="$(ssh "${REMOTE}" hostname -s 2>/dev/null)"
@@ -295,7 +352,7 @@ jane-push:
         exit 1
     fi
     echo "▶ Building release binaries (local)..."
-    cargo build --release -p aiua -p philote -p membrane -p model-router -p tool-runner -p graph-runner
+    cargo build --release -p aiua -p philote -p membrane -p model-router -p tool-runner -p graph-runner -p philotic-web
     echo "▶ Stopping Jane on ${REMOTE}..."
     ssh "${REMOTE}" "pkill -f '/opt/homebrew/bin/aiua' 2>/dev/null || true; sleep 2"
     echo "▶ Pushing binaries to ${REMOTE}:${REMOTE_CELLAR}..."
