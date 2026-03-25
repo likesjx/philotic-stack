@@ -2458,10 +2458,30 @@ impl AgentRuntime {
                 reason = %decision.reason,
                 "Auto recall skipped: no Muninn memory backend configured."
             );
+            let _ = self
+                .emit_turn_event(
+                    session_id,
+                    "memory_auto_recall_skipped",
+                    Some(format!("Skipped auto recall: no memory backend configured")),
+                )
+                .await;
             return Ok(());
         };
 
-        let decision = engine.evaluate_recall(&recall_context).await?;
+        let decision = match engine.evaluate_recall(&recall_context).await {
+            Ok(d) => d,
+            Err(err) => {
+                warn!(session_id = %session_id, error = %err, "Auto recall skipped: memory engine unavailable.");
+                let _ = self
+                    .emit_turn_event(
+                        session_id,
+                        "memory_auto_recall_skipped",
+                        Some(format!("Skipped auto recall: memory engine unavailable")),
+                    )
+                    .await;
+                return Ok(());
+            }
+        };
         if !decision.should_recall() {
             info!(
                 session_id = %session_id,
@@ -2486,7 +2506,13 @@ impl AgentRuntime {
             "Running auto recall for turn."
         );
 
-        let result = engine.recall_for_turn(&recall_context).await?;
+        let result = match engine.recall_for_turn(&recall_context).await {
+            Ok(r) => r,
+            Err(err) => {
+                warn!(session_id = %session_id, error = %err, "Auto recall failed: memory engine error.");
+                return Ok(());
+            }
+        };
         let recalled_memories = result
             .engrams
             .into_iter()

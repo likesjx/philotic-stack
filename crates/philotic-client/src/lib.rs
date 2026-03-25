@@ -806,6 +806,23 @@ pub enum IpcRequest {
     RegisterComponent {
         manifest: ComponentManifest,
     },
+    /// Inject a remote node incarnation into the local node registry.
+    ///
+    /// Used in smoke / integration tests to simulate mesh discovery without
+    /// requiring live UDP beaconing between hotels.  The injected advertisement
+    /// survives for the registry's normal TTL (15 s) and is subject to the same
+    /// staleness eviction as beacon-sourced entries.
+    SeedRemoteIncarnation {
+        node_id: String,
+        hotel_id: String,
+        incarnation_id: String,
+        target_role: String,
+        /// Optional UDS socket path for this node. When provided the hotel
+        /// will forward tasks addressed to this node directly via the socket
+        /// (smoke-test cross-hotel delivery without full mesh).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        socket_path: Option<String>,
+    },
 }
 
 /// Represents the canonical response from the local Ansible back to the Guest via IPC.

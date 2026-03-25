@@ -24,6 +24,20 @@ pub struct TurnRecord {
     pub created_at: u64,
 }
 
+/// Strip binary/audio payloads from user content before storing in turn history.
+/// Voice messages arrive as `{"audio_base64":"..."}` — 1–2 MB blobs that must
+/// not flow into the model context or checkpoint graph nodes.
+fn sanitize_turn_content_for_history(content: &str) -> String {
+    if content.len() > 500 {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(content) {
+            if v.get("audio_base64").is_some() {
+                return "[voice message]".to_string();
+            }
+        }
+    }
+    content.to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextLayerId {
@@ -478,6 +492,15 @@ pub struct ContextWindowPolicy {
     /// When true (default), assistant turns in the dialogue window include
     /// tool call names and args alongside the response text.
     pub include_tool_calls: bool,
+    /// Maximum characters included per tool result in the tool call history sent
+    /// to the model. Results exceeding this are truncated with a note.
+    /// Default: 32_768, min: 1_000, max: 500_000.
+    #[serde(default = "default_max_tool_result_chars")]
+    pub max_tool_result_chars: usize,
+}
+
+fn default_max_tool_result_chars() -> usize {
+    32_768
 }
 
 impl Default for ContextWindowPolicy {
@@ -486,6 +509,7 @@ impl Default for ContextWindowPolicy {
             dialogue_window_minutes: 10,
             dialogue_window_chars: 10_000,
             include_tool_calls: true,
+            max_tool_result_chars: 32_768,
         }
     }
 }
@@ -1008,7 +1032,7 @@ impl SessionState {
             .unwrap_or(0);
         self.recent_turns.push(TurnRecord {
             turn_id: turn.turn_id.clone(),
-            user_content: turn.user_content.clone(),
+            user_content: sanitize_turn_content_for_history(&turn.user_content),
             assistant_content: Some(assistant_content),
             created_at: now_secs,
         });
@@ -1243,6 +1267,16 @@ impl SessionState {
                 self.settings.context_window.include_tool_calls = v;
                 Ok(format!(
                     "Set settings.context_window.include_tool_calls = {v}."
+                ))
+            }
+            "settings.context_window.max_tool_result_chars" => {
+                let v = value
+                    .as_u64()
+                    .ok_or("settings.context_window.max_tool_result_chars requires a usize")?;
+                let clamped = (v as usize).clamp(1_000, 500_000);
+                self.settings.context_window.max_tool_result_chars = clamped;
+                Ok(format!(
+                    "Set settings.context_window.max_tool_result_chars = {clamped}."
                 ))
             }
             "settings.memory.memory_window_size" => {
@@ -1516,14 +1550,23 @@ impl SessionState {
         let mut prompt = self.build_prompt_with_tools(&turn.user_content, &tools);
 
         if !turn.working_tool_history.is_empty() {
+            let max_result_chars = self.settings.context_window.max_tool_result_chars.max(1_000);
             prompt.push_str("\n\n[Tool call history]\n");
             for (i, (call, result)) in turn.working_tool_history.iter().enumerate() {
                 let args = serde_json::to_string(&call.arguments).unwrap_or_default();
+                let content = if result.content.len() > max_result_chars {
+                    format!(
+                        "{}… [truncated: {} chars total]",
+                        &result.content[..max_result_chars],
+                        result.content.len()
+                    )
+                } else {
+                    result.content.clone()
+                };
                 prompt.push_str(&format!(
                     "Call {n}: {name}({args})\nResult {n}: {content}\n\n",
                     n = i + 1,
                     name = call.tool_name,
-                    content = result.content,
                 ));
             }
             prompt.push_str(
@@ -2043,6 +2086,8 @@ impl SessionState {
 
         // tool_history: accumulated (call, result) pairs from the active turn.
         // Always present in the envelope — empty on initial turn, populated on re-entry.
+        // Results are truncated to max_tool_result_chars to prevent context overflow.
+        let max_result_chars = self.settings.context_window.max_tool_result_chars.max(1_000);
         let tool_history: Vec<Value> = self
             .active_turn
             .as_ref()
@@ -2051,11 +2096,20 @@ impl SessionState {
                     .iter()
                     .enumerate()
                     .map(|(i, (call, result))| {
+                        let result_text = if result.content.len() > max_result_chars {
+                            format!(
+                                "{}… [truncated: {} chars total]",
+                                &result.content[..max_result_chars],
+                                result.content.len()
+                            )
+                        } else {
+                            result.content.clone()
+                        };
                         json!({
                             "index": i + 1,
                             "tool_name": call.tool_name,
                             "arguments": call.arguments,
-                            "result": result.content,
+                            "result": result_text,
                         })
                     })
                     .collect()
@@ -2246,7 +2300,8 @@ impl SessionState {
         if !self.recent_turns.is_empty() {
             let mut recent = String::from("[Recent session context]\n");
             for turn in &self.recent_turns {
-                recent.push_str(&format!("User: {}\n", turn.user_content));
+                let display_content = sanitize_turn_content_for_history(&turn.user_content);
+                recent.push_str(&format!("User: {}\n", display_content));
                 if let Some(reply) = &turn.assistant_content {
                     recent.push_str(&format!("Assistant: {}\n", reply));
                 }
@@ -2696,9 +2751,12 @@ impl SessionState {
             .iter()
             .rev()
             .take(3)
-            .map(|turn| match &turn.assistant_content {
-                Some(reply) => format!("{} -> {}", turn.user_content, reply),
-                None => turn.user_content.clone(),
+            .map(|turn| {
+                let uc = sanitize_turn_content_for_history(&turn.user_content);
+                match &turn.assistant_content {
+                    Some(reply) => format!("{} -> {}", uc, reply),
+                    None => uc,
+                }
             })
             .collect::<Vec<_>>()
             .join(" | ")
@@ -3599,6 +3657,74 @@ mod tests {
         let checkpoint = state.checkpoint_json();
         assert!(checkpoint["active_turn"].is_null());
         assert_eq!(checkpoint["recent_turns"][0]["assistant_content"], "hi");
+    }
+
+    #[test]
+    fn voice_message_is_sanitized_before_storing_in_recent_turns() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        let audio_payload = format!(
+            r#"{{"audio_base64":"{}"}}"#,
+            "A".repeat(1_900_000) // ~1.9MB
+        );
+        state.start_turn(WorkingTurn {
+            task_id: Uuid::nil(),
+            turn_id: "turn-1".into(),
+            chat_id: "123".into(),
+            user_content: audio_payload,
+            final_reply_to: "local-aiua-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase: TurnPhase::Queued,
+            iteration: 0,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
+            active_plan: None,
+            consecutive_step_failures: 0,
+            provider_repair_note: None,
+            provider_repair_attempts: 0,
+            pending_text_reply: None,
+            had_voice_input: false,
+            awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
+        });
+
+        state.complete_active_turn("transcription reply".into());
+        let checkpoint = state.checkpoint_json();
+        let stored_content = checkpoint["recent_turns"][0]["user_content"]
+            .as_str()
+            .unwrap();
+        assert_eq!(stored_content, "[voice message]");
+    }
+
+    #[test]
+    fn stale_audio_in_checkpoint_is_stripped_from_knowledge_projection() {
+        // Regression: old checkpoints on disk may still have raw audio base64 in
+        // recent_turns[].user_content. Ensure project_knowledge() never leaks it.
+        let audio_payload = format!(
+            r#"{{"audio_base64":"{}"}}"#,
+            "B".repeat(1_900_000)
+        );
+        let checkpoint = serde_json::json!({
+            "session_id": "sess-1",
+            "agent_id": "agent-jane-01",
+            "source": "telegram",
+            "recent_turns": [
+                {
+                    "turn_id": "t1",
+                    "user_content": audio_payload,
+                    "assistant_content": "got it",
+                    "created_at": 0u64
+                }
+            ]
+        });
+        let state =
+            SessionState::from_checkpoint(&checkpoint).expect("from_checkpoint must succeed");
+        let knowledge = state.project_knowledge("", &[]);
+        assert!(!knowledge.contains("audio_base64"), "audio base64 must not appear in context");
+        assert!(knowledge.contains("[voice message]"), "placeholder must appear in context");
     }
 
     #[test]

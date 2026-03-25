@@ -3,7 +3,7 @@ title: "Philotic Seam Registry"
 doc_type: workflow
 domain: workflow-docs
 status: active
-last_updated: 2026-03-19
+last_updated: 2026-03-24
 tags:
   - seams
   - ids
@@ -121,6 +121,10 @@ This registry makes the seam layer explicit without forcing every task bullet to
 | `attachable-observability-listeners` | `operator-control-plane` | [ROUTER_NATIVE_OBSERVABILITY_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ROUTER_NATIVE_OBSERVABILITY_PROPOSAL.md) | `docs/task.md` → `New Project: Router-Native Observability` |
 | `vault-secret-refs` | `operator-control-plane` | [KEY_VAULT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/KEY_VAULT_PROPOSAL.md) | `docs/task.md` → `New Project: Key Vault` |
 | `remote-vault-delegation` | `operator-control-plane` | [KEY_VAULT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/KEY_VAULT_PROPOSAL.md) | `docs/task.md` → `New Project: Key Vault` |
+| `elevenlabs-streaming-tts` | `tooling-execution` | [STREAMING_TTS_AND_MUSIC_ANALYSIS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/STREAMING_TTS_AND_MUSIC_ANALYSIS_PROPOSAL.md) | `docs/task.md` → `New Project: Streaming TTS And Music Analysis` |
+| `elevenlabs-stt-surface` | `tooling-execution` | [STREAMING_TTS_AND_MUSIC_ANALYSIS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/STREAMING_TTS_AND_MUSIC_ANALYSIS_PROPOSAL.md) | `docs/task.md` → `New Project: Streaming TTS And Music Analysis` |
+| `onnx-music-analysis-surface` | `tooling-execution` | [STREAMING_TTS_AND_MUSIC_ANALYSIS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/STREAMING_TTS_AND_MUSIC_ANALYSIS_PROPOSAL.md) | `docs/task.md` → `New Project: Streaming TTS And Music Analysis` |
+| `midi-output-artifact` | `tooling-execution` | [STREAMING_TTS_AND_MUSIC_ANALYSIS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/STREAMING_TTS_AND_MUSIC_ANALYSIS_PROPOSAL.md) | `docs/task.md` → `New Project: Streaming TTS And Music Analysis` |
 
 ## Usage Rule
 

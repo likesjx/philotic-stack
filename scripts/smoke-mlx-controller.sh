@@ -142,12 +142,15 @@ if [[ -f "${ROOT_DIR}/mesh-config.json" ]]; then
   export PHILOTIC_MLX_CONFIG="${TMP_DIR}/fleet.json"
 
   cargo build -p aiua -q
+  "${ROOT_DIR}/target/debug/aiua" load \
+    --file "${ROOT_DIR}/mesh-config.json" \
+    --hotel "${HOTEL_NAME}" \
+    >>"${TMP_DIR}/aiua.log" 2>&1
   "${ROOT_DIR}/target/debug/aiua" \
     --hotel "${HOTEL_NAME}" \
-    --load-config "${ROOT_DIR}/mesh-config.json" \
     --test text-roundtrip \
     --test-text "ping from mlx smoke" \
-    >"${TMP_DIR}/aiua.log" 2>&1 || {
+    >>"${TMP_DIR}/aiua.log" 2>&1 || {
       echo "  Hotel roundtrip log:"
       tail -20 "${TMP_DIR}/aiua.log"
       fail "hotel roundtrip failed"

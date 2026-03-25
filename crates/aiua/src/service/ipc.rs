@@ -11,6 +11,7 @@ use ansible_mesh_core::graph::{AbstractSkillRecord, SkillValidationState};
 use ansible_mesh_core::registry::{
     CapabilityAdvertisement, ExecutionReachability, NodeRegistry, NodeStatus,
 };
+use ansible_mesh_core::{NodeCapabilities, NodeConstraints};
 use ansible_mesh_core::storage::{
     ComponentManifest, GuestRecord, HotelRecord, SessionEventRecord, SessionParticipantRecord,
     SessionRecord, SessionTurnRecord,
@@ -147,6 +148,9 @@ pub struct IpcServer {
     subagent_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
     subagent_hooks: SubagentHookRegistry,
     registry: Arc<RwLock<NodeRegistry>>,
+    /// Smoke-test peer socket map: node_id → UDS socket path for direct
+    /// cross-hotel task forwarding without full mesh infrastructure.
+    peer_sockets: Arc<RwLock<HashMap<String, String>>>,
     muninn_config: Option<Arc<memory_core::MuninnConfig>>,
 }
 
@@ -1319,6 +1323,7 @@ impl IpcServer {
             subagent_leases: Arc::new(Mutex::new(RuntimeLeaseRegistry::default())),
             subagent_hooks: Arc::new(Mutex::new(HashMap::new())),
             registry: Arc::new(RwLock::new(NodeRegistry::new())),
+            peer_sockets: Arc::new(RwLock::new(HashMap::new())),
             muninn_config: None,
         }
     }
@@ -1369,6 +1374,7 @@ impl IpcServer {
                     let subagent_leases = self.subagent_leases.clone();
                     let subagent_hooks = self.subagent_hooks.clone();
                     let registry = self.registry.clone();
+                    let peer_sockets = self.peer_sockets.clone();
                     let muninn_config = self.muninn_config.clone();
                     tokio::spawn(async move {
                         if let Err(e) = Self::handle_client(
@@ -1384,6 +1390,7 @@ impl IpcServer {
                             subagent_leases,
                             subagent_hooks,
                             registry,
+                            peer_sockets,
                             muninn_config,
                         )
                         .await
@@ -1412,6 +1419,7 @@ impl IpcServer {
         subagent_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
         subagent_hooks: SubagentHookRegistry,
         registry: Arc<RwLock<NodeRegistry>>,
+        peer_sockets: Arc<RwLock<HashMap<String, String>>>,
         muninn_config: Option<Arc<memory_core::MuninnConfig>>,
     ) -> anyhow::Result<()> {
         let conn_id = Uuid::new_v4();
@@ -1470,6 +1478,7 @@ impl IpcServer {
                             &subagent_leases,
                             &subagent_hooks,
                             &registry,
+                            &peer_sockets,
                             conn_id,
                             &outbound_tx,
                             &mut subscribed_roles,
@@ -2127,6 +2136,7 @@ impl IpcServer {
         subagent_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
         subagent_hooks: &SubagentHookRegistry,
         registry: &Arc<RwLock<NodeRegistry>>,
+        peer_sockets: &Arc<RwLock<HashMap<String, String>>>,
         conn_id: Uuid,
         outbound_tx: &mpsc::UnboundedSender<IpcResponse>,
         subscribed_roles: &mut Vec<String>,
@@ -3137,6 +3147,49 @@ impl IpcServer {
                     trace: vec![],
                 };
                 let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(env)).await;
+                if target_node != local_node_id {
+                    // When a peer socket is registered for this node (smoke-test cross-hotel
+                    // forwarding), relay the task directly via the peer's UDS socket.
+                    let peer_path = peer_sockets.read().await.get(&target_node).cloned();
+                    if let Some(peer_path) = peer_path {
+                        let task_json_fwd = task_json.clone();
+                        let target_node_fwd = target_node.clone();
+                        let target_role_fwd = target_role.clone();
+                        // Strip the "<node_id>:" incarnation prefix from target_guest_id
+                        // before forwarding: the remote hotel's subscriber is registered
+                        // under its short guest_id, not the full incarnation_id.
+                        let target_guest_id_fwd = target_guest_id.as_deref().map(|g| {
+                            let prefix = format!("{}:", target_node);
+                            g.strip_prefix(prefix.as_str()).unwrap_or(g).to_string()
+                        });
+                        tokio::spawn(async move {
+                            match PhiloticClient::connect_at(
+                                &peer_path,
+                                GuestIdentity {
+                                    guest_id: "cross-hotel-proxy".into(),
+                                    role: "proxy".into(),
+                                    supported_tools: vec![],
+                                },
+                            )
+                            .await
+                            {
+                                Ok(mut peer_client) => {
+                                    let _ = peer_client
+                                        .send_request(IpcRequest::EmitTask {
+                                            target_node: target_node_fwd,
+                                            target_role: target_role_fwd,
+                                            target_guest_id: target_guest_id_fwd,
+                                            task_json: task_json_fwd,
+                                        })
+                                        .await;
+                                }
+                                Err(err) => {
+                                    warn!("Cross-hotel proxy failed to connect to {peer_path}: {err}");
+                                }
+                            }
+                        });
+                    }
+                }
                 if target_node == local_node_id {
                     match route_resolution {
                         AgentRouteResolution::Deliver(target_guest_id) => {
@@ -4278,6 +4331,38 @@ impl IpcServer {
             ),
             IpcRequest::RegisterComponent { manifest } => {
                 Self::handle_register_component(graph, materialization_requester, manifest).await
+            }
+            IpcRequest::SeedRemoteIncarnation {
+                node_id,
+                hotel_id,
+                incarnation_id,
+                target_role,
+                socket_path,
+            } => {
+                let caps = NodeCapabilities {
+                    node_id: node_id.clone(),
+                    roles: vec![ansible_mesh_core::NodeRole::AnsibleNode],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: NodeConstraints::default(),
+                };
+                let ad = CapabilityAdvertisement {
+                    hotel_id,
+                    node_id: node_id.clone(),
+                    incarnation_id,
+                    target_role,
+                    availability_state: "live".into(),
+                    selection_hint: None,
+                    latency_hint_ms: None,
+                    max_concurrent_jobs: None,
+                    active_jobs: 0,
+                    queue_depth: 0,
+                };
+                registry.write().await.update_node(caps, vec![ad], None);
+                if let Some(path) = socket_path {
+                    peer_sockets.write().await.insert(node_id, path);
+                }
+                IpcResponse::success("seed_remote_incarnation", None)
             }
         }
     }

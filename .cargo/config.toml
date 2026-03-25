@@ -1,0 +1,5 @@
+[target.aarch64-apple-darwin]
+# ORT (ONNX Runtime) prebuilt binaries reference libclang_rt.osx from the Xcode
+# clang-17 path, but Xcode ships clang 21+. The library lives in the Command Line
+# Tools at the clang-17 path. Add it to the linker search path unconditionally.
+rustflags = ["-L", "/Library/Developer/CommandLineTools/usr/lib/clang/17/lib/darwin"]

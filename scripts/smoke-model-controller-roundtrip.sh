@@ -25,18 +25,15 @@ cargo build -p aiua >/dev/null
 
 echo "Running startup-driven model-controller smoke..."
 if [[ -f "${ROOT_DIR}/mesh-config.json" ]]; then
-  "${ROOT_DIR}/target/debug/aiua" \
+  "${ROOT_DIR}/target/debug/aiua" load \
+    --file "${ROOT_DIR}/mesh-config.json" \
     --hotel "${HOTEL_NAME}" \
-    --load-config "${ROOT_DIR}/mesh-config.json" \
-    --test text-roundtrip \
-    --test-text "${PHILOTIC_SMOKE_USER_CONTENT:-hello model controller}" \
-    >"${TMP_DIR}/aiua.log" 2>&1
-else
-  "${ROOT_DIR}/target/debug/aiua" \
-    --hotel "${HOTEL_NAME}" \
-    --test text-roundtrip \
-    --test-text "${PHILOTIC_SMOKE_USER_CONTENT:-hello model controller}" \
-    >"${TMP_DIR}/aiua.log" 2>&1
+    >>"${TMP_DIR}/aiua.log" 2>&1
 fi
+"${ROOT_DIR}/target/debug/aiua" \
+  --hotel "${HOTEL_NAME}" \
+  --test text-roundtrip \
+  --test-text "${PHILOTIC_SMOKE_USER_CONTENT:-hello model controller}" \
+  >>"${TMP_DIR}/aiua.log" 2>&1
 
 echo "Model-controller smoke round-trip succeeded."

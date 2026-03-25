@@ -4,6 +4,31 @@ use serde_json::Value;
 use tokio::time::{Duration, sleep, timeout};
 use uuid::Uuid;
 
+async fn seed_remote_incarnation(
+    client: &mut PhiloticClient,
+    node_id: &str,
+    hotel_id: &str,
+    incarnation_id: &str,
+    target_role: &str,
+    socket_path: Option<String>,
+) -> Result<()> {
+    let response = client
+        .send_request(IpcRequest::SeedRemoteIncarnation {
+            node_id: node_id.into(),
+            hotel_id: hotel_id.into(),
+            incarnation_id: incarnation_id.into(),
+            target_role: target_role.into(),
+            socket_path,
+        })
+        .await
+        .context("failed to seed remote incarnation")?;
+
+    match response {
+        IpcResponse::Standard { ok: true, .. } => Ok(()),
+        other => bail!("unexpected response while seeding remote incarnation: {other:?}"),
+    }
+}
+
 async fn seed_session_bindings(
     client: &mut PhiloticClient,
     session_id: &str,
@@ -96,6 +121,13 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "remote-model-chat-1".to_string());
     let content = std::env::var("PHILOTIC_SMOKE_USER_CONTENT")
         .unwrap_or_else(|_| "explain the remote model placement smoke".to_string());
+    // The source hotel's node ID — used as task target and final reply destination.
+    // Defaults to the legacy static node ID for backwards compatibility.
+    let local_node_id = std::env::var("PHILOTIC_NODE_ID")
+        .unwrap_or_else(|_| "local-aiua-01".to_string());
+    // Optional: direct UDS socket path of the remote hotel for cross-hotel forwarding
+    // in smoke environments where mesh beaconing is not running.
+    let remote_socket_path = std::env::var("PHILOTIC_REMOTE_HOTEL_SOCKET").ok();
 
     let mut client = PhiloticClient::connect(GuestIdentity {
         guest_id: "remote-model-smoke-membrane".into(),
@@ -104,6 +136,52 @@ async fn main() -> Result<()> {
     })
     .await
     .with_context(|| format!("failed to connect smoke driver to {socket_path}"))?;
+
+    // Inject the remote model-router incarnation into the source hotel's node registry.
+    // In smoke tests, mesh beaconing is disabled (PHILOTIC_SMOKE_MODE=1), so we must
+    // manually inform the source hotel about the remote incarnation for route assembly.
+    // Also provide the remote socket path so the source hotel can forward tasks to the
+    // remote hotel directly via UDS.
+    seed_remote_incarnation(
+        &mut client,
+        &expected_remote_node,
+        &remote_hotel_id,
+        &expected_remote_incarnation,
+        "model",
+        remote_socket_path.clone(),
+    )
+    .await?;
+
+    // Seed the source node into the remote hotel so the remote model-router can forward
+    // its response back to the source agent. We connect to the remote hotel and register
+    // the source node's socket there.
+    if let Some(ref remote_path) = remote_socket_path {
+        let local_hotel_id = local_node_id
+            .strip_suffix("-aiua-01")
+            .unwrap_or(&local_node_id)
+            .to_string();
+        let source_incarnation_id = format!("{}:agent-jane-01", local_node_id);
+        let mut remote_client = PhiloticClient::connect_at(
+            remote_path,
+            GuestIdentity {
+                guest_id: "cross-hotel-setup-probe".into(),
+                role: "probe".into(),
+                supported_tools: Vec::new(),
+            },
+        )
+        .await
+        .context("failed to connect to remote hotel for back-channel seeding")?;
+
+        seed_remote_incarnation(
+            &mut remote_client,
+            &local_node_id,
+            &local_hotel_id,
+            &source_incarnation_id,
+            "agent",
+            Some(socket_path.clone()),
+        )
+        .await?;
+    }
 
     seed_session_bindings(&mut client, &session_id, &remote_hotel_id).await?;
     wait_for_remote_model_route(
@@ -117,7 +195,7 @@ async fn main() -> Result<()> {
 
     let response = client
         .send_request(IpcRequest::EmitTask {
-            target_node: "local-aiua-01".into(),
+            target_node: local_node_id.clone(),
             target_role: "agent".into(),
             target_guest_id: None,
             task_json: serde_json::json!({
@@ -126,7 +204,7 @@ async fn main() -> Result<()> {
                 "turn_id": turn_id,
                 "chat_id": chat_id,
                 "content": content,
-                "final_reply_to": "local-aiua-01",
+                "final_reply_to": local_node_id,
                 "final_reply_role": "membrane",
                 "final_reply_guest_id": "remote-model-smoke-membrane"
             })
