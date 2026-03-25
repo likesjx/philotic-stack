@@ -5,11 +5,12 @@ use model_router::providers::OnnxProvider;
 use model_router::providers::onnx::OnnxProviderConfig;
 use model_router::runtime::{ControllerGuestConfig, run_model_controller};
 use model_router::sidecar::run_sidecar;
-use onnx_runner::EmbeddingsConfig;
+use onnx_runner::{EmbeddingsConfig, TranscribeConfig};
 use std::sync::Arc;
 
 const DEFAULT_SIDECAR_ADDR: &str = "127.0.0.1:11435";
 const DEFAULT_EMBED_REPO: &str = "onnx-community/embeddinggemma-300m-ONNX";
+const DEFAULT_WHISPER_REPO: &str = "onnx-community/whisper-small";
 const DEFAULT_GUEST_ID: &str = "model-onnx-01";
 const DEFAULT_ROLE: &str = "model.local";
 
@@ -32,6 +33,10 @@ struct Args {
     /// HuggingFace repo id for the embedding model (overrides PHILOTIC_ONNX_EMBED_REPO).
     #[arg(long, env = "PHILOTIC_ONNX_EMBED_REPO", default_value = DEFAULT_EMBED_REPO)]
     embed_repo: String,
+
+    /// HuggingFace repo id for the Whisper transcription model (overrides PHILOTIC_ONNX_WHISPER_REPO).
+    #[arg(long, env = "PHILOTIC_ONNX_WHISPER_REPO", default_value = DEFAULT_WHISPER_REPO)]
+    whisper_repo: String,
 
     /// Prefer the quantized ONNX variant (set to "0" to use fp32).
     #[arg(long, env = "PHILOTIC_ONNX_PREFER_QUANTIZED", default_value = "true")]
@@ -58,6 +63,11 @@ async fn main() -> Result<()> {
             prefer_quantized: args.prefer_quantized,
             max_seq_len: 512,
         },
+        transcribe: TranscribeConfig {
+            repo_id: args.whisper_repo.clone(),
+            prefer_quantized: args.prefer_quantized,
+            max_new_tokens: 448,
+        },
         prefer_quantized: args.prefer_quantized,
     };
 
@@ -74,10 +84,11 @@ async fn main() -> Result<()> {
     // the provider into the factory closure.
     let provider = Arc::new(OnnxProvider::load(config)?);
     let shared_embeddings = provider.shared_embeddings();
+    let shared_whisper = provider.shared_whisper();
 
     if args.sidecar_only {
         tracing::info!("sidecar-only mode: skipping hotel IPC registration");
-        run_sidecar(&args.sidecar_addr, shared_embeddings).await
+        run_sidecar(&args.sidecar_addr, shared_embeddings, shared_whisper).await
     } else {
         // Leak the strings into 'static so the ControllerGuestConfig closure
         // can hold them without lifetime issues.
@@ -94,7 +105,7 @@ async fn main() -> Result<()> {
             }),
         });
 
-        let sidecar_task = run_sidecar(&args.sidecar_addr, shared_embeddings);
+        let sidecar_task = run_sidecar(&args.sidecar_addr, shared_embeddings, shared_whisper);
 
         tokio::select! {
             res = ipc_task => {
