@@ -17,7 +17,7 @@ pub struct BeaconDaemon {
     local_capabilities: NodeCapabilities,
     inbox_tx: mpsc::Sender<BeaconMessage>,
     auth: Arc<MeshAuth>,
-    nonce_tracker: Arc<NonceTracker>,
+    nonce_db_path: String,
     enable_rust_auth: bool,
 }
 
@@ -31,21 +31,41 @@ impl BeaconDaemon {
         db_path: &str,
         enable_rust_auth: bool,
     ) -> Result<Self> {
+        Self::bind_with_registry(
+            addr,
+            local_capabilities,
+            inbox_tx,
+            psk,
+            db_path,
+            enable_rust_auth,
+            Arc::new(RwLock::new(NodeRegistry::new())),
+        )
+        .await
+    }
+
+    pub async fn bind_with_registry(
+        addr: &str,
+        local_capabilities: NodeCapabilities,
+        inbox_tx: mpsc::Sender<BeaconMessage>,
+        psk: &str,
+        db_path: &str,
+        enable_rust_auth: bool,
+        registry: Arc<RwLock<NodeRegistry>>,
+    ) -> Result<Self> {
         let socket = UdpSocket::bind(addr)
             .await
             .context(format!("Failed to bind UDP socket to {}", addr))?;
 
         let auth = Arc::new(MeshAuth::new(psk));
-        let nonce_tracker = Arc::new(NonceTracker::open(db_path)?);
 
         info!("Beacon daemon listening on {}", socket.local_addr()?);
         Ok(Self {
             socket: Arc::new(socket),
-            registry: Arc::new(RwLock::new(NodeRegistry::new())),
+            registry,
             local_capabilities,
             inbox_tx,
             auth,
-            nonce_tracker,
+            nonce_db_path: db_path.to_string(),
             enable_rust_auth,
         })
     }
@@ -104,7 +124,17 @@ impl BeaconDaemon {
                     }
 
                     // 2. Replay Guard Nonce Check
-                    if let Err(e) = self.nonce_tracker.assert_and_record_nonce(&msg.msg_id) {
+                    let nonce_tracker = match NonceTracker::open(&self.nonce_db_path) {
+                        Ok(tracker) => tracker,
+                        Err(e) => {
+                            warn!(
+                                "Packet dropped: failed to open nonce tracker for {}: {}",
+                                msg.msg_id, e
+                            );
+                            return;
+                        }
+                    };
+                    if let Err(e) = nonce_tracker.assert_and_record_nonce(&msg.msg_id) {
                         warn!("Packet dropped: {}", e);
                         return;
                     }

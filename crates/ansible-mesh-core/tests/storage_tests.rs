@@ -16,6 +16,7 @@ use ansible_mesh_core::sqlite_storage::{
 use ansible_mesh_core::storage::{
     CursorStorage, EventStorage, GraphStorage, GuestRecord, HotelRecord, SecretRecord,
     SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,
+    VaultRegistryEntry,
 };
 use ansible_mesh_core::{NodeCapabilities, NodeRole};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -88,12 +89,15 @@ fn sample_role_incarnation(role_name: &str) -> RoleIncarnationRecord {
         guest_id: format!("agent-jane:{role_name}"),
         toolset_profile: format!("{role_name}-profile"),
         role_identity_addendum: Some(format!("You are the {role_name} role.")),
+        role_manifest: None,
+        is_admin: false,
         inactive_ttl_seconds: Some(900),
         turn_loop_config: TurnLoopConfig {
             iteration_cap: Some(12),
             approval_policy: Some("default".into()),
             model_profile: Some("gemini-default".into()),
             context_window_policy: Some("balanced".into()),
+            loop_script: None,
         },
     }
 }
@@ -513,6 +517,7 @@ fn sample_guest(id: &str, active: bool) -> GuestRecord {
         config_json: r#"{"command":"agent-core"}"#.into(),
         is_active: active,
         active_pid: None,
+        last_active_at: None,
     }
 }
 
@@ -752,6 +757,32 @@ fn graph_storage_sync_apartment_creates_graph_node_and_edge() {
 }
 
 #[test]
+fn graph_storage_sync_apartment_backfills_missing_agent_identity() {
+    let store = open_graph_storage();
+
+    store
+        .sync_apartment(
+            "agent-unseeded",
+            "short",
+            &serde_json::json!({"summary": "created from sync"}),
+        )
+        .expect("sync apartment should backfill agent identity");
+
+    let identity = store
+        .get_agent_identity("agent-unseeded")
+        .expect("get agent identity")
+        .expect("identity should exist after apartment sync");
+    assert_eq!(identity.agent_id, "agent-unseeded");
+    assert_eq!(identity.persona_name, "agent-unseeded");
+
+    let apartment = store
+        .get_apartment("agent-unseeded", "short")
+        .expect("get apartment")
+        .expect("apartment should exist");
+    assert_eq!(apartment["summary"], "created from sync");
+}
+
+#[test]
 fn graph_storage_get_apartment_returns_latest_checkpoint() {
     let store = open_graph_storage();
     seed_agent_identity(&store, "agent-jane");
@@ -825,6 +856,8 @@ fn graph_storage_lists_role_incarnations_by_agent() {
             guest_id: "agent-aria:researcher".into(),
             toolset_profile: "research-profile".into(),
             role_identity_addendum: None,
+            role_manifest: None,
+            is_admin: false,
             inactive_ttl_seconds: None,
             turn_loop_config: TurnLoopConfig::default(),
         })
@@ -879,9 +912,7 @@ fn graph_storage_toolset_profile_round_trip() {
     assert_eq!(loaded, profile);
 
     let listed = store.list_toolset_profiles().unwrap();
-    assert!(listed
-        .iter()
-        .any(|p| p.profile_name == "orchestrator"));
+    assert!(listed.iter().any(|p| p.profile_name == "orchestrator"));
 }
 
 #[test]
@@ -1274,4 +1305,112 @@ mod ipc_serde_tests {
             _ => panic!("wrong variant"),
         }
     }
+}
+
+// ── MuninnDB config helpers ──────────────────────────────────────────────────
+
+#[test]
+fn muninn_endpoint_round_trip() {
+    let store = open_graph_storage();
+
+    // Absent by default.
+    assert!(store.get_muninn_endpoint().unwrap().is_none());
+
+    store.set_muninn_endpoint("http://127.0.0.1:8475").unwrap();
+    let loaded = store
+        .get_muninn_endpoint()
+        .unwrap()
+        .expect("endpoint present");
+    assert_eq!(loaded, "http://127.0.0.1:8475");
+
+    // Overwrite.
+    store
+        .set_muninn_endpoint("http://muninn.example.com:8475")
+        .unwrap();
+    let updated = store
+        .get_muninn_endpoint()
+        .unwrap()
+        .expect("endpoint present");
+    assert_eq!(updated, "http://muninn.example.com:8475");
+}
+
+#[test]
+fn vault_registry_upsert_and_list() {
+    let store = open_graph_storage();
+
+    // Empty by default.
+    assert!(store.get_vault_registry().unwrap().is_empty());
+
+    // Insert two entries.
+    store
+        .upsert_vault_registry_entry(&VaultRegistryEntry {
+            vault_name: "self_philote-1".into(),
+            secret_ref: "secret://hotel/default/muninn/self-philote-1".into(),
+        })
+        .unwrap();
+    store
+        .upsert_vault_registry_entry(&VaultRegistryEntry {
+            vault_name: "user_jared".into(),
+            secret_ref: "secret://hotel/default/muninn/user-jared".into(),
+        })
+        .unwrap();
+
+    let entries = store.get_vault_registry().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(entries.iter().any(|e| e.vault_name == "self_philote-1"));
+    assert!(entries.iter().any(|e| e.vault_name == "user_jared"));
+}
+
+#[test]
+fn vault_registry_upsert_updates_existing() {
+    let store = open_graph_storage();
+
+    store
+        .upsert_vault_registry_entry(&VaultRegistryEntry {
+            vault_name: "self_philote-1".into(),
+            secret_ref: "secret://hotel/default/muninn/self-philote-1-v1".into(),
+        })
+        .unwrap();
+
+    // Upsert with same vault_name but new secret_ref.
+    store
+        .upsert_vault_registry_entry(&VaultRegistryEntry {
+            vault_name: "self_philote-1".into(),
+            secret_ref: "secret://hotel/default/muninn/self-philote-1-v2".into(),
+        })
+        .unwrap();
+
+    let entries = store.get_vault_registry().unwrap();
+    assert_eq!(entries.len(), 1, "should not duplicate");
+    assert_eq!(
+        entries[0].secret_ref,
+        "secret://hotel/default/muninn/self-philote-1-v2"
+    );
+}
+
+#[test]
+fn vault_registry_remove_entry() {
+    let store = open_graph_storage();
+
+    store
+        .upsert_vault_registry_entry(&VaultRegistryEntry {
+            vault_name: "self_philote-1".into(),
+            secret_ref: "secret://hotel/default/muninn/self-philote-1".into(),
+        })
+        .unwrap();
+    store
+        .upsert_vault_registry_entry(&VaultRegistryEntry {
+            vault_name: "user_jared".into(),
+            secret_ref: "secret://hotel/default/muninn/user-jared".into(),
+        })
+        .unwrap();
+
+    store.remove_vault_registry_entry("self_philote-1").unwrap();
+
+    let entries = store.get_vault_registry().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].vault_name, "user_jared");
+
+    // Remove non-existent — should be a no-op, not an error.
+    store.remove_vault_registry_entry("self_philote-1").unwrap();
 }

@@ -27,7 +27,7 @@ implemented_by:
   - ../../crates/ansible-mesh-core/src/graph.rs
   - ../../crates/ansible-mesh-core/src/storage.rs
   - ../../crates/ansible-mesh-core/src/sqlite_storage.rs
-  - ../../crates/ansible/src/service/ipc.rs
+  - ../../crates/aiua/src/service/ipc.rs
 active_seams:
   - role-incarnation-records
   - active-membrane-routing
@@ -62,7 +62,7 @@ This slice is intentionally narrower than the full proposal:
 - active route selection exists, and unregistered active-incarnation targets now fall back to a live orchestrator when one is present
 - the first parked-delivery/on-demand materialization path exists for inbound agent tasks
 - basic `HandoffToRole` / `HandoffBack` IPC now exists, and active route ownership only flips after the target incarnation is live or registers after on-demand materialization
-- `/role <name>`, `/back`, and `/roles` now exist as manual operator surfaces in `agent-core`, backed by the same hotel handoff/runtime contract and hotel-backed role listing
+- `/role <name>`, `/back`, and `/roles` now exist as manual operator surfaces in `philote`, backed by the same hotel handoff/runtime contract and hotel-backed role listing
 - handoff skill scaffolding, role-profile seeding, inactive TTL reclaim, and subagents remain future slices
 
 Important design shift:
@@ -223,7 +223,11 @@ Those belong to the agent/home-hotel membrane boundary, not the currently active
 
 ## Handoff Skill
 
-Handoff is not a raw IPC call — it is a **defined skill** that incarnations invoke to signal and execute a role transition. This makes handoff parametric, introspectable, and extensible.
+Handoff is not a raw standalone IPC call — it is a **defined skill** that incarnations invoke to signal and execute a role transition. This makes handoff parametric, introspectable, and extensible.
+
+> [!NOTE] 
+> **Transitional Architecture**: Currently, `HandoffToRole` is implemented as a local `IpcRequest` that bypasses the mesh router (`ansible-mesh-core`). This is acceptable while an agent's session is strictly anchored to a single "Home Hotel" node. However, to support future multi-node role splitting (e.g., orchestrator on a local mac, a heavy researcher role on a GPU server), same-identity handoff **must** eventually be routed as a formal `EventKind::SessionControl` payload over the mesh ledger. This ensures session state mutations and handoff bundles remain securely recorded and properly routed across hotel boundaries.
+
 
 For same-identity role transitions, the default semantic meaning is now:
 
@@ -243,7 +247,7 @@ A handoff skill specifies:
 
 ### Delegate/execute split, adapted from OpenClaw
 
-The old OpenClaw `ansible` plugin used a useful split:
+The old OpenClaw `aiua` plugin used a useful split:
 
 - a **delegation-side skill/reference** to decide that work should be handed off and describe the contract
 - an **executor-side skill/reference** owned by the target capability/agent that actually performs the work
@@ -476,13 +480,13 @@ SpawnSubagent {
 ```
 
 The hotel:
-1. Materializes a short-lived `agent-core` process with `PHILOTIC_AGENT_MODE=subagent` and the provided toolset bindings
+1. Materializes a short-lived `philote` process with `PHILOTIC_AGENT_MODE=subagent` and the provided toolset bindings
 2. Sends the subagent a single inbound task (goal + context snapshot) once the process registers
 3. Records the parent association (`parent_task_id → parent_guest_id`)
 4. When the subagent emits `CompleteTask` or `FailTask`, delivers the result to the parent as an `InboundTask` (fully async — the hotel does not block)
 5. Reclaims the subagent process after result delivery
 
-The `agent-core` runtime in subagent mode: after emitting `CompleteTask` or `FailTask`, exit rather than continue listening.
+The `philote` runtime in subagent mode: after emitting `CompleteTask` or `FailTask`, exit rather than continue listening.
 
 Subagents cannot spawn subagents by default. Nested spawning, if later allowed, must cap child TTL to parent's remaining TTL.
 
@@ -587,7 +591,7 @@ Dependencies are real and must be respected:
 
 7. **Inactive TTL + on-demand rematerialization.** Add TTL check to the supervisor loop. Restore session context from memory on rematerialization.
 
-8. **`SpawnSubagent` IPC + subagent runtime mode.** One-shot execution mode in `agent-core`. Async result routing in the hotel.
+8. **`SpawnSubagent` IPC + subagent runtime mode.** One-shot execution mode in `philote`. Async result routing in the hotel.
 
 9. **Memory Tier 2 (`session_facts`) and `UpdateMemory` IPC.** Establish the memory write contract before Tier 4 integration.
 

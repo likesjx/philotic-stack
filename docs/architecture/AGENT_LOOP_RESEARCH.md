@@ -157,7 +157,7 @@ The best approach for Philotic is **not** to clone one vendor loop wholesale.
 The best approach is:
 
 - keep session and turn durability in Philotic's graph/session substrate
-- keep the cognitive loop in `agent-core`
+- keep the cognitive loop in `philote`
 - model loop steps explicitly as state transitions
 - checkpoint at step boundaries
 - treat tool calls, tool results, pauses, and approvals as first-class events

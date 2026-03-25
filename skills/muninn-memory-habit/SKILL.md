@@ -58,9 +58,11 @@ Prefer organizing memory around three questions:
 
 ## Default Habit
 
-### All Muninn calls go through subagents — no direct calls
+### During active work: delegate writes to background subagents
 
-Never call `muninn_*` tools directly in the main thread. All Muninn operations are delegated to Agent subagents.
+During an active session, delegate Muninn writes to background subagents so the main thread is never blocked.
+
+**Exception — session close (check-engine):** call `muninn_remember` / `muninn_remember_batch` directly in the main thread. Do not delegate to a background subagent at close-out — the session may end before the subagent completes, losing the writes. Direct calls at check-engine time are correct and expected.
 
 **Recall → foreground subagent** (result needed before responding):
 

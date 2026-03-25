@@ -408,7 +408,7 @@ to:
 ## Open Questions
 
 1. How should role-local working memory be stored and reactivated across posture switches?
-2. Does the hotel own parked role working memory, or does `agent-core` manage it internally?
+2. Does the hotel own parked role working memory, or does `philote` manage it internally?
 3. What exact packet shape should a role handoff/context shift carry?
 4. What exact delegation packet should subagents receive?
 5. When should a role be allowed to request concurrent materialization of another role rather than spawning a subagent?

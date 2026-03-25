@@ -245,7 +245,7 @@ Default user conversations should stay linear unless there is a meaningful reaso
 
 ### Agent Logic
 
-- allow `agent-core` to create a new session checkpoint from a parent checkpoint
+- allow `philote` to create a new session checkpoint from a parent checkpoint
 - clone only the required prefix/summary into the new branch
 - keep new turns and checkpoints isolated to the forked session
 

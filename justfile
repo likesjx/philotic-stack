@@ -24,55 +24,92 @@ install-git-hooks:
 session-start:
     python3 scripts/muninn_mcp.py bootstrap
 
-# Start the Hotel Manager (Ansible Host Daemon)
-start-ansible hotel:
+# Merge mesh-config.secrets.json into mesh-config.json.
+# mesh-config.secrets.json holds only rotating secrets (API keys, bot tokens).
+# mesh-config.example.json holds the full structure with placeholders — commit that, not the secrets.
+sync-config:
+    #!/usr/bin/env python3
+    import json, sys, os
+    base = json.load(open("mesh-config.json")) if os.path.exists("mesh-config.json") else json.load(open("mesh-config.example.json"))
+    if not os.path.exists("mesh-config.secrets.json"):
+        print("mesh-config.secrets.json not found — nothing to merge"); sys.exit(0)
+    secrets = json.load(open("mesh-config.secrets.json"))
+    def deep_merge(a, b):
+        for k, v in b.items():
+            if k in a and isinstance(a[k], dict) and isinstance(v, dict):
+                deep_merge(a[k], v)
+            else:
+                a[k] = v
+    deep_merge(base, secrets)
+    json.dump(base, open("mesh-config.json", "w"), indent=2)
+    print("mesh-config.json updated from secrets")
+
+# Start the Hotel Manager (Aiua Host Daemon)
+start-aiua hotel:
     cargo build --workspace
-    cargo run -p ansible -- --hotel {{hotel}} --load-config mesh-config.json
+    cargo run -p aiua -- --hotel {{hotel}}
 
 # Rebuild the local runtime binaries that the hotel materializes during watched UAT.
 build-runtime:
-    cargo build -p ansible -p agent-core -p membrane -p model-router
+    cargo build -p aiua -p philote -p membrane -p model-router -p tool-runner -p graph-runner -p philotic-web
 
 # Kill local Philotic hotel/guest binaries from this checkout and clear stale sockets.
 kill-local-stack:
-    @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/ansible" || true
+    @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/aiua" || true
     @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/membrane" || true
-    @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/agent-core" || true
+    @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/philote" || true
     @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/model-controller-gemini" || true
     @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/model-controller-elevenlabs" || true
     @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/tool-runner" || true
-    @rm -f /tmp/philotic-default.sock /tmp/philotic-aria-architect-hotel.sock /tmp/philotic-startup-test-hotel.sock
+    @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/graph-runner" || true
+    @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/model-controller-mlx" || true
+    @rm -f /tmp/philotic-default.sock /tmp/philotic-local-telegram.sock /tmp/philotic-aria-architect-hotel.sock /tmp/philotic-startup-test-hotel.sock
 
 # Rebuild first, then kill stale local runtime processes/sockets, then start one hotel cleanly.
-start-ansible-clean hotel:
+start-aiua-clean hotel:
     just build-runtime
     just kill-local-stack
-    cargo run -p ansible -- --hotel {{hotel}} --load-config mesh-config.json
+    cargo run -p aiua -- --hotel {{hotel}}
 
 # Start the transitional Gemini OAuth flow through the hotel CLI
 gemini-oauth-start client_id project_id:
     @echo "Using GOOGLE_CLIENT_SECRET from env if needed by the OAuth client."
     @echo "On macOS, the hotel will use or create a Keychain-backed vault root key automatically."
     @echo "PHILOTIC_VAULT_MASTER_KEY remains a fallback for non-macOS or explicit override cases."
-    cargo run -p ansible -- auth google start --provider gemini --client-id {{client_id}} --project-id {{project_id}}
+    cargo run -p aiua -- auth google start --provider gemini --client-id {{client_id}} --project-id {{project_id}}
 
 # Validate that stored Gemini OAuth auth can call a real Gemini model
 gemini-oauth-validate:
-    cargo run -p ansible -- auth google validate --provider gemini
+    cargo run -p aiua -- auth google validate --provider gemini
 
-# Start the local UAT stack. Ansible will materialize the gateway, agent, model, and tool guests.
-start-ansible-uat:
-    @echo "Starting UAT stack on hotel 'local-telegram' using mesh-config.json..."
-    @echo "If you are testing Telegram, make sure only one Telegram poller is running for this bot token."
-    cargo run -p ansible -- --hotel local-telegram --load-config mesh-config.json
+# Start the local UAT stack. Aiua will materialize the gateway, agent, model, and tool guests.
+# Pass worktree=<path> to run a worktree's philote binary instead of the main one.
+# Example: just uat worktree=../philotic-stack-philote-role-handoff
+uat worktree="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just kill-local-stack
+    if [ -n "{{worktree}}" ]; then
+        abs="$(cd "{{worktree}}" && pwd)"
+        export PHILOTIC_BIN_DIR="$abs/target/debug"
+        echo "UAT: using worktree binary from $PHILOTIC_BIN_DIR"
+        cargo build --manifest-path "{{worktree}}/Cargo.toml" -p philote
+    fi
+    echo "Starting UAT stack on hotel 'local-telegram'..."
+    echo "Only one Telegram poller should be running for this bot token."
+    cargo run -p aiua -- --hotel local-telegram
+
+# (legacy alias)
+start-aiua-uat:
+    just uat
 
 # Start the Gateway (Telegram Membrane)
 start-gateway:
     cargo run -p membrane
 
-# Start the Persona (Agent Core)
+# Start the Persona (Philote)
 start-agent:
-    cargo run -p agent-core
+    cargo run -p philote
 
 # Start the Mind (Model Router)
 start-model:
@@ -82,17 +119,31 @@ start-model:
 start-tool:
     cargo run -p tool-runner
 
+# Start the Graph Runner (context graph + table adapter)
+start-graph-runner:
+    cargo run -p graph-runner
+
 # Start the full stack in background (requires tmux or similar)
 start:
     @echo "Starting the Philotic Stack..."
     @echo "To run these properly, you should run the individual start-* commands in separate panes."
 
-# Check the status of the local mesh (pings the Ansible host daemon)
+# Check the status of the local mesh (pings the Aiua host daemon)
 status:
     @echo "Checking Philotic Stack local status..."
-    @# Ping the Ansible daemon port or check processes.
-    @ps aux | grep -v grep | grep "cargo run -p ansible" || echo "Ansible daemon is not running."
+    @# Ping the Aiua daemon port or check processes.
+    @ps aux | grep -v grep | grep "cargo run -p aiua" || echo "Aiua daemon is not running."
     @ps aux | grep -v grep | grep "cargo run -p membrane" || echo "Membrane gateway is not running."
+
+# Build and install phil symlink to /usr/local/bin (dev workflow shortcut)
+phil-install:
+    cargo build -p philotic-web
+    @ln -sf "$(pwd)/target/debug/philotic-web" /usr/local/bin/phil
+    @echo "phil installed → /usr/local/bin/phil"
+
+# Run philotic-web CLI (dev shortcut)
+phil *args:
+    cargo run -p philotic-web -- {{args}}
 
 # Format code
 format:
@@ -103,15 +154,15 @@ worktree-create slug base="main":
     ./scripts/codex-worktree.sh create {{slug}} {{base}}
 
 # Bootstrap an implementation workstream with a dedicated sibling worktree and checklist.
-workstream-start slug base="main":
+workstream-start slug base="develop":
     ./scripts/codex-workstream.sh start {{slug}} {{base}}
 
 # Show git status plus hot-file overlap for an active workstream.
-workstream-status slug compare_ref="origin/main":
+workstream-status slug compare_ref="origin/develop":
     ./scripts/codex-workstream.sh status {{slug}} {{compare_ref}}
 
 # Show only hot-file overlap for an active workstream.
-workstream-overlap slug compare_ref="origin/main":
+workstream-overlap slug compare_ref="origin/develop":
     ./scripts/codex-workstream.sh overlap {{slug}} {{compare_ref}}
 
 # List registered git worktrees for this repo.
@@ -174,39 +225,175 @@ smoke-session-control:
 smoke-session-bindings:
     ./scripts/smoke-session-bindings-roundtrip.sh
 
-# Run the structured cognitive startup smoke
+# Run the structured cognitive startup smoke (fake Gemini — no live credentials needed)
 smoke-cognitive:
     bash scripts/smoke-cognitive-roundtrip.sh
 
-# Run the trusted vertical-slice verification suite
-verify-vertical-slice:
+# Run the cognitive re-entry smoke (session resume + turn loop continuation)
+smoke-cognitive-reentry:
+    bash scripts/smoke-cognitive-reentry-roundtrip.sh
+
+# Run the ONNX embedding sidecar smoke (downloads model on first run, ~300 MB)
+smoke-embed:
+    bash scripts/smoke-embed-roundtrip.sh
+
+# Run the graph-runner smoke (create → upsert node → get node → export round-trip)
+smoke-graph-runner:
+    bash scripts/smoke-graph-runner-roundtrip.sh
+
+# Run the agent-graph-runner live smoke (write + declare + sync round-trip, Seams 3 & 4)
+smoke-agent-graph:
+    bash scripts/smoke-agent-graph-roundtrip.sh
+
+# Run the desktop membrane management surface smoke (lease, REST API, auth, clean shutdown)
+smoke-desktop-membrane:
+    bash scripts/smoke-desktop-membrane.sh
+
+# Run the model-controller roundtrip smoke (requires mesh-config.json with model credentials)
+smoke-model-controller:
+    bash scripts/smoke-model-controller-roundtrip.sh
+
+# Run the auto-recall smoke (session memory persistence + retrieval)
+smoke-auto-recall:
+    bash scripts/smoke-auto-recall.sh
+
+# Run the remote-model roundtrip smoke (requires two running hotels + model credentials)
+smoke-remote-model:
+    bash scripts/smoke-remote-model-roundtrip.sh
+
+# Run the Gemini OAuth roundtrip smoke (requires live Gemini OAuth credentials)
+smoke-gemini-oauth:
+    bash scripts/smoke-gemini-oauth-roundtrip.sh
+
+# Run the MLX model controller smoke (requires mlx_lm installed + Apple Silicon)
+smoke-mlx:
+    bash scripts/smoke-mlx-controller.sh
+
+# Run the agent-graph-runner cargo integration tests (tool dispatch without live hotel, Seams 3 & 4)
+test-agent-graph:
+    cargo test -p agent-graph-runner --test smoke -- --nocapture
+
+# Run the router trace cargo tests (RouterTraceStorage unit coverage, Seam 5)
+test-router-trace:
+    cargo test -p ansible-mesh-core -- router_trace --nocapture
+
+# ── UAT Suites ────────────────────────────────────────────────────────────────
+
+# Core unit + integration test suite (no binaries, fast)
+test-suite:
     cargo test -p philotic-client -- --nocapture
-    cargo test -p agent-core -- --nocapture
-    cargo test -p ansible -- --nocapture
+    cargo test -p philote -- --nocapture
+    cargo test -p aiua -- --nocapture
+    cargo test -p agent-graph-runner --test smoke -- --nocapture
+    cargo test -p ansible-mesh-core -- router_trace --nocapture
+
+# Full binary smoke suite (no external credentials or large model downloads)
+# Covers: routing, approval flows, session lifecycle, cognitive loop, graph runner,
+#         agent graph, subagent, cognitive re-entry, desktop membrane.
+smoke-suite:
     ./scripts/smoke-routed-tool-roundtrip.sh
     ./scripts/smoke-approval-roundtrip.sh
+    ./scripts/smoke-deny-roundtrip.sh
+    ./scripts/smoke-approve-steer-roundtrip.sh
+    ./scripts/smoke-deny-redirect-roundtrip.sh
+    ./scripts/smoke-preapprove-roundtrip.sh
     ./scripts/smoke-session-control-roundtrip.sh
     ./scripts/smoke-session-bindings-roundtrip.sh
+    ./scripts/smoke-subagent-roundtrip.sh
+    bash scripts/smoke-cognitive-roundtrip.sh
+    bash scripts/smoke-cognitive-reentry-roundtrip.sh
+    bash scripts/smoke-graph-runner-roundtrip.sh
+    bash scripts/smoke-agent-graph-roundtrip.sh
+    bash scripts/smoke-desktop-membrane.sh
+
+# Run the trusted vertical-slice verification suite (test-suite + smoke-suite)
+verify-vertical-slice:
+    just test-suite
+    just smoke-suite
 
 # Print the operator checklist for the current trusted vertical slice
 operator-checklist:
-    @echo "Philotic Vertical Slice Operator Checklist"
+    @echo "Philotic Stack UAT Checklist"
     @echo ""
-    @echo "1. Run: just verify-vertical-slice"
-    @echo "2. If you need extra approval-path confidence, also run:"
-    @echo "   - just smoke-deny"
-    @echo "   - just smoke-approve-steer"
-    @echo "   - just smoke-deny-redirect"
-    @echo "   - just smoke-preapprove"
-    @echo "3. For watched-live confidence, start a hotel and verify:"
-    @echo "   - guest processes are alive"
-    @echo "   - guests actually register/subscribe"
-    @echo "   - routed tool flow succeeds"
-    @echo "4. Record the highest honest confidence level:"
-    @echo "   - test-green"
-    @echo "   - smoke-green"
-    @echo "   - watched-live-green"
-    @echo "5. Note any assumption-vs-reality gaps before closing the slice"
+    @echo "── Tier 1: No external deps (run always) ──────────────────────"
+    @echo "  just verify-vertical-slice"
+    @echo "    = just test-suite  (unit + integration tests)"
+    @echo "    + just smoke-suite (binary roundtrip smokes, incl. desktop membrane)"
+    @echo ""
+    @echo "── Tier 2: External credentials required ───────────────────────"
+    @echo "  just smoke-model-controller   # mesh-config.json + Gemini key"
+    @echo "  just smoke-auto-recall        # running hotel + Muninn (PHILOTIC_HOTEL_SOCKET must be set)"
+    @echo "  just smoke-gemini-oauth       # live Gemini OAuth flow"
+    @echo "  just smoke-remote-model       # two live hotels"
+    @echo ""
+    @echo "── Tier 3: Hardware / large download ───────────────────────────"
+    @echo "  just smoke-embed              # ~300 MB ONNX model download"
+    @echo "  just smoke-mlx                # Apple Silicon + mlx_lm installed"
+    @echo ""
+    @echo "── Watched-live UAT ────────────────────────────────────────────"
+    @echo "  just uat                      # start local-telegram hotel"
+    @echo "  Verify: guests alive, registered, routed tool flow succeeds"
+    @echo ""
+    @echo "── Confidence levels ───────────────────────────────────────────"
+    @echo "  test-green        (just test-suite passes)"
+    @echo "  smoke-green       (just smoke-suite passes)"
+    @echo "  uat-green         (verify-vertical-slice + tier-2 passes)"
+    @echo "  watched-live-green (live hotel + telegram confirms end-to-end)"
+
+# Build release binaries locally (MacBook Air) and push them to mbp-jane via SCP.
+# mbp-jane is a separate machine — it has no repo, only runs Cellar-installed binaries.
+# Stops Jane on mbp-jane, installs, restarts.
+jane-push:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    REMOTE=mbp-jane
+    REMOTE_CELLAR=/opt/homebrew/Cellar/aiua/0.1.0-alpha/bin
+    BINS="aiua philote membrane model-router model-controller-gemini model-controller-elevenlabs model-controller-mlx philote-worker tool-runner graph-runner philotic-web"
+    # Safety guard: verify we are actually talking to mbp-jane before touching anything.
+    # mbp-jane's system hostname is "MacBookPro" — the SSH alias is just our local label.
+    ACTUAL_HOST="$(ssh "${REMOTE}" hostname -s 2>/dev/null)"
+    if [ "${ACTUAL_HOST}" != "MacBookPro" ]; then
+        echo "❌ Aborting: remote hostname is '${ACTUAL_HOST}', expected 'MacBookPro' (mbp-jane)."
+        exit 1
+    fi
+    echo "▶ Building release binaries (local)..."
+    cargo build --release -p aiua -p philote -p membrane -p model-router -p tool-runner -p graph-runner -p philotic-web
+    echo "▶ Stopping Jane on ${REMOTE}..."
+    ssh "${REMOTE}" "pkill -f '/opt/homebrew/bin/aiua' 2>/dev/null || true; sleep 2"
+    echo "▶ Pushing binaries to ${REMOTE}:${REMOTE_CELLAR}..."
+    for bin in $BINS; do
+        if [ ! -f "target/release/$bin" ]; then
+            echo "  – $bin (not built locally, skipping)"
+            continue
+        fi
+        if ! ssh "${REMOTE}" "test -f '${REMOTE_CELLAR}/$bin'"; then
+            echo "  – $bin (not in remote Cellar, skipping)"
+            continue
+        fi
+        ssh "${REMOTE}" "chmod u+w '${REMOTE_CELLAR}/$bin'"
+        scp -q "target/release/$bin" "${REMOTE}:${REMOTE_CELLAR}/$bin"
+        ssh "${REMOTE}" "chmod u-w '${REMOTE_CELLAR}/$bin'"
+        echo "  ✓ $bin"
+    done
+    echo "▶ Applying config on ${REMOTE}..."
+    ssh "${REMOTE}" "/opt/homebrew/bin/aiua load --file ~/mesh-config.json --hotel default"
+    echo "▶ Starting Jane on ${REMOTE}..."
+    ssh "${REMOTE}" "nohup /opt/homebrew/bin/aiua --hotel default >> ~/.philotic/aiua.log 2>&1 & echo \$! > ~/.philotic/aiua.pid && echo 'aiua started pid '\$(cat ~/.philotic/aiua.pid)"
+    echo "✅ Jane updated and running on ${REMOTE}."
+
+# Stop Jane on mbp-jane without pushing new binaries.
+jane-stop:
+    #!/usr/bin/env bash
+    ssh mbp-jane "pkill -f '/opt/homebrew/bin/aiua' && echo '▶ aiua stopped' || echo '▶ aiua was not running'"
+
+# Start Jane on mbp-jane (without pushing — uses whatever binary is already installed).
+jane-start:
+    #!/usr/bin/env bash
+    ssh mbp-jane "nohup /opt/homebrew/bin/aiua --hotel default >> ~/.philotic/aiua.log 2>&1 & echo \$! > ~/.philotic/aiua.pid && echo 'aiua started pid '\$(cat ~/.philotic/aiua.pid)"
+
+# Check whether Jane (aiua) is running on mbp-jane.
+jane-status:
+    @ssh mbp-jane "ps aux | grep '[/]opt/homebrew/bin/aiua' || echo 'aiua is not running on mbp-jane'"
 
 # Show configured Ansible inventory for deployment targets
 ansible-inventory:

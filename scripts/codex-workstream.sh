@@ -11,7 +11,7 @@ Usage:
 
 Conventions:
   - Worktree bootstrap delegates to scripts/codex-worktree.sh
-  - compare-ref defaults to origin/main
+  - compare-ref defaults to origin/develop
   - hot files are the runtime/docs paths most likely to cause expensive merge drift
 EOF
 }
@@ -22,12 +22,16 @@ die() {
 }
 
 repo_root() {
-    git rev-parse --show-toplevel
+    dirname "$(git rev-parse --path-format=absolute --git-common-dir)"
+}
+
+script_dir() {
+    cd "$(dirname "${BASH_SOURCE[0]}")" && pwd
 }
 
 worktree_path() {
     local slug=$1
-    "$(repo_root)/scripts/codex-worktree.sh" path "${slug}"
+    "$(script_dir)/codex-worktree.sh" path "${slug}"
 }
 
 branch_name() {
@@ -42,9 +46,9 @@ require_worktree() {
 
 hot_file_patterns() {
     cat <<'EOF'
-crates/ansible/src/main.rs
-crates/ansible/src/service/ipc.rs
-crates/agent-core/src/runtime.rs
+crates/aiua/src/main.rs
+crates/aiua/src/service/ipc.rs
+crates/philote/src/runtime.rs
 crates/membrane/src/main.rs
 crates/model-router/src/main.rs
 crates/model-router/src/runtime.rs
@@ -52,7 +56,7 @@ crates/model-router/src/controller.rs
 crates/model-router/src/providers/gemini.rs
 crates/model-router/src/providers/elevenlabs.rs
 crates/philotic-client/src/lib.rs
-crates/ansible/README.md
+crates/aiua/README.md
 docs/task.md
 docs/architecture/MODEL_CONTROLLER_PROPOSAL.md
 EOF
@@ -65,10 +69,10 @@ print_header() {
 
 cmd_start() {
     local slug=${1:-}
-    local base_ref=${2:-main}
+    local base_ref=${2:-develop}
     [ -n "${slug}" ] || die "missing slug"
 
-    "$(repo_root)/scripts/codex-worktree.sh" create "${slug}" "${base_ref}"
+    "$(script_dir)/codex-worktree.sh" create "${slug}" "${base_ref}"
 
     local path
     path=$(worktree_path "${slug}")
@@ -79,7 +83,7 @@ Workstream bootstrap:
   slug:        ${slug}
   branch:      $(branch_name "${slug}")
   worktree:    ${path}
-  compare-ref: origin/main
+  compare-ref: origin/develop
 
 Recommended next steps:
   cd ${path}
@@ -88,14 +92,15 @@ Recommended next steps:
 
 Rules:
   - Keep one active implementation thread per worktree.
-  - Merge or rebase from origin/main before touching hot runtime files.
+  - Merge or rebase from origin/develop before touching hot runtime files.
+  - PRs target develop, not main. main is releases only.
   - Run just workstream-overlap ${slug} before opening a PR.
 EOF
 }
 
 cmd_status() {
     local slug=${1:-}
-    local compare_ref=${2:-origin/main}
+    local compare_ref=${2:-origin/develop}
     [ -n "${slug}" ] || die "missing slug"
 
     local path
@@ -120,7 +125,7 @@ cmd_status() {
 
 cmd_overlap() {
     local slug=${1:-}
-    local compare_ref=${2:-origin/main}
+    local compare_ref=${2:-origin/develop}
     [ -n "${slug}" ] || die "missing slug"
 
     local path changed overlap_file hot_file_list

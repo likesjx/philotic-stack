@@ -16,8 +16,8 @@ When usage elsewhere drifts from those definitions, fix the usage — not the gl
 
 Philotic is a distributed AI agent operating system built around:
 
-- `ansible` as the hotel daemon and canonical context owner
-- materialized guest processes such as `membrane`, `agent-core`, `model-router`, and tool runners
+- `aiua` as the hotel daemon and canonical context owner
+- materialized guest processes such as `membrane`, `philote`, `model-router`, and tool runners
 - a graph-backed context and session model
 - explicit runtime boundaries between cognition, routing, execution, and persistence
 
@@ -34,7 +34,7 @@ Examples:
 - canonical session state in the context graph
 - derived recovery checkpoints in apartments
 - live routing/materialization state in the hotel runtime
-- local working turn state inside `agent-core`
+- local working turn state inside `philote`
 
 If two places appear to own the same thing, stop and resolve the boundary before extending behavior.
 
@@ -77,6 +77,26 @@ If a proposed design has:
 - testability problems
 
 say so clearly and propose the alternative.
+
+### 2.6 Rule Placement
+
+Do not let top-level repo guidance become the only home for bug-preventing rules.
+
+Use this placement heuristic:
+
+- if violating the rule creates a code bug, the rule belongs in code
+- if violating the rule creates team confusion, the rule belongs in workflow/process docs
+- if it does both, enforce it in code and summarize it in process guidance
+
+Code-facing rules should live as close as possible to the enforcing boundary:
+
+- types and schemas
+- parser/serializer logic
+- nearby tests
+- module docs
+- crate READMEs
+
+Process-facing rules should live in repo workflow docs and skills. See [docs/process/WORKFLOW.md](/Users/jaredlikes/code/philotic-stack/docs/process/WORKFLOW.md).
 
 ## 3. Slice Contract
 
@@ -192,6 +212,31 @@ Do not stop at unit tests when the change affects:
 - materialization
 - environment-specific behavior
 
+### 5.3.1 Installed Runtime Truth Gate
+
+When validation depends on an installed or supervised runtime, do not treat source edits or local test binaries as live truth.
+
+Before claiming `smoke-green` or `watched-live-green` on an installed stack:
+
+- verify the installed binary path actually changed
+- verify the running process is using that path
+- verify the relevant supervisor or launch agent actually restarted
+- verify the observed behavior came from the updated runtime, not a stale process or stale cellar binary
+
+If source is fixed but rollout is not proven, say so explicitly. That is `test-green`, not live-green with good intentions.
+
+### 5.3.2 Tool Projection Is Policy
+
+Tool availability is not the same as tool appropriateness.
+
+When exposing tools to a model:
+
+- treat projection as a policy surface, not a passive mirror of bindings
+- suppress high-agency tools on conversational, gratitude, acknowledgment, or otherwise low-intent turns
+- treat voice/transcription re-entry as a first-class policy boundary, not just “text with extra steps”
+
+If a bad model action happened because an inappropriate tool was still visible, fix projection policy before blaming the model alone.
+
 ### 5.4 Decision Capture
 
 When a durable architectural or workflow decision is made, update:
@@ -218,17 +263,67 @@ Before moving on, state:
 
 ## 6. Commit and Push Discipline
 
-Default to one commit/push per coherent slice.
+Default to one commit/push per coherent slice. The quality control is slice size — if the slice is too big to explain cleanly, it is too big to commit cleanly.
 
-Commit messages should:
+### 6.1 Subject Line
 
-- describe the primary change in the subject
-- list the core behavioral or architectural changes in the body
-- mention important verification or operational consequences when relevant
+```
+type(scope): short description
+```
 
-Avoid vague progress commits.
+**Types**: `feat`, `fix`, `chore`, `ops`, `docs`, `refactor`, `test`, `perf`
+**Scope**: crate or area — `aiua`, `membrane`, `philote`, `model-router`, `philotic-web`, `ansible-mesh-core`, `phil`, `skills`
 
-The quality control is slice size. If the slice is too big to explain cleanly, it is probably too big to commit cleanly.
+### 6.2 Body
+
+1–5 bullet points. Focus on *why* and *what changed at the boundary* — not a changelog dump.
+
+### 6.3 Trailers
+
+Trailers are **additive** — include the ones that apply. Do not add empty or N/A placeholders.
+
+| Trailer | When to include |
+|---|---|
+| `Slice: codex/<slug>` | Always, when on a named workstream |
+| `Seam: <seam-id>` | When the change touches a known seam boundary |
+| `Fixes: DEF-NNN` | When closing a tracked defect in `docs/DEFECTS.md` |
+| `Refs: <short-name>` | Architectural cross-link; repeat the line for multiple refs |
+| `Verified: <level>` | Always; be honest: `test-green`, `smoke-green`, `watched-live-green`, `check-only` |
+
+Short names for `Refs:` are preferred — `TELEGRAM_POLL_LEASE_PROPOSAL`, `SEAM_REGISTRY`, `DEFECTS` — not full paths.
+
+### 6.4 Examples
+
+```
+feat(membrane): graceful poll lease release on shutdown
+
+- release lease explicitly on SIGTERM instead of relying on TTL expiry
+- prevents ~30s standby takeover delay during intentional restarts
+
+Slice: codex/telegram-poll-hardening
+Seam: telegram-poll-lease
+Verified: smoke-green (dual-poller handoff)
+```
+
+```
+fix(aiua): dead guest with cleared PID drops poll lease correctly
+
+- cleared PID no longer holds the poll lease open after supervisor reap
+- lease drop fires before supervisor reschedules the slot
+
+Slice: codex/telegram-poll-hardening
+Seam: telegram-poll-lease
+Fixes: DEF-001
+Refs: TELEGRAM_POLL_LEASE_PROPOSAL
+Refs: RUNTIME_AUTHORITY_LEASES_PROPOSAL
+Verified: test-green
+```
+
+```
+chore(skills): add check-engine skill, fix muninn-memory-habit subagent rule
+
+Verified: check-only
+```
 
 ## 7. Testing and Validation Rules
 
@@ -298,12 +393,19 @@ Interpret `SVE refresh` as:
 - re-read [AGENTS.md](/Users/jaredlikes/code/philotic-stack/AGENTS.md)
 - re-read [docs/architecture/README.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/README.md)
 - re-read [docs/architecture/ARCHITECTURE_STATUS.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE_STATUS.md)
+- re-read [docs/architecture/ARCH_RULES.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCH_RULES.md)
+- re-read [docs/architecture/ROADMAP.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ROADMAP.md)
 - re-read [docs/architecture/DOC_TAGGING_FRONTMATTER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DOC_TAGGING_FRONTMATTER_PROPOSAL.md)
+- re-read [docs/process/WORKFLOW.md](/Users/jaredlikes/code/philotic-stack/docs/process/WORKFLOW.md)
 - apply the current repo-local SVE skill/process stack before continuing
+
+The workflow home for the SVE operating loop is [docs/process/WORKFLOW.md](/Users/jaredlikes/code/philotic-stack/docs/process/WORKFLOW.md).
 
 For older open sessions that may not yet know this shorthand, the operator should use the explicit long form once and ask the agent to restate the refreshed protocol before continuing.
 
 ### 8.2 Muninn Failure Rule
+
+The session bootstrap in CLAUDE.md is non-negotiable. It applies on every session start — including sessions resumed from a summary, continued mid-task, or picking up after context compression. A context summary is observed state only; Muninn recall is required for decision history.
 
 When Muninn is required by protocol for meaningful work:
 
@@ -331,7 +433,9 @@ When multiple conversations or workstreams are active in parallel:
 - let one thread own architectural boundary changes while other threads implement within those boundaries
 - capture assumption-vs-reality gaps quickly, because drift accelerates when work is parallel
 
-Use the repo-local worktree workflow in [parallel-worktree-runbook.md](/Users/jaredlikes/code/philotic-stack/docs/operations/parallel-worktree-runbook.md), and prefer:
+Branch model: `codex/<slug>` branches PR into `develop` (integration edge); `develop` merges to `main` when stable. Never merge feature branches directly to `main`.
+
+Use the repo-local worktree workflow and prefer:
 
 - `just workstream-start <slug>`
 - `just workstream-status <slug>`
@@ -356,6 +460,7 @@ The repository contains specialized skills in `skills/` to standardize common wo
 
 | Skill | Purpose |
 |---|---|
+| `check-engine` | **End-of-session review** — memory sweep, MEMORY.md sync, open threads, process gaps, green status |
 | `philotic-slice-closeout` | Finalizing implementation slices (tasks, proposals, commits) |
 | `verification-ladder` | Deciding and reporting the honest validation level |
 | `proposal-maintainer` | Architecture/process proposal and spec hygiene |
@@ -364,6 +469,8 @@ The repository contains specialized skills in `skills/` to standardize common wo
 | `subagent-delegation` | Splitting large tasks into bounded sub-tasks |
 | `runtime-debugger` | Diagnosing live multi-process/multimodal stack failures |
 | `runtime-materialization` | Designing startup/wake/sleep and placement policy |
+| `runtime-rollout-watch` | Proving installed/runtime rollout truth before claiming live validation |
+| `retrospective-workflow` | Running seam-based retrospectives and turning lessons into code/process/SVE changes |
 | `muninn-memory-protocol` | Client adapter contract for memory integration |
 
 ## 12. Repository-Specific Notes

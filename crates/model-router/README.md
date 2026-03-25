@@ -13,6 +13,20 @@ Provider-specific model controllers materialize as separate guests on the mesh.
 - Return results as `TaskResult` events to the requesting agent
 - Host transitional voice-provider work, such as ElevenLabs TTS, until the dedicated voice machine exists
 
+## Local Invariants
+
+Rules that prevent `model-router` bugs should live here, in nearby provider code, and in controller tests.
+
+- Provider adapters preserve the canonical controller contract; provider quirks should not silently flatten it.
+- Tool-enabled turns must preserve real tool schemas when the provider supports them.
+- Non-tool text replies should return structured channels when those channels were requested.
+- Provider-native features are allowed, but they must map back into the shared controller response envelope cleanly.
+
+See:
+
+- `src/controller.rs` for canonical request/response shaping
+- `src/providers/gemini.rs` for Gemini-specific adaptation and schema preservation
+
 ## Routing Logic (MVP)
 
 1. Receive `ModelRouteRequest { task, constraints, preferred_models }`

@@ -8,9 +8,9 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_DIR="$(mktemp -d)"
 HOTEL_NAME="jane-smoke-sub-$$"
-export PHILOTIC_NODE_ID="${HOTEL_NAME}-ansible-01"
-export PHILOTIC_TARGET_NODE="${HOTEL_NAME}-ansible-01"
-export PHILOTIC_FINAL_REPLY_TO="${HOTEL_NAME}-ansible-01"
+export PHILOTIC_NODE_ID="${HOTEL_NAME}-aiua-01"
+export PHILOTIC_TARGET_NODE="${HOTEL_NAME}-aiua-01"
+export PHILOTIC_FINAL_REPLY_TO="${HOTEL_NAME}-aiua-01"
 SOCKET_PATH="/tmp/philotic-${HOTEL_NAME}.sock"
 
 cleanup() {
@@ -18,8 +18,8 @@ cleanup() {
   set +e
   if [[ ${exit_code} -ne 0 ]]; then
     echo "--- subagent smoke FAILED ---"
-    echo "ansible log:"
-    [[ -f "${TMP_DIR}/ansible.log" ]] && cat "${TMP_DIR}/ansible.log"
+    echo "aiua log:"
+    [[ -f "${TMP_DIR}/aiua.log" ]] && cat "${TMP_DIR}/aiua.log"
   fi
   [[ -n "${ANSIBLE_PID:-}" ]] && kill "${ANSIBLE_PID}" >/dev/null 2>&1
   wait "${ANSIBLE_PID:-}" >/dev/null 2>&1
@@ -30,14 +30,14 @@ cleanup() {
 trap cleanup EXIT
 
 echo "Building subagent smoke binaries…"
-cargo build -p ansible -p philotic-client --example subagent_smoke_driver 2>&1 | grep -v "^$"
+cargo build -p aiua -p philotic-client --example subagent_smoke_driver 2>&1 | grep -v "^$"
 
-echo "Starting ansible (smoke mode) in ${TMP_DIR}…"
+echo "Starting aiua (smoke mode) in ${TMP_DIR}…"
 (
   cd "${TMP_DIR}"
   PHILOTIC_SMOKE_MODE=1 \
-    "${ROOT_DIR}/target/debug/ansible" --hotel "${HOTEL_NAME}" \
-    >"${TMP_DIR}/ansible.log" 2>&1
+    "${ROOT_DIR}/target/debug/aiua" --hotel "${HOTEL_NAME}" \
+    >"${TMP_DIR}/aiua.log" 2>&1
 ) &
 ANSIBLE_PID=$!
 
@@ -48,8 +48,8 @@ for _ in {1..50}; do
 done
 
 if [[ ! -S "${SOCKET_PATH}" ]]; then
-  echo "Hotel socket did not appear. ansible log:"
-  cat "${TMP_DIR}/ansible.log"
+  echo "Hotel socket did not appear. aiua log:"
+  cat "${TMP_DIR}/aiua.log"
   exit 1
 fi
 

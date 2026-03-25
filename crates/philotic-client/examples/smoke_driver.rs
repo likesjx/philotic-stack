@@ -9,7 +9,7 @@ async fn main() -> Result<()> {
     let expected =
         std::env::var("PHILOTIC_SMOKE_EXPECTED_REPLY").unwrap_or_else(|_| "pong".to_string());
     let target_node =
-        std::env::var("PHILOTIC_TARGET_NODE").unwrap_or_else(|_| "local-ansible-01".to_string());
+        std::env::var("PHILOTIC_TARGET_NODE").unwrap_or_else(|_| "local-aiua-01".to_string());
     let final_reply_to =
         std::env::var("PHILOTIC_FINAL_REPLY_TO").unwrap_or_else(|_| target_node.clone());
     let session_id = std::env::var("PHILOTIC_SMOKE_SESSION_ID")
@@ -53,25 +53,32 @@ async fn main() -> Result<()> {
         other => bail!("unexpected emit response: {other:?}"),
     }
 
-    let final_reply = timeout(Duration::from_secs(10), client.recv_task())
-        .await
-        .context("timed out waiting for final reply")??;
+    let deadline = Duration::from_secs(10);
+    let mut reply_content = None;
+    for _ in 0..10 {
+        let inbound = timeout(deadline, client.recv_task())
+            .await
+            .context("timed out waiting for final reply")??;
 
-    let IpcResponse::InboundTask { task_json, .. } = final_reply else {
-        bail!("unexpected final reply envelope: {final_reply:?}");
-    };
+        let IpcResponse::InboundTask { task_json, .. } = inbound else {
+            continue;
+        };
 
-    let payload: serde_json::Value =
-        serde_json::from_str(&task_json).context("failed to decode final reply json")?;
-    let action = payload.get("action").and_then(serde_json::Value::as_str);
-    let reply_content = payload
-        .get("content")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
+        let payload: serde_json::Value =
+            serde_json::from_str(&task_json).context("failed to decode final reply json")?;
+        let action = payload.get("action").and_then(serde_json::Value::as_str);
+        if action != Some("send_reply") {
+            continue;
+        }
 
-    if action != Some("send_reply") {
-        bail!("unexpected final reply action: {:?}", action);
+        reply_content = payload
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        break;
     }
+
+    let reply_content = reply_content.context("did not receive send_reply before timeout")?;
     if reply_content != expected {
         bail!(
             "expected final reply {:?}, got {:?}",

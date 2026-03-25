@@ -75,7 +75,7 @@ At **4,911 lines**, `service/ipc.rs` is the single most critical file in the sta
 This is not a criticism of the design process — the proposals are high quality. But the gap between `docs/architecture/` and `crates/` is wide, and it grows with each session.
 
 ### 4. No integration test directories for core crates
-Only `ansible-mesh-core` has a `tests/` directory. `ansible`, `agent-core`, and `membrane` — which contain the most complex runtime behavior — have no integration test layer. The smoke scripts fill some of this gap but are environment-dependent and not CI-runnable.
+Only `ansible-mesh-core` has a `tests/` directory. `aiua`, `philote`, and `membrane` — which contain the most complex runtime behavior — have no integration test layer. The smoke scripts fill some of this gap but are environment-dependent and not CI-runnable.
 
 **Recommendation:** Add at least one integration test per crate that exercises the happy path without a live running hotel where possible (e.g., `GuestManager` can be tested with a mock materializer).
 
@@ -111,5 +111,5 @@ The biggest risk is **proposal accumulation outpacing implementation velocity**.
 1. **Split `ipc.rs`** into sub-modules by concern
 2. **Audit and fix `unwrap()` density** in async task bodies in `ansible/`
 3. **Activate or deprecate `tool-runner`** — resolve its status
-4. **Add one integration test per core crate** (`ansible`, `agent-core`, `membrane`)
+4. **Add one integration test per core crate** (`aiua`, `philote`, `membrane`)
 5. **Close the current branches** before opening new proposal workstreams

@@ -40,7 +40,7 @@ Define a tool model where:
 - the runtime resolves execution routing
 - concrete tool runners perform the work
 
-This keeps implementation details out of the model and out of most of `agent-core`.
+This keeps implementation details out of the model and out of most of `philote`.
 
 The model should not know whether a tool is:
 
@@ -80,7 +80,7 @@ Implemented so far:
   - preferred hotel
   - preferred environment
 - explicit route `selection_reason` values now reflect when a preferred route wins even if it requires materialization
-- `agent-core` now translates abstract tool calls into preassembled route envelopes instead of rediscovering routing at call time
+- `philote` now translates abstract tool calls into preassembled route envelopes instead of rediscovering routing at call time
 
 Still pending in [task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md):
 
@@ -105,8 +105,8 @@ That layer should:
 
 Then:
 
-- `agent-core` plans with the abstract catalog
-- `agent-core` invokes tools through a runtime `ToolExecutor`
+- `philote` plans with the abstract catalog
+- `philote` invokes tools through a runtime `ToolExecutor`
 - `ToolExecutor` dispatches to the resolved runner
 - the runner returns a normalized tool result
 
@@ -192,7 +192,7 @@ Example:
   ],
   "execution_routes": {
     "workspace.read_file": {
-      "target_node": "local-ansible-01",
+      "target_node": "local-aiua-01",
       "target_role": "tool.workspace",
       "runner_id": "workspace-runner-1",
       "execution_mode": "ipc",
@@ -215,7 +215,7 @@ Only `tools_for_model` belongs in prompt/model context.
 Current Philotic implementation note:
 
 - route envelopes now carry runner/incarnation/hotel/environment metadata plus a `selection_reason`
-- `agent-core` uses that prepared envelope when dispatching external tool calls
+- `philote` uses that prepared envelope when dispatching external tool calls
 - `local_agent` tools are resolved entirely within the loop runtime and are intentionally limited to simple logic or self/session configuration behavior
 
 `execution_mode` must stay general. A routed tool may execute over:
@@ -234,7 +234,7 @@ Tool assembly therefore also needs to answer:
 
 ## 3. Agent Tool Abstraction
 
-`agent-core` should not execute real tools directly.
+`philote` should not execute real tools directly.
 
 Instead it should:
 
@@ -268,7 +268,7 @@ Responsibilities:
 - dispatch the call
 - await a normalized result envelope
 
-This can begin as a runtime helper in `agent-core`, but it should conceptually be an execution client to hotel-owned routing metadata, not a pile of local tool implementations.
+This can begin as a runtime helper in `philote`, but it should conceptually be an execution client to hotel-owned routing metadata, not a pile of local tool implementations.
 
 The longer-term routing model should distinguish:
 
@@ -335,7 +335,7 @@ The user should approve:
 
 not:
 
-- “send IPC to `tool.workspace` on `local-ansible-01` with runner lease `abc123`”
+- “send IPC to `tool.workspace` on `local-aiua-01` with runner lease `abc123`”
 
 That would be technically rich and humanly useless.
 
@@ -343,7 +343,7 @@ That would be technically rich and humanly useless.
 
 ### 1. Session snapshot load
 
-`agent-core` loads canonical session snapshot:
+`philote` loads canonical session snapshot:
 
 - session status
 - approval policy
@@ -361,7 +361,7 @@ Hotel/runtime assembles the session tool environment:
 
 ### 3. Prompt construction
 
-`agent-core` includes only abstract tool definitions in the model-facing context.
+`philote` includes only abstract tool definitions in the model-facing context.
 
 ### 4. Tool call
 
@@ -386,7 +386,7 @@ Model returns:
 Hotel routes to the concrete runner:
 
 - `target_role = tool.workspace`
-- `target_node = local-ansible-01`
+- `target_node = local-aiua-01`
 
 ### 7. Result normalization
 
@@ -404,18 +404,18 @@ Runner returns:
 
 ### 8. Loop resume
 
-`agent-core` consumes normalized tool result and continues.
+`philote` consumes normalized tool result and continues.
 
 ## What Belongs Where
 
-### `agent-core`
+### `philote`
 
 - tool planning
 - abstract tool invocation
 - waiting/resume behavior
 - normalized result handling
 
-### `ansible`
+### `aiua`
 
 - canonical session and binding ownership
 - tool assembly
@@ -462,7 +462,7 @@ Skills should not decide process routing directly.
 
 ### Phase 2
 
-- replace local tool execution in `agent-core` with routed execution through `ToolExecutor`
+- replace local tool execution in `philote` with routed execution through `ToolExecutor`
 - persist tool request/result events explicitly
 
 ### Phase 3
@@ -477,7 +477,7 @@ Skills should not decide process routing directly.
 - make sessions define intended capability, not concrete implementation
 - make the hotel own route resolution and runner readiness
 - make tool runners separate components/processes
-- keep `agent-core` focused on planning and normalized orchestration
+- keep `philote` focused on planning and normalized orchestration
 
 That gives us the separation we actually want:
 

@@ -1,6 +1,8 @@
 use anyhow::Result;
 use clap::Parser;
-use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, is_ipc_disconnect};
+use philotic_client::{
+    CommandManifestEntry, GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, is_ipc_disconnect,
+};
 use pulldown_cmark::{
     CodeBlockKind, Event, LinkType, Options, Parser as MarkdownParser, Tag, TagEnd,
 };
@@ -15,7 +17,7 @@ const TELEGRAM_POLL_TIMEOUT_SECS: u64 = 10;
 const TELEGRAM_POLL_LEASE_RENEW_INTERVAL_SECS: u64 = 20;
 
 fn local_node_id() -> String {
-    std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-ansible-01".to_string())
+    std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string())
 }
 
 fn local_guest_id() -> String {
@@ -649,8 +651,9 @@ struct ActiveTurn {
     /// Sending on this channel cancels the typing heartbeat task.
     cancel_typing: oneshot::Sender<()>,
     /// `message_id` of the first message sent for this turn, used for edit-based streaming.
-    #[allow(dead_code)]
     draft_message_id: Option<i64>,
+    /// Telegram thread the turn belongs to, if any.
+    thread_id: Option<String>,
 }
 
 impl ActiveTurn {
@@ -719,12 +722,95 @@ async fn send_telegram_text(
     }
 }
 
+async fn edit_telegram_text(
+    http_client: &reqwest::Client,
+    tg_base: &str,
+    chat_id: &str,
+    message_id: i64,
+    text: &str,
+) -> bool {
+    let formatted = telegram_format_text(text);
+    let edit_url = format!("{tg_base}editMessageText");
+    let payload = json!({
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": formatted.text,
+        "parse_mode": formatted.parse_mode,
+        "disable_web_page_preview": true
+    });
+
+    match http_client.post(&edit_url).json(&payload).send().await {
+        Ok(res) => res.status().is_success(),
+        Err(e) => {
+            error!("editMessageText failed: {}", e);
+            false
+        }
+    }
+}
+
+/// Splits `text` at `\n\n` paragraph boundaries so each chunk fits within `limit` bytes.
+/// Falls back to `\n` line breaks, then hard-splits at `limit` if no breaks are found.
+fn split_at_paragraph_boundary(text: &str, limit: usize) -> Vec<String> {
+    if text.len() <= limit {
+        return vec![text.to_string()];
+    }
+    let mut chunks = Vec::new();
+    let mut remaining = text;
+    while remaining.len() > limit {
+        let split_at = if let Some(pos) = remaining[..limit].rfind("\n\n") {
+            pos + 2
+        } else if let Some(pos) = remaining[..limit].rfind('\n') {
+            pos + 1
+        } else {
+            limit
+        };
+        chunks.push(remaining[..split_at].to_string());
+        remaining = &remaining[split_at..];
+    }
+    if !remaining.is_empty() {
+        chunks.push(remaining.to_string());
+    }
+    chunks
+}
+
+async fn upsert_formatted_text(
+    http_client: &reqwest::Client,
+    tg_base: &str,
+    chat_id: &str,
+    thread_id: Option<&str>,
+    existing_message_id: Option<i64>,
+    text: &str,
+) -> Option<i64> {
+    let chunks = split_at_paragraph_boundary(text, 4096);
+    let Some(first_chunk) = chunks.first() else {
+        return existing_message_id;
+    };
+
+    let first_message_id = match existing_message_id {
+        Some(message_id)
+            if edit_telegram_text(http_client, tg_base, chat_id, message_id, first_chunk).await =>
+        {
+            Some(message_id)
+        }
+        _ => send_telegram_text(http_client, tg_base, chat_id, thread_id, first_chunk).await,
+    };
+
+    for chunk in chunks.iter().skip(1) {
+        send_telegram_text(http_client, tg_base, chat_id, thread_id, chunk).await;
+    }
+
+    first_message_id
+}
+
 /// Commands handled entirely within membrane, before the envelope reaches agent-core.
 /// Returns `true` if the command was handled locally (caller should skip the EmitTask).
 async fn handle_membrane_command(
     http_client: &reqwest::Client,
     tg_base: &str,
     envelope: &TelegramMessageEnvelope,
+    session_id_overrides: &mut HashMap<String, String>,
+    agent_id: &str,
+    agent_cmds: &[CommandManifestEntry],
 ) -> bool {
     let Some(command) = envelope.command.as_deref() else {
         return false;
@@ -740,7 +826,7 @@ async fn handle_membrane_command(
                 tg_base,
                 &envelope.chat_id,
                 envelope.thread_id.as_deref(),
-                &telegram_help_text(),
+                &telegram_help_text(agent_cmds),
             )
             .await;
             true
@@ -753,6 +839,35 @@ async fn handle_membrane_command(
                 &envelope.chat_id,
                 envelope.thread_id.as_deref(),
                 "pong",
+            )
+            .await;
+            true
+        }
+        "/new" => {
+            info!("Membrane handling /new for chat [{}]", envelope.chat_id);
+            let epoch_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let new_session_id = match envelope.thread_id.as_deref() {
+                Some(tid) => format!(
+                    "telegram:{}:{}:{}:{}",
+                    envelope.chat_id, tid, epoch_ms, agent_id
+                ),
+                None => format!("telegram:{}:{}:{}", envelope.chat_id, epoch_ms, agent_id),
+            };
+            let session_key = format!(
+                "{}:{}",
+                envelope.chat_id,
+                envelope.thread_id.as_deref().unwrap_or("")
+            );
+            session_id_overrides.insert(session_key, new_session_id);
+            send_telegram_text(
+                http_client,
+                tg_base,
+                &envelope.chat_id,
+                envelope.thread_id.as_deref(),
+                "Started a new conversation.",
             )
             .await;
             true
@@ -1081,60 +1196,26 @@ fn telegram_command(text: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Native membrane commands — these are always present regardless of what the agent advertises.
+/// Agent-side commands are fetched at startup via `fetch_agent_command_manifest` and merged in.
 const TELEGRAM_MENU_COMMANDS: &[TelegramBotCommand] = &[
     TelegramBotCommand {
         command: "help",
         description: "Show available commands.",
     },
     TelegramBotCommand {
-        command: "commands",
-        description: "List all supported slash commands.",
-    },
-    TelegramBotCommand {
         command: "ping",
         description: "Quick health check.",
     },
     TelegramBotCommand {
-        command: "status",
-        description: "Show current session status.",
-    },
-    TelegramBotCommand {
-        command: "pause",
-        description: "Pause the current session.",
-    },
-    TelegramBotCommand {
-        command: "resume",
-        description: "Resume the current session.",
-    },
-    TelegramBotCommand {
-        command: "role",
-        description: "Switch to a named role.",
-    },
-    TelegramBotCommand {
-        command: "roles",
-        description: "List configured roles and active role.",
-    },
-    TelegramBotCommand {
-        command: "back",
-        description: "Return to the orchestrator role.",
-    },
-    TelegramBotCommand {
-        command: "approve",
-        description: "Approve the pending action.",
-    },
-    TelegramBotCommand {
-        command: "deny",
-        description: "Deny the pending action.",
-    },
-    TelegramBotCommand {
-        command: "tts",
-        description: "Set text-to-speech mode.",
+        command: "new",
+        description: "Start a fresh conversation.",
     },
 ];
 
 const TELEGRAM_MAX_COMMANDS: usize = 100;
 
-fn telegram_help_text() -> String {
+fn telegram_help_text(agent_cmds: &[CommandManifestEntry]) -> String {
     let mut help = String::from("Available Telegram slash commands:\n\n");
     for command in TELEGRAM_MENU_COMMANDS {
         help.push_str(&format!(
@@ -1142,12 +1223,16 @@ fn telegram_help_text() -> String {
             command.command, command.description
         ));
     }
-    help.push_str("\nNotes:\n");
-    help.push_str("/role expects a role name, for example /role developer.\n");
-    help.push_str("/roles lists configured roles and highlights the active one.\n");
-    help.push_str("/back returns the session to the orchestrator role.\n");
-    help.push_str("/approve and /deny can include a note.\n");
-    help.push_str("/tts accepts optional modes like on, off, or auto.");
+    for entry in agent_cmds {
+        if let Some(hint) = &entry.usage_hint {
+            help.push_str(&format!(
+                "/{:<9} {} ({})\n",
+                entry.command, entry.description, hint
+            ));
+        } else {
+            help.push_str(&format!("/{:<9} {}\n", entry.command, entry.description));
+        }
+    }
     help
 }
 
@@ -1170,6 +1255,7 @@ fn normalize_telegram_menu_command_name(command: &str) -> Option<String> {
     (!normalized.is_empty()).then_some(normalized)
 }
 
+#[allow(dead_code)]
 fn build_telegram_menu_commands(commands: &[TelegramBotCommand]) -> Vec<Value> {
     let mut normalized_commands = Vec::new();
     let mut seen = HashSet::new();
@@ -1211,7 +1297,91 @@ fn build_telegram_menu_commands(commands: &[TelegramBotCommand]) -> Vec<Value> {
     normalized_commands
 }
 
-async fn register_telegram_commands(http_client: &reqwest::Client, tg_base: &str) {
+/// Build the Telegram bot command list from native membrane commands plus agent-published entries.
+fn build_combined_telegram_commands(
+    native: &[TelegramBotCommand],
+    agent_cmds: &[CommandManifestEntry],
+) -> Vec<Value> {
+    let mut normalized_commands = Vec::new();
+    let mut seen = HashSet::new();
+
+    let mut push = |name: &str, description: &str| {
+        let Some(normalized_name) = normalize_telegram_menu_command_name(name) else {
+            return;
+        };
+        if !seen.insert(normalized_name.clone()) {
+            return;
+        }
+        normalized_commands.push(json!({
+            "command": normalized_name,
+            "description": description
+        }));
+    };
+
+    for cmd in native {
+        push(cmd.command, cmd.description);
+    }
+    for entry in agent_cmds {
+        push(&entry.command, &entry.description);
+    }
+
+    if normalized_commands.len() > TELEGRAM_MAX_COMMANDS {
+        let overflow = normalized_commands.len() - TELEGRAM_MAX_COMMANDS;
+        warn!(
+            "Telegram command menu has {} entries; truncating {} overflow command(s) to respect Telegram's {} command limit.",
+            normalized_commands.len(),
+            overflow,
+            TELEGRAM_MAX_COMMANDS
+        );
+        normalized_commands.truncate(TELEGRAM_MAX_COMMANDS);
+    }
+
+    normalized_commands
+}
+
+/// Fetch the command manifest that agent-core published to the hotel via `SyncApartment`.
+/// Returns an empty list if the agent hasn't started yet or on any error.
+async fn fetch_agent_command_manifest(
+    ipc_client: &mut PhiloticClient,
+    agent_id: &str,
+) -> Vec<CommandManifestEntry> {
+    let key = format!("__apartment__:{agent_id}:command_manifest");
+    match ipc_client.send_request(IpcRequest::GetConfig { key }).await {
+        Ok(IpcResponse::ConfigData {
+            value_json: Some(json_str),
+            ..
+        }) => match serde_json::from_str::<Vec<CommandManifestEntry>>(&json_str) {
+            Ok(entries) => {
+                info!("Fetched {} agent command manifest entries.", entries.len());
+                entries
+            }
+            Err(e) => {
+                warn!("Failed to parse agent command manifest: {}", e);
+                vec![]
+            }
+        },
+        Ok(IpcResponse::ConfigData {
+            value_json: None, ..
+        }) => {
+            info!("Agent command manifest not yet available; using native commands only.");
+            vec![]
+        }
+        Ok(_) => {
+            warn!("Unexpected IPC response when fetching agent command manifest.");
+            vec![]
+        }
+        Err(e) => {
+            warn!("Failed to fetch agent command manifest: {}", e);
+            vec![]
+        }
+    }
+}
+
+async fn register_telegram_commands(
+    http_client: &reqwest::Client,
+    tg_base: &str,
+    agent_cmds: &[CommandManifestEntry],
+) {
     let delete_url = format!("{tg_base}deleteMyCommands");
     match http_client.post(&delete_url).json(&json!({})).send().await {
         Ok(response) => {
@@ -1224,7 +1394,7 @@ async fn register_telegram_commands(http_client: &reqwest::Client, tg_base: &str
         Err(err) => warn!("deleteMyCommands request failed: {}", err),
     }
 
-    let commands = build_telegram_menu_commands(TELEGRAM_MENU_COMMANDS);
+    let commands = build_combined_telegram_commands(TELEGRAM_MENU_COMMANDS, agent_cmds);
     if commands.is_empty() {
         warn!(
             "Skipping setMyCommands because no Telegram-safe commands remained after normalization."
@@ -1241,8 +1411,10 @@ async fn register_telegram_commands(http_client: &reqwest::Client, tg_base: &str
         Ok(response) => {
             if response.status().is_success() {
                 info!(
-                    "Registered {} Telegram bot commands for menu UI.",
-                    TELEGRAM_MENU_COMMANDS.len()
+                    "Registered {} Telegram bot commands for menu UI ({} native, {} agent).",
+                    commands.len(),
+                    TELEGRAM_MENU_COMMANDS.len(),
+                    agent_cmds.len(),
                 );
             } else {
                 let status = response.status();
@@ -1369,13 +1541,19 @@ async fn release_telegram_poll_lease(
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
-    let args = Args::parse();
-
-    info!("Starting Materialized Membrane (Telegram Gateway) Guest Process...");
-    let guest_id = local_guest_id();
+/// Core seat loop: one IPC connection + one Telegram bot polling indefinitely.
+///
+/// Called once per seat (once in single-seat mode, N times via tokio::spawn in multi-seat).
+async fn run_seat_impl(
+    seat_guest_id: String,
+    telegram_token_key: String,
+    target_agent_id: String,
+    http_client: reqwest::Client,
+    telegram_api_base: String,
+    telegram_file_api_base: String,
+    blob_base: String,
+) -> Result<()> {
+    let guest_id = seat_guest_id;
 
     let identity = GuestIdentity {
         guest_id: guest_id.clone(),
@@ -1384,8 +1562,6 @@ async fn main() -> Result<()> {
     };
 
     let mut ipc_client = PhiloticClient::connect(identity).await?;
-    let target_agent_id = configured_target_agent_id();
-    let telegram_token_key = configured_telegram_token_key();
 
     // Pull configuration from the Hotel Graph dynamically
     info!("Requesting Telegram Configuration from Ansible Context Graph...");
@@ -1459,51 +1635,66 @@ async fn main() -> Result<()> {
     let mut next_lease_renewal =
         tokio::time::Instant::now() + Duration::from_secs(TELEGRAM_POLL_LEASE_RENEW_INTERVAL_SECS);
 
-    // Boot the reqwest client for Telegram API
-    let http_client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()?;
-
-    let telegram_api_base = std::env::var("PHILOTIC_TELEGRAM_API_BASE_URL")
-        .unwrap_or_else(|_| "https://api.telegram.org".to_string())
-        .trim_end_matches('/')
-        .to_string();
-    let telegram_file_api_base = std::env::var("PHILOTIC_TELEGRAM_FILE_API_BASE_URL")
-        .unwrap_or_else(|_| telegram_api_base.clone())
-        .trim_end_matches('/')
-        .to_string();
     let tg_base = format!("{telegram_api_base}/bot{}/", bot_token);
     let tg_file_base = format!("{telegram_file_api_base}/file/bot{}/", bot_token);
-    let blob_base = std::env::var("PHILOTIC_BLOB_BASE_URL")
-        .unwrap_or_else(|_| format!("http://127.0.0.1:{}", args.ansible_port + 1))
-        .trim_end_matches('/')
-        .to_string();
-    register_telegram_commands(&http_client, &tg_base).await;
+    let agent_cmds = fetch_agent_command_manifest(&mut ipc_client, &target_agent_id).await;
+    register_telegram_commands(&http_client, &tg_base, &agent_cmds).await;
     let mut offset: i64 = 0;
     // session_id → ActiveTurn for in-flight agent turns.
     let mut active_turns: HashMap<String, ActiveTurn> = HashMap::new();
+    // (chat_id:thread_id) → overridden session_id, set by /new.
+    let mut session_id_overrides: HashMap<String, String> = HashMap::new();
 
     info!("Starting Telegram long-polling loop...");
 
+    // Poll task: spawned so that arriving IPC messages (agent replies) never cancel
+    // the in-flight getUpdates HTTP request.  A cancelled request leaves a zombie
+    // session on Telegram's server and causes immediate Conflict on the next retry.
+    let mut poll_handle: Option<tokio::task::JoinHandle<Result<Value, reqwest::Error>>> = None;
+    // When set, do not start a new poll until this instant (Conflict back-off).
+    let mut poll_resume_at: Option<tokio::time::Instant> = None;
+
     // Main Long-Polling Loop
     loop {
-        let url = format!("{}getUpdates", tg_base);
-        let params = [
-            ("offset", offset.to_string()),
-            ("timeout", TELEGRAM_POLL_TIMEOUT_SECS.to_string()),
-            (
-                "allowed_updates",
-                "[\"message\",\"callback_query\"]".to_string(),
-            ),
-        ];
+        // Start a new poll if none is in flight and we are not in back-off.
+        if poll_handle.is_none() {
+            let ready = poll_resume_at.map_or(true, |t| tokio::time::Instant::now() >= t);
+            if ready {
+                poll_resume_at = None;
+                let url = format!("{}getUpdates", tg_base);
+                let off = offset;
+                let client = http_client.clone();
+                poll_handle = Some(tokio::spawn(async move {
+                    let res = client
+                        .get(&url)
+                        .query(&[
+                            ("offset", off.to_string()),
+                            ("timeout", TELEGRAM_POLL_TIMEOUT_SECS.to_string()),
+                            (
+                                "allowed_updates",
+                                "[\"message\",\"callback_query\"]".to_string(),
+                            ),
+                        ])
+                        .send()
+                        .await?;
+                    res.json::<Value>().await
+                }));
+            }
+        }
 
         tokio::select! {
             // Branch 1: Wait for Telegram Updates (Long Polling)
-            http_result = http_client.get(&url).query(&params).send() => {
+            // The request runs in an independent tokio task so that the IPC branch
+            // (below) never cancels it mid-flight.
+            poll_result = poll_handle.as_mut().unwrap(), if poll_handle.is_some() => {
+                poll_handle = None;
+                let http_result: Result<Value, reqwest::Error> = match poll_result {
+                    Ok(r) => r,
+                    Err(e) => { warn!("Poll task panicked: {}", e); continue; }
+                };
                 match http_result {
-                    Ok(res) => {
-                        if let Ok(json) = res.json::<Value>().await {
-                            if let Some(result) = json.get("result").and_then(|r| r.as_array()) {
+                    Ok(json) => {
+                        if let Some(result) = json.get("result").and_then(|r| r.as_array()) {
                                 for update in result {
                                     if let Some(update_id) = update.get("update_id").and_then(|id| id.as_i64()) {
                                         offset = update_id + 1; // Ack the message
@@ -1518,6 +1709,17 @@ async fn main() -> Result<()> {
                                                     envelope.attachments,
                                                 ).await;
                                             }
+
+                                            // Apply any active /new session override for this chat.
+                                            let session_key = format!(
+                                                "{}:{}",
+                                                envelope.chat_id,
+                                                envelope.thread_id.as_deref().unwrap_or("")
+                                            );
+                                            if let Some(sid) = session_id_overrides.get(&session_key) {
+                                                envelope.session_id = sid.clone();
+                                            }
+
                                             info!(
                                                 "Received Telegram {} message from chat [{}]{}: {}",
                                                 envelope.message_kind,
@@ -1536,6 +1738,9 @@ async fn main() -> Result<()> {
                                                 &http_client,
                                                 &tg_base,
                                                 &envelope,
+                                                &mut session_id_overrides,
+                                                &target_agent_id,
+                                                &agent_cmds,
                                             )
                                             .await
                                             {
@@ -1546,7 +1751,7 @@ async fn main() -> Result<()> {
                                             let task_req = IpcRequest::EmitTask {
                                                 target_node: local_node_id.clone(),
                                                 target_role: "agent".into(),
-                                                target_guest_id: None,
+                                                target_guest_id: Some(target_agent_id.clone()),
                                                 task_json: json!({
                                                     "source": "telegram",
                                                     "transport": "telegram",
@@ -1581,6 +1786,7 @@ async fn main() -> Result<()> {
                                                         ActiveTurn {
                                                             cancel_typing: cancel_tx,
                                                             draft_message_id: None,
+                                                            thread_id: envelope.thread_id.clone(),
                                                         },
                                                     );
                                                 }
@@ -1591,44 +1797,29 @@ async fn main() -> Result<()> {
                                 }
                             } else if let Some(desc) = json.get("description").and_then(|d| d.as_str()) {
                                 error!("Telegram API Error: {}", desc);
+                                // On Conflict, schedule a back-off before the next poll.
+                                // We do NOT sleep here so that IPC messages (agent replies) are
+                                // still processed during the back-off window.
+                                if desc.contains("Conflict") {
+                                    poll_resume_at = Some(
+                                        tokio::time::Instant::now()
+                                            + Duration::from_secs(TELEGRAM_POLL_TIMEOUT_SECS + 2),
+                                    );
+                                }
                             }
-                        }
                     }
                     Err(e) => {
                         warn!("Telegram Long Polling failed: {}. Retrying in 5s...", e);
-                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        poll_resume_at = Some(
+                            tokio::time::Instant::now() + Duration::from_secs(5),
+                        );
                     }
                 }
             }
 
-            _ = tokio::time::sleep_until(next_lease_renewal) => {
-                match renew_telegram_poll_lease(
-                    &mut ipc_client,
-                    &poll_lease_key,
-                    &target_agent_id,
-                    poll_lease_epoch,
-                ).await {
-                    Ok(lease_epoch) => {
-                        poll_lease_epoch = lease_epoch;
-                        next_lease_renewal = tokio::time::Instant::now()
-                            + Duration::from_secs(TELEGRAM_POLL_LEASE_RENEW_INTERVAL_SECS);
-                    }
-                    Err(err) => {
-                        warn!(
-                            "Failed to renew Telegram poll lease [{}]: {}. Membrane will stop polling.",
-                            poll_lease_key, err
-                        );
-                        if let Err(release_err) =
-                            release_telegram_poll_lease(&mut ipc_client, &poll_lease_key).await
-                        {
-                            warn!(
-                                "Failed to release Telegram poll lease [{}] during shutdown: {}",
-                                poll_lease_key, release_err
-                            );
-                        }
-                        return Ok(());
-                    }
-                }
+            // Back-off timer: fires when poll_resume_at expires so we don't busy-loop.
+            _ = tokio::time::sleep_until(poll_resume_at.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(86400))), if poll_handle.is_none() && poll_resume_at.is_some() => {
+                poll_resume_at = None;
             }
 
             _ = tokio::signal::ctrl_c() => {
@@ -1669,20 +1860,53 @@ async fn main() -> Result<()> {
                                     }
                                 }
                                 // waiting_tool and waiting_model: typing continues — no action needed.
+                            } else if action == "partial_reply" {
+                                let content = task.get("content").and_then(Value::as_str).unwrap_or_default().to_string();
+                                info!(
+                                    "Partial reply observed for session [{}] ({} chars); typing continues until final reply.",
+                                    session_id,
+                                    content.len()
+                                );
+                                if !chat_id.is_empty() && !content.is_empty() {
+                                    let (draft_message_id, thread_id) = active_turns
+                                        .get(&session_id)
+                                        .map(|active| (active.draft_message_id, active.thread_id.clone()))
+                                        .unwrap_or((None, None));
+                                    if let Some(message_id) = upsert_formatted_text(
+                                        &http_client,
+                                        &tg_base,
+                                        &chat_id,
+                                        thread_id.as_deref(),
+                                        draft_message_id,
+                                        &content,
+                                    ).await {
+                                        if let Some(active) = active_turns.get_mut(&session_id) {
+                                            active.draft_message_id = Some(message_id);
+                                        }
+                                    }
+                                }
                             } else {
                                 // send_reply (or any unrecognised action): deliver to Telegram and
                                 // cancel the typing heartbeat for this session.
-                                if let Some(active) = active_turns.remove(&session_id) {
+                                let (draft_message_id, active_thread_id) = if let Some(active) = active_turns.remove(&session_id) {
+                                    let draft_message_id = active.draft_message_id;
+                                    let active_thread_id = active.thread_id.clone();
                                     active.cancel();
-                                }
+                                    (draft_message_id, active_thread_id)
+                                } else {
+                                    (None, None)
+                                };
 
                                 let content = task.get("content").and_then(|c| c.as_str()).unwrap_or_default().to_string();
+                                let thread_id = task.get("thread_id").and_then(|v| v.as_str()).map(str::to_string).or(active_thread_id);
                                 let audio_artifact_json = task.get("audio_artifact").and_then(|a| a.as_str()).map(str::to_string);
                                 let send_text_caption = task.get("send_text_caption").and_then(|v| v.as_bool()).unwrap_or(false);
 
                                 if !chat_id.is_empty() {
                                     let http_client_clone = http_client.clone();
                                     let tg_base_clone = tg_base.clone();
+                                    let thread_id_clone = thread_id.clone();
+                                    let draft_message_id = draft_message_id;
 
                                     tokio::spawn(async move {
                                         // Voice path: send audio first, then optional text caption.
@@ -1722,33 +1946,26 @@ async fn main() -> Result<()> {
 
                                             // Also send text as a follow-up caption if requested.
                                             if send_text_caption && !content.is_empty() {
-                                                let formatted = telegram_format_text(&content);
-                                                let send_url = format!("{}sendMessage", tg_base_clone);
-                                                let payload = json!({
-                                                    "chat_id": chat_id,
-                                                    "text": formatted.text,
-                                                    "parse_mode": formatted.parse_mode,
-                                                    "disable_web_page_preview": true
-                                                });
-                                                if let Err(e) = http_client_clone.post(&send_url).json(&payload).send().await {
-                                                    error!("Failed to send text caption after audio: {}", e);
-                                                }
+                                                let _ = upsert_formatted_text(
+                                                    &http_client_clone,
+                                                    &tg_base_clone,
+                                                    &chat_id,
+                                                    thread_id_clone.as_deref(),
+                                                    draft_message_id,
+                                                    &content,
+                                                ).await;
                                             }
                                         } else if !content.is_empty() {
                                             // Text-only path.
-                                            let formatted = telegram_format_text(&content);
-                                            let send_url = format!("{}sendMessage", tg_base_clone);
-                                            let payload = json!({
-                                                "chat_id": chat_id,
-                                                "text": formatted.text,
-                                                "parse_mode": formatted.parse_mode,
-                                                "disable_web_page_preview": true
-                                            });
                                             info!("Sending final response back to Telegram Chat [{}]...", chat_id);
-                                            match http_client_clone.post(&send_url).json(&payload).send().await {
-                                                Ok(_) => info!("Telegram Response Sent Successfully!"),
-                                                Err(e) => error!("Failed to send Telegram Response: {}", e),
-                                            }
+                                            let _ = upsert_formatted_text(
+                                                &http_client_clone,
+                                                &tg_base_clone,
+                                                &chat_id,
+                                                thread_id_clone.as_deref(),
+                                                draft_message_id,
+                                                &content,
+                                            ).await;
                                         }
                                     });
                                 } else {
@@ -1768,17 +1985,150 @@ async fn main() -> Result<()> {
                 }
             }
         }
+
+        // Renew lease between polls (never mid-poll) to avoid cancelling in-flight HTTP requests.
+        if tokio::time::Instant::now() >= next_lease_renewal {
+            match renew_telegram_poll_lease(
+                &mut ipc_client,
+                &poll_lease_key,
+                &target_agent_id,
+                poll_lease_epoch,
+            )
+            .await
+            {
+                Ok(epoch) => {
+                    poll_lease_epoch = epoch;
+                    next_lease_renewal = tokio::time::Instant::now()
+                        + Duration::from_secs(TELEGRAM_POLL_LEASE_RENEW_INTERVAL_SECS);
+                }
+                Err(err) => {
+                    warn!(
+                        "Failed to renew Telegram poll lease [{}]: {}. Seat exiting.",
+                        poll_lease_key, err
+                    );
+                    let _ = release_telegram_poll_lease(&mut ipc_client, &poll_lease_key).await;
+                    return Ok(());
+                }
+            }
+        }
     }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
+    let args = Args::parse();
+
+    info!("Starting Materialized Membrane (Telegram Gateway) Guest Process...");
+
+    let http_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()?;
+
+    let telegram_api_base = std::env::var("PHILOTIC_TELEGRAM_API_BASE_URL")
+        .unwrap_or_else(|_| "https://api.telegram.org".to_string())
+        .trim_end_matches('/')
+        .to_string();
+    let telegram_file_api_base = std::env::var("PHILOTIC_TELEGRAM_FILE_API_BASE_URL")
+        .unwrap_or_else(|_| telegram_api_base.clone())
+        .trim_end_matches('/')
+        .to_string();
+    let blob_base = std::env::var("PHILOTIC_BLOB_BASE_URL")
+        .unwrap_or_else(|_| format!("http://127.0.0.1:{}", args.ansible_port + 1))
+        .trim_end_matches('/')
+        .to_string();
+
+    // ── Multi-seat mode ────────────────────────────────────────────────────────
+    // PHILOTIC_AGENT_ROSTER is set by aiua when running a multi-agent hotel.
+    // It's a JSON array of {agent_key, agent_id} objects — one entry per agent.
+    // One seat task is spawned per entry, each with its own IPC connection.
+    if let Ok(roster_json) = std::env::var("PHILOTIC_AGENT_ROSTER") {
+        if !roster_json.trim().is_empty() {
+            let roster: Vec<Value> = serde_json::from_str(&roster_json).unwrap_or_default();
+            let hotel_guest_id = local_guest_id(); // e.g. "default:membrane-gateway"
+
+            let mut tasks = Vec::new();
+            for entry in &roster {
+                let agent_key = entry.get("agent_key").and_then(Value::as_str).unwrap_or("");
+                let agent_id = entry.get("agent_id").and_then(Value::as_str).unwrap_or("");
+                if agent_key.is_empty() || agent_id.is_empty() {
+                    warn!(
+                        "Skipping roster entry with missing agent_key or agent_id: {}",
+                        entry
+                    );
+                    continue;
+                }
+                // Each seat registers under the per-agent guest_id so that philote reply
+                // routing (final_reply_guest_id) lands in the correct seat's inbox.
+                let seat_guest_id = format!("{}-{}", hotel_guest_id, agent_key);
+                let token_key = format!("telegram_bot_token_{}", agent_key);
+
+                info!(
+                    "Spawning seat for agent [{}] (guest_id: {})",
+                    agent_id, seat_guest_id
+                );
+                let agent_id = agent_id.to_string();
+                let http = http_client.clone();
+                let tg_api = telegram_api_base.clone();
+                let tg_file = telegram_file_api_base.clone();
+                let blob = blob_base.clone();
+
+                tasks.push(tokio::spawn(async move {
+                    if let Err(e) = run_seat_impl(
+                        seat_guest_id.clone(),
+                        token_key,
+                        agent_id,
+                        http,
+                        tg_api,
+                        tg_file,
+                        blob,
+                    )
+                    .await
+                    {
+                        error!("Seat [{}] exited with error: {}", seat_guest_id, e);
+                    }
+                }));
+            }
+
+            if tasks.is_empty() {
+                warn!("PHILOTIC_AGENT_ROSTER contained no valid seats. Membrane exiting.");
+                return Ok(());
+            }
+
+            // All seats run indefinitely. Wait for all to exit (IPC disconnect or ctrl-c).
+            for task in tasks {
+                let _ = task.await;
+            }
+            return Ok(());
+        }
+    }
+
+    // ── Single-seat legacy mode (backward compat / single-agent hotels) ────────
+    let guest_id = local_guest_id();
+    let target_agent_id = configured_target_agent_id();
+    let telegram_token_key = configured_telegram_token_key();
+
+    run_seat_impl(
+        guest_id,
+        telegram_token_key,
+        target_agent_id,
+        http_client,
+        telegram_api_base,
+        telegram_file_api_base,
+        blob_base,
+    )
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         TELEGRAM_MAX_COMMANDS, TELEGRAM_MENU_COMMANDS, TelegramBotCommand, TelegramFileRef,
-        build_telegram_menu_commands, default_attachment_name, enrich_attachment_with_transport,
-        normalize_telegram_menu_command_name, telegram_command, telegram_format_text,
-        telegram_help_text, telegram_inbound_envelope,
+        build_combined_telegram_commands, build_telegram_menu_commands, default_attachment_name,
+        enrich_attachment_with_transport, normalize_telegram_menu_command_name, telegram_command,
+        telegram_format_text, telegram_help_text, telegram_inbound_envelope,
     };
+    use philotic_client::CommandManifestEntry;
     use serde_json::json;
 
     #[test]
@@ -1993,9 +2343,35 @@ mod tests {
 
     #[test]
     fn telegram_help_text_lists_registered_commands() {
-        let help = telegram_help_text();
+        let agent_cmds = vec![
+            CommandManifestEntry {
+                command: "status".into(),
+                description: "Show current session status.".into(),
+                usage_hint: None,
+            },
+            CommandManifestEntry {
+                command: "role".into(),
+                description: "Switch to a named role.".into(),
+                usage_hint: Some("/role <name>".into()),
+            },
+            CommandManifestEntry {
+                command: "roles".into(),
+                description: "List configured roles.".into(),
+                usage_hint: None,
+            },
+            CommandManifestEntry {
+                command: "back".into(),
+                description: "Return to orchestrator.".into(),
+                usage_hint: None,
+            },
+            CommandManifestEntry {
+                command: "approve".into(),
+                description: "Approve the pending action.".into(),
+                usage_hint: None,
+            },
+        ];
+        let help = telegram_help_text(&agent_cmds);
         assert!(help.contains("/help"));
-        assert!(help.contains("/commands"));
         assert!(help.contains("/status"));
         assert!(help.contains("/role"));
         assert!(help.contains("/roles"));
@@ -2067,5 +2443,63 @@ mod tests {
         assert!(left.starts_with("telegram:telegram_bot_token:"));
         assert_ne!(left, different);
         assert!(!left.contains("abc123:secret"));
+    }
+
+    #[test]
+    fn split_at_paragraph_boundary_short_text_passthrough() {
+        let chunks = super::split_at_paragraph_boundary("hello world", 4096);
+        assert_eq!(chunks, vec!["hello world"]);
+    }
+
+    #[test]
+    fn split_at_paragraph_boundary_splits_long_text_at_double_newline() {
+        let para_a = "a".repeat(3000);
+        let para_b = "b".repeat(3000);
+        let text = format!("{}\n\n{}", para_a, para_b);
+        let chunks = super::split_at_paragraph_boundary(&text, 4096);
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].starts_with('a'));
+        assert!(chunks[1].starts_with('b'));
+    }
+
+    #[test]
+    fn split_at_paragraph_boundary_hard_splits_when_no_breaks() {
+        let text = "x".repeat(5000);
+        let chunks = super::split_at_paragraph_boundary(&text, 4096);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), 4096);
+        assert_eq!(chunks[1].len(), 904);
+    }
+
+    #[test]
+    fn help_text_includes_new_command() {
+        let help = super::telegram_help_text(&[]);
+        assert!(help.contains("/new"), "help text should mention /new");
+    }
+
+    #[test]
+    fn menu_commands_include_new() {
+        let has_new = super::TELEGRAM_MENU_COMMANDS
+            .iter()
+            .any(|c| c.command == "new");
+        assert!(has_new, "TELEGRAM_MENU_COMMANDS should include 'new'");
+    }
+
+    #[test]
+    fn combined_commands_include_native_and_agent_entries() {
+        let agent_cmds = vec![CommandManifestEntry {
+            command: "status".into(),
+            description: "Show status.".into(),
+            usage_hint: None,
+        }];
+        let combined = build_combined_telegram_commands(TELEGRAM_MENU_COMMANDS, &agent_cmds);
+        let names: Vec<&str> = combined
+            .iter()
+            .filter_map(|v| v["command"].as_str())
+            .collect();
+        assert!(names.contains(&"help"));
+        assert!(names.contains(&"ping"));
+        assert!(names.contains(&"new"));
+        assert!(names.contains(&"status"));
     }
 }

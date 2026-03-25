@@ -32,14 +32,16 @@ Use [$runtime-debugger](../runtime-debugger/SKILL.md) when the main job is findi
 1. Identify the slice boundary.
 2. Update the relevant Philotic proposal `Disposition`.
 3. Update `docs/task.md` for completed work and real follow-ups.
-4. If architecture docs moved, run the `architecture-docs-maintainer` pass:
+4. Update `docs/DEFECTS.md` for any defects opened, progressed, or closed during this slice. Confirm closing commits carry `Fixes: DEF-NNN`.
+5. If architecture docs moved, run the `architecture-docs-maintainer` pass:
    - update `ARCHITECTURE_STATUS.md` if current truth changed
    - update `ARCHITECTURE.md` if durable reference changed
    - ensure metadata/domains/links still align
-5. Summarize the highest honest verification level.
-6. Record assumption-vs-reality gaps exposed by the slice.
-7. Commit and push one coherent slice.
-8. State the next seam.
+6. Summarize the highest honest verification level.
+   - If live validation depended on a supervised/installed runtime, confirm installed binary truth and process restart before calling anything `smoke-green` or `watched-live-green`.
+7. Record assumption-vs-reality gaps exposed by the slice.
+8. Commit and push one coherent slice per the commit convention in `AGENTS.md §6`.
+9. State the next seam.
 
 ## Output Expectations
 

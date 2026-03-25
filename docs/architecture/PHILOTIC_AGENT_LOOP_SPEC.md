@@ -37,11 +37,11 @@ It does **not** specify transport-specific UX.
 
 ## Canonical Ownership
 
-- `ansible`
+- `aiua`
   - canonical session and turn state
   - event timeline
   - recovery snapshot composition
-- `agent-core`
+- `philote`
   - in-flight working loop state
   - provider interaction
   - tool orchestration

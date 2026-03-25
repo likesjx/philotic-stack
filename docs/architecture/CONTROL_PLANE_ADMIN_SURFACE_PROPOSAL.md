@@ -104,7 +104,7 @@ Recommended boundary:
 - `membrane` may start an authenticated operator control session
 - `membrane` may launch a Mini App or secure action link
 - `membrane` may collect approval intents and control-plane requests
-- `ansible` / hotel control plane validates, authorizes, persists, audits, and executes the requested admin action
+- `aiua` / hotel control plane validates, authorizes, persists, audits, and executes the requested admin action
 
 This keeps the outside-world interface useful without letting the transport boundary quietly become the admin database with better emojis.
 

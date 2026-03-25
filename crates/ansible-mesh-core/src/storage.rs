@@ -8,11 +8,12 @@
 use crate::event::EventEnvelope;
 use crate::graph::{
     AbstractSkillRecord, AbstractToolRecord, GraphEdge, GraphNode, RoleIncarnationRecord,
-    ToolsetProfileRecord,
+    RuleRecord, ToolsetProfileRecord, WorkflowSkillRecord,
 };
 use crate::NodeCapabilities;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 // ──────────────────────────────────────────────────────────────────────
 // EventStorage – manages the durable mesh_events log
@@ -63,6 +64,40 @@ pub struct GuestRecord {
     pub config_json: String,
     pub is_active: bool,
     pub active_pid: Option<String>,
+    /// Unix epoch (seconds) of the last time this guest was activated or spawned.
+    /// Used by the supervisor TTL check for role incarnation guests.
+    pub last_active_at: Option<u64>,
+}
+
+/// A declarative description of a component for registration with the hotel.
+/// Written by `philotic-web component add`; read by aiua to upsert a GuestRecord.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComponentManifest {
+    /// Unique guest identifier (e.g. "model-mlx-01").
+    pub guest_id: String,
+    /// Role announced to the hotel (e.g. "model.mlx").
+    pub role: String,
+    /// Hotel name to register with (e.g. "default").
+    pub hotel: String,
+    /// Spawn command for the component binary (resolved via PHILOTIC_BIN_DIR or PATH).
+    pub command: String,
+    /// Command-line arguments passed to the binary.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Environment variables injected into the spawned process.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Component-specific configuration blob stored in node_config under
+    /// `component:{guest_id}` and fetched by the binary via `IpcRequest::GetConfig`.
+    #[serde(default)]
+    pub component_config: serde_json::Value,
+    /// If true, the hotel materializes (spawns) the guest immediately after upsert.
+    #[serde(default = "default_auto_start")]
+    pub auto_start: bool,
+}
+
+fn default_auto_start() -> bool {
+    true
 }
 
 /// A named hotel runtime record stored in the Context Graph.
@@ -158,6 +193,45 @@ pub struct SecretRecord {
     pub updated_at: u64,
 }
 
+// ── Graph runner registry key constant ───────────────────────────────────────
+
+/// Context Graph config key: graph runner instance registry.
+/// Value is a JSON array of [`GraphRunnerInstanceRecord`].
+pub const CONFIG_GRAPH_RUNNER_REGISTRY: &str = "graph_runner_registry";
+
+/// Maps a `graph_id` to the `instance_id` of the graph-runner that owns it.
+/// Stored in the ODS under [`CONFIG_GRAPH_RUNNER_REGISTRY`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphRunnerInstanceRecord {
+    pub graph_id: String,
+    pub instance_id: String,
+    pub registered_at: u64,
+}
+
+// ── MuninnDB config key constants ────────────────────────────────────────────
+
+/// Context Graph config key: MuninnDB REST endpoint URL.
+/// Value is a JSON string, e.g. `"http://127.0.0.1:8475"`.
+pub const CONFIG_MUNINN_ENDPOINT: &str = "muninn_endpoint";
+
+/// Context Graph config key: vault registry.
+/// Value is a JSON array of [`VaultRegistryEntry`].
+pub const CONFIG_VAULT_REGISTRY: &str = "vault_registry";
+
+/// Maps a MuninnDB vault name to the `secret_ref` of its API token in the
+/// hotel key vault. Stored in the Context Graph under [`CONFIG_VAULT_REGISTRY`].
+///
+/// Vault naming convention: `[a-z0-9_-]`, `_` as scope prefix separator,
+/// `-` for internal id separators — e.g. `self_philote-1`, `user_jared`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultRegistryEntry {
+    /// Vault name, e.g. `self_philote-1`. Must match `[a-z0-9_-]`, max 64 chars.
+    pub vault_name: String,
+    /// Secret ref for this vault's API token, e.g.
+    /// `secret://hotel/default/muninn/self-philote-1`.
+    pub secret_ref: String,
+}
+
 /// Abstraction over the local Context Graph database.
 pub trait GraphStorage: Send + Sync {
     // ── Node configuration ───────────────────────────────────────────
@@ -204,12 +278,16 @@ pub trait GraphStorage: Send + Sync {
     /// Update the `is_active` flag for a guest (e.g. mark released subagents inactive).
     fn set_guest_active(&self, hotel_name: &str, guest_id: &str, active: bool) -> Result<()>;
 
+    /// Stamp the last-active time for a guest (Unix epoch seconds).
+    fn set_guest_last_active(&self, hotel_name: &str, guest_id: &str, epoch: u64) -> Result<()>;
+
     /// Bulk-insert or replace guest rows (used during initial seeding).
     fn seed_guests(&self, hotel_name: &str, guests: &[GuestRecord]) -> Result<()>;
 
     // ── Agent identity bundles ───────────────────────────────────────
 
     fn upsert_agent_identity(&self, identity: &AgentIdentityRecord) -> Result<()>;
+    fn list_agent_identities(&self) -> Result<Vec<AgentIdentityRecord>>;
     fn get_agent_identity(&self, agent_id: &str) -> Result<Option<AgentIdentityRecord>>;
 
     // ── Memory apartments ────────────────────────────────────────────
@@ -235,6 +313,13 @@ pub trait GraphStorage: Send + Sync {
         role_name: &str,
     ) -> Result<Option<RoleIncarnationRecord>>;
     fn list_role_incarnations(&self, agent_id: &str) -> Result<Vec<RoleIncarnationRecord>>;
+
+    /// Find any role incarnation records whose `guest_id` matches the given value.
+    /// Used by the supervisor to check TTL without knowing the owning agent_id.
+    fn list_role_incarnations_by_guest_id(
+        &self,
+        guest_id: &str,
+    ) -> Result<Vec<RoleIncarnationRecord>>;
     fn upsert_session_participant(&self, participant: &SessionParticipantRecord) -> Result<()>;
     fn list_session_participants(&self, session_id: &str) -> Result<Vec<SessionParticipantRecord>>;
     fn upsert_session_turn(&self, turn: &SessionTurnRecord) -> Result<()>;
@@ -271,19 +356,123 @@ pub trait GraphStorage: Send + Sync {
     /// List all abstract skill definitions in the catalog.
     fn list_abstract_skills(&self) -> Result<Vec<AbstractSkillRecord>>;
 
+    // ── Workflow skill catalog (shareable governed workflows) ─────────────
+
+    /// Upsert a shared governed workflow skill definition.
+    fn upsert_workflow_skill(&self, skill: &WorkflowSkillRecord) -> Result<()>;
+
+    /// Load a single workflow skill definition.
+    fn get_workflow_skill(&self, workflow_name: &str) -> Result<Option<WorkflowSkillRecord>>;
+
+    /// List all workflow skill definitions in the catalog.
+    fn list_workflow_skills(&self) -> Result<Vec<WorkflowSkillRecord>>;
+
     // ── Toolset profiles (role provisioning bundles) ─────────────────────
 
     /// Upsert a named toolset profile into the context graph.
     fn upsert_toolset_profile(&self, profile: &ToolsetProfileRecord) -> Result<()>;
 
     /// Load a single toolset profile by name, or `None` if not found.
-    fn get_toolset_profile(
-        &self,
-        profile_name: &str,
-    ) -> Result<Option<ToolsetProfileRecord>>;
+    fn get_toolset_profile(&self, profile_name: &str) -> Result<Option<ToolsetProfileRecord>>;
 
     /// List all toolset profiles in the context graph.
     fn list_toolset_profiles(&self) -> Result<Vec<ToolsetProfileRecord>>;
+
+    // ── MuninnDB / memory-core configuration ────────────────────────────────
+
+    /// Load the MuninnDB REST endpoint URL, or `None` if not configured.
+    ///
+    /// Stored under `CONFIG_MUNINN_ENDPOINT` as a JSON string.
+    /// Default when absent: `http://127.0.0.1:8475` (local instance).
+    fn get_muninn_endpoint(&self) -> Result<Option<String>> {
+        self.get_config_value(CONFIG_MUNINN_ENDPOINT)?
+            .map(|raw| serde_json::from_str::<String>(&raw).map_err(anyhow::Error::from))
+            .transpose()
+    }
+
+    /// Persist the MuninnDB REST endpoint URL.
+    fn set_muninn_endpoint(&self, url: &str) -> Result<()> {
+        self.set_config_value(CONFIG_MUNINN_ENDPOINT, &serde_json::to_string(url)?)
+    }
+
+    /// Load all vault registry entries. Returns an empty vec if not configured.
+    ///
+    /// Each entry maps a vault name (e.g. `self_philote-1`) to the `secret_ref`
+    /// of its API token in the hotel key vault.
+    fn get_vault_registry(&self) -> Result<Vec<VaultRegistryEntry>> {
+        Ok(self
+            .get_config_value(CONFIG_VAULT_REGISTRY)?
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default())
+    }
+
+    /// Upsert a single vault registry entry (matched by `vault_name`).
+    fn upsert_vault_registry_entry(&self, entry: &VaultRegistryEntry) -> Result<()> {
+        let mut entries = self.get_vault_registry()?;
+        match entries
+            .iter()
+            .position(|e| e.vault_name == entry.vault_name)
+        {
+            Some(pos) => entries[pos] = entry.clone(),
+            None => entries.push(entry.clone()),
+        }
+        self.set_config_value(CONFIG_VAULT_REGISTRY, &serde_json::to_string(&entries)?)
+    }
+
+    /// Remove a vault registry entry by vault name. No-op if not present.
+    fn remove_vault_registry_entry(&self, vault_name: &str) -> Result<()> {
+        let entries: Vec<VaultRegistryEntry> = self
+            .get_vault_registry()?
+            .into_iter()
+            .filter(|e| e.vault_name != vault_name)
+            .collect();
+        self.set_config_value(CONFIG_VAULT_REGISTRY, &serde_json::to_string(&entries)?)
+    }
+
+    // ── Rules tier (durable behavioral constraints) ──────────────────────────
+
+    /// Upsert a durable rule into the context graph. Idempotent on `rule_id`.
+    fn upsert_rule(&self, rule: &RuleRecord) -> Result<()>;
+
+    /// Load a single rule by `rule_id`, or `None` if not found.
+    fn get_rule(&self, rule_id: &str) -> Result<Option<RuleRecord>>;
+
+    /// List all rules owned by the given agent. Returns an empty vec if none.
+    fn list_rules(&self, agent_id: &str) -> Result<Vec<RuleRecord>>;
+
+    // ── Graph runner registry ─────────────────────────────────────────────────
+
+    /// Load all graph runner instance records. Returns an empty vec if not set.
+    fn get_graph_runner_registry(&self) -> Result<Vec<GraphRunnerInstanceRecord>> {
+        Ok(self
+            .get_config_value(CONFIG_GRAPH_RUNNER_REGISTRY)?
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default())
+    }
+
+    /// Upsert a single graph runner instance record (matched by `graph_id`).
+    fn upsert_graph_runner_instance(&self, record: &GraphRunnerInstanceRecord) -> Result<()> {
+        let mut entries = self.get_graph_runner_registry()?;
+        match entries.iter().position(|e| e.graph_id == record.graph_id) {
+            Some(pos) => entries[pos] = record.clone(),
+            None => entries.push(record.clone()),
+        }
+        self.set_config_value(
+            CONFIG_GRAPH_RUNNER_REGISTRY,
+            &serde_json::to_string(&entries)?,
+        )
+    }
+
+    /// Look up the instance_id for a given graph_id, or None if not registered.
+    fn get_graph_runner_instance(
+        &self,
+        graph_id: &str,
+    ) -> Result<Option<GraphRunnerInstanceRecord>> {
+        Ok(self
+            .get_graph_runner_registry()?
+            .into_iter()
+            .find(|e| e.graph_id == graph_id))
+    }
 }
 
 /// Generic graph persistence contract.

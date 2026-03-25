@@ -1,18 +1,20 @@
 use crate::controller::{
-    ControllerResponseEnvelope, ControllerTask, ModelProvider, ProviderConfigs, ProviderRegistry,
-    TaskKind,
+    ControllerResponseEnvelope, ControllerTask, ModelProvider, ProviderConfigs, ProviderOutput,
+    ProviderRegistry, TaskKind,
 };
 use anyhow::Result;
+use ansible_mesh_core::router_trace::{RouterTraceStorage, RouterTrainingRecord, SqliteRouterTraceStorage};
 use philotic_client::{
     GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, TaskErrorPayload, is_ipc_disconnect,
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
+use ulid::Ulid;
 
 fn local_node_id() -> String {
-    std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-ansible-01".to_string())
+    std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string())
 }
 
 type ProviderFactory =
@@ -39,6 +41,12 @@ struct ReplyRoute {
     chat_id: String,
 }
 
+#[derive(Debug, Clone)]
+enum StubResponse {
+    Text(String),
+    Structured(Value),
+}
+
 pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
     tracing_subscriber::fmt::init();
     info!(
@@ -53,10 +61,36 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
     };
 
     let mut ipc_client = PhiloticClient::connect(identity).await?;
+    ipc_client
+        .send_request(IpcRequest::SubscribeInbox {
+            role: config.role.into(),
+        })
+        .await?;
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
         .build()?;
     let stub_response = std::env::var("PHILOTIC_MODEL_ROUTER_STUB_RESPONSE").ok();
+
+    // Open the router training-tap trace store if configured.
+    let trace_store: Option<Arc<dyn RouterTraceStorage>> =
+        match std::env::var("PHILOTIC_ROUTER_TRACE_DB") {
+            Ok(path) => {
+                if let Some(parent) = std::path::Path::new(&path).parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                match SqliteRouterTraceStorage::open(&path) {
+                    Ok(store) => {
+                        info!(path = %path, "router training-tap trace store opened");
+                        Some(Arc::new(store))
+                    }
+                    Err(e) => {
+                        warn!(path = %path, "failed to open router trace store: {e}");
+                        None
+                    }
+                }
+            }
+            Err(_) => None,
+        };
 
     info!(
         "Listening for inbound model tasks on role [{}] from the Philotic Web...",
@@ -85,22 +119,10 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
 
                 let reply = ReplyRoute::from_task(&task_value);
 
-                if let Some(response_text) =
+                if let Some(stub_response) =
                     short_circuit_response(&task_value, stub_response.as_deref())
                 {
-                    emit_text_response(
-                        &mut ipc_client,
-                        &reply,
-                        ControllerResponseEnvelope {
-                            capability: TaskKind::TextGenerate.as_str().to_string(),
-                            content: response_text.clone(),
-                            result: json!({ "display_text": response_text }),
-                            artifacts: Vec::new(),
-                            trace: Default::default(),
-                            provider_output: Value::Null,
-                        },
-                    )
-                    .await?;
+                    emit_stub_response(&mut ipc_client, &reply, &task_value, stub_response).await?;
                     continue;
                 }
 
@@ -163,8 +185,45 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                     provider.id()
                 );
 
+                let dispatch_start = Instant::now();
+                let provider_id = provider.id().to_string();
+                let task_kind = controller_task.kind.as_str().to_string();
+
                 match provider.invoke(&controller_task).await {
+                    Ok(ProviderOutput::ToolCall {
+                        tool_name,
+                        arguments,
+                    }) => {
+                        let latency_ms = dispatch_start.elapsed().as_millis() as u64;
+                        record_routing_trace(
+                            trace_store.as_deref(),
+                            &reply,
+                            &provider_id,
+                            &task_kind,
+                            "tool_call",
+                            None,
+                            latency_ms,
+                        );
+                        emit_tool_call_response(
+                            &mut ipc_client,
+                            &reply,
+                            tool_name,
+                            arguments,
+                            None,
+                        )
+                        .await?;
+                    }
                     Ok(output) => {
+                        let latency_ms = dispatch_start.elapsed().as_millis() as u64;
+                        record_routing_trace(
+                            trace_store.as_deref(),
+                            &reply,
+                            &provider_id,
+                            &task_kind,
+                            "success",
+                            None,
+                            latency_ms,
+                        );
                         let response = ControllerResponseEnvelope::from_output(
                             &controller_task,
                             provider.id(),
@@ -173,6 +232,22 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                         emit_text_response(&mut ipc_client, &reply, response).await?;
                     }
                     Err(err) => {
+                        let latency_ms = dispatch_start.elapsed().as_millis() as u64;
+                        let failure_code = classify_provider_failure(
+                            Some(task_kind.as_str()),
+                            Some(provider_id.as_str()),
+                            &err.to_string(),
+                        )
+                        .code;
+                        record_routing_trace(
+                            trace_store.as_deref(),
+                            &reply,
+                            &provider_id,
+                            &task_kind,
+                            "failure",
+                            failure_code.as_deref(),
+                            latency_ms,
+                        );
                         error!("Provider invocation failed: {}", err);
                         emit_failure(
                             &mut ipc_client,
@@ -206,7 +281,7 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
     }
 }
 
-fn short_circuit_response(task: &Value, stub_response: Option<&str>) -> Option<String> {
+fn short_circuit_response(task: &Value, stub_response: Option<&str>) -> Option<StubResponse> {
     let stub = stub_response?;
 
     if task.get("prompt").and_then(Value::as_str).is_some() {
@@ -235,28 +310,152 @@ fn short_circuit_response(task: &Value, stub_response: Option<&str>) -> Option<S
                     if iteration > 0 {
                         let iter_key = format!("{}:{}", turn_id, iteration);
                         if k == iter_key {
-                            info!("Model controller turn/iteration-aware stub mode returning response for [{}].", iter_key);
-                            return Some(v.to_string());
+                            info!(
+                                "Model controller turn/iteration-aware stub mode returning response for [{}].",
+                                iter_key
+                            );
+                            return Some(parse_stub_response(v));
                         }
                     }
 
                     // Keep track of plain turn_id match as fallback
                     if k == turn_id {
-                        turn_match = Some(v.to_string());
+                        turn_match = Some(parse_stub_response(v));
                     }
                 }
             }
             if let Some(v) = turn_match {
-                info!("Model controller turn-aware stub mode returning response for [{}].", turn_id);
+                info!(
+                    "Model controller turn-aware stub mode returning response for [{}].",
+                    turn_id
+                );
                 return Some(v);
             }
         }
 
         info!("Model controller stub mode returning deterministic response.");
-        return Some(stub.to_string());
+        return Some(parse_stub_response(stub));
     }
 
     None
+}
+
+fn parse_stub_response(raw: &str) -> StubResponse {
+    let trimmed = raw.trim();
+    if let Some(json_text) = trimmed.strip_prefix("json:") {
+        let value: Value =
+            serde_json::from_str(json_text).unwrap_or_else(|_| json!({ "display_text": trimmed }));
+        return StubResponse::Structured(value);
+    }
+    StubResponse::Text(trimmed.to_string())
+}
+
+async fn emit_stub_response(
+    ipc_client: &mut PhiloticClient,
+    reply: &ReplyRoute,
+    task_value: &Value,
+    stub_response: StubResponse,
+) -> Result<()> {
+    match stub_response {
+        StubResponse::Text(response_text) => {
+            emit_text_response(
+                ipc_client,
+                reply,
+                ControllerResponseEnvelope {
+                    capability: TaskKind::TextGenerate.as_str().to_string(),
+                    content: response_text.clone(),
+                    result: json!({ "display_text": response_text }),
+                    artifacts: Vec::new(),
+                    trace: Default::default(),
+                    provider_output: Value::Null,
+                },
+            )
+            .await
+        }
+        StubResponse::Structured(value) => {
+            validate_stub_prompt(task_value, &value)?;
+
+            if let Some(tool_call) = value.get("tool_call").and_then(Value::as_object) {
+                let tool_name = tool_call
+                    .get("tool_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("echo")
+                    .to_string();
+                let arguments = tool_call
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                let model_result = json!({
+                    "capability": TaskKind::TextGenerate.as_str(),
+                    "result": {
+                        "active_plan": value.get("active_plan").cloned(),
+                        "spoken_text": value.get("spoken_text").cloned(),
+                        "memory_concept": value.get("memory_concept").cloned(),
+                    },
+                    "artifacts": [],
+                    "trace": {},
+                    "provider_output": Value::Null,
+                });
+                emit_tool_call_response(ipc_client, reply, tool_name, arguments, Some(model_result))
+                    .await
+            } else {
+                let display_text = value
+                    .get("display_text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let content = value
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| display_text.clone());
+                emit_text_response(
+                    ipc_client,
+                    reply,
+                    ControllerResponseEnvelope {
+                        capability: TaskKind::TextGenerate.as_str().to_string(),
+                        content,
+                        result: json!({
+                            "display_text": display_text,
+                            "spoken_text": value.get("spoken_text").cloned(),
+                            "memory_concept": value.get("memory_concept").cloned(),
+                            "active_plan": value.get("active_plan").cloned(),
+                        }),
+                        artifacts: Vec::new(),
+                        trace: Default::default(),
+                        provider_output: Value::Null,
+                    },
+                )
+                .await
+            }
+        }
+    }
+}
+
+fn validate_stub_prompt(task_value: &Value, stub_value: &Value) -> Result<()> {
+    let Some(required) = stub_value
+        .get("require_prompt_substrings")
+        .and_then(Value::as_array)
+    else {
+        return Ok(());
+    };
+
+    let prompt = ControllerTask::from_value(task_value)
+        .ok()
+        .and_then(|task| {
+            task.composed_prompt_text()
+                .or_else(|| task.prompt_text().map(str::to_string))
+        })
+        .unwrap_or_default();
+    for needle in required.iter().filter_map(Value::as_str) {
+        if !prompt.contains(needle) {
+            anyhow::bail!(
+                "stub validation failed: prompt missing required substring {:?}",
+                needle
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn emit_text_response(
@@ -307,6 +506,39 @@ async fn emit_text_response(
     Ok(())
 }
 
+async fn emit_tool_call_response(
+    ipc_client: &mut PhiloticClient,
+    reply: &ReplyRoute,
+    tool_name: String,
+    arguments: serde_json::Value,
+    model_result: Option<Value>,
+) -> Result<()> {
+    let reply_req = IpcRequest::EmitTask {
+        target_node: reply.reply_to.clone(),
+        target_role: reply.reply_role.clone(),
+        target_guest_id: None,
+        task_json: json!({
+            "action": "model_response",
+            "agent_action": {
+                "kind": "tool_call",
+                "tool_name": tool_name,
+                "arguments": arguments,
+                "model_result": model_result,
+            },
+            "session_id": reply.session_id,
+            "turn_id": reply.turn_id,
+            "chat_id": reply.chat_id,
+            "final_reply_to": reply.final_reply_to,
+            "final_reply_role": reply.final_reply_role,
+            "final_reply_guest_id": reply.final_reply_guest_id
+        })
+        .to_string(),
+    };
+
+    ipc_client.send_request(reply_req).await?;
+    Ok(())
+}
+
 async fn emit_failure(
     ipc_client: &mut PhiloticClient,
     reply: &ReplyRoute,
@@ -314,8 +546,7 @@ async fn emit_failure(
     provider: Option<&str>,
     message: String,
 ) -> Result<()> {
-    let error_payload =
-        TaskErrorPayload::provider_failure("model-router", capability, provider, message.clone());
+    let error_payload = classify_provider_failure(capability, provider, &message);
     error!(
         "Emitting model failure capability={:?} provider={:?}: {}",
         capability, provider, message
@@ -348,6 +579,70 @@ async fn emit_failure(
 
     ipc_client.send_request(reply_req).await?;
     Ok(())
+}
+
+fn classify_provider_failure(
+    capability: Option<&str>,
+    provider: Option<&str>,
+    message: &str,
+) -> TaskErrorPayload {
+    let mut payload = TaskErrorPayload::provider_failure(
+        "model-router",
+        capability,
+        provider,
+        message.to_string(),
+    );
+
+    let malformed_tool_call = message.contains("tool_call.arguments missing from")
+        || message.contains("returned invalid tool_call")
+        || message.contains("returned unsupported tool_call");
+
+    if malformed_tool_call {
+        payload.code = Some("MODEL_INVALID_TOOL_CALL".into());
+        payload.retryable = Some(true);
+    }
+
+    payload
+}
+
+// ── Training-tap helper ───────────────────────────────────────────────────────
+
+fn now_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Record a routing decision into the training-tap store, if one is open.
+///
+/// Failures to write are logged as warnings and do not abort the request path.
+fn record_routing_trace(
+    store: Option<&dyn RouterTraceStorage>,
+    reply: &ReplyRoute,
+    provider_id: &str,
+    task_kind: &str,
+    outcome: &str,
+    failure_code: Option<&str>,
+    latency_ms: u64,
+) {
+    let Some(store) = store else { return };
+    let record = RouterTrainingRecord {
+        trace_id: Ulid::new().to_string(),
+        agent_id: String::new(), // populated below if available from session context
+        session_id: reply.session_id.clone(),
+        turn_id: reply.turn_id.clone(),
+        provider_id: provider_id.to_string(),
+        model_id: None,
+        task_kind: task_kind.to_string(),
+        outcome: outcome.to_string(),
+        failure_code: failure_code.map(str::to_string),
+        latency_ms: Some(latency_ms),
+        timestamp: now_epoch_secs(),
+    };
+    if let Err(e) = store.record_trace(&record) {
+        warn!(provider = %provider_id, outcome = %outcome, "router trace write failed: {e}");
+    }
 }
 
 impl ReplyRoute {
@@ -394,5 +689,112 @@ impl ReplyRoute {
                 .unwrap_or_default()
                 .to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::classify_provider_failure;
+
+    #[test]
+    fn classify_provider_failure_marks_malformed_tool_calls_retryable() {
+        let payload = classify_provider_failure(
+            Some("text.generate"),
+            Some("gemini"),
+            "Provider invocation failed: tool_call.arguments missing from Gemini response",
+        );
+
+        assert_eq!(payload.kind, "provider_failure");
+        assert_eq!(payload.code.as_deref(), Some("MODEL_INVALID_TOOL_CALL"));
+        assert_eq!(payload.retryable, Some(true));
+        assert_eq!(payload.provider.as_deref(), Some("gemini"));
+        assert_eq!(payload.capability.as_deref(), Some("text.generate"));
+    }
+
+    #[test]
+    fn classify_provider_failure_leaves_generic_errors_non_retryable() {
+        let payload = classify_provider_failure(
+            Some("voice.synthesize"),
+            Some("elevenlabs"),
+            "Provider invocation failed: missing voice",
+        );
+
+        assert_eq!(payload.kind, "provider_failure");
+        assert_eq!(payload.code, None);
+        assert_eq!(payload.retryable, None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StubResponse, parse_stub_response, short_circuit_response, validate_stub_prompt};
+    use serde_json::json;
+
+    #[test]
+    fn parse_stub_response_supports_json_prefix() {
+        let parsed = parse_stub_response(r#"json:{"display_text":"hello"}"#);
+        match parsed {
+            StubResponse::Structured(value) => {
+                assert_eq!(value["display_text"], "hello");
+            }
+            other => panic!("expected structured stub response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn short_circuit_response_prefers_iteration_specific_stub() {
+        let task = json!({
+            "prompt": "continue",
+            "context_projection": {
+                "conversation_turn": { "conversation_turn_id": "turn-1" },
+                "active_step": { "iteration": 2 }
+            }
+        });
+
+        let stub = r#"turn-1=json:{"display_text":"fallback"};turn-1:2=json:{"display_text":"iteration-two"}"#;
+        let parsed = short_circuit_response(&task, Some(stub)).expect("stub should match");
+        match parsed {
+            StubResponse::Structured(value) => {
+                assert_eq!(value["display_text"], "iteration-two");
+            }
+            other => panic!("expected structured stub response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_stub_prompt_checks_composed_reentry_prompt() {
+        let task = json!({
+            "kind": "text.generate",
+            "context": {
+                "active_turn": { "role": "user", "text": "Keep going." },
+                "tool_history": [{
+                    "index": 1,
+                    "tool_name": "echo",
+                    "arguments": { "text": "hello structured tool" },
+                    "result": "hello structured tool"
+                }],
+                "active_plan": {
+                    "goal": "echo hello structured tool",
+                    "status": "in_progress",
+                    "steps": [{
+                        "id": 1,
+                        "description": "call echo",
+                        "tool_name": "echo",
+                        "status": "in_progress"
+                    }]
+                }
+            }
+        });
+
+        let stub = json!({
+            "require_prompt_substrings": [
+                "[Tool call history]",
+                "Call 1: echo({\"text\":\"hello structured tool\"})",
+                "[Active plan]",
+                "Goal: echo hello structured tool"
+            ]
+        });
+
+        validate_stub_prompt(&task, &stub).expect("composed prompt should satisfy stub checks");
     }
 }

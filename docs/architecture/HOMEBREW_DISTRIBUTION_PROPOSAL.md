@@ -56,8 +56,8 @@ Sources:
 ### 2. Philotic does not yet present one obvious public binary
 Current workspace binaries are:
 
-- `ansible`
-- `agent-core`
+- `aiua`
+- `philote`
 - `membrane`
 - `model-router`
 - `tool-runner`
@@ -65,7 +65,7 @@ Current workspace binaries are:
 These are meaningful internal runtime components, but they are not yet a clean public install story for Homebrew users.
 
 ### 3. The current binary names are collision-prone
-The strongest immediate operator entry point is the hotel daemon in `crates/ansible`, but `ansible` is already an established Homebrew formula name. Shipping a Philotic formula that installs a binary named `ansible` would create naming and linking conflicts.
+The strongest immediate operator entry point is the hotel daemon in `crates/ansible`, but `aiua` is already an established Homebrew formula name. Shipping a Philotic formula that installs a binary named `aiua` would create naming and linking conflicts.
 
 ## Repo Reality
 
@@ -82,7 +82,7 @@ Observed current state in this repository:
 Choose one install target for Homebrew users. Recommended options, in order:
 
 1. introduce a dedicated public binary such as `philotic` or `philotic-hotel`
-2. if the daemon remains the public entry point, rename the installed binary away from `ansible`
+2. if the daemon remains the public entry point, rename the installed binary away from `aiua`
 3. keep guest binaries out of the initial formula unless there is a concrete operator need for direct execution
 
 Recommendation:

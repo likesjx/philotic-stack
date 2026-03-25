@@ -61,14 +61,14 @@ status and active seams, use [ARCHITECTURE_STATUS.md](/Users/jaredlikes/code/phi
 
 ```
            ┌──────────────────────────────────────────────┐
-           │               HOTEL  (Ansible daemon)         │
+           │               HOTEL  (aiua daemon)            │
            │                                               │
            │  ┌──────────┐   IPC    ┌────────────────────┐ │
-           │  │ membrane  │◄────────►│  ansible (hotel)   │ │
+           │  │ membrane  │◄────────►│  aiua (hotel)      │ │
            │  └──────────┘   UDS    │                    │ │
            │                        │  • ContextGraph DB  │ │
            │  ┌──────────┐          │  • GuestManager     │ │
-           │  │agent-core│◄────────►│  • IpcServer        │ │
+           │  │ philote  │◄────────►│  • IpcServer        │ │
            │  └──────────┘   UDS    │  • BeaconDaemon     │ │
            │                        │  • BlobService      │ │
            │  ┌─────────────┐       │  • Outbound Disp.   │ │
@@ -83,7 +83,7 @@ status and active seams, use [ARCHITECTURE_STATUS.md](/Users/jaredlikes/code/phi
 
 **Key design constraints:**
 
-- One canonical `ansible` hotel daemon per machine.
+- One canonical `aiua` hotel daemon per machine.
 - All in-machine communication uses **Unix Domain Sockets** (IPC).
 - Cross-machine coordination uses **UDP BeaconMessages** on the control plane plus a framed point-to-point execution transport for routed work.
 - The Context Graph SQLite DB is the canonical source of truth for all hotel state.
@@ -96,13 +96,14 @@ status and active seams, use [ARCHITECTURE_STATUS.md](/Users/jaredlikes/code/phi
 
 | Crate               | Role                                                         |
 | ------------------- | ------------------------------------------------------------ |
-| `ansible`           | Hotel daemon — orchestration and service host                |
+| `aiua`           | Hotel daemon — orchestration and service host                |
 | `ansible-mesh-core` | Shared primitives, traits, mesh types, storage               |
 | `philotic-client`   | Guest SDK — IPC client for guests to talk to the hotel       |
 | `membrane`           | Telegram/gateway guest binary                                |
-| `agent-core`        | Persona/agent guest binary                                   |
-| `model-router`      | Model controller SDK + provider binaries (Gemini, ElevenLabs)|
-| `tool-runner`       | Workspace tool executor guest (inactive — not yet spawned)   |
+| `philote`           | Persona/agent cognitive loop guest binary                    |
+| `model-router`      | Multi-provider model routing (Gemini, ElevenLabs, etc.)      |
+| `philotic-web`      | Desktop operator surface (Next.js)                           |
+| `tool-runner`       | Workspace tool executor guest                                |
 | `robot-kit`         | Embedded robotics HAL (separate concern, not hotel/guest)    |
 
 ### 2.1 The Legacy Reference
@@ -113,7 +114,7 @@ The `legacy-zeroclaw` submodule was removed from this repository. Historical ref
 
 ## 3. The Hotel — `crates/ansible`
 
-The `ansible` daemon is the authoritative runtime process for a hotel node.
+The `aiua` daemon is the authoritative runtime process for a hotel node.
 It starts first, owns the Context Graph database, and materializes all guest
 processes.
 
@@ -124,7 +125,7 @@ main()
   │
   ├─ Parse CLI args (--load-config flag)
   ├─ Read PHILOTIC_* env flags (feature gates)
-  ├─ Open SqliteGraphStorage ("ansible_context.db")
+  ├─ Open SqliteGraphStorage ("aiua_context.db")
   ├─ Optionally seed config from JSON file
   ├─ Load or bootstrap NodeCapabilities
   ├─ Bind BeaconDaemon (UDP control plane, port 8999)
@@ -132,7 +133,7 @@ main()
   ├─ Start execution-plane listener (default dev layout: base + 2)
   ├─ Materialize all active guests (GuestManager)
   ├─ Start Guest Supervisor loop (reconcile every 5s)
-  ├─ Start IpcServer (UDS, /tmp/ansible.sock)
+  ├─ Start IpcServer (UDS, /tmp/philotic-aiua.sock)
   ├─ [Flag] Start Outbound Mesh Dispatcher
   ├─ [Flag] Start Task Lifecycle Ledger Writer
   └─ Enter main inbox loop (BeaconMessage dispatch)
@@ -236,10 +237,10 @@ the hotel exclusively over the IPC UDS socket using `PhiloticClient`.
 | Binary                      | Crate                 | Role identity                    | Purpose                                                    |
 | --------------------------- | --------------------- | -------------------------------- | ---------------------------------------------------------- |
 | `membrane`                   | `crates/membrane`      | `membrane-telegram-01`            | Telegram gateway, ingress/egress for external messages     |
-| `agent-core`                | `crates/agent-core`   | `agent-jane-01`                  | Persona runtime, long-running reasoning loop               |
-| `model-controller-gemini`   | `crates/model-router` | `model-controller-gemini-01`     | Gemini provider controller; role `model.gemini`            |
-| `model-controller-elevenlabs` | `crates/model-router` | `model-controller-elevenlabs-01` | ElevenLabs TTS controller; role `model.elevenlabs`         |
-| `tool-runner`               | `crates/tool-runner`  | `{hotel}:tool-runner`            | Workspace tool executor (inactive — seeded but not spawned)|
+| `philote`                | `crates/philote`      | `agent-{persona}-01`             | Persona runtime, long-running reasoning loop               |
+| `model-router`              | `crates/model-router` | `model-router-01`                | Multi-provider LLM/TTS routing guest (Gemini, ElevenLabs)  |
+| `tool-runner`               | `crates/tool-runner`  | `{hotel}:tool-runner`            | Workspace tool executor                                    |
+| `philotic-web`              | `crates/philotic-web` | `desktop-operator-01`            | Desktop/web operator surface                               |
 
 The `model-router` crate now acts as shared SDK/runtime infrastructure. The two `model-controller-*` binaries are separate materialized guests for their respective providers.
 
@@ -312,7 +313,7 @@ client.sync_apartment(agent_id, memory_type, content_json) -> Result<()>
 ## 7. Intra-Hotel IPC (Unix Domain Sockets)
 
 All communication between guests and the hotel daemon uses a **Unix Domain Socket**
-at `/tmp/philotic-ansible.sock` (overridable via `PHILOTIC_HOTEL_SOCKET`). The protocol is newline-delimited JSON
+at `/tmp/philotic-aiua.sock` (overridable via `PHILOTIC_HOTEL_SOCKET`). The protocol is newline-delimited JSON
 over a persistent stream connection.
 
 ```
@@ -601,7 +602,7 @@ Default is `INSECURE_DEV_DEFAULT_PSK` — override before production.
 
 | Variable                              | Default                          | Effect                                              |
 | ------------------------------------- | -------------------------------- | --------------------------------------------------- |
-| `PHILOTIC_HOTEL_SOCKET`               | `/tmp/philotic-ansible.sock`     | IPC Unix domain socket path                         |
+| `PHILOTIC_HOTEL_SOCKET`               | `/tmp/philotic-aiua.sock`     | IPC Unix domain socket path                         |
 | `PHILOTIC_MESH_PSK`                   | `INSECURE_DEV_DEFAULT_PSK`       | Shared mesh authentication key                      |
 | `PHILOTIC_HOTEL_PORT`                 | `9000`                           | IPC listen port                                     |
 | `PHILOTIC_BIN_DIR`                    | (none — uses `PATH`)             | Directory where guest binaries are resolved         |
@@ -626,7 +627,7 @@ Default is `INSECURE_DEV_DEFAULT_PSK` — override before production.
 | Auth Exchange                 | 🔲 Planned  | Invite/ticket validation (PORT-BP-006)                 |
 | Scaling / Performance Monitor | 🔲 Planned  | Process scale-out/in based on machine metrics          |
 | WebRTC P2P Data Channels      | 🔶 In Progress | Signal/SDP types exist; `WebRtcGuest` started but ICE/lifecycle incomplete |
-| Multi-Hotel Parity Tests      | 🔲 Planned  | Shadow mode + chaos tests (PORT-BP-009)                |
+| Multi-Hotel Parity Tests      | ✅ Complete | Mesh-visible capability routing and remote model proof |
 
 ### Current Transitional Notes
 

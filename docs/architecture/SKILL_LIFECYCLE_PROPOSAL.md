@@ -414,13 +414,13 @@ The persona uses `lease_epoch` in every `AssignSubagentTask` and `RenewSubagentL
 - lease registry in hotel state: tracks active leases by `subagent_guest_id`, enforces epoch fencing, handles `idle_behavior` timers
 - hook subscription registry in hotel state: records negotiated set per `subagent_guest_id`, routes or drops `FireSubagentHook` accordingly; `SubagentHookRecord` carries typed `HookSubscription` list with per-hook `HookRoute`
 - `HookSubscription` routing refinement: each subscription entry now carries `route: HookRoute` and optional `handler_skill`; `completion_route` and `failure_route` are top-level fields on the skill definition; Layer 1 rejects `Discard` on either terminal route
-- `agent-core` crate split into lib + two binary targets:
-  - `agent-core` binary — persona cognitive loop (`AgentRuntime`, unchanged)
-  - `agent-worker` binary — `WorkerRuntime` implementing `AgentDriver`; receives `SubagentDelegation` via `InboundTask`, dispatches single-model-call execution, fires `TurnCompleted` hook via `FireSubagentHook`
+- `philote` crate split into lib + two binary targets:
+  - `philote` binary — persona cognitive loop (`AgentRuntime`, unchanged)
+  - `philote-worker` binary — `WorkerRuntime` implementing `AgentDriver`; receives `SubagentDelegation` via `InboundTask`, dispatches single-model-call execution, fires `TurnCompleted` hook via `FireSubagentHook`
   - `AgentDriver` trait — shared `run()` contract for both runtime types
 - `RegisterSkill` hotel handler: translates `IpcRequest::RegisterSkill` → `SkillDraft` → `validate_skill_layer1` → `apply_validation_to_record` → `graph.upsert_abstract_skill` → `IpcResponse::SkillRegistered`
 - `skill.register` and `subagent.spawn` tools added to abstract tool catalog with full schemas; both classified as `"capability"` class
-- `is_local_agent_tool()` and `execute_local_agent_tool()` wired in `agent-core` for both tools: IPC dispatch → response parsing → `handle_tool_result` continuation
+- `is_local_agent_tool()` and `execute_local_agent_tool()` wired in `philote` for both tools: IPC dispatch → response parsing → `handle_tool_result` continuation
 
 **Not in this slice:**
 

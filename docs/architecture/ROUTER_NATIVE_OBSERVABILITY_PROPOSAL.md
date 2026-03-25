@@ -142,7 +142,7 @@ Examples:
 
 - all `provider.error` events
 - only one session
-- only `membrane` and `agent-core`
+- only `membrane` and `philote`
 - only one hotel
 - only validation traces
 

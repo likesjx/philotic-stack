@@ -12,6 +12,7 @@ pub enum TaskKind {
     MediaAnalyze,
     AudioTranscribe,
     VoiceSynthesize,
+    Embed,
 }
 
 impl TaskKind {
@@ -21,6 +22,7 @@ impl TaskKind {
             Self::MediaAnalyze => "media.analyze",
             Self::AudioTranscribe => "voice.transcribe",
             Self::VoiceSynthesize => "voice.synthesize",
+            Self::Embed => "text.embed",
         }
     }
 }
@@ -49,6 +51,7 @@ impl RequestClass {
             TaskKind::TextGenerate => Self::Cognitive,
             TaskKind::MediaAnalyze | TaskKind::AudioTranscribe => Self::Transform,
             TaskKind::VoiceSynthesize => Self::Synthesis,
+            TaskKind::Embed => Self::Embedding,
         }
     }
 
@@ -138,12 +141,23 @@ pub struct AttachmentInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ToolHistoryEntry {
+    pub index: usize,
+    pub tool_name: String,
+    pub arguments: Value,
+    pub result: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ContextEnvelope {
     pub instructions: Vec<ProjectionItem>,
     pub identity: Vec<ProjectionItem>,
     pub memory: Vec<ProjectionItem>,
+    pub recalled_memory: Vec<ProjectionItem>,
     pub dialogue_window: Vec<TurnInput>,
     pub active_turn: Option<TurnInput>,
+    pub tool_history: Vec<ToolHistoryEntry>,
+    pub active_plan: Option<Value>,
     pub attachments: Vec<AttachmentInput>,
 }
 
@@ -202,6 +216,9 @@ pub struct ControllerTask {
     pub affordances: Affordances,
     pub routing_hints: RoutingHints,
     pub provider_options: Map<String, Value>,
+    /// Tools the agent has available this turn. Non-empty signals tool-enabled mode.
+    /// Each entry is a raw JSON object with at minimum `tool_name` and `description`.
+    pub tools: Vec<Value>,
 }
 
 impl ControllerTask {
@@ -231,6 +248,7 @@ impl ControllerTask {
                 TaskKind::AudioTranscribe
             }
             Some("voice.synthesize") | Some("voice_synthesize") => TaskKind::VoiceSynthesize,
+            Some("text.embed") | Some("embed") => TaskKind::Embed,
             Some(other) => bail!("unsupported task kind [{}]", other),
             None if task.get("prompt").and_then(Value::as_str).is_some() => TaskKind::TextGenerate,
             None if !context.attachments.is_empty() => TaskKind::MediaAnalyze,
@@ -303,6 +321,11 @@ impl ControllerTask {
             affordances,
             routing_hints,
             provider_options,
+            tools: task
+                .get("tools_for_model")
+                .and_then(Value::as_array)
+                .map(|arr| arr.iter().filter(|v| v.is_object()).cloned().collect())
+                .unwrap_or_default(),
         };
 
         controller_task.validate()?;
@@ -353,6 +376,13 @@ impl ControllerTask {
             }
         }
 
+        if !self.context.recalled_memory.is_empty() {
+            let text = join_projection_items(&self.context.recalled_memory);
+            if !text.is_empty() {
+                sections.push(format!("[Recalled memory]\n{text}"));
+            }
+        }
+
         if !self.context.dialogue_window.is_empty() {
             let dialogue = self
                 .context
@@ -374,6 +404,70 @@ impl ControllerTask {
                 let role = active_turn.role.as_deref().unwrap_or("user");
                 sections.push(format!("[Active turn]\n{role}: {text}"));
             }
+        }
+
+        if !self.context.tool_history.is_empty() {
+            let history = self
+                .context
+                .tool_history
+                .iter()
+                .map(|entry| {
+                    let args = serde_json::to_string(&entry.arguments).unwrap_or_default();
+                    format!(
+                        "Call {n}: {name}({args})\nResult {n}: {result}",
+                        n = entry.index,
+                        name = entry.tool_name,
+                        result = entry.result,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            sections.push(format!(
+                "[Tool call history]\n{history}\n\nReview the above tool results and continue. \
+                 Call another tool if needed, or respond to the user if you have enough information."
+            ));
+        }
+
+        if let Some(plan) = self.context.active_plan.as_ref() {
+            let goal = plan
+                .get("goal")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let status = plan
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let steps = plan
+                .get("steps")
+                .and_then(Value::as_array)
+                .map(|steps| {
+                    steps
+                        .iter()
+                        .map(|step| {
+                            let id = step
+                                .get("id")
+                                .or_else(|| step.get("index"))
+                                .and_then(Value::as_u64)
+                                .map(|n| n.to_string())
+                                .unwrap_or_else(|| "?".into());
+                            let description = step
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unnamed step");
+                            let step_status = step
+                                .get("status")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown");
+                            format!("[{step_status}] {id}. {description}")
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .filter(|steps| !steps.is_empty())
+                .unwrap_or_else(|| "No steps recorded.".into());
+            sections.push(format!(
+                "[Active plan]\nGoal: {goal}\nStatus: {status}\nSteps:\n{steps}"
+            ));
         }
 
         if let Some(prompt) = self
@@ -477,6 +571,14 @@ impl ControllerTask {
                     bail!("voice.synthesize task text cannot be empty");
                 }
             }
+            TaskKind::Embed => {
+                let text = self
+                    .composed_prompt_text()
+                    .context("text.embed task missing input text (prompt)")?;
+                if text.trim().is_empty() {
+                    bail!("text.embed task input text cannot be empty");
+                }
+            }
         }
 
         match self.request_class {
@@ -511,7 +613,12 @@ impl ControllerTask {
                 }
             }
             RequestClass::Embedding => {
-                bail!("request_class [embedding] is not yet supported by model-router");
+                if self.kind != TaskKind::Embed {
+                    bail!(
+                        "request_class [embedding] requires task kind [text.embed], got [{}]",
+                        self.kind.as_str()
+                    );
+                }
             }
         }
 
@@ -687,12 +794,49 @@ fn parse_context(value: Option<&Value>) -> ContextEnvelope {
         return ContextEnvelope::default();
     };
 
+    let tool_history = object
+        .get("tool_history")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    let obj = entry.as_object()?;
+                    Some(ToolHistoryEntry {
+                        index: obj
+                            .get("index")
+                            .and_then(Value::as_u64)
+                            .map(|n| n as usize)
+                            .unwrap_or(0),
+                        tool_name: obj
+                            .get("tool_name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_string(),
+                        arguments: obj
+                            .get("arguments")
+                            .cloned()
+                            .unwrap_or(Value::Object(Default::default())),
+                        result: obj
+                            .get("result")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     ContextEnvelope {
         instructions: parse_projection_items(object.get("instructions")),
         identity: parse_projection_items(object.get("identity")),
         memory: parse_projection_items(object.get("memory")),
+        recalled_memory: parse_projection_items(object.get("recalled_memory")),
         dialogue_window: parse_turns(object.get("dialogue_window")),
         active_turn: object.get("active_turn").map(parse_turn_input),
+        tool_history,
+        active_plan: object.get("active_plan").cloned(),
         attachments: parse_attachments(object.get("attachments")),
     }
 }
@@ -830,22 +974,43 @@ pub struct AudioArtifact {
 pub struct TextResult {
     pub display_text: Option<String>,
     pub spoken_text: Option<String>,
+    pub partial_replies: Vec<String>,
     pub working_memory_delta: Option<String>,
     pub follow_up_questions: Vec<String>,
     pub intent_summary: Option<String>,
+    pub memory_concept: Option<String>,
+    pub memory_candidate: Option<serde_json::Value>,
+    pub active_plan: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ProviderOutput {
     Text {
         content: String,
         display_text: Option<String>,
         spoken_text: Option<String>,
+        partial_replies: Vec<String>,
         working_memory_delta: Option<String>,
         follow_up_questions: Vec<String>,
         intent_summary: Option<String>,
+        memory_concept: Option<String>,
+        memory_candidate: Option<serde_json::Value>,
+        active_plan: Option<serde_json::Value>,
     },
     Audio(AudioArtifact),
+    /// Model chose to call a tool rather than produce a text response.
+    ToolCall {
+        tool_name: String,
+        arguments: Value,
+    },
+    /// A dense embedding vector produced by a local ONNX embedding model.
+    ///
+    /// `model_gen` carries the provenance token `"{repo}@{sha8}"` so consumers
+    /// can detect embedding-space drift when the model is hot-swapped.
+    Embedding {
+        vector: Vec<f32>,
+        model_gen: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -884,16 +1049,24 @@ impl ControllerResponseEnvelope {
                 content,
                 display_text,
                 spoken_text,
+                partial_replies,
                 working_memory_delta,
                 follow_up_questions,
                 intent_summary,
+                memory_concept,
+                memory_candidate,
+                active_plan,
             } => {
                 let text_result = TextResult {
                     display_text: display_text.or_else(|| Some(content.clone())),
                     spoken_text,
+                    partial_replies,
                     working_memory_delta,
                     follow_up_questions,
                     intent_summary,
+                    memory_concept,
+                    memory_candidate,
+                    active_plan,
                 };
                 let result = serialize_text_result(task, &text_result);
                 let content = result
@@ -938,6 +1111,47 @@ impl ControllerResponseEnvelope {
                     provider_output: Value::Null,
                 })
             }
+            ProviderOutput::Embedding { vector, model_gen } => {
+                let vector_value: Value = vector
+                    .iter()
+                    .map(|&f| serde_json::Number::from_f64(f as f64).map(Value::Number))
+                    .collect::<Option<Vec<_>>>()
+                    .map(Value::Array)
+                    .unwrap_or(Value::Null);
+
+                Ok(Self {
+                    capability: task.kind.as_str().to_string(),
+                    content: model_gen.clone(),
+                    result: json!({
+                        "model_gen": model_gen,
+                        "dim": vector.len(),
+                    }),
+                    artifacts: vec![ResponseArtifact {
+                        kind: "embedding".into(),
+                        mime_type: Some("application/json".into()),
+                        output_format: None,
+                        payload: json!({
+                            "vector": vector_value,
+                            "model_gen": model_gen,
+                            "dim": vector.len(),
+                        }),
+                    }],
+                    trace: ResponseTrace {
+                        provider: Some(provider_id.to_string()),
+                        model: task.model.clone(),
+                        voice: None,
+                    },
+                    provider_output: Value::Null,
+                })
+            }
+            // ToolCall is intercepted in runtime.rs before reaching from_output.
+            // If it somehow arrives here, treat it as an error.
+            ProviderOutput::ToolCall { tool_name, .. } => {
+                anyhow::bail!(
+                    "ProviderOutput::ToolCall({}) reached from_output — should have been intercepted in runtime",
+                    tool_name
+                )
+            }
         }
     }
 }
@@ -945,16 +1159,24 @@ impl ControllerResponseEnvelope {
 fn serialize_text_result(task: &ControllerTask, result: &TextResult) -> Value {
     let channels_requested = !task.response_contract.channels.is_empty();
     let include_spoken = channels_requested && task.wants_channel("spoken_text");
+    let include_partial = channels_requested && task.wants_channel("partial_replies");
     let include_memory = channels_requested && task.wants_channel("working_memory_delta");
     let include_questions = channels_requested && task.wants_channel("follow_up_questions");
     let include_intent = channels_requested && task.wants_channel("intent_summary");
+    let include_concept = channels_requested && task.wants_channel("memory_concept");
+    let include_memory_candidate = channels_requested && task.wants_channel("memory_candidate");
+    let include_plan = channels_requested && task.wants_channel("active_plan");
 
     json!({
         "display_text": result.display_text,
         "spoken_text": if include_spoken { result.spoken_text.clone() } else { None::<String> },
+        "partial_replies": if include_partial { result.partial_replies.clone() } else { Vec::<String>::new() },
         "working_memory_delta": if include_memory { result.working_memory_delta.clone() } else { None::<String> },
         "follow_up_questions": if include_questions { result.follow_up_questions.clone() } else { Vec::<String>::new() },
         "intent_summary": if include_intent { result.intent_summary.clone() } else { None::<String> },
+        "memory_concept": if include_concept { result.memory_concept.clone() } else { None::<String> },
+        "memory_candidate": if include_memory_candidate { result.memory_candidate.clone() } else { None::<Value> },
+        "active_plan": if include_plan { result.active_plan.clone() } else { None::<Value> },
     })
 }
 
@@ -1277,6 +1499,90 @@ mod tests {
     }
 
     #[test]
+    fn parse_context_preserves_active_plan() {
+        let task = ControllerTask::from_value(&json!({
+            "kind": "text.generate",
+            "context": {
+                "active_turn": {
+                    "role": "user",
+                    "text": "Continue the task."
+                },
+                "active_plan": {
+                    "goal": "finish the task",
+                    "status": "in_progress",
+                    "steps": [
+                        {
+                            "id": 1,
+                            "description": "inspect repo",
+                            "status": "done"
+                        },
+                        {
+                            "id": 2,
+                            "description": "apply fix",
+                            "status": "in_progress"
+                        }
+                    ]
+                }
+            }
+        }))
+        .unwrap();
+
+        let plan = task
+            .context
+            .active_plan
+            .as_ref()
+            .expect("active plan should survive context parsing");
+        assert_eq!(plan["goal"], "finish the task");
+        assert_eq!(plan["steps"][1]["description"], "apply fix");
+    }
+
+    #[test]
+    fn composed_prompt_includes_active_plan() {
+        let task = ControllerTask::from_value(&json!({
+            "kind": "text.generate",
+            "context": {
+                "identity": [{"text": "You are Jane."}],
+                "active_turn": {
+                    "role": "user",
+                    "text": "Keep going."
+                },
+                "tool_history": [{
+                    "index": 1,
+                    "tool_name": "workspace.read",
+                    "arguments": {"path": "README.md"},
+                    "result": "Read successfully."
+                }],
+                "active_plan": {
+                    "goal": "summarize README and patch the issue",
+                    "status": "in_progress",
+                    "steps": [
+                        {
+                            "id": 1,
+                            "description": "read README",
+                            "status": "done"
+                        },
+                        {
+                            "id": 2,
+                            "description": "patch the issue",
+                            "status": "in_progress"
+                        }
+                    ]
+                }
+            }
+        }))
+        .unwrap();
+
+        let composed = task
+            .composed_prompt_text()
+            .expect("structured task should compose a prompt");
+        assert!(composed.contains("[Tool call history]"));
+        assert!(composed.contains("[Active plan]"));
+        assert!(composed.contains("Goal: summarize README and patch the issue"));
+        assert!(composed.contains("[done] 1. read README"));
+        assert!(composed.contains("[in_progress] 2. patch the issue"));
+    }
+
+    #[test]
     fn infers_media_task_from_flat_blob_backed_attachments() {
         let task = ControllerTask::from_value(&json!({
             "action": "analyze_media",
@@ -1448,9 +1754,13 @@ mod tests {
                 content: "Hello back".into(),
                 display_text: None,
                 spoken_text: Some("Hello back, warmly.".into()),
+                partial_replies: vec!["Hello".into(), "Hello back".into()],
                 working_memory_delta: Some("The user greeted the assistant.".into()),
                 follow_up_questions: vec!["How can I help next?".into()],
                 intent_summary: Some("Exchange greetings".into()),
+                memory_concept: None,
+                memory_candidate: None,
+                active_plan: None,
             },
         )
         .unwrap();
@@ -1458,6 +1768,7 @@ mod tests {
         assert_eq!(response.content, "Hello back");
         assert_eq!(response.result["display_text"], "Hello back");
         assert!(response.result["spoken_text"].is_null());
+        assert_eq!(response.result["partial_replies"], json!([]));
         assert_eq!(response.result["follow_up_questions"], json!([]));
     }
 
@@ -1471,7 +1782,7 @@ mod tests {
                 }
             },
             "response_contract": {
-                "channels": ["spoken_text", "working_memory_delta", "follow_up_questions", "intent_summary"]
+                "channels": ["spoken_text", "partial_replies", "working_memory_delta", "follow_up_questions", "intent_summary", "memory_candidate"]
             }
         }))
         .unwrap();
@@ -1483,17 +1794,30 @@ mod tests {
                 content: "Hello back".into(),
                 display_text: Some("Hello back".into()),
                 spoken_text: Some("Hello back, warmly.".into()),
+                partial_replies: vec!["Hello".into(), "Hello back".into()],
                 working_memory_delta: Some("The user greeted the assistant.".into()),
                 follow_up_questions: vec!["How can I help next?".into()],
                 intent_summary: Some("Exchange greetings".into()),
+                memory_concept: None,
+                memory_candidate: Some(json!({
+                    "concept": "greeting-exchange",
+                    "content": "The user greeted the assistant and reopened the collaboration thread.",
+                    "tags": ["greeting", "session"]
+                })),
+                active_plan: None,
             },
         )
         .unwrap();
 
         assert_eq!(response.result["spoken_text"], "Hello back, warmly.");
+        assert_eq!(response.result["partial_replies"], json!(["Hello", "Hello back"]));
         assert_eq!(
             response.result["working_memory_delta"],
             "The user greeted the assistant."
+        );
+        assert_eq!(
+            response.result["memory_candidate"]["concept"],
+            "greeting-exchange"
         );
         assert_eq!(
             response.result["follow_up_questions"],

@@ -1,4 +1,9 @@
 use anyhow::{Context, Result};
+pub use ansible_mesh_core::resources::{
+    ResourceDenied, ResourceGranted, ResourceMaterializing, ResourceReleased, ResourceRequest,
+    ResourceRevoked, ResourceType,
+};
+pub use ansible_mesh_core::storage::ComponentManifest;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::io::ErrorKind;
@@ -14,6 +19,178 @@ pub struct GuestIdentity {
     pub role: String,
     #[serde(default)]
     pub supported_tools: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesktopMembraneStatusView {
+    pub hotel: String,
+    pub daemon: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesktopMembraneGuestView {
+    pub guest_id: String,
+    pub name: String,
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<String>,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uptime: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorAgentView {
+    pub agent_id: String,
+    pub persona_name: String,
+    pub authority_hotel: String,
+    #[serde(default)]
+    pub toolset_tags: Vec<String>,
+    #[serde(default)]
+    pub active_session: bool,
+}
+
+pub type DesktopMembraneAgentView = OperatorAgentView;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTargetReachabilityView {
+    pub protocol: String,
+    pub host: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTargetView {
+    pub target_node_id: String,
+    pub target_hotel: String,
+    pub source_hotel: String,
+    #[serde(default)]
+    pub is_local: bool,
+    #[serde(default)]
+    pub roles: Vec<String>,
+    #[serde(default)]
+    pub models: Vec<String>,
+    #[serde(default)]
+    pub tools: Vec<String>,
+    #[serde(default)]
+    pub advertised_roles: Vec<String>,
+    pub freshness_state: String,
+    pub freshness_age_secs: u64,
+    pub freshness_ttl_secs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reachability: Option<OperatorTargetReachabilityView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTargetStatusView {
+    pub target_node_id: String,
+    pub target_hotel: String,
+    pub source_hotel: String,
+    pub observation_kind: String,
+    pub daemon_status: String,
+    pub freshness_state: String,
+    pub freshness_age_secs: u64,
+    pub freshness_ttl_secs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reachability: Option<OperatorTargetReachabilityView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTargetGuestInventoryView {
+    pub target_node_id: String,
+    pub target_hotel: String,
+    pub source_hotel: String,
+    pub observation_kind: String,
+    pub available: bool,
+    pub pending_remote_query_state: String,
+    #[serde(default)]
+    pub guests: Vec<DesktopMembraneGuestView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTargetAgentInventoryView {
+    pub target_node_id: String,
+    pub target_hotel: String,
+    pub source_hotel: String,
+    pub observation_kind: String,
+    pub available: bool,
+    pub pending_remote_query_state: String,
+    #[serde(default)]
+    pub agents: Vec<OperatorAgentView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+pub type DesktopMembraneTargetReachabilityView = OperatorTargetReachabilityView;
+pub type DesktopMembraneTargetView = OperatorTargetView;
+pub type DesktopMembraneTargetStatusView = OperatorTargetStatusView;
+pub type DesktopMembraneTargetGuestInventoryView = OperatorTargetGuestInventoryView;
+pub type DesktopMembraneTargetAgentInventoryView = OperatorTargetAgentInventoryView;
+
+pub const OPERATOR_SURFACE_QUERY_ROLE: &str = "management.operator_surface_query";
+pub const OPERATOR_SURFACE_QUERY_REPLY_ROLE: &str = "management.operator_surface_query.reply";
+pub const OPERATOR_SURFACE_QUERY_HANDOFF_KIND: &str = "operator_surface_query";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OperatorSurfaceQueryHandoff {
+    pub handoff_kind: String,
+    pub surface: String,
+    pub request_id: String,
+    pub source_hotel: String,
+    pub target_hotel: String,
+    pub target_node_id: String,
+    pub caller_kind: String,
+    pub caller_id: String,
+    pub visibility_scope: String,
+    pub grant_scope: String,
+    pub intent: String,
+    #[serde(default)]
+    pub payload: serde_json::Value,
+    pub reply_to_node: String,
+    pub reply_to_role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_guest_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace: Option<String>,
+}
+
+pub const OPERATOR_CHAT_REPLY_ROLE: &str = "management.operator_chat.reply";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorChatTurnReply {
+    pub source_hotel: String,
+    pub target_hotel: String,
+    pub target_node_id: String,
+    pub target_agent_id: String,
+    pub operator_session_id: String,
+    pub conversation_id: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub delivery_kind: String,
+    pub reply_action: String,
+    #[serde(default)]
+    pub observed_events: Vec<String>,
+    #[serde(default)]
+    pub observed_partial_replies: Vec<String>,
+    pub content: String,
+}
+
+/// A single entry in an agent's command manifest — describes one slash command the agent handles.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandManifestEntry {
+    /// The command name without the leading slash, e.g. `"status"`.
+    pub command: String,
+    /// One-line human-readable description shown in Telegram's command menu.
+    pub description: String,
+    /// Optional short usage string shown in /help, e.g. `"/role <name>"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_hint: Option<String>,
 }
 
 /// Shared cross-component task failure envelope.
@@ -51,6 +228,54 @@ impl TaskErrorPayload {
         }
     }
 
+    /// A tool execution failure originating inside agent-core local dispatch.
+    pub fn tool_execution(
+        tool_name: impl Into<String>,
+        message: impl Into<String>,
+        code: Option<&str>,
+    ) -> Self {
+        let tool_name = tool_name.into();
+        Self {
+            kind: "tool_execution_failure".into(),
+            message: message.into(),
+            code: code.map(str::to_string),
+            component: Some("philote".into()),
+            capability: Some(tool_name),
+            provider: None,
+            retryable: Some(false),
+        }
+    }
+
+    /// A failure returned by the hotel IPC layer (error code + message from hotel).
+    pub fn ipc_failure(
+        component: impl Into<String>,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: "ipc_failure".into(),
+            message: message.into(),
+            code: Some(code.into()),
+            component: Some(component.into()),
+            provider: None,
+            capability: None,
+            retryable: Some(true),
+        }
+    }
+
+    /// A transport-level failure (socket error, serialization failure, etc.).
+    pub fn transport_error(component: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            kind: "transport_error".into(),
+            message: message.into(),
+            code: None,
+            component: Some(component.into()),
+            provider: None,
+            capability: None,
+            retryable: Some(true),
+        }
+    }
+
     pub fn display_message(&self) -> String {
         let mut parts = vec![self.message.clone(), format!("kind={}", self.kind)];
         if let Some(code) = self.code.as_deref() {
@@ -82,16 +307,24 @@ pub struct HandoffBundle {
     pub return_to: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff_reason: Option<String>,
+    /// The role handing off (e.g. "orchestrator", "developer"). None = orchestrator base.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_role: Option<String>,
+    /// The role receiving the handoff. Always set for same-identity role handoffs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_goal: Option<String>,
     #[serde(default)]
     pub active_constraints: Vec<String>,
+    /// Session-local facts still live at handoff time. Owned by the workflow, not the operator.
     #[serde(default)]
     pub relevant_session_facts: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_summary: Option<String>,
     #[serde(default)]
     pub suggested_memory_refs: Vec<String>,
+    /// One of: "required" (target must hand back), "optional", "none".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_return_mode: Option<String>,
     #[serde(default)]
@@ -327,15 +560,57 @@ pub enum IpcRequest {
         lease_key: String,
         agent_id: String,
     },
+    AcquireDesktopMembraneLease {
+        lease_key: String,
+        port: u16,
+    },
     GetTelegramPollLeaseOwner {
         lease_key: String,
     },
+    GetDesktopMembraneLeaseOwner {
+        lease_key: String,
+    },
+    GetDesktopMembraneStatus,
+    GetDesktopMembraneTargetStatus {
+        target_node_id: String,
+    },
+    QueryOperatorTargets,
+    QueryOperatorTargetStatus {
+        target_node_id: String,
+    },
+    QueryOperatorTargetGuests {
+        target_node_id: String,
+    },
+    QueryOperatorTargetAgents {
+        target_node_id: String,
+    },
+    SendOperatorChatTurn {
+        target_node_id: String,
+        target_agent_id: String,
+        operator_session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation_id: Option<String>,
+        content: String,
+    },
+    ListDesktopMembraneGuests,
+    ListDesktopMembraneTargetGuests {
+        target_node_id: String,
+    },
+    ListDesktopMembraneAgents,
+    ListDesktopMembraneTargets,
     RenewTelegramPollLease {
         lease_key: String,
         agent_id: String,
         lease_epoch: u64,
     },
+    RenewDesktopMembraneLease {
+        lease_key: String,
+        lease_epoch: u64,
+    },
     ReleaseTelegramPollLease {
+        lease_key: String,
+    },
+    ReleaseDesktopMembraneLease {
         lease_key: String,
     },
     HandoffToRole {
@@ -348,6 +623,25 @@ pub enum IpcRequest {
         summary: String,
         #[serde(default)]
         return_to: Option<String>,
+    },
+    DelegateToPeer {
+        target_agent_id: String,
+        task_description: String,
+        context_package: String,
+        chat_id: String,
+        #[serde(default)]
+        source: Option<String>,
+        #[serde(default)]
+        expected_artifacts: Vec<String>,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+    },
+    DelegateToExternalPeer {
+        target_peer_type: String,
+        task_description: String,
+        context_package: String,
+        #[serde(default)]
+        expected_artifacts: Vec<String>,
     },
     SpawnSubagent {
         session_id: String,
@@ -385,7 +679,7 @@ pub enum IpcRequest {
     RegisterSkill {
         skill_name: String,
         description: String,
-        /// The subagent worker kind (e.g. `"agent-worker"`).
+        /// The subagent worker kind (e.g. `"philote-worker"`).
         subagent_kind: String,
         /// High-level goal statement for this skill.
         goal: String,
@@ -404,6 +698,22 @@ pub enum IpcRequest {
         #[serde(default)]
         lease_terms: SubagentLeaseTerms,
     },
+    /// Assign a registered skill to a role's toolset profile.
+    /// Requires orchestrator identity. Skill must exist in catalog.
+    AssignSkill {
+        agent_id: String,
+        role_name: String,
+        skill_name: String,
+    },
+    /// Remove a skill from a role's toolset profile.
+    /// Requires orchestrator identity.
+    RevokeSkill {
+        agent_id: String,
+        role_name: String,
+        skill_name: String,
+    },
+    /// List all registered skills with their validation states.
+    ListSkills {},
     ListRoleIncarnations {
         agent_id: String,
     },
@@ -432,9 +742,17 @@ pub enum IpcRequest {
         agent_id: String,
         role_name: String,
         guest_id: String,
+        /// The active persona role of the calling agent (e.g. "orchestrator").
+        /// Distinct from the IPC process role ("agent") — this is the session-level
+        /// persona role stored in the context graph, checked server-side for authority.
+        calling_role: String,
         toolset_profile: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         role_identity_addendum: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role_manifest: Option<String>,
+        #[serde(default)]
+        is_admin: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         inactive_ttl_seconds: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -445,6 +763,65 @@ pub enum IpcRequest {
         model_profile: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context_window_policy: Option<String>,
+    },
+    /// Request the hotel's loaded MuninnDB configuration (vault tokens included).
+    FetchMemoryConfig,
+    /// Register a graph instance with the hotel's ODS so it can route graph_id → instance_id.
+    /// Sent by the graph-runner on startup (for all existing graphs) and after each graph.create.
+    RegisterGraphInstance {
+        graph_id: String,
+        instance_id: String,
+    },
+    /// Propose a new durable rule for the agent.
+    ///
+    /// The hotel stores the rule in the context graph and requires operator confirmation
+    /// before the rule takes effect. Responds with [`IpcResponse::RuleProposed`].
+    ProposeRule {
+        agent_id: String,
+        description: String,
+        rationale: String,
+    },
+    /// List all durable rules owned by the given agent.
+    ///
+    /// Responds with [`IpcResponse::RuleList`].
+    ListRules {
+        agent_id: String,
+    },
+    /// Agent declares a need for a resource; hotel responds with
+    /// [`IpcResponse::ResourceGranted`], [`IpcResponse::ResourceDenied`], or
+    /// [`IpcResponse::ResourceMaterializing`].
+    ResourceRequest(ResourceRequest),
+    /// Agent notifies the hotel that it no longer needs a resource instance.
+    ///
+    /// The hotel decrements the tenant count; zero-tenant instances may be
+    /// torn down per their teardown policy.
+    ResourceReleased(ResourceReleased),
+    /// Register (or update) a component with the hotel.
+    ///
+    /// The hotel upserts a `GuestRecord` into `materialized_guests`, stores the
+    /// `component_config` blob under `node_config["component:{guest_id}"]`, and
+    /// materializes (spawns) the guest if `auto_start` is true.
+    ///
+    /// Responds with [`IpcResponse::ComponentRegistered`].
+    RegisterComponent {
+        manifest: ComponentManifest,
+    },
+    /// Inject a remote node incarnation into the local node registry.
+    ///
+    /// Used in smoke / integration tests to simulate mesh discovery without
+    /// requiring live UDP beaconing between hotels.  The injected advertisement
+    /// survives for the registry's normal TTL (15 s) and is subject to the same
+    /// staleness eviction as beacon-sourced entries.
+    SeedRemoteIncarnation {
+        node_id: String,
+        hotel_id: String,
+        incarnation_id: String,
+        target_role: String,
+        /// Optional UDS socket path for this node. When provided the hotel
+        /// will forward tasks addressed to this node directly via the socket
+        /// (smoke-test cross-hotel delivery without full mesh).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        socket_path: Option<String>,
     },
 }
 
@@ -467,9 +844,50 @@ pub enum IpcResponse {
         granted: bool,
         lease: Option<LeaseEnvelope>,
     },
+    DesktopMembraneLease {
+        desktop_granted: bool,
+        desktop_lease: Option<LeaseEnvelope>,
+    },
     TelegramPollLeaseStatus {
         active: bool,
         lease: Option<LeaseEnvelope>,
+    },
+    DesktopMembraneLeaseStatus {
+        desktop_active: bool,
+        desktop_lease: Option<LeaseEnvelope>,
+    },
+    DesktopMembraneStatusView {
+        membrane_status: DesktopMembraneStatusView,
+    },
+    DesktopMembraneTargetStatusView {
+        membrane_target_status: DesktopMembraneTargetStatusView,
+    },
+    OperatorTargetsView {
+        operator_targets: Vec<OperatorTargetView>,
+    },
+    OperatorTargetStatusView {
+        operator_target_status: OperatorTargetStatusView,
+    },
+    OperatorTargetGuestsView {
+        operator_target_guests: OperatorTargetGuestInventoryView,
+    },
+    OperatorTargetAgentsView {
+        operator_target_agents: OperatorTargetAgentInventoryView,
+    },
+    OperatorChatTurnReply {
+        operator_chat_reply: OperatorChatTurnReply,
+    },
+    DesktopMembraneGuestsView {
+        membrane_guests: Vec<DesktopMembraneGuestView>,
+    },
+    DesktopMembraneTargetGuestsView {
+        membrane_target_guests: DesktopMembraneTargetGuestInventoryView,
+    },
+    DesktopMembraneAgentsView {
+        membrane_agents: Vec<DesktopMembraneAgentView>,
+    },
+    DesktopMembraneTargetsView {
+        membrane_targets: Vec<DesktopMembraneTargetView>,
     },
     HandoffAck {
         handoff_guest_id: String,
@@ -478,6 +896,10 @@ pub enum IpcResponse {
     HandoffBackAck {
         handoff_guest_id: String,
         became_active: bool,
+    },
+    DelegationAck {
+        delegation_id: String,
+        status: String,
     },
     SpawnSubagentOk {
         subagent_guest_id: String,
@@ -502,6 +924,16 @@ pub enum IpcResponse {
         #[serde(default)]
         validation_errors: Vec<String>,
     },
+    /// Response to [`IpcRequest::AssignSkill`] and [`IpcRequest::RevokeSkill`].
+    SkillAssigned {
+        role_name: String,
+        skill_name: String,
+        operation: String, // "assigned" or "revoked"
+    },
+    /// Response to [`IpcRequest::ListSkills`].
+    SkillList {
+        skills: Vec<serde_json::Value>,
+    },
     InboundTask {
         source_node: String,
         task_id: Uuid,
@@ -524,6 +956,50 @@ pub enum IpcResponse {
         agent_id: String,
         memory_type: String,
         content_json: serde_json::Value,
+    },
+    /// Response to [`IpcRequest::FetchMemoryConfig`].
+    /// `config_json` is `None` if MuninnDB is not configured on this hotel.
+    MemoryConfig {
+        config_json: Option<String>,
+    },
+    /// Response to [`IpcRequest::RegisterGraphInstance`].
+    GraphInstanceRegistered {
+        graph_id: String,
+    },
+    /// Response to [`IpcRequest::ProposeRule`].
+    RuleProposed {
+        rule_id: String,
+    },
+    /// Response to [`IpcRequest::ListRules`].
+    RuleList {
+        rules: Vec<serde_json::Value>,
+    },
+    /// Hotel → agent: the requested resource is live and the binding is active.
+    /// Response to [`IpcRequest::ResourceRequest`].
+    ResourceGranted {
+        resource_granted: ResourceGranted,
+    },
+    /// Hotel → agent: the resource request was refused.
+    /// Response to [`IpcRequest::ResourceRequest`].
+    ResourceDenied {
+        resource_denied: ResourceDenied,
+    },
+    /// Hotel → agent: the resource is being materialised; a `ResourceGranted`
+    /// will follow asynchronously once the instance is ready.
+    /// Response to [`IpcRequest::ResourceRequest`].
+    ResourceMaterializing {
+        resource_materializing: ResourceMaterializing,
+    },
+    /// Hotel → agent: the hotel is withdrawing a previously issued grant.
+    /// Pushed without a corresponding request; agents must stop using the
+    /// resource immediately.
+    ResourceRevoked {
+        resource_revoked: ResourceRevoked,
+    },
+    /// Response to [`IpcRequest::RegisterComponent`].
+    ComponentRegistered {
+        registered_guest_id: String,
+        registered_role: String,
     },
 }
 
@@ -641,11 +1117,11 @@ impl PhiloticClient {
 
     fn socket_path() -> String {
         std::env::var("PHILOTIC_HOTEL_SOCKET")
-            .unwrap_or_else(|_| "/tmp/philotic-ansible.sock".to_string())
+            .unwrap_or_else(|_| "/tmp/philotic-aiua.sock".to_string())
     }
 
     /// Connect to the local Ansible daemon automatically, driven by environment variables.
-    /// Default Hotel socket is `/tmp/philotic-ansible.sock` unless `PHILOTIC_HOTEL_SOCKET` is specified.
+    /// Default Hotel socket is `/tmp/philotic-aiua.sock` unless `PHILOTIC_HOTEL_SOCKET` is specified.
     pub async fn connect_at(socket_path: impl AsRef<str>, identity: GuestIdentity) -> Result<Self> {
         let socket_path = socket_path.as_ref().to_string();
         let stream = UnixStream::connect(&socket_path)
@@ -682,7 +1158,7 @@ impl PhiloticClient {
     }
 
     /// Connect to the local Ansible daemon automatically, driven by environment variables.
-    /// Default Hotel socket is `/tmp/philotic-ansible.sock` unless `PHILOTIC_HOTEL_SOCKET` is specified.
+    /// Default Hotel socket is `/tmp/philotic-aiua.sock` unless `PHILOTIC_HOTEL_SOCKET` is specified.
     pub async fn connect(identity: GuestIdentity) -> Result<Self> {
         Self::connect_at(Self::socket_path(), identity).await
     }
@@ -812,7 +1288,7 @@ mod tests {
                 lease_type: "telegram_poll".into(),
                 lease_scope: "telegram:bot-token:abcd".into(),
                 authority_hotel: "hotel-alpha".into(),
-                authority_component: Some("ansible".into()),
+                authority_component: Some("aiua".into()),
                 owner_guest_id: "membrane-telegram-01".into(),
                 owner_hotel: Some("hotel-alpha".into()),
                 owner_component_type: Some("membrane".into()),
@@ -976,7 +1452,7 @@ mod tests {
                 write_frame(
                     &mut stream,
                     &serde_json::to_vec(&IpcResponse::InboundTask {
-                        source_node: "local-ansible-01".into(),
+                        source_node: "local-aiua-01".into(),
                         task_id: Uuid::nil(),
                         task_json: serde_json::json!({
                             "action": "send_reply",
@@ -1067,7 +1543,7 @@ mod tests {
                 .await;
 
                 let payload = serde_json::to_vec(&IpcResponse::InboundTask {
-                    source_node: "local-ansible-01".into(),
+                    source_node: "local-aiua-01".into(),
                     task_id: Uuid::nil(),
                     task_json: serde_json::json!({
                         "action": "send_reply",

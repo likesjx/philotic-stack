@@ -31,11 +31,11 @@ The native `rusqlite` Context Graph is now the absolute Source of Truth for the 
 
 ### 2. Universal Materialization (The Hotel and Guests)
 
-The `ansible` daemon now acts as an empty "Hotel".
+The `aiua` daemon now acts as an empty "Hotel".
 Upon booting, it reads its required capabilities from the `materialized_guests` table in the Context Graph and physically spawns separate OS child processes (`Guests`) for each feature:
 
 - `membrane` (The Telegram Gateway)
-- `agent-core` (The Persona, e.g., Jane)
+- `philote` (The Persona, e.g., Jane)
 - `model-router` (The Inference Engine, e.g., Gemini)
 
 The Ansible daemon gracefully handles Ctrl+C shutdown signals, broadcasting to all children to avoid orphaned processes. It also tracks the active execution PID in the database itself (Reclamation), ensuring no two identical agents run at the same time by using `kill -9` on ghosts before spawning a new one.
@@ -61,7 +61,7 @@ When you send a message to the Telegram bot, the following zero-trust execution 
 
 ## Validation Results
 
-We walked the trace logs of the `ansible_context.db` and the raw `tracing_subscriber` terminal output to confirm:
+We walked the trace logs of the `aiua_context.db` and the raw `tracing_subscriber` terminal output to confirm:
 
 - The UDP Sockets bound to the correct PIDs without OS `error 48`.
 - The `Agent Core` logic successfully received the prompt.

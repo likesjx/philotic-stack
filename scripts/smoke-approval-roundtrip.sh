@@ -5,20 +5,20 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_DIR="$(mktemp -d)"
 HOTEL_NAME="jane-smoke-approval-$$"
 export PHILOTIC_AGENT_ID="agent-jane-01"
-NODE_NAME="${HOTEL_NAME}-ansible-01"
+NODE_NAME="${HOTEL_NAME}-aiua-01"
 export PHILOTIC_NODE_ID="${NODE_NAME}"
 export PHILOTIC_MODEL_ROUTER_STUB_RESPONSE="approval-turn-1=APPROVAL_REQUIRED: deploy the thing;approval-turn-2=Approved: deploy the thing"
-export PHILOTIC_NODE_ID="${HOTEL_NAME}-ansible-01"
-export PHILOTIC_TARGET_NODE="${HOTEL_NAME}-ansible-01"
-export PHILOTIC_FINAL_REPLY_TO="${HOTEL_NAME}-ansible-01"
+export PHILOTIC_NODE_ID="${HOTEL_NAME}-aiua-01"
+export PHILOTIC_TARGET_NODE="${HOTEL_NAME}-aiua-01"
+export PHILOTIC_FINAL_REPLY_TO="${HOTEL_NAME}-aiua-01"
 SOCKET_PATH="/tmp/philotic-${HOTEL_NAME}.sock"
 
 cleanup() {
   local exit_code=$?
   set +e
   if [[ ${exit_code} -ne 0 ]]; then
-    echo "Approval smoke failed. ansible log:"
-    [[ -f "${TMP_DIR}/ansible.log" ]] && cat "${TMP_DIR}/ansible.log"
+    echo "Approval smoke failed. aiua log:"
+    [[ -f "${TMP_DIR}/aiua.log" ]] && cat "${TMP_DIR}/aiua.log"
     echo "Approval smoke failed. agent log:"
     [[ -f "${TMP_DIR}/agent.log" ]] && cat "${TMP_DIR}/agent.log"
     echo "Approval smoke failed. model log:"
@@ -37,12 +37,12 @@ cleanup() {
 trap cleanup EXIT
 
 echo "Building approval-smoke binaries..."
-cargo build -p ansible -p agent-core -p model-router -p philotic-client --example approval_smoke_driver >/dev/null
+cargo build -p aiua -p philote -p model-router -p philotic-client --example approval_smoke_driver >/dev/null
 
-echo "Starting ansible in ${TMP_DIR}..."
+echo "Starting aiua in ${TMP_DIR}..."
 (
   cd "${TMP_DIR}"
-  PHILOTIC_SMOKE_MODE=1 cargo run -q --manifest-path "${ROOT_DIR}/crates/ansible/Cargo.toml" --bin ansible -- --hotel "${HOTEL_NAME}" >"${TMP_DIR}/ansible.log" 2>&1
+  PHILOTIC_SMOKE_MODE=1 cargo run -q --manifest-path "${ROOT_DIR}/crates/aiua/Cargo.toml" --bin aiua -- --hotel "${HOTEL_NAME}" >"${TMP_DIR}/aiua.log" 2>&1
 ) &
 ANSIBLE_PID=$!
 
@@ -54,13 +54,13 @@ for _ in {1..50}; do
 done
 
 if [[ ! -S "${SOCKET_PATH}" ]]; then
-  echo "ansible socket did not appear"
+  echo "aiua socket did not appear"
   exit 1
 fi
 
-echo "Starting agent-core..."
+echo "Starting philote..."
 PHILOTIC_HOTEL_SOCKET="${SOCKET_PATH}" \
-  cargo run -q --manifest-path "${ROOT_DIR}/crates/agent-core/Cargo.toml" --bin agent-core >"${TMP_DIR}/agent.log" 2>&1 &
+  cargo run -q --manifest-path "${ROOT_DIR}/crates/philote/Cargo.toml" --bin philote >"${TMP_DIR}/agent.log" 2>&1 &
 AGENT_PID=$!
 
 echo "Starting model-router..."

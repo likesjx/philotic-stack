@@ -52,6 +52,10 @@ impl NodeRegistry {
         status.last_seen.elapsed() <= DEFAULT_NODE_TTL
     }
 
+    pub fn freshness_ttl_secs() -> u64 {
+        DEFAULT_NODE_TTL.as_secs()
+    }
+
     /// Register or update a node's capabilities from a heartbeat.
     pub fn update_node(
         &mut self,

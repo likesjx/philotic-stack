@@ -59,6 +59,10 @@ pub enum EventKind {
     MemoryOp,
     /// Capability availability advertisement.
     CapabilityPublish,
+    /// Administrative control plane mutations (e.g., Session role handoffs)
+    SessionControl,
+    /// Portable agent-graph snapshot for LWW mesh synchronisation (Seam 4).
+    AgentGraphSync,
 }
 
 /// The payload definition. Large files must use `BlobRef`.
