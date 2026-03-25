@@ -9,11 +9,17 @@
 //!   GET  /api/status
 //!   GET  /api/guests
 //!   GET  /api/agents
+//!   GET  /api/agents/:agent_id/roles
+//!   GET  /api/agents/:agent_id/rules
+//!   GET  /api/skills
 //!   GET  /api/mesh/targets
 //!   GET  /api/mesh/targets/:target_node_id/status
 //!   GET  /api/mesh/targets/:target_node_id/guests
 //!   GET  /api/mesh/targets/:target_node_id/agents
 //!   POST /api/mesh/targets/:target_node_id/agents/:agent_id/chat
+//!   GET  /api/config
+//!   GET  /api/config/telegram
+//!   GET  /api/config/gemini
 //!   GET  /api/sessions    (stub — returns [] until session table exists)
 //!   GET  /api/apartments/:agent_id   (disabled by default for the desktop membrane)
 //!   POST /api/guests/:guest_id/restart
@@ -145,6 +151,12 @@ pub async fn run(
         .route("/api/status", get(handle_status))
         .route("/api/guests", get(handle_guests))
         .route("/api/agents", get(handle_agents))
+        .route("/api/agents/:agent_id/roles", get(handle_agent_roles))
+        .route("/api/agents/:agent_id/rules", get(handle_agent_rules))
+        .route("/api/skills", get(handle_skills))
+        .route("/api/config", get(handle_config))
+        .route("/api/config/telegram", get(handle_config_telegram))
+        .route("/api/config/gemini", get(handle_config_gemini))
         .route("/api/mesh/targets", get(handle_mesh_targets))
         .route(
             "/api/mesh/targets/:target_node_id/status",
@@ -1056,6 +1068,178 @@ async fn handle_guest_stop(
     }
 }
 
+// ── GET /api/agents/:agent_id/roles ──────────────────────────────────────────
+
+async fn handle_agent_roles(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_list_role_incarnations(&state.socket, &agent_id).await {
+        Ok(roles) => Json(roles).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// ── GET /api/agents/:agent_id/rules ──────────────────────────────────────────
+
+async fn handle_agent_rules(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_list_rules(&state.socket, &agent_id).await {
+        Ok(rules) => Json(rules).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// ── GET /api/skills ───────────────────────────────────────────────────────────
+
+async fn handle_skills(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_list_skills(&state.socket).await {
+        Ok(skills) => Json(skills).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// ── GET /api/config ───────────────────────────────────────────────────────────
+
+async fn handle_config(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    // Read well-known operator-facing config keys. Values are returned as-is
+    // (already JSON-encoded strings in the context graph).
+    let keys = &[
+        "execution_host",
+        "vault_registry",
+        "tool_runner_registry",
+    ];
+    let mut out = serde_json::Map::new();
+    for key in keys {
+        match ipc_get_config(&state.socket, key).await {
+            Ok(Some(val)) => { out.insert(key.to_string(), val); }
+            Ok(None) => { out.insert(key.to_string(), Value::Null); }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("reading {key}: {e}")})),
+                )
+                    .into_response();
+            }
+        }
+    }
+    Json(Value::Object(out)).into_response()
+}
+
+// ── GET /api/config/telegram ──────────────────────────────────────────────────
+
+async fn handle_config_telegram(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    // Return token ref name only — never the token value.
+    let token_ref = match ipc_get_config(&state.socket, "telegram_bot_token").await {
+        Ok(Some(val)) => {
+            // The value is the token itself. Surface only that it is set and its first 8 chars as a hint.
+            let hint = val
+                .as_str()
+                .map(|s| format!("{}…", &s[..s.len().min(8)]))
+                .unwrap_or_else(|| "(set)".into());
+            Some(hint)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    Json(json!({
+        "token_configured": token_ref.is_some(),
+        "token_hint": token_ref,
+    }))
+    .into_response()
+}
+
+// ── GET /api/config/gemini ────────────────────────────────────────────────────
+
+async fn handle_config_gemini(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    // Surface OAuth metadata only — no token values.
+    let meta_keys = &[
+        "gemini_oauth_project_id",
+        "gemini_oauth_scope",
+        "gemini_oauth_token_type",
+        "gemini_oauth_access_token_expires_at",
+    ];
+    let ref_keys = &[
+        "gemini_oauth_access_token_ref",
+        "gemini_oauth_refresh_token_ref",
+    ];
+    let mut meta = serde_json::Map::new();
+    for key in meta_keys {
+        match ipc_get_config(&state.socket, key).await {
+            Ok(Some(val)) => { meta.insert(key.to_string(), val); }
+            Ok(None) => {}
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("reading {key}: {e}")})),
+                )
+                    .into_response();
+            }
+        }
+    }
+    let mut refs_configured = serde_json::Map::new();
+    for key in ref_keys {
+        let configured = match ipc_get_config(&state.socket, key).await {
+            Ok(v) => v.is_some(),
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("reading {key}: {e}")})),
+                )
+                    .into_response();
+            }
+        };
+        refs_configured.insert(key.to_string(), Value::Bool(configured));
+    }
+    Json(json!({
+        "oauth_metadata": meta,
+        "token_refs_configured": refs_configured,
+    }))
+    .into_response()
+}
+
+// ── IPC helpers ───────────────────────────────────────────────────────────────
+
 async fn ipc_guest_action(socket: &str, guest_id: &str, action: &str) -> Result<()> {
     let mut client = connect_management_client(socket, "philotic-web-mgmt").await?;
 
@@ -1187,6 +1371,66 @@ async fn ipc_desktop_membrane_target_agents(
         other => Err(anyhow!(
             "unexpected desktop membrane target agents response: {other:?}"
         )),
+    }
+}
+
+async fn ipc_list_role_incarnations(socket: &str, agent_id: &str) -> Result<Value> {
+    let mut client = connect_management_client(socket, "philotic-web-roles").await?;
+    match client
+        .send_request(IpcRequest::ListRoleIncarnations {
+            agent_id: agent_id.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::Standard {
+            ok: true,
+            data: Some(d),
+            ..
+        } => Ok(d),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected role incarnations response: {other:?}")),
+    }
+}
+
+async fn ipc_list_rules(socket: &str, agent_id: &str) -> Result<Vec<Value>> {
+    let mut client = connect_management_client(socket, "philotic-web-rules").await?;
+    match client
+        .send_request(IpcRequest::ListRules {
+            agent_id: agent_id.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::RuleList { rules } => Ok(rules),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected rules response: {other:?}")),
+    }
+}
+
+async fn ipc_list_skills(socket: &str) -> Result<Vec<Value>> {
+    let mut client = connect_management_client(socket, "philotic-web-skills").await?;
+    match client.send_request(IpcRequest::ListSkills {}).await? {
+        IpcResponse::SkillList { skills } => Ok(skills),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected skills response: {other:?}")),
+    }
+}
+
+async fn ipc_get_config(socket: &str, key: &str) -> Result<Option<Value>> {
+    let mut client = connect_management_client(socket, "philotic-web-config").await?;
+    match client
+        .send_request(IpcRequest::GetConfig {
+            key: key.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::ConfigData { value_json: Some(raw), .. } => {
+            let parsed: Value = serde_json::from_str(&raw)
+                .unwrap_or_else(|_| Value::String(raw));
+            Ok(Some(parsed))
+        }
+        IpcResponse::ConfigData { value_json: None, .. } => Ok(None),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected config data response: {other:?}")),
     }
 }
 
