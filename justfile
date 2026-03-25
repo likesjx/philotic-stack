@@ -245,6 +245,10 @@ smoke-graph-runner:
 smoke-agent-graph:
     bash scripts/smoke-agent-graph-roundtrip.sh
 
+# Run the desktop membrane management surface smoke (lease, REST API, auth, clean shutdown)
+smoke-desktop-membrane:
+    bash scripts/smoke-desktop-membrane.sh
+
 # Run the model-controller roundtrip smoke (requires mesh-config.json with model credentials)
 smoke-model-controller:
     bash scripts/smoke-model-controller-roundtrip.sh
@@ -285,7 +289,7 @@ test-suite:
 
 # Full binary smoke suite (no external credentials or large model downloads)
 # Covers: routing, approval flows, session lifecycle, cognitive loop, graph runner,
-#         agent graph, subagent, cognitive re-entry.
+#         agent graph, subagent, cognitive re-entry, desktop membrane.
 smoke-suite:
     ./scripts/smoke-routed-tool-roundtrip.sh
     ./scripts/smoke-approval-roundtrip.sh
@@ -300,6 +304,7 @@ smoke-suite:
     bash scripts/smoke-cognitive-reentry-roundtrip.sh
     bash scripts/smoke-graph-runner-roundtrip.sh
     bash scripts/smoke-agent-graph-roundtrip.sh
+    bash scripts/smoke-desktop-membrane.sh
 
 # Run the trusted vertical-slice verification suite (test-suite + smoke-suite)
 verify-vertical-slice:
@@ -313,11 +318,11 @@ operator-checklist:
     @echo "── Tier 1: No external deps (run always) ──────────────────────"
     @echo "  just verify-vertical-slice"
     @echo "    = just test-suite  (unit + integration tests)"
-    @echo "    + just smoke-suite (binary roundtrip smokes)"
+    @echo "    + just smoke-suite (binary roundtrip smokes, incl. desktop membrane)"
     @echo ""
     @echo "── Tier 2: External credentials required ───────────────────────"
     @echo "  just smoke-model-controller   # mesh-config.json + Gemini key"
-    @echo "  just smoke-auto-recall        # running hotel + agent session"
+    @echo "  just smoke-auto-recall        # running hotel + Muninn (PHILOTIC_HOTEL_SOCKET must be set)"
     @echo "  just smoke-gemini-oauth       # live Gemini OAuth flow"
     @echo "  just smoke-remote-model       # two live hotels"
     @echo ""

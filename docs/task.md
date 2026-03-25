@@ -1036,6 +1036,7 @@ Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membra
   - unknown/dirty desktop source state
 - [ ] Define the CI/release workflow for acquiring desktop UI assets explicitly rather than relying on opportunistic sibling-repo discovery.
 - [ ] Add integrated release-shape verification that proves the embedded assets served by `philotic-web` match the recorded asset manifest.
+- [x] Write and pass `smoke-desktop-membrane` covering: lease acquisition, core REST endpoints, auth rejection (401 no-token + wrong-token), apartment not returning 200, and clean SIGTERM shutdown.
 
 ## Next Project: Tool Assembly and Routed Execution
 

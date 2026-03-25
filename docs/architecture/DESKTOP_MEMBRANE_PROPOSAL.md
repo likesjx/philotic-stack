@@ -76,9 +76,11 @@ The desktop UI should not become a second control plane with nicer CSS, more dir
 
 ## Disposition
 
-`proposed`
+`accepted for current slice`
 
 Track follow-on work in [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md).
+
+First slice is smoke-green: `just smoke-desktop-membrane` (lease, REST API auth, core endpoints, clean shutdown).
 
 ## Current Slice
 
