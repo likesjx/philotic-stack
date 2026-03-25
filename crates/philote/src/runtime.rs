@@ -1757,6 +1757,13 @@ impl AgentRuntime {
             )
         };
 
+        // Store the tool call on the active turn BEFORE dispatching so that when the
+        // result returns, handle_tool_result can recover the full (name + arguments)
+        // pair for the working_tool_history. Without this, the fallback uses empty args.
+        if let Some(state) = self.sessions.get_mut(&session_id) {
+            state.set_pending_tool_call(tool_call.clone());
+        }
+
         let tool_req = ToolExecutionPayload {
             action: "execute_tool",
             session_id,
@@ -1922,6 +1929,14 @@ impl AgentRuntime {
             };
             let stall_threshold = state.settings.execution.stall_detection_threshold;
 
+            // Increment iteration before building the envelope so the context projection
+            // carries the correct (post-increment) iteration number. This ensures
+            // turn/iteration-aware stubs and any model-side telemetry see the right value.
+            if let Some(turn) = state.active_turn.as_mut() {
+                turn.iteration += 1;
+                turn.phase = TurnPhase::WaitingModel;
+            }
+
             let iteration = state.active_turn.as_ref().map(|t| t.iteration).unwrap_or(0);
             let iteration_cap = state.settings.execution.iteration_cap;
 
@@ -1930,7 +1945,7 @@ impl AgentRuntime {
                     "Stall detected: {consecutive_failures} consecutive step failures \
                      (threshold: {stall_threshold}). Surfacing to user."
                 ))
-            } else if iteration >= iteration_cap {
+            } else if iteration > iteration_cap {
                 Err(format!(
                     "Turn exceeded maximum tool iterations ({iteration_cap}). Aborting."
                 ))
@@ -1940,10 +1955,6 @@ impl AgentRuntime {
                 // and tool_history all reach model-router — not just a flat prompt.
                 match state.build_reentry_context_envelope() {
                     Some((prompt, context, context_projection, tools)) => {
-                        if let Some(turn) = state.active_turn.as_mut() {
-                            turn.iteration += 1;
-                            turn.phase = TurnPhase::WaitingModel;
-                        }
                         let active_turn = state.active_turn.as_ref().expect("turn exists");
                         Ok((
                             prompt,
