@@ -53,6 +53,19 @@ pub fn store_secret(graph: &GraphDomain, input: SecretInput) -> Result<String> {
     Ok(secret_ref)
 }
 
+/// Re-encrypt an existing vault secret in place with new plaintext.
+/// The secret_ref, scope, allowed_roles, and allowed_guests are preserved.
+pub fn rotate_secret(graph: &GraphDomain, secret_ref: &str, plaintext: &str) -> Result<()> {
+    let Some(mut record) = graph.get_secret(secret_ref)? else {
+        anyhow::bail!("vault secret not found: {}", secret_ref);
+    };
+    let (ciphertext_b64, nonce_b64) = encrypt(plaintext)?;
+    record.ciphertext_b64 = ciphertext_b64;
+    record.nonce_b64 = nonce_b64;
+    record.updated_at = now_secs();
+    graph.upsert_secret(&record)
+}
+
 pub fn resolve_secret(
     graph: &GraphDomain,
     secret_ref: &str,

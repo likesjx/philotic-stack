@@ -82,6 +82,11 @@ Track follow-on work in [docs/task.md](/Users/jaredlikes/code/philotic-stack/doc
 
 First slice is smoke-green: `just smoke-desktop-membrane` (lease, REST API auth, core endpoints, clean shutdown).
 
+Subsequent slices shipped:
+- **Slice 1 & 2**: agent cognitive drill-down (`/api/agents/:id/roles`, `/api/agents/:id/rules`, `/api/skills`) and hotel config read (`/api/config`, `/api/config/telegram`, `/api/config/gemini`).
+- **Slice 3 (components)**: component inventory + lifecycle management (`/api/components`, `/api/components/:guest_id`, enable/disable/restart) via new `ListComponents`, `SetComponentActive`, `RestartComponent` IPC variants.
+- **Slice 4 (graphs + secrets + skill mutations)**: graph runner instance inventory (`/api/graphs`, `/api/graphs/:graph_id`), secret ref inventory (`/api/secrets`, vault registry + config ref presence, no values), skill assignment mutations (`POST /DELETE /api/agents/:id/roles/:role_name/skills[/:skill_name]`) with management-role operator bypass.
+
 ## Current Slice
 
 This slice has started landing in code, but the boundary is still transitional in a few important places.

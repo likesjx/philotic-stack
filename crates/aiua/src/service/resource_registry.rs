@@ -1,4 +1,5 @@
 //! In-memory resource registry for the `demand-derived-materialization` seam.
+#![allow(dead_code)]
 //!
 //! # Transitional note
 //!

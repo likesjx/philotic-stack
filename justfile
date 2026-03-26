@@ -55,21 +55,37 @@ build-runtime:
 
 # Kill local Philotic hotel/guest binaries from this checkout and clear stale sockets.
 kill-local-stack:
-    @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/aiua" || true
-    @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/membrane" || true
-    @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/philote" || true
-    @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/model-controller-gemini" || true
-    @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/model-controller-elevenlabs" || true
-    @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/tool-runner" || true
-    @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/graph-runner" || true
-    @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/model-controller-mlx" || true
-    @rm -f /tmp/philotic-default.sock /tmp/philotic-local-telegram.sock /tmp/philotic-aria-architect-hotel.sock /tmp/philotic-startup-test-hotel.sock
+    @pkill -KILL -f "target/debug/aiua" 2>/dev/null || true
+    @pkill -KILL -f "target/debug/membrane" 2>/dev/null || true
+    @pkill -KILL -f "target/debug/philote" 2>/dev/null || true
+    @pkill -KILL -f "target/debug/model-controller-gemini" 2>/dev/null || true
+    @pkill -KILL -f "target/debug/model-controller-elevenlabs" 2>/dev/null || true
+    @pkill -KILL -f "target/debug/tool-runner" 2>/dev/null || true
+    @pkill -KILL -f "target/debug/graph-runner" 2>/dev/null || true
+    @pkill -KILL -f "target/debug/model-controller-mlx" 2>/dev/null || true
+    @sleep 0.3
+    @rm -f /tmp/philotic-*.sock
 
 # Rebuild first, then kill stale local runtime processes/sockets, then start one hotel cleanly.
 start-aiua-clean hotel:
     just build-runtime
     just kill-local-stack
     cargo run -p aiua -- --hotel {{hotel}}
+
+# Wait for the hotel socket then start philotic-web serve.
+# Usage: just start-serve local-telegram   (run in a second terminal after start-aiua-clean)
+start-serve hotel:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    SOCK="/tmp/philotic-{{hotel}}.sock"
+    echo "Waiting for ${SOCK}..."
+    for i in $(seq 1 60); do
+      [[ -S "${SOCK}" ]] && break
+      [[ ${i} -eq 60 ]] && echo "Timed out waiting for ${SOCK}" && exit 1
+      sleep 0.5
+    done
+    echo "Socket ready — starting serve"
+    exec "$(pwd)/target/debug/philotic-web" serve
 
 # Start the transitional Gemini OAuth flow through the hotel CLI
 gemini-oauth-start client_id project_id:

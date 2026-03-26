@@ -20,6 +20,16 @@
 //!   GET  /api/config
 //!   GET  /api/config/telegram
 //!   GET  /api/config/gemini
+//!   GET  /api/components
+//!   GET  /api/components/:guest_id
+//!   POST /api/components/:guest_id/enable
+//!   POST /api/components/:guest_id/disable
+//!   POST /api/components/:guest_id/restart
+//!   GET  /api/graphs
+//!   GET  /api/graphs/:graph_id
+//!   GET  /api/secrets
+//!   POST /api/agents/:agent_id/roles/:role_name/skills  (assign skill)
+//!   DELETE /api/agents/:agent_id/roles/:role_name/skills/:skill_name  (revoke skill)
 //!   GET  /api/sessions    (stub — returns [] until session table exists)
 //!   GET  /api/apartments/:agent_id   (disabled by default for the desktop membrane)
 //!   POST /api/guests/:guest_id/restart
@@ -37,7 +47,7 @@ use axum::{
     },
     http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Json, Response},
-    routing::{get, post},
+    routing::{delete, get, post, put},
     Router,
 };
 use rand::Rng;
@@ -151,12 +161,33 @@ pub async fn run(
         .route("/api/status", get(handle_status))
         .route("/api/guests", get(handle_guests))
         .route("/api/agents", get(handle_agents))
+        .route("/api/agents/:agent_id", axum::routing::patch(handle_agent_patch))
         .route("/api/agents/:agent_id/roles", get(handle_agent_roles))
         .route("/api/agents/:agent_id/rules", get(handle_agent_rules))
         .route("/api/skills", get(handle_skills))
+        .route("/api/toolsets", get(handle_toolsets))
         .route("/api/config", get(handle_config))
         .route("/api/config/telegram", get(handle_config_telegram))
         .route("/api/config/gemini", get(handle_config_gemini))
+        .route("/api/components", get(handle_components))
+        .route("/api/components/:guest_id", get(handle_component_detail))
+        .route("/api/components/:guest_id/enable", post(handle_component_enable))
+        .route("/api/components/:guest_id/disable", post(handle_component_disable))
+        .route("/api/components/:guest_id/restart", post(handle_component_restart))
+        .route("/api/graphs", get(handle_graphs))
+        .route("/api/graphs/:graph_id", get(handle_graph_detail))
+        .route("/api/secrets", get(handle_secrets))
+        .route("/api/secrets/rotate", post(handle_secret_rotate))
+        .route("/api/vault", post(handle_vault_add))
+        .route("/api/config/:key", put(handle_config_put))
+        .route(
+            "/api/agents/:agent_id/roles/:role_name/skills",
+            post(handle_assign_skill),
+        )
+        .route(
+            "/api/agents/:agent_id/roles/:role_name/skills/:skill_name",
+            delete(handle_revoke_skill),
+        )
         .route("/api/mesh/targets", get(handle_mesh_targets))
         .route(
             "/api/mesh/targets/:target_node_id/status",
@@ -1078,14 +1109,30 @@ async fn handle_agent_roles(
     if !check_auth(&headers, &state) {
         return unauthorized();
     }
-    match ipc_list_role_incarnations(&state.socket, &agent_id).await {
-        Ok(roles) => Json(roles).into_response(),
-        Err(e) => (
+    // Load role incarnations, then enrich each with its toolset profile data.
+    let role_data = match ipc_list_role_incarnations(&state.socket, &agent_id).await {
+        Ok(d) => d,
+        Err(e) => return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        ).into_response(),
+    };
+    let roles_arr = role_data.get("roles").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let mut enriched_roles = Vec::new();
+    for role in roles_arr {
+        let profile_name = role.get("toolset_profile").and_then(|v| v.as_str()).unwrap_or("");
+        let profile = if !profile_name.is_empty() {
+            ipc_get_toolset_profile(&state.socket, profile_name).await.ok().flatten()
+        } else {
+            None
+        };
+        let mut role_obj = role.clone();
+        if let (Some(obj), Some(p)) = (role_obj.as_object_mut(), profile) {
+            obj.insert("toolset".to_string(), p);
+        }
+        enriched_roles.push(role_obj);
     }
+    Json(json!({ "agent_id": agent_id, "roles": enriched_roles })).into_response()
 }
 
 // ── GET /api/agents/:agent_id/rules ──────────────────────────────────────────
@@ -1116,6 +1163,22 @@ async fn handle_skills(headers: HeaderMap, State(state): State<AppState>) -> Res
     }
     match ipc_list_skills(&state.socket).await {
         Ok(skills) => Json(skills).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// ── GET /api/toolsets ─────────────────────────────────────────────────────────
+
+async fn handle_toolsets(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_list_toolset_profiles(&state.socket).await {
+        Ok(profiles) => Json(profiles).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
@@ -1236,6 +1299,436 @@ async fn handle_config_gemini(headers: HeaderMap, State(state): State<AppState>)
         "token_refs_configured": refs_configured,
     }))
     .into_response()
+}
+
+// ── GET /api/graphs ───────────────────────────────────────────────────────────
+
+async fn handle_graphs(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_list_graph_instances(&state.socket).await {
+        Ok(instances) => Json(instances).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// ── GET /api/graphs/:graph_id ─────────────────────────────────────────────────
+
+async fn handle_graph_detail(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(graph_id): Path<String>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_list_graph_instances(&state.socket).await {
+        Ok(instances) => {
+            let found = instances
+                .into_iter()
+                .find(|g| g.get("graph_id").and_then(|v| v.as_str()) == Some(graph_id.as_str()));
+            match found {
+                Some(g) => Json(g).into_response(),
+                None => (StatusCode::NOT_FOUND, Json(json!({"error": "graph instance not found"}))).into_response(),
+            }
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// ── GET /api/secrets ──────────────────────────────────────────────────────────
+//
+// Returns a read-only inventory of known secret refs: vault registry entries
+// (vault name → secret_ref) plus known config-key secret refs (telegram, gemini).
+// Values are never returned — only metadata about what refs are configured.
+
+async fn handle_secrets(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+
+    // Vault registry: {vault_name: string, secret_ref: string}[]
+    let vault_registry = match ipc_get_config(&state.socket, "vault_registry").await {
+        Ok(Some(v)) => v.as_array().cloned().unwrap_or_default(),
+        _ => vec![],
+    };
+    let vault_entries: Vec<Value> = vault_registry
+        .into_iter()
+        .filter_map(|entry| {
+            let name = entry.get("vault_name").or_else(|| entry.get("name"))
+                .and_then(|v| v.as_str())?.to_string();
+            let secret_ref = entry.get("secret_ref")
+                .and_then(|v| v.as_str())?.to_string();
+            Some(json!({ "kind": "vault_token", "name": name, "secret_ref": secret_ref }))
+        })
+        .collect();
+
+    // Named config-key secret refs
+    let named_refs = [
+        ("gemini_oauth_access_token", "gemini_oauth_access_token_ref"),
+        ("gemini_oauth_refresh_token", "gemini_oauth_refresh_token_ref"),
+        ("telegram_bot_token", "telegram_bot_token"),
+    ];
+    let mut named_entries: Vec<Value> = Vec::new();
+    for (label, key) in &named_refs {
+        let configured = match ipc_get_config(&state.socket, key).await {
+            Ok(Some(_)) => true,
+            _ => false,
+        };
+        named_entries.push(json!({ "kind": "config_ref", "name": label, "key": key, "configured": configured }));
+    }
+
+    Json(json!({
+        "vault_entries": vault_entries,
+        "config_refs": named_entries,
+    }))
+    .into_response()
+}
+
+// ── PUT /api/config/:key ──────────────────────────────────────────────────────
+//
+// Allowed keys for operator mutation (prevents arbitrary config overwrites).
+const MUTABLE_CONFIG_KEYS: &[&str] = &[
+    "telegram_bot_token",
+    "execution_host",
+    "vault_registry",
+];
+
+#[derive(serde::Deserialize)]
+struct SetConfigBody {
+    value: Value,
+}
+
+async fn handle_config_put(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    Json(body): Json<SetConfigBody>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    if !MUTABLE_CONFIG_KEYS.contains(&key.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("config key '{}' is not operator-mutable", key)})),
+        )
+            .into_response();
+    }
+    let value_json = match serde_json::to_string(&body.value) {
+        Ok(s) => s,
+        Err(e) => return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("invalid value: {e}")})),
+        ).into_response(),
+    };
+    match ipc_set_config(&state.socket, &key, &value_json).await {
+        Ok(()) => {
+            let event = json!({ "type": "config:updated", "payload": { "key": key } });
+            let _ = state.tx.send(event.to_string());
+            Json(json!({"ok": true})).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// ── POST /api/secrets/rotate ──────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct RotateSecretBody {
+    secret_ref: String,
+    plaintext: String,
+}
+
+async fn handle_secret_rotate(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(body): Json<RotateSecretBody>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_rotate_secret(&state.socket, &body.secret_ref, &body.plaintext).await {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// ── POST /api/vault ───────────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct AddVaultEntryBody {
+    vault_name: String,
+    plaintext: String,
+    #[serde(default)]
+    allowed_roles: Vec<String>,
+}
+
+async fn handle_vault_add(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(body): Json<AddVaultEntryBody>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_add_vault_entry(&state.socket, &body.vault_name, &body.plaintext, body.allowed_roles).await {
+        Ok(secret_ref) => {
+            let event = json!({ "type": "vault:entry-added", "payload": { "vault_name": body.vault_name, "secret_ref": secret_ref } });
+            let _ = state.tx.send(event.to_string());
+            Json(json!({"ok": true, "secret_ref": secret_ref})).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// ── POST /api/agents/:agent_id/roles/:role_name/skills ────────────────────────
+
+#[derive(serde::Deserialize)]
+struct AssignSkillBody {
+    skill_name: String,
+}
+
+async fn handle_assign_skill(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path((agent_id, role_name)): Path<(String, String)>,
+    Json(body): Json<AssignSkillBody>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_assign_skill(&state.socket, &agent_id, &role_name, &body.skill_name).await {
+        Ok(result) => {
+            let event = json!({ "type": "skill:assigned", "payload": { "agent_id": agent_id, "role_name": role_name, "skill_name": body.skill_name } });
+            let _ = state.tx.send(event.to_string());
+            Json(result).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// ── DELETE /api/agents/:agent_id/roles/:role_name/skills/:skill_name ──────────
+
+async fn handle_revoke_skill(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path((agent_id, role_name, skill_name)): Path<(String, String, String)>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_revoke_skill(&state.socket, &agent_id, &role_name, &skill_name).await {
+        Ok(result) => {
+            let event = json!({ "type": "skill:revoked", "payload": { "agent_id": agent_id, "role_name": role_name, "skill_name": skill_name } });
+            let _ = state.tx.send(event.to_string());
+            Json(result).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// ── PATCH /api/agents/:agent_id ───────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct PatchAgentBody {
+    #[serde(default)]
+    persona_name: Option<String>,
+    #[serde(default)]
+    default_toolset: Option<Vec<String>>,
+    #[serde(default)]
+    default_skillset: Option<Vec<String>>,
+}
+
+async fn handle_agent_patch(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    Json(body): Json<PatchAgentBody>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_patch_agent_bundle(&state.socket, &agent_id, body.persona_name, body.default_toolset, body.default_skillset).await {
+        Ok(agent) => {
+            let event = json!({ "type": "agent:updated", "payload": { "agent_id": agent_id } });
+            let _ = state.tx.send(event.to_string());
+            Json(agent).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn ipc_patch_agent_bundle(
+    socket: &str,
+    agent_id: &str,
+    persona_name: Option<String>,
+    default_toolset: Option<Vec<String>>,
+    default_skillset: Option<Vec<String>>,
+) -> Result<Value> {
+    let mut client = connect_management_client(socket, "philotic-web-patch-agent").await?;
+    match client
+        .send_request(IpcRequest::PatchAgentBundle {
+            agent_id: agent_id.to_string(),
+            persona_name,
+            default_toolset,
+            default_skillset,
+        })
+        .await?
+    {
+        IpcResponse::AgentUpdated { agent } => Ok(serde_json::to_value(agent)?),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected patch_agent_bundle response: {other:?}")),
+    }
+}
+
+// ── GET /api/components ───────────────────────────────────────────────────────
+
+async fn handle_components(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_list_components(&state.socket).await {
+        Ok(components) => Json(components).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// ── GET /api/components/:guest_id ─────────────────────────────────────────────
+
+async fn handle_component_detail(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(guest_id): Path<String>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_list_components(&state.socket).await {
+        Ok(components) => {
+            let found = components
+                .into_iter()
+                .find(|c| c.get("guest_id").and_then(|v| v.as_str()) == Some(guest_id.as_str()));
+            match found {
+                Some(c) => Json(c).into_response(),
+                None => (StatusCode::NOT_FOUND, Json(json!({"error": "component not found"}))).into_response(),
+            }
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// ── POST /api/components/:guest_id/enable ─────────────────────────────────────
+
+async fn handle_component_enable(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(guest_id): Path<String>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_set_component_active(&state.socket, &guest_id, true).await {
+        Ok(_) => {
+            let event = json!({ "type": "component:enabled", "payload": { "guest_id": guest_id } });
+            let _ = state.tx.send(event.to_string());
+            Json(json!({"ok": true, "guest_id": guest_id, "active": true})).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// ── POST /api/components/:guest_id/disable ────────────────────────────────────
+
+async fn handle_component_disable(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(guest_id): Path<String>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_set_component_active(&state.socket, &guest_id, false).await {
+        Ok(_) => {
+            let event = json!({ "type": "component:disabled", "payload": { "guest_id": guest_id } });
+            let _ = state.tx.send(event.to_string());
+            Json(json!({"ok": true, "guest_id": guest_id, "active": false})).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// ── POST /api/components/:guest_id/restart ────────────────────────────────────
+
+async fn handle_component_restart(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(guest_id): Path<String>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_restart_component(&state.socket, &guest_id).await {
+        Ok(_) => {
+            let event = json!({ "type": "component:restarted", "payload": { "guest_id": guest_id } });
+            let _ = state.tx.send(event.to_string());
+            Json(json!({"ok": true, "guest_id": guest_id})).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 // ── IPC helpers ───────────────────────────────────────────────────────────────
@@ -1415,6 +1908,32 @@ async fn ipc_list_skills(socket: &str) -> Result<Vec<Value>> {
     }
 }
 
+async fn ipc_get_toolset_profile(socket: &str, profile_name: &str) -> Result<Option<Value>> {
+    let mut client = connect_management_client(socket, "philotic-web-toolsets").await?;
+    match client
+        .send_request(IpcRequest::GetToolsetProfile { profile_name: profile_name.to_string() })
+        .await?
+    {
+        IpcResponse::Standard { ok: true, data, .. } => Ok(data),
+        IpcResponse::Standard { ok: false, message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected toolset_profile response: {other:?}")),
+    }
+}
+
+async fn ipc_list_toolset_profiles(socket: &str) -> Result<Vec<Value>> {
+    let mut client = connect_management_client(socket, "philotic-web-toolsets").await?;
+    match client
+        .send_request(IpcRequest::ListToolsetProfiles {})
+        .await?
+    {
+        IpcResponse::Standard { ok: true, data: Some(d), .. } => {
+            Ok(d.as_array().cloned().unwrap_or_default())
+        }
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected toolset_profiles response: {other:?}")),
+    }
+}
+
 async fn ipc_get_config(socket: &str, key: &str) -> Result<Option<Value>> {
     let mut client = connect_management_client(socket, "philotic-web-config").await?;
     match client
@@ -1431,6 +1950,148 @@ async fn ipc_get_config(socket: &str, key: &str) -> Result<Option<Value>> {
         IpcResponse::ConfigData { value_json: None, .. } => Ok(None),
         IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected config data response: {other:?}")),
+    }
+}
+
+async fn ipc_set_config(socket: &str, key: &str, value_json: &str) -> Result<()> {
+    let mut client = connect_management_client(socket, "philotic-web-config-write").await?;
+    match client
+        .send_request(IpcRequest::SetConfig {
+            key: key.to_string(),
+            value_json: value_json.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::Standard { ok: true, .. } => Ok(()),
+        IpcResponse::Standard { ok: false, message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected set_config response: {other:?}")),
+    }
+}
+
+async fn ipc_rotate_secret(socket: &str, secret_ref: &str, plaintext: &str) -> Result<()> {
+    let mut client = connect_management_client(socket, "philotic-web-vault-write").await?;
+    match client
+        .send_request(IpcRequest::RotateSecret {
+            secret_ref: secret_ref.to_string(),
+            plaintext: plaintext.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::Standard { ok: true, .. } => Ok(()),
+        IpcResponse::Standard { ok: false, message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected rotate_secret response: {other:?}")),
+    }
+}
+
+async fn ipc_add_vault_entry(
+    socket: &str,
+    vault_name: &str,
+    plaintext: &str,
+    allowed_roles: Vec<String>,
+) -> Result<String> {
+    let mut client = connect_management_client(socket, "philotic-web-vault-write").await?;
+    match client
+        .send_request(IpcRequest::AddVaultEntry {
+            vault_name: vault_name.to_string(),
+            plaintext: plaintext.to_string(),
+            allowed_roles,
+        })
+        .await?
+    {
+        IpcResponse::Standard { ok: true, data, .. } => {
+            let secret_ref = data
+                .as_ref()
+                .and_then(|d| d.get("secret_ref"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Ok(secret_ref)
+        }
+        IpcResponse::Standard { ok: false, message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected add_vault_entry response: {other:?}")),
+    }
+}
+
+async fn ipc_list_graph_instances(socket: &str) -> Result<Vec<Value>> {
+    let mut client = connect_management_client(socket, "philotic-web-graphs").await?;
+    match client.send_request(IpcRequest::ListGraphInstances {}).await? {
+        IpcResponse::GraphInstanceList { instances } => Ok(instances),
+        IpcResponse::Standard { ok: false, message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected list_graph_instances response: {other:?}")),
+    }
+}
+
+async fn ipc_assign_skill(socket: &str, agent_id: &str, role_name: &str, skill_name: &str) -> Result<Value> {
+    let mut client = connect_management_client(socket, "philotic-web-skills-mgmt").await?;
+    match client
+        .send_request(IpcRequest::AssignSkill {
+            agent_id: agent_id.to_string(),
+            role_name: role_name.to_string(),
+            skill_name: skill_name.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::SkillAssigned { role_name, skill_name, operation } => {
+            Ok(json!({"ok": true, "role_name": role_name, "skill_name": skill_name, "operation": operation}))
+        }
+        IpcResponse::Standard { ok: false, message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected assign_skill response: {other:?}")),
+    }
+}
+
+async fn ipc_revoke_skill(socket: &str, agent_id: &str, role_name: &str, skill_name: &str) -> Result<Value> {
+    let mut client = connect_management_client(socket, "philotic-web-skills-mgmt").await?;
+    match client
+        .send_request(IpcRequest::RevokeSkill {
+            agent_id: agent_id.to_string(),
+            role_name: role_name.to_string(),
+            skill_name: skill_name.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::SkillAssigned { role_name, skill_name, operation } => {
+            Ok(json!({"ok": true, "role_name": role_name, "skill_name": skill_name, "operation": operation}))
+        }
+        IpcResponse::Standard { ok: false, message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected revoke_skill response: {other:?}")),
+    }
+}
+
+async fn ipc_list_components(socket: &str) -> Result<Vec<Value>> {
+    let mut client = connect_management_client(socket, "philotic-web-components").await?;
+    match client.send_request(IpcRequest::ListComponents {}).await? {
+        IpcResponse::ComponentInventory { components } => Ok(components),
+        IpcResponse::Standard { ok: false, message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected list_components response: {other:?}")),
+    }
+}
+
+async fn ipc_set_component_active(socket: &str, guest_id: &str, active: bool) -> Result<()> {
+    let mut client = connect_management_client(socket, "philotic-web-components").await?;
+    match client
+        .send_request(IpcRequest::SetComponentActive {
+            guest_id: guest_id.to_string(),
+            active,
+        })
+        .await?
+    {
+        IpcResponse::Standard { ok: true, .. } => Ok(()),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected set_component_active response: {other:?}")),
+    }
+}
+
+async fn ipc_restart_component(socket: &str, guest_id: &str) -> Result<()> {
+    let mut client = connect_management_client(socket, "philotic-web-components").await?;
+    match client
+        .send_request(IpcRequest::RestartComponent {
+            guest_id: guest_id.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::Standard { ok: true, .. } => Ok(()),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected restart_component response: {other:?}")),
     }
 }
 
