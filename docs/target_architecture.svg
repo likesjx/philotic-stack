@@ -5,144 +5,307 @@
 </defs>
 <rect width="1400" height="980" fill="#0a0c14"/>
 
-  <circle cx="50" cy="44" r="20" fill="none" stroke="#00e5ff" stroke-width="2" opacity="0.9"/>
-  <text x="50" y="49" text-anchor="middle" font-size="16" fill="#00e5ff">&#x2B21;</text>
-  <text x="80" y="37" font-size="20" font-weight="700" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">The <tspan fill="#00e5ff">Philotic Stack</tspan></text>
-  <text x="80" y="56" font-size="11" fill="#8892b0" font-family="Inter, system-ui, -apple-system, sans-serif">Distributed AI Agent OS  ·  Rust  ·  Hotel / Guest Model  ·  Target Architecture</text>
-  <line x1="0" y1="76" x2="1400" y2="76" stroke="#1e2540" stroke-width="1"/>
-  <rect x="20" y="94" width="1360" height="30" rx="6" fill="#111420" stroke="#1e2540" stroke-width="1"/>
-  <line x1="32" y1="109" x2="64" y2="109" stroke="#00e5ff" stroke-width="2"/>
-  <text x="70" y="113" font-size="10" fill="#8892b0" font-family="Inter, system-ui, -apple-system, sans-serif">IPC / Unix Domain Socket</text>
-  <line x1="256" y1="109" x2="288" y2="109" stroke="#d500f9" stroke-width="2"/>
-  <text x="294" y="113" font-size="10" fill="#8892b0" font-family="Inter, system-ui, -apple-system, sans-serif">UDP Control Plane (BeaconMessage)</text>
-  <line x1="520" y1="109" x2="552" y2="109" stroke="#2979ff" stroke-width="2"/>
-  <text x="558" y="113" font-size="10" fill="#8892b0" font-family="Inter, system-ui, -apple-system, sans-serif">TCP Execution Plane</text>
-  <line x1="700" y1="109" x2="732" y2="109" stroke="#1de9b6" stroke-width="2" stroke-dasharray="5,3"/>
-  <text x="738" y="113" font-size="10" fill="#8892b0" font-family="Inter, system-ui, -apple-system, sans-serif">HTTP / Blob Service</text>
-  <line x1="882" y1="109" x2="914" y2="109" stroke="#ffc107" stroke-width="2" stroke-dasharray="5,3"/>
-  <text x="920" y="113" font-size="10" fill="#8892b0" font-family="Inter, system-ui, -apple-system, sans-serif">SQLite Read / Write</text>
-  <rect x="20" y="140" width="1360" height="575" rx="12" fill="#00e5ff" fill-opacity="0.04" stroke="#00e5ff" stroke-opacity="0.4" stroke-width="1.5"/>
-  <circle cx="38" cy="159" r="4" fill="#00e5ff" opacity="0.9"/>
-  <text x="50" y="164" font-size="9" font-weight="700" letter-spacing="1.6" fill="#00e5ff" font-family="Inter, system-ui, -apple-system, sans-serif" style="text-transform:uppercase">PHYSICAL NODE — THE HOTEL (ANSIBLE DAEMON)</text>
-  <rect x="36" y="170" width="285" height="515" rx="12" fill="#ffc107" fill-opacity="0.04" stroke="#ffc107" stroke-opacity="0.4" stroke-width="1.5"/>
-  <circle cx="54" cy="189" r="4" fill="#ffc107" opacity="0.9"/>
-  <text x="66" y="194" font-size="9" font-weight="700" letter-spacing="1.6" fill="#ffc107" font-family="Inter, system-ui, -apple-system, sans-serif" style="text-transform:uppercase">CORE SERVICES</text>
-  <rect x="46" y="196" width="265" height="48" rx="7" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
-  <text x="56" y="214" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">IpcServer</text>
-  <text x="56" y="227" font-size="9" fill="#8892b0" font-family="JetBrains Mono, monospace">service/ipc.rs</text>
-  <rect x="46" y="254" width="265" height="48" rx="7" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
-  <text x="56" y="272" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">GuestManager</text>
-  <text x="56" y="285" font-size="9" fill="#8892b0" font-family="JetBrains Mono, monospace">service/guest_manager.rs</text>
-  <rect x="46" y="312" width="265" height="48" rx="7" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
-  <text x="56" y="330" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">BlobService</text>
-  <text x="56" y="343" font-size="9" fill="#8892b0" font-family="JetBrains Mono, monospace">service/blob.rs  :9001</text>
-  <rect x="46" y="370" width="265" height="48" rx="7" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
-  <text x="56" y="388" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">MeshDispatcher</text>
-  <text x="56" y="401" font-size="9" fill="#8892b0" font-family="JetBrains Mono, monospace">service/mesh_dispatcher.rs</text>
-  <rect x="46" y="428" width="265" height="48" rx="7" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
-  <text x="56" y="446" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">WebRtcGuest</text>
-  <text x="56" y="459" font-size="9" fill="#8892b0" font-family="JetBrains Mono, monospace">service/webrtc_guest.rs</text>
-  <rect x="337" y="170" width="238" height="515" rx="12" fill="#ff6d00" fill-opacity="0.04" stroke="#ff6d00" stroke-opacity="0.4" stroke-width="1.5"/>
-  <circle cx="355" cy="189" r="4" fill="#ff6d00" opacity="0.9"/>
-  <text x="367" y="194" font-size="9" font-weight="700" letter-spacing="1.6" fill="#ff6d00" font-family="Inter, system-ui, -apple-system, sans-serif" style="text-transform:uppercase">STORAGE LAYER</text>
-  <rect x="347" y="196" width="218" height="58" rx="7" fill="#161b2e" stroke="#ff6d00" stroke-width="1"/>
-  <text x="357" y="214" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">GraphStorage</text>
-  <text x="357" y="227" font-size="9" fill="#8892b0" font-family="JetBrains Mono, monospace">Arc&lt;dyn GraphStorage&gt;</text>
-  <rect x="347" y="268" width="218" height="58" rx="7" fill="#161b2e" stroke="#ff6d00" stroke-width="1"/>
-  <text x="357" y="286" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">EventStorage</text>
-  <text x="357" y="299" font-size="9" fill="#8892b0" font-family="JetBrains Mono, monospace">Arc&lt;dyn EventStorage&gt;</text>
-  <rect x="347" y="340" width="218" height="58" rx="7" fill="#161b2e" stroke="#ff6d00" stroke-width="1"/>
-  <text x="357" y="358" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">CursorStorage</text>
-  <text x="357" y="371" font-size="9" fill="#8892b0" font-family="JetBrains Mono, monospace">Arc&lt;dyn CursorStorage&gt;</text>
-  <rect x="347" y="412" width="218" height="58" rx="7" fill="#1a1000" stroke="#ff6d00" stroke-width="1"/>
-  <text x="357" y="430" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">SQLite</text>
-  <text x="357" y="443" font-size="9" fill="#8892b0" font-family="JetBrains Mono, monospace">ansible_context.db</text>
-  <rect x="591" y="170" width="265" height="258" rx="12" fill="#d500f9" fill-opacity="0.04" stroke="#d500f9" stroke-opacity="0.4" stroke-width="1.5"/>
-  <circle cx="609" cy="189" r="4" fill="#d500f9" opacity="0.9"/>
-  <text x="621" y="194" font-size="9" font-weight="700" letter-spacing="1.6" fill="#d500f9" font-family="Inter, system-ui, -apple-system, sans-serif" style="text-transform:uppercase">ANSIBLE-MESH-CORE PRIMITIVES</text>
-  <rect x="601" y="196" width="245" height="44" rx="7" fill="#161b2e" stroke="#d500f9" stroke-width="1"/>
-  <text x="611" y="214" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">BeaconDaemon</text>
-  <text x="611" y="227" font-size="9" fill="#8892b0" font-family="JetBrains Mono, monospace">beacon.rs  UDP :8999</text>
-  <rect x="601" y="251" width="245" height="44" rx="7" fill="#161b2e" stroke="#d500f9" stroke-width="1"/>
-  <text x="611" y="269" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">NodeRegistry</text>
-  <text x="611" y="282" font-size="9" fill="#8892b0" font-family="JetBrains Mono, monospace">registry.rs</text>
-  <rect x="601" y="306" width="245" height="44" rx="7" fill="#161b2e" stroke="#d500f9" stroke-width="1"/>
-  <text x="611" y="324" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">AuthZ (HMAC-PSK)</text>
-  <text x="611" y="337" font-size="9" fill="#8892b0" font-family="JetBrains Mono, monospace">authz.rs</text>
-  <rect x="601" y="361" width="245" height="44" rx="7" fill="#161b2e" stroke="#d500f9" stroke-width="1"/>
-  <text x="611" y="379" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">ModelManagerInvoker</text>
-  <text x="611" y="392" font-size="9" fill="#8892b0" font-family="JetBrains Mono, monospace">model_manager.rs</text>
-  <rect x="872" y="170" width="184" height="258" rx="12" fill="#1de9b6" fill-opacity="0.04" stroke="#1de9b6" stroke-opacity="0.4" stroke-width="1.5"/>
-  <circle cx="890" cy="189" r="4" fill="#1de9b6" opacity="0.9"/>
-  <text x="902" y="194" font-size="9" font-weight="700" letter-spacing="1.6" fill="#1de9b6" font-family="Inter, system-ui, -apple-system, sans-serif" style="text-transform:uppercase">PHILOTIC-CLIENT SDK</text>
-  <rect x="882" y="196" width="164" height="48" rx="7" fill="#161b2e" stroke="#1de9b6" stroke-width="1"/>
-  <text x="892" y="214" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">PhiloticClient</text>
-  <text x="892" y="227" font-size="9" fill="#8892b0" font-family="JetBrains Mono, monospace">philotic-client crate</text>
-  <text x="882" y="268" font-size="9" fill="#4a5370" font-family="Inter, system-ui, -apple-system, sans-serif">Used by every guest binary</text>
-  <rect x="591" y="442" width="765" height="223" rx="12" fill="#00e676" fill-opacity="0.04" stroke="#00e676" stroke-opacity="0.4" stroke-width="1.5"/>
-  <circle cx="609" cy="461" r="4" fill="#00e676" opacity="0.9"/>
-  <text x="621" y="466" font-size="9" font-weight="700" letter-spacing="1.6" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" style="text-transform:uppercase">GUEST OS PROCESSES (MATERIALIZED BY GUESTMANAGER)</text>
-  <rect x="601" y="468" width="239" height="70" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
-  <text x="611" y="486" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Membrane</text>
-  <text x="611" y="499" font-size="9" fill="#8892b0" font-family="JetBrains Mono, monospace">membrane-telegram-01</text>
-  <rect x="849" y="468" width="239" height="70" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
-  <text x="859" y="486" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Agent-Core</text>
-  <text x="859" y="499" font-size="9" fill="#8892b0" font-family="JetBrains Mono, monospace">agent-jane-01</text>
-  <rect x="1097" y="468" width="239" height="70" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
-  <text x="1107" y="486" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Model-Gemini</text>
-  <text x="1107" y="499" font-size="9" fill="#8892b0" font-family="JetBrains Mono, monospace">model-controller-gemini-01</text>
-  <rect x="601" y="550" width="239" height="70" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
-  <text x="611" y="568" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Model-ElevenLabs</text>
-  <text x="611" y="581" font-size="9" fill="#8892b0" font-family="JetBrains Mono, monospace">model-controller-elevenlabs-01</text>
-  <rect x="849" y="550" width="239" height="70" rx="7" fill="#161b2e" stroke="#1de9b6" stroke-width="1"/>
-  <text x="859" y="568" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Tool-Runner</text>
-  <text x="859" y="581" font-size="9" fill="#8892b0" font-family="JetBrains Mono, monospace">{hotel}:tool-runner</text>
-  <rect x="1097" y="550" width="239" height="70" rx="7" fill="#161b2e" stroke="#1de9b6" stroke-width="1"/>
-  <text x="1107" y="568" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">MCP Guest (Python/Node)</text>
-  <text x="1107" y="581" font-size="9" fill="#8892b0" font-family="JetBrains Mono, monospace">any-mcp-process</text>
-  <rect x="20" y="728" width="1360" height="240" rx="12" fill="#d500f9" fill-opacity="0.04" stroke="#d500f9" stroke-opacity="0.45" stroke-width="1.5"/>
-  <circle cx="38" cy="747" r="4" fill="#d500f9" opacity="0.9"/>
-  <text x="50" y="752" font-size="9" font-weight="700" letter-spacing="1.6" fill="#d500f9" font-family="Inter, system-ui, -apple-system, sans-serif" style="text-transform:uppercase">THE PHILOTIC WEB — INTER-HOTEL MESH</text>
-  <rect x="36" y="758" width="300" height="192" rx="12" fill="#2979ff" fill-opacity="0.04" stroke="#2979ff" stroke-opacity="0.5" stroke-width="1.5"/>
-  <circle cx="54" cy="777" r="4" fill="#2979ff" opacity="0.9"/>
-  <text x="66" y="782" font-size="9" font-weight="700" letter-spacing="1.6" fill="#2979ff" font-family="Inter, system-ui, -apple-system, sans-serif" style="text-transform:uppercase">UDP CONTROL PLANE</text>
-  <rect x="46" y="784" width="280" height="42" rx="7" fill="#161b2e" stroke="#2979ff" stroke-width="1"/>
-  <text x="56" y="802" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Heartbeat</text>
-  <text x="56" y="815" font-size="9" fill="#8892b0" font-family="JetBrains Mono, monospace">heartbeat.rs  HEARTBEAT</text>
-  <rect x="46" y="836" width="280" height="42" rx="7" fill="#161b2e" stroke="#2979ff" stroke-width="1"/>
-  <text x="56" y="854" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Gossip / Peer Disc.</text>
-  <text x="56" y="867" font-size="9" fill="#8892b0" font-family="JetBrains Mono, monospace">registry + beacon emit</text>
-  <rect x="46" y="888" width="280" height="42" rx="7" fill="#161b2e" stroke="#2979ff" stroke-width="1"/>
-  <text x="56" y="906" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Memory Op Routing</text>
-  <text x="56" y="919" font-size="9" fill="#8892b0" font-family="JetBrains Mono, monospace">MEMORY_OP  MEMORY_OP_ACK</text>
-  <rect x="350" y="758" width="330" height="192" rx="12" fill="#00e5ff" fill-opacity="0.04" stroke="#00e5ff" stroke-opacity="0.5" stroke-width="1.5"/>
-  <circle cx="368" cy="777" r="4" fill="#00e5ff" opacity="0.9"/>
-  <text x="380" y="782" font-size="9" font-weight="700" letter-spacing="1.6" fill="#00e5ff" font-family="Inter, system-ui, -apple-system, sans-serif" style="text-transform:uppercase">TCP EXECUTION PLANE (DATA PLANE)</text>
-  <rect x="360" y="784" width="310" height="42" rx="7" fill="#161b2e" stroke="#00e5ff" stroke-width="1"/>
-  <text x="370" y="802" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">EventLedger</text>
-  <text x="370" y="815" font-size="9" fill="#8892b0" font-family="JetBrains Mono, monospace">ledger.rs  mesh_events table</text>
-  <rect x="360" y="836" width="310" height="42" rx="7" fill="#161b2e" stroke="#00e5ff" stroke-width="1"/>
-  <text x="370" y="854" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">CursorTracker</text>
-  <text x="370" y="867" font-size="9" fill="#8892b0" font-family="JetBrains Mono, monospace">cursor.rs  mesh_cursors table</text>
-  <rect x="360" y="888" width="310" height="42" rx="7" fill="#161b2e" stroke="#00e5ff" stroke-width="1"/>
-  <text x="370" y="906" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Event Batch / ACK</text>
-  <text x="370" y="919" font-size="9" fill="#8892b0" font-family="JetBrains Mono, monospace">MESH_EVENT_BATCH  MESH_EVENT_ACK</text>
-  <rect x="696" y="758" width="228" height="192" rx="12" fill="#1de9b6" fill-opacity="0.04" stroke="#1de9b6" stroke-opacity="0.5" stroke-width="1.5"/>
-  <circle cx="714" cy="777" r="4" fill="#1de9b6" opacity="0.9"/>
-  <text x="726" y="782" font-size="9" font-weight="700" letter-spacing="1.6" fill="#1de9b6" font-family="Inter, system-ui, -apple-system, sans-serif" style="text-transform:uppercase">WEBRTC EPHEMERAL PLANE</text>
-  <rect x="706" y="784" width="208" height="56" rx="7" fill="#161b2e" stroke="#1de9b6" stroke-width="1"/>
-  <text x="716" y="802" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">SDP Signaling</text>
-  <text x="716" y="815" font-size="9" fill="#8892b0" font-family="JetBrains Mono, monospace">webrtc.rs  WEBRTC_SIGNAL</text>
-  <rect x="706" y="852" width="208" height="56" rx="7" fill="#161b2e" stroke="#1de9b6" stroke-width="1"/>
-  <text x="716" y="870" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">P2P Data Channel</text>
-  <text x="716" y="883" font-size="9" fill="#8892b0" font-family="JetBrains Mono, monospace">ICE / DTLS  bypasses mesh</text>
-  <rect x="940" y="758" width="176" height="192" rx="12" fill="#f50057" fill-opacity="0.04" stroke="#f50057" stroke-opacity="0.5" stroke-width="1.5"/>
-  <circle cx="958" cy="777" r="4" fill="#f50057" opacity="0.9"/>
-  <text x="970" y="782" font-size="9" font-weight="700" letter-spacing="1.6" fill="#f50057" font-family="Inter, system-ui, -apple-system, sans-serif" style="text-transform:uppercase">REMOTE HOTEL NODE</text>
-  <rect x="950" y="784" width="156" height="56" rx="7" fill="#1a0010" stroke="#f50057" stroke-width="1"/>
-  <text x="960" y="802" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Ansible Daemon</text>
-  <text x="960" y="815" font-size="9" fill="#8892b0" font-family="JetBrains Mono, monospace">remote hotel</text>
-  <rect x="950" y="852" width="156" height="56" rx="7" fill="#1a0010" stroke="#f50057" stroke-width="1"/>
-  <text x="960" y="870" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Guest Processes</text>
-  <text x="960" y="883" font-size="9" fill="#8892b0" font-family="JetBrains Mono, monospace">peer node agents</text>
-  <text x="500" y="972" font-size="9" fill="#4a5370" font-family="Inter, system-ui, -apple-system, sans-serif">philotic-stack  Architecture  Target  2026-03-10</text></svg>
+<!-- ════════════════════════════════════════════════════════════════════ -->
+<!-- HEADER                                                              -->
+<!-- ════════════════════════════════════════════════════════════════════ -->
+<circle cx="50" cy="44" r="20" fill="none" stroke="#00e5ff" stroke-width="2" opacity="0.9"/>
+<text x="50" y="49" text-anchor="middle" font-size="16" fill="#00e5ff">&#x2B21;</text>
+<text x="80" y="37" font-size="20" font-weight="700" fill="#e8eaf0" letter-spacing="0.5">The <tspan fill="#00e5ff">Philotic Stack</tspan></text>
+<text x="80" y="56" font-size="11" fill="#8892b0">Distributed AI Agent OS  ·  Rust  ·  Hotel / Guest Model  ·  Target Architecture</text>
+<line x1="0" y1="76" x2="1400" y2="76" stroke="#1e2540" stroke-width="1"/>
+
+<!-- Crate count -->
+<text x="1370" y="37" text-anchor="end" font-size="11" font-weight="600" fill="#00e5ff">14 crates</text>
+<text x="1370" y="52" text-anchor="end" font-size="10" fill="#4a5370">~74K LOC · Rust</text>
+
+<!-- ════════════════════════════════════════════════════════════════════ -->
+<!-- CONNECTION LEGEND                                                    -->
+<!-- ════════════════════════════════════════════════════════════════════ -->
+<rect x="20" y="84" width="1360" height="30" rx="6" fill="#111420" stroke="#1e2540" stroke-width="1"/>
+<line x1="32" y1="99" x2="64" y2="99" stroke="#00e5ff" stroke-width="2"/>
+<text x="70" y="103" font-size="10" fill="#8892b0">IPC / Unix Domain Socket</text>
+<line x1="246" y1="99" x2="278" y2="99" stroke="#d500f9" stroke-width="2"/>
+<text x="284" y="103" font-size="10" fill="#8892b0">UDP Control Plane (BeaconMessage)</text>
+<line x1="520" y1="99" x2="552" y2="99" stroke="#2979ff" stroke-width="2"/>
+<text x="558" y="103" font-size="10" fill="#8892b0">TCP Execution Plane</text>
+<line x1="700" y1="99" x2="732" y2="99" stroke="#1de9b6" stroke-width="2" stroke-dasharray="5,3"/>
+<text x="738" y="103" font-size="10" fill="#8892b0">HTTP / WebSocket</text>
+<line x1="880" y1="99" x2="912" y2="99" stroke="#ffc107" stroke-width="2" stroke-dasharray="5,3"/>
+<text x="918" y="103" font-size="10" fill="#8892b0">SQLite Read / Write</text>
+
+<!-- ════════════════════════════════════════════════════════════════════ -->
+<!-- PHYSICAL NODE CONTAINER                                             -->
+<!-- ════════════════════════════════════════════════════════════════════ -->
+<rect x="20" y="126" width="1360" height="580" rx="12" fill="#00e5ff" fill-opacity="0.04" stroke="#00e5ff" stroke-opacity="0.4" stroke-width="1.5"/>
+<circle cx="38" cy="145" r="4" fill="#00e5ff" opacity="0.9"/>
+<text x="50" y="150" font-size="9" font-weight="700" letter-spacing="1.6" fill="#00e5ff" style="text-transform:uppercase">PHYSICAL NODE — THE HOTEL (AIUA DAEMON)</text>
+
+<!-- ════════════════════════════════════════════════════════════════════ -->
+<!-- CORE SERVICES                                                       -->
+<!-- ════════════════════════════════════════════════════════════════════ -->
+<rect x="36" y="160" width="250" height="534" rx="12" fill="#ffc107" fill-opacity="0.04" stroke="#ffc107" stroke-opacity="0.4" stroke-width="1.5"/>
+<circle cx="54" cy="179" r="4" fill="#ffc107" opacity="0.9"/>
+<text x="66" y="184" font-size="9" font-weight="700" letter-spacing="1.6" fill="#ffc107" style="text-transform:uppercase">CORE SERVICES</text>
+
+<!-- IpcServer -->
+<rect x="46" y="194" width="230" height="40" rx="7" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
+<text x="56" y="211" font-size="11" font-weight="600" fill="#e8eaf0">IpcServer</text>
+<text x="56" y="224" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">service/ipc.rs  (13K LOC)</text>
+
+<!-- GuestManager -->
+<rect x="46" y="242" width="230" height="40" rx="7" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
+<text x="56" y="259" font-size="11" font-weight="600" fill="#e8eaf0">GuestManager</text>
+<text x="56" y="272" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">service/guest_manager.rs</text>
+
+<!-- BlobService -->
+<rect x="46" y="290" width="230" height="40" rx="7" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
+<text x="56" y="307" font-size="11" font-weight="600" fill="#e8eaf0">BlobService</text>
+<text x="56" y="320" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">service/blob.rs  :9001</text>
+
+<!-- MeshDispatcher -->
+<rect x="46" y="338" width="230" height="40" rx="7" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
+<text x="56" y="355" font-size="11" font-weight="600" fill="#e8eaf0">MeshDispatcher</text>
+<text x="56" y="368" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">service/mesh_dispatcher.rs</text>
+
+<!-- ResourceRegistry -->
+<rect x="46" y="386" width="230" height="40" rx="7" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
+<text x="56" y="403" font-size="11" font-weight="600" fill="#e8eaf0">ResourceRegistry</text>
+<text x="56" y="416" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">service/resource_registry.rs</text>
+
+<!-- CronTicker -->
+<rect x="46" y="434" width="230" height="40" rx="7" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
+<text x="56" y="451" font-size="11" font-weight="600" fill="#e8eaf0">CronTicker</text>
+<text x="56" y="464" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">service/cron_ticker.rs</text>
+
+<!-- VaultService -->
+<rect x="46" y="482" width="230" height="40" rx="7" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
+<text x="56" y="499" font-size="11" font-weight="600" fill="#e8eaf0">VaultService</text>
+<text x="56" y="512" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">service/vault.rs</text>
+
+<!-- Auth Exchange -->
+<rect x="46" y="530" width="230" height="34" rx="7" fill="#161b2e" stroke="#ffc107" stroke-width="0.5" stroke-opacity="0.5"/>
+<text x="56" y="547" font-size="10" font-weight="500" fill="#8892b0">Auth Exchange</text>
+<text x="56" y="558" font-size="8" fill="#4a5370" font-family="JetBrains Mono, monospace">OAuth token management</text>
+
+<!-- ════════════════════════════════════════════════════════════════════ -->
+<!-- STORAGE LAYER                                                       -->
+<!-- ════════════════════════════════════════════════════════════════════ -->
+<rect x="298" y="160" width="252" height="534" rx="12" fill="#ff6d00" fill-opacity="0.04" stroke="#ff6d00" stroke-opacity="0.4" stroke-width="1.5"/>
+<circle cx="316" cy="179" r="4" fill="#ff6d00" opacity="0.9"/>
+<text x="328" y="184" font-size="9" font-weight="700" letter-spacing="1.6" fill="#ff6d00" style="text-transform:uppercase">STORAGE LAYER</text>
+
+<!-- GraphDomain -->
+<rect x="308" y="194" width="232" height="44" rx="7" fill="#161b2e" stroke="#ff6d00" stroke-width="1"/>
+<text x="318" y="212" font-size="11" font-weight="600" fill="#e8eaf0">GraphDomain</text>
+<text x="318" y="227" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">ansible-mesh-core  (SQLite)</text>
+
+<!-- EventStorage -->
+<rect x="308" y="248" width="232" height="44" rx="7" fill="#161b2e" stroke="#ff6d00" stroke-width="1"/>
+<text x="318" y="266" font-size="11" font-weight="600" fill="#e8eaf0">EventStorage</text>
+<text x="318" y="281" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">mesh_events table  (SQLite)</text>
+
+<!-- AgentGraphStorage -->
+<rect x="308" y="302" width="232" height="44" rx="7" fill="#161b2e" stroke="#ff6d00" stroke-width="1"/>
+<text x="318" y="320" font-size="11" font-weight="600" fill="#e8eaf0">AgentGraphStorage</text>
+<text x="318" y="335" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">per-agent cognitive graph</text>
+
+<!-- RouterTraceStorage -->
+<rect x="308" y="356" width="232" height="44" rx="7" fill="#161b2e" stroke="#ff6d00" stroke-width="1"/>
+<text x="318" y="374" font-size="11" font-weight="600" fill="#e8eaf0">RouterTraceStorage</text>
+<text x="318" y="389" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">model routing RL traces</text>
+
+<!-- Vault (encrypted) -->
+<rect x="308" y="410" width="232" height="44" rx="7" fill="#1a1000" stroke="#ff6d00" stroke-width="1"/>
+<text x="318" y="428" font-size="11" font-weight="600" fill="#e8eaf0">Vault <tspan font-size="8" fill="#ffc107">(encrypted)</tspan></text>
+<text x="318" y="443" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">secrets, tokens, keys</text>
+
+<!-- SQLite Backing Store label -->
+<rect x="308" y="466" width="232" height="36" rx="7" fill="#1a1000" stroke="#ff6d00" stroke-width="0.5" stroke-opacity="0.5"/>
+<text x="318" y="483" font-size="10" font-weight="500" fill="#8892b0">Backing Store</text>
+<text x="318" y="494" font-size="8" fill="#4a5370" font-family="JetBrains Mono, monospace">ansible_context.db  (SQLite)</text>
+
+<!-- ════════════════════════════════════════════════════════════════════ -->
+<!-- GUEST PROCESSES                                                     -->
+<!-- ════════════════════════════════════════════════════════════════════ -->
+<rect x="562" y="160" width="806" height="534" rx="12" fill="#00e676" fill-opacity="0.04" stroke="#00e676" stroke-opacity="0.4" stroke-width="1.5"/>
+<circle cx="580" cy="179" r="4" fill="#00e676" opacity="0.9"/>
+<text x="592" y="184" font-size="9" font-weight="700" letter-spacing="1.6" fill="#00e676" style="text-transform:uppercase">GUEST PROCESSES (MATERIALIZED BY GUESTMANAGER)</text>
+
+<!-- Row 1: Philote, Membrane, Philote Worker -->
+<rect x="574" y="194" width="248" height="60" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
+<text x="584" y="213" font-size="11" font-weight="600" fill="#e8eaf0">Philote <tspan font-size="9" fill="#00e676">(agent-core)</tspan></text>
+<text x="584" y="227" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">cognitive loop · sessions · roles</text>
+<text x="584" y="242" font-size="8" fill="#4a5370" font-family="JetBrains Mono, monospace">philote crate</text>
+
+<rect x="832" y="194" width="248" height="60" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
+<text x="842" y="213" font-size="11" font-weight="600" fill="#e8eaf0">Membrane</text>
+<text x="842" y="227" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">Telegram gateway · polls/webhooks</text>
+<text x="842" y="242" font-size="8" fill="#4a5370" font-family="JetBrains Mono, monospace">membrane crate</text>
+
+<rect x="1090" y="194" width="266" height="60" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
+<text x="1100" y="213" font-size="11" font-weight="600" fill="#e8eaf0">Philote Worker</text>
+<text x="1100" y="227" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">subagent delegation worker</text>
+<text x="1100" y="242" font-size="8" fill="#4a5370" font-family="JetBrains Mono, monospace">philote-worker binary</text>
+
+<!-- Row 2: Model Controllers -->
+<rect x="574" y="266" width="122" height="50" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
+<text x="584" y="285" font-size="10" font-weight="600" fill="#e8eaf0">Model: Gemini</text>
+<text x="584" y="298" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">model-controller</text>
+
+<rect x="706" y="266" width="138" height="50" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
+<text x="716" y="285" font-size="10" font-weight="600" fill="#e8eaf0">Model: ElevenLabs</text>
+<text x="716" y="298" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">TTS + STT</text>
+
+<rect x="854" y="266" width="112" height="50" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
+<text x="864" y="285" font-size="10" font-weight="600" fill="#e8eaf0">Model: ONNX</text>
+<text x="864" y="298" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">onnx-runner</text>
+
+<rect x="976" y="266" width="112" height="50" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
+<text x="986" y="285" font-size="10" font-weight="600" fill="#e8eaf0">Model: MLX</text>
+<text x="986" y="298" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">mlx-runner</text>
+
+<!-- model-router (routing layer) -->
+<rect x="1098" y="266" width="258" height="50" rx="7" fill="#161b2e" stroke="#d500f9" stroke-width="1" stroke-opacity="0.7"/>
+<text x="1108" y="285" font-size="10" font-weight="600" fill="#d500f9">model-router</text>
+<text x="1108" y="298" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">LLM inference routing layer</text>
+
+<!-- Row 3: Runners + Sandbox -->
+<rect x="574" y="328" width="192" height="50" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
+<text x="584" y="347" font-size="11" font-weight="600" fill="#e8eaf0">Tool Runner</text>
+<text x="584" y="362" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">sandboxed tool execution</text>
+
+<rect x="776" y="328" width="192" height="50" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
+<text x="786" y="347" font-size="11" font-weight="600" fill="#e8eaf0">Graph Runner</text>
+<text x="786" y="362" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">shared project graph store</text>
+
+<rect x="978" y="328" width="192" height="50" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
+<text x="988" y="347" font-size="11" font-weight="600" fill="#e8eaf0">Agent Graph Runner</text>
+<text x="988" y="362" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">per-agent cognitive graph</text>
+
+<rect x="1180" y="328" width="176" height="50" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
+<text x="1190" y="347" font-size="11" font-weight="600" fill="#e8eaf0">Philotic Sandbox</text>
+<text x="1190" y="362" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">Landlock + seccomp</text>
+
+<!-- Row 4: Library crates -->
+<rect x="574" y="394" width="355" height="42" rx="7" fill="#161b2e" stroke="#1de9b6" stroke-width="1" stroke-opacity="0.6"/>
+<text x="584" y="411" font-size="10" font-weight="600" fill="#1de9b6">ansible-mesh-core</text>
+<text x="584" y="424" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">core types · GraphDomain · beacon · events · validation</text>
+
+<rect x="939" y="394" width="190" height="42" rx="7" fill="#161b2e" stroke="#1de9b6" stroke-width="1" stroke-opacity="0.6"/>
+<text x="949" y="411" font-size="10" font-weight="600" fill="#1de9b6">philotic-client</text>
+<text x="949" y="424" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">IPC client SDK for guests</text>
+
+<rect x="1139" y="394" width="217" height="42" rx="7" fill="#161b2e" stroke="#1de9b6" stroke-width="1" stroke-opacity="0.6"/>
+<text x="1149" y="411" font-size="10" font-weight="600" fill="#1de9b6">memory-core</text>
+<text x="1149" y="424" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">MemoryEngine trait · Muninn client</text>
+
+<!-- Annotation: "All guests connect via philotic-client IPC" -->
+<text x="574" y="458" font-size="8.5" fill="#4a5370" font-style="italic">All guest processes connect to the hotel via philotic-client over Unix Domain Socket IPC</text>
+
+<!-- ════════════════════════════════════════════════════════════════════ -->
+<!-- CONNECTION LINES (within Physical Node)                             -->
+<!-- ════════════════════════════════════════════════════════════════════ -->
+
+<!-- IPC backbone: IpcServer → Guest area -->
+<line x1="276" y1="214" x2="298" y2="214" stroke="#00e5ff" stroke-width="1.5" opacity="0.5"/>
+<line x1="550" y1="214" x2="574" y2="214" stroke="#00e5ff" stroke-width="1.5" opacity="0.6"/>
+<line x1="550" y1="291" x2="574" y2="291" stroke="#00e5ff" stroke-width="1.5" opacity="0.6"/>
+<line x1="550" y1="350" x2="574" y2="350" stroke="#00e5ff" stroke-width="1.5" opacity="0.6"/>
+<!-- IPC vertical backbone -->
+<line x1="550" y1="200" x2="550" y2="420" stroke="#00e5ff" stroke-width="1" opacity="0.25"/>
+
+<!-- SQLite connection dashes: Core ↔ Storage -->
+<line x1="286" y1="310" x2="308" y2="270" stroke="#ffc107" stroke-width="1" stroke-dasharray="5,3" opacity="0.35"/>
+<line x1="286" y1="500" x2="308" y2="430" stroke="#ffc107" stroke-width="1" stroke-dasharray="5,3" opacity="0.35"/>
+
+<!-- Agent Graph Runner → AgentGraphStorage -->
+<line x1="978" y1="378" x2="540" y2="324" stroke="#ffc107" stroke-width="1" stroke-dasharray="4,3" opacity="0.25"/>
+
+<!-- Graph Runner → GraphDomain -->
+<line x1="776" y1="370" x2="540" y2="216" stroke="#ffc107" stroke-width="1" stroke-dasharray="4,3" opacity="0.25"/>
+
+<!-- ════════════════════════════════════════════════════════════════════ -->
+<!-- NETWORKING SECTION                                                  -->
+<!-- ════════════════════════════════════════════════════════════════════ -->
+<rect x="20" y="720" width="808" height="248" rx="12" fill="#d500f9" fill-opacity="0.04" stroke="#d500f9" stroke-opacity="0.45" stroke-width="1.5"/>
+<circle cx="38" cy="739" r="4" fill="#d500f9" opacity="0.9"/>
+<text x="50" y="744" font-size="9" font-weight="700" letter-spacing="1.6" fill="#d500f9" style="text-transform:uppercase">NETWORKING</text>
+
+<!-- IPC (UDS) -->
+<rect x="36" y="756" width="186" height="60" rx="7" fill="#161b2e" stroke="#00e5ff" stroke-width="1"/>
+<text x="46" y="776" font-size="11" font-weight="600" fill="#00e5ff">IPC (UDS)</text>
+<text x="46" y="790" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">Unix Domain Socket</text>
+<text x="46" y="804" font-size="8" fill="#4a5370">hotel ↔ guest communication</text>
+
+<!-- UDP Beacon -->
+<rect x="232" y="756" width="186" height="60" rx="7" fill="#161b2e" stroke="#d500f9" stroke-width="1"/>
+<text x="242" y="776" font-size="11" font-weight="600" fill="#d500f9">UDP Beacon</text>
+<text x="242" y="790" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">:8999  BeaconMessage</text>
+<text x="242" y="804" font-size="8" fill="#4a5370">mesh discovery · gossip · liveness</text>
+
+<!-- TCP Execution Plane -->
+<rect x="428" y="756" width="186" height="60" rx="7" fill="#161b2e" stroke="#2979ff" stroke-width="1"/>
+<text x="438" y="776" font-size="11" font-weight="600" fill="#2979ff">TCP Execution Plane</text>
+<text x="438" y="790" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">inter-hotel task routing</text>
+<text x="438" y="804" font-size="8" fill="#4a5370">event batch · ACK · cursors</text>
+
+<!-- HTTP / WebSocket -->
+<rect x="624" y="756" width="192" height="60" rx="7" fill="#161b2e" stroke="#1de9b6" stroke-width="1" stroke-dasharray="5,3"/>
+<text x="634" y="776" font-size="11" font-weight="600" fill="#1de9b6">HTTP / WebSocket</text>
+<text x="634" y="790" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">REST API + WS push</text>
+<text x="634" y="804" font-size="8" fill="#4a5370">desktop membrane surface</text>
+
+<!-- Tailscale note -->
+<rect x="36" y="828" width="780" height="28" rx="7" fill="#161b2e" stroke="#1e2540" stroke-width="0.5"/>
+<text x="46" y="846" font-size="9" fill="#4a5370">Tailscale / MagicDNS — transitional overlay network for inter-hotel connectivity</text>
+
+<!-- Networking → Physical Node connection lines -->
+<line x1="129" y1="756" x2="129" y2="706" stroke="#00e5ff" stroke-width="1.5" opacity="0.4"/>
+<line x1="325" y1="756" x2="325" y2="706" stroke="#d500f9" stroke-width="1.5" opacity="0.4"/>
+<line x1="521" y1="756" x2="521" y2="706" stroke="#2979ff" stroke-width="1.5" opacity="0.4"/>
+<line x1="720" y1="756" x2="720" y2="706" stroke="#1de9b6" stroke-width="1.5" stroke-dasharray="5,3" opacity="0.4"/>
+
+<!-- ════════════════════════════════════════════════════════════════════ -->
+<!-- EXTERNAL                                                            -->
+<!-- ════════════════════════════════════════════════════════════════════ -->
+<rect x="842" y="720" width="538" height="248" rx="12" fill="#2979ff" fill-opacity="0.04" stroke="#2979ff" stroke-opacity="0.45" stroke-width="1.5"/>
+<circle cx="860" cy="739" r="4" fill="#2979ff" opacity="0.9"/>
+<text x="872" y="744" font-size="9" font-weight="700" letter-spacing="1.6" fill="#2979ff" style="text-transform:uppercase">EXTERNAL</text>
+
+<!-- Muninn Memory -->
+<rect x="856" y="756" width="240" height="62" rx="7" fill="#161b2e" stroke="#2979ff" stroke-width="1"/>
+<text x="866" y="776" font-size="11" font-weight="600" fill="#e8eaf0">Muninn Memory</text>
+<text x="866" y="790" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">REST :8475 · MCP :8750</text>
+<text x="866" y="804" font-size="8" fill="#4a5370">cognitive memory · Ebbinghaus decay</text>
+
+<!-- Desktop Membrane (philotic-web serve) -->
+<rect x="1108" y="756" width="260" height="62" rx="7" fill="#161b2e" stroke="#1de9b6" stroke-width="1" stroke-dasharray="5,3"/>
+<text x="1118" y="776" font-size="11" font-weight="600" fill="#e8eaf0">Desktop Membrane</text>
+<text x="1118" y="790" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">philotic-web serve</text>
+<text x="1118" y="804" font-size="8" fill="#4a5370">operator UI · REST · WS · chat routing</text>
+
+<!-- Peer Hotels (Mesh) -->
+<rect x="856" y="828" width="240" height="62" rx="7" fill="#161b2e" stroke="#d500f9" stroke-width="1"/>
+<text x="866" y="848" font-size="11" font-weight="600" fill="#e8eaf0">Peer Hotels <tspan font-size="9" fill="#d500f9">(Mesh)</tspan></text>
+<text x="866" y="862" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">remote hotel nodes</text>
+<text x="866" y="876" font-size="8" fill="#4a5370">inter-hotel routing · event sync</text>
+
+<!-- philotic-web CLI -->
+<rect x="1108" y="828" width="260" height="62" rx="7" fill="#161b2e" stroke="#1e2540" stroke-width="1"/>
+<text x="1118" y="848" font-size="11" font-weight="600" fill="#e8eaf0">philotic-web CLI</text>
+<text x="1118" y="862" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">phil init/start/stop/status/flush</text>
+<text x="1118" y="876" font-size="8" fill="#4a5370">operator control surface</text>
+
+<!-- External → Physical Node connection lines -->
+<line x1="976" y1="756" x2="976" y2="706" stroke="#1de9b6" stroke-width="1.5" stroke-dasharray="5,3" opacity="0.4"/>
+<line x1="1238" y1="756" x2="1238" y2="706" stroke="#1de9b6" stroke-width="1.5" stroke-dasharray="5,3" opacity="0.4"/>
+<!-- Peer Hotels connections -->
+<line x1="856" y1="850" x2="828" y2="810" stroke="#d500f9" stroke-width="1" opacity="0.3"/>
+<line x1="856" y1="860" x2="828" y2="820" stroke="#2979ff" stroke-width="1" opacity="0.3"/>
+
+<!-- ════════════════════════════════════════════════════════════════════ -->
+<!-- FOOTER                                                              -->
+<!-- ════════════════════════════════════════════════════════════════════ -->
+<text x="700" y="970" text-anchor="middle" font-size="9" fill="#4a5370">philotic-stack  ·  Target Architecture  ·  2026-03-26</text>
+
+</svg>

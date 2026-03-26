@@ -2,8 +2,8 @@
 title: "Homebrew Distribution"
 doc_type: proposal
 domain: deployment-distribution
-status: proposed
-last_updated: 2026-03-12
+status: accepted-current-slice
+last_updated: 2026-03-26
 tags:
   - distribution
   - homebrew
@@ -17,7 +17,8 @@ task_refs:
   - docs/task.md
 proposal_id: homebrew-distribution
 implements: []
-implemented_by: []
+implemented_by:
+  - https://github.com/likesjx/homebrew-philotic
 active_seams:
   - public-cli-naming
   - homebrew-release-pipeline
