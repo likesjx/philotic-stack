@@ -1037,6 +1037,12 @@ Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membra
 - [ ] Define the CI/release workflow for acquiring desktop UI assets explicitly rather than relying on opportunistic sibling-repo discovery.
 - [ ] Add integrated release-shape verification that proves the embedded assets served by `philotic-web` match the recorded asset manifest.
 - [x] Write and pass `smoke-desktop-membrane` covering: lease acquisition, core REST endpoints, auth rejection (401 no-token + wrong-token), apartment not returning 200, and clean SIGTERM shutdown.
+- [x] Add agent cognitive drill-down endpoints: `GET /api/agents/:id/roles`, `GET /api/agents/:id/rules`, `GET /api/skills`.
+- [x] Add hotel config read endpoints: `GET /api/config`, `GET /api/config/telegram`, `GET /api/config/gemini`.
+- [x] Add component management surface (Slice 3): `GET /api/components`, `GET /api/components/:guest_id`, `POST /api/components/:guest_id/enable|disable|restart` — via new `ListComponents`, `SetComponentActive`, `RestartComponent` IPC variants. Fixed serde untagged enum ordering hazard (`MemoryConfig` all-optional fields moved to last position).
+- [x] Add graph runner instance inventory (Slice 4): `GET /api/graphs`, `GET /api/graphs/:graph_id` — via new `ListGraphInstances` IPC variant.
+- [x] Add secret refs read-only inventory (Slice 4): `GET /api/secrets` — vault registry entries + known config-key ref presence flags; no values exposed.
+- [x] Add skill assignment mutations (Slice 4): `POST /api/agents/:agent_id/roles/:role_name/skills`, `DELETE /api/agents/:agent_id/roles/:role_name/skills/:skill_name` — management-role bypass added to `AssignSkill`/`RevokeSkill` authority checks.
 
 ## Next Project: Tool Assembly and Routed Execution
 

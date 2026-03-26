@@ -6,9 +6,13 @@ const PHILOTIC_BINS: &[&str] = &[
     "aiua",
     "membrane",
     "philote",
+    "model-router",
     "model-controller-gemini",
     "model-controller-elevenlabs",
+    "model-controller-mlx",
     "tool-runner",
+    "graph-runner",
+    "agent-graph-runner",
 ];
 
 pub async fn run(kill_pattern: Option<String>) -> Result<()> {
@@ -45,7 +49,8 @@ pub async fn run(kill_pattern: Option<String>) -> Result<()> {
 
     // ── Kill ──────────────────────────────────────────────────────────────
     if let Some(pattern) = kill_pattern {
-        let to_kill: Vec<&Process> = if pattern == "*" || pattern == "all" {
+        let kill_all = pattern == "*" || pattern == "all";
+        let to_kill: Vec<&Process> = if kill_all {
             procs.iter().collect()
         } else {
             procs.iter().filter(|p| p.name.contains(&pattern)).collect()
@@ -56,20 +61,24 @@ pub async fn run(kill_pattern: Option<String>) -> Result<()> {
             return Ok(());
         }
 
-        println!("\nKilling {} process(es):", to_kill.len());
+        // Use SIGKILL for "all" (the p-53 kill switch for abandoned processes);
+        // use SIGTERM for targeted pattern kills.
+        let (signal, signal_name) = if kill_all { ("-KILL", "SIGKILL") } else { ("-TERM", "SIGTERM") };
+
+        println!("\nKilling {} process(es) with {}:", to_kill.len(), signal_name);
         for p in &to_kill {
             let result = std::process::Command::new("kill")
-                .arg("-TERM")
+                .arg(signal)
                 .arg(p.pid.to_string())
                 .status();
             match result {
-                Ok(s) if s.success() => println!("  SIGTERM → pid {}  {}", p.pid, p.name),
+                Ok(s) if s.success() => println!("  {} → pid {}  {}", signal_name, p.pid, p.name),
                 _ => println!("  FAILED  → pid {}  {}", p.pid, p.name),
             }
         }
 
         // Clean up sockets and PID file if killing everything
-        if pattern == "*" || pattern == "all" {
+        if kill_all {
             for s in &sockets {
                 let _ = fs::remove_file(s);
             }
@@ -77,6 +86,7 @@ pub async fn run(kill_pattern: Option<String>) -> Result<()> {
             if !sockets.is_empty() {
                 println!("  sockets removed");
             }
+            println!("\nTip: run `phil flush --restart <hotel>` to reboot cleanly.");
         }
     }
 
@@ -137,12 +147,24 @@ fn find_processes() -> Vec<Process> {
 }
 
 fn find_sockets() -> Vec<String> {
-    glob::glob("/tmp/philotic-*.sock")
-        .map(|paths| {
-            paths
-                .filter_map(|p| p.ok())
-                .map(|p| p.display().to_string())
-                .collect()
-        })
-        .unwrap_or_default()
+    let mut sockets = Vec::new();
+
+    // /tmp sockets
+    if let Ok(paths) = glob::glob("/tmp/philotic-*.sock") {
+        sockets.extend(paths.filter_map(|p| p.ok()).map(|p| p.display().to_string()));
+    }
+
+    // Profile dir sockets — ~/.philotic/*.sock and ~/.philotic/*/*.sock
+    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let base = home.join(".philotic");
+    for pattern in [
+        base.join("*.sock").to_string_lossy().into_owned(),
+        base.join("*").join("*.sock").to_string_lossy().into_owned(),
+    ] {
+        if let Ok(paths) = glob::glob(&pattern) {
+            sockets.extend(paths.filter_map(|p| p.ok()).map(|p| p.display().to_string()));
+        }
+    }
+
+    sockets
 }

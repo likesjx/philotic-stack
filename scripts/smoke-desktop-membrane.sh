@@ -271,6 +271,43 @@ print(f'  refs_configured={r[\"token_refs_configured\"]}')
 "
 echo "  /api/config/gemini OK"
 
+# ── GET /api/components ──────────────────────────────────────────────────────
+
+echo "Testing GET /api/components..."
+COMPONENTS=$(api GET /api/components)
+echo "${COMPONENTS}" | python3 -c "
+import json, sys
+r = json.load(sys.stdin)
+assert isinstance(r, list), f'expected list, got: {r}'
+print(f'  {len(r)} component(s)')
+"
+echo "  /api/components OK"
+
+# ── GET /api/graphs ──────────────────────────────────────────────────────────
+
+echo "Testing GET /api/graphs..."
+GRAPHS=$(api GET /api/graphs)
+echo "${GRAPHS}" | python3 -c "
+import json, sys
+r = json.load(sys.stdin)
+assert isinstance(r, list), f'expected list, got: {r}'
+print(f'  {len(r)} graph instance(s)')
+"
+echo "  /api/graphs OK"
+
+# ── GET /api/secrets ──────────────────────────────────────────────────────────
+
+echo "Testing GET /api/secrets..."
+SECRETS=$(api GET /api/secrets)
+echo "${SECRETS}" | python3 -c "
+import json, sys
+r = json.load(sys.stdin)
+assert 'vault_entries' in r, f'missing vault_entries: {r}'
+assert 'config_refs' in r, f'missing config_refs: {r}'
+print(f'  {len(r[\"vault_entries\"])} vault entry/entries, {len(r[\"config_refs\"])} config ref(s)')
+"
+echo "  /api/secrets OK"
+
 # ── Auth rejection — no token ─────────────────────────────────────────────────
 
 echo "Testing 401 for unauthenticated request..."

@@ -48,6 +48,10 @@ pub struct OperatorAgentView {
     #[serde(default)]
     pub toolset_tags: Vec<String>,
     #[serde(default)]
+    pub default_toolset: Vec<String>,
+    #[serde(default)]
+    pub default_skillset: Vec<String>,
+    #[serde(default)]
     pub active_session: bool,
 }
 
@@ -713,8 +717,25 @@ pub enum IpcRequest {
         role_name: String,
         skill_name: String,
     },
+    /// Patch mutable fields on an agent's identity bundle.
+    /// Requires management identity. Only supplied fields are changed.
+    PatchAgentBundle {
+        agent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        persona_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default_toolset: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default_skillset: Option<Vec<String>>,
+    },
     /// List all registered skills with their validation states.
     ListSkills {},
+    /// Get a single toolset profile by name.
+    GetToolsetProfile {
+        profile_name: String,
+    },
+    /// List all toolset profiles registered in the context graph.
+    ListToolsetProfiles {},
     ListRoleIncarnations {
         agent_id: String,
     },
@@ -765,6 +786,24 @@ pub enum IpcRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context_window_policy: Option<String>,
     },
+    /// Write a config value to the hotel's context graph (operator/management only).
+    SetConfig {
+        key: String,
+        value_json: String,
+    },
+    /// Re-encrypt an existing vault secret in place with new plaintext.
+    /// The secret_ref, scope, and ACL are preserved; only the ciphertext changes.
+    RotateSecret {
+        secret_ref: String,
+        plaintext: String,
+    },
+    /// Store a new vault secret and append it to the vault_registry config key.
+    AddVaultEntry {
+        vault_name: String,
+        plaintext: String,
+        #[serde(default)]
+        allowed_roles: Vec<String>,
+    },
     /// Request the hotel's loaded MuninnDB configuration (vault tokens included).
     FetchMemoryConfig,
     /// Register a graph instance with the hotel's ODS so it can route graph_id → instance_id.
@@ -806,6 +845,36 @@ pub enum IpcRequest {
     /// Responds with [`IpcResponse::ComponentRegistered`].
     RegisterComponent {
         manifest: ComponentManifest,
+    },
+    /// List all registered graph runner instances.
+    ///
+    /// Responds with [`IpcResponse::GraphInstanceList`].
+    ListGraphInstances {},
+    /// List all registered components (guests that were registered via RegisterComponent).
+    ///
+    /// Returns every guest record enriched with its component config and tool-runner
+    /// capabilities where available.
+    ///
+    /// Responds with [`IpcResponse::ComponentInventory`].
+    ListComponents {},
+    /// Enable or disable a registered component.
+    ///
+    /// When `active` is `true` the hotel sets `is_active=true` in the context graph and
+    /// triggers immediate materialization (spawns the process if not already running).
+    /// When `active` is `false` the hotel sets `is_active=false` and sends SIGTERM to
+    /// the running process if one is present.
+    ///
+    /// Responds with [`IpcResponse::Standard`].
+    SetComponentActive {
+        guest_id: String,
+        active: bool,
+    },
+    /// Restart a registered component: terminate the running process (if any) then
+    /// immediately re-spawn it (requires `is_active=true` in the context graph).
+    ///
+    /// Responds with [`IpcResponse::Standard`].
+    RestartComponent {
+        guest_id: String,
     },
     /// Inject a remote node incarnation into the local node registry.
     ///
@@ -950,6 +1019,10 @@ pub enum IpcResponse {
         #[serde(default)]
         validation_errors: Vec<String>,
     },
+    /// Response to [`IpcRequest::PatchAgentBundle`].
+    AgentUpdated {
+        agent: DesktopMembraneAgentView,
+    },
     /// Response to [`IpcRequest::AssignSkill`] and [`IpcRequest::RevokeSkill`].
     SkillAssigned {
         role_name: String,
@@ -982,11 +1055,6 @@ pub enum IpcResponse {
         agent_id: String,
         memory_type: String,
         content_json: serde_json::Value,
-    },
-    /// Response to [`IpcRequest::FetchMemoryConfig`].
-    /// `config_json` is `None` if MuninnDB is not configured on this hotel.
-    MemoryConfig {
-        config_json: Option<String>,
     },
     /// Response to [`IpcRequest::RegisterGraphInstance`].
     GraphInstanceRegistered {
@@ -1027,9 +1095,27 @@ pub enum IpcResponse {
         registered_guest_id: String,
         registered_role: String,
     },
+    /// Response to [`IpcRequest::ListComponents`].
+    ComponentInventory {
+        components: Vec<serde_json::Value>,
+    },
+    /// Response to [`IpcRequest::ListGraphInstances`].
+    GraphInstanceList {
+        instances: Vec<serde_json::Value>,
+    },
     /// Response to [`IpcRequest::ListCronJobs`].
     CronJobList {
         jobs: Vec<CronJob>,
+    },
+    /// Response to [`IpcRequest::FetchMemoryConfig`].
+    /// `config_json` is `None` if MuninnDB is not configured on this hotel.
+    ///
+    /// NOTE: This variant MUST remain at the end of the enum. It has an all-optional
+    /// field (`config_json: Option<String>`), which with `#[serde(untagged)]` means it
+    /// will match ANY JSON object that serde hasn't already matched to an earlier variant.
+    /// Placing it last ensures it only wins when no other variant can match.
+    MemoryConfig {
+        config_json: Option<String>,
     },
 }
 

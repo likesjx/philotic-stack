@@ -1021,10 +1021,12 @@ impl IpcServer {
         let hotel_name = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
             anyhow::anyhow!("local hotel record missing for node [{local_node_id}]")
         })?;
+        let mut seen = std::collections::HashSet::new();
         let mut agents = graph
             .list_agent_identities()?
             .into_iter()
             .filter(|identity| identity.authority_hotel == hotel_name)
+            .filter(|identity| seen.insert(identity.agent_id.clone()))
             .map(Self::desktop_membrane_agent_view)
             .collect::<Vec<_>>();
         agents.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
@@ -1041,23 +1043,27 @@ impl IpcServer {
     fn operator_agent_view(
         identity: ansible_mesh_core::storage::AgentIdentityRecord,
     ) -> OperatorAgentView {
-        let toolset_tags = identity
-            .bundle_json
-            .get("toolset_tags")
-            .and_then(serde_json::Value::as_array)
-            .map(|tags| {
-                tags.iter()
-                    .filter_map(serde_json::Value::as_str)
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let str_vec = |key: &str| {
+            identity
+                .bundle_json
+                .get(key)
+                .and_then(serde_json::Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
 
         OperatorAgentView {
             agent_id: identity.agent_id,
             persona_name: identity.persona_name,
             authority_hotel: identity.authority_hotel,
-            toolset_tags,
+            toolset_tags: str_vec("toolset_tags"),
+            default_toolset: str_vec("default_toolset"),
+            default_skillset: str_vec("default_skillset"),
             active_session: false,
         }
     }
@@ -2302,6 +2308,46 @@ impl IpcServer {
                         error!("Failed to resolve vault secret [{}]: {}", secret_ref, err);
                         IpcResponse::error("secret", "SECRET_ERROR", err.to_string())
                     }
+                }
+            }
+            IpcRequest::GetToolsetProfile { profile_name } => {
+                match graph.get_toolset_profile(&profile_name) {
+                    Ok(Some(p)) => IpcResponse::success(
+                        "toolset_profile",
+                        Some(serde_json::to_value(&p).unwrap_or(serde_json::Value::Null)),
+                    ),
+                    Ok(None) => IpcResponse::success("toolset_profile", None),
+                    Err(e) => IpcResponse::error("toolset_profile", "PROFILE_ERROR", e.to_string()),
+                }
+            }
+            IpcRequest::ListToolsetProfiles {} => {
+                match graph.list_toolset_profiles() {
+                    Ok(profiles) => IpcResponse::success(
+                        "list_toolset_profiles",
+                        Some(serde_json::to_value(&profiles).unwrap_or(serde_json::Value::Array(vec![]))),
+                    ),
+                    Err(e) => IpcResponse::error("list_toolset_profiles", "PROFILES_ERROR", e.to_string()),
+                }
+            }
+            IpcRequest::SetConfig { key, value_json } => {
+                info!("SetConfig requested: {}", key);
+                match graph.set_config_value(&key, &value_json) {
+                    Ok(()) => IpcResponse::success("config", None),
+                    Err(e) => IpcResponse::error("config", "CONFIG_ERROR", e.to_string()),
+                }
+            }
+            IpcRequest::RotateSecret { secret_ref, plaintext } => {
+                info!("RotateSecret requested for ref: {}", secret_ref);
+                match crate::vault::rotate_secret(graph, &secret_ref, &plaintext) {
+                    Ok(()) => IpcResponse::success("secret", None),
+                    Err(e) => IpcResponse::error("secret", "SECRET_ERROR", e.to_string()),
+                }
+            }
+            IpcRequest::AddVaultEntry { vault_name, plaintext, allowed_roles } => {
+                info!("AddVaultEntry requested: {}", vault_name);
+                match Self::handle_add_vault_entry(graph, vault_name, plaintext, allowed_roles) {
+                    Ok(secret_ref) => IpcResponse::success("vault", Some(serde_json::json!({ "secret_ref": secret_ref }))),
+                    Err(e) => IpcResponse::error("vault", "VAULT_ERROR", e.to_string()),
                 }
             }
             IpcRequest::PublishMessage {
@@ -3993,6 +4039,28 @@ impl IpcServer {
                     validation_errors: errors,
                 }
             }
+            IpcRequest::PatchAgentBundle {
+                agent_id,
+                persona_name,
+                default_toolset,
+                default_skillset,
+            } => {
+                match Self::handle_patch_agent_bundle(
+                    graph,
+                    local_node_id,
+                    &agent_id,
+                    persona_name,
+                    default_toolset,
+                    default_skillset,
+                ) {
+                    Ok(agent) => IpcResponse::AgentUpdated { agent },
+                    Err(err) => IpcResponse::error(
+                        "patch_agent_bundle",
+                        "PATCH_AGENT_BUNDLE_ERROR",
+                        err.to_string(),
+                    ),
+                }
+            }
             IpcRequest::AssignSkill {
                 agent_id,
                 role_name,
@@ -4005,14 +4073,15 @@ impl IpcServer {
                         "guest must register before assigning skills",
                     );
                 };
-                if identity.role != "orchestrator" {
+                let is_management = identity.role == "management";
+                if !is_management && identity.role != "orchestrator" {
                     return IpcResponse::error(
                         "assign_skill",
                         "ASSIGN_FORBIDDEN",
-                        "only orchestrator guests may assign skills",
+                        "only orchestrator or management guests may assign skills",
                     );
                 }
-                if !identity.guest_id.starts_with(&agent_id) {
+                if !is_management && !identity.guest_id.starts_with(&agent_id) {
                     return IpcResponse::error(
                         "assign_skill",
                         "ASSIGN_FORBIDDEN",
@@ -4109,14 +4178,15 @@ impl IpcServer {
                         "guest must register before revoking skills",
                     );
                 };
-                if identity.role != "orchestrator" {
+                let is_management = identity.role == "management";
+                if !is_management && identity.role != "orchestrator" {
                     return IpcResponse::error(
                         "revoke_skill",
                         "REVOKE_FORBIDDEN",
-                        "only orchestrator guests may revoke skills",
+                        "only orchestrator or management guests may revoke skills",
                     );
                 }
-                if !identity.guest_id.starts_with(&agent_id) {
+                if !is_management && !identity.guest_id.starts_with(&agent_id) {
                     return IpcResponse::error(
                         "revoke_skill",
                         "REVOKE_FORBIDDEN",
@@ -4331,6 +4401,31 @@ impl IpcServer {
             ),
             IpcRequest::RegisterComponent { manifest } => {
                 Self::handle_register_component(graph, materialization_requester, manifest).await
+            }
+            IpcRequest::ListGraphInstances {} => {
+                match graph.get_graph_runner_registry() {
+                    Ok(records) => {
+                        let instances: Vec<serde_json::Value> = records
+                            .into_iter()
+                            .map(|r| serde_json::json!({
+                                "graph_id": r.graph_id,
+                                "instance_id": r.instance_id,
+                                "registered_at": r.registered_at,
+                            }))
+                            .collect();
+                        IpcResponse::GraphInstanceList { instances }
+                    }
+                    Err(e) => IpcResponse::error("list_graph_instances", "STORAGE_ERROR", e.to_string()),
+                }
+            }
+            IpcRequest::ListComponents {} => {
+                Self::handle_list_components(graph, local_node_id)
+            }
+            IpcRequest::SetComponentActive { guest_id, active } => {
+                Self::handle_set_component_active(graph, materialization_requester, local_node_id, &guest_id, active).await
+            }
+            IpcRequest::RestartComponent { guest_id } => {
+                Self::handle_restart_component(graph, materialization_requester, local_node_id, &guest_id).await
             }
             IpcRequest::SeedRemoteIncarnation {
                 node_id,
@@ -4557,6 +4652,281 @@ impl IpcServer {
             registered_guest_id: guest_id,
             registered_role: role,
         }
+    }
+
+    fn handle_patch_agent_bundle(
+        graph: &GraphDomain,
+        local_node_id: &str,
+        agent_id: &str,
+        persona_name: Option<String>,
+        default_toolset: Option<Vec<String>>,
+        default_skillset: Option<Vec<String>>,
+    ) -> anyhow::Result<DesktopMembraneAgentView> {
+        let mut identity = graph
+            .get_agent_identity(agent_id)?
+            .ok_or_else(|| anyhow::anyhow!("agent [{agent_id}] not found"))?;
+
+        // Verify the agent belongs to the local hotel
+        let hotel_name = Self::local_hotel_name(graph, local_node_id)
+            .ok_or_else(|| anyhow::anyhow!("local hotel record missing"))?;
+        if identity.authority_hotel != hotel_name {
+            anyhow::bail!("agent [{agent_id}] does not belong to local hotel [{hotel_name}]");
+        }
+
+        if let Some(name) = persona_name {
+            identity.persona_name = name;
+        }
+        if let Some(toolset) = default_toolset {
+            identity.bundle_json["default_toolset"] = serde_json::json!(toolset);
+        }
+        if let Some(skillset) = default_skillset {
+            identity.bundle_json["default_skillset"] = serde_json::json!(skillset);
+        }
+
+        graph.upsert_agent_identity(&identity)?;
+        Ok(Self::desktop_membrane_agent_view(identity))
+    }
+
+    fn handle_add_vault_entry(
+        graph: &GraphDomain,
+        vault_name: String,
+        plaintext: String,
+        allowed_roles: Vec<String>,
+    ) -> anyhow::Result<String> {
+        use crate::vault::{SecretInput, store_secret};
+
+        // Store the encrypted secret.
+        let secret_ref = store_secret(
+            graph,
+            SecretInput {
+                secret_kind: "vault-token".to_string(),
+                scope: "hotel".to_string(),
+                allowed_roles,
+                allowed_guests: Vec::new(),
+                plaintext,
+            },
+        )?;
+
+        // Append new entry to vault_registry in node_config.
+        let mut registry: Vec<serde_json::Value> = graph
+            .get_config_value("vault_registry")
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        registry.push(serde_json::json!({ "vault_name": vault_name, "secret_ref": secret_ref }));
+        graph.set_config_value("vault_registry", &serde_json::to_string(&registry)?)?;
+
+        Ok(secret_ref)
+    }
+
+    fn handle_list_components(graph: &GraphDomain, local_node_id: &str) -> IpcResponse {
+        let hotel_name = match Self::local_hotel_name(graph, local_node_id) {
+            Some(h) => h,
+            None => {
+                return IpcResponse::error("list_components", "HOTEL_NOT_FOUND", "local hotel record not found");
+            }
+        };
+
+        let guests = match graph.list_guests(&hotel_name, false) {
+            Ok(g) => g,
+            Err(e) => {
+                return IpcResponse::error("list_components", "STORAGE_ERROR", e.to_string());
+            }
+        };
+
+        // Load tool_runner_registry once to enrich tool-runner entries with capabilities.
+        let tool_registry: Vec<serde_json::Value> = graph
+            .get_config_value("tool_runner_registry")
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(&s).ok())
+            .unwrap_or_default();
+
+        let components: Vec<serde_json::Value> = guests
+            .into_iter()
+            .filter_map(|g| {
+                // Infer component type from role prefix — only model-controllers and tool-runners
+                // are surfaced here. Agents, membrane, and other guests belong in /api/guests.
+                let component_type = if g.role == "model" || g.role.starts_with("model.") || g.role.starts_with("model-controller") {
+                    "model-controller"
+                } else if g.role == "tool" || g.role.starts_with("tool.") || g.role.starts_with("tool-runner") {
+                    "tool-runner"
+                } else {
+                    return None;
+                };
+
+                // Read per-component config blob.
+                let component_config = {
+                    let key = format!("component:{}", g.guest_id);
+                    graph
+                        .get_config_value(&key)
+                        .ok()
+                        .flatten()
+                        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                        .unwrap_or(serde_json::Value::Null)
+                };
+
+                // Find capabilities from tool_runner_registry if this is a tool runner.
+                let capabilities: Vec<String> = tool_registry
+                    .iter()
+                    .find(|entry| {
+                        entry.get("guest_id").and_then(|v| v.as_str()) == Some(&g.guest_id)
+                    })
+                    .and_then(|entry| {
+                        entry
+                            .get("capabilities")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|c| c.as_str().map(String::from))
+                                    .collect()
+                            })
+                    })
+                    .unwrap_or_default();
+
+                Some(serde_json::json!({
+                    "guest_id": g.guest_id,
+                    "role": g.role,
+                    "component_type": component_type,
+                    "is_active": g.is_active,
+                    "active_pid": g.active_pid,
+                    "last_active_at": g.last_active_at,
+                    "component_config": component_config,
+                    "capabilities": capabilities,
+                }))
+            })
+            .collect();
+
+        IpcResponse::ComponentInventory { components }
+    }
+
+    async fn handle_set_component_active(
+        graph: &GraphDomain,
+        materialization_requester: Option<&dyn GuestMaterializationRequester>,
+        local_node_id: &str,
+        guest_id: &str,
+        active: bool,
+    ) -> IpcResponse {
+        let hotel_name = match Self::local_hotel_name(graph, local_node_id) {
+            Some(h) => h,
+            None => {
+                return IpcResponse::error("set_component_active", "HOTEL_NOT_FOUND", "local hotel record not found");
+            }
+        };
+
+        // Verify guest exists.
+        let guest_record = graph
+            .list_guests(&hotel_name, false)
+            .ok()
+            .and_then(|guests| guests.into_iter().find(|g| g.guest_id == guest_id));
+
+        if guest_record.is_none() {
+            return IpcResponse::error(
+                "set_component_active",
+                "GUEST_NOT_FOUND",
+                format!("No component registered with guest_id={guest_id}"),
+            );
+        }
+        let guest = guest_record.unwrap();
+
+        if !active {
+            // Kill the process if running, then mark inactive.
+            if let Some(ref pid_str) = guest.active_pid {
+                if let Ok(pid) = pid_str.parse::<u32>() {
+                    let _ = ProcessCommand::new("kill")
+                        .args(["-15", &pid.to_string()])
+                        .status();
+                }
+            }
+            if let Err(e) = graph.set_guest_pid(&hotel_name, guest_id, None) {
+                warn!("SetComponentActive: failed to clear PID for {guest_id}: {e}");
+            }
+            if let Err(e) = graph.set_guest_active(&hotel_name, guest_id, false) {
+                return IpcResponse::error("set_component_active", "STORAGE_ERROR", e.to_string());
+            }
+            info!(guest_id = %guest_id, "component deactivated");
+        } else {
+            // Mark active then trigger materialization.
+            if let Err(e) = graph.set_guest_active(&hotel_name, guest_id, true) {
+                return IpcResponse::error("set_component_active", "STORAGE_ERROR", e.to_string());
+            }
+            if let Some(req) = materialization_requester {
+                if let Err(e) = req.ensure_guest_active(guest_id).await {
+                    warn!("SetComponentActive: ensure_guest_active failed for {guest_id}: {e}");
+                }
+            }
+            info!(guest_id = %guest_id, "component activated");
+        }
+
+        IpcResponse::success("set_component_active", Some(serde_json::json!({ "guest_id": guest_id, "active": active })))
+    }
+
+    async fn handle_restart_component(
+        graph: &GraphDomain,
+        materialization_requester: Option<&dyn GuestMaterializationRequester>,
+        local_node_id: &str,
+        guest_id: &str,
+    ) -> IpcResponse {
+        let hotel_name = match Self::local_hotel_name(graph, local_node_id) {
+            Some(h) => h,
+            None => {
+                return IpcResponse::error("restart_component", "HOTEL_NOT_FOUND", "local hotel record not found");
+            }
+        };
+
+        let guest_record = graph
+            .list_guests(&hotel_name, false)
+            .ok()
+            .and_then(|guests| guests.into_iter().find(|g| g.guest_id == guest_id));
+
+        let Some(guest) = guest_record else {
+            return IpcResponse::error(
+                "restart_component",
+                "GUEST_NOT_FOUND",
+                format!("No component registered with guest_id={guest_id}"),
+            );
+        };
+
+        if !guest.is_active {
+            return IpcResponse::error(
+                "restart_component",
+                "COMPONENT_INACTIVE",
+                format!("Component {guest_id} is marked inactive; enable it first"),
+            );
+        }
+
+        // Terminate running process.
+        if let Some(ref pid_str) = guest.active_pid {
+            if let Ok(pid) = pid_str.parse::<u32>() {
+                let _ = ProcessCommand::new("kill")
+                    .args(["-15", &pid.to_string()])
+                    .status();
+            }
+        }
+        if let Err(e) = graph.set_guest_pid(&hotel_name, guest_id, None) {
+            warn!("RestartComponent: failed to clear PID for {guest_id}: {e}");
+        }
+
+        // Respawn.
+        if let Some(req) = materialization_requester {
+            if let Err(e) = req.ensure_guest_active(guest_id).await {
+                return IpcResponse::error(
+                    "restart_component",
+                    "SPAWN_FAILED",
+                    e.to_string(),
+                );
+            }
+        } else {
+            return IpcResponse::error(
+                "restart_component",
+                "NO_MATERIALIZER",
+                "no materialization requester available",
+            );
+        }
+
+        info!(guest_id = %guest_id, "component restarted");
+        IpcResponse::success("restart_component", Some(serde_json::json!({ "guest_id": guest_id })))
     }
 
     fn record_apartment_checkpoint(

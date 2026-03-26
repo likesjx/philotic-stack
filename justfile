@@ -55,21 +55,54 @@ build-runtime:
 
 # Kill local Philotic hotel/guest binaries from this checkout and clear stale sockets.
 kill-local-stack:
-    @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/aiua" || true
-    @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/membrane" || true
-    @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/philote" || true
-    @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/model-controller-gemini" || true
-    @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/model-controller-elevenlabs" || true
-    @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/tool-runner" || true
-    @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/graph-runner" || true
-    @pkill -f "/Users/jaredlikes/code/philotic-stack/target/debug/model-controller-mlx" || true
-    @rm -f /tmp/philotic-default.sock /tmp/philotic-local-telegram.sock /tmp/philotic-aria-architect-hotel.sock /tmp/philotic-startup-test-hotel.sock
+    @pkill -KILL -f "target/debug/aiua" 2>/dev/null || true
+    @pkill -KILL -f "target/debug/membrane" 2>/dev/null || true
+    @pkill -KILL -f "target/debug/philote" 2>/dev/null || true
+    @pkill -KILL -f "target/debug/model-controller-gemini" 2>/dev/null || true
+    @pkill -KILL -f "target/debug/model-controller-elevenlabs" 2>/dev/null || true
+    @pkill -KILL -f "target/debug/tool-runner" 2>/dev/null || true
+    @pkill -KILL -f "target/debug/graph-runner" 2>/dev/null || true
+    @pkill -KILL -f "target/debug/model-controller-mlx" 2>/dev/null || true
+    @sleep 0.3
+    @rm -f /tmp/philotic-*.sock
+
+# Nuclear clear: kill ALL aiua and guest processes (both debug and Homebrew installs),
+# remove all sockets (tmp and profile dirs). Safe to run anytime — use when FD exhaustion
+# or stale processes are suspected, or before a clean restart of any hotel.
+clear-aiua:
+    @echo "Clearing all aiua processes and sockets…"
+    @pkill -KILL -f "aiua" 2>/dev/null || true
+    @pkill -KILL -f "membrane" 2>/dev/null || true
+    @pkill -KILL -f "philote" 2>/dev/null || true
+    @pkill -KILL -f "model-router" 2>/dev/null || true
+    @pkill -KILL -f "tool-runner" 2>/dev/null || true
+    @pkill -KILL -f "graph-runner" 2>/dev/null || true
+    @pkill -KILL -f "agent-graph-runner" 2>/dev/null || true
+    @sleep 0.5
+    @rm -f /tmp/philotic-*.sock
+    @find "${HOME}/.philotic" -name "*.sock" -delete 2>/dev/null || true
+    @echo "Done. All aiua processes and sockets cleared."
 
 # Rebuild first, then kill stale local runtime processes/sockets, then start one hotel cleanly.
 start-aiua-clean hotel:
     just build-runtime
     just kill-local-stack
     cargo run -p aiua -- --hotel {{hotel}}
+
+# Wait for the hotel socket then start philotic-web serve.
+# Usage: just start-serve local-telegram   (run in a second terminal after start-aiua-clean)
+start-serve hotel:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    SOCK="/tmp/philotic-{{hotel}}.sock"
+    echo "Waiting for ${SOCK}..."
+    for i in $(seq 1 60); do
+      [[ -S "${SOCK}" ]] && break
+      [[ ${i} -eq 60 ]] && echo "Timed out waiting for ${SOCK}" && exit 1
+      sleep 0.5
+    done
+    echo "Socket ready — starting serve"
+    exec "$(pwd)/target/debug/philotic-web" serve
 
 # Start the transitional Gemini OAuth flow through the hotel CLI
 gemini-oauth-start client_id project_id:
@@ -339,6 +372,39 @@ operator-checklist:
     @echo "  smoke-green       (just smoke-suite passes)"
     @echo "  uat-green         (verify-vertical-slice + tier-2 passes)"
     @echo "  watched-live-green (live hotel + telegram confirms end-to-end)"
+
+# Build release binaries and install them into the local Homebrew Cellar.
+# Use this when jane is offline or to update the local phil/aiua without touching jane.
+local-push:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    AIUA_CELLAR=/opt/homebrew/Cellar/aiua/0.1.0-alpha/bin
+    PHIL_CELLAR=/opt/homebrew/Cellar/philotic-web/0.1.0-alpha/bin
+    AIUA_BINS="aiua philote membrane model-router model-controller-gemini model-controller-elevenlabs model-controller-mlx philote-worker tool-runner graph-runner"
+    echo "▶ Building release binaries..."
+    cargo build --release -p aiua -p philote -p membrane -p model-router -p tool-runner -p graph-runner -p philotic-web
+    echo "▶ Installing aiua stack to ${AIUA_CELLAR}..."
+    for bin in $AIUA_BINS; do
+        if [ ! -f "target/release/$bin" ]; then
+            echo "  – $bin (not built, skipping)"
+            continue
+        fi
+        if [ ! -f "${AIUA_CELLAR}/$bin" ]; then
+            echo "  – $bin (not in local Cellar, skipping)"
+            continue
+        fi
+        chmod u+w "${AIUA_CELLAR}/$bin"
+        cp "target/release/$bin" "${AIUA_CELLAR}/$bin"
+        chmod u-w "${AIUA_CELLAR}/$bin"
+        echo "  ✓ $bin"
+    done
+    echo "▶ Installing phil to ${PHIL_CELLAR}..."
+    chmod u+w "${PHIL_CELLAR}/philotic-web" "${PHIL_CELLAR}/phil" 2>/dev/null || true
+    cp target/release/philotic-web "${PHIL_CELLAR}/philotic-web"
+    cp target/release/philotic-web "${PHIL_CELLAR}/phil"
+    chmod u-w "${PHIL_CELLAR}/philotic-web" "${PHIL_CELLAR}/phil"
+    echo "  ✓ phil"
+    echo "✅ Local Homebrew install updated."
 
 # Build release binaries locally (MacBook Air) and push them to mbp-jane via SCP.
 # mbp-jane is a separate machine — it has no repo, only runs Cellar-installed binaries.
