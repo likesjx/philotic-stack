@@ -673,6 +673,55 @@ fn handle_cron_fired_broadcast(graph: &GraphDomain, payload_json: &str) {
     }
 }
 
+/// Handle an inbound `CronJobSync` broadcast from a peer hotel.
+///
+/// Replicates job definitions locally so this hotel can participate in
+/// guaranteed firing without requiring a shared config file.
+fn handle_cron_job_sync(graph: &GraphDomain, payload_json: &str) {
+    #[derive(serde::Deserialize)]
+    struct CronJobSyncPayload {
+        op: String,
+        job: Option<ansible_mesh_core::cron::CronJob>,
+        job_id: Option<String>,
+    }
+
+    let parsed: CronJobSyncPayload = match serde_json::from_str(payload_json) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("handle_cron_job_sync: invalid payload: {e}");
+            return;
+        }
+    };
+
+    match parsed.op.as_str() {
+        "upsert" => {
+            if let Some(job) = parsed.job {
+                if let Err(e) = graph.upsert_cron_job(&job) {
+                    warn!("handle_cron_job_sync: upsert failed for {}: {e}", job.id);
+                } else {
+                    info!("CronJobSync: replicated upsert for job {}", job.id);
+                }
+            } else {
+                warn!("handle_cron_job_sync: upsert op missing job field");
+            }
+        }
+        "remove" => {
+            if let Some(job_id) = parsed.job_id {
+                if let Err(e) = graph.remove_cron_job(&job_id) {
+                    warn!("handle_cron_job_sync: remove failed for {job_id}: {e}");
+                } else {
+                    info!("CronJobSync: replicated remove for job {job_id}");
+                }
+            } else {
+                warn!("handle_cron_job_sync: remove op missing job_id field");
+            }
+        }
+        other => {
+            warn!("handle_cron_job_sync: unknown op '{other}'");
+        }
+    }
+}
+
 fn mesh_target_addr_for_node(
     graph: &GraphDomain,
     target_node_id: &str,
@@ -850,20 +899,31 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
                                 for event in &events {
                                     IpcServer::deliver_event_envelope(&inbound_inboxes, event)
                                         .await;
-                                    // CronFired broadcast: advance local schedule so the
-                                    // staggered-offset fire on this hotel is suppressed.
-                                    if event.kind
-                                        == ansible_mesh_core::event::EventKind::CronFired
-                                    {
-                                        if let ansible_mesh_core::event::EventPayload::Inline {
-                                            data,
-                                        } = &event.payload
-                                        {
-                                            handle_cron_fired_broadcast(
-                                                inbound_graph.as_ref(),
+                                    // Cron control-plane broadcasts.
+                                    match &event.kind {
+                                        ansible_mesh_core::event::EventKind::CronFired => {
+                                            if let ansible_mesh_core::event::EventPayload::Inline {
                                                 data,
-                                            );
+                                            } = &event.payload
+                                            {
+                                                handle_cron_fired_broadcast(
+                                                    inbound_graph.as_ref(),
+                                                    data,
+                                                );
+                                            }
                                         }
+                                        ansible_mesh_core::event::EventKind::CronJobSync => {
+                                            if let ansible_mesh_core::event::EventPayload::Inline {
+                                                data,
+                                            } = &event.payload
+                                            {
+                                                handle_cron_job_sync(
+                                                    inbound_graph.as_ref(),
+                                                    data,
+                                                );
+                                            }
+                                        }
+                                        _ => {}
                                     }
                                 }
                                 let _ = dispatcher_inbound_tx

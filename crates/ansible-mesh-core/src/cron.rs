@@ -60,6 +60,58 @@ pub struct CronJob {
     pub created_by: CronJobSource,
 }
 
+/// Variables available for payload template interpolation at fire time.
+///
+/// All `{var}` placeholders in a job's `payload` string are replaced with
+/// the corresponding value before the envelope is dispatched.
+pub struct CronInterpolationVars<'a> {
+    /// Fire epoch in milliseconds since Unix epoch. Replaces `{timestamp}`.
+    pub timestamp_ms: u64,
+    /// ISO 8601 string of the fire time. Replaces `{iso_timestamp}`.
+    pub iso_timestamp: String,
+    /// The cron job's unique ID. Replaces `{job_id}`.
+    pub job_id: &'a str,
+    /// The firing hotel's node ID. Replaces `{node_id}`.
+    pub node_id: &'a str,
+    /// The destination role inbox. Replaces `{target_role}`.
+    pub target_role: &'a str,
+}
+
+impl<'a> CronInterpolationVars<'a> {
+    /// Construct vars for a given fire time and job context.
+    pub fn new(timestamp_ms: u64, job_id: &'a str, node_id: &'a str, target_role: &'a str) -> Self {
+        let iso_timestamp = Utc
+            .timestamp_millis_opt(timestamp_ms as i64)
+            .single()
+            .unwrap_or_else(|| Utc::now())
+            .to_rfc3339();
+        Self {
+            timestamp_ms,
+            iso_timestamp,
+            job_id,
+            node_id,
+            target_role,
+        }
+    }
+}
+
+/// Interpolate all `{var}` placeholders in `payload` using the provided vars.
+///
+/// Supported placeholders:
+/// - `{timestamp}` — fire epoch in milliseconds
+/// - `{iso_timestamp}` — ISO 8601 date-time string
+/// - `{job_id}` — cron job UUID
+/// - `{node_id}` — firing hotel node ID
+/// - `{target_role}` — destination role inbox
+pub fn interpolate_payload(payload: &str, vars: &CronInterpolationVars) -> String {
+    payload
+        .replace("{timestamp}", &vars.timestamp_ms.to_string())
+        .replace("{iso_timestamp}", &vars.iso_timestamp)
+        .replace("{job_id}", vars.job_id)
+        .replace("{node_id}", vars.node_id)
+        .replace("{target_role}", vars.target_role)
+}
+
 /// Compute the next fire time (ms since epoch) strictly after `after_ms`.
 ///
 /// `schedule_str` must be a valid cron expression (7-field with seconds).
