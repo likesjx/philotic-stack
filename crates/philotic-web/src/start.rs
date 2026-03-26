@@ -11,18 +11,27 @@ pub fn pid_path() -> PathBuf {
     profile_dir().join("aiua.pid")
 }
 
-/// Returns the expected aiua socket path for the current profile.
-/// When PHILOTIC_PROFILE is set: ~/.philotic/<profile>/aiua.sock
+/// Returns the expected aiua socket path for the given hotel.
+///
+/// When PHILOTIC_PROFILE is set: ~/.philotic/<profile>/aiua-<hotel>.sock
+///   (matches aiua's hotel_ipc_socket_path naming convention)
 /// When unset: falls back to PHILOTIC_HOTEL_SOCKET env var or /tmp/philotic-<hotel>.sock
 pub fn socket_path(hotel: &str) -> String {
+    let safe_name: String = hotel
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => ch,
+            _ => '-',
+        })
+        .collect();
     if active_profile().is_some() {
         profile_dir()
-            .join("aiua.sock")
+            .join(format!("aiua-{safe_name}.sock"))
             .to_string_lossy()
             .into_owned()
     } else {
         std::env::var("PHILOTIC_HOTEL_SOCKET")
-            .unwrap_or_else(|_| format!("/tmp/philotic-{hotel}.sock"))
+            .unwrap_or_else(|_| format!("/tmp/philotic-{safe_name}.sock"))
     }
 }
 

@@ -199,6 +199,78 @@ print(f'  {len(r)} target(s)')
 "
 echo "  /api/mesh/targets OK"
 
+# ── GET /api/skills ───────────────────────────────────────────────────────────
+
+echo "Testing GET /api/skills..."
+SKILLS=$(api GET /api/skills)
+echo "${SKILLS}" | python3 -c "
+import json, sys
+r = json.load(sys.stdin)
+assert isinstance(r, list), f'expected list, got: {r}'
+print(f'  {len(r)} skill(s)')
+"
+echo "  /api/skills OK"
+
+# ── GET /api/agents/:id/roles and /rules (unknown agent → stable response) ───
+
+echo "Testing GET /api/agents/smoke-agent/roles..."
+ROLES_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+  -H "Authorization: Bearer ${TOKEN}" \
+  "http://${SERVE_ADDR}/api/agents/smoke-agent/roles")
+# 200 (empty roles) or 500 (agent not found) — either is a valid wired response
+if [[ "${ROLES_CODE}" != "200" && "${ROLES_CODE}" != "500" ]]; then
+  echo "ERROR: /api/agents/:id/roles returned unexpected ${ROLES_CODE}" >&2
+  exit 1
+fi
+echo "  /api/agents/smoke-agent/roles → ${ROLES_CODE} OK"
+
+echo "Testing GET /api/agents/smoke-agent/rules..."
+RULES_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+  -H "Authorization: Bearer ${TOKEN}" \
+  "http://${SERVE_ADDR}/api/agents/smoke-agent/rules")
+if [[ "${RULES_CODE}" != "200" && "${RULES_CODE}" != "500" ]]; then
+  echo "ERROR: /api/agents/:id/rules returned unexpected ${RULES_CODE}" >&2
+  exit 1
+fi
+echo "  /api/agents/smoke-agent/rules → ${RULES_CODE} OK"
+
+# ── GET /api/config ───────────────────────────────────────────────────────────
+
+echo "Testing GET /api/config..."
+CONFIG=$(api GET /api/config)
+echo "${CONFIG}" | python3 -c "
+import json, sys
+r = json.load(sys.stdin)
+assert isinstance(r, dict), f'expected dict, got: {r}'
+print(f'  keys: {list(r.keys())}')
+"
+echo "  /api/config OK"
+
+# ── GET /api/config/telegram ──────────────────────────────────────────────────
+
+echo "Testing GET /api/config/telegram..."
+TG=$(api GET /api/config/telegram)
+echo "${TG}" | python3 -c "
+import json, sys
+r = json.load(sys.stdin)
+assert 'token_configured' in r, f'missing token_configured: {r}'
+print(f'  token_configured={r[\"token_configured\"]}')
+"
+echo "  /api/config/telegram OK"
+
+# ── GET /api/config/gemini ────────────────────────────────────────────────────
+
+echo "Testing GET /api/config/gemini..."
+GM=$(api GET /api/config/gemini)
+echo "${GM}" | python3 -c "
+import json, sys
+r = json.load(sys.stdin)
+assert 'oauth_metadata' in r, f'missing oauth_metadata: {r}'
+assert 'token_refs_configured' in r, f'missing token_refs_configured: {r}'
+print(f'  refs_configured={r[\"token_refs_configured\"]}')
+"
+echo "  /api/config/gemini OK"
+
 # ── Auth rejection — no token ─────────────────────────────────────────────────
 
 echo "Testing 401 for unauthenticated request..."

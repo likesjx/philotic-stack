@@ -9,11 +9,17 @@
 //!   GET  /api/status
 //!   GET  /api/guests
 //!   GET  /api/agents
+//!   GET  /api/agents/:agent_id/roles
+//!   GET  /api/agents/:agent_id/rules
+//!   GET  /api/skills
 //!   GET  /api/mesh/targets
 //!   GET  /api/mesh/targets/:target_node_id/status
 //!   GET  /api/mesh/targets/:target_node_id/guests
 //!   GET  /api/mesh/targets/:target_node_id/agents
 //!   POST /api/mesh/targets/:target_node_id/agents/:agent_id/chat
+//!   GET  /api/config
+//!   GET  /api/config/telegram
+//!   GET  /api/config/gemini
 //!   GET  /api/sessions    (stub — returns [] until session table exists)
 //!   GET  /api/apartments/:agent_id   (disabled by default for the desktop membrane)
 //!   POST /api/guests/:guest_id/restart
@@ -67,6 +73,8 @@ const HEADER_CORP: &str = "cross-origin-resource-policy";
 struct AppState {
     token: Arc<String>,
     db_path: PathBuf,
+    /// IPC socket path for the connected hotel
+    socket: Arc<String>,
     /// Broadcast channel for WebSocket push events
     tx: broadcast::Sender<String>,
 }
@@ -115,8 +123,9 @@ pub async fn run(
         None => PathBuf::from("mesh-config.json"),
     });
     let hotel = read_hotel_name(&config_path);
+    let socket = crate::start::socket_path(&hotel);
     let lease_key = desktop_membrane_lease_key(&hotel);
-    let lease_handle = acquire_desktop_membrane_lease(&lease_key, port).await?;
+    let lease_handle = acquire_desktop_membrane_lease(&socket, &lease_key, port).await?;
 
     // Generate session token
     let token: String = {
@@ -130,6 +139,7 @@ pub async fn run(
     let state = AppState {
         token: Arc::new(token.clone()),
         db_path,
+        socket: Arc::new(socket),
         tx,
     };
 
@@ -141,6 +151,12 @@ pub async fn run(
         .route("/api/status", get(handle_status))
         .route("/api/guests", get(handle_guests))
         .route("/api/agents", get(handle_agents))
+        .route("/api/agents/:agent_id/roles", get(handle_agent_roles))
+        .route("/api/agents/:agent_id/rules", get(handle_agent_rules))
+        .route("/api/skills", get(handle_skills))
+        .route("/api/config", get(handle_config))
+        .route("/api/config/telegram", get(handle_config_telegram))
+        .route("/api/config/gemini", get(handle_config_gemini))
         .route("/api/mesh/targets", get(handle_mesh_targets))
         .route(
             "/api/mesh/targets/:target_node_id/status",
@@ -206,10 +222,10 @@ fn desktop_membrane_lease_key(hotel: &str) -> String {
 }
 
 async fn acquire_desktop_membrane_lease(
+    socket: &str,
     lease_key: &str,
     port: u16,
 ) -> Result<DesktopMembraneLeaseHandle> {
-    let socket = crate::start::socket_path("aiua");
     let identity = GuestIdentity {
         guest_id: format!("philotic-web-membrane-{port}"),
         role: "management".into(),
@@ -525,7 +541,7 @@ async fn handle_status(headers: HeaderMap, State(state): State<AppState>) -> Res
         return unauthorized();
     }
 
-    let status = match ipc_desktop_membrane_status().await {
+    let status = match ipc_desktop_membrane_status(&state.socket).await {
         Ok(status) => status,
         Err(err) => {
             return (
@@ -551,7 +567,7 @@ async fn handle_guests(headers: HeaderMap, State(state): State<AppState>) -> Res
         return unauthorized();
     }
 
-    match ipc_desktop_membrane_guests().await {
+    match ipc_desktop_membrane_guests(&state.socket).await {
         Ok(guests) => Json(guests).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -568,7 +584,7 @@ async fn handle_agents(headers: HeaderMap, State(state): State<AppState>) -> Res
         return unauthorized();
     }
 
-    match ipc_desktop_membrane_agents().await {
+    match ipc_desktop_membrane_agents(&state.socket).await {
         Ok(agents) => Json(agents).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -585,7 +601,7 @@ async fn handle_mesh_targets(headers: HeaderMap, State(state): State<AppState>) 
         return unauthorized();
     }
 
-    match ipc_desktop_membrane_targets().await {
+    match ipc_desktop_membrane_targets(&state.socket).await {
         Ok(targets) => Json(targets).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -604,7 +620,7 @@ async fn handle_mesh_target_status(
         return unauthorized();
     }
 
-    match ipc_desktop_membrane_target_status(&target_node_id).await {
+    match ipc_desktop_membrane_target_status(&state.socket, &target_node_id).await {
         Ok(status) => Json(status).into_response(),
         Err(err) => {
             let status_code = if err
@@ -629,7 +645,7 @@ async fn handle_mesh_target_guests(
         return unauthorized();
     }
 
-    match ipc_desktop_membrane_target_guests(&target_node_id).await {
+    match ipc_desktop_membrane_target_guests(&state.socket, &target_node_id).await {
         Ok(guests) => Json(guests).into_response(),
         Err(err) => {
             let status_code = if err
@@ -654,7 +670,7 @@ async fn handle_mesh_target_agents(
         return unauthorized();
     }
 
-    match ipc_desktop_membrane_target_agents(&target_node_id).await {
+    match ipc_desktop_membrane_target_agents(&state.socket, &target_node_id).await {
         Ok(agents) => Json(agents).into_response(),
         Err(err) => {
             let status_code = if err
@@ -684,7 +700,7 @@ async fn handle_mesh_target_agent_chat(
         .operator_session_id
         .unwrap_or_else(|| "desktop-membrane".into());
 
-    let targets = match ipc_desktop_membrane_targets().await {
+    let targets = match ipc_desktop_membrane_targets(&state.socket).await {
         Ok(targets) => targets,
         Err(err) => {
             return (
@@ -734,9 +750,11 @@ async fn handle_mesh_target_agent_chat(
     };
 
     let tx = state.tx.clone();
+    let socket = state.socket.as_ref().clone();
     let accepted_for_error = accepted.clone();
     tokio::spawn(async move {
         if let Err(err) = stream_operator_chat_turn(
+            socket,
             tx.clone(),
             local_node_id,
             target_node_id,
@@ -771,6 +789,7 @@ async fn handle_mesh_target_agent_chat(
 }
 
 async fn stream_operator_chat_turn(
+    socket: String,
     tx: broadcast::Sender<String>,
     local_node_id: String,
     target_node_id: String,
@@ -782,7 +801,7 @@ async fn stream_operator_chat_turn(
     content: String,
 ) -> Result<()> {
     let reply_guest_id = new_operator_chat_id("operator-chat");
-    let mut client = connect_client_with_identity(GuestIdentity {
+    let mut client = connect_client_with_identity(&socket, GuestIdentity {
         guest_id: reply_guest_id.clone(),
         role: OPERATOR_CHAT_REPLY_ROLE.into(),
         supported_tools: vec![],
@@ -1010,7 +1029,7 @@ async fn handle_guest_restart(
     }
 
     // Signal the hotel via IPC to restart the guest
-    match ipc_guest_action(&guest_id, "restart").await {
+    match ipc_guest_action(&state.socket, &guest_id, "restart").await {
         Ok(_) => {
             let event = json!({ "type": "guest:started", "payload": { "guest_id": guest_id } });
             let _ = state.tx.send(event.to_string());
@@ -1035,7 +1054,7 @@ async fn handle_guest_stop(
         return unauthorized();
     }
 
-    match ipc_guest_action(&guest_id, "stop").await {
+    match ipc_guest_action(&state.socket, &guest_id, "stop").await {
         Ok(_) => {
             let event = json!({ "type": "guest:stopped", "payload": { "guest_id": guest_id } });
             let _ = state.tx.send(event.to_string());
@@ -1049,8 +1068,180 @@ async fn handle_guest_stop(
     }
 }
 
-async fn ipc_guest_action(guest_id: &str, action: &str) -> Result<()> {
-    let mut client = connect_management_client("philotic-web-mgmt").await?;
+// ── GET /api/agents/:agent_id/roles ──────────────────────────────────────────
+
+async fn handle_agent_roles(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_list_role_incarnations(&state.socket, &agent_id).await {
+        Ok(roles) => Json(roles).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// ── GET /api/agents/:agent_id/rules ──────────────────────────────────────────
+
+async fn handle_agent_rules(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_list_rules(&state.socket, &agent_id).await {
+        Ok(rules) => Json(rules).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// ── GET /api/skills ───────────────────────────────────────────────────────────
+
+async fn handle_skills(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_list_skills(&state.socket).await {
+        Ok(skills) => Json(skills).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// ── GET /api/config ───────────────────────────────────────────────────────────
+
+async fn handle_config(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    // Read well-known operator-facing config keys. Values are returned as-is
+    // (already JSON-encoded strings in the context graph).
+    let keys = &[
+        "execution_host",
+        "vault_registry",
+        "tool_runner_registry",
+    ];
+    let mut out = serde_json::Map::new();
+    for key in keys {
+        match ipc_get_config(&state.socket, key).await {
+            Ok(Some(val)) => { out.insert(key.to_string(), val); }
+            Ok(None) => { out.insert(key.to_string(), Value::Null); }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("reading {key}: {e}")})),
+                )
+                    .into_response();
+            }
+        }
+    }
+    Json(Value::Object(out)).into_response()
+}
+
+// ── GET /api/config/telegram ──────────────────────────────────────────────────
+
+async fn handle_config_telegram(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    // Return token ref name only — never the token value.
+    let token_ref = match ipc_get_config(&state.socket, "telegram_bot_token").await {
+        Ok(Some(val)) => {
+            // The value is the token itself. Surface only that it is set and its first 8 chars as a hint.
+            let hint = val
+                .as_str()
+                .map(|s| format!("{}…", &s[..s.len().min(8)]))
+                .unwrap_or_else(|| "(set)".into());
+            Some(hint)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    Json(json!({
+        "token_configured": token_ref.is_some(),
+        "token_hint": token_ref,
+    }))
+    .into_response()
+}
+
+// ── GET /api/config/gemini ────────────────────────────────────────────────────
+
+async fn handle_config_gemini(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    // Surface OAuth metadata only — no token values.
+    let meta_keys = &[
+        "gemini_oauth_project_id",
+        "gemini_oauth_scope",
+        "gemini_oauth_token_type",
+        "gemini_oauth_access_token_expires_at",
+    ];
+    let ref_keys = &[
+        "gemini_oauth_access_token_ref",
+        "gemini_oauth_refresh_token_ref",
+    ];
+    let mut meta = serde_json::Map::new();
+    for key in meta_keys {
+        match ipc_get_config(&state.socket, key).await {
+            Ok(Some(val)) => { meta.insert(key.to_string(), val); }
+            Ok(None) => {}
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("reading {key}: {e}")})),
+                )
+                    .into_response();
+            }
+        }
+    }
+    let mut refs_configured = serde_json::Map::new();
+    for key in ref_keys {
+        let configured = match ipc_get_config(&state.socket, key).await {
+            Ok(v) => v.is_some(),
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("reading {key}: {e}")})),
+                )
+                    .into_response();
+            }
+        };
+        refs_configured.insert(key.to_string(), Value::Bool(configured));
+    }
+    Json(json!({
+        "oauth_metadata": meta,
+        "token_refs_configured": refs_configured,
+    }))
+    .into_response()
+}
+
+// ── IPC helpers ───────────────────────────────────────────────────────────────
+
+async fn ipc_guest_action(socket: &str, guest_id: &str, action: &str) -> Result<()> {
+    let mut client = connect_management_client(socket, "philotic-web-mgmt").await?;
 
     // Publish a management action to the hotel
     let payload = serde_json::json!({
@@ -1067,8 +1258,8 @@ async fn ipc_guest_action(guest_id: &str, action: &str) -> Result<()> {
     Ok(())
 }
 
-async fn ipc_desktop_membrane_status() -> Result<DesktopMembraneStatusView> {
-    let mut client = connect_management_client("philotic-web-status").await?;
+async fn ipc_desktop_membrane_status(socket: &str) -> Result<DesktopMembraneStatusView> {
+    let mut client = connect_management_client(socket, "philotic-web-status").await?;
     match client
         .send_request(IpcRequest::GetDesktopMembraneStatus)
         .await?
@@ -1081,8 +1272,8 @@ async fn ipc_desktop_membrane_status() -> Result<DesktopMembraneStatusView> {
     }
 }
 
-async fn ipc_desktop_membrane_guests() -> Result<Vec<DesktopMembraneGuestView>> {
-    let mut client = connect_management_client("philotic-web-guests").await?;
+async fn ipc_desktop_membrane_guests(socket: &str) -> Result<Vec<DesktopMembraneGuestView>> {
+    let mut client = connect_management_client(socket, "philotic-web-guests").await?;
     match client
         .send_request(IpcRequest::ListDesktopMembraneGuests)
         .await?
@@ -1095,8 +1286,8 @@ async fn ipc_desktop_membrane_guests() -> Result<Vec<DesktopMembraneGuestView>> 
     }
 }
 
-async fn ipc_desktop_membrane_agents() -> Result<Vec<DesktopMembraneAgentView>> {
-    let mut client = connect_management_client("philotic-web-agents").await?;
+async fn ipc_desktop_membrane_agents(socket: &str) -> Result<Vec<DesktopMembraneAgentView>> {
+    let mut client = connect_management_client(socket, "philotic-web-agents").await?;
     match client
         .send_request(IpcRequest::ListDesktopMembraneAgents)
         .await?
@@ -1109,8 +1300,8 @@ async fn ipc_desktop_membrane_agents() -> Result<Vec<DesktopMembraneAgentView>> 
     }
 }
 
-async fn ipc_desktop_membrane_targets() -> Result<Vec<OperatorTargetView>> {
-    let mut client = connect_management_client("philotic-web-mesh-targets").await?;
+async fn ipc_desktop_membrane_targets(socket: &str) -> Result<Vec<OperatorTargetView>> {
+    let mut client = connect_management_client(socket, "philotic-web-mesh-targets").await?;
     match client.send_request(IpcRequest::QueryOperatorTargets).await? {
         IpcResponse::OperatorTargetsView { operator_targets } => Ok(operator_targets),
         IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
@@ -1121,9 +1312,10 @@ async fn ipc_desktop_membrane_targets() -> Result<Vec<OperatorTargetView>> {
 }
 
 async fn ipc_desktop_membrane_target_status(
+    socket: &str,
     target_node_id: &str,
 ) -> Result<OperatorTargetStatusView> {
-    let mut client = connect_management_client("philotic-web-mesh-target-status").await?;
+    let mut client = connect_management_client(socket, "philotic-web-mesh-target-status").await?;
     match client
         .send_request(IpcRequest::QueryOperatorTargetStatus {
             target_node_id: target_node_id.to_string(),
@@ -1141,9 +1333,10 @@ async fn ipc_desktop_membrane_target_status(
 }
 
 async fn ipc_desktop_membrane_target_guests(
+    socket: &str,
     target_node_id: &str,
 ) -> Result<OperatorTargetGuestInventoryView> {
-    let mut client = connect_management_client("philotic-web-mesh-target-guests").await?;
+    let mut client = connect_management_client(socket, "philotic-web-mesh-target-guests").await?;
     match client
         .send_request(IpcRequest::QueryOperatorTargetGuests {
             target_node_id: target_node_id.to_string(),
@@ -1161,9 +1354,10 @@ async fn ipc_desktop_membrane_target_guests(
 }
 
 async fn ipc_desktop_membrane_target_agents(
+    socket: &str,
     target_node_id: &str,
 ) -> Result<OperatorTargetAgentInventoryView> {
-    let mut client = connect_management_client("philotic-web-mesh-target-agents").await?;
+    let mut client = connect_management_client(socket, "philotic-web-mesh-target-agents").await?;
     match client
         .send_request(IpcRequest::QueryOperatorTargetAgents {
             target_node_id: target_node_id.to_string(),
@@ -1180,14 +1374,74 @@ async fn ipc_desktop_membrane_target_agents(
     }
 }
 
+async fn ipc_list_role_incarnations(socket: &str, agent_id: &str) -> Result<Value> {
+    let mut client = connect_management_client(socket, "philotic-web-roles").await?;
+    match client
+        .send_request(IpcRequest::ListRoleIncarnations {
+            agent_id: agent_id.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::Standard {
+            ok: true,
+            data: Some(d),
+            ..
+        } => Ok(d),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected role incarnations response: {other:?}")),
+    }
+}
+
+async fn ipc_list_rules(socket: &str, agent_id: &str) -> Result<Vec<Value>> {
+    let mut client = connect_management_client(socket, "philotic-web-rules").await?;
+    match client
+        .send_request(IpcRequest::ListRules {
+            agent_id: agent_id.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::RuleList { rules } => Ok(rules),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected rules response: {other:?}")),
+    }
+}
+
+async fn ipc_list_skills(socket: &str) -> Result<Vec<Value>> {
+    let mut client = connect_management_client(socket, "philotic-web-skills").await?;
+    match client.send_request(IpcRequest::ListSkills {}).await? {
+        IpcResponse::SkillList { skills } => Ok(skills),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected skills response: {other:?}")),
+    }
+}
+
+async fn ipc_get_config(socket: &str, key: &str) -> Result<Option<Value>> {
+    let mut client = connect_management_client(socket, "philotic-web-config").await?;
+    match client
+        .send_request(IpcRequest::GetConfig {
+            key: key.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::ConfigData { value_json: Some(raw), .. } => {
+            let parsed: Value = serde_json::from_str(&raw)
+                .unwrap_or_else(|_| Value::String(raw));
+            Ok(Some(parsed))
+        }
+        IpcResponse::ConfigData { value_json: None, .. } => Ok(None),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected config data response: {other:?}")),
+    }
+}
+
 fn new_operator_chat_id(prefix: &str) -> String {
     let mut rng = rand::thread_rng();
     let suffix = format!("{:016x}", rng.r#gen::<u64>());
     format!("{prefix}-{suffix}")
 }
 
-async fn connect_management_client(guest_id: &str) -> Result<PhiloticClient> {
-    connect_client_with_identity(GuestIdentity {
+async fn connect_management_client(socket: &str, guest_id: &str) -> Result<PhiloticClient> {
+    connect_client_with_identity(socket, GuestIdentity {
         guest_id: guest_id.into(),
         role: "management".into(),
         supported_tools: vec![],
@@ -1195,9 +1449,8 @@ async fn connect_management_client(guest_id: &str) -> Result<PhiloticClient> {
     .await
 }
 
-async fn connect_client_with_identity(identity: GuestIdentity) -> Result<PhiloticClient> {
-    let socket = crate::start::socket_path("aiua");
-    PhiloticClient::connect_at(&socket, identity)
+async fn connect_client_with_identity(socket: &str, identity: GuestIdentity) -> Result<PhiloticClient> {
+    PhiloticClient::connect_at(socket, identity)
         .await
         .map_err(Into::into)
 }
