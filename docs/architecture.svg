@@ -1,312 +1,391 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 950" font-family="'Segoe UI', system-ui, -apple-system, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 950" font-family="Inter, system-ui, -apple-system, sans-serif">
   <defs>
-    <filter id="shadow" x="-4%" y="-4%" width="108%" height="108%">
-      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-opacity="0.15"/>
-    </filter>
     <linearGradient id="bgGrad" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#0d1117"/>
-      <stop offset="100%" stop-color="#161b22"/>
+      <stop offset="0%" stop-color="#0a0c14"/>
+      <stop offset="100%" stop-color="#0d1019"/>
     </linearGradient>
-    <linearGradient id="agentGrad" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#1a1e2e"/>
-      <stop offset="100%" stop-color="#1e2436"/>
-    </linearGradient>
-    <linearGradient id="memGrad" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#1a1a2e"/>
-      <stop offset="100%" stop-color="#1e1e36"/>
-    </linearGradient>
-    <marker id="arrowBlue" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#3b82f6"/></marker>
-    <marker id="arrowAmber" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#f59e0b"/></marker>
-    <marker id="arrowGreen" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#4ade80"/></marker>
-    <marker id="arrowCyan" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#06b6d4"/></marker>
-    <marker id="arrowPurple" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#c084fc"/></marker>
-    <marker id="arrowViolet" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#8b5cf6"/></marker>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+    <filter id="shadow" x="-4%" y="-4%" width="108%" height="108%">
+      <feDropShadow dx="0" dy="2" stdDeviation="4" flood-color="#000" flood-opacity="0.3"/>
+    </filter>
+    <!-- Arrow markers -->
+    <marker id="arrowCyan" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#00e5ff"/></marker>
+    <marker id="arrowPurple" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#d500f9"/></marker>
+    <marker id="arrowBlue" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#2979ff"/></marker>
+    <marker id="arrowTeal" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#1de9b6"/></marker>
+    <marker id="arrowAmber" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#ffc107"/></marker>
+    <marker id="arrowGreen" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#00e676"/></marker>
+    <marker id="arrowRed" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#ff5252"/></marker>
+    <!-- Reverse arrows -->
+    <marker id="arrowCyanRev" markerWidth="8" markerHeight="6" refX="0" refY="3" orient="auto"><path d="M8,0 L0,3 L8,6" fill="#00e5ff"/></marker>
+    <marker id="arrowAmberRev" markerWidth="8" markerHeight="6" refX="0" refY="3" orient="auto"><path d="M8,0 L0,3 L8,6" fill="#ffc107"/></marker>
   </defs>
 
   <!-- Background -->
-  <rect width="1100" height="950" rx="12" fill="url(#bgGrad)"/>
+  <rect width="1100" height="950" fill="url(#bgGrad)"/>
 
-  <!-- Title -->
-  <text x="550" y="38" text-anchor="middle" fill="#e6edf3" font-size="22" font-weight="700">ZeroClaw Architecture</text>
-  <text x="550" y="58" text-anchor="middle" fill="#7d8590" font-size="12">Zero overhead. Zero compromise. 100% Rust. 100% Agnostic. 8 pluggable traits.</text>
+  <!-- ═══════════════════════════════════════════ -->
+  <!-- HEADER: Logo + Title                        -->
+  <!-- ═══════════════════════════════════════════ -->
+  <!-- Hexagon logo -->
+  <g transform="translate(340, 22)">
+    <polygon points="15,0 28,8 28,23 15,31 2,23 2,8" fill="none" stroke="#00e5ff" stroke-width="1.8"/>
+    <circle cx="15" cy="15.5" r="4" fill="#00e5ff" opacity="0.5"/>
+    <circle cx="15" cy="15.5" r="1.5" fill="#00e5ff"/>
+  </g>
+  <text x="550" y="42" text-anchor="middle" fill="#e8eaf0" font-size="20" font-weight="700" letter-spacing="0.5">Philotic Stack Architecture</text>
+  <text x="550" y="60" text-anchor="middle" fill="#8892b0" font-size="10" letter-spacing="0.3">Distributed AI Agent OS · Rust · Hotel / Guest Model · 14 Crates · ~74K LOC</text>
 
-  <!-- ═══════════ LEFT: Chat Apps ═══════════ -->
-  <rect x="20" y="80" width="150" height="310" rx="10" fill="#1c2333" stroke="#3b82f6" stroke-width="1.5" filter="url(#shadow)"/>
-  <text x="95" y="105" text-anchor="middle" fill="#93c5fd" font-size="13" font-weight="600">Chat Apps</text>
+  <!-- ═══════════════════════════════════════════ -->
+  <!-- TOP: Mesh Network Zone                      -->
+  <!-- ═══════════════════════════════════════════ -->
+  <rect x="20" y="78" width="1060" height="100" rx="8" fill="#161b2e" stroke="#d500f9" stroke-width="1" opacity="0.85"/>
+  <text x="40" y="96" fill="#d500f9" font-size="9" font-weight="700" letter-spacing="1.6">MESH NETWORK</text>
+  <text x="240" y="96" fill="#8892b0" font-size="8">ansible-mesh-core</text>
 
-  <rect x="35" y="120" width="120" height="24" rx="6" fill="#1e293b"/>
-  <text x="95" y="137" text-anchor="middle" fill="#60a5fa" font-size="10">Telegram</text>
-  <rect x="35" y="150" width="120" height="24" rx="6" fill="#1e293b"/>
-  <text x="95" y="167" text-anchor="middle" fill="#818cf8" font-size="10">Discord</text>
-  <rect x="35" y="180" width="120" height="24" rx="6" fill="#1e293b"/>
-  <text x="95" y="197" text-anchor="middle" fill="#a78bfa" font-size="10">Slack</text>
-  <rect x="35" y="210" width="120" height="24" rx="6" fill="#1e293b"/>
-  <text x="95" y="227" text-anchor="middle" fill="#c084fc" font-size="10">iMessage</text>
-  <rect x="35" y="240" width="120" height="24" rx="6" fill="#1e293b"/>
-  <text x="95" y="257" text-anchor="middle" fill="#e879f9" font-size="10">Matrix</text>
-  <rect x="35" y="270" width="120" height="24" rx="6" fill="#1e293b"/>
-  <text x="95" y="287" text-anchor="middle" fill="#f472b6" font-size="10">Webhook</text>
-  <rect x="35" y="300" width="120" height="24" rx="6" fill="#1e293b"/>
-  <text x="95" y="317" text-anchor="middle" fill="#fb923c" font-size="10">CLI</text>
+  <!-- Peer Hotels -->
+  <rect x="40" y="108" width="155" height="54" rx="6" fill="#1a1230" stroke="#d500f9" stroke-width="0.8"/>
+  <text x="117" y="126" text-anchor="middle" fill="#ea80fc" font-size="10" font-weight="600">Peer Hotels</text>
+  <text x="117" y="141" text-anchor="middle" fill="#8892b0" font-size="8" font-family="'JetBrains Mono', monospace">MeshDispatcher</text>
+  <text x="117" y="153" text-anchor="middle" fill="#8892b0" font-size="7.5">Inter-hotel task routing</text>
 
-  <text x="95" y="355" text-anchor="middle" fill="#7d8590" font-size="9" font-style="italic">+ any Channel trait</text>
+  <!-- Beacon Discovery -->
+  <rect x="215" y="108" width="155" height="54" rx="6" fill="#1a1230" stroke="#d500f9" stroke-width="0.8"/>
+  <text x="292" y="126" text-anchor="middle" fill="#ea80fc" font-size="10" font-weight="600">Beacon Discovery</text>
+  <text x="292" y="141" text-anchor="middle" fill="#8892b0" font-size="8" font-family="'JetBrains Mono', monospace">UDP :8999</text>
+  <text x="292" y="153" text-anchor="middle" fill="#8892b0" font-size="7.5">Gossip + liveness</text>
 
-  <!-- Arrow: Chat Apps → Security -->
-  <line x1="170" y1="230" x2="195" y2="230" stroke="#3b82f6" stroke-width="2" marker-end="url(#arrowBlue)"/>
+  <!-- TCP Execution -->
+  <rect x="390" y="108" width="155" height="54" rx="6" fill="#1a1230" stroke="#d500f9" stroke-width="0.8"/>
+  <text x="467" y="126" text-anchor="middle" fill="#ea80fc" font-size="10" font-weight="600">TCP Execution</text>
+  <text x="467" y="141" text-anchor="middle" fill="#8892b0" font-size="8" font-family="'JetBrains Mono', monospace">Execution Plane</text>
+  <text x="467" y="153" text-anchor="middle" fill="#8892b0" font-size="7.5">Cross-hotel task dispatch</text>
 
-  <!-- ═══════════ CENTER-LEFT: Security Layer ═══════════ -->
-  <rect x="200" y="80" width="190" height="310" rx="10" fill="#1c2333" stroke="#f59e0b" stroke-width="1.5" filter="url(#shadow)"/>
-  <text x="295" y="105" text-anchor="middle" fill="#fbbf24" font-size="13" font-weight="600">Security Layer</text>
+  <!-- Tailscale overlay -->
+  <rect x="565" y="108" width="155" height="54" rx="6" fill="#1a1230" stroke="#d500f9" stroke-width="0.8" stroke-dasharray="4,2"/>
+  <text x="642" y="126" text-anchor="middle" fill="#ea80fc" font-size="10" font-weight="600">Overlay Network</text>
+  <text x="642" y="141" text-anchor="middle" fill="#8892b0" font-size="8" font-family="'JetBrains Mono', monospace">Tailscale / MagicDNS</text>
+  <text x="642" y="153" text-anchor="middle" fill="#8892b0" font-size="7.5">Transitional</text>
 
-  <!-- Gateway Pairing -->
-  <rect x="213" y="120" width="165" height="50" rx="8" fill="#292524" stroke="#f59e0b" stroke-width="1" stroke-dasharray="4,2"/>
-  <text x="295" y="138" text-anchor="middle" fill="#fbbf24" font-size="10" font-weight="600">Gateway Pairing</text>
-  <text x="295" y="153" text-anchor="middle" fill="#a8a29e" font-size="8">6-digit OTP + bearer tokens</text>
-  <text x="295" y="164" text-anchor="middle" fill="#a8a29e" font-size="8">constant-time comparison</text>
+  <!-- Auth -->
+  <rect x="740" y="108" width="155" height="54" rx="6" fill="#1a1230" stroke="#d500f9" stroke-width="0.8"/>
+  <text x="817" y="126" text-anchor="middle" fill="#ea80fc" font-size="10" font-weight="600">Auth Exchange</text>
+  <text x="817" y="141" text-anchor="middle" fill="#8892b0" font-size="8" font-family="'JetBrains Mono', monospace">OAuth + HMAC-PSK</text>
+  <text x="817" y="153" text-anchor="middle" fill="#8892b0" font-size="7.5">Hotel identity &amp; pairing</text>
 
-  <!-- Auth Gate -->
-  <rect x="213" y="178" width="165" height="45" rx="8" fill="#292524" stroke="#f59e0b" stroke-width="1" stroke-dasharray="4,2"/>
-  <text x="295" y="196" text-anchor="middle" fill="#fbbf24" font-size="10" font-weight="600">Auth Gate</text>
-  <text x="295" y="210" text-anchor="middle" fill="#a8a29e" font-size="8">Channel allowlists + webhook_secret</text>
+  <!-- Homebrew -->
+  <rect x="915" y="108" width="150" height="54" rx="6" fill="#1a1230" stroke="#4a5370" stroke-width="0.8" stroke-dasharray="4,2"/>
+  <text x="990" y="126" text-anchor="middle" fill="#8892b0" font-size="10" font-weight="600">Distribution</text>
+  <text x="990" y="141" text-anchor="middle" fill="#8892b0" font-size="8" font-family="'JetBrains Mono', monospace">brew install</text>
+  <text x="990" y="153" text-anchor="middle" fill="#8892b0" font-size="7.5">likesjx/philotic tap</text>
 
-  <!-- Rate Limiter -->
-  <rect x="213" y="230" width="165" height="45" rx="8" fill="#292524" stroke="#f59e0b" stroke-width="1" stroke-dasharray="4,2"/>
-  <text x="295" y="248" text-anchor="middle" fill="#fbbf24" font-size="10" font-weight="600">Rate Limiter</text>
-  <text x="295" y="262" text-anchor="middle" fill="#a8a29e" font-size="8">sliding window, cost/day cap</text>
+  <!-- ═══════════════════════════════════════════ -->
+  <!-- MIDDLE ROW: 3 main zones                    -->
+  <!-- ═══════════════════════════════════════════ -->
 
-  <!-- Filesystem Sandbox -->
-  <rect x="213" y="282" width="165" height="50" rx="8" fill="#292524" stroke="#f59e0b" stroke-width="1" stroke-dasharray="4,2"/>
-  <text x="295" y="300" text-anchor="middle" fill="#fbbf24" font-size="10" font-weight="600">Filesystem Sandbox</text>
-  <text x="295" y="314" text-anchor="middle" fill="#a8a29e" font-size="8">path jail + null byte block</text>
-  <text x="295" y="325" text-anchor="middle" fill="#a8a29e" font-size="8">symlink escape detection</text>
+  <!-- ─── LEFT: Operator Surfaces ─── -->
+  <rect x="20" y="198" width="200" height="380" rx="8" fill="#161b2e" stroke="#1de9b6" stroke-width="1.2" filter="url(#shadow)"/>
+  <text x="120" y="220" text-anchor="middle" fill="#1de9b6" font-size="9" font-weight="700" letter-spacing="1.6">OPERATOR SURFACES</text>
 
-  <!-- Encrypted Secrets -->
-  <rect x="213" y="340" width="165" height="38" rx="8" fill="#292524" stroke="#f59e0b" stroke-width="1" stroke-dasharray="4,2"/>
-  <text x="295" y="358" text-anchor="middle" fill="#fbbf24" font-size="10" font-weight="600">Encrypted Secrets</text>
-  <text x="295" y="372" text-anchor="middle" fill="#a8a29e" font-size="8">XOR + local key file (0600)</text>
+  <!-- Desktop Membrane -->
+  <rect x="35" y="236" width="170" height="80" rx="6" fill="#0f2420" stroke="#1de9b6" stroke-width="0.8"/>
+  <text x="120" y="254" text-anchor="middle" fill="#1de9b6" font-size="11" font-weight="600">Desktop Membrane</text>
+  <text x="120" y="269" text-anchor="middle" fill="#8892b0" font-size="8" font-family="'JetBrains Mono', monospace">philotic-web serve</text>
+  <text x="120" y="283" text-anchor="middle" fill="#8892b0" font-size="7.5">REST API + WebSocket push</text>
+  <text x="120" y="295" text-anchor="middle" fill="#8892b0" font-size="7.5">Operator chat · Session auth</text>
+  <!-- Status dot: in progress -->
+  <circle cx="193" cy="248" r="3.5" fill="#ffc107"/>
 
-  <!-- Arrow: Security → Agent -->
-  <line x1="295" y1="390" x2="295" y2="415" stroke="#f59e0b" stroke-width="2" marker-end="url(#arrowAmber)"/>
+  <!-- phil CLI -->
+  <rect x="35" y="326" width="170" height="60" rx="6" fill="#0f2420" stroke="#1de9b6" stroke-width="0.8"/>
+  <text x="120" y="346" text-anchor="middle" fill="#1de9b6" font-size="11" font-weight="600">phil CLI</text>
+  <text x="120" y="361" text-anchor="middle" fill="#8892b0" font-size="8" font-family="'JetBrains Mono', monospace">init · start · stop · status</text>
+  <text x="120" y="373" text-anchor="middle" fill="#8892b0" font-size="7.5">serve · flush · config</text>
+  <circle cx="193" cy="340" r="3.5" fill="#00e676"/>
 
-  <!-- ═══════════ CENTER: Tunnel ═══════════ -->
-  <rect x="405" y="80" width="180" height="200" rx="10" fill="#1c2333" stroke="#06b6d4" stroke-width="1.5" filter="url(#shadow)"/>
-  <text x="495" y="105" text-anchor="middle" fill="#67e8f9" font-size="13" font-weight="600">Agnostic Tunnel</text>
-  <text x="495" y="120" text-anchor="middle" fill="#7d8590" font-size="9">Bring Your Own</text>
+  <!-- Telegram Membrane -->
+  <rect x="35" y="396" width="170" height="55" rx="6" fill="#0f2420" stroke="#1de9b6" stroke-width="0.8"/>
+  <text x="120" y="415" text-anchor="middle" fill="#1de9b6" font-size="11" font-weight="600">Telegram Membrane</text>
+  <text x="120" y="430" text-anchor="middle" fill="#8892b0" font-size="8" font-family="'JetBrains Mono', monospace">membrane crate</text>
+  <text x="120" y="442" text-anchor="middle" fill="#8892b0" font-size="7.5">Polls/webhooks → Hotel IPC</text>
+  <circle cx="193" cy="409" r="3.5" fill="#00e676"/>
 
-  <rect x="418" y="132" width="155" height="22" rx="5" fill="#1e293b"/>
-  <text x="495" y="148" text-anchor="middle" fill="#22d3ee" font-size="10">Cloudflare</text>
-  <rect x="418" y="160" width="155" height="22" rx="5" fill="#1e293b"/>
-  <text x="495" y="176" text-anchor="middle" fill="#22d3ee" font-size="10">Tailscale</text>
-  <rect x="418" y="188" width="155" height="22" rx="5" fill="#1e293b"/>
-  <text x="495" y="204" text-anchor="middle" fill="#22d3ee" font-size="10">ngrok</text>
-  <rect x="418" y="216" width="155" height="22" rx="5" fill="#1e293b"/>
-  <text x="495" y="232" text-anchor="middle" fill="#22d3ee" font-size="10">Custom (bore, frp, ssh...)</text>
+  <!-- Future: Mobile -->
+  <rect x="35" y="461" width="170" height="34" rx="6" fill="#101520" stroke="#4a5370" stroke-width="0.8" stroke-dasharray="4,2"/>
+  <text x="120" y="483" text-anchor="middle" fill="#4a5370" font-size="9">Future: Mobile · Additional membranes</text>
 
-  <text x="495" y="265" text-anchor="middle" fill="#7d8590" font-size="9" font-style="italic">+ any Tunnel trait</text>
+  <!-- Protocol labels on left -->
+  <text x="120" y="510" text-anchor="middle" fill="#1de9b6" font-size="7.5" font-weight="600" opacity="0.7">HTTP / WebSocket</text>
 
-  <!-- Arrow: Tunnel → Agent -->
-  <line x1="495" y1="280" x2="495" y2="415" stroke="#06b6d4" stroke-width="2" marker-end="url(#arrowCyan)"/>
+  <!-- ─── CENTER: The Hotel (aiua) ─── -->
+  <rect x="250" y="198" width="380" height="380" rx="8" fill="#161b2e" stroke="#00e5ff" stroke-width="1.5" filter="url(#shadow)"/>
+  <!-- Inner glow effect for the hotel -->
+  <rect x="252" y="200" width="376" height="376" rx="7" fill="none" stroke="#00e5ff" stroke-width="0.3" opacity="0.3"/>
 
-  <!-- ═══════════ RIGHT: AI Providers ═══════════ -->
-  <rect x="600" y="80" width="480" height="200" rx="10" fill="#1c2333" stroke="#22c55e" stroke-width="1.5" filter="url(#shadow)"/>
-  <text x="840" y="105" text-anchor="middle" fill="#4ade80" font-size="13" font-weight="600">AI Providers (22+)</text>
-  <text x="840" y="120" text-anchor="middle" fill="#7d8590" font-size="9">Any OpenAI-compatible API</text>
+  <text x="440" y="220" text-anchor="middle" fill="#00e5ff" font-size="9" font-weight="700" letter-spacing="1.6">THE HOTEL</text>
+  <text x="440" y="233" text-anchor="middle" fill="#8892b0" font-size="8" font-family="'JetBrains Mono', monospace">aiua daemon · central switchboard</text>
 
-  <!-- Provider grid: 4 columns x 4 rows -->
-  <rect x="615" y="132" width="105" height="22" rx="5" fill="#1a2e1a"/>
-  <text x="667" y="148" text-anchor="middle" fill="#86efac" font-size="9">OpenRouter</text>
-  <rect x="730" y="132" width="105" height="22" rx="5" fill="#1a2e1a"/>
-  <text x="782" y="148" text-anchor="middle" fill="#86efac" font-size="9">Anthropic</text>
-  <rect x="845" y="132" width="105" height="22" rx="5" fill="#1a2e1a"/>
-  <text x="897" y="148" text-anchor="middle" fill="#86efac" font-size="9">OpenAI</text>
-  <rect x="960" y="132" width="105" height="22" rx="5" fill="#1a2e1a"/>
-  <text x="1012" y="148" text-anchor="middle" fill="#86efac" font-size="9">Ollama</text>
+  <!-- IPC Server -->
+  <rect x="268" y="248" width="165" height="52" rx="6" fill="#0c1525" stroke="#00e5ff" stroke-width="0.8"/>
+  <text x="350" y="266" text-anchor="middle" fill="#00e5ff" font-size="10" font-weight="600">IPC Server</text>
+  <text x="350" y="280" text-anchor="middle" fill="#8892b0" font-size="8" font-family="'JetBrains Mono', monospace">ipc.rs · 13K LOC</text>
+  <text x="350" y="292" text-anchor="middle" fill="#8892b0" font-size="7.5">Central message switchboard</text>
+  <circle cx="423" cy="260" r="3.5" fill="#00e676"/>
 
-  <rect x="615" y="160" width="105" height="22" rx="5" fill="#1a2e1a"/>
-  <text x="667" y="176" text-anchor="middle" fill="#86efac" font-size="9">Venice</text>
-  <rect x="730" y="160" width="105" height="22" rx="5" fill="#1a2e1a"/>
-  <text x="782" y="176" text-anchor="middle" fill="#86efac" font-size="9">Groq</text>
-  <rect x="845" y="160" width="105" height="22" rx="5" fill="#1a2e1a"/>
-  <text x="897" y="176" text-anchor="middle" fill="#86efac" font-size="9">Mistral</text>
-  <rect x="960" y="160" width="105" height="22" rx="5" fill="#1a2e1a"/>
-  <text x="1012" y="176" text-anchor="middle" fill="#86efac" font-size="9">xAI / Grok</text>
+  <!-- Guest Manager -->
+  <rect x="448" y="248" width="165" height="52" rx="6" fill="#0c1525" stroke="#00e5ff" stroke-width="0.8"/>
+  <text x="530" y="266" text-anchor="middle" fill="#00e5ff" font-size="10" font-weight="600">Guest Manager</text>
+  <text x="530" y="280" text-anchor="middle" fill="#8892b0" font-size="8">Process materialization</text>
+  <text x="530" y="292" text-anchor="middle" fill="#8892b0" font-size="7.5">Spawn · supervise · reap</text>
+  <circle cx="603" cy="260" r="3.5" fill="#00e676"/>
 
-  <rect x="615" y="188" width="105" height="22" rx="5" fill="#1a2e1a"/>
-  <text x="667" y="204" text-anchor="middle" fill="#86efac" font-size="9">DeepSeek</text>
-  <rect x="730" y="188" width="105" height="22" rx="5" fill="#1a2e1a"/>
-  <text x="782" y="204" text-anchor="middle" fill="#86efac" font-size="9">Together AI</text>
-  <rect x="845" y="188" width="105" height="22" rx="5" fill="#1a2e1a"/>
-  <text x="897" y="204" text-anchor="middle" fill="#86efac" font-size="9">Fireworks</text>
-  <rect x="960" y="188" width="105" height="22" rx="5" fill="#1a2e1a"/>
-  <text x="1012" y="204" text-anchor="middle" fill="#86efac" font-size="9">Perplexity</text>
+  <!-- Resource Registry -->
+  <rect x="268" y="310" width="108" height="46" rx="6" fill="#0c1525" stroke="#00e5ff" stroke-width="0.8"/>
+  <text x="322" y="328" text-anchor="middle" fill="#00e5ff" font-size="10" font-weight="600">Resources</text>
+  <text x="322" y="342" text-anchor="middle" fill="#8892b0" font-size="7.5">ResourceRegistry</text>
+  <text x="322" y="352" text-anchor="middle" fill="#8892b0" font-size="7.5">Lifecycle mgmt</text>
+  <circle cx="368" cy="320" r="3" fill="#00e676"/>
 
-  <rect x="615" y="216" width="105" height="22" rx="5" fill="#1a2e1a"/>
-  <text x="667" y="232" text-anchor="middle" fill="#86efac" font-size="9">Cohere</text>
-  <rect x="730" y="216" width="105" height="22" rx="5" fill="#1a2e1a"/>
-  <text x="782" y="232" text-anchor="middle" fill="#86efac" font-size="9">Cloudflare AI</text>
-  <rect x="845" y="216" width="105" height="22" rx="5" fill="#1a2e1a"/>
-  <text x="897" y="232" text-anchor="middle" fill="#86efac" font-size="9">Bedrock</text>
-  <rect x="960" y="216" width="105" height="22" rx="5" fill="#1e3a1e" stroke="#4ade80" stroke-width="1" stroke-dasharray="3,2"/>
-  <text x="1012" y="232" text-anchor="middle" fill="#4ade80" font-size="9" font-weight="600">custom:URL</text>
+  <!-- CronTicker -->
+  <rect x="386" y="310" width="108" height="46" rx="6" fill="#0c1525" stroke="#00e5ff" stroke-width="0.8"/>
+  <text x="440" y="328" text-anchor="middle" fill="#00e5ff" font-size="10" font-weight="600">CronTicker</text>
+  <text x="440" y="342" text-anchor="middle" fill="#8892b0" font-size="7.5">Distributed cron</text>
+  <text x="440" y="352" text-anchor="middle" fill="#8892b0" font-size="7.5">scheduler</text>
+  <circle cx="486" cy="320" r="3" fill="#00e676"/>
 
-  <text x="840" y="262" text-anchor="middle" fill="#7d8590" font-size="9" font-style="italic">+ any Provider trait / custom:URL</text>
+  <!-- BlobService -->
+  <rect x="504" y="310" width="108" height="46" rx="6" fill="#0c1525" stroke="#00e5ff" stroke-width="0.8"/>
+  <text x="558" y="328" text-anchor="middle" fill="#00e5ff" font-size="10" font-weight="600">BlobService</text>
+  <text x="558" y="342" text-anchor="middle" fill="#8892b0" font-size="7.5">Binary artifacts</text>
+  <text x="558" y="352" text-anchor="middle" fill="#8892b0" font-size="7.5" font-family="'JetBrains Mono', monospace">:9001</text>
+  <circle cx="604" cy="320" r="3" fill="#00e676"/>
 
-  <!-- Arrow: Providers → Agent LLM -->
-  <line x1="840" y1="280" x2="560" y2="440" stroke="#22c55e" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#arrowGreen)"/>
+  <!-- Mesh Dispatcher -->
+  <rect x="268" y="366" width="165" height="46" rx="6" fill="#0c1525" stroke="#00e5ff" stroke-width="0.8"/>
+  <text x="350" y="384" text-anchor="middle" fill="#00e5ff" font-size="10" font-weight="600">MeshDispatcher</text>
+  <text x="350" y="398" text-anchor="middle" fill="#8892b0" font-size="7.5">Inter-hotel message routing</text>
+  <text x="350" y="408" text-anchor="middle" fill="#8892b0" font-size="7.5">UDP beacon + TCP exec</text>
+  <circle cx="423" cy="376" r="3" fill="#00e676"/>
 
-  <!-- ═══════════ CENTER: Agent Loop ═══════════ -->
-  <rect x="20" y="420" width="1060" height="130" rx="12" fill="url(#agentGrad)" stroke="#22c55e" stroke-width="1.5" filter="url(#shadow)"/>
-  <text x="550" y="445" text-anchor="middle" fill="#4ade80" font-size="14" font-weight="700">Agent Loop</text>
+  <!-- Vault Service -->
+  <rect x="448" y="366" width="165" height="46" rx="6" fill="#0c1525" stroke="#00e5ff" stroke-width="0.8"/>
+  <text x="530" y="384" text-anchor="middle" fill="#00e5ff" font-size="10" font-weight="600">VaultService</text>
+  <text x="530" y="398" text-anchor="middle" fill="#8892b0" font-size="7.5">Encrypted key/secret storage</text>
+  <text x="530" y="408" text-anchor="middle" fill="#8892b0" font-size="7.5">Encrypted SQLite</text>
+  <circle cx="603" cy="376" r="3" fill="#00e676"/>
 
-  <!-- Message → LLM → Tools → Response flow -->
-  <rect x="50" y="460" width="110" height="42" rx="8" fill="#1a2e1a" stroke="#4ade80" stroke-width="1"/>
-  <text x="105" y="478" text-anchor="middle" fill="#4ade80" font-size="10" font-weight="600">Message</text>
-  <text x="105" y="495" text-anchor="middle" fill="#86efac" font-size="14">In</text>
+  <!-- GraphDomain access layer -->
+  <rect x="268" y="422" width="345" height="42" rx="6" fill="#0c1525" stroke="#00e5ff" stroke-width="0.8"/>
+  <text x="440" y="440" text-anchor="middle" fill="#00e5ff" font-size="10" font-weight="600">GraphDomain</text>
+  <text x="440" y="454" text-anchor="middle" fill="#8892b0" font-size="7.5">Entity-typed graph access layer · wraps SQLite · source of truth</text>
+  <circle cx="603" cy="432" r="3" fill="#00e676"/>
 
-  <rect x="200" y="460" width="110" height="42" rx="8" fill="#1a2e1a" stroke="#4ade80" stroke-width="1"/>
-  <text x="255" y="478" text-anchor="middle" fill="#4ade80" font-size="10" font-weight="600">Memory Recall</text>
-  <text x="255" y="495" text-anchor="middle" fill="#86efac" font-size="14">ctx</text>
+  <!-- Auth label inside hotel -->
+  <rect x="268" y="474" width="165" height="36" rx="6" fill="#0c1525" stroke="#00e5ff" stroke-width="0.8"/>
+  <text x="350" y="490" text-anchor="middle" fill="#00e5ff" font-size="9" font-weight="600">Auth Exchange</text>
+  <text x="350" y="502" text-anchor="middle" fill="#8892b0" font-size="7.5">OAuth · HMAC-PSK · session</text>
+  <circle cx="423" cy="484" r="3" fill="#00e676"/>
 
-  <rect x="350" y="460" width="110" height="42" rx="8" fill="#1a2e1a" stroke="#4ade80" stroke-width="1"/>
-  <text x="405" y="478" text-anchor="middle" fill="#4ade80" font-size="10" font-weight="600">LLM</text>
-  <text x="405" y="495" text-anchor="middle" fill="#86efac" font-size="14">AI</text>
+  <!-- BeaconDaemon inside hotel -->
+  <rect x="448" y="474" width="165" height="36" rx="6" fill="#0c1525" stroke="#00e5ff" stroke-width="0.8"/>
+  <text x="530" y="490" text-anchor="middle" fill="#00e5ff" font-size="9" font-weight="600">BeaconDaemon</text>
+  <text x="530" y="502" text-anchor="middle" fill="#8892b0" font-size="7.5" font-family="'JetBrains Mono', monospace">UDP :8999 gossip</text>
+  <circle cx="603" cy="484" r="3" fill="#00e676"/>
 
-  <rect x="500" y="460" width="110" height="42" rx="8" fill="#1a2e1a" stroke="#4ade80" stroke-width="1"/>
-  <text x="555" y="478" text-anchor="middle" fill="#4ade80" font-size="10" font-weight="600">Tools</text>
-  <text x="555" y="495" text-anchor="middle" fill="#86efac" font-size="14">exec</text>
+  <!-- IPC label below hotel -->
+  <text x="440" y="548" text-anchor="middle" fill="#00e5ff" font-size="7.5" font-weight="600" opacity="0.7">IPC / Unix Domain Socket</text>
+  <text x="440" y="560" text-anchor="middle" fill="#8892b0" font-size="7">Hotel ↔ Guest bidirectional</text>
 
-  <rect x="650" y="460" width="110" height="42" rx="8" fill="#1a2e1a" stroke="#4ade80" stroke-width="1"/>
-  <text x="705" y="478" text-anchor="middle" fill="#4ade80" font-size="10" font-weight="600">Memory Save</text>
-  <text x="705" y="495" text-anchor="middle" fill="#86efac" font-size="14">store</text>
+  <!-- ─── RIGHT: Guest Processes ─── -->
+  <rect x="660" y="198" width="420" height="380" rx="8" fill="#161b2e" stroke="#00e676" stroke-width="1.2" filter="url(#shadow)"/>
+  <text x="870" y="220" text-anchor="middle" fill="#00e676" font-size="9" font-weight="700" letter-spacing="1.6">GUEST PROCESSES</text>
+  <text x="870" y="233" text-anchor="middle" fill="#8892b0" font-size="8">Spawned &amp; supervised by Hotel</text>
 
-  <rect x="800" y="460" width="110" height="42" rx="8" fill="#1a2e1a" stroke="#4ade80" stroke-width="1"/>
-  <text x="855" y="478" text-anchor="middle" fill="#4ade80" font-size="10" font-weight="600">Response</text>
-  <text x="855" y="495" text-anchor="middle" fill="#86efac" font-size="14">Out</text>
+  <!-- Philote (Agent Core) — larger, primary -->
+  <rect x="678" y="248" width="190" height="80" rx="6" fill="#0c2010" stroke="#00e676" stroke-width="1"/>
+  <text x="773" y="268" text-anchor="middle" fill="#00e676" font-size="11" font-weight="600">Philote (Agent Core)</text>
+  <text x="773" y="283" text-anchor="middle" fill="#8892b0" font-size="8" font-family="'JetBrains Mono', monospace">philote crate</text>
+  <text x="773" y="296" text-anchor="middle" fill="#8892b0" font-size="7.5">Cognitive loop · session mgmt</text>
+  <text x="773" y="308" text-anchor="middle" fill="#8892b0" font-size="7.5">Role incarnation · slash commands</text>
+  <circle cx="858" cy="260" r="3.5" fill="#00e676"/>
 
-  <!-- Composio (optional) -->
-  <rect x="950" y="460" width="110" height="42" rx="8" fill="#1a2e1a" stroke="#4ade80" stroke-width="1" stroke-dasharray="4,2"/>
-  <text x="1005" y="478" text-anchor="middle" fill="#4ade80" font-size="9" font-weight="600">Composio</text>
-  <text x="1005" y="493" text-anchor="middle" fill="#7d8590" font-size="8">1000+ OAuth</text>
+  <!-- Philote Worker -->
+  <rect x="878" y="248" width="190" height="38" rx="6" fill="#0c2010" stroke="#00e676" stroke-width="0.8"/>
+  <text x="973" y="266" text-anchor="middle" fill="#00e676" font-size="10" font-weight="600">Philote Worker</text>
+  <text x="973" y="279" text-anchor="middle" fill="#8892b0" font-size="7.5">Subagent delegation</text>
+  <circle cx="1058" cy="260" r="3" fill="#00e676"/>
 
-  <!-- Agent loop arrows -->
-  <line x1="160" y1="481" x2="200" y2="481" stroke="#4ade80" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
-  <line x1="310" y1="481" x2="350" y2="481" stroke="#4ade80" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
-  <line x1="460" y1="481" x2="500" y2="481" stroke="#4ade80" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
-  <line x1="610" y1="481" x2="650" y2="481" stroke="#4ade80" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
-  <line x1="760" y1="481" x2="800" y2="481" stroke="#4ade80" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
+  <!-- Model Controllers -->
+  <rect x="878" y="296" width="190" height="62" rx="6" fill="#0c2010" stroke="#00e676" stroke-width="0.8"/>
+  <text x="973" y="314" text-anchor="middle" fill="#00e676" font-size="10" font-weight="600">Model Controllers</text>
+  <text x="973" y="328" text-anchor="middle" fill="#8892b0" font-size="8" font-family="'JetBrains Mono', monospace">model-router</text>
+  <text x="973" y="341" text-anchor="middle" fill="#8892b0" font-size="7.5">Gemini · ElevenLabs</text>
+  <text x="973" y="352" text-anchor="middle" fill="#8892b0" font-size="7.5">ONNX · MLX</text>
+  <circle cx="1058" cy="308" r="3" fill="#ffc107"/>
 
-  <!-- ═══════════ BOTTOM-LEFT: Memory Search Engine ═══════════ -->
-  <rect x="20" y="570" width="530" height="170" rx="10" fill="url(#memGrad)" stroke="#8b5cf6" stroke-width="1.5" filter="url(#shadow)"/>
-  <text x="285" y="595" text-anchor="middle" fill="#c4b5fd" font-size="13" font-weight="700">Memory Search Engine (All Custom)</text>
-  <text x="285" y="610" text-anchor="middle" fill="#7d8590" font-size="9">No Pinecone, no Elasticsearch, no LangChain</text>
+  <!-- Tool Runner -->
+  <rect x="678" y="340" width="190" height="52" rx="6" fill="#0c2010" stroke="#00e676" stroke-width="0.8"/>
+  <text x="773" y="358" text-anchor="middle" fill="#00e676" font-size="10" font-weight="600">Tool Runner</text>
+  <text x="773" y="373" text-anchor="middle" fill="#8892b0" font-size="8">Sandboxed execution</text>
+  <text x="773" y="385" text-anchor="middle" fill="#8892b0" font-size="7.5">Landlock + seccomp policies</text>
+  <circle cx="858" cy="352" r="3" fill="#00e676"/>
 
-  <!-- Memory layers: 2 columns -->
-  <rect x="35" y="622" width="245" height="24" rx="5" fill="#1e1a2e" stroke="#8b5cf6" stroke-width="0.5"/>
-  <text x="45" y="639" fill="#c4b5fd" font-size="9" font-weight="600">Vector DB</text>
-  <text x="157" y="639" text-anchor="middle" fill="#a78bfa" font-size="8">SQLite BLOB + cosine similarity</text>
+  <!-- Graph Runner -->
+  <rect x="678" y="402" width="190" height="42" rx="6" fill="#0c2010" stroke="#00e676" stroke-width="0.8"/>
+  <text x="773" y="420" text-anchor="middle" fill="#00e676" font-size="10" font-weight="600">Graph Runner</text>
+  <text x="773" y="436" text-anchor="middle" fill="#8892b0" font-size="7.5">Shared project graph store</text>
+  <circle cx="858" cy="414" r="3" fill="#00e676"/>
 
-  <rect x="290" y="622" width="245" height="24" rx="5" fill="#1e1a2e" stroke="#8b5cf6" stroke-width="0.5"/>
-  <text x="300" y="639" fill="#c4b5fd" font-size="9" font-weight="600">Keyword</text>
-  <text x="412" y="639" text-anchor="middle" fill="#a78bfa" font-size="8">FTS5 virtual tables + BM25</text>
+  <!-- Agent Graph Runner -->
+  <rect x="878" y="370" width="190" height="42" rx="6" fill="#0c2010" stroke="#00e676" stroke-width="0.8"/>
+  <text x="973" y="388" text-anchor="middle" fill="#00e676" font-size="10" font-weight="600">Agent Graph Runner</text>
+  <text x="973" y="404" text-anchor="middle" fill="#8892b0" font-size="7.5">Per-agent cognitive graph</text>
+  <circle cx="1058" cy="382" r="3" fill="#00e676"/>
 
-  <rect x="35" y="652" width="245" height="24" rx="5" fill="#1e1a2e" stroke="#8b5cf6" stroke-width="0.5"/>
-  <text x="45" y="669" fill="#c4b5fd" font-size="9" font-weight="600">Hybrid Merge</text>
-  <text x="157" y="669" text-anchor="middle" fill="#a78bfa" font-size="8">Weighted vector + keyword fusion</text>
+  <!-- Membrane (guest) -->
+  <rect x="878" y="422" width="190" height="42" rx="6" fill="#0c2010" stroke="#00e676" stroke-width="0.8"/>
+  <text x="973" y="440" text-anchor="middle" fill="#00e676" font-size="10" font-weight="600">Membrane (Guest)</text>
+  <text x="973" y="456" text-anchor="middle" fill="#8892b0" font-size="7.5">Telegram gateway process</text>
+  <circle cx="1058" cy="434" r="3" fill="#00e676"/>
 
-  <rect x="290" y="652" width="245" height="24" rx="5" fill="#1e1a2e" stroke="#8b5cf6" stroke-width="0.5"/>
-  <text x="300" y="669" fill="#c4b5fd" font-size="9" font-weight="600">Embeddings</text>
-  <text x="412" y="669" text-anchor="middle" fill="#a78bfa" font-size="8">OpenAI / custom URL / noop</text>
+  <!-- Cognitive Loop detail -->
+  <rect x="678" y="454" width="390" height="42" rx="6" fill="#0c2010" stroke="#ffc107" stroke-width="0.8" stroke-dasharray="4,2"/>
+  <text x="873" y="472" text-anchor="middle" fill="#ffc107" font-size="9" font-weight="600">Cognitive Loop — context envelope · memory tools · skill lifecycle</text>
+  <text x="873" y="486" text-anchor="middle" fill="#8892b0" font-size="7.5">SpawnSubagent works · governance &amp; streaming pending</text>
+  <circle cx="1058" cy="464" r="3" fill="#ffc107"/>
 
-  <rect x="35" y="682" width="245" height="24" rx="5" fill="#1e1a2e" stroke="#8b5cf6" stroke-width="0.5"/>
-  <text x="45" y="699" fill="#c4b5fd" font-size="9" font-weight="600">Chunking</text>
-  <text x="157" y="699" text-anchor="middle" fill="#a78bfa" font-size="8">Markdown-aware + heading ctx</text>
+  <!-- External calls label -->
+  <text x="870" y="515" text-anchor="middle" fill="#ff5252" font-size="7.5" font-weight="600" opacity="0.7">→ External: LLM APIs · Telegram Bot API · ElevenLabs TTS/STT</text>
 
-  <rect x="290" y="682" width="245" height="24" rx="5" fill="#1e1a2e" stroke="#8b5cf6" stroke-width="0.5"/>
-  <text x="300" y="699" fill="#c4b5fd" font-size="9" font-weight="600">Caching</text>
-  <text x="412" y="699" text-anchor="middle" fill="#a78bfa" font-size="8">embedding_cache + LRU eviction</text>
+  <!-- ═══════════════════════════════════════════ -->
+  <!-- BOTTOM: Storage Layer                       -->
+  <!-- ═══════════════════════════════════════════ -->
+  <rect x="20" y="600" width="1060" height="170" rx="8" fill="#161b2e" stroke="#ffc107" stroke-width="1" opacity="0.9"/>
+  <text x="40" y="620" fill="#ffc107" font-size="9" font-weight="700" letter-spacing="1.6">STORAGE LAYER</text>
+  <text x="215" y="620" fill="#8892b0" font-size="8">All SQLite · Zero external databases</text>
 
-  <rect x="35" y="712" width="500" height="20" rx="5" fill="#1e1a2e" stroke="#8b5cf6" stroke-width="0.5"/>
-  <text x="285" y="726" text-anchor="middle" fill="#a78bfa" font-size="8">Safe Reindex: rebuild FTS5 + re-embed missing vectors atomically | LIKE fallback | Upsert/Delete/Reindex</text>
+  <!-- Context Graph -->
+  <rect x="40" y="636" width="205" height="68" rx="6" fill="#1a1800" stroke="#ffc107" stroke-width="0.8"/>
+  <text x="142" y="656" text-anchor="middle" fill="#ffc107" font-size="11" font-weight="600">Context Graph</text>
+  <text x="142" y="671" text-anchor="middle" fill="#8892b0" font-size="8" font-family="'JetBrains Mono', monospace">GraphDomain / SQLite</text>
+  <text x="142" y="685" text-anchor="middle" fill="#8892b0" font-size="7.5">Source of truth · all hotel state</text>
+  <text x="142" y="697" text-anchor="middle" fill="#8892b0" font-size="7.5">Entity-typed graph layer</text>
 
-  <!-- Arrow: Agent → Memory -->
-  <line x1="255" y1="550" x2="255" y2="570" stroke="#8b5cf6" stroke-width="2" marker-end="url(#arrowViolet)"/>
+  <!-- Agent Graph -->
+  <rect x="260" y="636" width="195" height="68" rx="6" fill="#1a1800" stroke="#ffc107" stroke-width="0.8"/>
+  <text x="357" y="656" text-anchor="middle" fill="#ffc107" font-size="11" font-weight="600">Agent Graph</text>
+  <text x="357" y="671" text-anchor="middle" fill="#8892b0" font-size="8" font-family="'JetBrains Mono', monospace">SQLite per-agent</text>
+  <text x="357" y="685" text-anchor="middle" fill="#8892b0" font-size="7.5">Cognitive graph · agent.graph.*</text>
+  <text x="357" y="697" text-anchor="middle" fill="#8892b0" font-size="7.5">tool surface</text>
 
-  <!-- ═══════════ BOTTOM-RIGHT: Sandbox + Heartbeat ═══════════ -->
-  <rect x="570" y="570" width="250" height="170" rx="10" fill="#1c2333" stroke="#ef4444" stroke-width="1.5" filter="url(#shadow)"/>
-  <text x="695" y="595" text-anchor="middle" fill="#fca5a5" font-size="13" font-weight="600">Sandbox</text>
+  <!-- Vault -->
+  <rect x="470" y="636" width="175" height="68" rx="6" fill="#1a1800" stroke="#ffc107" stroke-width="0.8"/>
+  <text x="557" y="656" text-anchor="middle" fill="#ffc107" font-size="11" font-weight="600">Vault</text>
+  <text x="557" y="671" text-anchor="middle" fill="#8892b0" font-size="8" font-family="'JetBrains Mono', monospace">Encrypted SQLite</text>
+  <text x="557" y="685" text-anchor="middle" fill="#8892b0" font-size="7.5">Secrets · tokens · keys</text>
+  <text x="557" y="697" text-anchor="middle" fill="#8892b0" font-size="7.5">VaultService interface</text>
 
-  <text x="695" y="618" text-anchor="middle" fill="#ef4444" font-size="9">Command allowlist</text>
-  <text x="695" y="635" text-anchor="middle" fill="#ef4444" font-size="9">Path jail + traversal block</text>
-  <text x="695" y="652" text-anchor="middle" fill="#ef4444" font-size="9">Browser domain allowlist</text>
-  <text x="695" y="669" text-anchor="middle" fill="#ef4444" font-size="9">Null byte + Symlink escape block</text>
-  <text x="695" y="686" text-anchor="middle" fill="#ef4444" font-size="9">System dirs + Dotfiles blocked</text>
-  <text x="695" y="706" text-anchor="middle" fill="#ef4444" font-size="9">Default: Supervised + workspace-only</text>
-  <text x="695" y="726" text-anchor="middle" fill="#ef4444" font-size="9">Levels: ReadOnly / Supervised / Full</text>
+  <!-- Muninn -->
+  <rect x="660" y="636" width="195" height="68" rx="6" fill="#1a1800" stroke="#ffc107" stroke-width="0.8"/>
+  <text x="757" y="656" text-anchor="middle" fill="#ffc107" font-size="11" font-weight="600">Muninn</text>
+  <text x="757" y="671" text-anchor="middle" fill="#8892b0" font-size="8" font-family="'JetBrains Mono', monospace">REST :8475 · MCP :8750</text>
+  <text x="757" y="685" text-anchor="middle" fill="#8892b0" font-size="7.5">Cognitive memory engine</text>
+  <text x="757" y="697" text-anchor="middle" fill="#8892b0" font-size="7.5">Ebbinghaus decay model</text>
 
-  <!-- Arrow: Agent → Sandbox -->
-  <line x1="695" y1="550" x2="695" y2="570" stroke="#ef4444" stroke-width="2"/>
+  <!-- Router Trace -->
+  <rect x="870" y="636" width="195" height="68" rx="6" fill="#1a1800" stroke="#ffc107" stroke-width="0.8"/>
+  <text x="967" y="656" text-anchor="middle" fill="#ffc107" font-size="11" font-weight="600">Router Trace</text>
+  <text x="967" y="671" text-anchor="middle" fill="#8892b0" font-size="8" font-family="'JetBrains Mono', monospace">SQLite</text>
+  <text x="967" y="685" text-anchor="middle" fill="#8892b0" font-size="7.5">Model routing decisions</text>
+  <text x="967" y="697" text-anchor="middle" fill="#8892b0" font-size="7.5">RL training data</text>
 
-  <rect x="840" y="570" width="240" height="170" rx="10" fill="#1c2333" stroke="#06b6d4" stroke-width="1.5" filter="url(#shadow)"/>
-  <text x="960" y="595" text-anchor="middle" fill="#67e8f9" font-size="13" font-weight="600">Heartbeat &amp; Cron</text>
+  <!-- Storage layer library labels -->
+  <text x="285" y="728" text-anchor="middle" fill="#8892b0" font-size="7.5" font-style="italic">ansible-mesh-core · memory-core · philotic-client</text>
+  <text x="757" y="728" text-anchor="middle" fill="#8892b0" font-size="7.5" font-style="italic">onnx-runner · mlx-runner · philotic-sandbox</text>
 
-  <text x="960" y="620" text-anchor="middle" fill="#22d3ee" font-size="9">HEARTBEAT.md periodic tasks</text>
-  <text x="960" y="640" text-anchor="middle" fill="#22d3ee" font-size="9">Scheduled actions</text>
-  <text x="960" y="660" text-anchor="middle" fill="#22d3ee" font-size="9">Skills loader (TOML manifests)</text>
-  <text x="960" y="680" text-anchor="middle" fill="#22d3ee" font-size="9">50+ integrations registry</text>
-  <text x="960" y="700" text-anchor="middle" fill="#22d3ee" font-size="9">Observability (noop/log/multi)</text>
+  <!-- ═══════════════════════════════════════════ -->
+  <!-- DATA FLOW ARROWS                            -->
+  <!-- ═══════════════════════════════════════════ -->
 
-  <!-- Arrow: Agent → Heartbeat -->
-  <line x1="960" y1="550" x2="960" y2="570" stroke="#06b6d4" stroke-width="2"/>
+  <!-- Operator → Hotel: HTTP/WebSocket (teal dashed) -->
+  <line x1="220" y1="340" x2="248" y2="340" stroke="#1de9b6" stroke-width="2" stroke-dasharray="6,3" marker-end="url(#arrowTeal)"/>
+  <line x1="220" y1="410" x2="248" y2="410" stroke="#1de9b6" stroke-width="2" stroke-dasharray="6,3" marker-end="url(#arrowTeal)"/>
 
-  <!-- ═══════════ BOTTOM: Setup Wizard ═══════════ -->
-  <rect x="20" y="760" width="1060" height="170" rx="10" fill="#1c2333" stroke="#f472b6" stroke-width="1.5" filter="url(#shadow)"/>
-  <text x="550" y="785" text-anchor="middle" fill="#f9a8d4" font-size="14" font-weight="700">Setup Wizard  --  zeroclaw onboard (quick default | --interactive for full wizard)</text>
-  <text x="550" y="802" text-anchor="middle" fill="#7d8590" font-size="10">7 steps, under 60 seconds | Live connection testing | Secure defaults</text>
+  <!-- Hotel ↔ Guests: IPC/UDS (cyan solid) -->
+  <line x1="632" y1="280" x2="676" y2="280" stroke="#00e5ff" stroke-width="2" marker-end="url(#arrowCyan)"/>
+  <line x1="632" y1="350" x2="676" y2="360" stroke="#00e5ff" stroke-width="2" marker-end="url(#arrowCyan)"/>
+  <line x1="632" y1="420" x2="676" y2="420" stroke="#00e5ff" stroke-width="2" marker-end="url(#arrowCyan)"/>
 
-  <!-- Wizard steps: 7 -->
-  <rect x="30" y="815" width="130" height="38" rx="8" fill="#2d1f3d" stroke="#c084fc" stroke-width="1"/>
-  <text x="95" y="831" text-anchor="middle" fill="#e9d5ff" font-size="8" font-weight="600">1. Workspace</text>
-  <text x="95" y="845" text-anchor="middle" fill="#a78bfa" font-size="7">~/.zeroclaw/</text>
+  <!-- Hotel → Storage: SQLite (amber dashed) -->
+  <line x1="340" y1="520" x2="142" y2="634" stroke="#ffc107" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#arrowAmber)"/>
+  <line x1="440" y1="520" x2="357" y2="634" stroke="#ffc107" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#arrowAmber)"/>
+  <line x1="500" y1="520" x2="557" y2="634" stroke="#ffc107" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#arrowAmber)"/>
 
-  <rect x="170" y="815" width="130" height="38" rx="8" fill="#2d1f3d" stroke="#c084fc" stroke-width="1"/>
-  <text x="235" y="831" text-anchor="middle" fill="#e9d5ff" font-size="8" font-weight="600">2. AI Provider</text>
-  <text x="235" y="845" text-anchor="middle" fill="#a78bfa" font-size="7">22+ or custom URL</text>
+  <!-- Guests → Storage: Agent graph + Muninn -->
+  <line x1="773" y1="520" x2="357" y2="634" stroke="#ffc107" stroke-width="1" stroke-dasharray="4,2" marker-end="url(#arrowAmber)"/>
+  <line x1="870" y1="520" x2="757" y2="634" stroke="#ffc107" stroke-width="1" stroke-dasharray="4,2" marker-end="url(#arrowAmber)"/>
+  <line x1="973" y1="520" x2="967" y2="634" stroke="#ffc107" stroke-width="1" stroke-dasharray="4,2" marker-end="url(#arrowAmber)"/>
 
-  <rect x="310" y="815" width="130" height="38" rx="8" fill="#2d1f3d" stroke="#c084fc" stroke-width="1"/>
-  <text x="375" y="831" text-anchor="middle" fill="#e9d5ff" font-size="8" font-weight="600">3. Channels</text>
-  <text x="375" y="845" text-anchor="middle" fill="#a78bfa" font-size="7">7 channels + live test</text>
+  <!-- Hotel ↔ Mesh: UDP/TCP (purple) -->
+  <path d="M350,198 L350,178" stroke="#d500f9" stroke-width="2" marker-end="url(#arrowPurple)"/>
+  <path d="M530,198 L530,178" stroke="#d500f9" stroke-width="2" marker-end="url(#arrowPurple)"/>
 
-  <rect x="450" y="815" width="130" height="38" rx="8" fill="#2d1f3d" stroke="#c084fc" stroke-width="1"/>
-  <text x="515" y="831" text-anchor="middle" fill="#e9d5ff" font-size="8" font-weight="600">4. Tunnel</text>
-  <text x="515" y="845" text-anchor="middle" fill="#a78bfa" font-size="7">5 providers or skip</text>
+  <!-- Guests → External (red dashed, right edge) -->
+  <line x1="1068" y1="320" x2="1090" y2="320" stroke="#ff5252" stroke-width="1.5" stroke-dasharray="4,2" marker-end="url(#arrowRed)"/>
 
-  <rect x="590" y="815" width="130" height="38" rx="8" fill="#2d1f3d" stroke="#c084fc" stroke-width="1"/>
-  <text x="655" y="831" text-anchor="middle" fill="#e9d5ff" font-size="8" font-weight="600">5. Tool Mode</text>
-  <text x="655" y="845" text-anchor="middle" fill="#a78bfa" font-size="7">Sovereign / Composio</text>
+  <!-- ═══════════════════════════════════════════ -->
+  <!-- LEGEND                                      -->
+  <!-- ═══════════════════════════════════════════ -->
+  <rect x="20" y="790" width="1060" height="140" rx="8" fill="#0e1120" stroke="#1e2540" stroke-width="1"/>
 
-  <rect x="730" y="815" width="130" height="38" rx="8" fill="#2d1f3d" stroke="#c084fc" stroke-width="1"/>
-  <text x="795" y="831" text-anchor="middle" fill="#e9d5ff" font-size="8" font-weight="600">6. Personalize</text>
-  <text x="795" y="845" text-anchor="middle" fill="#a78bfa" font-size="7">name, style, timezone</text>
+  <!-- Connection types legend -->
+  <text x="40" y="812" fill="#8892b0" font-size="9" font-weight="700" letter-spacing="1">CONNECTION TYPES</text>
 
-  <rect x="870" y="815" width="130" height="38" rx="8" fill="#2d1f3d" stroke="#c084fc" stroke-width="1"/>
-  <text x="935" y="831" text-anchor="middle" fill="#e9d5ff" font-size="8" font-weight="600">7. Scaffold</text>
-  <text x="935" y="845" text-anchor="middle" fill="#a78bfa" font-size="7">8 workspace MD files</text>
+  <line x1="40" y1="828" x2="80" y2="828" stroke="#00e5ff" stroke-width="2"/>
+  <text x="88" y="832" fill="#8892b0" font-size="8">IPC / Unix Domain Socket (Hotel ↔ Guests)</text>
 
-  <!-- Step arrows -->
-  <line x1="160" y1="834" x2="170" y2="834" stroke="#c084fc" stroke-width="1" marker-end="url(#arrowPurple)"/>
-  <line x1="300" y1="834" x2="310" y2="834" stroke="#c084fc" stroke-width="1" marker-end="url(#arrowPurple)"/>
-  <line x1="440" y1="834" x2="450" y2="834" stroke="#c084fc" stroke-width="1" marker-end="url(#arrowPurple)"/>
-  <line x1="580" y1="834" x2="590" y2="834" stroke="#c084fc" stroke-width="1" marker-end="url(#arrowPurple)"/>
-  <line x1="720" y1="834" x2="730" y2="834" stroke="#c084fc" stroke-width="1" marker-end="url(#arrowPurple)"/>
-  <line x1="860" y1="834" x2="870" y2="834" stroke="#c084fc" stroke-width="1" marker-end="url(#arrowPurple)"/>
+  <line x1="40" y1="848" x2="80" y2="848" stroke="#d500f9" stroke-width="2"/>
+  <text x="88" y="852" fill="#8892b0" font-size="8">UDP Beacon + TCP Execution (Mesh)</text>
 
-  <!-- Wizard output summary -->
-  <text x="550" y="872" text-anchor="middle" fill="#7d8590" font-size="9">Full summary: Provider, Model, Channels, Tunnel, Composio, Secrets, Gateway, Autonomy, Memory</text>
+  <line x1="40" y1="868" x2="80" y2="868" stroke="#1de9b6" stroke-width="2" stroke-dasharray="6,3"/>
+  <text x="88" y="872" fill="#8892b0" font-size="8">HTTP / WebSocket (Operator → Hotel)</text>
 
-  <!-- Ready badge -->
-  <rect x="380" y="888" width="340" height="28" rx="14" fill="#166534" stroke="#4ade80" stroke-width="1"/>
-  <text x="550" y="907" text-anchor="middle" fill="#4ade80" font-size="12" font-weight="600">Ready -- zeroclaw agent</text>
+  <line x1="40" y1="888" x2="80" y2="888" stroke="#ffc107" stroke-width="1.5" stroke-dasharray="6,3"/>
+  <text x="88" y="892" fill="#8892b0" font-size="8">SQLite Read/Write (Storage)</text>
 
-  <!-- Footer stats -->
-  <text x="550" y="942" text-anchor="middle" fill="#7d8590" font-size="10">~3.4MB binary  |  &lt;10ms startup  |  1,050 tests  |  22+ providers  |  8 traits  |  18,900+ lines of Rust  |  0 clippy warnings</text>
+  <line x1="40" y1="908" x2="80" y2="908" stroke="#ff5252" stroke-width="1.5" stroke-dasharray="4,2"/>
+  <text x="88" y="912" fill="#8892b0" font-size="8">External APIs (LLM, Telegram, ElevenLabs)</text>
+
+  <!-- Status legend -->
+  <text x="430" y="812" fill="#8892b0" font-size="9" font-weight="700" letter-spacing="1">STATUS</text>
+
+  <circle cx="440" cy="830" r="4" fill="#00e676"/>
+  <text x="452" y="834" fill="#8892b0" font-size="8">Implemented</text>
+
+  <circle cx="440" cy="850" r="4" fill="#ffc107"/>
+  <text x="452" y="854" fill="#8892b0" font-size="8">In Progress</text>
+
+  <circle cx="440" cy="870" r="4" fill="#4a5370"/>
+  <text x="452" y="874" fill="#8892b0" font-size="8">Planned</text>
+
+  <!-- Crate counts -->
+  <text x="640" y="812" fill="#8892b0" font-size="9" font-weight="700" letter-spacing="1">CRATE BREAKDOWN</text>
+
+  <text x="640" y="832" fill="#00e5ff" font-size="8" font-weight="600">Binaries (8)</text>
+  <text x="740" y="832" fill="#8892b0" font-size="7">aiua · philote · membrane · philotic-web · model-router · tool-runner · graph-runner · agent-graph-runner</text>
+
+  <text x="640" y="852" fill="#00e676" font-size="8" font-weight="600">Libraries (6)</text>
+  <text x="730" y="852" fill="#8892b0" font-size="7">ansible-mesh-core · philotic-client · memory-core · onnx-runner · mlx-runner · philotic-sandbox</text>
+
+  <!-- Key external integrations -->
+  <text x="640" y="878" fill="#8892b0" font-size="9" font-weight="700" letter-spacing="1">EXTERNAL</text>
+  <text x="640" y="898" fill="#ff5252" font-size="8" font-weight="600">APIs</text>
+  <text x="672" y="898" fill="#8892b0" font-size="7.5">Google Gemini · ElevenLabs TTS/STT · Telegram Bot API · Muninn REST + MCP</text>
+
+  <text x="640" y="915" fill="#00e676" font-size="8" font-weight="600">Local</text>
+  <text x="672" y="915" fill="#8892b0" font-size="7.5">ONNX Runtime (embeddings/transcription) · MLX (Apple Silicon inference)</text>
+
 </svg>
