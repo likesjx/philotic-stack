@@ -63,6 +63,14 @@ pub enum EventKind {
     SessionControl,
     /// Portable agent-graph snapshot for LWW mesh synchronisation (Seam 4).
     AgentGraphSync,
+    /// Broadcast by the hotel that fired a guaranteed cron job so that peer
+    /// hotels can suppress their staggered-offset fire for the same epoch.
+    /// Payload: `{ "job_id": "...", "fire_epoch": u64, "fired_by": "node-id" }`.
+    CronFired,
+    /// Broadcast by the hotel that owns a cron job definition so that peer
+    /// hotels replicate it locally and can participate in mesh-coordinated firing.
+    /// Payload: `{ "op": "upsert"|"remove", "job": CronJob|null, "job_id": "..." }`.
+    CronJobSync,
 }
 
 /// The payload definition. Large files must use `BlobRef`.

@@ -38,6 +38,7 @@ mod vault;
 
 mod service;
 use service::blob::BlobService;
+use service::cron_ticker::CronTicker;
 use service::ipc::IpcServer;
 use std::sync::Arc;
 
@@ -601,6 +602,126 @@ fn mesh_targets_for_graph(
         .collect())
 }
 
+/// Handle an inbound `CronFired` broadcast from a peer hotel.
+///
+/// Updates the local `CronJob` record so that this hotel's `CronTicker`
+/// suppresses its staggered-offset fire for the same epoch.
+fn handle_cron_fired_broadcast(graph: &GraphDomain, payload_json: &str) {
+    #[derive(serde::Deserialize)]
+    struct CronFiredPayload {
+        job_id: String,
+        fire_epoch: u64,
+    }
+
+    let parsed: CronFiredPayload = match serde_json::from_str(payload_json) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("handle_cron_fired_broadcast: invalid payload: {e}");
+            return;
+        }
+    };
+
+    match graph.get_cron_job(&parsed.job_id) {
+        Ok(Some(job)) => {
+            // Only update if this epoch is still pending on this hotel.
+            if job.last_fired_epoch == Some(parsed.fire_epoch) {
+                return; // already up-to-date
+            }
+            if job.next_fire_at != parsed.fire_epoch {
+                return; // epoch mismatch — stale or duplicate broadcast
+            }
+            let next = match ansible_mesh_core::cron::next_fire_after(
+                &job.schedule,
+                parsed.fire_epoch,
+            ) {
+                Ok(n) => n,
+                Err(e) => {
+                    warn!(
+                        "handle_cron_fired_broadcast: no next fire for job {}: {e}",
+                        parsed.job_id
+                    );
+                    return;
+                }
+            };
+            let mut updated = job;
+            updated.last_fired_epoch = Some(parsed.fire_epoch);
+            updated.next_fire_at = next;
+            if let Err(e) = graph.upsert_cron_job(&updated) {
+                warn!(
+                    "handle_cron_fired_broadcast: failed to update job {}: {e}",
+                    parsed.job_id
+                );
+            } else {
+                info!(
+                    "CronFired broadcast applied: job={} epoch={}",
+                    parsed.job_id, parsed.fire_epoch
+                );
+            }
+        }
+        Ok(None) => {
+            debug!(
+                "handle_cron_fired_broadcast: job {} not found locally (ok if not registered here)",
+                parsed.job_id
+            );
+        }
+        Err(e) => {
+            warn!(
+                "handle_cron_fired_broadcast: graph lookup failed for job {}: {e}",
+                parsed.job_id
+            );
+        }
+    }
+}
+
+/// Handle an inbound `CronJobSync` broadcast from a peer hotel.
+///
+/// Replicates job definitions locally so this hotel can participate in
+/// guaranteed firing without requiring a shared config file.
+fn handle_cron_job_sync(graph: &GraphDomain, payload_json: &str) {
+    #[derive(serde::Deserialize)]
+    struct CronJobSyncPayload {
+        op: String,
+        job: Option<ansible_mesh_core::cron::CronJob>,
+        job_id: Option<String>,
+    }
+
+    let parsed: CronJobSyncPayload = match serde_json::from_str(payload_json) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("handle_cron_job_sync: invalid payload: {e}");
+            return;
+        }
+    };
+
+    match parsed.op.as_str() {
+        "upsert" => {
+            if let Some(job) = parsed.job {
+                if let Err(e) = graph.upsert_cron_job(&job) {
+                    warn!("handle_cron_job_sync: upsert failed for {}: {e}", job.id);
+                } else {
+                    info!("CronJobSync: replicated upsert for job {}", job.id);
+                }
+            } else {
+                warn!("handle_cron_job_sync: upsert op missing job field");
+            }
+        }
+        "remove" => {
+            if let Some(job_id) = parsed.job_id {
+                if let Err(e) = graph.remove_cron_job(&job_id) {
+                    warn!("handle_cron_job_sync: remove failed for {job_id}: {e}");
+                } else {
+                    info!("CronJobSync: replicated remove for job {job_id}");
+                }
+            } else {
+                warn!("handle_cron_job_sync: remove op missing job_id field");
+            }
+        }
+        other => {
+            warn!("handle_cron_job_sync: unknown op '{other}'");
+        }
+    }
+}
+
 fn mesh_target_addr_for_node(
     graph: &GraphDomain,
     target_node_id: &str,
@@ -778,6 +899,32 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
                                 for event in &events {
                                     IpcServer::deliver_event_envelope(&inbound_inboxes, event)
                                         .await;
+                                    // Cron control-plane broadcasts.
+                                    match &event.kind {
+                                        ansible_mesh_core::event::EventKind::CronFired => {
+                                            if let ansible_mesh_core::event::EventPayload::Inline {
+                                                data,
+                                            } = &event.payload
+                                            {
+                                                handle_cron_fired_broadcast(
+                                                    inbound_graph.as_ref(),
+                                                    data,
+                                                );
+                                            }
+                                        }
+                                        ansible_mesh_core::event::EventKind::CronJobSync => {
+                                            if let ansible_mesh_core::event::EventPayload::Inline {
+                                                data,
+                                            } = &event.payload
+                                            {
+                                                handle_cron_job_sync(
+                                                    inbound_graph.as_ref(),
+                                                    data,
+                                                );
+                                            }
+                                        }
+                                        _ => {}
+                                    }
                                 }
                                 let _ = dispatcher_inbound_tx
                                     .send(LedgerCommand::CommitInboundBatch {
@@ -4555,6 +4702,24 @@ async fn main() -> Result<()> {
             error!("Hotel Front Desk (UDS) failed: {}", e);
         }
     });
+
+    {
+        let cron_offset_ms = std::env::var("PHILOTIC_CRON_OFFSET_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+            * 1000;
+        let cron_ticker = CronTicker::new(
+            graph_domain_arc.clone(),
+            dispatcher_tx.clone(),
+            ipc_inboxes.clone(),
+            caps.node_id.clone(),
+            cron_offset_ms,
+        );
+        tokio::spawn(async move {
+            cron_ticker.run().await;
+        });
+    }
 
     tokio::spawn(run_operator_surface_query_worker(
         hotel.ipc_socket_path.clone(),
