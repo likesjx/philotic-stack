@@ -3,9 +3,10 @@
 //! Covers:
 //! - `SqliteEventStorage` (append, delete, query_unacked)
 //! - `SqliteCursorStorage` (get, advance, anti-regression)
-//! - `SqliteGraphStorage` (node_config, guest CRUD, memory apartment sync)
+//! - `GraphDomain` over `SqliteGraphStorage` (node_config, guest CRUD, memory apartment sync)
 //! - `IpcRequest` / `IpcResponse` serialization round-trips
 
+use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
 use ansible_mesh_core::graph::{
     AbstractSkillRecord, RoleIncarnationRecord, ToolsetProfileRecord, TurnLoopConfig,
@@ -14,11 +15,12 @@ use ansible_mesh_core::sqlite_storage::{
     SqliteCursorStorage, SqliteEventStorage, SqliteGraphStorage,
 };
 use ansible_mesh_core::storage::{
-    CursorStorage, EventStorage, GraphStorage, GuestRecord, HotelRecord, SecretRecord,
+    CursorStorage, EventStorage, GuestRecord, HotelRecord, SecretRecord,
     SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,
     VaultRegistryEntry,
 };
 use ansible_mesh_core::{NodeCapabilities, NodeRole};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -61,8 +63,10 @@ fn open_cursor_storage() -> SqliteCursorStorage {
     SqliteCursorStorage::open(":memory:").expect("open SqliteCursorStorage")
 }
 
-fn open_graph_storage() -> SqliteGraphStorage {
-    SqliteGraphStorage::open(":memory:").expect("open SqliteGraphStorage")
+fn open_graph_domain() -> (SqliteGraphStorage, GraphDomain) {
+    let storage = SqliteGraphStorage::open(":memory:").expect("open SqliteGraphStorage");
+    let domain = GraphDomain::new(Arc::new(storage.adapter()));
+    (storage, domain)
 }
 
 fn sample_session() -> SessionRecord {
