@@ -373,6 +373,39 @@ operator-checklist:
     @echo "  uat-green         (verify-vertical-slice + tier-2 passes)"
     @echo "  watched-live-green (live hotel + telegram confirms end-to-end)"
 
+# Build release binaries and install them into the local Homebrew Cellar.
+# Use this when jane is offline or to update the local phil/aiua without touching jane.
+local-push:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    AIUA_CELLAR=/opt/homebrew/Cellar/aiua/0.1.0-alpha/bin
+    PHIL_CELLAR=/opt/homebrew/Cellar/philotic-web/0.1.0-alpha/bin
+    AIUA_BINS="aiua philote membrane model-router model-controller-gemini model-controller-elevenlabs model-controller-mlx philote-worker tool-runner graph-runner"
+    echo "▶ Building release binaries..."
+    cargo build --release -p aiua -p philote -p membrane -p model-router -p tool-runner -p graph-runner -p philotic-web
+    echo "▶ Installing aiua stack to ${AIUA_CELLAR}..."
+    for bin in $AIUA_BINS; do
+        if [ ! -f "target/release/$bin" ]; then
+            echo "  – $bin (not built, skipping)"
+            continue
+        fi
+        if [ ! -f "${AIUA_CELLAR}/$bin" ]; then
+            echo "  – $bin (not in local Cellar, skipping)"
+            continue
+        fi
+        chmod u+w "${AIUA_CELLAR}/$bin"
+        cp "target/release/$bin" "${AIUA_CELLAR}/$bin"
+        chmod u-w "${AIUA_CELLAR}/$bin"
+        echo "  ✓ $bin"
+    done
+    echo "▶ Installing phil to ${PHIL_CELLAR}..."
+    chmod u+w "${PHIL_CELLAR}/philotic-web" "${PHIL_CELLAR}/phil" 2>/dev/null || true
+    cp target/release/philotic-web "${PHIL_CELLAR}/philotic-web"
+    cp target/release/philotic-web "${PHIL_CELLAR}/phil"
+    chmod u-w "${PHIL_CELLAR}/philotic-web" "${PHIL_CELLAR}/phil"
+    echo "  ✓ phil"
+    echo "✅ Local Homebrew install updated."
+
 # Build release binaries locally (MacBook Air) and push them to mbp-jane via SCP.
 # mbp-jane is a separate machine — it has no repo, only runs Cellar-installed binaries.
 # Stops Jane on mbp-jane, installs, restarts.
