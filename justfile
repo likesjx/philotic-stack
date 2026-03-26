@@ -66,6 +66,23 @@ kill-local-stack:
     @sleep 0.3
     @rm -f /tmp/philotic-*.sock
 
+# Nuclear clear: kill ALL aiua and guest processes (both debug and Homebrew installs),
+# remove all sockets (tmp and profile dirs). Safe to run anytime — use when FD exhaustion
+# or stale processes are suspected, or before a clean restart of any hotel.
+clear-aiua:
+    @echo "Clearing all aiua processes and sockets…"
+    @pkill -KILL -f "aiua" 2>/dev/null || true
+    @pkill -KILL -f "membrane" 2>/dev/null || true
+    @pkill -KILL -f "philote" 2>/dev/null || true
+    @pkill -KILL -f "model-router" 2>/dev/null || true
+    @pkill -KILL -f "tool-runner" 2>/dev/null || true
+    @pkill -KILL -f "graph-runner" 2>/dev/null || true
+    @pkill -KILL -f "agent-graph-runner" 2>/dev/null || true
+    @sleep 0.5
+    @rm -f /tmp/philotic-*.sock
+    @find "${HOME}/.philotic" -name "*.sock" -delete 2>/dev/null || true
+    @echo "Done. All aiua processes and sockets cleared."
+
 # Rebuild first, then kill stale local runtime processes/sockets, then start one hotel cleanly.
 start-aiua-clean hotel:
     just build-runtime

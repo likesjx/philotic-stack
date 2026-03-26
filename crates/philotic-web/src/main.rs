@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 mod component;
+mod flush;
 mod footprint;
 mod init;
 mod load;
@@ -97,9 +98,19 @@ enum Command {
 
     /// Show all running philotic processes, sockets, and PID files
     Footprint {
-        /// Kill matched processes (* or 'all' to kill everything, or a name pattern e.g. 'membrane')
+        /// Kill matched processes (* or 'all' to SIGKILL everything, or a name pattern e.g. 'membrane')
         #[arg(long)]
         kill: Option<String>,
+    },
+
+    /// Kill ALL philotic processes (SIGKILL) and wipe all sockets, then optionally restart a hotel.
+    ///
+    /// Use this when abandoned processes are exhausting file descriptors (OS error 24).
+    /// Equivalent to `just clear-aiua` but restarts the hotel afterward if --restart is given.
+    Flush {
+        /// Hotel to restart after flushing (omit to flush only)
+        #[arg(long)]
+        restart: Option<String>,
     },
 
     /// Manage registered components (model controllers, tool runners, etc.)
@@ -185,6 +196,7 @@ async fn main() -> Result<()> {
             ServiceAction::Status { hotel } => service::status(hotel).await,
         },
         Command::Footprint { kill } => footprint::run(kill).await,
+        Command::Flush { restart } => flush::run(restart).await,
         Command::Component { action } => match action {
             ComponentAction::Add { manifest } => component::add(manifest).await,
             ComponentAction::List => component::list().await,
