@@ -59,6 +59,7 @@ use tokio::sync::{broadcast, watch, Mutex};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use philotic_client::{
+    CronJob, CronJobSource,
     DesktopMembraneAgentView, DesktopMembraneGuestView, DesktopMembraneStatusView,
     GuestIdentity, IpcRequest, IpcResponse, LeaseEnvelope,
     OperatorTargetAgentInventoryView, OperatorTargetGuestInventoryView,
@@ -176,6 +177,10 @@ pub async fn run(
         .route("/api/components/:guest_id/restart", post(handle_component_restart))
         .route("/api/graphs", get(handle_graphs))
         .route("/api/graphs/:graph_id", get(handle_graph_detail))
+        .route("/api/cron", get(handle_cron_list).post(handle_cron_create))
+        .route("/api/cron/:job_id", delete(handle_cron_delete))
+        .route("/api/cron/:job_id/enable",  post(handle_cron_enable))
+        .route("/api/cron/:job_id/disable", post(handle_cron_disable))
         .route("/api/secrets", get(handle_secrets))
         .route("/api/secrets/rotate", post(handle_secret_rotate))
         .route("/api/vault", post(handle_vault_add))
@@ -1187,6 +1192,110 @@ async fn handle_toolsets(headers: HeaderMap, State(state): State<AppState>) -> R
     }
 }
 
+// ── Cron endpoints ────────────────────────────────────────────────────────────
+
+async fn handle_cron_list(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if !check_auth(&headers, &state) { return unauthorized(); }
+    match ipc_list_cron_jobs(&state.socket).await {
+        Ok(jobs) => Json(jobs).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CreateCronBody {
+    schedule: String,
+    target_role: String,
+    payload: String,
+    #[serde(default)]
+    target_node_id: Option<String>,
+    #[serde(default)]
+    guaranteed: bool,
+    #[serde(default)]
+    enabled: bool,
+}
+
+async fn handle_cron_create(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(body): Json<CreateCronBody>,
+) -> Response {
+    if !check_auth(&headers, &state) { return unauthorized(); }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let job = CronJob {
+        id: uuid::Uuid::new_v4().to_string(),
+        schedule: body.schedule,
+        target_role: body.target_role,
+        target_node_id: body.target_node_id,
+        payload: body.payload,
+        guaranteed: body.guaranteed,
+        enabled: body.enabled,
+        last_fired_epoch: None,
+        next_fire_at: now_ms,
+        created_at: now_ms,
+        created_by: CronJobSource::Operator,
+    };
+    match ipc_register_cron_job(&state.socket, job.clone()).await {
+        Ok(()) => {
+            let event = json!({ "type": "cron:created", "payload": { "job_id": job.id } });
+            let _ = state.tx.send(event.to_string());
+            Json(json!({"ok": true, "job_id": job.id})).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+async fn handle_cron_delete(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+) -> Response {
+    if !check_auth(&headers, &state) { return unauthorized(); }
+    match ipc_remove_cron_job(&state.socket, &job_id).await {
+        Ok(()) => {
+            let event = json!({ "type": "cron:deleted", "payload": { "job_id": job_id } });
+            let _ = state.tx.send(event.to_string());
+            Json(json!({"ok": true})).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+async fn handle_cron_enable(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+) -> Response {
+    if !check_auth(&headers, &state) { return unauthorized(); }
+    match ipc_set_cron_enabled(&state.socket, &job_id, true).await {
+        Ok(()) => {
+            let event = json!({ "type": "cron:updated", "payload": { "job_id": job_id, "enabled": true } });
+            let _ = state.tx.send(event.to_string());
+            Json(json!({"ok": true})).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+async fn handle_cron_disable(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+) -> Response {
+    if !check_auth(&headers, &state) { return unauthorized(); }
+    match ipc_set_cron_enabled(&state.socket, &job_id, false).await {
+        Ok(()) => {
+            let event = json!({ "type": "cron:updated", "payload": { "job_id": job_id, "enabled": false } });
+            let _ = state.tx.send(event.to_string());
+            Json(json!({"ok": true})).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
 // ── GET /api/config ───────────────────────────────────────────────────────────
 
 async fn handle_config(headers: HeaderMap, State(state): State<AppState>) -> Response {
@@ -1931,6 +2040,56 @@ async fn ipc_list_toolset_profiles(socket: &str) -> Result<Vec<Value>> {
         }
         IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected toolset_profiles response: {other:?}")),
+    }
+}
+
+async fn ipc_list_cron_jobs(socket: &str) -> Result<Vec<Value>> {
+    let mut client = connect_management_client(socket, "philotic-web-cron").await?;
+    match client.send_request(IpcRequest::ListCronJobs).await? {
+        IpcResponse::CronJobList { jobs } => Ok(jobs
+            .into_iter()
+            .map(|j| serde_json::to_value(j).unwrap_or(serde_json::Value::Null))
+            .collect()),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected cron list response: {other:?}")),
+    }
+}
+
+async fn ipc_register_cron_job(socket: &str, job: CronJob) -> Result<()> {
+    let mut client = connect_management_client(socket, "philotic-web-cron").await?;
+    match client.send_request(IpcRequest::RegisterCronJob { job }).await? {
+        IpcResponse::Standard { ok: true, .. } => Ok(()),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        IpcResponse::Error(msg) => Err(anyhow!(msg)),
+        other => Err(anyhow!("unexpected register_cron response: {other:?}")),
+    }
+}
+
+async fn ipc_remove_cron_job(socket: &str, job_id: &str) -> Result<()> {
+    let mut client = connect_management_client(socket, "philotic-web-cron").await?;
+    match client
+        .send_request(IpcRequest::RemoveCronJob { job_id: job_id.to_string() })
+        .await?
+    {
+        IpcResponse::Standard { ok: true, .. } => Ok(()),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        IpcResponse::Error(msg) => Err(anyhow!(msg)),
+        other => Err(anyhow!("unexpected remove_cron response: {other:?}")),
+    }
+}
+
+async fn ipc_set_cron_enabled(socket: &str, job_id: &str, enabled: bool) -> Result<()> {
+    let req = if enabled {
+        IpcRequest::EnableCronJob { job_id: job_id.to_string() }
+    } else {
+        IpcRequest::DisableCronJob { job_id: job_id.to_string() }
+    };
+    let mut client = connect_management_client(socket, "philotic-web-cron").await?;
+    match client.send_request(req).await? {
+        IpcResponse::Standard { ok: true, .. } => Ok(()),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        IpcResponse::Error(msg) => Err(anyhow!(msg)),
+        other => Err(anyhow!("unexpected cron enable/disable response: {other:?}")),
     }
 }
 
