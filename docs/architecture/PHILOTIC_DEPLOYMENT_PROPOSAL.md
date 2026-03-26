@@ -2,8 +2,8 @@
 title: "Philotic Deployment and Environment Model"
 doc_type: proposal
 domain: deployment-distribution
-status: proposed
-last_updated: 2026-03-17
+status: accepted-current-slice
+last_updated: 2026-03-26
 tags:
   - deployment
   - environments
@@ -23,7 +23,7 @@ implemented_by: []
 active_seams:
   - philotic-profile-namespacing
   - mbp-jane-launchd-hardening
-  - phil-service-subcommands
+  - philotic-web-service-subcommands
 source_of_truth_targets:
   - ARCHITECTURE_STATUS.md
 ---
@@ -32,7 +32,7 @@ source_of_truth_targets:
 
 ## Goal
 
-Define the three-environment model for Philotic, establish `PHILOTIC_PROFILE` as the isolation primitive, root MBP-Jane as a permanent always-on edge production node via launchd, and give `phil` ownership of service lifecycle management.
+Define the three-environment model for Philotic, establish `PHILOTIC_PROFILE` as the isolation primitive, root MBP-Jane as a permanent always-on edge production node via launchd, and give `philotic-web` ownership of service lifecycle management.
 
 ## Core Recommendation
 
@@ -40,7 +40,7 @@ Treat environment isolation as a path-namespacing problem solved once by `PHILOT
 
 ## Disposition
 
-`proposed` — decisions settled in planning; implementation not yet started.
+`accepted for current slice`
 
 ## Current Slice
 
@@ -64,7 +64,7 @@ MBP-Jane is never razed. Ground-zero testing is never done on MBP-Jane. VPS is a
 
 ## 2. `PHILOTIC_PROFILE` — The Isolation Primitive
 
-`PHILOTIC_PROFILE` is an environment variable that drives all path derivation in `aiua`, `phil`, and related tooling. Every runtime path is namespaced under `~/.philotic/<profile>/`.
+`PHILOTIC_PROFILE` is an environment variable that drives all path derivation in `aiua`, `philotic-web`, and related tooling. Every runtime path is namespaced under `~/.philotic/<profile>/`.
 
 ### 2.1 Directory Layout
 
@@ -149,18 +149,18 @@ All of Jane's state lives here: context graph, vault, OAuth tokens, socket. Not 
 
 ## 4. `phil service` — Service Lifecycle Ownership
 
-`phil` (the `philotic-web` CLI, operator control plane for the Philotic Web mesh) owns launchd service management via a `service` subcommand family.
+`philotic-web` (the, operator control plane for the Philotic Web mesh) owns launchd service management via a `service` subcommand family.
 
 ### 4.1 Subcommands
 
 | Command | Action |
 |---|---|
-| `phil service install [--profile <name>]` | Generate and load the launchd plist for the given profile |
-| `phil service uninstall [--profile <name>]` | Unload and remove the plist |
-| `phil service start [--profile <name>]` | `launchctl start` |
-| `phil service stop [--profile <name>]` | `launchctl stop` |
-| `phil service restart [--profile <name>]` | stop + start |
-| `phil service status [--profile <name>]` | Show launchd state, PID, last exit |
+| `philotic-web service install [--profile <name>]` | Generate and load the launchd plist for the given profile |
+| `philotic-web service uninstall [--profile <name>]` | Unload and remove the plist |
+| `philotic-web service start [--profile <name>]` | `launchctl start` |
+| `philotic-web service stop [--profile <name>]` | `launchctl stop` |
+| `philotic-web service restart [--profile <name>]` | stop + start |
+| `philotic-web service status [--profile <name>]` | Show launchd state, PID, last exit |
 
 `--profile` defaults to `PHILOTIC_PROFILE` from the environment if not specified.
 
