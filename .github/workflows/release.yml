@@ -10,6 +10,11 @@ name: Release
 #   stable:     build → GitHub Release → bump Homebrew tap
 #   pre-release: build → GitHub Release (marked pre-release) → tap unchanged
 #
+# Targets (6):
+#   macOS:   aarch64-apple-darwin, x86_64-apple-darwin
+#   Linux:   aarch64-unknown-linux-gnu, x86_64-unknown-linux-gnu
+#   Windows: aarch64-pc-windows-msvc, x86_64-pc-windows-msvc
+#
 # Prerequisites (one-time setup):
 #   - Create a GitHub PAT with `repo` scope on likesjx/homebrew-philotic
 #   - Add it as a secret named TAP_GITHUB_TOKEN on this repo
@@ -71,24 +76,47 @@ jobs:
 
   # ── Build native binaries ────────────────────────────────────────────────────
   build:
-    name: Build ${{ matrix.target }}
+    name: Build ${{ matrix.artifact }}
     needs: validate-branch
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
+          # ── macOS ──
           - target: aarch64-apple-darwin
             runner: macos-14
             artifact: darwin-arm64
+            os: macos
           - target: x86_64-apple-darwin
             runner: macos-13
             artifact: darwin-x86_64
+            os: macos
+          # ── Linux ──
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            artifact: linux-arm64
+            os: linux
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            artifact: linux-x86_64
+            os: linux
+          # ── Windows ──
+          - target: aarch64-pc-windows-msvc
+            runner: windows-latest
+            artifact: windows-arm64
+            os: windows
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            artifact: windows-x86_64
+            os: windows
 
     steps:
       - uses: actions/checkout@v4
 
+      # Desktop UI is macOS-only (embedded in philotic-web serve)
       - name: Checkout jaredlikes-desktop (for embedded UI)
+        if: matrix.os == 'macos'
         uses: actions/checkout@v4
         with:
           repository: likesjx/jaredlikes-desktop
@@ -96,10 +124,21 @@ jobs:
           path: jaredlikes-desktop
 
       - name: Build desktop UI
+        if: matrix.os == 'macos'
         run: |
           cd jaredlikes-desktop
           npm ci
           npm run build
+
+      # Cross-compilation tools for Linux ARM64
+      - name: Install cross-compilation tools (Linux ARM64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++" >> $GITHUB_ENV
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -118,14 +157,16 @@ jobs:
 
       - name: Build binaries
         env:
-          PHILOTIC_DESKTOP_DIR: ${{ github.workspace }}/jaredlikes-desktop
+          PHILOTIC_DESKTOP_DIR: ${{ matrix.os == 'macos' && format('{0}/jaredlikes-desktop', github.workspace) || '' }}
+        shell: bash
         run: |
           cargo build --release --target ${{ matrix.target }} \
             -p philotic-web \
             -p aiua \
             -p philote \
             -p membrane \
-            -p model-router
+            -p model-router \
+            -p tool-runner
 
       - name: Package binaries
         shell: bash
@@ -134,19 +175,44 @@ jobs:
           STAGING="philotic-${TAG}-${{ matrix.artifact }}"
           mkdir -p "$STAGING"
 
-          for bin in philotic-web aiua philote membrane model-router; do
-            SRC="target/${{ matrix.target }}/release/$bin"
+          EXT=""
+          if [[ "${{ matrix.os }}" == "windows" ]]; then
+            EXT=".exe"
+          fi
+
+          for bin in philotic-web aiua philote membrane model-router tool-runner; do
+            SRC="target/${{ matrix.target }}/release/${bin}${EXT}"
             if [ -f "$SRC" ]; then
-              cp "$SRC" "$STAGING/${bin}-${{ matrix.artifact }}"
-              shasum -a 256 "$STAGING/${bin}-${{ matrix.artifact }}" >> "$STAGING/SHA256SUMS"
+              cp "$SRC" "$STAGING/${bin}-${{ matrix.artifact }}${EXT}"
             fi
           done
 
           [ -f mesh-config.example.json ] && cp mesh-config.example.json "$STAGING/"
 
-          tar czf "$STAGING.tar.gz" "$STAGING"
-          sha256sum "$STAGING.tar.gz" > "$STAGING.tar.gz.sha256" 2>/dev/null || \
-            shasum -a 256 "$STAGING.tar.gz" > "$STAGING.tar.gz.sha256"
+          # Generate checksums
+          cd "$STAGING"
+          if command -v sha256sum &> /dev/null; then
+            sha256sum * > SHA256SUMS
+          else
+            shasum -a 256 * > SHA256SUMS
+          fi
+          cd ..
+
+          if [[ "${{ matrix.os }}" == "windows" ]]; then
+            7z a "$STAGING.zip" "$STAGING"
+            if command -v sha256sum &> /dev/null; then
+              sha256sum "$STAGING.zip" > "$STAGING.zip.sha256"
+            else
+              shasum -a 256 "$STAGING.zip" > "$STAGING.zip.sha256"
+            fi
+          else
+            tar czf "$STAGING.tar.gz" "$STAGING"
+            if command -v sha256sum &> /dev/null; then
+              sha256sum "$STAGING.tar.gz" > "$STAGING.tar.gz.sha256"
+            else
+              shasum -a 256 "$STAGING.tar.gz" > "$STAGING.tar.gz.sha256"
+            fi
+          fi
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
@@ -155,6 +221,8 @@ jobs:
           path: |
             philotic-${{ github.ref_name }}-${{ matrix.artifact }}.tar.gz
             philotic-${{ github.ref_name }}-${{ matrix.artifact }}.tar.gz.sha256
+            philotic-${{ github.ref_name }}-${{ matrix.artifact }}.zip
+            philotic-${{ github.ref_name }}-${{ matrix.artifact }}.zip.sha256
 
   # ── Create GitHub Release ────────────────────────────────────────────────────
   release:
@@ -202,10 +270,10 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           mkdir -p release-assets
           cp "philotic-stack-$VERSION.tar.gz" release-assets/
-          find artifacts -name "*.tar.gz" -o -name "*.sha256" | \
+          find artifacts -name "*.tar.gz" -o -name "*.sha256" -o -name "*.zip" | \
             xargs -I{} cp {} release-assets/
 
-      - name: Extract binary sha256s for tap
+      - name: Extract binary sha256s for Homebrew tap
         id: binary_sha256
         run: |
           TAG="${GITHUB_REF_NAME}"
