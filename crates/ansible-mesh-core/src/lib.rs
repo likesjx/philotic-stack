@@ -3,6 +3,7 @@ use uuid::Uuid;
 
 pub mod adapter;
 pub mod agent;
+pub mod cron;
 pub mod agent_graph_storage;
 pub mod authz;
 pub mod beacon;

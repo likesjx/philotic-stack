@@ -4364,6 +4364,54 @@ impl IpcServer {
                 }
                 IpcResponse::success("seed_remote_incarnation", None)
             }
+            // ── Cron scheduler ──────────────────────────────────────────────
+            IpcRequest::RegisterCronJob { job } => {
+                info!("RegisterCronJob: id={} role={}", job.id, job.target_role);
+                match graph.upsert_cron_job(&job) {
+                    Ok(_) => IpcResponse::success(
+                        "register_cron_job",
+                        Some(serde_json::json!({ "job_id": job.id })),
+                    ),
+                    Err(e) => IpcResponse::Error(format!("RegisterCronJob failed: {e}")),
+                }
+            }
+            IpcRequest::RemoveCronJob { job_id } => {
+                info!("RemoveCronJob: id={}", job_id);
+                match graph.remove_cron_job(&job_id) {
+                    Ok(_) => IpcResponse::success("remove_cron_job", None),
+                    Err(e) => IpcResponse::Error(format!("RemoveCronJob failed: {e}")),
+                }
+            }
+            IpcRequest::ListCronJobs => match graph.list_cron_jobs() {
+                Ok(jobs) => IpcResponse::CronJobList { jobs },
+                Err(e) => IpcResponse::Error(format!("ListCronJobs failed: {e}")),
+            },
+            IpcRequest::EnableCronJob { job_id } => {
+                match graph.get_cron_job(&job_id) {
+                    Ok(Some(mut job)) => {
+                        job.enabled = true;
+                        match graph.upsert_cron_job(&job) {
+                            Ok(_) => IpcResponse::success("enable_cron_job", None),
+                            Err(e) => IpcResponse::Error(format!("EnableCronJob failed: {e}")),
+                        }
+                    }
+                    Ok(None) => IpcResponse::Error(format!("cron job not found: {job_id}")),
+                    Err(e) => IpcResponse::Error(format!("EnableCronJob failed: {e}")),
+                }
+            }
+            IpcRequest::DisableCronJob { job_id } => {
+                match graph.get_cron_job(&job_id) {
+                    Ok(Some(mut job)) => {
+                        job.enabled = false;
+                        match graph.upsert_cron_job(&job) {
+                            Ok(_) => IpcResponse::success("disable_cron_job", None),
+                            Err(e) => IpcResponse::Error(format!("DisableCronJob failed: {e}")),
+                        }
+                    }
+                    Ok(None) => IpcResponse::Error(format!("cron job not found: {job_id}")),
+                    Err(e) => IpcResponse::Error(format!("DisableCronJob failed: {e}")),
+                }
+            }
         }
     }
 

@@ -38,6 +38,7 @@ mod vault;
 
 mod service;
 use service::blob::BlobService;
+use service::cron_ticker::CronTicker;
 use service::ipc::IpcServer;
 use std::sync::Arc;
 
@@ -4555,6 +4556,18 @@ async fn main() -> Result<()> {
             error!("Hotel Front Desk (UDS) failed: {}", e);
         }
     });
+
+    {
+        let cron_ticker = CronTicker::new(
+            graph_domain_arc.clone(),
+            dispatcher_tx.clone(),
+            ipc_inboxes.clone(),
+            caps.node_id.clone(),
+        );
+        tokio::spawn(async move {
+            cron_ticker.run().await;
+        });
+    }
 
     tokio::spawn(run_operator_surface_query_worker(
         hotel.ipc_socket_path.clone(),
