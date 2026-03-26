@@ -13,6 +13,7 @@
 //! `"abstract_tool:bash.exec"`, `"rule:rule-001"`. This keeps keys globally
 //! unique within a store and makes kind-scoped lookups fast.
 
+use crate::cron::CronJob;
 use crate::graph::{
     AbstractSkillRecord, AbstractToolRecord, GraphNode, RoleIncarnationRecord, RuleRecord,
     ToolsetProfileRecord, WorkflowSkillRecord,
@@ -52,6 +53,7 @@ pub const NODE_KIND_TOOLSET_PROFILE: &str = "toolset_profile";
 pub const NODE_KIND_NODE_CAPABILITIES: &str = "node_capabilities";
 pub const NODE_KIND_CONFIG: &str = "config";
 pub const NODE_KIND_APARTMENT: &str = "apartment";
+pub const NODE_KIND_CRON_JOB: &str = "cron_job";
 
 // ── GraphDomain ───────────────────────────────────────────────────────────────
 
@@ -861,6 +863,65 @@ impl GraphDomain {
             None => Ok(None),
             Some(node) => Ok(node.data.get("content").cloned()),
         }
+    }
+
+    // ── Cron job methods ──────────────────────────────────────────────────────
+
+    fn cron_job_key(id: &str) -> String {
+        format!("{}:{}", NODE_KIND_CRON_JOB, id)
+    }
+
+    /// Upsert a cron job record as a graph node.
+    pub fn upsert_cron_job(&self, job: &CronJob) -> Result<()> {
+        let data =
+            serde_json::to_value(job).context("GraphDomain::upsert_cron_job: serialize CronJob")?;
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::cron_job_key(&job.id),
+            kind: NODE_KIND_CRON_JOB.to_string(),
+            label: Some(job.target_role.clone()),
+            data,
+        })
+    }
+
+    /// Load a cron job by id.
+    pub fn get_cron_job(&self, id: &str) -> Result<Option<CronJob>> {
+        match self.adapter.get_node(&Self::cron_job_key(id))? {
+            None => Ok(None),
+            Some(node) => {
+                let job = serde_json::from_value(node.data)
+                    .context("GraphDomain::get_cron_job: deserialize CronJob")?;
+                Ok(Some(job))
+            }
+        }
+    }
+
+    /// Remove a cron job by id. No-op if not present.
+    pub fn remove_cron_job(&self, id: &str) -> Result<()> {
+        self.adapter.delete_node(&Self::cron_job_key(id))
+    }
+
+    /// List all cron job records.
+    pub fn list_cron_jobs(&self) -> Result<Vec<CronJob>> {
+        self.adapter
+            .list_nodes_by_kind(NODE_KIND_CRON_JOB)?
+            .into_iter()
+            .map(|n| {
+                serde_json::from_value(n.data)
+                    .context("GraphDomain::list_cron_jobs: deserialize CronJob")
+            })
+            .collect()
+    }
+
+    /// List cron jobs that are due to fire.
+    ///
+    /// Returns all jobs where `enabled = true` AND
+    /// `next_fire_at + offset_ms <= now_ms`.
+    pub fn list_due_cron_jobs(&self, now_ms: u64, offset_ms: u64) -> Result<Vec<CronJob>> {
+        Ok(self
+            .list_cron_jobs()?
+            .into_iter()
+            .filter(|j| j.enabled && j.next_fire_at.saturating_add(offset_ms) <= now_ms)
+            .collect())
     }
 }
 

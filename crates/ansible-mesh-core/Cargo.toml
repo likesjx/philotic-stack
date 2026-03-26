@@ -19,6 +19,8 @@ sha2 = "0.10"
 log = "0.4"
 tracing = "0.1"
 rusqlite = { version = "0.37", features = ["bundled"] }
+cron = "0.12"
+chrono = { version = "0.4", features = ["clock"] }
 
 [dev-dependencies]
 philotic-client = { path = "../philotic-client" }

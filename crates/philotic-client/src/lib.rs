@@ -3,6 +3,7 @@ pub use ansible_mesh_core::resources::{
     ResourceDenied, ResourceGranted, ResourceMaterializing, ResourceReleased, ResourceRequest,
     ResourceRevoked, ResourceType,
 };
+pub use ansible_mesh_core::cron::{CronJob, CronJobId, CronJobSource};
 pub use ansible_mesh_core::storage::ComponentManifest;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -892,6 +893,31 @@ pub enum IpcRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         socket_path: Option<String>,
     },
+    // ── Cron scheduler IPC ───────────────────────────────────────────────────
+    /// Register (or update) a cron job with the hotel.
+    ///
+    /// The hotel stores the job in the Context Graph and the `CronTicker`
+    /// will begin firing it on schedule.  Responds with
+    /// [`IpcResponse::Standard`] (ok=true) on success.
+    RegisterCronJob {
+        job: CronJob,
+    },
+    /// Remove a cron job by id. No-op if not present.
+    RemoveCronJob {
+        job_id: CronJobId,
+    },
+    /// List all cron jobs registered with this hotel.
+    ///
+    /// Responds with [`IpcResponse::CronJobList`].
+    ListCronJobs,
+    /// Enable a previously disabled cron job.
+    EnableCronJob {
+        job_id: CronJobId,
+    },
+    /// Disable a cron job without removing it.
+    DisableCronJob {
+        job_id: CronJobId,
+    },
 }
 
 /// Represents the canonical response from the local Ansible back to the Guest via IPC.
@@ -1076,6 +1102,10 @@ pub enum IpcResponse {
     /// Response to [`IpcRequest::ListGraphInstances`].
     GraphInstanceList {
         instances: Vec<serde_json::Value>,
+    },
+    /// Response to [`IpcRequest::ListCronJobs`].
+    CronJobList {
+        jobs: Vec<CronJob>,
     },
     /// Response to [`IpcRequest::FetchMemoryConfig`].
     /// `config_json` is `None` if MuninnDB is not configured on this hotel.

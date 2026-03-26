@@ -1,28 +1,49 @@
 /// Ollama-compatible HTTP sidecar for the ONNX provider.
 ///
-/// Exposes embedding inference directly over HTTP so clients that speak the
-/// Ollama API (Muninn, vector stores, tooling) can use local ONNX models
-/// without going through the IPC routing plane.
+/// Exposes embedding and transcription inference directly over HTTP so clients
+/// that speak the Ollama API (Muninn, vector stores, tooling) can use local
+/// ONNX models without going through the IPC routing plane.
 ///
 /// Port: 11435 (leaves Ollama's 11434 free for optional proxy fallback).
 use anyhow::Result;
-use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::post};
-use onnx_runner::{EmbeddingsBackend, ModelCache};
+use axum::{
+    body::Bytes,
+    extract::State,
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
+use onnx_runner::{EmbeddingsBackend, ModelCache, WhisperBackend};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info};
 
+// ── State ─────────────────────────────────────────────────────────────────────
+
 #[derive(Clone)]
 pub struct SidecarState {
     embeddings: Arc<RwLock<Option<EmbeddingsBackend>>>,
+    whisper: Arc<RwLock<Option<WhisperBackend>>>,
 }
 
 impl SidecarState {
-    pub fn new(embeddings: Arc<RwLock<Option<EmbeddingsBackend>>>) -> Self {
-        Self { embeddings }
+    pub fn new(
+        embeddings: Arc<RwLock<Option<EmbeddingsBackend>>>,
+        whisper: Arc<RwLock<Option<WhisperBackend>>>,
+    ) -> Self {
+        Self { embeddings, whisper }
     }
 }
+
+// ── /api/health ───────────────────────────────────────────────────────────────
+
+async fn health() -> impl IntoResponse {
+    Json(serde_json::json!({"status": "ok"}))
+}
+
+// ── /api/embeddings ───────────────────────────────────────────────────────────
 
 /// Ollama `POST /api/embeddings` request body.
 #[derive(Debug, Deserialize)]
@@ -70,9 +91,75 @@ async fn embed(
     }
 }
 
+// ── /api/transcribe ───────────────────────────────────────────────────────────
+
+/// `POST /api/transcribe` response body.
+#[derive(Debug, Serialize)]
+pub struct TranscribeResponse {
+    pub text: String,
+    /// Model generation provenance token.
+    pub model_gen: String,
+}
+
+/// Accept raw WAV bytes in the request body (Content-Type: audio/wav or
+/// application/octet-stream).  Returns the transcript as JSON.
+async fn transcribe(
+    State(state): State<SidecarState>,
+    body: Bytes,
+) -> impl IntoResponse {
+    let guard = state.whisper.read().await;
+    let Some(backend) = guard.as_ref() else {
+        error!("sidecar: Whisper backend not loaded");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Whisper backend not loaded"})),
+        )
+            .into_response();
+    };
+
+    // Run in a blocking task to avoid stalling the async executor.
+    let backend_ptr = backend as *const WhisperBackend as usize;
+    let wav_bytes = body.to_vec();
+
+    let result = tokio::task::spawn_blocking(move || {
+        // SAFETY: the RwLock read guard is held for the duration of this block.
+        let backend = unsafe { &*(backend_ptr as *const WhisperBackend) };
+        backend.transcribe(&wav_bytes)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(output)) => Json(TranscribeResponse {
+            text: output.text,
+            model_gen: output.model_gen,
+        })
+        .into_response(),
+        Ok(Err(err)) => {
+            error!(%err, "sidecar: Whisper transcription failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": err.to_string()})),
+            )
+                .into_response()
+        }
+        Err(panic) => {
+            error!(?panic, "sidecar: Whisper blocking task panicked");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+// ── Router & runner ───────────────────────────────────────────────────────────
+
 pub fn router(state: SidecarState) -> Router {
     Router::new()
+        .route("/api/health", get(health))
         .route("/api/embeddings", post(embed))
+        .route("/api/transcribe", post(transcribe))
         .with_state(state)
 }
 
@@ -80,8 +167,9 @@ pub fn router(state: SidecarState) -> Router {
 pub async fn run_sidecar(
     addr: &str,
     embeddings: Arc<RwLock<Option<EmbeddingsBackend>>>,
+    whisper: Arc<RwLock<Option<WhisperBackend>>>,
 ) -> Result<()> {
-    let state = SidecarState::new(embeddings);
+    let state = SidecarState::new(embeddings, whisper);
     let app = router(state);
 
     let listener = tokio::net::TcpListener::bind(addr)

@@ -4459,7 +4459,138 @@ impl IpcServer {
                 }
                 IpcResponse::success("seed_remote_incarnation", None)
             }
+            // ── Cron scheduler ──────────────────────────────────────────────
+            IpcRequest::RegisterCronJob { job } => {
+                info!("RegisterCronJob: id={} role={}", job.id, job.target_role);
+                match graph.upsert_cron_job(&job) {
+                    Ok(_) => {
+                        Self::broadcast_cron_sync_upsert(dispatcher_tx, local_node_id, &job).await;
+                        IpcResponse::success(
+                            "register_cron_job",
+                            Some(serde_json::json!({ "job_id": job.id })),
+                        )
+                    }
+                    Err(e) => IpcResponse::Error(format!("RegisterCronJob failed: {e}")),
+                }
+            }
+            IpcRequest::RemoveCronJob { job_id } => {
+                info!("RemoveCronJob: id={}", job_id);
+                match graph.remove_cron_job(&job_id) {
+                    Ok(_) => {
+                        Self::broadcast_cron_sync_remove(dispatcher_tx, local_node_id, &job_id)
+                            .await;
+                        IpcResponse::success("remove_cron_job", None)
+                    }
+                    Err(e) => IpcResponse::Error(format!("RemoveCronJob failed: {e}")),
+                }
+            }
+            IpcRequest::ListCronJobs => match graph.list_cron_jobs() {
+                Ok(jobs) => IpcResponse::CronJobList { jobs },
+                Err(e) => IpcResponse::Error(format!("ListCronJobs failed: {e}")),
+            },
+            IpcRequest::EnableCronJob { job_id } => {
+                match graph.get_cron_job(&job_id) {
+                    Ok(Some(mut job)) => {
+                        job.enabled = true;
+                        match graph.upsert_cron_job(&job) {
+                            Ok(_) => {
+                                Self::broadcast_cron_sync_upsert(
+                                    dispatcher_tx,
+                                    local_node_id,
+                                    &job,
+                                )
+                                .await;
+                                IpcResponse::success("enable_cron_job", None)
+                            }
+                            Err(e) => IpcResponse::Error(format!("EnableCronJob failed: {e}")),
+                        }
+                    }
+                    Ok(None) => IpcResponse::Error(format!("cron job not found: {job_id}")),
+                    Err(e) => IpcResponse::Error(format!("EnableCronJob failed: {e}")),
+                }
+            }
+            IpcRequest::DisableCronJob { job_id } => {
+                match graph.get_cron_job(&job_id) {
+                    Ok(Some(mut job)) => {
+                        job.enabled = false;
+                        match graph.upsert_cron_job(&job) {
+                            Ok(_) => {
+                                Self::broadcast_cron_sync_upsert(
+                                    dispatcher_tx,
+                                    local_node_id,
+                                    &job,
+                                )
+                                .await;
+                                IpcResponse::success("disable_cron_job", None)
+                            }
+                            Err(e) => IpcResponse::Error(format!("DisableCronJob failed: {e}")),
+                        }
+                    }
+                    Ok(None) => IpcResponse::Error(format!("cron job not found: {job_id}")),
+                    Err(e) => IpcResponse::Error(format!("DisableCronJob failed: {e}")),
+                }
+            }
         }
+    }
+
+    /// Broadcast a `CronJobSync` upsert envelope for a job definition change.
+    async fn broadcast_cron_sync_upsert(
+        dispatcher_tx: &mpsc::Sender<LedgerCommand>,
+        local_node_id: &str,
+        job: &ansible_mesh_core::cron::CronJob,
+    ) {
+        use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let payload = serde_json::json!({ "op": "upsert", "job": job }).to_string();
+        let env = EventEnvelope {
+            event_id: Uuid::new_v4(),
+            seq: 0,
+            source_node_id: local_node_id.to_string(),
+            target_node_id: None,
+            source_agent_id: "ipc-server".into(),
+            target_agent_id: None,
+            kind: EventKind::CronJobSync,
+            corr_id: format!("cron-sync:{}", job.id),
+            attempt: 0,
+            created_at: now_ms,
+            expires_at: None,
+            payload: EventPayload::Inline { data: payload },
+            trace: vec!["ipc:cron-sync".into()],
+        };
+        let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(env)).await;
+    }
+
+    /// Broadcast a `CronJobSync` remove envelope when a job is deleted.
+    async fn broadcast_cron_sync_remove(
+        dispatcher_tx: &mpsc::Sender<LedgerCommand>,
+        local_node_id: &str,
+        job_id: &str,
+    ) {
+        use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let payload = serde_json::json!({ "op": "remove", "job_id": job_id }).to_string();
+        let env = EventEnvelope {
+            event_id: Uuid::new_v4(),
+            seq: 0,
+            source_node_id: local_node_id.to_string(),
+            target_node_id: None,
+            source_agent_id: "ipc-server".into(),
+            target_agent_id: None,
+            kind: EventKind::CronJobSync,
+            corr_id: format!("cron-sync-remove:{job_id}"),
+            attempt: 0,
+            created_at: now_ms,
+            expires_at: None,
+            payload: EventPayload::Inline { data: payload },
+            trace: vec!["ipc:cron-sync-remove".into()],
+        };
+        let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(env)).await;
     }
 
     async fn handle_register_component(
