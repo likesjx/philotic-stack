@@ -780,7 +780,8 @@ Seam IDs: `structured-model-envelope`, `hotel-gemini-oauth-flow`
 - [x] Let `philote` consume cognitive-stage audio artifacts from native-live model results on voice turns, so returned audio can be delivered directly instead of reflexively invoking a second synth pass.
 - [ ] Extend the Gemini Live seam further with first-class audio-artifact return into cognition and true in-session tool-response continuation instead of one-turn surfacing only.
 - [x] Land the first narrow shared `media-prep` substrate for audio ligand preparation and move Gemini Live PCM adaptation onto it, so repeated provider/media pressure has a real shared enzyme without pretending we needed a giant generic interceptor framework first.
-- [ ] Extend the new `media-prep` seam beyond audio ligand prep into artifact interception and other provider/media adaptation paths only where repeated pressure proves the extra anatomy is real.
+- [x] Extend the new `media-prep` seam into the first shared artifact-interception path by standardizing the `audio_artifact` envelope across `model-router`, `philote`, and `membrane`, including legacy payload tolerance for older `data_b64` residue.
+- [ ] Extend `media-prep` further into additional artifact classes or provider/media adaptation paths only where repeated pressure proves the extra anatomy is real.
 - [ ] Define the shared catalog layer for models, tools, skills, and rights as reference knowledge outside hotel-owned mutable state.
 - [ ] Extend the hotel's projected key ring beyond `effective_rights` for tools/skills/component capabilities into scoped execution credentials and richer right classes.
 - [ ] Audit `model-router` and runner dispatch beyond current tool/component assembly so lower execution layers consume projected rights but never inject or widen them.

@@ -15,6 +15,7 @@ use crate::session::{
     merge_session_index, turn_routed_capability_profile,
 };
 use anyhow::Result;
+use media_prep::{extract_audio_artifact_json, parse_audio_artifact_json};
 use memory_core::{
     MemoryScope, MuninnConfig, MuninnRestEngine, RecallContext, RecallTrigger, VaultResolver,
 };
@@ -107,22 +108,7 @@ fn extract_model_error(task: &InboundTaskPayload) -> Option<String> {
 }
 
 fn extract_model_audio_artifact(model_result: Option<&Value>) -> Option<String> {
-    let artifacts = model_result?.get("artifacts")?.as_array()?;
-    let artifact = artifacts.iter().find(|artifact| {
-        artifact
-            .get("kind")
-            .and_then(Value::as_str)
-            .map(|kind| kind == "audio")
-            .unwrap_or(false)
-            || artifact
-                .get("payload")
-                .and_then(|payload| payload.get("kind"))
-                .and_then(Value::as_str)
-                .map(|kind| kind == "audio_artifact")
-                .unwrap_or(false)
-    })?;
-    let payload = artifact.get("payload")?;
-    serde_json::to_string(payload).ok()
+    extract_audio_artifact_json(model_result)
 }
 
 fn should_attempt_provider_repair(error: &TaskErrorPayload, state: Option<&SessionState>) -> bool {
@@ -3621,7 +3607,7 @@ impl AgentRuntime {
             .unwrap_or_default();
 
         // Validate the audio content — if it doesn't look like a valid audio artifact, fall back.
-        let audio_artifact = if raw_audio_content.trim_start().starts_with('{') {
+        let audio_artifact = if parse_audio_artifact_json(&raw_audio_content).is_ok() {
             Some(raw_audio_content.clone())
         } else {
             warn!(
@@ -9173,7 +9159,7 @@ mod tests {
                     "output_format": "wav",
                     "voice_id": "gemini-live",
                     "model": "gemini-3.1-flash-live",
-                    "data_b64": "AQID"
+                    "audio_base64": "AQID"
                 }
             }]
         });

@@ -117,12 +117,14 @@ Current implemented truth for this seam is still transitional:
 - `response.generate` now uses the Live websocket seam and returns canonical text output
 - `voice.dialogue` now uses the Live websocket seam and prepares non-PCM blob-backed audio through the first shared `media-prep` enzyme, which currently uses a transitional ffmpeg-backed PCM path before sending Gemini realtime input
 - `philote` now treats cognitive-stage audio artifacts as first-class enough to short-circuit duplicate voice synthesis on voice turns, delivering the native-live artifact directly instead of reflexively asking another synth to repeat it
+- the first shared artifact-interception path now also lives in `media-prep` via a shared `audio_artifact` envelope, so `model-router`, `philote`, and `membrane` stop independently serializing, guessing at, and re-decoding the same payload shape
 - audio output currently re-enters Philotic through output transcription text rather than a first-class cognitive audio artifact
 - sequential in-session tool-response continuation is still a follow-on seam
 
 Interception boundary note:
 
 - the codec pressure now has a first narrow shared home in `media-prep`, while interception still happens at the provider receptor (`model-router` native-live seam), because that is the first layer that knows Gemini Live specifically requires realtime PCM input
+- artifact-envelope pressure now has a first shared home there too, because outbound audio artifacts were already crossing `model-router` -> `philote` -> `membrane` with duplicated local decoding logic
 - this is still transitional, not the permanent final anatomy
 - a cleaner long-term shape is to let `media-prep` grow into a broader shared interception substrate between `philote` and provider invocation, but moving all adaptation pressure earlier before more artifact paths are properly metabolized would just spread provider-specific physiology upstream
 

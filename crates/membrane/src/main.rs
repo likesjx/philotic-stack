@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
+use media_prep::parse_audio_artifact_json;
 use philotic_client::{
     CommandManifestEntry, GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, is_ipc_disconnect,
 };
@@ -1911,12 +1912,9 @@ async fn run_seat_impl(
                                     tokio::spawn(async move {
                                         // Voice path: send audio first, then optional text caption.
                                         if let Some(artifact_json) = audio_artifact_json {
-                                            if let Ok(artifact) = serde_json::from_str::<Value>(&artifact_json) {
-                                                let mime_type = artifact.get("mime_type").and_then(Value::as_str).unwrap_or("audio/mpeg");
-                                                let audio_b64 = artifact.get("audio_base64").and_then(Value::as_str).unwrap_or_default();
-
-                                                use base64::Engine;
-                                                match base64::engine::general_purpose::STANDARD.decode(audio_b64) {
+                                            if let Ok(artifact) = parse_audio_artifact_json(&artifact_json) {
+                                                let mime_type = artifact.mime_type.as_str();
+                                                match artifact.decode_audio_bytes() {
                                                     Ok(audio_bytes) => {
                                                         // Use sendVoice for OGG (voice notes), sendAudio for everything else.
                                                         let (endpoint, field_name, file_name) = if mime_type.contains("ogg") {
@@ -1938,10 +1936,10 @@ async fn run_seat_impl(
                                                             Err(e) => error!("Failed to send Telegram audio: {}", e),
                                                         }
                                                     }
-                                                    Err(e) => error!("Failed to decode audio_base64: {}", e),
+                                                    Err(e) => error!("Failed to decode audio artifact payload: {}", e),
                                                 }
                                             } else {
-                                                error!("Failed to parse audio_artifact JSON; skipping audio delivery.");
+                                                error!("Failed to parse shared audio artifact envelope; skipping audio delivery.");
                                             }
 
                                             // Also send text as a follow-up caption if requested.

@@ -51,6 +51,7 @@ That live seam is now partially wired:
 
 - `response.generate` can execute over the Gemini Live websocket path and return canonical text output
 - `voice.dialogue` can execute over the Gemini Live websocket path and now prepares current blob-backed non-PCM audio through the shared `media-prep` enzyme, which currently uses a transitional ffmpeg-backed PCM path
+- outbound audio now also uses a shared `audio_artifact` envelope from `media-prep`, so provider serialization and downstream delivery stop re-implementing the same payload contract three different ways
 - native-live tool calls are intercepted before response-envelope serialization, just like the classic path
 - session resumption handles are captured on the live seam
 

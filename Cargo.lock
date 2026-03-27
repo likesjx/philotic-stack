@@ -2180,6 +2180,9 @@ name = "media-prep"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
@@ -2188,8 +2191,8 @@ name = "membrane"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
  "clap",
+ "media-prep",
  "philotic-client",
  "pulldown-cmark",
  "reqwest",
@@ -2697,6 +2700,7 @@ dependencies = [
  "ansible-mesh-core",
  "anyhow",
  "clap",
+ "media-prep",
  "memory-core",
  "philotic-client",
  "serde",

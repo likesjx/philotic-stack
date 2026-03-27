@@ -1,8 +1,7 @@
 use ansible_mesh_core::catalog_rights::{has_right, tool_right};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use media_prep::serialize_audio_artifact_envelope;
 use philotic_client::{IpcRequest, IpcResponse, PhiloticClient};
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
@@ -1422,16 +1421,14 @@ impl NativeLiveRegistry {
 }
 
 pub fn serialize_audio_artifact(artifact: &AudioArtifact) -> Result<String> {
-    Ok(json!({
-        "kind": "audio_artifact",
-        "provider": artifact.provider,
-        "model": artifact.model,
-        "voice_id": artifact.voice_id,
-        "mime_type": artifact.mime_type,
-        "output_format": artifact.output_format,
-        "audio_base64": BASE64_STANDARD.encode(&artifact.audio_bytes),
-    })
-    .to_string())
+    serialize_audio_artifact_envelope(
+        Some(&artifact.provider),
+        Some(&artifact.model),
+        Some(&artifact.voice_id),
+        &artifact.mime_type,
+        Some(&artifact.output_format),
+        &artifact.audio_bytes,
+    )
 }
 
 async fn fetch_config_string(ipc_client: &mut PhiloticClient, key: &str) -> Result<Option<String>> {
