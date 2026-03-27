@@ -562,6 +562,9 @@ Policy note:
 - approval interrupts should be stage-aware too: valid for real tool/workflow gates, redirected on low-intent conversational turns, and rejected on non-cognitive transform/synthesis stages
 - routing self-improvement should be governed: the first `routing.policy.propose` path should surface a durable operator-reviewed proposal, not silently mutate controller choice or stage policy at runtime
 - agent-local routing preferences can now flow in as advisory `routing_hints` from the active session binding path; model-controller may use those hints to honor provider/model bias, but it still must not become the authority for turn ownership or mutable routing policy
+- model requests now also carry the projected `effective_rights` envelope so
+  model-controller can validate that any surfaced tool contract is still inside
+  the hotel's key ring, rather than trusting upstream assembly blindly
 
 ## Optimization-Oriented Response Channels
 

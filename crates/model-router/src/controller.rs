@@ -1,3 +1,4 @@
+use ansible_mesh_core::catalog_rights::{has_right, tool_right};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use base64::Engine;
@@ -222,6 +223,7 @@ pub struct ControllerTask {
     pub affordances: Affordances,
     pub routing_hints: RoutingHints,
     pub provider_options: Map<String, Value>,
+    pub effective_rights: Vec<String>,
     /// Tools the agent has available this turn. Non-empty signals tool-enabled mode.
     /// Each entry is a raw JSON object with at minimum `tool_name` and `description`.
     pub tools: Vec<Value>,
@@ -328,6 +330,16 @@ impl ControllerTask {
             affordances,
             routing_hints,
             provider_options,
+            effective_rights: task
+                .get("effective_rights")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
             tools: task
                 .get("tools_for_model")
                 .and_then(Value::as_array)
@@ -535,6 +547,20 @@ impl ControllerTask {
     }
 
     fn validate(&self) -> Result<()> {
+        if !self.effective_rights.is_empty() {
+            for tool in &self.tools {
+                let Some(tool_name) = tool.get("tool_name").and_then(Value::as_str) else {
+                    bail!("tool entry missing tool_name");
+                };
+                if !has_right(&self.effective_rights, &tool_right(tool_name)) {
+                    bail!(
+                        "tool [{}] is present in tools_for_model without matching effective_rights",
+                        tool_name
+                    );
+                }
+            }
+        }
+
         match self.kind {
             TaskKind::TextGenerate => {
                 let prompt = self
@@ -1754,6 +1780,43 @@ mod tests {
         assert_eq!(task.routing_hints.stage.as_deref(), Some("egress"));
         assert_eq!(task.routing_hints.streaming, Some(true));
         assert_eq!(task.model.as_deref(), Some("eleven_multilingual_v2"));
+    }
+
+    #[test]
+    fn parses_effective_rights() {
+        let task = ControllerTask::from_value(&json!({
+            "kind": "text.generate",
+            "prompt": "hello",
+            "effective_rights": ["tool.echo", "component.text.generate"]
+        }))
+        .expect("task should parse");
+
+        assert_eq!(
+            task.effective_rights,
+            vec![
+                "tool.echo".to_string(),
+                "component.text.generate".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_tool_surface_without_matching_effective_right() {
+        let err = ControllerTask::from_value(&json!({
+            "kind": "text.generate",
+            "prompt": "hello",
+            "effective_rights": ["tool.echo"],
+            "tools_for_model": [{
+                "tool_name": "workspace.read",
+                "description": "Read a file",
+                "input_schema": { "type": "object" }
+            }]
+        }))
+        .expect_err("task should reject tool surface without matching right");
+
+        assert!(err.to_string().contains(
+            "tool [workspace.read] is present in tools_for_model without matching effective_rights"
+        ));
     }
 
     #[test]

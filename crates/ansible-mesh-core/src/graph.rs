@@ -68,6 +68,21 @@ pub struct AbstractToolRecord {
     pub class: String,
 }
 
+/// A system-wide shared right definition stored in the context graph.
+///
+/// Node kind: `abstract_right`. Node key: `abstract_right:{right_name}`.
+/// Rights are shared reference knowledge describing a named grant the hotel may
+/// project into a session's effective key ring.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AbstractRightRecord {
+    pub right_name: String,
+    pub description: String,
+    /// What kind of target this right refers to: "tool", "skill", or "component".
+    pub target_kind: String,
+    /// Stable identifier for the referenced tool, skill, or component capability.
+    pub target_ref: String,
+}
+
 /// Lifecycle and validation state for a shared skill definition.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", content = "data")]

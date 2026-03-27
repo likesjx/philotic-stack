@@ -1314,6 +1314,13 @@ impl AgentRuntime {
             context_projection: Some(context_projection),
             attachments,
             tools_for_model,
+            effective_rights: self
+                .sessions
+                .get(&session_id)
+                .expect("session should exist while preparing model request")
+                .bindings
+                .effective_rights
+                .clone(),
             response_contract: Some(if stage.kind == TurnRoutingStageKind::Cognition {
                 self.sessions
                     .get(&session_id)
@@ -2336,6 +2343,13 @@ impl AgentRuntime {
                     context_projection: Some(context_projection),
                     attachments: Vec::new(),
                     tools_for_model,
+                    effective_rights: self
+                        .sessions
+                        .get(&session_id)
+                        .expect("session should exist while preparing model request")
+                        .bindings
+                        .effective_rights
+                        .clone(),
                     response_contract: Some(
                         self.sessions
                             .get(&session_id)
@@ -2468,6 +2482,13 @@ impl AgentRuntime {
             context_projection: Some(context_projection),
             attachments: Vec::new(),
             tools_for_model,
+            effective_rights: self
+                .sessions
+                .get(&session_id)
+                .expect("session should exist while preparing model request")
+                .bindings
+                .effective_rights
+                .clone(),
             response_contract: Some(
                 self.sessions
                     .get(&session_id)
@@ -2619,6 +2640,13 @@ impl AgentRuntime {
             context_projection,
             attachments: Vec::new(),
             tools_for_model: reentry.tools_for_model,
+            effective_rights: self
+                .sessions
+                .get(&session_id)
+                .expect("session should exist while preparing model request")
+                .bindings
+                .effective_rights
+                .clone(),
             response_contract: Some(
                 self.sessions
                     .get(&session_id)
@@ -3593,6 +3621,13 @@ impl AgentRuntime {
             context_projection: Some(context_projection),
             attachments: Vec::new(),
             tools_for_model: tools,
+            effective_rights: self
+                .sessions
+                .get(&session_id)
+                .expect("session should exist while preparing model request")
+                .bindings
+                .effective_rights
+                .clone(),
             response_contract: Some(
                 self.sessions
                     .get(&session_id)
@@ -4482,6 +4517,13 @@ impl AgentRuntime {
             context_projection,
             attachments: Vec::new(),
             tools_for_model,
+            effective_rights: self
+                .sessions
+                .get(&session_id)
+                .expect("session should exist while preparing model request")
+                .bindings
+                .effective_rights
+                .clone(),
             response_contract: Some(
                 self.sessions
                     .get(&session_id)
@@ -7212,6 +7254,7 @@ mod tests {
             })),
             attachments: Vec::new(),
             tools_for_model: Vec::new(),
+            effective_rights: Vec::new(),
             response_contract: None,
             routing_hints: None,
             provider_options: None,

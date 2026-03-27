@@ -888,6 +888,7 @@ mod tests {
             affordances: Default::default(),
             routing_hints: RoutingHints::default(),
             provider_options: Default::default(),
+            effective_rights: Vec::new(),
             tools,
         }
     }
@@ -1070,6 +1071,7 @@ mod tests {
             affordances: Default::default(),
             routing_hints: RoutingHints::default(),
             provider_options: Default::default(),
+            effective_rights: Vec::new(),
             tools: vec![],
         };
 
@@ -1112,6 +1114,7 @@ mod tests {
             affordances: Default::default(),
             routing_hints: RoutingHints::default(),
             provider_options: Default::default(),
+            effective_rights: Vec::new(),
             tools: vec![],
         };
 

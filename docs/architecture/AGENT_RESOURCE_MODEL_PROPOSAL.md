@@ -369,6 +369,9 @@ Transitional note:
   `effective_rights` key ring for tools, skills, and component capabilities, and
   lower tool/component assembly paths consume that key ring instead of widening
   visibility just because a runner or route exists
+- the first shared rights catalog slice is now live too: rights are becoming
+  shared reference knowledge in their own right, instead of existing only as
+  strings projected into session bindings
 
 ---
 

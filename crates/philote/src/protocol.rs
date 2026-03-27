@@ -93,6 +93,8 @@ pub struct ModelRequestPayload {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<TransportAttachment>,
     pub tools_for_model: Vec<ToolDefinition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effective_rights: Vec<String>,
     /// Forwarded verbatim to the model controller as `response_contract`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_contract: Option<serde_json::Value>,

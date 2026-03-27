@@ -381,10 +381,14 @@ Current implemented slice:
   the same projected rights
 - allowed-incarnation tool assembly no longer widens visible tools merely
   because a runner advertises support
+- `model-router` now receives the projected `effective_rights` envelope and
+  rejects tool surfaces that arrive without matching rights, so a bad upstream
+  projection cannot quietly reintroduce a widened tool surface below `philote`
 
 This is the first enforcement slice, not the full destination:
 
 - the right-token vocabulary is now shared
+- abstract rights now have a first shared graph catalog substrate
 - the full shared catalog layer for models, tools, skills, and rights is still
   a follow-on seam
 

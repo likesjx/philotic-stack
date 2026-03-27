@@ -743,6 +743,7 @@ Seam IDs: `structured-model-envelope`, `hotel-gemini-oauth-flow`
 - [x] Add first-class agent-graph routing preferences plus active `agent.graph.read`/`agent.graph.write` tool definitions so routing posture can be stored in agent-local graph state instead of only prompt text.
 - [x] Feed stored agent-graph routing preferences into live `TurnRoutingPlan` compilation by projecting them through hotel session bindings and applying advisory provider/model hints per stage.
 - [x] Project an explicit `effective_rights` key ring through hotel session bindings and enforce it in tool/component assembly so lower execution layers stop widening visibility just because a runner or route exists.
+- [x] Add the first shared abstract-right catalog substrate and carry `effective_rights` into model-controller requests so lower execution layers can validate tool visibility against the hotel's key ring.
 - [ ] Replace the transitional durable-rule bridge behind `routing.policy.propose` with routing-specific policy records, evaluation history, and operator disposition state.
 - [ ] Fold model-graph metadata into live turn-routing-plan ranking so shared catalog truth informs selection without becoming mutable preference storage.
 - [ ] Define the shared catalog layer for models, tools, skills, and rights as reference knowledge outside hotel-owned mutable state.

@@ -15,8 +15,8 @@
 
 use crate::cron::CronJob;
 use crate::graph::{
-    AbstractSkillRecord, AbstractToolRecord, GraphNode, RoleIncarnationRecord, RuleRecord,
-    ToolsetProfileRecord, WorkflowSkillRecord,
+    AbstractRightRecord, AbstractSkillRecord, AbstractToolRecord, GraphNode, RoleIncarnationRecord,
+    RuleRecord, ToolsetProfileRecord, WorkflowSkillRecord,
 };
 use crate::storage::{
     AgentIdentityRecord, GraphAdapter, GraphRunnerInstanceRecord, GuestRecord, HotelRecord,
@@ -36,6 +36,7 @@ use std::sync::Arc;
 // Slice 1
 pub const NODE_KIND_HOTEL: &str = "hotel";
 pub const NODE_KIND_ABSTRACT_TOOL: &str = "abstract_tool";
+pub const NODE_KIND_ABSTRACT_RIGHT: &str = "abstract_right";
 pub const NODE_KIND_RULE: &str = "rule";
 
 // Slice 2
@@ -80,6 +81,10 @@ impl GraphDomain {
 
     fn abstract_tool_key(tool_name: &str) -> String {
         format!("{}:{}", NODE_KIND_ABSTRACT_TOOL, tool_name)
+    }
+
+    fn abstract_right_key(right_name: &str) -> String {
+        format!("{}:{}", NODE_KIND_ABSTRACT_RIGHT, right_name)
     }
 
     fn rule_key(rule_id: &str) -> String {
@@ -162,12 +167,51 @@ impl GraphDomain {
             .collect()
     }
 
+    /// Upsert an abstract right record as a graph node.
+    pub fn upsert_abstract_right(&self, right: &AbstractRightRecord) -> Result<()> {
+        let data = serde_json::to_value(right)
+            .context("GraphDomain::upsert_abstract_right: serialize AbstractRightRecord")?;
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::abstract_right_key(&right.right_name),
+            kind: NODE_KIND_ABSTRACT_RIGHT.to_string(),
+            label: Some(right.right_name.clone()),
+            data,
+        })
+    }
+
+    /// Load an abstract right record by right name.
+    pub fn get_abstract_right(&self, right_name: &str) -> Result<Option<AbstractRightRecord>> {
+        match self
+            .adapter
+            .get_node(&Self::abstract_right_key(right_name))?
+        {
+            None => Ok(None),
+            Some(node) => {
+                let record = serde_json::from_value(node.data)
+                    .context("GraphDomain::get_abstract_right: deserialize AbstractRightRecord")?;
+                Ok(Some(record))
+            }
+        }
+    }
+
+    /// List all abstract right records.
+    pub fn list_abstract_rights(&self) -> Result<Vec<AbstractRightRecord>> {
+        self.adapter
+            .list_nodes_by_kind(NODE_KIND_ABSTRACT_RIGHT)?
+            .into_iter()
+            .map(|n| {
+                serde_json::from_value(n.data)
+                    .context("GraphDomain::list_abstract_rights: deserialize AbstractRightRecord")
+            })
+            .collect()
+    }
+
     // ── Rule methods ──────────────────────────────────────────────────────────
 
     /// Upsert a rule record as a graph node.
     pub fn upsert_rule(&self, rule: &RuleRecord) -> Result<()> {
-        let data = serde_json::to_value(rule)
-            .context("GraphDomain::upsert_rule: serialize RuleRecord")?;
+        let data =
+            serde_json::to_value(rule).context("GraphDomain::upsert_rule: serialize RuleRecord")?;
         self.adapter.upsert_node(&GraphNode {
             node_key: Self::rule_key(&rule.rule_id),
             kind: NODE_KIND_RULE.to_string(),
@@ -221,7 +265,10 @@ impl GraphDomain {
     }
 
     pub fn get_guest(&self, hotel_name: &str, guest_id: &str) -> Result<Option<GuestRecord>> {
-        match self.adapter.get_node(&Self::guest_key(hotel_name, guest_id))? {
+        match self
+            .adapter
+            .get_node(&Self::guest_key(hotel_name, guest_id))?
+        {
             None => Ok(None),
             Some(node) => Ok(Some(
                 serde_json::from_value(node.data)
@@ -257,12 +304,7 @@ impl GraphDomain {
     }
 
     /// Update the `active_pid` on a guest record (get → mutate → upsert).
-    pub fn set_guest_pid(
-        &self,
-        hotel_name: &str,
-        guest_id: &str,
-        pid: Option<&str>,
-    ) -> Result<()> {
+    pub fn set_guest_pid(&self, hotel_name: &str, guest_id: &str, pid: Option<&str>) -> Result<()> {
         if let Some(mut rec) = self.get_guest(hotel_name, guest_id)? {
             rec.active_pid = pid.map(str::to_string);
             self.upsert_guest(&rec)?;
@@ -324,10 +366,9 @@ impl GraphDomain {
     pub fn get_agent_identity(&self, agent_id: &str) -> Result<Option<AgentIdentityRecord>> {
         match self.adapter.get_node(&Self::agent_identity_key(agent_id))? {
             None => Ok(None),
-            Some(node) => Ok(Some(
-                serde_json::from_value(node.data)
-                    .context("GraphDomain::get_agent_identity: deserialize AgentIdentityRecord")?,
-            )),
+            Some(node) => Ok(Some(serde_json::from_value(node.data).context(
+                "GraphDomain::get_agent_identity: deserialize AgentIdentityRecord",
+            )?)),
         }
     }
 
@@ -336,9 +377,8 @@ impl GraphDomain {
             .list_nodes_by_kind(NODE_KIND_AGENT_IDENTITY)?
             .into_iter()
             .map(|n| {
-                serde_json::from_value(n.data).context(
-                    "GraphDomain::list_agent_identities: deserialize AgentIdentityRecord",
-                )
+                serde_json::from_value(n.data)
+                    .context("GraphDomain::list_agent_identities: deserialize AgentIdentityRecord")
             })
             .collect()
     }
@@ -397,13 +437,14 @@ impl GraphDomain {
     ) -> Result<Vec<SessionParticipantRecord>> {
         let prefix = format!("{}:{}:", NODE_KIND_SESSION_PARTICIPANT, session_id);
         let mut out = Vec::new();
-        for node in self.adapter.list_nodes_by_kind(NODE_KIND_SESSION_PARTICIPANT)? {
+        for node in self
+            .adapter
+            .list_nodes_by_kind(NODE_KIND_SESSION_PARTICIPANT)?
+        {
             if node.node_key.starts_with(&prefix) {
-                out.push(
-                    serde_json::from_value(node.data).context(
-                        "GraphDomain::list_session_participants: deserialize SessionParticipantRecord",
-                    )?,
-                );
+                out.push(serde_json::from_value(node.data).context(
+                    "GraphDomain::list_session_participants: deserialize SessionParticipantRecord",
+                )?);
             }
         }
         Ok(out)
@@ -431,12 +472,14 @@ impl GraphDomain {
         session_id: &str,
         turn_id: &str,
     ) -> Result<Option<SessionTurnRecord>> {
-        match self.adapter.get_node(&Self::session_turn_key(session_id, turn_id))? {
+        match self
+            .adapter
+            .get_node(&Self::session_turn_key(session_id, turn_id))?
+        {
             None => Ok(None),
-            Some(node) => Ok(Some(
-                serde_json::from_value(node.data)
-                    .context("GraphDomain::get_session_turn: deserialize SessionTurnRecord")?,
-            )),
+            Some(node) => Ok(Some(serde_json::from_value(node.data).context(
+                "GraphDomain::get_session_turn: deserialize SessionTurnRecord",
+            )?)),
         }
     }
 
@@ -451,8 +494,9 @@ impl GraphDomain {
         for node in self.adapter.list_nodes_by_kind(NODE_KIND_SESSION_TURN)? {
             if node.node_key.starts_with(&prefix) {
                 out.push(
-                    serde_json::from_value(node.data)
-                        .context("GraphDomain::list_session_turns: deserialize SessionTurnRecord")?,
+                    serde_json::from_value(node.data).context(
+                        "GraphDomain::list_session_turns: deserialize SessionTurnRecord",
+                    )?,
                 );
             }
         }
@@ -521,26 +565,28 @@ impl GraphDomain {
         agent_id: &str,
         role_name: &str,
     ) -> Result<Option<RoleIncarnationRecord>> {
-        match self.adapter.get_node(&Self::role_incarnation_key(agent_id, role_name))? {
+        match self
+            .adapter
+            .get_node(&Self::role_incarnation_key(agent_id, role_name))?
+        {
             None => Ok(None),
-            Some(node) => Ok(Some(
-                serde_json::from_value(node.data).context(
-                    "GraphDomain::get_role_incarnation: deserialize RoleIncarnationRecord",
-                )?,
-            )),
+            Some(node) => Ok(Some(serde_json::from_value(node.data).context(
+                "GraphDomain::get_role_incarnation: deserialize RoleIncarnationRecord",
+            )?)),
         }
     }
 
     pub fn list_role_incarnations(&self, agent_id: &str) -> Result<Vec<RoleIncarnationRecord>> {
         let prefix = format!("{}:{}:", NODE_KIND_ROLE_INCARNATION, agent_id);
         let mut out = Vec::new();
-        for node in self.adapter.list_nodes_by_kind(NODE_KIND_ROLE_INCARNATION)? {
+        for node in self
+            .adapter
+            .list_nodes_by_kind(NODE_KIND_ROLE_INCARNATION)?
+        {
             if node.node_key.starts_with(&prefix) {
-                out.push(
-                    serde_json::from_value(node.data).context(
-                        "GraphDomain::list_role_incarnations: deserialize RoleIncarnationRecord",
-                    )?,
-                );
+                out.push(serde_json::from_value(node.data).context(
+                    "GraphDomain::list_role_incarnations: deserialize RoleIncarnationRecord",
+                )?);
             }
         }
         Ok(out)
@@ -552,7 +598,10 @@ impl GraphDomain {
         guest_id: &str,
     ) -> Result<Vec<RoleIncarnationRecord>> {
         let mut out = Vec::new();
-        for node in self.adapter.list_nodes_by_kind(NODE_KIND_ROLE_INCARNATION)? {
+        for node in self
+            .adapter
+            .list_nodes_by_kind(NODE_KIND_ROLE_INCARNATION)?
+        {
             let record: RoleIncarnationRecord = serde_json::from_value(node.data).context(
                 "GraphDomain::list_role_incarnations_by_guest_id: deserialize RoleIncarnationRecord",
             )?;
@@ -608,12 +657,14 @@ impl GraphDomain {
     }
 
     pub fn get_abstract_skill(&self, skill_name: &str) -> Result<Option<AbstractSkillRecord>> {
-        match self.adapter.get_node(&Self::abstract_skill_key(skill_name))? {
+        match self
+            .adapter
+            .get_node(&Self::abstract_skill_key(skill_name))?
+        {
             None => Ok(None),
-            Some(node) => Ok(Some(
-                serde_json::from_value(node.data)
-                    .context("GraphDomain::get_abstract_skill: deserialize AbstractSkillRecord")?,
-            )),
+            Some(node) => Ok(Some(serde_json::from_value(node.data).context(
+                "GraphDomain::get_abstract_skill: deserialize AbstractSkillRecord",
+            )?)),
         }
     }
 
@@ -646,12 +697,14 @@ impl GraphDomain {
     }
 
     pub fn get_workflow_skill(&self, workflow_name: &str) -> Result<Option<WorkflowSkillRecord>> {
-        match self.adapter.get_node(&Self::workflow_skill_key(workflow_name))? {
+        match self
+            .adapter
+            .get_node(&Self::workflow_skill_key(workflow_name))?
+        {
             None => Ok(None),
-            Some(node) => Ok(Some(
-                serde_json::from_value(node.data)
-                    .context("GraphDomain::get_workflow_skill: deserialize WorkflowSkillRecord")?,
-            )),
+            Some(node) => Ok(Some(serde_json::from_value(node.data).context(
+                "GraphDomain::get_workflow_skill: deserialize WorkflowSkillRecord",
+            )?)),
         }
     }
 
@@ -684,13 +737,14 @@ impl GraphDomain {
     }
 
     pub fn get_toolset_profile(&self, profile_name: &str) -> Result<Option<ToolsetProfileRecord>> {
-        match self.adapter.get_node(&Self::toolset_profile_key(profile_name))? {
+        match self
+            .adapter
+            .get_node(&Self::toolset_profile_key(profile_name))?
+        {
             None => Ok(None),
-            Some(node) => Ok(Some(
-                serde_json::from_value(node.data).context(
-                    "GraphDomain::get_toolset_profile: deserialize ToolsetProfileRecord",
-                )?,
-            )),
+            Some(node) => Ok(Some(serde_json::from_value(node.data).context(
+                "GraphDomain::get_toolset_profile: deserialize ToolsetProfileRecord",
+            )?)),
         }
     }
 
@@ -699,9 +753,8 @@ impl GraphDomain {
             .list_nodes_by_kind(NODE_KIND_TOOLSET_PROFILE)?
             .into_iter()
             .map(|n| {
-                serde_json::from_value(n.data).context(
-                    "GraphDomain::list_toolset_profiles: deserialize ToolsetProfileRecord",
-                )
+                serde_json::from_value(n.data)
+                    .context("GraphDomain::list_toolset_profiles: deserialize ToolsetProfileRecord")
             })
             .collect()
     }
@@ -724,10 +777,9 @@ impl GraphDomain {
     pub fn load_node_capabilities(&self) -> Result<Option<NodeCapabilities>> {
         match self.adapter.get_node(Self::NODE_CAPABILITIES_KEY)? {
             None => Ok(None),
-            Some(node) => Ok(Some(
-                serde_json::from_value(node.data)
-                    .context("GraphDomain::load_node_capabilities: deserialize NodeCapabilities")?,
-            )),
+            Some(node) => Ok(Some(serde_json::from_value(node.data).context(
+                "GraphDomain::load_node_capabilities: deserialize NodeCapabilities",
+            )?)),
         }
     }
 
@@ -770,7 +822,10 @@ impl GraphDomain {
 
     pub fn upsert_vault_registry_entry(&self, entry: &VaultRegistryEntry) -> Result<()> {
         let mut entries = self.get_vault_registry()?;
-        match entries.iter().position(|e| e.vault_name == entry.vault_name) {
+        match entries
+            .iter()
+            .position(|e| e.vault_name == entry.vault_name)
+        {
             Some(pos) => entries[pos] = entry.clone(),
             None => entries.push(entry.clone()),
         }
@@ -859,7 +914,10 @@ impl GraphDomain {
         agent_id: &str,
         memory_type: &str,
     ) -> Result<Option<serde_json::Value>> {
-        match self.adapter.get_node(&Self::apartment_key(agent_id, memory_type))? {
+        match self
+            .adapter
+            .get_node(&Self::apartment_key(agent_id, memory_type))?
+        {
             None => Ok(None),
             Some(node) => Ok(node.data.get("content").cloned()),
         }
@@ -930,7 +988,9 @@ impl GraphDomain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{AbstractSkillRecord, RoleIncarnationRecord, ToolsetProfileRecord};
+    use crate::graph::{
+        AbstractRightRecord, AbstractSkillRecord, RoleIncarnationRecord, ToolsetProfileRecord,
+    };
     use crate::sqlite_storage::SqliteGraphStorage;
     use crate::storage::{
         AgentIdentityRecord, GuestRecord, SecretRecord, SessionRecord, VaultRegistryEntry,
@@ -974,6 +1034,15 @@ mod tests {
         }
     }
 
+    fn right(name: &str, target_kind: &str, target_ref: &str) -> AbstractRightRecord {
+        AbstractRightRecord {
+            right_name: name.to_string(),
+            description: format!("Description for {}", name),
+            target_kind: target_kind.to_string(),
+            target_ref: target_ref.to_string(),
+        }
+    }
+
     fn rule(id: &str, agent: &str) -> RuleRecord {
         RuleRecord {
             rule_id: id.to_string(),
@@ -1006,7 +1075,12 @@ mod tests {
         for name in ["alpha", "beta", "gamma"] {
             d.upsert_hotel(&hotel(name)).unwrap();
         }
-        let names: Vec<_> = d.list_hotels().unwrap().into_iter().map(|h| h.hotel_name).collect();
+        let names: Vec<_> = d
+            .list_hotels()
+            .unwrap()
+            .into_iter()
+            .map(|h| h.hotel_name)
+            .collect();
         assert_eq!(names.len(), 3);
         assert!(names.contains(&"alpha".to_string()));
         assert!(names.contains(&"beta".to_string()));
@@ -1037,7 +1111,10 @@ mod tests {
 
     #[test]
     fn abstract_tool_missing_returns_none() {
-        assert!(make_domain().get_abstract_tool("no.such.tool").unwrap().is_none());
+        assert!(make_domain()
+            .get_abstract_tool("no.such.tool")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1047,6 +1124,30 @@ mod tests {
             d.upsert_abstract_tool(&tool(name)).unwrap();
         }
         assert_eq!(d.list_abstract_tools().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn abstract_right_roundtrip() {
+        let d = make_domain();
+        d.upsert_abstract_right(&right("tool.echo", "tool", "echo"))
+            .unwrap();
+        let r = d.get_abstract_right("tool.echo").unwrap().unwrap();
+        assert_eq!(r.right_name, "tool.echo");
+        assert_eq!(r.target_kind, "tool");
+        assert_eq!(r.target_ref, "echo");
+    }
+
+    #[test]
+    fn abstract_right_list() {
+        let d = make_domain();
+        for (name, kind, target) in [
+            ("tool.echo", "tool", "echo"),
+            ("skill.handoff.back", "skill", "handoff.back"),
+            ("component.text.generate", "component", "text.generate"),
+        ] {
+            d.upsert_abstract_right(&right(name, kind, target)).unwrap();
+        }
+        assert_eq!(d.list_abstract_rights().unwrap().len(), 3);
     }
 
     // ── Guest ─────────────────────────────────────────────────────────────────
@@ -1096,7 +1197,12 @@ mod tests {
             Some("12345".to_string())
         );
         d.set_guest_pid("default", "g1", None).unwrap();
-        assert!(d.get_guest("default", "g1").unwrap().unwrap().active_pid.is_none());
+        assert!(d
+            .get_guest("default", "g1")
+            .unwrap()
+            .unwrap()
+            .active_pid
+            .is_none());
     }
 
     // ── Agent identity ────────────────────────────────────────────────────────
@@ -1185,7 +1291,10 @@ mod tests {
             updated_at: 0,
         };
         d.upsert_secret(&s).unwrap();
-        let loaded = d.get_secret("secret://hotel/default/api-key").unwrap().unwrap();
+        let loaded = d
+            .get_secret("secret://hotel/default/api-key")
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.ciphertext_b64, "abc123");
     }
 
@@ -1200,7 +1309,13 @@ mod tests {
             ..Default::default()
         };
         d.upsert_abstract_skill(&sk).unwrap();
-        assert_eq!(d.get_abstract_skill("code-review").unwrap().unwrap().skill_name, "code-review");
+        assert_eq!(
+            d.get_abstract_skill("code-review")
+                .unwrap()
+                .unwrap()
+                .skill_name,
+            "code-review"
+        );
         assert_eq!(d.list_abstract_skills().unwrap().len(), 1);
     }
 

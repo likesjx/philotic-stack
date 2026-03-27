@@ -1,5 +1,8 @@
 use ansible_mesh_core::beacon::BeaconDaemon;
-use ansible_mesh_core::graph::{AbstractSkillRecord, AbstractToolRecord, ToolsetProfileRecord};
+use ansible_mesh_core::catalog_rights::{component_right, skill_right, tool_right};
+use ansible_mesh_core::graph::{
+    AbstractRightRecord, AbstractSkillRecord, AbstractToolRecord, ToolsetProfileRecord,
+};
 use ansible_mesh_core::heartbeat::emit_heartbeat;
 use ansible_mesh_core::registry::{CapabilityAdvertisement, ExecutionReachability, NodeRegistry};
 use ansible_mesh_core::storage::{
@@ -1953,6 +1956,132 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
 
     for tool in &catalog {
         graph.upsert_abstract_tool(tool)?;
+    }
+    Ok(())
+}
+
+/// Seed the built-in abstract rights catalog into the context graph.
+fn seed_abstract_right_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
+    let catalog = [
+        AbstractRightRecord {
+            right_name: tool_right("session.status"),
+            description: "Allows visibility and invocation of the session.status tool.".into(),
+            target_kind: "tool".into(),
+            target_ref: "session.status".into(),
+        },
+        AbstractRightRecord {
+            right_name: tool_right("echo"),
+            description: "Allows visibility and invocation of the echo tool.".into(),
+            target_kind: "tool".into(),
+            target_ref: "echo".into(),
+        },
+        AbstractRightRecord {
+            right_name: tool_right("workspace.list"),
+            description: "Allows visibility and invocation of the workspace.list tool.".into(),
+            target_kind: "tool".into(),
+            target_ref: "workspace.list".into(),
+        },
+        AbstractRightRecord {
+            right_name: tool_right("workspace.read"),
+            description: "Allows visibility and invocation of the workspace.read tool.".into(),
+            target_kind: "tool".into(),
+            target_ref: "workspace.read".into(),
+        },
+        AbstractRightRecord {
+            right_name: tool_right("agent.graph.read"),
+            description: "Allows visibility and invocation of the agent.graph.read tool.".into(),
+            target_kind: "tool".into(),
+            target_ref: "agent.graph.read".into(),
+        },
+        AbstractRightRecord {
+            right_name: tool_right("agent.graph.write"),
+            description: "Allows visibility and invocation of the agent.graph.write tool.".into(),
+            target_kind: "tool".into(),
+            target_ref: "agent.graph.write".into(),
+        },
+        AbstractRightRecord {
+            right_name: tool_right("agent.configure"),
+            description: "Allows visibility and invocation of the agent.configure tool.".into(),
+            target_kind: "tool".into(),
+            target_ref: "agent.configure".into(),
+        },
+        AbstractRightRecord {
+            right_name: skill_right("handoff.to_role"),
+            description: "Allows activation of the handoff.to_role skill posture.".into(),
+            target_kind: "skill".into(),
+            target_ref: "handoff.to_role".into(),
+        },
+        AbstractRightRecord {
+            right_name: skill_right("handoff.back"),
+            description: "Allows activation of the handoff.back skill posture.".into(),
+            target_kind: "skill".into(),
+            target_ref: "handoff.back".into(),
+        },
+        AbstractRightRecord {
+            right_name: skill_right("role.governance"),
+            description: "Allows activation of the role.governance skill posture.".into(),
+            target_kind: "skill".into(),
+            target_ref: "role.governance".into(),
+        },
+        AbstractRightRecord {
+            right_name: skill_right("role.authoring"),
+            description: "Allows activation of the role.authoring skill posture.".into(),
+            target_kind: "skill".into(),
+            target_ref: "role.authoring".into(),
+        },
+        AbstractRightRecord {
+            right_name: skill_right("delegate.to_peer"),
+            description: "Allows activation of the delegate.to_peer skill posture.".into(),
+            target_kind: "skill".into(),
+            target_ref: "delegate.to_peer".into(),
+        },
+        AbstractRightRecord {
+            right_name: skill_right("delegate.to_external_cognitive_peer"),
+            description:
+                "Allows activation of the delegate.to_external_cognitive_peer skill posture.".into(),
+            target_kind: "skill".into(),
+            target_ref: "delegate.to_external_cognitive_peer".into(),
+        },
+        AbstractRightRecord {
+            right_name: skill_right("routing.refinement"),
+            description: "Allows activation of the routing.refinement skill posture.".into(),
+            target_kind: "skill".into(),
+            target_ref: "routing.refinement".into(),
+        },
+        AbstractRightRecord {
+            right_name: component_right("text.generate"),
+            description: "Allows routing a turn through text.generate model execution.".into(),
+            target_kind: "component".into(),
+            target_ref: "text.generate".into(),
+        },
+        AbstractRightRecord {
+            right_name: component_right("media.analyze"),
+            description: "Allows routing a turn through media.analyze model execution.".into(),
+            target_kind: "component".into(),
+            target_ref: "media.analyze".into(),
+        },
+        AbstractRightRecord {
+            right_name: component_right("voice.synthesize"),
+            description: "Allows routing a turn through voice.synthesize model execution.".into(),
+            target_kind: "component".into(),
+            target_ref: "voice.synthesize".into(),
+        },
+        AbstractRightRecord {
+            right_name: component_right("voice.transcribe"),
+            description: "Allows routing a turn through voice.transcribe model execution.".into(),
+            target_kind: "component".into(),
+            target_ref: "voice.transcribe".into(),
+        },
+        AbstractRightRecord {
+            right_name: component_right("text.embed"),
+            description: "Allows routing a turn through text.embed model execution.".into(),
+            target_kind: "component".into(),
+            target_ref: "text.embed".into(),
+        },
+    ];
+
+    for right in &catalog {
+        graph.upsert_abstract_right(right)?;
     }
     Ok(())
 }
@@ -4346,6 +4475,7 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
 
     seed_orchestrator_roles(&graph_domain, &all_profiles)?;
     seed_abstract_tool_catalog(&graph_domain)?;
+    seed_abstract_right_catalog(&graph_domain)?;
     seed_abstract_skill_catalog(&graph_domain)?;
     seed_toolset_profiles(&graph_domain)?;
     seed_skill_crafting(&graph_domain)?;
@@ -4476,6 +4606,7 @@ async fn main() -> Result<()> {
     let mut hotel = reconcile_hotel_record(&graph_domain_arc, &hotel_name)?;
 
     seed_abstract_tool_catalog(&graph_domain_arc)?;
+    seed_abstract_right_catalog(&graph_domain_arc)?;
     seed_abstract_skill_catalog(&graph_domain_arc)?;
     seed_toolset_profiles(&graph_domain_arc)?;
     seed_skill_crafting(&graph_domain_arc)?;
