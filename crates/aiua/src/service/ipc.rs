@@ -126,6 +126,13 @@ struct AllowedIncarnation {
 struct LocalDeliveryProvenanceHint {
     guest_id: String,
     updated_at: u64,
+    marker_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PlacementMarkerPolicy {
+    ttl_secs: u64,
+    supersede_on_newer_active_incarnation_conflict: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -160,6 +167,23 @@ fn load_agent_graph_routing_preferences(agent_id: &str) -> Option<Vec<serde_json
             .filter_map(|preference| serde_json::to_value(preference).ok())
             .collect(),
     )
+}
+
+fn placement_marker_policy(marker_kind: Option<&str>) -> PlacementMarkerPolicy {
+    match marker_kind {
+        Some("receptor_ingress") | Some("membrane_ingress") => PlacementMarkerPolicy {
+            ttl_secs: std::cmp::max(1, LOCAL_DELIVERY_PROVENANCE_TTL_SECS / 2),
+            supersede_on_newer_active_incarnation_conflict: true,
+        },
+        Some("role_handoff") => PlacementMarkerPolicy {
+            ttl_secs: LOCAL_DELIVERY_PROVENANCE_TTL_SECS.saturating_mul(2),
+            supersede_on_newer_active_incarnation_conflict: true,
+        },
+        Some("transport_continuity") | None | Some(_) => PlacementMarkerPolicy {
+            ttl_secs: LOCAL_DELIVERY_PROVENANCE_TTL_SECS,
+            supersede_on_newer_active_incarnation_conflict: true,
+        },
+    }
 }
 
 fn load_agent_graph_snapshot(agent_id: &str, source_node_id: &str) -> Option<serde_json::Value> {
@@ -2139,6 +2163,11 @@ impl IpcServer {
         let provenance = session.summary_json.get("agent_runtime_provenance")?;
         let delivery_hotel = provenance.get("delivery_hotel")?.as_str()?;
         let delivery_target_guest_id = provenance.get("delivery_target_guest_id")?.as_str()?;
+        let marker_kind = provenance
+            .get("marker_kind")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let policy = placement_marker_policy(marker_kind.as_deref());
         let freshness_anchor = provenance
             .get("updated_at")
             .and_then(serde_json::Value::as_u64)
@@ -2146,12 +2175,13 @@ impl IpcServer {
         if Some(delivery_hotel) != local_hotel_name {
             return None;
         }
-        if unix_ts().saturating_sub(freshness_anchor) > LOCAL_DELIVERY_PROVENANCE_TTL_SECS {
+        if unix_ts().saturating_sub(freshness_anchor) > policy.ttl_secs {
             return None;
         }
         Some(LocalDeliveryProvenanceHint {
             guest_id: delivery_target_guest_id.to_string(),
             updated_at: freshness_anchor,
+            marker_kind,
         })
     }
 
@@ -2198,7 +2228,11 @@ impl IpcServer {
             session.active_incarnation_id.as_deref(),
             provenance_hint.as_ref(),
         ) {
-            if active_guest_id != hint.guest_id && session.updated_at > hint.updated_at {
+            let policy = placement_marker_policy(hint.marker_kind.as_deref());
+            if policy.supersede_on_newer_active_incarnation_conflict
+                && active_guest_id != hint.guest_id
+                && session.updated_at > hint.updated_at
+            {
                 provenance_hint = None;
             }
         }
@@ -5550,7 +5584,7 @@ impl IpcServer {
                     payload
                         .get("source")
                         .and_then(serde_json::Value::as_str)
-                        .map(|_| "membrane_ingress".to_string())
+                        .map(|_| "receptor_ingress".to_string())
                 });
             let marker_source = payload
                 .get("placement_marker_source")
@@ -8937,6 +8971,156 @@ mod tests {
             .await
             .is_err(),
             "developer should not receive task when persisted local provenance is stale"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_task_marker_policy_gives_receptor_ingress_a_shorter_half_life() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let now = unix_ts();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-jane-01".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-jane:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: false,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig::default(),
+            })
+            .expect("orchestrator role should seed");
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-marker-half-life".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: None,
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("123".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "agent_runtime_provenance": {
+                        "authority_hotel": "remote-hotel",
+                        "delivery_hotel": "local-hotel",
+                        "delivery_target_guest_id": "agent-jane:developer",
+                        "marker_kind": "receptor_ingress",
+                        "marker_source": "telegram",
+                        "updated_at": now.saturating_sub(LOCAL_DELIVERY_PROVENANCE_TTL_SECS.saturating_sub(2))
+                    }
+                }),
+                created_at: now,
+                updated_at: now,
+            })
+            .expect("session should seed");
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut orchestrator = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane:orchestrator".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("orchestrator connect");
+        let mut developer = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane:developer".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("developer connect");
+        let mut membrane = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-local".into(),
+            role: "membrane".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("membrane connect");
+
+        let response = membrane
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: None,
+                task_json: serde_json::json!({
+                    "session_id": "sess-marker-half-life",
+                    "source": "telegram",
+                    "chat_id": "123",
+                    "content": "short half-life marker should die"
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit task");
+
+        assert!(matches!(response, IpcResponse::Standard { ok: true, .. }));
+
+        let delivered = tokio::time::timeout(
+            tokio::time::Duration::from_secs(1),
+            orchestrator.recv_task(),
+        )
+        .await
+        .expect("orchestrator should receive fallback task")
+        .expect("orchestrator recv should succeed");
+        match delivered {
+            IpcResponse::InboundTask { task_json, .. } => {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("payload should decode");
+                assert_eq!(payload["content"], "short half-life marker should die");
+            }
+            other => panic!("unexpected orchestrator inbound response: {other:?}"),
+        }
+
+        assert!(
+            tokio::time::timeout(
+                tokio::time::Duration::from_millis(200),
+                developer.recv_task()
+            )
+            .await
+            .is_err(),
+            "developer should not receive task when receptor_ingress marker has already undergone apoptosis"
         );
 
         unsafe {

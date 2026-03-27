@@ -334,7 +334,7 @@ one inbound payload.
 Those placement records now also carry explicit marker typing. Runtime
 provenance should include at least a `marker_kind` and `marker_source` so the
 hotel can distinguish transport continuity markers from role-handoff markers,
-membrane ingress markers, or later routing enzymes. A marker is more useful
+receptor ingress markers, or later routing enzymes. A marker is more useful
 when you know not just where it points, but what biological process expressed
 it.
 
@@ -349,6 +349,14 @@ placement gets a bounded lifetime and should undergo apoptosis when it goes
 stale or is superseded by newer placement truth. The point is not to crown a
 new exclusive holder; it is to keep useful local continuity briefly alive
 without letting old placement memories haunt the runtime forever.
+
+Different marker classes should not all age like the same tissue. A
+`receptor_ingress` marker is usually just a short-lived clue about where an
+incoming turn happened to land, so it should have a shorter half-life than a
+`transport_continuity` marker that was expressed specifically to carry agent
+placement across hotels. `role_handoff` markers can reasonably live a little
+longer because they encode an intentional operator or workflow move rather than
+an incidental ingress stain.
 
 In practice, a fresher active-incarnation update is the `p53` check here: if
 the runtime has newer local evidence that the session now belongs on a
