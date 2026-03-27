@@ -171,18 +171,65 @@ fn load_agent_graph_routing_preferences(agent_id: &str) -> Option<Vec<serde_json
     )
 }
 
-fn load_agent_graph_reflex_preferences(agent_id: &str) -> Option<Vec<serde_json::Value>> {
+fn latest_routing_policy_reflex_dispositions(
+    graph: &GraphDomain,
+    agent_id: &str,
+) -> HashMap<String, serde_json::Value> {
+    let mut dispositions = HashMap::new();
+    let Ok(policies) = graph.list_routing_policies(agent_id) else {
+        return dispositions;
+    };
+    for policy in policies {
+        let Some(preference_key) = policy.learned_reflex_preference_key.clone() else {
+            continue;
+        };
+        let decided_at = policy.operator_disposition.decided_at;
+        let replace = dispositions
+            .get(&preference_key)
+            .and_then(|existing| existing.get("decided_at"))
+            .and_then(|value| value.as_u64())
+            .map(|existing| decided_at >= existing)
+            .unwrap_or(true);
+        if replace {
+            dispositions.insert(
+                preference_key,
+                serde_json::json!({
+                    "proposal_id": policy.proposal_id,
+                    "state": policy.operator_disposition.state,
+                    "reason": policy.operator_disposition.reason,
+                    "decided_at": decided_at,
+                }),
+            );
+        }
+    }
+    dispositions
+}
+
+fn load_agent_graph_reflex_preferences(
+    graph: &GraphDomain,
+    agent_id: &str,
+) -> Option<(Vec<serde_json::Value>, Vec<serde_json::Value>)> {
     let path = agent_graph_db_path(agent_id);
     if !path.exists() {
         return None;
     }
     let storage = SqliteAgentGraphStorage::open(agent_id, &path).ok()?;
     let preferences = storage.list_reflex_preferences().ok()?;
-    Some(
-        preferences
-            .into_iter()
-            .filter_map(|preference| {
-                Some(serde_json::json!({
+    let dispositions = latest_routing_policy_reflex_dispositions(graph, agent_id);
+    let mut layers = Vec::new();
+    let mut suppressions = Vec::new();
+    for preference in preferences {
+        if let Some(disposition) = dispositions.get(&preference.preference_key) {
+            if disposition.get("state").and_then(|value| value.as_str()) == Some("rejected") {
+                suppressions.push(serde_json::json!({
+                    "preference_key": preference.preference_key,
+                    "reason": "suppressed_by_rejected_routing_policy",
+                    "routing_policy": disposition,
+                }));
+                continue;
+            }
+        }
+        layers.push(serde_json::json!({
                     "policy_scope": "agent_learned",
                     "policy_source": "agent_graph",
                     "origin_class": "agent_learned",
@@ -190,10 +237,9 @@ fn load_agent_graph_reflex_preferences(agent_id: &str) -> Option<Vec<serde_json:
                     "reason": preference.config_json.get("reason").cloned().unwrap_or(serde_json::Value::Null),
                     "preference_key": preference.preference_key,
                     "reflexes": preference.reflexes_json,
-                }))
-            })
-            .collect(),
-    )
+        }));
+    }
+    Some((layers, suppressions))
 }
 
 fn infer_marker_strength(
@@ -6635,16 +6681,24 @@ impl IpcServer {
                     });
                 }
             }
-            if let Some(reflex_policy_agent_layers) = load_agent_graph_reflex_preferences(agent_id)
+            if let Some((reflex_policy_agent_layers, reflex_policy_agent_suppressions)) =
+                load_agent_graph_reflex_preferences(graph, agent_id)
             {
                 if let Some(obj) = bindings.as_object_mut() {
                     obj.insert(
                         "reflex_policy_agent_layers".to_string(),
                         serde_json::Value::Array(reflex_policy_agent_layers),
                     );
+                    if !reflex_policy_agent_suppressions.is_empty() {
+                        obj.insert(
+                            "reflex_policy_agent_suppressions".to_string(),
+                            serde_json::Value::Array(reflex_policy_agent_suppressions),
+                        );
+                    }
                 } else {
                     bindings = serde_json::json!({
                         "reflex_policy_agent_layers": reflex_policy_agent_layers,
+                        "reflex_policy_agent_suppressions": reflex_policy_agent_suppressions,
                     });
                 }
             }
@@ -14511,6 +14565,159 @@ mod tests {
             pref.config_json["reason"],
             "approved routing.policy.propose write-back"
         );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+            std::env::remove_var("PHILOTIC_AGENT_GRAPH_DB");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        let _ = std::fs::remove_file(&graph_db_path);
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_session_snapshot_suppresses_rejected_agent_learned_reflex_policy() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let graph_db_template = test_agent_graph_db_template();
+        let agent_id = "agent-learned-rejected-01";
+        let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        if let Some(parent) = Path::new(&graph_db_path).parent() {
+            std::fs::create_dir_all(parent).expect("create agent graph parent");
+        }
+        let storage =
+            SqliteAgentGraphStorage::open(agent_id, Path::new(&graph_db_path)).expect("open db");
+        storage
+            .upsert_reflex_preference(&AgentReflexPreference {
+                agent_id: agent_id.into(),
+                preference_key: "operator-mesh-trust".into(),
+                precedence: 72,
+                reflexes_json: serde_json::json!({
+                    "remote_tool_reflex": "allow",
+                    "credential_scope_reflex": "mesh_scoped"
+                }),
+                config_json: serde_json::json!({"reason": "learned trust from prior approved sessions"}),
+                updated_at: 0,
+            })
+            .expect("seed reflex preference");
+
+        graph
+            .upsert_routing_policy(&ansible_mesh_core::graph::RoutingPolicyRecord {
+                proposal_id: "routing-policy-reject-01".into(),
+                agent_id: agent_id.into(),
+                problem: "Remote tool reach proved unsafe under review.".into(),
+                proposed_change: "Reject the learned remote-tool trust reflex.".into(),
+                evidence: "Operator observed unsafe reach expansion.".into(),
+                affected_stage: Some("cognition".into()),
+                affected_capability: Some("text.generate".into()),
+                learned_reflex_preference_key: Some("operator-mesh-trust".into()),
+                operator_disposition: ansible_mesh_core::graph::RoutingPolicyDispositionRecord {
+                    state: "rejected".into(),
+                    reason: "Rejected after operator review.".into(),
+                    decided_at: 99,
+                },
+                evaluations: vec![ansible_mesh_core::graph::RoutingPolicyEvaluationRecord {
+                    evaluation_kind: "operator_disposition".into(),
+                    decision: "rejected".into(),
+                    reason: "Rejected after operator review.".into(),
+                    created_at: 99,
+                    source_tool: Some("philotic-web".into()),
+                }],
+                created_at: 98,
+            })
+            .expect("seed routing policy");
+
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-agent-learned-reflex-rejected".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some(agent_id.into()),
+                active_incarnation_id: Some("agent-learned:orchestrator".into()),
+                channel_kind: Some("operator".into()),
+                channel_session_key: Some("chat-1".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "agent_runtime_provenance": {
+                        "marker_kind": "transport_continuity",
+                        "marker_source": "operator_chat",
+                        "marker_strength": "medium",
+                        "placement_risk_level": "guarded"
+                    }
+                }),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("seed session");
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+            std::env::set_var("PHILOTIC_AGENT_GRAPH_DB", &graph_db_template);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("client connect");
+
+        let response = client
+            .send_request(IpcRequest::GetConfig {
+                key: "__session_snapshot__:sess-agent-learned-reflex-rejected".into(),
+            })
+            .await
+            .expect("session snapshot request");
+
+        match response {
+            IpcResponse::ConfigData {
+                value_json: Some(value_json),
+                ..
+            } => {
+                let snapshot: serde_json::Value =
+                    serde_json::from_str(&value_json).expect("snapshot should decode");
+                let layers = snapshot["bindings"]["effective_reflex_policy"]["layers"]
+                    .as_array()
+                    .expect("layers array");
+                assert!(!layers.iter().any(|layer| {
+                    layer["origin_class"] == serde_json::json!("agent_learned")
+                        && layer["preference_key"] == serde_json::json!("operator-mesh-trust")
+                }));
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflexes"]["remote_tool_reflex"],
+                    "deny"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["reflex_policy_agent_suppressions"][0]["preference_key"],
+                    "operator-mesh-trust"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["reflex_policy_agent_suppressions"][0]["routing_policy"]["state"],
+                    "rejected"
+                );
+            }
+            other => panic!("unexpected session snapshot response: {other:?}"),
+        }
 
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");

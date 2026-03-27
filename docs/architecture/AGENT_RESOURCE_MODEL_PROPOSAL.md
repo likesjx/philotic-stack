@@ -460,6 +460,18 @@ That keeps routing policy governance from collapsing into “whatever happened a
 tool execution time must remain true forever,” which is emotionally relatable
 but architecturally terrible.
 
+The next step after later-life control is enforcement. A rejected routing-policy
+artifact linked to a learned reflex preference should actually inhibit that
+`agent_learned` layer during hotel binding assembly. The current slice now does
+that:
+
+- hotel snapshot assembly checks the latest routing-policy disposition for each
+  linked `learned_reflex_preference_key`
+- rejected disposition suppresses that `agent_learned` reflex layer from
+  `effective_reflex_policy`
+- suppression leaves a visible marker in bindings so the inhibition is
+  inspectable instead of mysteriously biochemical
+
 In practice, a fresher active-incarnation update is the `p53` check here: if
 the runtime has newer local evidence that the session now belongs on a
 different active guest, older delivery provenance should die immediately rather
