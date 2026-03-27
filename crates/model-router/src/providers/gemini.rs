@@ -23,6 +23,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::info;
 
 const GEMINI_LIVE_DEFAULT_MODEL: &str = "gemini-3.1-flash-live-preview";
+const GEMINI_AUDIO_TRANSCRIBE_DEFAULT_MODEL: &str = "gemini-3-flash-preview";
 const GEMINI_LIVE_PROTOCOL: &str = "gemini-live-v1beta";
 const GEMINI_LIVE_MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
 type GeminiLiveSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -131,6 +132,13 @@ impl GeminiProvider {
                 self.base_url, model
             )),
         }
+    }
+
+    fn request_model<'a>(&'a self, task: &'a ControllerTask) -> &'a str {
+        task.model.as_deref().unwrap_or_else(|| match task.kind {
+            TaskKind::AudioTranscribe => GEMINI_AUDIO_TRANSCRIBE_DEFAULT_MODEL,
+            _ => &self.default_model,
+        })
     }
 
     fn live_endpoint_url(&self) -> Result<reqwest::Url> {
@@ -1171,7 +1179,7 @@ impl ModelProvider for GeminiProvider {
             }
         }
 
-        let url = self.endpoint_url(task.model.as_deref())?;
+        let url = self.endpoint_url(Some(self.request_model(task)))?;
         let req = self.http_client.post(url).json(&payload);
         let response = self.apply_auth_headers(req)?.send().await?;
         let status = response.status();
@@ -1819,6 +1827,44 @@ mod tests {
         };
 
         assert!(crate::controller::ModelProvider::supports(&provider, &task));
+    }
+
+    #[test]
+    fn audio_transcribe_defaults_to_gemini_3_flash_preview() {
+        let provider = GeminiProvider::new(
+            reqwest::Client::new(),
+            Some(GeminiAuth::ApiKey("api-key".into())),
+            None,
+        );
+        let task = ControllerTask {
+            kind: TaskKind::AudioTranscribe,
+            request_class: RequestClass::Transform,
+            session_id: None,
+            turn_id: None,
+            provider: None,
+            model: None,
+            prompt: Some("Transcribe this audio verbatim.".into()),
+            text: None,
+            spoken_text: None,
+            display_text: None,
+            voice: None,
+            voice_id: None,
+            output_format: None,
+            language_code: None,
+            response_contract: Default::default(),
+            context: ContextEnvelope::default(),
+            context_projection: Default::default(),
+            affordances: Default::default(),
+            routing_hints: RoutingHints::default(),
+            provider_options: Default::default(),
+            effective_rights: Vec::new(),
+            tools: vec![],
+        };
+
+        assert_eq!(
+            provider.request_model(&task),
+            super::GEMINI_AUDIO_TRANSCRIBE_DEFAULT_MODEL
+        );
     }
 
     #[test]
