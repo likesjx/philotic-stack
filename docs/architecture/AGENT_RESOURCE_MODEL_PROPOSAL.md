@@ -365,6 +365,10 @@ Transitional note:
   hotel state and agent-owned overlay state
 - that relay path does not make the hotel the conceptual owner of the overlay
 - it also does not make downstream routers the owner of rights
+- the first enforcement slice is now live: hotel snapshots project an explicit
+  `effective_rights` key ring for tools, skills, and component capabilities, and
+  lower tool/component assembly paths consume that key ring instead of widening
+  visibility just because a runner or route exists
 
 ---
 

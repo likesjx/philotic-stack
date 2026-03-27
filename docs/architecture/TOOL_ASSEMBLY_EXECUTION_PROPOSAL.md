@@ -373,6 +373,21 @@ They must not:
 That would turn execution infrastructure into a stealth control plane, which is
 efficient only in the way stepping on a rake is an efficient lesson.
 
+Current implemented slice:
+
+- hotel session snapshots now project `bindings.effective_rights`
+- `philote` tool assembly filters visible tools through that key ring
+- hotel-side tool assembly and component-capability assembly also filter through
+  the same projected rights
+- allowed-incarnation tool assembly no longer widens visible tools merely
+  because a runner advertises support
+
+This is the first enforcement slice, not the full destination:
+
+- the right-token vocabulary is now shared
+- the full shared catalog layer for models, tools, skills, and rights is still
+  a follow-on seam
+
 ## Proposed Runtime Flow
 
 ### 1. Session snapshot load

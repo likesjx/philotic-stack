@@ -6,6 +6,9 @@ use crate::service::lease::{
 };
 use crate::vault::{SecretAccess, resolve_secret};
 use ansible_mesh_core::agent_graph_storage::{AgentGraphStorage, SqliteAgentGraphStorage};
+use ansible_mesh_core::catalog_rights::{
+    component_right, has_right, normalize_rights, skill_right, tool_right,
+};
 use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
 use ansible_mesh_core::graph::{AbstractSkillRecord, SkillValidationState};
@@ -30,7 +33,7 @@ use philotic_client::{
     OperatorChatTurnReply, OperatorSurfaceQueryHandoff, OperatorTargetAgentInventoryView,
     OperatorTargetGuestInventoryView, OperatorTargetStatusView, PhiloticClient, SubagentDelegation,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::Arc;
@@ -144,6 +147,59 @@ fn load_agent_graph_routing_preferences(agent_id: &str) -> Option<Vec<serde_json
             .filter_map(|preference| serde_json::to_value(preference).ok())
             .collect(),
     )
+}
+
+fn declared_component_capabilities(bindings: &serde_json::Value) -> Vec<String> {
+    let mut capabilities =
+        BTreeSet::from(["media.analyze".to_string(), "text.generate".to_string()]);
+
+    for route in bindings
+        .get("component_routes")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(capability) = route.get("capability").and_then(serde_json::Value::as_str) {
+            capabilities.insert(capability.to_string());
+        }
+    }
+
+    capabilities.into_iter().collect()
+}
+
+fn project_effective_rights(bindings: &serde_json::Value) -> Vec<String> {
+    let toolset = bindings
+        .get("effective_toolset")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let skillset = bindings
+        .get("effective_skillset")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let mut rights = Vec::new();
+    rights.extend(toolset.iter().map(|tool_name| tool_right(tool_name)));
+    rights.extend(skillset.iter().map(|skill_name| skill_right(skill_name)));
+    rights.extend(
+        declared_component_capabilities(bindings)
+            .into_iter()
+            .map(|capability| component_right(&capability)),
+    );
+    normalize_rights(rights)
 }
 
 #[derive(Debug, Clone)]
@@ -5567,6 +5623,16 @@ impl IpcServer {
             }
         }
 
+        {
+            let effective_rights = project_effective_rights(&bindings);
+            if let Some(obj) = bindings.as_object_mut() {
+                obj.insert(
+                    "effective_rights".to_string(),
+                    serde_json::json!(effective_rights),
+                );
+            }
+        }
+
         let role_activation = active_role_record
             .and_then(|role_record| {
                 let effective_skillset = bindings
@@ -5841,23 +5907,26 @@ fn compose_component_route_assembly(
 }
 
 fn default_component_capabilities(bindings: &serde_json::Value) -> Vec<String> {
-    let mut capabilities = std::collections::BTreeSet::from([
-        "text.generate".to_string(),
-        "media.analyze".to_string(),
-    ]);
-
-    for route in bindings
-        .get("component_routes")
+    let capabilities = declared_component_capabilities(bindings);
+    let rights = bindings
+        .get("effective_rights")
         .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        if let Some(capability) = route.get("capability").and_then(serde_json::Value::as_str) {
-            capabilities.insert(capability.to_string());
-        }
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if rights.is_empty() {
+        return capabilities;
     }
 
-    capabilities.into_iter().collect()
+    capabilities
+        .into_iter()
+        .filter(|capability| has_right(&rights, &component_right(capability)))
+        .collect()
 }
 
 fn select_component_route(
@@ -6233,7 +6302,25 @@ fn default_visible_toolset(bindings: &serde_json::Value) -> Vec<String> {
     if toolset.is_empty() {
         toolset.push("echo".into());
     }
+    let rights = bindings
+        .get("effective_rights")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if rights.is_empty() {
+        return toolset;
+    }
+
     toolset
+        .into_iter()
+        .filter(|tool_name| has_right(&rights, &tool_right(tool_name)))
+        .collect()
 }
 
 fn remote_tool_advertisements(
@@ -6468,7 +6555,18 @@ fn compose_tool_assembly_from_incarnations(
     incarnations: &[AllowedIncarnation],
 ) -> serde_json::Value {
     let preferences = parse_routing_preferences(bindings);
-    let toolset = {
+    let rights = bindings
+        .get("effective_rights")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut toolset = {
         let filtered = default_visible_toolset(bindings);
         if bindings
             .get("effective_toolset")
@@ -6485,6 +6583,9 @@ fn compose_tool_assembly_from_incarnations(
                 .collect::<Vec<_>>()
         }
     };
+    if !rights.is_empty() {
+        toolset.retain(|tool_name| has_right(&rights, &tool_right(tool_name)));
+    }
 
     let tools_for_model = toolset
         .iter()
@@ -6661,12 +6762,11 @@ mod tests {
     use ansible_mesh_core::registry::{CapabilityAdvertisement, NodeRegistry};
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
     use ansible_mesh_core::storage::{
-        AgentIdentityRecord, GraphStorage, GuestRecord, HotelRecord, SecretRecord,
-        SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,
+        AgentIdentityRecord, GuestRecord, HotelRecord, SessionRecord, SessionTurnRecord,
     };
     use base64::Engine;
     use philotic_client::{
-        GuestIdentity, HandoffBundle, HookKind, OperatorTargetView, PhiloticClient,
+        GuestIdentity, HandoffBundle, OperatorTargetView, PhiloticClient,
         SubagentCompletionContract, SubagentContextPacket, SubagentDelegation,
     };
     use std::path::Path;
@@ -6852,269 +6952,6 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct TestGraphStorage;
-
-    impl GraphStorage for TestGraphStorage {
-        fn load_node_capabilities(&self) -> anyhow::Result<Option<NodeCapabilities>> {
-            Ok(None)
-        }
-        fn save_node_capabilities(&self, _caps: &NodeCapabilities) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn get_config_value(&self, _key: &str) -> anyhow::Result<Option<String>> {
-            Ok(None)
-        }
-        fn set_config_value(&self, _key: &str, _value_json: &str) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn upsert_secret(&self, _secret: &SecretRecord) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn get_secret(&self, _secret_ref: &str) -> anyhow::Result<Option<SecretRecord>> {
-            Ok(None)
-        }
-        fn get_hotel(&self, _hotel_name: &str) -> anyhow::Result<Option<HotelRecord>> {
-            Ok(None)
-        }
-        fn list_hotels(&self) -> anyhow::Result<Vec<HotelRecord>> {
-            Ok(vec![])
-        }
-        fn upsert_hotel(&self, _hotel: &HotelRecord) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn set_hotel_pid(&self, _hotel_name: &str, _pid: Option<&str>) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn list_guests(
-            &self,
-            _hotel_name: &str,
-            _active_only: bool,
-        ) -> anyhow::Result<Vec<GuestRecord>> {
-            Ok(vec![])
-        }
-        fn set_guest_pid(
-            &self,
-            _hotel_name: &str,
-            _guest_id: &str,
-            _pid: Option<&str>,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn set_guest_active(
-            &self,
-            _hotel_name: &str,
-            _guest_id: &str,
-            _active: bool,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn seed_guests(&self, _hotel_name: &str, _guests: &[GuestRecord]) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn upsert_agent_identity(&self, _identity: &AgentIdentityRecord) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn list_agent_identities(&self) -> anyhow::Result<Vec<AgentIdentityRecord>> {
-            Ok(vec![])
-        }
-        fn get_agent_identity(
-            &self,
-            _agent_id: &str,
-        ) -> anyhow::Result<Option<AgentIdentityRecord>> {
-            Ok(None)
-        }
-        fn sync_apartment(
-            &self,
-            _agent_id: &str,
-            _memory_type: &str,
-            _content_json: &serde_json::Value,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn get_apartment(
-            &self,
-            _agent_id: &str,
-            _memory_type: &str,
-        ) -> anyhow::Result<Option<serde_json::Value>> {
-            Ok(None)
-        }
-        fn upsert_session(&self, _session: &SessionRecord) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn get_session(&self, _session_id: &str) -> anyhow::Result<Option<SessionRecord>> {
-            Ok(None)
-        }
-        fn upsert_role_incarnation(&self, _role: &RoleIncarnationRecord) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn get_role_incarnation(
-            &self,
-            _agent_id: &str,
-            _role_name: &str,
-        ) -> anyhow::Result<Option<RoleIncarnationRecord>> {
-            Ok(None)
-        }
-        fn list_role_incarnations(
-            &self,
-            _agent_id: &str,
-        ) -> anyhow::Result<Vec<RoleIncarnationRecord>> {
-            Ok(vec![])
-        }
-        fn upsert_session_participant(
-            &self,
-            _participant: &SessionParticipantRecord,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn list_session_participants(
-            &self,
-            _session_id: &str,
-        ) -> anyhow::Result<Vec<SessionParticipantRecord>> {
-            Ok(vec![])
-        }
-        fn upsert_session_turn(&self, _turn: &SessionTurnRecord) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn get_session_turn(
-            &self,
-            _session_id: &str,
-            _turn_id: &str,
-        ) -> anyhow::Result<Option<SessionTurnRecord>> {
-            Ok(None)
-        }
-        fn list_session_turns(
-            &self,
-            _session_id: &str,
-            _limit: usize,
-        ) -> anyhow::Result<Vec<SessionTurnRecord>> {
-            Ok(vec![])
-        }
-        fn append_session_event(&self, _event: &SessionEventRecord) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn list_session_events(
-            &self,
-            _session_id: &str,
-            _limit: usize,
-        ) -> anyhow::Result<Vec<SessionEventRecord>> {
-            Ok(vec![])
-        }
-
-        fn upsert_abstract_tool(
-            &self,
-            _tool: &ansible_mesh_core::graph::AbstractToolRecord,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn get_abstract_tool(
-            &self,
-            _tool_name: &str,
-        ) -> anyhow::Result<Option<ansible_mesh_core::graph::AbstractToolRecord>> {
-            Ok(None)
-        }
-
-        fn list_abstract_tools(
-            &self,
-        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::AbstractToolRecord>> {
-            Ok(vec![])
-        }
-
-        fn upsert_abstract_skill(
-            &self,
-            _skill: &ansible_mesh_core::graph::AbstractSkillRecord,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn get_abstract_skill(
-            &self,
-            _skill_name: &str,
-        ) -> anyhow::Result<Option<ansible_mesh_core::graph::AbstractSkillRecord>> {
-            Ok(None)
-        }
-
-        fn list_abstract_skills(
-            &self,
-        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::AbstractSkillRecord>> {
-            Ok(vec![])
-        }
-
-        fn list_role_incarnations_by_guest_id(
-            &self,
-            _guest_id: &str,
-        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::RoleIncarnationRecord>> {
-            Ok(vec![])
-        }
-
-        fn set_guest_last_active(
-            &self,
-            _hotel_name: &str,
-            _guest_id: &str,
-            _epoch: u64,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn upsert_toolset_profile(
-            &self,
-            _profile: &ansible_mesh_core::graph::ToolsetProfileRecord,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn get_toolset_profile(
-            &self,
-            _profile_name: &str,
-        ) -> anyhow::Result<Option<ansible_mesh_core::graph::ToolsetProfileRecord>> {
-            Ok(None)
-        }
-
-        fn list_toolset_profiles(
-            &self,
-        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::ToolsetProfileRecord>> {
-            Ok(vec![])
-        }
-
-        fn upsert_rule(&self, _rule: &ansible_mesh_core::graph::RuleRecord) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn get_rule(
-            &self,
-            _rule_id: &str,
-        ) -> anyhow::Result<Option<ansible_mesh_core::graph::RuleRecord>> {
-            Ok(None)
-        }
-
-        fn list_rules(
-            &self,
-            _agent_id: &str,
-        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::RuleRecord>> {
-            Ok(vec![])
-        }
-
-        fn upsert_workflow_skill(
-            &self,
-            _skill: &ansible_mesh_core::graph::WorkflowSkillRecord,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn get_workflow_skill(
-            &self,
-            _workflow_name: &str,
-        ) -> anyhow::Result<Option<ansible_mesh_core::graph::WorkflowSkillRecord>> {
-            Ok(None)
-        }
-
-        fn list_workflow_skills(
-            &self,
-        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::WorkflowSkillRecord>> {
-            Ok(vec![])
-        }
-    }
     fn test_socket_path() -> String {
         format!("/tmp/ipc-e2e-{}.sock", Uuid::new_v4().simple())
     }
@@ -8823,6 +8660,21 @@ mod tests {
                     skillset.iter().any(|s| s == "handoff.back"),
                     "expected handoff.back in effective_skillset, got {skillset:?}"
                 );
+                let rights = snap["bindings"]["effective_rights"]
+                    .as_array()
+                    .expect("effective_rights should be an array");
+                assert!(
+                    rights.iter().any(|r| r == "tool.session.status"),
+                    "expected tool.session.status in effective_rights, got {rights:?}"
+                );
+                assert!(
+                    rights.iter().any(|r| r == "tool.workspace.read"),
+                    "expected tool.workspace.read in effective_rights, got {rights:?}"
+                );
+                assert!(
+                    rights.iter().any(|r| r == "skill.handoff.back"),
+                    "expected skill.handoff.back in effective_rights, got {rights:?}"
+                );
                 assert_eq!(snap["role_activation"]["toolset_profile_ref"], "codex");
             }
             other => panic!("unexpected response: {other:?}"),
@@ -9016,6 +8868,10 @@ mod tests {
                     snapshot["bindings"]["effective_workspace_ref"],
                     "workspace://main"
                 );
+                assert_eq!(
+                    snapshot["bindings"]["effective_rights"][0],
+                    "component.media.analyze"
+                );
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -9028,6 +8884,79 @@ mod tests {
         if Path::new(&socket_path).exists() {
             let _ = std::fs::remove_file(&socket_path);
         }
+    }
+
+    #[test]
+    fn compose_tool_assembly_does_not_widen_beyond_effective_rights() {
+        let bindings = serde_json::json!({
+            "effective_toolset": ["echo", "agent.configure"],
+            "effective_rights": ["tool.echo"],
+        });
+
+        let assembly = compose_tool_assembly(&bindings, &[], &[], &[], "local-aiua-01");
+        let tools = assembly["tools_for_model"]
+            .as_array()
+            .expect("tools_for_model should be an array");
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["tool_name"], "echo");
+        assert!(
+            assembly["execution_routes"]
+                .get("agent.configure")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn incarnation_tool_assembly_does_not_widen_beyond_effective_rights() {
+        let bindings = serde_json::json!({
+            "effective_rights": ["tool.workspace.read"],
+            "allowed_tool_runner_incarnations": [{
+                "incarnation_id": "runner-1",
+                "runner_id": "runner-1",
+                "target_node": "local-aiua-01",
+                "target_role": "tool.workspace",
+                "supported_tools": ["workspace.read", "workspace.list"]
+            }]
+        });
+
+        let assembly = compose_tool_assembly_from_incarnations(
+            &bindings,
+            &[AllowedIncarnation {
+                incarnation_id: "runner-1".into(),
+                runner_id: Some("runner-1".into()),
+                hotel_id: None,
+                environment_id: None,
+                target_node: Some("local-aiua-01".into()),
+                target_role: Some("tool.workspace".into()),
+                supported_tools: vec!["workspace.read".into(), "workspace.list".into()],
+                execution_mode: "capability".into(),
+                availability_state: "live".into(),
+                selection_hint: None,
+            }],
+        );
+
+        let tools = assembly["tools_for_model"]
+            .as_array()
+            .expect("tools_for_model should be an array");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["tool_name"], "workspace.read");
+        assert!(assembly["execution_routes"].get("workspace.read").is_some());
+        assert!(assembly["execution_routes"].get("workspace.list").is_none());
+    }
+
+    #[test]
+    fn default_component_capabilities_follow_effective_rights() {
+        let bindings = serde_json::json!({
+            "component_routes": [
+                { "capability": "voice.synthesize" }
+            ],
+            "effective_rights": ["component.text.generate"],
+        });
+
+        let capabilities = default_component_capabilities(&bindings);
+
+        assert_eq!(capabilities, vec!["text.generate".to_string()]);
     }
 
     #[tokio::test]

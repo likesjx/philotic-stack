@@ -1,5 +1,6 @@
 use crate::catalog::{tool_catalog, tool_class, tool_requires_approval};
 use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
+use ansible_mesh_core::catalog_rights::{has_right, tool_right};
 use philotic_client::{
     HandoffBundle, SubagentCompletionContract, SubagentContextPacket, SubagentDelegation,
 };
@@ -674,6 +675,8 @@ pub struct RoutingPreferenceBinding {
 pub struct SessionBindings {
     #[serde(default)]
     pub effective_toolset: Vec<String>,
+    #[serde(default)]
+    pub effective_rights: Vec<String>,
     #[serde(default)]
     pub effective_skillset: Vec<String>,
     #[serde(default)]
@@ -3520,7 +3523,14 @@ fn default_visible_toolset(bindings: &SessionBindings) -> Vec<String> {
         }
     }
 
+    if bindings.effective_rights.is_empty() {
+        return toolset;
+    }
+
     toolset
+        .into_iter()
+        .filter(|tool_name| has_right(&bindings.effective_rights, &tool_right(tool_name)))
+        .collect()
 }
 
 fn is_local_agent_tool(tool_name: &str) -> bool {
@@ -3597,7 +3607,7 @@ fn task_runner_base_config_for_tool(
 }
 
 fn tool_assembly_from_allowed_incarnations(bindings: &SessionBindings) -> ToolAssembly {
-    let visible_tools = if bindings.effective_toolset.is_empty() {
+    let mut visible_tools = if bindings.effective_toolset.is_empty() {
         bindings
             .allowed_tool_runner_incarnations
             .iter()
@@ -3608,6 +3618,10 @@ fn tool_assembly_from_allowed_incarnations(bindings: &SessionBindings) -> ToolAs
     } else {
         bindings.effective_toolset.clone()
     };
+    if !bindings.effective_rights.is_empty() {
+        visible_tools
+            .retain(|tool_name| has_right(&bindings.effective_rights, &tool_right(tool_name)));
+    }
 
     let catalog = tool_catalog();
     let tools_for_model = visible_tools
@@ -3892,6 +3906,7 @@ mod tests {
         merge_session_index, session_checkpoint_memory_type,
     };
     use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
+    use ansible_mesh_core::catalog_rights::tool_right;
     use uuid::Uuid;
 
     #[test]
@@ -4304,6 +4319,7 @@ mod tests {
             state.bindings,
             SessionBindings {
                 effective_toolset: vec!["echo".into(), "workspace.read".into()],
+                effective_rights: Vec::new(),
                 effective_skillset: vec!["planning".into()],
                 effective_skill_guidance: Vec::new(),
                 effective_workspace_ref: Some("workspace://main".into()),
@@ -4721,6 +4737,43 @@ mod tests {
     }
 
     #[test]
+    fn default_tool_assembly_does_not_widen_beyond_effective_rights() {
+        let state = SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        let mut bindings = state.bindings.clone();
+        bindings.effective_toolset = vec!["agent.configure".into(), "echo".into()];
+        bindings.effective_rights = vec![tool_right("echo")];
+
+        let assembly = default_tool_assembly_for_bindings(&bindings);
+
+        assert!(!assembly.policy_annotations.contains_key("agent.configure"));
+        assert!(assembly.policy_annotations.contains_key("echo"));
+        assert_eq!(assembly.tools_for_model.len(), 1);
+        assert_eq!(assembly.tools_for_model[0].tool_name, "echo");
+    }
+
+    #[test]
+    fn allowed_incarnation_tool_assembly_respects_effective_rights() {
+        let state = SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        let mut bindings = state.bindings.clone();
+        bindings.effective_rights = vec![tool_right("workspace.read")];
+        bindings.allowed_tool_runner_incarnations = vec![ToolRunnerIncarnationBinding {
+            incarnation_id: "runner-1".into(),
+            runner_id: Some("runner-1".into()),
+            target_node: Some("local-aiua-01".into()),
+            target_role: Some("tool.workspace".into()),
+            supported_tools: vec!["workspace.read".into(), "workspace.list".into()],
+            ..Default::default()
+        }];
+
+        let assembly = default_tool_assembly_for_bindings(&bindings);
+
+        assert!(assembly.execution_routes.contains_key("workspace.read"));
+        assert!(!assembly.execution_routes.contains_key("workspace.list"));
+        assert_eq!(assembly.tools_for_model.len(), 1);
+        assert_eq!(assembly.tools_for_model[0].tool_name, "workspace.read");
+    }
+
+    #[test]
     fn prompt_reflects_session_preapproval() {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
@@ -4737,6 +4790,7 @@ mod tests {
         state.status = "paused".into();
         state.bindings = SessionBindings {
             effective_toolset: vec!["echo".into()],
+            effective_rights: Vec::new(),
             effective_skillset: vec!["planning".into()],
             effective_skill_guidance: Vec::new(),
             effective_workspace_ref: Some("workspace://main".into()),

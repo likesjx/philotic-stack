@@ -6981,6 +6981,9 @@ impl AgentRuntime {
         let new_toolset: Option<Vec<String>> = bindings
             .get("effective_toolset")
             .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let new_rights: Option<Vec<String>> = bindings
+            .get("effective_rights")
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
         let new_skillset: Option<Vec<String>> = bindings
             .get("effective_skillset")
             .and_then(|v| serde_json::from_value(v.clone()).ok());
@@ -6996,6 +6999,12 @@ impl AgentRuntime {
         if let Some(toolset) = new_toolset {
             if toolset != state.bindings.effective_toolset {
                 state.bindings.effective_toolset = toolset;
+                changed = true;
+            }
+        }
+        if let Some(rights) = new_rights {
+            if rights != state.bindings.effective_rights {
+                state.bindings.effective_rights = rights;
                 changed = true;
             }
         }
@@ -7297,6 +7306,7 @@ mod tests {
         let snapshot = serde_json::json!({
             "bindings": {
                 "effective_toolset": ["echo"],
+                "effective_rights": ["component.media.analyze", "component.text.generate", "tool.echo"],
                 "effective_skillset": ["planning"]
             },
             "component_route_assembly": {
@@ -7323,6 +7333,14 @@ mod tests {
         assert_eq!(route.target_node, "default-aiua-01");
         assert_eq!(route.hotel_id.as_deref(), Some("default"));
         assert_eq!(state.bindings.effective_toolset, vec!["echo"]);
+        assert_eq!(
+            state.bindings.effective_rights,
+            vec![
+                "component.media.analyze".to_string(),
+                "component.text.generate".to_string(),
+                "tool.echo".to_string(),
+            ]
+        );
         assert_eq!(state.bindings.effective_skillset, vec!["planning"]);
     }
 
@@ -7962,6 +7980,7 @@ mod tests {
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         let snapshot = serde_json::json!({
             "bindings": {
+                "effective_rights": ["tool.echo"],
                 "routing_preferences": [{
                     "preference_key": "cognition-gemini-flash",
                     "stage_kind": "cognition",
@@ -7977,6 +7996,10 @@ mod tests {
 
         AgentRuntime::merge_snapshot_bindings(&mut state, &snapshot);
 
+        assert_eq!(
+            state.bindings.effective_rights,
+            vec!["tool.echo".to_string()]
+        );
         assert_eq!(
             state.bindings.routing_preferences,
             vec![RoutingPreferenceBinding {
