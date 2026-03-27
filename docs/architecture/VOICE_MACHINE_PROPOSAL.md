@@ -3,7 +3,7 @@ title: "Philotic Voice Machine Proposal"
 doc_type: proposal
 domain: membrane-transport
 status: accepted-current-slice
-last_updated: 2026-03-12
+last_updated: 2026-03-26
 tags:
   - voice
   - media
@@ -44,7 +44,7 @@ without turning `philote` into an audio pipeline with opinions.
 
 ## Disposition
 
-`in progress — policy-driven voice ingress/egress and watched-live Telegram audio delivery are working; transcription-to-reasoning re-entry is the current agent-core seam, and the dedicated voice machine component is not yet materialised`
+`in progress — policy-driven voice ingress/egress and watched-live Telegram audio delivery are working; philote now carries an explicit staged turn routing plan for voice turns, but the dedicated voice machine component is not yet materialised`
 
 Track active work in [task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md).
 
@@ -98,6 +98,30 @@ Current agent-core requirement:
 - `voice.transcribe` is an intermediate transform, not the final assistant answer
 - the transcript must be routed back into the normal reasoning loop as the user turn
 - only the post-reasoning assistant reply should flow into `voice.synthesize`
+
+### Current turn-routing slice
+
+`philote` now treats a voice turn as a staged execution contract instead of a lucky branch:
+
+1. `ingress` — `voice.transcribe` as a `transform` request
+2. `cognition` — `text.generate` as the normal agent reasoning turn
+3. `egress` — `voice.synthesize` as a `synthesis` request when voice reply policy is active
+
+That plan is compiled at turn start, stored on the active turn, checkpointed with session recovery state, and surfaced in task progress updates (`waiting_model`, transcription re-entry `waiting_model`, and `waiting_voice`).
+
+The current implementation now also uses the stage plan at request assembly time:
+
+- ingress transform calls get a slimmer context envelope with no tool history, no recalled memory, and only a minimal recent dialogue window
+- non-cognitive stages suppress tool projection entirely, even if the session has tools bound
+- cognitive calls keep the full reasoning envelope
+- low-intent cognitive turns now ask for fewer side channels, so gratitude/ack turns do not request planning or memory artifacts by default
+- model requests now carry stage-derived `routing_hints` so model-controller can see provider preference, controller role, capability, and envelope intent without becoming the owner of the turn
+
+This is intentionally still transitional:
+
+- the stage plan is turn-local observability and execution intent, not a second routing authority
+- component-route resolution and provider invocation still belong to the existing model-controller/runtime seams
+- context envelopes are now stage-aware at request assembly time, but the deeper payload-builder split is still transitional
 
 ### Example config
 
@@ -168,6 +192,7 @@ Use when:
 - transcript quality matters
 - text artifacts are required
 - the selected model is text-native
+- the session should preserve one canonical agent-owned turn across the whole flow
 
 ### 2. Native Speech-to-Speech
 

@@ -194,6 +194,11 @@ pub struct Affordances {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RoutingHints {
     pub implementation: Option<String>,
+    pub controller_role: Option<String>,
+    pub capability: Option<String>,
+    pub context_envelope: Option<String>,
+    pub stage: Option<String>,
+    pub streaming: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -949,6 +954,23 @@ fn parse_routing_hints(value: Option<&Value>) -> RoutingHints {
             .get("implementation")
             .and_then(Value::as_str)
             .map(str::to_string),
+        controller_role: object
+            .get("controller_role")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        capability: object
+            .get("capability")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        context_envelope: object
+            .get("context_envelope")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        stage: object
+            .get("stage")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        streaming: object.get("streaming").and_then(Value::as_bool),
     }
 }
 
@@ -1687,6 +1709,42 @@ mod tests {
     }
 
     #[test]
+    fn parses_extended_stage_routing_hints() {
+        let task = ControllerTask::from_value(&json!({
+            "kind": "voice.synthesize",
+            "text": "hello",
+            "routing_hints": {
+                "implementation": "elevenlabs",
+                "controller_role": "model.elevenlabs",
+                "capability": "voice.synthesize",
+                "context_envelope": "egress",
+                "stage": "egress",
+                "streaming": true
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            task.routing_hints.implementation.as_deref(),
+            Some("elevenlabs")
+        );
+        assert_eq!(
+            task.routing_hints.controller_role.as_deref(),
+            Some("model.elevenlabs")
+        );
+        assert_eq!(
+            task.routing_hints.capability.as_deref(),
+            Some("voice.synthesize")
+        );
+        assert_eq!(
+            task.routing_hints.context_envelope.as_deref(),
+            Some("egress")
+        );
+        assert_eq!(task.routing_hints.stage.as_deref(), Some("egress"));
+        assert_eq!(task.routing_hints.streaming, Some(true));
+    }
+
+    #[test]
     fn parses_affordances_separately_from_context() {
         let task = ControllerTask::from_value(&json!({
             "kind": "text.generate",
@@ -1810,7 +1868,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.result["spoken_text"], "Hello back, warmly.");
-        assert_eq!(response.result["partial_replies"], json!(["Hello", "Hello back"]));
+        assert_eq!(
+            response.result["partial_replies"],
+            json!(["Hello", "Hello back"])
+        );
         assert_eq!(
             response.result["working_memory_delta"],
             "The user greeted the assistant."

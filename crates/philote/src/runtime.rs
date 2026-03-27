@@ -8,7 +8,8 @@ use crate::protocol::{
 };
 use crate::session::{
     ActivePlan, AgentProfile, ComponentRouteAssembly, MediaRoutingPolicy, RecalledMemoryRecord,
-    SessionState, ToolExecutionRoute, TtsMode, VoiceResponsePolicy, WorkingTurn,
+    SessionState, ToolExecutionRoute, TtsMode, TurnContextEnvelopeKind, TurnRoutingPlan,
+    TurnRoutingStageKind, TurnRoutingStagePlan, VoiceResponsePolicy, WorkingTurn,
     merge_session_index,
 };
 use anyhow::Result;
@@ -379,11 +380,123 @@ fn action_to_capability(action: &str) -> &'static str {
     }
 }
 
+fn role_to_provider_hint(role: &str) -> Option<String> {
+    let provider = role
+        .strip_prefix("model.")
+        .filter(|provider| !provider.is_empty())?;
+    Some(provider.to_string())
+}
+
+fn compile_turn_routing_plan(
+    media_routing: Option<&MediaRouting>,
+    voice_policy: Option<&VoiceResponsePolicy>,
+    had_voice_input: bool,
+) -> TurnRoutingPlan {
+    let mut stages = Vec::new();
+
+    if let Some(routing) = media_routing {
+        let controller_role = match routing.capability {
+            "voice.transcribe" => DEFAULT_VOICE_MODEL_ROLE,
+            _ => DEFAULT_TEXT_MODEL_ROLE,
+        };
+        stages.push(TurnRoutingStagePlan {
+            kind: TurnRoutingStageKind::Ingress,
+            capability: routing.capability.to_string(),
+            request_class: "transform".into(),
+            context_envelope: TurnContextEnvelopeKind::Ingress,
+            controller_role: controller_role.into(),
+            provider_hint: role_to_provider_hint(controller_role),
+            streaming: routing.capability == "voice.transcribe",
+        });
+    }
+
+    stages.push(TurnRoutingStagePlan {
+        kind: TurnRoutingStageKind::Cognition,
+        capability: "text.generate".into(),
+        request_class: "cognitive".into(),
+        context_envelope: TurnContextEnvelopeKind::Cognitive,
+        controller_role: DEFAULT_TEXT_MODEL_ROLE.into(),
+        provider_hint: role_to_provider_hint(DEFAULT_TEXT_MODEL_ROLE),
+        streaming: true,
+    });
+
+    let tts_mode_enabled = voice_policy
+        .map(|policy| match policy.mode {
+            TtsMode::Off => false,
+            TtsMode::Auto => had_voice_input,
+            TtsMode::On => true,
+        })
+        .unwrap_or(false);
+    if tts_mode_enabled {
+        let controller_role = DEFAULT_VOICE_MODEL_ROLE;
+        stages.push(TurnRoutingStagePlan {
+            kind: TurnRoutingStageKind::Egress,
+            capability: "voice.synthesize".into(),
+            request_class: "synthesis".into(),
+            context_envelope: TurnContextEnvelopeKind::Egress,
+            controller_role: controller_role.into(),
+            provider_hint: role_to_provider_hint(controller_role),
+            streaming: true,
+        });
+    }
+
+    TurnRoutingPlan {
+        trigger: if media_routing
+            .map(|routing| routing.capability == "voice.transcribe")
+            .unwrap_or(false)
+        {
+            "voice_input".into()
+        } else if had_voice_input {
+            "voice_input_no_transform".into()
+        } else {
+            "text_input".into()
+        },
+        stages,
+    }
+}
+
+fn stage_plan(
+    turn_routing_plan: &TurnRoutingPlan,
+    kind: TurnRoutingStageKind,
+) -> Option<&TurnRoutingStagePlan> {
+    turn_routing_plan
+        .stages
+        .iter()
+        .find(|stage| stage.kind == kind)
+}
+
+fn stage_routing_hints(stage: &TurnRoutingStagePlan) -> serde_json::Value {
+    serde_json::json!({
+        "implementation": stage.provider_hint,
+        "controller_role": stage.controller_role,
+        "capability": stage.capability,
+        "context_envelope": match stage.context_envelope {
+            TurnContextEnvelopeKind::Ingress => "ingress",
+            TurnContextEnvelopeKind::Cognitive => "cognitive",
+            TurnContextEnvelopeKind::Egress => "egress",
+        },
+        "stage": match stage.kind {
+            TurnRoutingStageKind::Ingress => "ingress",
+            TurnRoutingStageKind::Cognition => "cognition",
+            TurnRoutingStageKind::Egress => "egress",
+        },
+        "streaming": stage.streaming,
+    })
+}
+
+fn active_turn_stage_routing_hints(
+    state: Option<&SessionState>,
+    kind: TurnRoutingStageKind,
+) -> Option<serde_json::Value> {
+    let turn_routing_plan = state?.active_turn_routing_plan()?;
+    let stage = stage_plan(turn_routing_plan, kind)?;
+    Some(stage_routing_hints(stage))
+}
+
 struct MediaRouting {
     action: String,
     capability: &'static str,
     attachments: Vec<TransportAttachment>,
-    strip_tools: bool,
 }
 
 /// Applies the agent's `MediaRoutingPolicy` to the candidate blob-backed attachments and returns
@@ -422,7 +535,6 @@ fn resolve_media_routing(
         action: action_str.to_string(),
         capability: action_to_capability(action_str),
         attachments: candidate_attachments,
-        strip_tools: policy.strip_tools_on_media,
     })
 }
 
@@ -854,6 +966,7 @@ impl AgentRuntime {
                 provider_repair_attempts: 0,
                 pending_text_reply: None,
                 had_voice_input,
+                turn_routing_plan: None,
                 awaiting_transcription_reentry: false,
                 scripted_loop_context: None,
             });
@@ -880,30 +993,15 @@ impl AgentRuntime {
 
         self.maybe_auto_recall_turn_memory(&session_id).await?;
 
-        let (
-            checkpoint_memory_type,
-            checkpoint_json,
-            index_state,
-            model_prompt,
-            model_context,
-            context_projection,
-            tools_for_model,
-        ) = {
+        let (checkpoint_memory_type, checkpoint_json, index_state) = {
             let state = self
                 .sessions
                 .get_mut(&session_id)
                 .expect("session should exist after ensuring and binding transport target");
-            let tools_for_model = state.project_tools_for_turn(&content);
-            let (model_prompt, model_context, context_projection) =
-                state.model_request_payloads(&content, &tools_for_model);
             (
                 state.checkpoint_memory_type(),
                 state.checkpoint_json(),
                 state.clone(),
-                model_prompt,
-                model_context,
-                context_projection,
-                tools_for_model,
             )
         };
 
@@ -980,12 +1078,35 @@ impl AgentRuntime {
             .get(&session_id)
             .map(|s| s.agent_profile.media_routing_policy.clone())
             .unwrap_or_default();
+        let voice_policy = self
+            .sessions
+            .get(&session_id)
+            .map(|s| s.agent_profile.voice_response_policy.clone())
+            .unwrap_or_default();
         let media_attachments = media_analysis_attachments(&task);
         let media_routing = resolve_media_routing(&media_policy, media_attachments);
+        let turn_routing_plan =
+            compile_turn_routing_plan(media_routing.as_ref(), Some(&voice_policy), had_voice_input);
         let awaiting_transcription_reentry = media_routing
             .as_ref()
             .map(|routing| routing.action == "transcribe")
             .unwrap_or(false);
+
+        let (checkpoint_memory_type, checkpoint_json, index_state) = {
+            let state = self
+                .sessions
+                .get_mut(&session_id)
+                .expect("active turn should still exist after context build");
+            state.bump_active_turn_iteration();
+            state.set_active_turn_phase(TurnPhase::WaitingModel);
+            state.set_active_turn_routing_plan(turn_routing_plan.clone());
+            state.set_active_turn_awaiting_transcription_reentry(awaiting_transcription_reentry);
+            (
+                state.checkpoint_memory_type(),
+                state.checkpoint_json(),
+                state.clone(),
+            )
+        };
 
         let _ = self
             .ipc_client
@@ -997,61 +1118,80 @@ impl AgentRuntime {
                     "turn_id": turn_id,
                     "chat_id": chat_id,
                     "content": content,
+                    "turn_routing_plan": turn_routing_plan,
                 }),
             })
             .await?;
-
-        let (checkpoint_memory_type, checkpoint_json, index_state) = {
-            let state = self
-                .sessions
-                .get_mut(&session_id)
-                .expect("active turn should still exist after context build");
-            state.bump_active_turn_iteration();
-            state.set_active_turn_phase(TurnPhase::WaitingModel);
-            state.set_active_turn_awaiting_transcription_reentry(awaiting_transcription_reentry);
-            (
-                state.checkpoint_memory_type(),
-                state.checkpoint_json(),
-                state.clone(),
-            )
-        };
 
         self.ipc_client
             .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
             .await?;
         self.sync_session_index(&index_state).await?;
 
-        let (action, prompt, attachments, tools_for_model, capability) =
+        let (action, prompt, context, context_projection, attachments, tools_for_model, stage) =
             if let Some(routing) = media_routing {
+                let stage = stage_plan(&turn_routing_plan, TurnRoutingStageKind::Ingress)
+                    .expect("ingress stage should exist for routed media turns")
+                    .clone();
+                let effective_tools = self
+                    .sessions
+                    .get(&session_id)
+                    .expect("session should exist while preparing model request")
+                    .project_tools_for_envelope(&content, stage.context_envelope);
+                let (_, context, context_projection) = self
+                    .sessions
+                    .get(&session_id)
+                    .expect("session should exist while preparing model request")
+                    .model_request_payloads_for_envelope(
+                        &content,
+                        &effective_tools,
+                        stage.context_envelope,
+                    );
                 let prompt = if routing.action == "transcribe" {
                     transcription_prompt(&content)
                 } else {
                     media_analysis_prompt(&content, &routing.attachments)
                 };
-                let effective_tools = if routing.strip_tools {
-                    Vec::new()
-                } else {
-                    tools_for_model
-                };
                 (
                     routing.action,
                     prompt,
+                    context,
+                    context_projection,
                     routing.attachments,
                     effective_tools,
-                    routing.capability,
+                    stage,
                 )
             } else {
+                let stage = stage_plan(&turn_routing_plan, TurnRoutingStageKind::Cognition)
+                    .expect("cognition stage should exist for every turn")
+                    .clone();
+                let effective_tools = self
+                    .sessions
+                    .get(&session_id)
+                    .expect("session should exist while preparing model request")
+                    .project_tools_for_envelope(&content, stage.context_envelope);
+                let (prompt, context, context_projection) = self
+                    .sessions
+                    .get(&session_id)
+                    .expect("session should exist while preparing model request")
+                    .model_request_payloads_for_envelope(
+                        &content,
+                        &effective_tools,
+                        stage.context_envelope,
+                    );
                 (
                     "generate_text".to_string(),
-                    model_prompt,
+                    prompt,
+                    context,
+                    context_projection,
                     Vec::new(),
-                    tools_for_model,
-                    "text.generate",
+                    effective_tools,
+                    stage,
                 )
             };
         let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
             self.sessions.get(&session_id),
-            capability,
+            stage.capability.as_str(),
             DEFAULT_TEXT_MODEL_ROLE,
         );
 
@@ -1083,28 +1223,41 @@ impl AgentRuntime {
                 attachment.transport_error.as_deref()
             );
         }
+        let stage_summary = turn_routing_plan
+            .stages
+            .iter()
+            .map(|stage| format!("{:?}:{}", stage.kind, stage.capability))
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        info!(
+            "Session [{}] compiled turn routing plan trigger [{}]: {}",
+            session_id, turn_routing_plan.trigger, stage_summary
+        );
 
         let model_req = ModelRequestPayload {
             action,
-            request_class: Some(
-                if capability == "text.generate" {
-                    "cognitive"
-                } else {
-                    "transform"
-                }
-                .to_string(),
-            ),
+            request_class: Some(stage.request_class.clone()),
             session_id: session_id.clone(),
             turn_id,
             prompt,
-            user_content: content,
-            context: Some(model_context),
+            user_content: content.clone(),
+            context: Some(context),
             context_projection: Some(context_projection),
             attachments,
             tools_for_model,
-            response_contract: Some(
-                serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan", "memory_concept"] }),
-            ),
+            response_contract: Some(if stage.kind == TurnRoutingStageKind::Cognition {
+                self.sessions
+                    .get(&session_id)
+                    .expect("session should exist while preparing response contract")
+                    .cognitive_response_contract(
+                        &content,
+                        stage_plan(&turn_routing_plan, TurnRoutingStageKind::Egress).is_some(),
+                    )
+            } else {
+                serde_json::json!({})
+            }),
+            routing_hints: Some(stage_routing_hints(&stage)),
+            provider_options: None,
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
@@ -1113,7 +1266,7 @@ impl AgentRuntime {
             final_reply_guest_id,
         };
 
-        if debug_model_requests_enabled() && capability == "text.generate" {
+        if debug_model_requests_enabled() && stage.capability == "text.generate" {
             match serde_json::to_string_pretty(&model_req) {
                 Ok(json) => info!(
                     "PHILOTIC_DEBUG_MODEL_REQUESTS philote outbound model request session={} turn={}:\n{}",
@@ -1391,6 +1544,7 @@ impl AgentRuntime {
             final_reply_to,
             final_reply_role,
             final_reply_guest_id,
+            turn_routing_plan,
             checkpoint_memory_type,
             checkpoint_json,
             index_state,
@@ -1427,6 +1581,7 @@ impl AgentRuntime {
                 final_reply_to,
                 final_reply_role,
                 final_reply_guest_id,
+                state.active_turn_routing_plan().cloned(),
                 state.checkpoint_memory_type(),
                 state.checkpoint_json(),
                 state.clone(),
@@ -1453,6 +1608,7 @@ impl AgentRuntime {
                         "session_id": session_id,
                         "turn_id": turn_id,
                         "chat_id": chat_id,
+                        "turn_routing_plan": turn_routing_plan,
                         "approval_request": {
                             "approval_id": approval.approval_id,
                             "reason": approval.reason,
@@ -1515,6 +1671,7 @@ impl AgentRuntime {
                     "session_id": session_id,
                     "turn_id": turn_id,
                     "chat_id": chat_id,
+                    "turn_routing_plan": turn_routing_plan,
                     "approval_request": {
                         "approval_id": approval.approval_id,
                         "reason": approval.reason,
@@ -1604,207 +1761,210 @@ impl AgentRuntime {
         bypass_approval: bool,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
-        // Agent-level approval enforcement: if the tool's policy annotation marks it as
-        // requiring approval, and the current approval policy does not preapprove it,
-        // synthesize an ApprovalRequest before executing. This runs independently of
-        // whether the model itself requested approval — it is the agent's safety gate.
-        // Skipped when bypass_approval is true (i.e. we are resuming after a resolution).
-        let force_approval = if bypass_approval {
-            false
-        } else {
-            self
+            // Agent-level approval enforcement: if the tool's policy annotation marks it as
+            // requiring approval, and the current approval policy does not preapprove it,
+            // synthesize an ApprovalRequest before executing. This runs independently of
+            // whether the model itself requested approval — it is the agent's safety gate.
+            // Skipped when bypass_approval is true (i.e. we are resuming after a resolution).
+            let force_approval = if bypass_approval {
+                false
+            } else {
+                self.sessions
+                    .get(&session_id)
+                    .map(|state| {
+                        let requires = state
+                            .tool_assembly
+                            .policy_annotations
+                            .get(&tool_call.tool_name)
+                            .map(|a| a.approval_required)
+                            .unwrap_or(false);
+                        if requires {
+                            let synthetic = ApprovalRequest {
+                                approval_id: None,
+                                reason: format!(
+                                    "Tool '{}' requires approval before execution.",
+                                    tool_call.tool_name
+                                ),
+                                approved_response: format!("Executing {}.", tool_call.tool_name),
+                            };
+                            !state.approval_policy_allows(&synthetic, Some(&tool_call))
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(false)
+            };
+
+            // Admin role creation requires live operator approval regardless of any approval policy.
+            // This check runs before the normal force_approval gate so it can set always_require_human.
+            // Bypassed when bypass_approval is true (already resolved by the operator).
+            let is_admin_role_creation = !bypass_approval
+                && tool_call.tool_name == "role.configure"
+                && tool_call
+                    .arguments
+                    .get("is_admin")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+            // rule.propose always requires live operator approval — cannot be preapproved or bypassed.
+            // Rules are durable and permanently affect agent behavior, so human confirmation is required.
+            // (bypass_approval does NOT bypass rule.propose — that one is unconditional.)
+            let is_rule_propose = !bypass_approval && tool_call.tool_name == "rule.propose";
+
+            if is_admin_role_creation || is_rule_propose || force_approval {
+                // Set pending_tool_call so the approval handler can read it for class lookup.
+                if let Some(state) = self.sessions.get_mut(&session_id) {
+                    state.set_pending_tool_call(tool_call.clone());
+                }
+                let role_name_hint = if is_admin_role_creation {
+                    tool_call
+                        .arguments
+                        .get("role_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string()
+                } else {
+                    String::new()
+                };
+                let (reason, approved_response) = if is_admin_role_creation {
+                    (
+                        format!(
+                            "Admin role '{}' creation requires your explicit live approval. \
+                         This cannot be preapproved or bypassed by policy.",
+                            role_name_hint
+                        ),
+                        format!("Admin role '{}' approved.", role_name_hint),
+                    )
+                } else if is_rule_propose {
+                    (
+                        "Rule proposal requires your explicit live approval.".to_string(),
+                        "Rule proposal approved.".to_string(),
+                    )
+                } else {
+                    (
+                        format!(
+                            "Tool '{}' requires approval before execution.",
+                            tool_call.tool_name
+                        ),
+                        format!("Executing {}.", tool_call.tool_name),
+                    )
+                };
+                let synthetic = ApprovalRequest {
+                    approval_id: Some(uuid::Uuid::new_v4().to_string()),
+                    reason,
+                    approved_response,
+                };
+                return self
+                    .handle_approval_request(
+                        session_id,
+                        turn_id,
+                        synthetic,
+                        is_admin_role_creation || is_rule_propose,
+                    )
+                    .await;
+            }
+
+            // Emit step_started if streaming is enabled.
+            let stream_events = self
                 .sessions
                 .get(&session_id)
-                .map(|state| {
-                    let requires = state
-                        .tool_assembly
-                        .policy_annotations
-                        .get(&tool_call.tool_name)
-                        .map(|a| a.approval_required)
-                        .unwrap_or(false);
-                    if requires {
-                        let synthetic = ApprovalRequest {
-                            approval_id: None,
-                            reason: format!(
-                                "Tool '{}' requires approval before execution.",
-                                tool_call.tool_name
-                            ),
-                            approved_response: format!("Executing {}.", tool_call.tool_name),
-                        };
-                        !state.approval_policy_allows(&synthetic, Some(&tool_call))
-                    } else {
-                        false
+                .map(|s| s.settings.execution.stream_tool_events)
+                .unwrap_or(true);
+            if stream_events {
+                let step_info = Some(tool_call.tool_name.clone());
+                let _ = self
+                    .emit_turn_event(&session_id, "step_started", step_info)
+                    .await;
+            }
+            let (
+                chat_id,
+                final_reply_to,
+                final_reply_role,
+                final_reply_guest_id,
+                workspace_ref,
+                route,
+                session_user_id,
+            ) = {
+                let Some(state) = self.sessions.get(&session_id) else {
+                    warn!(
+                        "Tool execution requested for unknown session {}",
+                        session_id
+                    );
+                    return Ok(());
+                };
+                let route = match Self::execute_bound_tool(state, &tool_call) {
+                    Ok(route) => route.clone(),
+                    Err(err) => {
+                        return self
+                            .fail_active_turn(session_id, turn_id, err.to_string())
+                            .await;
                     }
-                })
-                .unwrap_or(false)
-        };
+                };
+                let Some(active_turn) = state.active_turn.as_ref() else {
+                    warn!(
+                        "Dropping tool execution routing for session {} turn {} after active turn disappeared",
+                        session_id, turn_id
+                    );
+                    return Ok(());
+                };
+                (
+                    active_turn.chat_id.clone(),
+                    active_turn.final_reply_to.clone(),
+                    active_turn.final_reply_role.clone(),
+                    active_turn.final_reply_guest_id.clone(),
+                    state.bindings.effective_workspace_ref.clone(),
+                    route,
+                    state.source.clone(),
+                )
+            };
 
-        // Admin role creation requires live operator approval regardless of any approval policy.
-        // This check runs before the normal force_approval gate so it can set always_require_human.
-        // Bypassed when bypass_approval is true (already resolved by the operator).
-        let is_admin_role_creation = !bypass_approval
-            && tool_call.tool_name == "role.configure"
-            && tool_call
-                .arguments
-                .get("is_admin")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-
-        // rule.propose always requires live operator approval — cannot be preapproved or bypassed.
-        // Rules are durable and permanently affect agent behavior, so human confirmation is required.
-        // (bypass_approval does NOT bypass rule.propose — that one is unconditional.)
-        let is_rule_propose = !bypass_approval && tool_call.tool_name == "rule.propose";
-
-        if is_admin_role_creation || is_rule_propose || force_approval {
-            // Set pending_tool_call so the approval handler can read it for class lookup.
+            // Store the tool call on the active turn BEFORE dispatching so that when the
+            // result returns, handle_tool_result can recover the full (name + arguments)
+            // pair for the working_tool_history. Without this, the fallback uses empty args.
             if let Some(state) = self.sessions.get_mut(&session_id) {
                 state.set_pending_tool_call(tool_call.clone());
             }
-            let role_name_hint = if is_admin_role_creation {
-                tool_call
-                    .arguments
-                    .get("role_name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown")
-                    .to_string()
-            } else {
-                String::new()
-            };
-            let (reason, approved_response) = if is_admin_role_creation {
-                (
-                    format!(
-                        "Admin role '{}' creation requires your explicit live approval. \
-                         This cannot be preapproved or bypassed by policy.",
-                        role_name_hint
-                    ),
-                    format!("Admin role '{}' approved.", role_name_hint),
-                )
-            } else if is_rule_propose {
-                (
-                    "Rule proposal requires your explicit live approval.".to_string(),
-                    "Rule proposal approved.".to_string(),
-                )
-            } else {
-                (
-                    format!(
-                        "Tool '{}' requires approval before execution.",
-                        tool_call.tool_name
-                    ),
-                    format!("Executing {}.", tool_call.tool_name),
-                )
-            };
-            let synthetic = ApprovalRequest {
-                approval_id: Some(uuid::Uuid::new_v4().to_string()),
-                reason,
-                approved_response,
-            };
-            return self
-                .handle_approval_request(session_id, turn_id, synthetic, is_admin_role_creation || is_rule_propose)
-                .await;
-        }
 
-        // Emit step_started if streaming is enabled.
-        let stream_events = self
-            .sessions
-            .get(&session_id)
-            .map(|s| s.settings.execution.stream_tool_events)
-            .unwrap_or(true);
-        if stream_events {
-            let step_info = Some(tool_call.tool_name.clone());
-            let _ = self
-                .emit_turn_event(&session_id, "step_started", step_info)
-                .await;
-        }
-        let (
-            chat_id,
-            final_reply_to,
-            final_reply_role,
-            final_reply_guest_id,
-            workspace_ref,
-            route,
-            session_user_id,
-        ) = {
-            let Some(state) = self.sessions.get(&session_id) else {
-                warn!(
-                    "Tool execution requested for unknown session {}",
-                    session_id
-                );
-                return Ok(());
-            };
-            let route = match Self::execute_bound_tool(state, &tool_call) {
-                Ok(route) => route.clone(),
-                Err(err) => {
-                    return self
-                        .fail_active_turn(session_id, turn_id, err.to_string())
-                        .await;
-                }
-            };
-            let Some(active_turn) = state.active_turn.as_ref() else {
-                warn!(
-                    "Dropping tool execution routing for session {} turn {} after active turn disappeared",
-                    session_id, turn_id
-                );
-                return Ok(());
-            };
-            (
-                active_turn.chat_id.clone(),
-                active_turn.final_reply_to.clone(),
-                active_turn.final_reply_role.clone(),
-                active_turn.final_reply_guest_id.clone(),
-                state.bindings.effective_workspace_ref.clone(),
-                route,
-                state.source.clone(),
-            )
-        };
-
-        // Store the tool call on the active turn BEFORE dispatching so that when the
-        // result returns, handle_tool_result can recover the full (name + arguments)
-        // pair for the working_tool_history. Without this, the fallback uses empty args.
-        if let Some(state) = self.sessions.get_mut(&session_id) {
-            state.set_pending_tool_call(tool_call.clone());
-        }
-
-        let tool_req = ToolExecutionPayload {
-            action: "execute_tool",
-            session_id,
-            turn_id,
-            chat_id,
-            tool_name: tool_call.tool_name,
-            arguments: tool_call.arguments,
-            execution_mode: route.execution_mode.clone(),
-            agent_id: self.agent_id.clone(),
-            user_id: Some(session_user_id),
-            runner_id: route.runner_id.clone(),
-            incarnation_id: route.incarnation_id.clone(),
-            hotel_id: route.hotel_id.clone(),
-            environment_id: route.environment_id.clone(),
-            task_runner_kind: route.task_runner_kind.clone(),
-            task_runner_config: route.task_runner_config.clone(),
-            selection_reason: route.selection_reason.clone(),
-            workspace_ref: workspace_ref.clone(),
-            task_runner_overlay: route
-                .task_runner_kind
-                .as_deref()
-                .map(|kind| TaskRunnerOverlay {
-                    workspace_ref: if kind == "workspace" {
-                        workspace_ref
-                    } else {
-                        None
-                    },
-                    allowed_tools: None,
-                    max_read_bytes: None,
-                    max_search_results: None,
+            let tool_req = ToolExecutionPayload {
+                action: "execute_tool",
+                session_id,
+                turn_id,
+                chat_id,
+                tool_name: tool_call.tool_name,
+                arguments: tool_call.arguments,
+                execution_mode: route.execution_mode.clone(),
+                agent_id: self.agent_id.clone(),
+                user_id: Some(session_user_id),
+                runner_id: route.runner_id.clone(),
+                incarnation_id: route.incarnation_id.clone(),
+                hotel_id: route.hotel_id.clone(),
+                environment_id: route.environment_id.clone(),
+                task_runner_kind: route.task_runner_kind.clone(),
+                task_runner_config: route.task_runner_config.clone(),
+                selection_reason: route.selection_reason.clone(),
+                workspace_ref: workspace_ref.clone(),
+                task_runner_overlay: route.task_runner_kind.as_deref().map(|kind| {
+                    TaskRunnerOverlay {
+                        workspace_ref: if kind == "workspace" {
+                            workspace_ref
+                        } else {
+                            None
+                        },
+                        allowed_tools: None,
+                        max_read_bytes: None,
+                        max_search_results: None,
+                    }
                 }),
-            reply_to: local_node_id(),
-            reply_role: "agent".into(),
-            final_reply_to,
-            final_reply_role,
-            final_reply_guest_id,
-        };
+                reply_to: local_node_id(),
+                reply_role: "agent".into(),
+                final_reply_to,
+                final_reply_role,
+                final_reply_guest_id,
+            };
 
-        if route.execution_mode == "local_agent" {
-            return self.execute_local_agent_tool(tool_req).await;
-        }
+            if route.execution_mode == "local_agent" {
+                return self.execute_local_agent_tool(tool_req).await;
+            }
 
             self.ipc_client
                 .send_request(IpcRequest::EmitTask {
@@ -1889,7 +2049,11 @@ impl AgentRuntime {
                 )
             };
             if stream_events {
-                let event = if step_failed { "step_failed" } else { "step_completed" };
+                let event = if step_failed {
+                    "step_failed"
+                } else {
+                    "step_completed"
+                };
                 let _ = self.emit_turn_event(&session_id, event, None).await;
             }
             self.ipc_client
@@ -2029,14 +2193,29 @@ impl AgentRuntime {
                     session_id: session_id.clone(),
                     turn_id,
                     prompt,
-                    user_content,
+                    user_content: user_content.clone(),
                     context: Some(context),
                     context_projection: Some(context_projection),
                     attachments: Vec::new(),
                     tools_for_model,
                     response_contract: Some(
-                        serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan"] }),
+                        self.sessions
+                            .get(&session_id)
+                            .expect("session should exist while preparing response contract")
+                            .cognitive_response_contract(
+                                &user_content,
+                                active_turn_stage_routing_hints(
+                                    self.sessions.get(&session_id),
+                                    TurnRoutingStageKind::Egress,
+                                )
+                                .is_some(),
+                            ),
                     ),
+                    routing_hints: active_turn_stage_routing_hints(
+                        self.sessions.get(&session_id),
+                        TurnRoutingStageKind::Cognition,
+                    ),
+                    provider_options: None,
                     chat_id,
                     reply_to: local_node_id(),
                     reply_role: "agent".into(),
@@ -2146,14 +2325,29 @@ impl AgentRuntime {
             session_id: session_id.clone(),
             turn_id,
             prompt,
-            user_content,
+            user_content: user_content.clone(),
             context: Some(context),
             context_projection: Some(context_projection),
             attachments: Vec::new(),
             tools_for_model,
             response_contract: Some(
-                serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan"] }),
+                self.sessions
+                    .get(&session_id)
+                    .expect("session should exist while preparing response contract")
+                    .cognitive_response_contract(
+                        &user_content,
+                        active_turn_stage_routing_hints(
+                            self.sessions.get(&session_id),
+                            TurnRoutingStageKind::Egress,
+                        )
+                        .is_some(),
+                    ),
             ),
+            routing_hints: active_turn_stage_routing_hints(
+                self.sessions.get(&session_id),
+                TurnRoutingStageKind::Cognition,
+            ),
+            provider_options: None,
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
@@ -2240,6 +2434,11 @@ impl AgentRuntime {
             .await?;
         self.sync_session_index(&index_state).await?;
 
+        let turn_routing_plan = self
+            .sessions
+            .get(&session_id)
+            .and_then(|state| state.active_turn_routing_plan().cloned());
+
         let _ = self
             .ipc_client
             .send_request(IpcRequest::UpdateTask {
@@ -2250,6 +2449,7 @@ impl AgentRuntime {
                     "turn_id": turn_id,
                     "chat_id": reentry.chat_id,
                     "content": reentry.user_content,
+                    "turn_routing_plan": turn_routing_plan,
                 }),
             })
             .await?;
@@ -2258,14 +2458,12 @@ impl AgentRuntime {
             .sessions
             .get(&session_id)
             .map(|state| {
-                let projection = state.build_context_projection(&reentry.user_content);
-                (
-                    Some(state.model_context_from_projection(&projection)),
-                    Some(
-                        serde_json::to_value(&projection)
-                            .expect("context projection should serialize"),
-                    ),
-                )
+                let (_, context, context_projection) = state.model_request_payloads_for_envelope(
+                    &reentry.user_content,
+                    &reentry.tools_for_model,
+                    TurnContextEnvelopeKind::Cognitive,
+                );
+                (Some(context), Some(context_projection))
             })
             .unwrap_or((None, None));
         if let Some(state) = self.sessions.get_mut(&session_id) {
@@ -2284,8 +2482,23 @@ impl AgentRuntime {
             attachments: Vec::new(),
             tools_for_model: reentry.tools_for_model,
             response_contract: Some(
-                serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan", "memory_concept"] }),
+                self.sessions
+                    .get(&session_id)
+                    .expect("session should exist while preparing response contract")
+                    .cognitive_response_contract(
+                        &reentry.user_content,
+                        active_turn_stage_routing_hints(
+                            self.sessions.get(&session_id),
+                            TurnRoutingStageKind::Egress,
+                        )
+                        .is_some(),
+                    ),
             ),
+            routing_hints: active_turn_stage_routing_hints(
+                self.sessions.get(&session_id),
+                TurnRoutingStageKind::Cognition,
+            ),
+            provider_options: None,
             chat_id: reentry.chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
@@ -2425,7 +2638,10 @@ impl AgentRuntime {
             trigger: RecallTrigger::UserTurnStart,
             scope: MemoryScope::SelfOnly,
             recall_seed_text: active_turn.user_content.clone(),
-            active_goal: active_turn.active_plan.as_ref().map(|plan| plan.goal.clone()),
+            active_goal: active_turn
+                .active_plan
+                .as_ref()
+                .map(|plan| plan.goal.clone()),
             role_name: state
                 .role_activation
                 .as_ref()
@@ -2616,6 +2832,7 @@ impl AgentRuntime {
             final_reply_to,
             final_reply_role,
             final_reply_guest_id,
+            turn_routing_plan,
             checkpoint_memory_type,
             checkpoint_json,
             index_state,
@@ -2644,6 +2861,7 @@ impl AgentRuntime {
                 final_reply_to,
                 final_reply_role,
                 final_reply_guest_id,
+                state.active_turn_routing_plan().cloned(),
                 state.checkpoint_memory_type(),
                 state.checkpoint_json(),
                 state.clone(),
@@ -2664,6 +2882,7 @@ impl AgentRuntime {
                     "session_id": session_id,
                     "turn_id": turn_id,
                     "chat_id": chat_id,
+                    "turn_routing_plan": turn_routing_plan,
                 }),
             })
             .await?;
@@ -2697,6 +2916,10 @@ impl AgentRuntime {
             "kind": "voice.synthesize",
             "request_class": "synthesis",
             "provider": policy.provider,
+            "routing_hints": turn_routing_plan
+                .as_ref()
+                .and_then(|plan| stage_plan(plan, TurnRoutingStageKind::Egress))
+                .map(stage_routing_hints),
             "spoken_text": spoken_text.unwrap_or_else(|| strip_markup(&display_text)),
             "voice_id": policy.voice_id,
             "model": policy.model,
@@ -2997,8 +3220,8 @@ impl AgentRuntime {
             .to_string();
 
         // Try to parse as JSON; fall back to a plain string value.
-        let output_value: Value = serde_json::from_str(&raw_text)
-            .unwrap_or(Value::String(raw_text));
+        let output_value: Value =
+            serde_json::from_str(&raw_text).unwrap_or(Value::String(raw_text));
 
         {
             let Some(state) = self.sessions.get_mut(&session_id) else {
@@ -3076,9 +3299,7 @@ impl AgentRuntime {
                         let Some(state) = self.sessions.get_mut(&session_id) else {
                             return Ok(());
                         };
-                        state.with_scripted_executor_mut(|exec| {
-                            exec.advance_past_tool_sequence()
-                        });
+                        state.with_scripted_executor_mut(|exec| exec.advance_past_tool_sequence());
                     }
                     self.scripted_dispatch_after_advance(
                         session_id,
@@ -3105,11 +3326,7 @@ impl AgentRuntime {
                         )
                     };
                     self.ipc_client
-                        .sync_apartment(
-                            &self.agent_id,
-                            &checkpoint_memory_type,
-                            checkpoint_json,
-                        )
+                        .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
                         .await?;
                     self.sync_session_index(&index_state).await?;
                     self.scripted_dispatch_after_advance(
@@ -3180,7 +3397,10 @@ impl AgentRuntime {
                     )
                     .await;
             };
-            let turn = state.active_turn.as_mut().expect("turn exists after envelope");
+            let turn = state
+                .active_turn
+                .as_mut()
+                .expect("turn exists after envelope");
             turn.iteration += 1;
             turn.phase = TurnPhase::WaitingModel;
             let task_id = turn.task_id;
@@ -3230,14 +3450,29 @@ impl AgentRuntime {
             session_id: session_id.clone(),
             turn_id,
             prompt,
-            user_content,
+            user_content: user_content.clone(),
             context: Some(context),
             context_projection: Some(context_projection),
             attachments: Vec::new(),
             tools_for_model: tools,
             response_contract: Some(
-                serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan"] }),
+                self.sessions
+                    .get(&session_id)
+                    .expect("session should exist while preparing response contract")
+                    .cognitive_response_contract(
+                        &user_content,
+                        active_turn_stage_routing_hints(
+                            self.sessions.get(&session_id),
+                            TurnRoutingStageKind::Egress,
+                        )
+                        .is_some(),
+                    ),
             ),
+            routing_hints: active_turn_stage_routing_hints(
+                self.sessions.get(&session_id),
+                TurnRoutingStageKind::Cognition,
+            ),
+            provider_options: None,
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
@@ -3726,9 +3961,7 @@ impl AgentRuntime {
                 effective_skill_guidance: vec![],
                 working_memory_policy: None,
                 memory_projection_policy: None,
-                turn_loop_config: role_config
-                    .as_ref()
-                    .map(|c| c.turn_loop_config.clone()),
+                turn_loop_config: role_config.as_ref().map(|c| c.turn_loop_config.clone()),
             };
 
             state.role_activation = Some(activation);
@@ -4079,21 +4312,21 @@ impl AgentRuntime {
         let tools_for_model = self
             .sessions
             .get(&session_id)
-            .map(|state| state.tool_assembly.tools_for_model.clone())
+            .map(|state| {
+                state.project_tools_for_envelope(&user_content, TurnContextEnvelopeKind::Cognitive)
+            })
             .unwrap_or_default();
 
         let (context, context_projection) = self
             .sessions
             .get(&session_id)
             .map(|state| {
-                let projection = state.build_context_projection(&user_content);
-                (
-                    Some(state.model_context_from_projection(&projection)),
-                    Some(
-                        serde_json::to_value(&projection)
-                            .expect("context projection should serialize"),
-                    ),
-                )
+                let (_, context, context_projection) = state.model_request_payloads_for_envelope(
+                    &user_content,
+                    &tools_for_model,
+                    TurnContextEnvelopeKind::Cognitive,
+                );
+                (Some(context), Some(context_projection))
             })
             .unwrap_or((None, None));
         if let Some(state) = self.sessions.get_mut(&session_id) {
@@ -4106,12 +4339,29 @@ impl AgentRuntime {
             session_id: session_id.clone(),
             turn_id,
             prompt,
-            user_content,
+            user_content: user_content.clone(),
             context,
             context_projection,
             attachments: Vec::new(),
             tools_for_model,
-            response_contract: None,
+            response_contract: Some(
+                self.sessions
+                    .get(&session_id)
+                    .expect("session should exist while preparing response contract")
+                    .cognitive_response_contract(
+                        &user_content,
+                        active_turn_stage_routing_hints(
+                            self.sessions.get(&session_id),
+                            TurnRoutingStageKind::Egress,
+                        )
+                        .is_some(),
+                    ),
+            ),
+            routing_hints: active_turn_stage_routing_hints(
+                self.sessions.get(&session_id),
+                TurnRoutingStageKind::Cognition,
+            ),
+            provider_options: None,
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
@@ -4950,7 +5200,10 @@ impl AgentRuntime {
                                 turn_loop_config: args
                                     .get("turn_loop_config")
                                     .and_then(|v| {
-                                        serde_json::from_value::<ansible_mesh_core::graph::TurnLoopConfig>(v.clone()).ok()
+                                        serde_json::from_value::<
+                                            ansible_mesh_core::graph::TurnLoopConfig,
+                                        >(v.clone())
+                                        .ok()
                                     })
                                     .unwrap_or_default(),
                             },
@@ -5534,7 +5787,7 @@ impl AgentRuntime {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                
+
                 let target_focus_framing = args
                     .and_then(|a| a.get("target_focus_framing"))
                     .and_then(|v| v.as_str())
@@ -5545,12 +5798,14 @@ impl AgentRuntime {
                         .fail_active_turn(
                             payload.session_id,
                             payload.turn_id,
-                            "handoff.to_role: missing required argument 'target_focus_framing'".into(),
+                            "handoff.to_role: missing required argument 'target_focus_framing'"
+                                .into(),
                         )
                         .await;
                 };
 
-                let active_goal = active_goal.map(|g| format!("{}\n\nTarget Focus Framing:\n{}", g, target_focus_framing));
+                let active_goal = active_goal
+                    .map(|g| format!("{}\n\nTarget Focus Framing:\n{}", g, target_focus_framing));
 
                 let expected_return_mode = args
                     .and_then(|a| a.get("expected_return_mode"))
@@ -5816,7 +6071,10 @@ impl AgentRuntime {
                 let _ = self
                     .emit_partial_reply(
                         &payload.session_id,
-                        format!("Let me hand you over to {} to help with this...", target_agent_id),
+                        format!(
+                            "Let me hand you over to {} to help with this...",
+                            target_agent_id
+                        ),
                     )
                     .await;
 
@@ -5837,7 +6095,9 @@ impl AgentRuntime {
                         delegation_id,
                         status,
                     }) => (
-                        format!("Delegated task to peer '{target_agent_id}' (delegation {delegation_id}, status: {status})."),
+                        format!(
+                            "Delegated task to peer '{target_agent_id}' (delegation {delegation_id}, status: {status})."
+                        ),
                         None,
                     ),
                     Ok(IpcResponse::Error(msg)) => {
@@ -5960,7 +6220,9 @@ impl AgentRuntime {
                         delegation_id,
                         status,
                     }) => (
-                        format!("Delegated task to external peer type '{target_peer_type}' (delegation {delegation_id}, status: {status})."),
+                        format!(
+                            "Delegated task to external peer type '{target_peer_type}' (delegation {delegation_id}, status: {status})."
+                        ),
                         None,
                     ),
                     Ok(IpcResponse::Error(msg)) => {
@@ -5982,7 +6244,9 @@ impl AgentRuntime {
                     Err(e) => {
                         let err = TaskErrorPayload::transport_error(
                             "philote",
-                            format!("delegate.to_external_cognitive_peer: IPC transport error — {e}"),
+                            format!(
+                                "delegate.to_external_cognitive_peer: IPC transport error — {e}"
+                            ),
                         );
                         (err.display_message(), Some(err))
                     }
@@ -6628,10 +6892,11 @@ async fn run_bash_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentRuntime, DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE, extract_model_error,
-        extract_model_error_payload, format_role_command_reply, format_roles_report,
-        media_analysis_attachments, normalized_user_content, parse_memory_candidate,
-        resolve_media_routing, resolve_model_execution_target, should_attempt_provider_repair,
+        AgentRuntime, DEFAULT_TEXT_MODEL_ROLE, DEFAULT_VOICE_MODEL_ROLE, LOCAL_NODE,
+        compile_turn_routing_plan, extract_model_error, extract_model_error_payload,
+        format_role_command_reply, format_roles_report, media_analysis_attachments,
+        normalized_user_content, parse_memory_candidate, resolve_media_routing,
+        resolve_model_execution_target, should_attempt_provider_repair,
     };
     use crate::commands::SlashCommand;
     use crate::r#loop::{ApprovalRequest, ToolCall, TurnPhase};
@@ -6640,7 +6905,7 @@ mod tests {
     };
     use crate::session::{
         ApprovalPolicy, ComponentExecutionRoute, ComponentRouteAssembly, ComponentRouteBinding,
-        SessionState, WorkingTurn,
+        SessionState, TtsMode, TurnRoutingStageKind, VoiceResponsePolicy, WorkingTurn,
     };
     use philotic_client::TaskErrorPayload;
     use uuid::Uuid;
@@ -6663,6 +6928,8 @@ mod tests {
             attachments: Vec::new(),
             tools_for_model: Vec::new(),
             response_contract: None,
+            routing_hints: None,
+            provider_options: None,
             chat_id: "123".into(),
             reply_to: LOCAL_NODE.into(),
             reply_role: "agent".into(),
@@ -6859,7 +7126,7 @@ mod tests {
     fn extract_model_error_payload_preserves_retryable_flag() {
         let payload = InboundTaskPayload {
             agent_action: None,
-                    handoff_bundle: None,
+            handoff_bundle: None,
             action: None,
             source: None,
             session_id: None,
@@ -6934,6 +7201,7 @@ mod tests {
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
+            turn_routing_plan: None,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
         });
@@ -7066,7 +7334,7 @@ mod tests {
         let task = InboundTaskPayload {
             action: None,
             agent_action: None,
-                    handoff_bundle: None,
+            handoff_bundle: None,
             source: Some("telegram".into()),
             session_id: None,
             turn_id: None,
@@ -7107,7 +7375,7 @@ mod tests {
         let task = InboundTaskPayload {
             action: None,
             agent_action: None,
-                    handoff_bundle: None,
+            handoff_bundle: None,
             source: Some("telegram".into()),
             session_id: None,
             turn_id: None,
@@ -7154,7 +7422,7 @@ mod tests {
         let task = InboundTaskPayload {
             action: None,
             agent_action: None,
-                    handoff_bundle: None,
+            handoff_bundle: None,
             source: Some("telegram".into()),
             session_id: None,
             turn_id: None,
@@ -7188,7 +7456,7 @@ mod tests {
         let task = InboundTaskPayload {
             action: None,
             agent_action: None,
-                    handoff_bundle: None,
+            handoff_bundle: None,
             source: Some("telegram".into()),
             session_id: None,
             turn_id: None,
@@ -7278,7 +7546,6 @@ mod tests {
         let r = routing.expect("should produce routing for blob-backed voice");
         assert_eq!(r.action, "analyze_media");
         assert_eq!(r.capability, "media.analyze");
-        assert!(r.strip_tools);
     }
 
     #[test]
@@ -7345,16 +7612,42 @@ mod tests {
     }
 
     #[test]
-    fn strip_tools_false_preserved_in_routing() {
+    fn compile_turn_routing_plan_for_voice_turn_has_three_stages() {
         use crate::session::MediaRoutingPolicy;
 
         let policy = MediaRoutingPolicy {
-            strip_tools_on_media: false,
+            voice_action: Some("transcribe".into()),
             ..Default::default()
         };
-        let atts = vec![blob_backed_attachment("photo")];
-        let r = resolve_media_routing(&policy, atts).unwrap();
-        assert!(!r.strip_tools);
+        let media_routing =
+            resolve_media_routing(&policy, vec![blob_backed_attachment("voice")]).unwrap();
+        let voice_policy = VoiceResponsePolicy {
+            mode: TtsMode::Auto,
+            ..Default::default()
+        };
+
+        let plan = compile_turn_routing_plan(Some(&media_routing), Some(&voice_policy), true);
+
+        assert_eq!(plan.trigger, "voice_input");
+        assert_eq!(plan.stages.len(), 3);
+        assert_eq!(plan.stages[0].kind, TurnRoutingStageKind::Ingress);
+        assert_eq!(plan.stages[0].capability, "voice.transcribe");
+        assert_eq!(plan.stages[0].controller_role, DEFAULT_VOICE_MODEL_ROLE);
+        assert_eq!(plan.stages[1].kind, TurnRoutingStageKind::Cognition);
+        assert_eq!(plan.stages[1].capability, "text.generate");
+        assert_eq!(plan.stages[1].controller_role, DEFAULT_TEXT_MODEL_ROLE);
+        assert_eq!(plan.stages[2].kind, TurnRoutingStageKind::Egress);
+        assert_eq!(plan.stages[2].capability, "voice.synthesize");
+    }
+
+    #[test]
+    fn compile_turn_routing_plan_for_text_turn_only_has_cognition() {
+        let plan = compile_turn_routing_plan(None, None, false);
+
+        assert_eq!(plan.trigger, "text_input");
+        assert_eq!(plan.stages.len(), 1);
+        assert_eq!(plan.stages[0].kind, TurnRoutingStageKind::Cognition);
+        assert_eq!(plan.stages[0].capability, "text.generate");
     }
 
     #[test]

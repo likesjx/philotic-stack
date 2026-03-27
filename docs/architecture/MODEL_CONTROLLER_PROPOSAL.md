@@ -238,6 +238,14 @@ The model-controller API should be structured around capabilities such as:
 
 Capability names alone are not enough to express what kind of execution contract a task needs. A `text.generate` request used for agent reasoning is not the same species of work as an embedding request or a narrow transform request, even when all of them happen to call a model.
 
+For staged turns, the model-controller should remain the executor per stage, not the owner of the whole turn. A voice turn may legitimately traverse:
+
+- `voice.transcribe` as `transform`
+- `text.generate` as `cognitive`
+- `voice.synthesize` as `synthesis`
+
+with the session/agent still owning continuity, tools, approvals, and final response policy across the whole turn.
+
 ## Request Classes
 
 Keep one model-controller boundary, but introduce an explicit `request_class` field inside the request envelope.
@@ -310,6 +318,7 @@ This gives the system a stable capability-facing request while preserving struct
 - prompt projection
 - context trimming
 - cache reuse
+- per-stage routing hints without pretending the controller owns the entire multi-hop turn
 - provider-specific rendering
 - routing decisions
 
@@ -537,6 +546,11 @@ This allows a caller to say:
 - text plus suggested next questions
 
 without pretending every turn needs every output.
+
+Policy note:
+
+- transform stages should usually request narrow output, not planning/memory channels
+- low-intent cognitive turns should be allowed to request a slimmer channel set than active problem-solving turns
 
 ## Optimization-Oriented Response Channels
 

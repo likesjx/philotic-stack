@@ -732,7 +732,10 @@ Seam IDs: `structured-model-envelope`, `hotel-gemini-oauth-flow`
 - [x] Investigate splitting voice-note transcription/understanding toward ElevenLabs or another speech-specialized provider while keeping richer text reasoning in the agent/model loop.
 - [x] Add `VoiceResponsePolicy` to `AgentProfile` so the agent has its own voice identity and TTS is policy-driven, not tool-driven.
 - [ ] Make the default local Jane/Aria voice UX honest: `mode=auto` should mirror voice-input turns with voice-only replies, while `/tts on` should escalate to voice+text delivery.
-- [ ] Route `voice.transcribe` results back into the normal agent reasoning loop before `voice.synthesize`, so voice turns stop parroting the transcript and instead speak the post-reasoning answer.
+- [x] Route `voice.transcribe` results back into the normal agent reasoning loop before `voice.synthesize`, so voice turns stop parroting the transcript and instead speak the post-reasoning answer.
+- [x] Carry an explicit staged `TurnRoutingPlan` on active voice turns so ingress transcription, cognitive generation, and voice egress are visible as one session-owned execution contract instead of an ad hoc branch.
+- [x] Make staged routing operational in model request assembly: trim ingress context envelopes and forward stage-derived routing hints into model-controller requests.
+- [x] Make stage policy influence affordances and output contracts: suppress tools on non-cognitive stages and request slimmer response channels for low-intent cognitive turns.
 - [x] Add a rebuild-first local watched-UAT workflow so stale materialized binaries and stale sockets do not masquerade as runtime regressions.
 - [ ] Define hotel CLI OAuth UX:
   - browser launch
