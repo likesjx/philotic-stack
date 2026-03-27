@@ -30,6 +30,13 @@ const DEFAULT_REPLY_ROLE: &str = "membrane";
 const DEFAULT_TEXT_MODEL_ROLE: &str = "model";
 const DEFAULT_VOICE_MODEL_ROLE: &str = "model.elevenlabs";
 
+#[derive(Debug, Clone)]
+struct LearnedReflexWriteback {
+    preference_key: String,
+    precedence: i32,
+    reflexes_json: serde_json::Value,
+}
+
 fn local_node_id() -> String {
     std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string())
 }
@@ -41,6 +48,39 @@ fn debug_model_requests_enabled() -> bool {
             .as_deref(),
         Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
     )
+}
+
+fn parse_learned_reflex_writeback(
+    args: &serde_json::Value,
+) -> std::result::Result<Option<LearnedReflexWriteback>, String> {
+    let Some(learned_reflex) = args.get("learned_reflex") else {
+        return Ok(None);
+    };
+    let Some(obj) = learned_reflex.as_object() else {
+        return Err("routing.policy.propose: 'learned_reflex' must be an object.".into());
+    };
+    let preference_key = obj
+        .get("preference_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if preference_key.is_empty() {
+        return Err("routing.policy.propose: learned_reflex.preference_key is required.".into());
+    }
+    let precedence = obj.get("precedence").and_then(|v| v.as_i64()).unwrap_or(70) as i32;
+    let reflexes_json = obj
+        .get("reflexes")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if !reflexes_json.is_object() {
+        return Err("routing.policy.propose: learned_reflex.reflexes must be an object.".into());
+    }
+    Ok(Some(LearnedReflexWriteback {
+        preference_key,
+        precedence,
+        reflexes_json,
+    }))
 }
 
 #[cfg(test)]
@@ -6804,6 +6844,14 @@ impl AgentRuntime {
                     .unwrap_or("")
                     .trim()
                     .to_string();
+                let learned_reflex = match parse_learned_reflex_writeback(&payload.arguments) {
+                    Ok(value) => value,
+                    Err(message) => {
+                        return self
+                            .fail_active_turn(payload.session_id, payload.turn_id, message)
+                            .await;
+                    }
+                };
 
                 if problem.is_empty() || proposed_change.is_empty() || evidence.is_empty() {
                     return self
@@ -6842,6 +6890,75 @@ impl AgentRuntime {
                     .await
                 {
                     Ok(IpcResponse::RuleProposed { rule_id }) => {
+                        let mut writeback_note = None;
+                        if let Some(reflex) = learned_reflex.as_ref() {
+                            let config_json = serde_json::json!({
+                                "reason": format!("approved write-back from routing.policy.propose rule {}", rule_id),
+                                "problem": problem.clone(),
+                                "proposed_change": proposed_change.clone(),
+                                "evidence": evidence.clone(),
+                                "affected_stage": affected_stage.clone(),
+                                "affected_capability": affected_capability.clone(),
+                                "rule_id": rule_id.clone(),
+                                "source_tool": "routing.policy.propose",
+                            });
+                            match self
+                                .ipc_client
+                                .send_request(IpcRequest::UpsertAgentReflexPreference {
+                                    agent_id: agent_id.clone(),
+                                    preference_key: reflex.preference_key.clone(),
+                                    precedence: reflex.precedence,
+                                    reflexes_json: reflex.reflexes_json.clone(),
+                                    config_json,
+                                })
+                                .await
+                            {
+                                Ok(IpcResponse::Standard { ok: true, .. }) => {
+                                    let _ = self
+                                        .ipc_client
+                                        .send_request(IpcRequest::UpdateTask {
+                                            task_id: Uuid::new_v4(),
+                                            state: "routing_reflex_writeback".into(),
+                                            payload: serde_json::json!({
+                                                "session_id": payload.session_id,
+                                                "turn_id": payload.turn_id,
+                                                "chat_id": payload.chat_id,
+                                                "reflex_evaluations": [{
+                                                    "reflex_name": reflex.preference_key,
+                                                    "decision": "approved_writeback",
+                                                    "reason": format!("approved learned reflex write-back from routing.policy.propose rule {}", rule_id),
+                                                    "source_tool": "routing.policy.propose"
+                                                }]
+                                            }),
+                                        })
+                                        .await;
+                                    writeback_note = Some(format!(
+                                        " Learned reflex '{}' was written into the agent graph.",
+                                        reflex.preference_key
+                                    ));
+                                }
+                                Ok(IpcResponse::Standard {
+                                    ok: false, message, ..
+                                }) => {
+                                    writeback_note = Some(format!(
+                                        " Rule stored, but learned reflex write-back was rejected — {}.",
+                                        message
+                                    ));
+                                }
+                                Ok(other) => {
+                                    writeback_note = Some(format!(
+                                        " Rule stored, but learned reflex write-back returned an unexpected response: {:?}.",
+                                        other
+                                    ));
+                                }
+                                Err(err) => {
+                                    writeback_note = Some(format!(
+                                        " Rule stored, but learned reflex write-back failed — {}.",
+                                        err
+                                    ));
+                                }
+                            }
+                        }
                         if let Some(state) = self.sessions.get_mut(&payload.session_id) {
                             state.rules.push(serde_json::json!({
                                 "rule_id": rule_id,
@@ -6851,11 +6968,18 @@ impl AgentRuntime {
                                 "problem": problem,
                                 "affected_stage": affected_stage,
                                 "affected_capability": affected_capability,
+                                "learned_reflex_preference_key": learned_reflex
+                                    .as_ref()
+                                    .map(|reflex| reflex.preference_key.clone()),
                             }));
                         }
-                        format!(
+                        let mut message = format!(
                             "Routing policy proposal stored for operator-governed review (id: {rule_id}). Transitional note: it currently rides on the durable rule store until routing-specific policy persistence exists."
-                        )
+                        );
+                        if let Some(note) = writeback_note {
+                            message.push_str(&note);
+                        }
+                        message
                     }
                     Ok(IpcResponse::Standard {
                         ok: true, message, ..
@@ -7626,6 +7750,39 @@ mod tests {
         )
         .expect_err("tool should be blocked");
         assert!(err.to_string().contains("not enabled"));
+    }
+
+    #[test]
+    fn parse_learned_reflex_writeback_accepts_valid_payload() {
+        let parsed = super::parse_learned_reflex_writeback(&serde_json::json!({
+            "learned_reflex": {
+                "preference_key": "operator-mesh-trust",
+                "precedence": 72,
+                "reflexes": {
+                    "remote_tool_reflex": "allow",
+                    "credential_scope_reflex": "mesh_scoped"
+                }
+            }
+        }))
+        .expect("parse should succeed")
+        .expect("writeback should be present");
+
+        assert_eq!(parsed.preference_key, "operator-mesh-trust");
+        assert_eq!(parsed.precedence, 72);
+        assert_eq!(parsed.reflexes_json["remote_tool_reflex"], "allow");
+    }
+
+    #[test]
+    fn parse_learned_reflex_writeback_rejects_non_object_reflexes() {
+        let err = super::parse_learned_reflex_writeback(&serde_json::json!({
+            "learned_reflex": {
+                "preference_key": "operator-mesh-trust",
+                "reflexes": "allow"
+            }
+        }))
+        .expect_err("parse should fail");
+
+        assert!(err.contains("learned_reflex.reflexes must be an object"));
     }
 
     #[test]

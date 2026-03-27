@@ -429,6 +429,19 @@ layers inside `effective_reflex_policy`. The hotel still owns grants and
 effective key rings; it merely projects the agent-owned learned posture into the
 runtime stack it enforces.
 
+Approved routing/reflex refinement should also be able to write back into that
+agent-owned layer. The current honest bridge is:
+
+- `routing.policy.propose` remains approval-gated and still stores the durable
+  narrative proposal through the transitional rule path
+- when the approved proposal carries an explicit learned reflex payload, hotel
+  IPC writes that payload into agent-graph `reflex_preferences`
+- the same turn records a `reflex_evaluations` event so the write-back leaves a
+  local audit trace instead of mutating posture with no antigen marker
+
+That is still transitional, but it turns approved refinement into actual durable
+agent posture rather than a very literate backlog item.
+
 In practice, a fresher active-incarnation update is the `p53` check here: if
 the runtime has newer local evidence that the session now belongs on a
 different active guest, older delivery provenance should die immediately rather

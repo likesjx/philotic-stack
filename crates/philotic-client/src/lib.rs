@@ -1,10 +1,10 @@
-use anyhow::{Context, Result};
+pub use ansible_mesh_core::cron::{CronJob, CronJobId, CronJobSource};
 pub use ansible_mesh_core::resources::{
     ResourceDenied, ResourceGranted, ResourceMaterializing, ResourceReleased, ResourceRequest,
     ResourceRevoked, ResourceType,
 };
-pub use ansible_mesh_core::cron::{CronJob, CronJobId, CronJobSource};
 pub use ansible_mesh_core::storage::ComponentManifest;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::io::ErrorKind;
@@ -826,6 +826,18 @@ pub enum IpcRequest {
     /// Responds with [`IpcResponse::RuleList`].
     ListRules {
         agent_id: String,
+    },
+    /// Upsert one learned reflex preference into the agent graph.
+    ///
+    /// Used by approved routing/reflex refinement flows to write durable
+    /// adaptive posture into agent-owned state without turning rule records
+    /// into stealth policy storage.
+    UpsertAgentReflexPreference {
+        agent_id: String,
+        preference_key: String,
+        precedence: i32,
+        reflexes_json: serde_json::Value,
+        config_json: serde_json::Value,
     },
     /// Agent declares a need for a resource; hotel responds with
     /// [`IpcResponse::ResourceGranted`], [`IpcResponse::ResourceDenied`], or

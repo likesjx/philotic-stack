@@ -762,6 +762,7 @@ Seam IDs: `structured-model-envelope`, `hotel-gemini-oauth-flow`
 - [x] Give reflex governance a first-class policy stack via ordered `effective_reflex_policy` layers and explicit `reflex_policy_records` carrying scope/source/precedence metadata, instead of relying on ad hoc merge order between inferred posture and override blobs.
 - [x] Distinguish reflex policy origins so hotel-projected `reflex_policy_defaults` from bindings become `hotel_default` layers beneath explicit session `reflex_policy_records`, instead of treating all reflex policy records as the same kind of override.
 - [x] Add mesh-synced agent-graph `reflex_preferences` and project them into session bindings as `agent_learned` reflex-policy layers, so durable adaptive posture lives with the agent rather than being smuggled into hotel/session override state.
+- [x] Let approved `routing.policy.propose` calls optionally write a learned reflex payload back into agent-graph `reflex_preferences` and record a `reflex_evaluations` audit trace, so accepted refinement becomes durable posture instead of only durable prose.
 - [ ] Replace the transitional durable-rule bridge behind `routing.policy.propose` with routing-specific policy records, evaluation history, and operator disposition state.
 - [ ] Fold model-graph metadata into live turn-routing-plan ranking so shared catalog truth informs selection without becoming mutable preference storage.
 - [ ] Define the shared catalog layer for models, tools, skills, and rights as reference knowledge outside hotel-owned mutable state.

@@ -5167,6 +5167,47 @@ impl IpcServer {
                     IpcResponse::error("list_rules", "STORAGE_ERROR", err.to_string())
                 }
             },
+            IpcRequest::UpsertAgentReflexPreference {
+                agent_id,
+                preference_key,
+                precedence,
+                reflexes_json,
+                config_json,
+            } => {
+                use ansible_mesh_core::agent_graph_storage::AgentReflexPreference;
+                let path = agent_graph_db_path(&agent_id);
+                let result = (|| -> anyhow::Result<()> {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    let storage = SqliteAgentGraphStorage::open(&agent_id, &path)?;
+                    storage.upsert_reflex_preference(&AgentReflexPreference {
+                        agent_id: agent_id.clone(),
+                        preference_key: preference_key.clone(),
+                        precedence,
+                        reflexes_json,
+                        config_json,
+                        updated_at: 0,
+                    })?;
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => IpcResponse::success(
+                        "agent_reflex_preference",
+                        Some(serde_json::json!({
+                            "message": format!("Stored learned reflex preference '{preference_key}'.")
+                        })),
+                    ),
+                    Err(err) => {
+                        error!("Failed to store learned reflex preference: {err}");
+                        IpcResponse::error(
+                            "upsert_agent_reflex_preference",
+                            "STORAGE_ERROR",
+                            err.to_string(),
+                        )
+                    }
+                }
+            }
             // Resource broker seam (agent-resource-broker). No callers yet;
             // hotel-side broker will be wired in the demand-derived-materialization seam.
             IpcRequest::ResourceRequest(_req) => IpcResponse::error(
@@ -14251,6 +14292,78 @@ mod tests {
             }
             other => panic!("unexpected session snapshot response: {other:?}"),
         }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+            std::env::remove_var("PHILOTIC_AGENT_GRAPH_DB");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        let _ = std::fs::remove_file(&graph_db_path);
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn upsert_agent_reflex_preference_persists_into_agent_graph() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let graph_db_template = test_agent_graph_db_template();
+        let agent_id = "agent-reflex-writeback-01";
+        let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+            std::env::set_var("PHILOTIC_AGENT_GRAPH_DB", &graph_db_template);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("client connect");
+
+        let response = client
+            .send_request(IpcRequest::UpsertAgentReflexPreference {
+                agent_id: agent_id.into(),
+                preference_key: "operator-mesh-trust".into(),
+                precedence: 77,
+                reflexes_json: serde_json::json!({
+                    "remote_tool_reflex": "allow",
+                    "credential_scope_reflex": "mesh_scoped"
+                }),
+                config_json: serde_json::json!({
+                    "reason": "approved routing.policy.propose write-back"
+                }),
+            })
+            .await
+            .expect("write-back request");
+
+        assert!(matches!(response, IpcResponse::Standard { ok: true, .. }));
+
+        let storage =
+            SqliteAgentGraphStorage::open(agent_id, Path::new(&graph_db_path)).expect("open db");
+        let pref = storage
+            .get_reflex_preference("operator-mesh-trust")
+            .expect("read reflex pref")
+            .expect("stored reflex pref");
+        assert_eq!(pref.precedence, 77);
+        assert_eq!(pref.reflexes_json["remote_tool_reflex"], "allow");
+        assert_eq!(
+            pref.config_json["reason"],
+            "approved routing.policy.propose write-back"
+        );
 
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");

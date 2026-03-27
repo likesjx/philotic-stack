@@ -738,6 +738,25 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     "affected_capability": {
                         "type": "string",
                         "description": "Optional capability hint such as voice.transcribe, text.generate, or voice.synthesize."
+                    },
+                    "learned_reflex": {
+                        "type": "object",
+                        "description": "Optional approved reflex write-back to store in the agent graph if this proposal should immediately update durable adaptive posture.",
+                        "properties": {
+                            "preference_key": {
+                                "type": "string",
+                                "description": "Stable key for the learned reflex preference in the agent graph."
+                            },
+                            "precedence": {
+                                "type": "integer",
+                                "description": "Optional precedence for the learned reflex layer. Defaults to 70."
+                            },
+                            "reflexes": {
+                                "type": "object",
+                                "description": "Reflex fields to write, such as remote_tool_reflex, remote_component_reflex, or credential_scope_reflex."
+                            }
+                        },
+                        "required": ["preference_key", "reflexes"]
                     }
                 },
                 "required": ["problem", "proposed_change", "evidence"]
