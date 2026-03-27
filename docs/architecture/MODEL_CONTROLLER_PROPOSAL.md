@@ -3,7 +3,7 @@ title: "Model Controller Proposal"
 doc_type: proposal
 domain: tooling-execution
 status: accepted-current-slice
-last_updated: 2026-03-26
+last_updated: 2026-03-27
 tags:
   - model-controller
   - models
@@ -276,6 +276,19 @@ They are allowed to collapse `ingress + cognition` under policy, but they
 should not automatically become whole-turn owners. They still need explicit
 envelope, approval, tool, and routing rules before they are allowed to bypass
 the simpler staged pipeline.
+
+Current implemented truth for this seam:
+
+- `philote` now lets shared model markers plus routing preferences influence
+  whether eligible voice turns keep the classic
+  `voice.transcribe -> text.generate -> voice.synthesize` path or collapse into
+  a native-live cognition species like `voice.dialogue`
+- that chosen cognition species now flows through initial outbound request
+  assembly and cognitive re-entry paths instead of being confined to plan
+  metadata
+- providers still must opt in explicitly; parsing and plan compilation now know
+  about native-live species, but execution still refuses them until a provider
+  implementation is wired honestly
 
 ## Request Classes
 

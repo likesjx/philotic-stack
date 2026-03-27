@@ -429,45 +429,17 @@ fn role_to_provider_hint(role: &str) -> Option<String> {
     Some(provider.to_string())
 }
 
-fn compile_turn_routing_plan(
-    media_routing: Option<&MediaRouting>,
-    voice_policy: Option<&VoiceResponsePolicy>,
-    had_voice_input: bool,
-    routing_preferences: &[RoutingPreferenceBinding],
-    bindings: &SessionBindings,
-) -> TurnRoutingPlan {
-    let mut stages = Vec::new();
-
-    if let Some(routing) = media_routing {
-        let profile = turn_routed_capability_profile(routing.capability).unwrap_or(
-            TurnRoutedCapabilityProfile {
-                species: TurnRoutedCapabilitySpecies::MediaAnalyze,
-                capability: "media.analyze",
-                request_class: "transform",
-                default_stage_kind: TurnRoutingStageKind::Ingress,
-                default_context_envelope: TurnContextEnvelopeKind::Ingress,
-                composition: TurnCapabilityCompositionKind::StageLocal,
-                default_streaming: false,
-            },
-        );
-        let controller_role = match routing.capability {
-            "voice.transcribe" => DEFAULT_VOICE_MODEL_ROLE,
-            _ => DEFAULT_TEXT_MODEL_ROLE,
-        };
-        stages.push(TurnRoutingStagePlan {
-            kind: profile.default_stage_kind,
-            capability: routing.capability.to_string(),
-            request_class: profile.request_class.into(),
-            context_envelope: profile.default_context_envelope,
-            controller_role: controller_role.into(),
-            provider_hint: role_to_provider_hint(controller_role),
-            model_ref: None,
-            streaming: profile.default_streaming,
-        });
+fn cognitive_controller_role(capability: &str) -> &'static str {
+    match capability {
+        "voice.dialogue" => DEFAULT_TEXT_MODEL_ROLE,
+        "response.generate" => DEFAULT_TEXT_MODEL_ROLE,
+        _ => DEFAULT_TEXT_MODEL_ROLE,
     }
+}
 
-    let cognition_profile =
-        turn_routed_capability_profile("text.generate").unwrap_or(TurnRoutedCapabilityProfile {
+fn cognitive_stage_plan(capability: &str) -> TurnRoutingStagePlan {
+    let profile =
+        turn_routed_capability_profile(capability).unwrap_or(TurnRoutedCapabilityProfile {
             species: TurnRoutedCapabilitySpecies::TextGenerate,
             capability: "text.generate",
             request_class: "cognitive",
@@ -476,16 +448,198 @@ fn compile_turn_routing_plan(
             composition: TurnCapabilityCompositionKind::StageLocal,
             default_streaming: true,
         });
-    stages.push(TurnRoutingStagePlan {
-        kind: cognition_profile.default_stage_kind,
-        capability: cognition_profile.capability.into(),
-        request_class: cognition_profile.request_class.into(),
-        context_envelope: cognition_profile.default_context_envelope,
-        controller_role: DEFAULT_TEXT_MODEL_ROLE.into(),
-        provider_hint: role_to_provider_hint(DEFAULT_TEXT_MODEL_ROLE),
+    let controller_role = cognitive_controller_role(profile.capability);
+    TurnRoutingStagePlan {
+        kind: profile.default_stage_kind,
+        capability: profile.capability.into(),
+        request_class: profile.request_class.into(),
+        context_envelope: profile.default_context_envelope,
+        controller_role: controller_role.into(),
+        provider_hint: role_to_provider_hint(controller_role),
         model_ref: None,
-        streaming: cognition_profile.default_streaming,
-    });
+        streaming: profile.default_streaming,
+    }
+}
+
+fn voice_turn_supports_native_live(
+    media_routing: Option<&MediaRouting>,
+    had_voice_input: bool,
+) -> bool {
+    had_voice_input
+        || media_routing
+            .map(|routing| routing.capability == "voice.transcribe")
+            .unwrap_or(false)
+}
+
+fn routing_preference_matches_stage(
+    preference: &RoutingPreferenceBinding,
+    stage: &TurnRoutingStagePlan,
+) -> bool {
+    preference
+        .stage_kind
+        .as_deref()
+        .map(|kind| kind == stage_kind_name(stage.kind))
+        .unwrap_or(true)
+        && preference
+            .capability
+            .as_deref()
+            .map(|capability| capability == stage.capability)
+            .unwrap_or(true)
+}
+
+fn shared_model_ligand_signal(stage: &TurnRoutingStagePlan, bindings: &SessionBindings) -> i32 {
+    bindings
+        .shared_model_markers
+        .iter()
+        .map(|marker| model_marker_stage_signal(marker, stage))
+        .max()
+        .unwrap_or(0)
+}
+
+fn cognitive_receptor_baseline(stage: &TurnRoutingStagePlan, _voice_turn: bool) -> i32 {
+    match stage.capability.as_str() {
+        "text.generate" => 1,
+        _ => 0,
+    }
+}
+
+fn cognitive_receptor_score(
+    stage: &TurnRoutingStagePlan,
+    routing_preferences: &[RoutingPreferenceBinding],
+    bindings: &SessionBindings,
+    voice_turn: bool,
+) -> i32 {
+    let preference_signal = routing_preferences
+        .iter()
+        .filter(|pref| pref.preference_level >= 0)
+        .filter(|pref| pref.provider_hint.is_some() || pref.model_ref.is_some())
+        .filter(|pref| routing_preference_matches_stage(pref, stage))
+        .map(|pref| routing_preference_score(pref, stage, bindings))
+        .max()
+        .unwrap_or(0);
+
+    cognitive_receptor_baseline(stage, voice_turn)
+        + preference_signal
+        + shared_model_ligand_signal(stage, bindings)
+}
+
+fn select_cognitive_receptor_stage(
+    media_routing: Option<&MediaRouting>,
+    had_voice_input: bool,
+    routing_preferences: &[RoutingPreferenceBinding],
+    bindings: &SessionBindings,
+) -> TurnRoutingStagePlan {
+    let voice_turn = voice_turn_supports_native_live(media_routing, had_voice_input);
+    let mut candidates = vec![cognitive_stage_plan("text.generate")];
+    if voice_turn {
+        candidates.push(cognitive_stage_plan("response.generate"));
+        candidates.push(cognitive_stage_plan("voice.dialogue"));
+    }
+
+    candidates
+        .into_iter()
+        .max_by(|left, right| {
+            cognitive_receptor_score(left, routing_preferences, bindings, voice_turn)
+                .cmp(&cognitive_receptor_score(
+                    right,
+                    routing_preferences,
+                    bindings,
+                    voice_turn,
+                ))
+                .then_with(|| left.capability.cmp(&right.capability))
+        })
+        .unwrap_or_else(|| cognitive_stage_plan("text.generate"))
+}
+
+fn active_or_default_cognitive_stage(state: Option<&SessionState>) -> TurnRoutingStagePlan {
+    state
+        .and_then(|session| session.active_turn_routing_plan())
+        .and_then(|plan| stage_plan(plan, TurnRoutingStageKind::Cognition))
+        .cloned()
+        .unwrap_or_else(|| cognitive_stage_plan("text.generate"))
+}
+
+fn native_live_voice_prompt(content: &str, capability: &str) -> String {
+    let context = content.trim();
+    match capability {
+        "voice.dialogue" => {
+            if context.is_empty() {
+                "Respond helpfully to the user's attached voice input as a native streaming voice dialogue turn.".to_string()
+            } else {
+                format!(
+                    "Respond helpfully to the user's attached voice input as a native streaming voice dialogue turn. User context: {}.",
+                    context
+                )
+            }
+        }
+        "response.generate" => {
+            if context.is_empty() {
+                "Generate the best response for the user's attached voice input, using native multimodal response behavior when supported.".to_string()
+            } else {
+                format!(
+                    "Generate the best response for the user's attached voice input, using native multimodal response behavior when supported. User context: {}.",
+                    context
+                )
+            }
+        }
+        _ => transcription_prompt(content),
+    }
+}
+
+fn compile_turn_routing_plan(
+    media_routing: Option<&MediaRouting>,
+    voice_policy: Option<&VoiceResponsePolicy>,
+    had_voice_input: bool,
+    routing_preferences: &[RoutingPreferenceBinding],
+    bindings: &SessionBindings,
+) -> TurnRoutingPlan {
+    let mut stages = Vec::new();
+    let cognition_stage = select_cognitive_receptor_stage(
+        media_routing,
+        had_voice_input,
+        routing_preferences,
+        bindings,
+    );
+    let collapses_ingress = media_routing
+        .map(|routing| routing.capability == "voice.transcribe")
+        .unwrap_or(false)
+        && turn_routed_capability_profile(&cognition_stage.capability)
+            .map(|profile| {
+                profile.composition == TurnCapabilityCompositionKind::CollapsibleIngressCognition
+            })
+            .unwrap_or(false);
+
+    if let Some(routing) = media_routing {
+        if !collapses_ingress {
+            let profile = turn_routed_capability_profile(routing.capability).unwrap_or(
+                TurnRoutedCapabilityProfile {
+                    species: TurnRoutedCapabilitySpecies::MediaAnalyze,
+                    capability: "media.analyze",
+                    request_class: "transform",
+                    default_stage_kind: TurnRoutingStageKind::Ingress,
+                    default_context_envelope: TurnContextEnvelopeKind::Ingress,
+                    composition: TurnCapabilityCompositionKind::StageLocal,
+                    default_streaming: false,
+                },
+            );
+            let controller_role = match routing.capability {
+                "voice.transcribe" => DEFAULT_VOICE_MODEL_ROLE,
+                _ => DEFAULT_TEXT_MODEL_ROLE,
+            };
+            stages.push(TurnRoutingStagePlan {
+                kind: profile.default_stage_kind,
+                capability: routing.capability.to_string(),
+                request_class: profile.request_class.into(),
+                context_envelope: profile.default_context_envelope,
+                controller_role: controller_role.into(),
+                provider_hint: role_to_provider_hint(controller_role),
+                model_ref: None,
+                streaming: profile.default_streaming,
+            });
+        }
+    }
+
+    stages.push(cognition_stage.clone());
 
     let tts_mode_enabled = voice_policy
         .map(|policy| match policy.mode {
@@ -520,7 +674,9 @@ fn compile_turn_routing_plan(
     }
 
     let mut plan = TurnRoutingPlan {
-        trigger: if media_routing
+        trigger: if collapses_ingress {
+            "voice_input_native_live".into()
+        } else if media_routing
             .map(|routing| routing.capability == "voice.transcribe")
             .unwrap_or(false)
         {
@@ -553,18 +709,7 @@ fn select_stage_routing_preference<'a>(
         .iter()
         .filter(|pref| pref.preference_level >= 0)
         .filter(|pref| pref.provider_hint.is_some() || pref.model_ref.is_some())
-        .filter(|pref| {
-            pref.stage_kind
-                .as_deref()
-                .map(|kind| kind == stage_kind_name(stage.kind))
-                .unwrap_or(true)
-        })
-        .filter(|pref| {
-            pref.capability
-                .as_deref()
-                .map(|capability| capability == stage.capability)
-                .unwrap_or(true)
-        })
+        .filter(|pref| routing_preference_matches_stage(pref, stage))
         .max_by(|left, right| {
             routing_preference_score(left, stage, bindings)
                 .cmp(&routing_preference_score(right, stage, bindings))
@@ -744,7 +889,12 @@ fn model_marker_stage_signal(marker: &serde_json::Value, stage: &TurnRoutingStag
     match stage.kind {
         TurnRoutingStageKind::Ingress => speed_marker + audio_native_marker,
         TurnRoutingStageKind::Cognition => {
-            speed_marker / 3 + thinking_marker / 2 + tool_use_marker / 2
+            let native_live_bonus = match stage.capability.as_str() {
+                "response.generate" => audio_native_marker,
+                "voice.dialogue" => audio_native_marker * 2,
+                _ => 0,
+            };
+            speed_marker / 3 + thinking_marker / 2 + tool_use_marker / 2 + native_live_bonus
         }
         TurnRoutingStageKind::Egress => speed_marker + audio_native_marker,
     }
@@ -1460,37 +1610,73 @@ impl AgentRuntime {
 
         let (action, prompt, context, context_projection, attachments, tools_for_model, stage) =
             if let Some(routing) = media_routing {
-                let stage = stage_plan(&turn_routing_plan, TurnRoutingStageKind::Ingress)
-                    .expect("ingress stage should exist for routed media turns")
-                    .clone();
-                let effective_tools = self
-                    .sessions
-                    .get(&session_id)
-                    .expect("session should exist while preparing model request")
-                    .project_tools_for_envelope(&content, stage.context_envelope);
-                let (_, context, context_projection) = self
-                    .sessions
-                    .get(&session_id)
-                    .expect("session should exist while preparing model request")
-                    .model_request_payloads_for_envelope(
-                        &content,
-                        &effective_tools,
-                        stage.context_envelope,
-                    );
-                let prompt = if routing.action == "transcribe" {
-                    transcription_prompt(&content)
+                if let Some(stage) =
+                    stage_plan(&turn_routing_plan, TurnRoutingStageKind::Ingress).cloned()
+                {
+                    let effective_tools = self
+                        .sessions
+                        .get(&session_id)
+                        .expect("session should exist while preparing model request")
+                        .project_tools_for_envelope(&content, stage.context_envelope);
+                    let (_, context, context_projection) = self
+                        .sessions
+                        .get(&session_id)
+                        .expect("session should exist while preparing model request")
+                        .model_request_payloads_for_envelope(
+                            &content,
+                            &effective_tools,
+                            stage.context_envelope,
+                        );
+                    let prompt = if routing.action == "transcribe" {
+                        transcription_prompt(&content)
+                    } else {
+                        media_analysis_prompt(&content, &routing.attachments)
+                    };
+                    (
+                        routing.action,
+                        prompt,
+                        context,
+                        context_projection,
+                        routing.attachments,
+                        effective_tools,
+                        stage,
+                    )
                 } else {
-                    media_analysis_prompt(&content, &routing.attachments)
-                };
-                (
-                    routing.action,
-                    prompt,
-                    context,
-                    context_projection,
-                    routing.attachments,
-                    effective_tools,
-                    stage,
-                )
+                    let stage = stage_plan(&turn_routing_plan, TurnRoutingStageKind::Cognition)
+                        .expect("cognition stage should exist for native-live media turns")
+                        .clone();
+                    let effective_tools = self
+                        .sessions
+                        .get(&session_id)
+                        .expect("session should exist while preparing model request")
+                        .project_tools_for_envelope(&content, stage.context_envelope);
+                    let (default_prompt, context, context_projection) = self
+                        .sessions
+                        .get(&session_id)
+                        .expect("session should exist while preparing model request")
+                        .model_request_payloads_for_envelope(
+                            &content,
+                            &effective_tools,
+                            stage.context_envelope,
+                        );
+                    let prompt = if matches!(
+                        stage.capability.as_str(),
+                        "response.generate" | "voice.dialogue"
+                    ) {
+                        native_live_voice_prompt(&content, &stage.capability)
+                    } else {
+                        default_prompt
+                    };
+                    (
+                        stage.capability.clone(),
+                        prompt,
+                        context,
+                        context_projection,
+                        routing.attachments,
+                        effective_tools,
+                        stage,
+                    )
+                }
             } else {
                 let stage = stage_plan(&turn_routing_plan, TurnRoutingStageKind::Cognition)
                     .expect("cognition stage should exist for every turn")
@@ -1510,7 +1696,7 @@ impl AgentRuntime {
                         stage.context_envelope,
                     );
                 (
-                    "generate_text".to_string(),
+                    stage.capability.clone(),
                     prompt,
                     context,
                     context_projection,
@@ -1603,7 +1789,7 @@ impl AgentRuntime {
             final_reply_guest_id,
         };
 
-        if debug_model_requests_enabled() && stage.capability == "text.generate" {
+        if debug_model_requests_enabled() && stage.kind == TurnRoutingStageKind::Cognition {
             match serde_json::to_string_pretty(&model_req) {
                 Ok(json) => info!(
                     "PHILOTIC_DEBUG_MODEL_REQUESTS philote outbound model request session={} turn={}:\n{}",
@@ -2593,9 +2779,11 @@ impl AgentRuntime {
                     .emit_turn_event(&session_id, "waiting_tool", None)
                     .await;
 
+                let cognitive_stage =
+                    active_or_default_cognitive_stage(self.sessions.get(&session_id));
                 let model_req = ModelRequestPayload {
-                    action: "generate_text".to_string(),
-                    request_class: Some("cognitive".to_string()),
+                    action: cognitive_stage.capability.clone(),
+                    request_class: Some(cognitive_stage.request_class.clone()),
                     session_id: session_id.clone(),
                     turn_id,
                     prompt,
@@ -2639,7 +2827,7 @@ impl AgentRuntime {
 
                 let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
                     self.sessions.get(&session_id),
-                    "text.generate",
+                    cognitive_stage.capability.as_str(),
                     DEFAULT_TEXT_MODEL_ROLE,
                 );
 
@@ -2732,9 +2920,10 @@ impl AgentRuntime {
             .emit_turn_event(&session_id, "loop_recovering", None)
             .await;
 
+        let cognitive_stage = active_or_default_cognitive_stage(self.sessions.get(&session_id));
         let model_req = ModelRequestPayload {
-            action: "generate_text".to_string(),
-            request_class: Some("cognitive".to_string()),
+            action: cognitive_stage.capability.clone(),
+            request_class: Some(cognitive_stage.request_class.clone()),
             session_id: session_id.clone(),
             turn_id,
             prompt,
@@ -2791,7 +2980,7 @@ impl AgentRuntime {
 
         let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
             self.sessions.get(&session_id),
-            "text.generate",
+            cognitive_stage.capability.as_str(),
             DEFAULT_TEXT_MODEL_ROLE,
         );
 
@@ -2890,9 +3079,10 @@ impl AgentRuntime {
             state.clear_handoff_summary();
         }
 
+        let cognitive_stage = active_or_default_cognitive_stage(self.sessions.get(&session_id));
         let model_req = ModelRequestPayload {
-            action: "generate_text".to_string(),
-            request_class: Some("cognitive".to_string()),
+            action: cognitive_stage.capability.clone(),
+            request_class: Some(cognitive_stage.request_class.clone()),
             session_id: session_id.clone(),
             turn_id,
             prompt: reentry.prompt,
@@ -2936,7 +3126,7 @@ impl AgentRuntime {
 
         let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
             self.sessions.get(&session_id),
-            "text.generate",
+            cognitive_stage.capability.as_str(),
             DEFAULT_TEXT_MODEL_ROLE,
         );
 
@@ -3871,9 +4061,10 @@ impl AgentRuntime {
             .await?;
         self.sync_session_index(&index_state).await?;
 
+        let cognitive_stage = active_or_default_cognitive_stage(self.sessions.get(&session_id));
         let model_req = ModelRequestPayload {
-            action: "generate_text".to_string(),
-            request_class: Some("cognitive".to_string()),
+            action: cognitive_stage.capability.clone(),
+            request_class: Some(cognitive_stage.request_class.clone()),
             session_id: session_id.clone(),
             turn_id,
             prompt,
@@ -3917,7 +4108,7 @@ impl AgentRuntime {
 
         let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
             self.sessions.get(&session_id),
-            "text.generate",
+            cognitive_stage.capability.as_str(),
             DEFAULT_TEXT_MODEL_ROLE,
         );
 
@@ -4767,9 +4958,10 @@ impl AgentRuntime {
             state.clear_handoff_summary();
         }
 
+        let cognitive_stage = active_or_default_cognitive_stage(self.sessions.get(&session_id));
         let model_req = ModelRequestPayload {
-            action: "generate_text".to_string(),
-            request_class: Some("cognitive".to_string()),
+            action: cognitive_stage.capability.clone(),
+            request_class: Some(cognitive_stage.request_class.clone()),
             session_id: session_id.clone(),
             turn_id,
             prompt,
@@ -4813,7 +5005,7 @@ impl AgentRuntime {
 
         let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
             self.sessions.get(&session_id),
-            "text.generate",
+            cognitive_stage.capability.as_str(),
             DEFAULT_TEXT_MODEL_ROLE,
         );
 
@@ -8623,6 +8815,138 @@ mod tests {
             plan.stages[0].model_ref.as_deref(),
             Some("gemini-3.1-flash")
         );
+    }
+
+    #[test]
+    fn compile_turn_routing_plan_selects_native_live_voice_dialogue_when_ligands_are_expressed() {
+        use crate::session::{RoutingPreferenceBinding, SessionBindings};
+
+        let routing_preferences = vec![
+            RoutingPreferenceBinding {
+                preference_key: "cognition-text-gemini".into(),
+                stage_kind: Some("cognition".into()),
+                capability: Some("text.generate".into()),
+                provider_hint: Some("gemini".into()),
+                model_ref: Some("gemini-3.1-flash".into()),
+                preference_level: 1,
+                weight: 90,
+                updated_at: 10,
+            },
+            RoutingPreferenceBinding {
+                preference_key: "cognition-live-gemini".into(),
+                stage_kind: Some("cognition".into()),
+                capability: Some("voice.dialogue".into()),
+                provider_hint: Some("gemini".into()),
+                model_ref: Some("gemini-3.1-flash-live".into()),
+                preference_level: 1,
+                weight: 90,
+                updated_at: 11,
+            },
+        ];
+        let bindings = SessionBindings {
+            shared_model_markers: vec![
+                serde_json::json!({
+                    "model_ref": "gemini-3.1-flash",
+                    "provider_hint": "gemini",
+                    "capability_markers": ["text.generate"],
+                    "speed_marker": 70,
+                    "thinking_marker": 72,
+                    "tool_use_marker": 75,
+                    "audio_native_marker": 0
+                }),
+                serde_json::json!({
+                    "model_ref": "gemini-3.1-flash-live",
+                    "provider_hint": "gemini",
+                    "capability_markers": ["voice.dialogue", "response.generate"],
+                    "speed_marker": 92,
+                    "thinking_marker": 74,
+                    "tool_use_marker": 78,
+                    "audio_native_marker": 95
+                }),
+            ],
+            ..Default::default()
+        };
+        let media_routing = MediaRouting {
+            action: "transcribe".into(),
+            capability: "voice.transcribe",
+            attachments: vec![blob_backed_attachment("voice")],
+        };
+        let voice_policy = VoiceResponsePolicy {
+            mode: TtsMode::Auto,
+            ..Default::default()
+        };
+
+        let plan = compile_turn_routing_plan(
+            Some(&media_routing),
+            Some(&voice_policy),
+            true,
+            &routing_preferences,
+            &bindings,
+        );
+
+        assert_eq!(plan.trigger, "voice_input_native_live");
+        assert_eq!(plan.stages.len(), 2);
+        assert_eq!(plan.stages[0].kind, TurnRoutingStageKind::Cognition);
+        assert_eq!(plan.stages[0].capability, "voice.dialogue");
+        assert_eq!(plan.stages[0].provider_hint.as_deref(), Some("gemini"));
+        assert_eq!(
+            plan.stages[0].model_ref.as_deref(),
+            Some("gemini-3.1-flash-live")
+        );
+        assert_eq!(plan.stages[1].kind, TurnRoutingStageKind::Egress);
+        assert_eq!(plan.stages[1].capability, "voice.synthesize");
+    }
+
+    #[test]
+    fn compile_turn_routing_plan_keeps_three_stage_voice_path_without_native_live_ligands() {
+        use crate::session::{RoutingPreferenceBinding, SessionBindings};
+
+        let routing_preferences = vec![RoutingPreferenceBinding {
+            preference_key: "cognition-text-gemini".into(),
+            stage_kind: Some("cognition".into()),
+            capability: Some("text.generate".into()),
+            provider_hint: Some("gemini".into()),
+            model_ref: Some("gemini-3.1-flash".into()),
+            preference_level: 1,
+            weight: 90,
+            updated_at: 10,
+        }];
+        let bindings = SessionBindings {
+            shared_model_markers: vec![serde_json::json!({
+                "model_ref": "gemini-3.1-flash",
+                "provider_hint": "gemini",
+                "capability_markers": ["text.generate"],
+                "speed_marker": 90,
+                "thinking_marker": 75,
+                "tool_use_marker": 80,
+                "audio_native_marker": 0
+            })],
+            ..Default::default()
+        };
+        let media_routing = MediaRouting {
+            action: "transcribe".into(),
+            capability: "voice.transcribe",
+            attachments: vec![blob_backed_attachment("voice")],
+        };
+        let voice_policy = VoiceResponsePolicy {
+            mode: TtsMode::Auto,
+            ..Default::default()
+        };
+
+        let plan = compile_turn_routing_plan(
+            Some(&media_routing),
+            Some(&voice_policy),
+            true,
+            &routing_preferences,
+            &bindings,
+        );
+
+        assert_eq!(plan.trigger, "voice_input");
+        assert_eq!(plan.stages.len(), 3);
+        assert_eq!(plan.stages[0].kind, TurnRoutingStageKind::Ingress);
+        assert_eq!(plan.stages[0].capability, "voice.transcribe");
+        assert_eq!(plan.stages[1].kind, TurnRoutingStageKind::Cognition);
+        assert_eq!(plan.stages[1].capability, "text.generate");
     }
 
     #[test]

@@ -772,6 +772,8 @@ Seam IDs: `structured-model-envelope`, `hotel-gemini-oauth-flow`
 - [x] Project shared `abstract_tool` / `abstract_skill` markers through hotel bindings and use shared tool ligands at the runner boundary to shape tool schema, approval sensitivity, and `local_only` routing suppression without widening rights.
 - [x] Add a first explicit turn-routed capability taxonomy in `philote`, distinguishing stage-local species from collapsible native-live species like `response.generate` and `voice.dialogue`.
 - [x] Extend `model-router` controller parsing and validation so native-live species like `response.generate` and `voice.dialogue` are first-class task kinds even before providers are wired.
+- [x] Let native-live species actually influence real `TurnRoutingPlan` compilation under policy, so eligible voice turns can collapse ingress into `voice.dialogue`/`response.generate` when shared model markers and routing preferences express that ligand, and carry the chosen cognition species through outbound request assembly plus cognitive re-entry.
+- [ ] Wire the first provider implementation for native-live species honestly, starting with explicit `response.generate` / `voice.dialogue` behavior instead of a magical realtime bypass.
 - [ ] Define the shared catalog layer for models, tools, skills, and rights as reference knowledge outside hotel-owned mutable state.
 - [ ] Extend the hotel's projected key ring beyond `effective_rights` for tools/skills/component capabilities into scoped execution credentials and richer right classes.
 - [ ] Audit `model-router` and runner dispatch beyond current tool/component assembly so lower execution layers consume projected rights but never inject or widen them.
