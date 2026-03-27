@@ -8,6 +8,8 @@ mod footprint;
 mod init;
 mod load;
 mod muninn;
+mod onboard;
+mod presets;
 mod reset;
 mod serve;
 mod service;
@@ -42,7 +44,18 @@ enum Command {
         /// Overwrite existing mesh-config.json
         #[arg(long)]
         force: bool,
+
+        /// Run the interactive setup wizard (default when no config exists)
+        #[arg(long, short)]
+        interactive: bool,
+
+        /// Skip the interactive wizard — write the raw template
+        #[arg(long)]
+        non_interactive: bool,
     },
+
+    /// List available agent fleet presets
+    Presets,
 
     /// Start the local aiua daemon (boots from DB — run `phil load` first if DB is empty)
     Start {
@@ -183,7 +196,45 @@ enum ServiceAction {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Init { config, force } => init::run(config, force).await,
+        Command::Init { config, force, interactive, non_interactive } => {
+            let config_path = config.unwrap_or_else(|| {
+                match init::active_profile() {
+                    Some(_) => init::profile_dir().join("config.json"),
+                    None => std::path::PathBuf::from("mesh-config.json"),
+                }
+            });
+
+            // Interactive by default when no config exists, unless --non-interactive
+            let should_interact = if non_interactive {
+                false
+            } else if interactive {
+                true
+            } else {
+                !config_path.exists()
+            };
+
+            // Identity + muninn always run; config template only in non-interactive
+            init::run_inner(Some(config_path.clone()), force, should_interact).await?;
+
+            if should_interact {
+                onboard::run_interactive(&config_path, force).await?;
+            }
+
+            Ok(())
+        }
+        Command::Presets => {
+            println!("Available fleet presets:");
+            println!();
+            for (name, desc) in presets::list_preset_names() {
+                let agents = presets::load_preset(&name)
+                    .map(|p| p.agents.iter().map(|a| a.persona_name.clone()).collect::<Vec<_>>().join(", "))
+                    .unwrap_or_default();
+                println!("  {name:<8} {desc}");
+                println!("  {:<8} Agents: {agents}", "");
+                println!();
+            }
+            Ok(())
+        }
         Command::Load { file, hotel } => load::run(file, hotel).await,
         Command::Start { hotel, detach } => start::run(hotel, detach).await,
         Command::Stop => stop::run().await,

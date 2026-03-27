@@ -46,7 +46,15 @@ pub fn public_key_path() -> PathBuf {
     identity_dir().join("operator.pub")
 }
 
+/// Backward-compatible entry point — runs identity + config template + muninn.
+#[allow(dead_code)]
 pub async fn run(config: Option<PathBuf>, force: bool) -> Result<()> {
+    run_inner(config, force, false).await
+}
+
+/// If `skip_config` is true, identity and muninn are set up but the
+/// mesh-config template is not written (the interactive wizard handles it).
+pub async fn run_inner(config: Option<PathBuf>, force: bool, skip_config: bool) -> Result<()> {
     let config_path = config.unwrap_or_else(|| PathBuf::from("mesh-config.json"));
 
     println!("philotic-web init");
@@ -86,7 +94,9 @@ pub async fn run(config: Option<PathBuf>, force: bool) -> Result<()> {
     println!("  fingerprint  {fingerprint}");
 
     // ── mesh-config.json template ──────────────────────────────────────────
-    if config_path.exists() && !force {
+    if skip_config {
+        // Interactive wizard will handle config generation
+    } else if config_path.exists() && !force {
         println!(
             "\n  config    {} already exists — skipping (use --force to overwrite)",
             config_path.display()

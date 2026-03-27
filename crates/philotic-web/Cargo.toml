@@ -27,3 +27,4 @@ tower-http = { version = "0.5", features = ["cors", "fs"] }
 tokio-tungstenite = "0.24"
 rust-embed = { version = "8", features = ["mime-guess"] }
 philotic-client = { path = "../philotic-client" }
+inquire = "0.7"
