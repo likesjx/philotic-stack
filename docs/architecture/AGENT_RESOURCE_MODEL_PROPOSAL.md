@@ -410,8 +410,10 @@ organs and give them policy shape. Runtime projection should therefore surface
 an `effective_reflex_policy` with ordered layers:
 
 - an inferred `placement_inferred` layer from runtime provenance
-- optional explicit `reflex_policy_records` with `policy_scope`,
-  `policy_source`, `precedence`, and `reflexes`
+- optional hotel-projected `hotel_default` layers from bindings
+- optional explicit `reflex_policy_records` for session-scoped override layers
+  with `policy_scope`, `policy_source`, `origin_class`, `precedence`, and
+  `reflexes`
 - a highest-precedence-wins merge rule that projects the final
   `effective_reflexes`
 

@@ -346,13 +346,56 @@ fn merge_reflex_overrides(
     reflexes
 }
 
+fn push_normalized_reflex_policy_records(
+    layers: &mut Vec<serde_json::Value>,
+    records: Option<&serde_json::Value>,
+    fallback_scope: &str,
+    fallback_source: &str,
+    fallback_origin_class: &str,
+    fallback_precedence: u64,
+) {
+    let Some(records) = records.and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    for record in records {
+        let Some(obj) = record.as_object() else {
+            continue;
+        };
+        let Some(reflexes) = obj.get("reflexes").and_then(serde_json::Value::as_object) else {
+            continue;
+        };
+        layers.push(serde_json::json!({
+            "policy_scope": obj
+                .get("policy_scope")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(fallback_scope),
+            "policy_source": obj
+                .get("policy_source")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(fallback_source),
+            "origin_class": obj
+                .get("origin_class")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(fallback_origin_class),
+            "precedence": obj
+                .get("precedence")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(fallback_precedence),
+            "reason": obj.get("reason").cloned().unwrap_or(serde_json::Value::Null),
+            "reflexes": serde_json::Value::Object(reflexes.clone()),
+        }));
+    }
+}
+
 fn normalized_reflex_policy_records(
     summary_json: &serde_json::Value,
+    bindings: &serde_json::Value,
     placement_risk_level: &str,
 ) -> Vec<serde_json::Value> {
     let mut layers = vec![serde_json::json!({
         "policy_scope": "placement_inferred",
         "policy_source": "hotel_runtime",
+        "origin_class": "inferred",
         "precedence": 10,
         "reason": format!(
             "derived from placement_risk_level={placement_risk_level} runtime provenance"
@@ -360,42 +403,33 @@ fn normalized_reflex_policy_records(
         "reflexes": effective_reflexes_from_placement_risk(placement_risk_level),
     })];
 
-    if let Some(records) = summary_json
-        .get("reflex_policy_records")
-        .and_then(serde_json::Value::as_array)
-    {
-        for record in records {
-            let Some(obj) = record.as_object() else {
-                continue;
-            };
-            let Some(reflexes) = obj.get("reflexes").and_then(serde_json::Value::as_object) else {
-                continue;
-            };
+    push_normalized_reflex_policy_records(
+        &mut layers,
+        bindings.get("reflex_policy_defaults"),
+        "hotel_default",
+        "hotel_bindings",
+        "hotel_default",
+        40,
+    );
+    push_normalized_reflex_policy_records(
+        &mut layers,
+        summary_json.get("reflex_policy_records"),
+        "session_override",
+        "session_summary",
+        "session_override",
+        100,
+    );
+    if summary_json.get("reflex_policy_records").is_none() {
+        if let Some(overrides) = summary_json.get("reflex_overrides") {
             layers.push(serde_json::json!({
-                "policy_scope": obj
-                    .get("policy_scope")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("session_override"),
-                "policy_source": obj
-                    .get("policy_source")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("session_summary"),
-                "precedence": obj
-                    .get("precedence")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(100),
-                "reason": obj.get("reason").cloned().unwrap_or(serde_json::Value::Null),
-                "reflexes": serde_json::Value::Object(reflexes.clone()),
+                "policy_scope": "session_override",
+                "policy_source": "legacy_reflex_overrides",
+                "origin_class": "legacy_bridge",
+                "precedence": 100,
+                "reason": "legacy reflex_overrides bridge",
+                "reflexes": overrides,
             }));
         }
-    } else if let Some(overrides) = summary_json.get("reflex_overrides") {
-        layers.push(serde_json::json!({
-            "policy_scope": "session_override",
-            "policy_source": "legacy_reflex_overrides",
-            "precedence": 100,
-            "reason": "legacy reflex_overrides bridge",
-            "reflexes": overrides,
-        }));
     }
 
     layers.sort_by_key(|layer| {
@@ -6474,9 +6508,12 @@ impl IpcServer {
                     )
                 })
                 .unwrap_or("guarded");
+            let effective_reflex_policy_layers = normalized_reflex_policy_records(
+                &session.summary_json,
+                &bindings,
+                placement_risk_level,
+            );
             if let Some(obj) = bindings.as_object_mut() {
-                let effective_reflex_policy_layers =
-                    normalized_reflex_policy_records(&session.summary_json, placement_risk_level);
                 let effective_reflexes =
                     effective_reflexes_from_policy_records(&effective_reflex_policy_layers);
                 let effective_right_policy = serde_json::json!({
@@ -6495,6 +6532,10 @@ impl IpcServer {
                     "effective_reflex_policy".to_string(),
                     serde_json::json!({
                         "precedence_model": "highest_precedence_wins",
+                        "origin_classes": effective_reflex_policy_layers
+                            .iter()
+                            .filter_map(|layer| layer.get("origin_class").and_then(serde_json::Value::as_str))
+                            .collect::<Vec<_>>(),
                         "layers": effective_reflex_policy_layers,
                         "evaluation_count": session
                             .summary_json
@@ -11400,6 +11441,15 @@ mod tests {
                 lease_owner_component_id: None,
                 lease_expires_at: None,
                 summary_json: serde_json::json!({
+                    "bindings": {
+                        "reflex_policy_defaults": [{
+                            "policy_source": "operator_baseline",
+                            "reason": "local remote tools stay damped",
+                            "reflexes": {
+                                "remote_component_reflex": "deny"
+                            }
+                        }]
+                    },
                     "agent_runtime_provenance": {
                         "marker_kind": "transport_continuity",
                         "marker_source": "operator_chat",
@@ -11407,17 +11457,10 @@ mod tests {
                         "placement_risk_level": "guarded"
                     },
                     "reflex_policy_records": [{
-                        "policy_scope": "hotel_default",
-                        "policy_source": "operator_baseline",
-                        "precedence": 40,
-                        "reason": "local remote tools stay damped",
-                        "reflexes": {
-                            "remote_component_reflex": "deny"
-                        }
-                    }, {
                         "policy_scope": "session_override",
                         "policy_source": "operator_override",
                         "precedence": 90,
+                        "origin_class": "session_override",
                         "reason": "trusted human just allowed broader tool reach",
                         "reflexes": {
                             "remote_tool_reflex": "allow",
@@ -11487,7 +11530,27 @@ mod tests {
                     "hotel_default"
                 );
                 assert_eq!(
+                    snapshot["bindings"]["effective_reflex_policy"]["layers"][1]["origin_class"],
+                    "hotel_default"
+                );
+                assert_eq!(
                     snapshot["bindings"]["effective_reflex_policy"]["layers"][2]["policy_scope"],
+                    "session_override"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflex_policy"]["layers"][2]["origin_class"],
+                    "session_override"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflex_policy"]["origin_classes"][0],
+                    "inferred"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflex_policy"]["origin_classes"][1],
+                    "hotel_default"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflex_policy"]["origin_classes"][2],
                     "session_override"
                 );
                 assert_eq!(
@@ -13839,6 +13902,119 @@ mod tests {
                 .iter()
                 .any(|event| event.kind == "reflex_policy_records_updated")
         );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_session_snapshot_projects_hotel_default_reflex_policy_from_bindings() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-reflex-hotel-defaults".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: Some("agent-jane:orchestrator".into()),
+                channel_kind: Some("operator".into()),
+                channel_session_key: Some("chat-1".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "bindings": {
+                        "reflex_policy_defaults": [{
+                            "policy_source": "hotel_profile",
+                            "reason": "remote tools stay damped by default",
+                            "reflexes": {
+                                "remote_tool_reflex": "deny",
+                                "remote_component_reflex": "deny"
+                            }
+                        }]
+                    },
+                    "agent_runtime_provenance": {
+                        "marker_kind": "role_handoff",
+                        "marker_source": "handoff_bundle",
+                        "marker_strength": "strong",
+                        "placement_risk_level": "low"
+                    }
+                }),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("seed session");
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("client connect");
+
+        let response = client
+            .send_request(IpcRequest::GetConfig {
+                key: "__session_snapshot__:sess-reflex-hotel-defaults".into(),
+            })
+            .await
+            .expect("session snapshot request");
+
+        match response {
+            IpcResponse::ConfigData {
+                value_json: Some(value_json),
+                ..
+            } => {
+                let snapshot: serde_json::Value =
+                    serde_json::from_str(&value_json).expect("snapshot should decode");
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflex_policy"]["layers"][1]["policy_scope"],
+                    "hotel_default"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflex_policy"]["layers"][1]["policy_source"],
+                    "hotel_profile"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflex_policy"]["layers"][1]["origin_class"],
+                    "hotel_default"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflexes"]["remote_tool_reflex"],
+                    "deny"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflexes"]["remote_component_reflex"],
+                    "deny"
+                );
+            }
+            other => panic!("unexpected session snapshot response: {other:?}"),
+        }
 
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
