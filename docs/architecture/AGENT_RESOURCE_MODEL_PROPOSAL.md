@@ -2,7 +2,7 @@
 title: "Agent-Centric Resource Model"
 doc_type: proposal
 domain: runtime-sessions
-status: proposed
+status: accepted-current-slice
 last_updated: 2026-03-26
 tags:
   - resource-broker
@@ -73,7 +73,9 @@ Six interconnected components compose this model:
   `SqliteAgentGraphStorage` (per-agent embedded SQLite); new `agent-graph-runner`
   crate with `agent.graph.*` tool surface and experience trace auto-recording.
 - Seam 4 (`agent-graph-mesh-sync`, commit 3f2f566): LWW snapshot export/import,
-  `EventKind::AgentGraphSync`, two-tier authority invariant (grants excluded).
+  `EventKind::AgentGraphSync`, two-tier authority invariant (grants excluded),
+  and now opportunistic task-carried graph hydration for transported
+  agent-directed work when the source hotel already knows the owning agent.
 - Seam 5 (`router-training-tap`, commit 4eb153b): `RouterTrainingRecord` +
   `SqliteRouterTraceStorage`, model-router wired to `PHILOTIC_ROUTER_TRACE_DB`,
   `ResourceType::RouterListener`.
@@ -301,6 +303,13 @@ serializes its state to a snapshot (using the storage trait's export surface),
 the mesh CRDT layer carries it, and the receiving hotel's tool-runner imports
 and applies it.
 
+Current implemented pressure adds a second continuity aid on top of that
+background sync: when the source hotel already knows which agent owns an
+agent-directed transported task, it may attach the current `agent_graph_snapshot`
+directly to the task payload. The receiving hotel hydrates that snapshot into
+its local per-agent store before delivery. This does not replace mesh sync; it
+reduces the very awkward window where an agent arrives before its graph does.
+
 This is dogfood: the mesh sync story for agent portability is proven by the
 same infrastructure everything else depends on. No second sync protocol.
 
@@ -505,6 +514,9 @@ leaves the system in a working state.
 - Export surface on `AgentGraphStorage` trait: snapshot → serialized payload
 - Import surface: apply incoming snapshot with LWW conflict resolution
 - Wire into existing mesh CRDT transport (no new sync protocol)
+- Opportunistically carry `agent_graph_snapshot` on transported agent-directed
+  task payloads when the source hotel knows the owning agent, and hydrate it
+  before local delivery on the receiving hotel
 - Agent portability proof: agent routed to remote hotel, graph follows via mesh
 - Two-tier authority invariant tests: hotel CG wins on grant conflicts
 

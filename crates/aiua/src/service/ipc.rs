@@ -5,7 +5,9 @@ use crate::service::lease::{
     LeaseRenewOutcome, RuntimeLeaseRegistry,
 };
 use crate::vault::{SecretAccess, resolve_secret};
-use ansible_mesh_core::agent_graph_storage::{AgentGraphStorage, SqliteAgentGraphStorage};
+use ansible_mesh_core::agent_graph_storage::{
+    AgentGraphSnapshot, AgentGraphStorage, SqliteAgentGraphStorage,
+};
 use ansible_mesh_core::catalog_rights::{
     component_right, has_right, normalize_rights, skill_right, tool_right,
 };
@@ -147,6 +149,88 @@ fn load_agent_graph_routing_preferences(agent_id: &str) -> Option<Vec<serde_json
             .filter_map(|preference| serde_json::to_value(preference).ok())
             .collect(),
     )
+}
+
+fn load_agent_graph_snapshot(agent_id: &str, source_node_id: &str) -> Option<serde_json::Value> {
+    let path = agent_graph_db_path(agent_id);
+    if !path.exists() {
+        return None;
+    }
+    let storage = SqliteAgentGraphStorage::open(agent_id, &path).ok()?;
+    let snapshot = storage.export_snapshot(source_node_id).ok()?;
+    serde_json::to_value(snapshot).ok()
+}
+
+fn attach_agent_graph_snapshot(
+    task_json: &str,
+    agent_id: Option<&str>,
+    source_node_id: &str,
+) -> String {
+    let Some(agent_id) = agent_id else {
+        return task_json.to_string();
+    };
+    let Some(snapshot) = load_agent_graph_snapshot(agent_id, source_node_id) else {
+        return task_json.to_string();
+    };
+    let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(task_json) else {
+        return task_json.to_string();
+    };
+    let Some(obj) = payload.as_object_mut() else {
+        return task_json.to_string();
+    };
+    if obj.contains_key("agent_graph_snapshot") {
+        return task_json.to_string();
+    }
+    obj.insert("agent_graph_snapshot".to_string(), snapshot);
+    serde_json::to_string(&payload).unwrap_or_else(|_| task_json.to_string())
+}
+
+fn infer_agent_id_for_task(
+    graph: &GraphDomain,
+    target_role: &str,
+    target_guest_id: Option<&str>,
+    task_json: &str,
+) -> Option<String> {
+    if target_role != "agent" {
+        return None;
+    }
+
+    if let Ok(payload) = serde_json::from_str::<serde_json::Value>(task_json) {
+        if let Some(session_id) = payload
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+        {
+            if let Ok(Some(session)) = graph.get_session(session_id) {
+                if let Some(agent_id) = session.primary_agent_id {
+                    return Some(agent_id);
+                }
+            }
+        }
+    }
+
+    let guest_id = target_guest_id?;
+    graph
+        .list_role_incarnations_by_guest_id(guest_id)
+        .ok()
+        .and_then(|mut roles| roles.drain(..).next())
+        .map(|role| role.agent_id)
+}
+
+fn apply_embedded_agent_graph_snapshot(task_json: &str) -> anyhow::Result<Option<String>> {
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(task_json) else {
+        return Ok(None);
+    };
+    let Some(snapshot_value) = payload.get("agent_graph_snapshot") else {
+        return Ok(None);
+    };
+    let snapshot: AgentGraphSnapshot = serde_json::from_value(snapshot_value.clone())?;
+    let path = agent_graph_db_path(&snapshot.agent_id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let storage = SqliteAgentGraphStorage::open(&snapshot.agent_id, &path)?;
+    storage.apply_snapshot(&snapshot)?;
+    Ok(Some(snapshot.agent_id))
 }
 
 fn declared_component_capabilities(bindings: &serde_json::Value) -> Vec<String> {
@@ -1895,6 +1979,13 @@ impl IpcServer {
         task_id: Uuid,
         task_json: String,
     ) {
+        if let Err(err) = Self::hydrate_agent_graph_snapshot(&task_json) {
+            warn!(
+                "Failed to hydrate agent graph snapshot before delivering task {} to role='{}' guest={:?}: {}",
+                task_id, target_role, target_guest_id, err
+            );
+        }
+
         let subscribers = {
             let guard = inboxes.lock().await;
             let role_subscribers = guard.get(target_role).cloned().unwrap_or_default();
@@ -2085,6 +2176,10 @@ impl IpcServer {
             .iter()
             .find(|guest_id| guest_id.ends_with(":orchestrator"))
             .cloned()
+    }
+
+    fn hydrate_agent_graph_snapshot(task_json: &str) -> anyhow::Result<Option<String>> {
+        apply_embedded_agent_graph_snapshot(task_json)
     }
 
     fn update_session_active_incarnation(
@@ -3236,6 +3331,17 @@ impl IpcServer {
                 target_guest_id,
                 task_json,
             } => {
+                let task_json = attach_agent_graph_snapshot(
+                    &task_json,
+                    infer_agent_id_for_task(
+                        graph,
+                        &target_role,
+                        target_guest_id.as_deref(),
+                        &task_json,
+                    )
+                    .as_deref(),
+                    local_node_id,
+                );
                 let route_resolution = Self::resolve_agent_route(
                     graph,
                     inboxes,
@@ -3440,6 +3546,19 @@ impl IpcServer {
                     "handoff_bundle": handoff_bundle,
                 })
                 .to_string();
+                let agent_id = match graph.get_session(&session_id) {
+                    Ok(Some(session)) => session.primary_agent_id,
+                    Ok(None) => None,
+                    Err(err) => {
+                        return IpcResponse::error(
+                            "handoff_to_role",
+                            "HANDOFF_SESSION_LOOKUP_FAILED",
+                            err.to_string(),
+                        );
+                    }
+                };
+                let task_json =
+                    attach_agent_graph_snapshot(&task_json, agent_id.as_deref(), local_node_id);
 
                 match Self::queue_or_deliver_guest_task(
                     graph,
@@ -3536,6 +3655,19 @@ impl IpcServer {
                     "from_incarnation_id": identity.guest_id,
                 })
                 .to_string();
+                let agent_id = match graph.get_session(&session_id) {
+                    Ok(Some(session)) => session.primary_agent_id,
+                    Ok(None) => None,
+                    Err(err) => {
+                        return IpcResponse::error(
+                            "handoff_back",
+                            "HANDOFF_SESSION_LOOKUP_FAILED",
+                            err.to_string(),
+                        );
+                    }
+                };
+                let task_json =
+                    attach_agent_graph_snapshot(&task_json, agent_id.as_deref(), local_node_id);
                 match Self::queue_or_deliver_guest_task(
                     graph,
                     inboxes,
@@ -6758,6 +6890,9 @@ mod tests {
     use crate::service::guest_manager::GuestMaterializationRequester;
     use crate::vault::{SecretInput, store_secret};
     use ansible_mesh_core::NodeCapabilities;
+    use ansible_mesh_core::agent_graph_storage::{
+        AgentGraphStorage, AgentRoutingPreference, SqliteAgentGraphStorage,
+    };
     use ansible_mesh_core::graph::{RoleIncarnationRecord, TurnLoopConfig};
     use ansible_mesh_core::registry::{CapabilityAdvertisement, NodeRegistry};
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
@@ -6956,6 +7091,13 @@ mod tests {
         format!("/tmp/ipc-e2e-{}.sock", Uuid::new_v4().simple())
     }
 
+    fn test_agent_graph_db_template() -> String {
+        format!(
+            "/tmp/agent-graph-{}-{{agent_id}}.db",
+            Uuid::new_v4().simple()
+        )
+    }
+
     static IPC_TEST_ENV_LOCK: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
 
     fn ipc_env_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -7053,6 +7195,212 @@ mod tests {
         }
         server_task.abort();
         let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_task_attaches_agent_graph_snapshot_from_session_primary_agent() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let graph_db_template = test_agent_graph_db_template();
+        let agent_id = "agent-jane-01";
+        let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-agent-graph-carry".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some(agent_id.into()),
+                active_incarnation_id: Some("agent-jane:orchestrator".into()),
+                channel_kind: Some("operator".into()),
+                channel_session_key: Some("chat-1".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("seed session");
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        if let Some(parent) = Path::new(&graph_db_path).parent() {
+            std::fs::create_dir_all(parent).expect("create agent graph parent");
+        }
+        let storage =
+            SqliteAgentGraphStorage::open(agent_id, Path::new(&graph_db_path)).expect("open db");
+        storage
+            .upsert_routing_preference(&AgentRoutingPreference {
+                agent_id: agent_id.into(),
+                preference_key: "voice-ingress-elevenlabs".into(),
+                stage_kind: Some("ingress".into()),
+                capability: Some("voice.transcribe".into()),
+                provider_hint: Some("elevenlabs".into()),
+                model_ref: Some("scribe_v1".into()),
+                preference_level: 1,
+                weight: 10,
+                config_json: serde_json::json!({}),
+                updated_at: 0,
+            })
+            .expect("seed routing preference");
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+            std::env::set_var("PHILOTIC_AGENT_GRAPH_DB", &graph_db_template);
+        }
+
+        let mut agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane:orchestrator".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("agent connect");
+
+        agent
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: Some("agent-jane:orchestrator".into()),
+                task_json: serde_json::json!({
+                    "session_id": "sess-agent-graph-carry",
+                    "turn_id": "turn-1",
+                    "chat_id": "chat-1",
+                    "content": "hello"
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit task");
+
+        let inbound = agent.recv_task().await.expect("recv task");
+        let IpcResponse::InboundTask { task_json, .. } = inbound else {
+            panic!("unexpected inbound response");
+        };
+        let payload: serde_json::Value =
+            serde_json::from_str(&task_json).expect("payload should decode");
+        assert_eq!(payload["agent_graph_snapshot"]["agent_id"], agent_id);
+        assert_eq!(
+            payload["agent_graph_snapshot"]["routing_preferences"]
+                .as_array()
+                .expect("routing preferences array")
+                .len(),
+            1
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+            std::env::remove_var("PHILOTIC_AGENT_GRAPH_DB");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        let _ = std::fs::remove_file(&graph_db_path);
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_task_hydrates_embedded_agent_graph_snapshot_before_delivery() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let graph_db_template = test_agent_graph_db_template();
+        let agent_id = "agent-jane-01";
+        let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        if let Some(parent) = Path::new(&graph_db_path).parent() {
+            std::fs::create_dir_all(parent).expect("create agent graph parent");
+        }
+        let snapshot = {
+            let storage = SqliteAgentGraphStorage::open(agent_id, Path::new(&graph_db_path))
+                .expect("open db");
+            storage
+                .upsert_routing_preference(&AgentRoutingPreference {
+                    agent_id: agent_id.into(),
+                    preference_key: "cognition-gemini-flash".into(),
+                    stage_kind: Some("cognition".into()),
+                    capability: Some("text.generate".into()),
+                    provider_hint: Some("gemini".into()),
+                    model_ref: Some("gemini-3.1-flash".into()),
+                    preference_level: 1,
+                    weight: 9,
+                    config_json: serde_json::json!({}),
+                    updated_at: 0,
+                })
+                .expect("seed routing preference");
+            storage
+                .export_snapshot("home-hotel-01")
+                .expect("export snapshot")
+        };
+        let _ = std::fs::remove_file(&graph_db_path);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+            std::env::set_var("PHILOTIC_AGENT_GRAPH_DB", &graph_db_template);
+        }
+
+        let mut agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane:orchestrator".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("agent connect");
+
+        agent
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: Some("agent-jane:orchestrator".into()),
+                task_json: serde_json::json!({
+                    "session_id": "sess-remote-ish",
+                    "turn_id": "turn-1",
+                    "chat_id": "chat-1",
+                    "content": "hello",
+                    "agent_graph_snapshot": snapshot
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit task");
+
+        let inbound = agent.recv_task().await.expect("recv task");
+        let IpcResponse::InboundTask { .. } = inbound else {
+            panic!("unexpected inbound response");
+        };
+
+        let hydrated =
+            SqliteAgentGraphStorage::open(agent_id, Path::new(&graph_db_path)).expect("open db");
+        let prefs = hydrated
+            .list_routing_preferences()
+            .expect("list routing preferences");
+        assert_eq!(prefs.len(), 1);
+        assert_eq!(prefs[0].preference_key, "cognition-gemini-flash");
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+            std::env::remove_var("PHILOTIC_AGENT_GRAPH_DB");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        let _ = std::fs::remove_file(&graph_db_path);
         if Path::new(&socket_path).exists() {
             let _ = std::fs::remove_file(&socket_path);
         }
