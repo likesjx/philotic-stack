@@ -106,6 +106,25 @@ fn extract_model_error(task: &InboundTaskPayload) -> Option<String> {
     Some(payload.display_message())
 }
 
+fn extract_model_audio_artifact(model_result: Option<&Value>) -> Option<String> {
+    let artifacts = model_result?.get("artifacts")?.as_array()?;
+    let artifact = artifacts.iter().find(|artifact| {
+        artifact
+            .get("kind")
+            .and_then(Value::as_str)
+            .map(|kind| kind == "audio")
+            .unwrap_or(false)
+            || artifact
+                .get("payload")
+                .and_then(|payload| payload.get("kind"))
+                .and_then(Value::as_str)
+                .map(|kind| kind == "audio_artifact")
+                .unwrap_or(false)
+    })?;
+    let payload = artifact.get("payload")?;
+    serde_json::to_string(payload).ok()
+}
+
 fn should_attempt_provider_repair(error: &TaskErrorPayload, state: Option<&SessionState>) -> bool {
     error.kind == "provider_failure"
         && error.retryable.unwrap_or(false)
@@ -1910,6 +1929,7 @@ impl AgentRuntime {
             .and_then(serde_json::Value::as_str)
             .filter(|s| !s.trim().is_empty())
             .map(str::to_string);
+        let audio_artifact = extract_model_audio_artifact(model_result);
 
         let partial_replies = model_result
             .and_then(|r| r.get("partial_replies"))
@@ -2017,6 +2037,7 @@ impl AgentRuntime {
                     turn_id,
                     content,
                     spoken_text,
+                    audio_artifact,
                     memory_concept,
                     memory_candidate,
                 )
@@ -2233,6 +2254,7 @@ impl AgentRuntime {
                     session_id,
                     turn_id,
                     approval.approved_response,
+                    None,
                     None,
                     None,
                     None,
@@ -3400,6 +3422,7 @@ impl AgentRuntime {
         turn_id: String,
         content: String,
         spoken_text: Option<String>,
+        audio_artifact: Option<String>,
         memory_concept: Option<String>,
         memory_candidate: Option<MemoryCandidate>,
     ) -> Result<()> {
@@ -3415,6 +3438,27 @@ impl AgentRuntime {
             .and_then(|s| s.active_turn.as_ref())
             .map(|t| t.had_voice_input)
             .unwrap_or(false);
+
+        if let Some(audio_artifact) = audio_artifact {
+            if voice_policy.is_active(had_voice_input) || had_voice_input {
+                return self
+                    .deliver_text_reply(
+                        session_id,
+                        turn_id,
+                        content,
+                        Some(audio_artifact),
+                        voice_policy.caption_enabled(),
+                        memory_concept,
+                        memory_candidate,
+                    )
+                    .await;
+            }
+
+            warn!(
+                "Session [{}] model returned an audio artifact on a non-voice turn; delivering text only and ignoring the unexpected artifact",
+                session_id
+            );
+        }
 
         if voice_policy.is_active(had_voice_input) {
             return self
@@ -3966,6 +4010,7 @@ impl AgentRuntime {
                         turn_id,
                         content,
                         spoken_text,
+                        None,
                         memory_concept,
                         memory_candidate,
                     )
@@ -9114,6 +9159,43 @@ mod tests {
         assert!(!super::command_bypasses_turn_start(
             &SlashCommand::Approve { note: None }
         ));
+    }
+
+    #[test]
+    fn extract_model_audio_artifact_reads_audio_payload_from_artifacts() {
+        let model_result = serde_json::json!({
+            "artifacts": [{
+                "kind": "audio",
+                "mime_type": "audio/wav",
+                "payload": {
+                    "kind": "audio_artifact",
+                    "mime_type": "audio/wav",
+                    "output_format": "wav",
+                    "voice_id": "gemini-live",
+                    "model": "gemini-3.1-flash-live",
+                    "data_b64": "AQID"
+                }
+            }]
+        });
+
+        let artifact = super::extract_model_audio_artifact(Some(&model_result))
+            .expect("audio artifact should extract");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&artifact).expect("artifact should stay serialized json");
+        assert_eq!(parsed["kind"], "audio_artifact");
+        assert_eq!(parsed["mime_type"], "audio/wav");
+    }
+
+    #[test]
+    fn extract_model_audio_artifact_ignores_non_audio_artifacts() {
+        let model_result = serde_json::json!({
+            "artifacts": [{
+                "kind": "embedding",
+                "payload": { "vector": [1, 2, 3] }
+            }]
+        });
+
+        assert!(super::extract_model_audio_artifact(Some(&model_result)).is_none());
     }
 
     // ── bash.exec tests ──────────────────────────────────────────────────────
