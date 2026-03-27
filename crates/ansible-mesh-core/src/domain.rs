@@ -303,6 +303,33 @@ impl GraphDomain {
         Ok(true)
     }
 
+    pub fn set_routing_policy_disposition(
+        &self,
+        proposal_id: &str,
+        state: String,
+        reason: String,
+        decided_at: u64,
+        source_tool: Option<String>,
+    ) -> Result<bool> {
+        let Some(mut record) = self.get_routing_policy(proposal_id)? else {
+            return Ok(false);
+        };
+        record.operator_disposition = crate::graph::RoutingPolicyDispositionRecord {
+            state: state.clone(),
+            reason: reason.clone(),
+            decided_at,
+        };
+        record.evaluations.push(RoutingPolicyEvaluationRecord {
+            evaluation_kind: "operator_disposition".to_string(),
+            decision: state,
+            reason,
+            created_at: decided_at,
+            source_tool,
+        });
+        self.upsert_routing_policy(&record)?;
+        Ok(true)
+    }
+
     // ── Guest methods ─────────────────────────────────────────────────────────
 
     fn guest_key(hotel_name: &str, guest_id: &str) -> String {
@@ -1561,5 +1588,29 @@ mod tests {
             record.evaluations[1].evaluation_kind,
             "learned_reflex_writeback"
         );
+    }
+
+    #[test]
+    fn set_routing_policy_disposition_updates_record_and_appends_history() {
+        let d = make_domain();
+        d.upsert_routing_policy(&routing_policy("routing-001", "agent-alice"))
+            .unwrap();
+        let updated = d
+            .set_routing_policy_disposition(
+                "routing-001",
+                "rejected".to_string(),
+                "Operator rejected after later review.".to_string(),
+                1_700_000_003,
+                Some("operator.control".to_string()),
+            )
+            .unwrap();
+        assert!(updated);
+        let record = d
+            .get_routing_policy("routing-001")
+            .unwrap()
+            .expect("stored routing policy");
+        assert_eq!(record.operator_disposition.state, "rejected");
+        assert_eq!(record.evaluations.len(), 2);
+        assert_eq!(record.evaluations[1].decision, "rejected");
     }
 }

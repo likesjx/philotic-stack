@@ -764,6 +764,7 @@ Seam IDs: `structured-model-envelope`, `hotel-gemini-oauth-flow`
 - [x] Add mesh-synced agent-graph `reflex_preferences` and project them into session bindings as `agent_learned` reflex-policy layers, so durable adaptive posture lives with the agent rather than being smuggled into hotel/session override state.
 - [x] Let approved `routing.policy.propose` calls optionally write a learned reflex payload back into agent-graph `reflex_preferences` and record a `reflex_evaluations` audit trace, so accepted refinement becomes durable posture instead of only durable prose.
 - [x] Replace the transitional durable-rule bridge behind `routing.policy.propose` with routing-specific policy records, evaluation history, and operator disposition state.
+- [x] Add a real operator lifecycle for routing-policy records: list them, revise disposition later, and append durable disposition evaluations instead of freezing governance at birth approval.
 - [ ] Fold model-graph metadata into live turn-routing-plan ranking so shared catalog truth informs selection without becoming mutable preference storage.
 - [ ] Define the shared catalog layer for models, tools, skills, and rights as reference knowledge outside hotel-owned mutable state.
 - [ ] Extend the hotel's projected key ring beyond `effective_rights` for tools/skills/component capabilities into scoped execution credentials and richer right classes.

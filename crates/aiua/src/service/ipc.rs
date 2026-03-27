@@ -5204,6 +5204,25 @@ impl IpcServer {
                     }
                 }
             }
+            IpcRequest::ListRoutingPolicies { agent_id } => match graph
+                .list_routing_policies(&agent_id)
+            {
+                Ok(policies) => {
+                    let json_policies: Vec<serde_json::Value> = policies
+                        .into_iter()
+                        .map(|policy| {
+                            serde_json::to_value(policy).unwrap_or(serde_json::Value::Null)
+                        })
+                        .collect();
+                    IpcResponse::RoutingPolicyList {
+                        policies: json_policies,
+                    }
+                }
+                Err(err) => {
+                    error!("Failed to list routing policies: {err}");
+                    IpcResponse::error("list_routing_policies", "STORAGE_ERROR", err.to_string())
+                }
+            },
             IpcRequest::ListRules { agent_id } => match graph.list_rules(&agent_id) {
                 Ok(rules) => {
                     let json_rules: Vec<serde_json::Value> = rules
@@ -5297,6 +5316,40 @@ impl IpcServer {
                     error!("Failed to append routing policy evaluation: {err}");
                     IpcResponse::error(
                         "routing_policy_evaluation",
+                        "STORAGE_ERROR",
+                        err.to_string(),
+                    )
+                }
+            },
+            IpcRequest::SetRoutingPolicyDisposition {
+                proposal_id,
+                state,
+                reason,
+                source_tool,
+            } => match graph.set_routing_policy_disposition(
+                &proposal_id,
+                state.clone(),
+                reason.clone(),
+                unix_ts(),
+                source_tool,
+            ) {
+                Ok(true) => IpcResponse::success(
+                    "routing_policy_disposition",
+                    Some(serde_json::json!({
+                        "proposal_id": proposal_id,
+                        "state": state,
+                        "reason": reason,
+                    })),
+                ),
+                Ok(false) => IpcResponse::error(
+                    "routing_policy_disposition",
+                    "NOT_FOUND",
+                    format!("unknown routing policy proposal '{}'", proposal_id),
+                ),
+                Err(err) => {
+                    error!("Failed to set routing policy disposition: {err}");
+                    IpcResponse::error(
+                        "routing_policy_disposition",
                         "STORAGE_ERROR",
                         err.to_string(),
                     )
@@ -14621,6 +14674,157 @@ mod tests {
         assert_eq!(
             stored.evaluations[1].evaluation_kind,
             "learned_reflex_writeback"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn set_routing_policy_disposition_updates_operator_state_and_history() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("client connect");
+
+        let proposal_id = match client
+            .send_request(IpcRequest::RecordRoutingPolicyProposal {
+                agent_id: "agent-routing-01".into(),
+                problem: "Remote model routes are too eager during guarded posture.".into(),
+                proposed_change: "Keep component reflex but dampen remote tools.".into(),
+                evidence: "Observed guarded sessions still seeing remote tool temptations.".into(),
+                affected_stage: Some("cognition".into()),
+                affected_capability: Some("text.generate".into()),
+                learned_reflex_preference_key: Some("guarded-remote-tool-dampening".into()),
+            })
+            .await
+            .expect("record request")
+        {
+            IpcResponse::RoutingPolicyRecorded { proposal_id } => proposal_id,
+            other => panic!("unexpected response: {other:?}"),
+        };
+
+        let response = client
+            .send_request(IpcRequest::SetRoutingPolicyDisposition {
+                proposal_id: proposal_id.clone(),
+                state: "rejected".into(),
+                reason: "Operator rejected after later review.".into(),
+                source_tool: Some("philotic-web".into()),
+            })
+            .await
+            .expect("disposition request");
+
+        assert!(matches!(response, IpcResponse::Standard { ok: true, .. }));
+
+        let stored = graph
+            .get_routing_policy(&proposal_id)
+            .expect("graph read")
+            .expect("stored proposal");
+        assert_eq!(stored.operator_disposition.state, "rejected");
+        assert_eq!(stored.evaluations.len(), 2);
+        assert_eq!(stored.evaluations[1].decision, "rejected");
+        assert_eq!(
+            stored.evaluations[1].source_tool.as_deref(),
+            Some("philotic-web")
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn list_routing_policies_returns_agent_scoped_records() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("client connect");
+
+        for agent_id in ["agent-routing-01", "agent-routing-01", "agent-routing-02"] {
+            let _ = client
+                .send_request(IpcRequest::RecordRoutingPolicyProposal {
+                    agent_id: agent_id.into(),
+                    problem: "Observed routing issue.".into(),
+                    proposed_change: "Change routing reflex.".into(),
+                    evidence: "Repeated operator correction.".into(),
+                    affected_stage: Some("cognition".into()),
+                    affected_capability: Some("text.generate".into()),
+                    learned_reflex_preference_key: None,
+                })
+                .await
+                .expect("record request");
+        }
+
+        let response = client
+            .send_request(IpcRequest::ListRoutingPolicies {
+                agent_id: "agent-routing-01".into(),
+            })
+            .await
+            .expect("list request");
+
+        let policies = match response {
+            IpcResponse::RoutingPolicyList { policies } => policies,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert_eq!(policies.len(), 2);
+        assert!(
+            policies
+                .iter()
+                .all(|policy| policy["agent_id"] == serde_json::json!("agent-routing-01"))
         );
 
         unsafe {

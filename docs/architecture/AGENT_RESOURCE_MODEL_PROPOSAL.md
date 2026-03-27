@@ -447,6 +447,19 @@ That is still not the whole governance story, but it turns approved refinement
 into actual durable agent posture plus durable routing-policy provenance rather
 than a very literate backlog item.
 
+The next necessary refinement after first-class storage is real later-life
+governance. Routing-policy records should not be frozen at birth approval.
+The current slice therefore adds:
+
+- hotel control-plane listing of agent-scoped routing-policy records
+- explicit later disposition updates such as `approved` -> `rejected`
+- durable evaluation append on each disposition change so operator review leaves
+  the same kind of antigen marker as write-back outcomes
+
+That keeps routing policy governance from collapsing into “whatever happened at
+tool execution time must remain true forever,” which is emotionally relatable
+but architecturally terrible.
+
 In practice, a fresher active-incarnation update is the `p53` check here: if
 the runtime has newer local evidence that the session now belongs on a
 different active guest, older delivery provenance should die immediately rather

@@ -833,6 +833,9 @@ pub enum IpcRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         learned_reflex_preference_key: Option<String>,
     },
+    ListRoutingPolicies {
+        agent_id: String,
+    },
     /// List all durable rules owned by the given agent.
     ///
     /// Responds with [`IpcResponse::RuleList`].
@@ -855,6 +858,13 @@ pub enum IpcRequest {
         proposal_id: String,
         evaluation_kind: String,
         decision: String,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_tool: Option<String>,
+    },
+    SetRoutingPolicyDisposition {
+        proposal_id: String,
+        state: String,
         reason: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source_tool: Option<String>,
@@ -1098,6 +1108,9 @@ pub enum IpcResponse {
     },
     RoutingPolicyRecorded {
         proposal_id: String,
+    },
+    RoutingPolicyList {
+        policies: Vec<serde_json::Value>,
     },
     /// Response to [`IpcRequest::ListRules`].
     RuleList {
