@@ -405,6 +405,19 @@ for that is lightweight session-level reflex records:
 Those records do not replace grants. They explain and adjust the fast posture
 layer that sits downstream of grants.
 
+The next honest step is to stop treating those records like two detached JSON
+organs and give them policy shape. Runtime projection should therefore surface
+an `effective_reflex_policy` with ordered layers:
+
+- an inferred `placement_inferred` layer from runtime provenance
+- optional explicit `reflex_policy_records` with `policy_scope`,
+  `policy_source`, `precedence`, and `reflexes`
+- a highest-precedence-wins merge rule that projects the final
+  `effective_reflexes`
+
+That keeps hotel inference, operator damping, and future agent-learned reflexes
+in one governable stack instead of quietly relying on merge order as policy.
+
 In practice, a fresher active-incarnation update is the `p53` check here: if
 the runtime has newer local evidence that the session now belongs on a
 different active guest, older delivery provenance should die immediately rather
