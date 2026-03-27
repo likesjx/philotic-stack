@@ -755,6 +755,7 @@ Seam IDs: `structured-model-envelope`, `hotel-gemini-oauth-flow`
 - [x] Differentiate placement-marker apoptosis by marker class so short-lived `receptor_ingress` continuity dies faster than transport or handoff markers instead of every marker pretending to have the same half-life.
 - [x] Differentiate placement-marker supersession posture by marker class so newer local active-incarnation truth kills weak `receptor_ingress` markers immediately but explicit `transport_continuity` and `role_handoff` markers can preserve their placement target under conflict.
 - [x] Add placement-marker strength (`marker_strength`) so weak receptor clues can still steer live delivery but cannot trigger parking/materialization on their own, while stronger continuity markers retain that authority.
+- [x] Derive `placement_risk_level` from placement provenance and project it into session posture so elevated-risk sessions suppress remote execution routes without mutating the hotel's underlying rights key ring.
 - [ ] Replace the transitional durable-rule bridge behind `routing.policy.propose` with routing-specific policy records, evaluation history, and operator disposition state.
 - [ ] Fold model-graph metadata into live turn-routing-plan ranking so shared catalog truth informs selection without becoming mutable preference storage.
 - [ ] Define the shared catalog layer for models, tools, skills, and rights as reference knowledge outside hotel-owned mutable state.

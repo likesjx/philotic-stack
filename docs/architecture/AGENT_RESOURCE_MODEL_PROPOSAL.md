@@ -333,11 +333,12 @@ one inbound payload.
 
 Those placement records now also carry explicit marker typing. Runtime
 provenance should include at least a `marker_kind`, `marker_source`, and
-`marker_strength` so the hotel can distinguish transport continuity markers
-from role-handoff markers, receptor ingress markers, or later routing enzymes,
-and also tell how much placement authority that marker should have. A marker is
-more useful when you know not just where it points, but what biological
-process expressed it and how strongly it should count.
+`marker_strength`, and now an inferred `placement_risk_level`, so the hotel can
+distinguish transport continuity markers from role-handoff markers, receptor
+ingress markers, or later routing enzymes, and also tell how much placement
+authority and remote-execution trust that marker should have. A marker is more
+useful when you know not just where it points, but what biological process
+expressed it, how strongly it should count, and what risk posture it implies.
 
 That provenance now influences local runtime behavior too. When a session has
 no live active incarnation, or its recorded active incarnation is stale, the
@@ -373,6 +374,13 @@ steer delivery to a live local guest, but not good enough to request local
 parking/materialization when no such guest is currently expressed. Medium or
 strong continuity markers can keep that placement claim longer, because they
 are closer to deliberate continuity than incidental ingress.
+
+That posture should now also constrain execution reach, not just placement.
+An elevated-risk placement marker should not cause the hotel to advertise
+remote execution paths as if the session were fully trusted mesh-local
+continuity. Rights do not change, but the projected execution posture can
+narrow: elevated-risk sessions can be forced into local-only execution until a
+stronger continuity or handoff marker is expressed.
 
 In practice, a fresher active-incarnation update is the `p53` check here: if
 the runtime has newer local evidence that the session now belongs on a

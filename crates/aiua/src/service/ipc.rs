@@ -189,6 +189,28 @@ fn infer_marker_strength(
     }
 }
 
+fn infer_placement_risk_level(
+    marker_kind: Option<&str>,
+    marker_source: Option<&str>,
+    marker_strength: Option<&str>,
+) -> &'static str {
+    let inferred_strength = infer_marker_strength(marker_strength, marker_kind);
+    match (marker_kind, marker_source, inferred_strength) {
+        (Some("receptor_ingress"), _, _) | (Some("membrane_ingress"), _, _) => "elevated",
+        (Some("role_handoff"), _, Some("strong")) => "low",
+        (Some("transport_continuity"), Some("operator_chat"), Some(level))
+            if matches!(level, "strong" | "medium") =>
+        {
+            "guarded"
+        }
+        (Some("transport_continuity"), _, Some(level)) if matches!(level, "strong" | "medium") => {
+            "guarded"
+        }
+        (_, _, Some("weak")) => "elevated",
+        _ => "guarded",
+    }
+}
+
 fn placement_marker_policy(
     marker_kind: Option<&str>,
     marker_strength: Option<&str>,
@@ -219,6 +241,14 @@ fn placement_marker_policy(
             ),
         },
     }
+}
+
+fn remote_execution_allowed(bindings: &serde_json::Value) -> bool {
+    bindings
+        .get("effective_posture")
+        .and_then(|posture| posture.get("remote_execution_allowed"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
 }
 
 fn load_agent_graph_snapshot(agent_id: &str, source_node_id: &str) -> Option<serde_json::Value> {
@@ -5678,6 +5708,11 @@ impl IpcServer {
                 .or_else(|| {
                     infer_marker_strength(None, marker_kind.as_deref()).map(str::to_string)
                 });
+            let placement_risk_level = infer_placement_risk_level(
+                marker_kind.as_deref(),
+                marker_source.as_deref(),
+                marker_strength.as_deref(),
+            );
             let agent_id = payload
                 .get("agent_id")
                 .and_then(serde_json::Value::as_str)
@@ -5734,6 +5769,7 @@ impl IpcServer {
                     "marker_kind": marker_kind,
                     "marker_source": marker_source,
                     "marker_strength": marker_strength,
+                    "placement_risk_level": placement_risk_level,
                     "updated_at": now,
                 });
                 session.summary_json = summary_json;
@@ -6176,6 +6212,35 @@ impl IpcServer {
             }
         }
 
+        {
+            let placement_risk_level = session
+                .summary_json
+                .get("agent_runtime_provenance")
+                .map(|provenance| {
+                    infer_placement_risk_level(
+                        provenance
+                            .get("marker_kind")
+                            .and_then(serde_json::Value::as_str),
+                        provenance
+                            .get("marker_source")
+                            .and_then(serde_json::Value::as_str),
+                        provenance
+                            .get("marker_strength")
+                            .and_then(serde_json::Value::as_str),
+                    )
+                })
+                .unwrap_or("guarded");
+            if let Some(obj) = bindings.as_object_mut() {
+                obj.insert(
+                    "effective_posture".to_string(),
+                    serde_json::json!({
+                        "placement_risk_level": placement_risk_level,
+                        "remote_execution_allowed": placement_risk_level != "elevated",
+                    }),
+                );
+            }
+        }
+
         let role_activation = active_role_record
             .and_then(|role_record| {
                 let effective_skillset = bindings
@@ -6519,6 +6584,7 @@ fn select_component_route(
             }
         })
         .unwrap_or_else(|| default_component_role(capability).to_string());
+    let allow_remote_execution = remote_execution_allowed(bindings);
 
     if let Some(incarnation_id) = binding
         .and_then(|route| route.get("incarnation"))
@@ -6539,25 +6605,27 @@ fn select_component_route(
             }));
         }
 
-        if let Some(remote) = registry
-            .advertisements_for_role(&target_role)
-            .filter(|advertisement| {
-                advertisement.node_id != local_node_id
-                    && advertisement.availability_state == "live"
-                    && advertisement.incarnation_id == incarnation_id
-            })
-            .next()
-        {
-            return Some(serde_json::json!({
-                "target_node": remote.node_id,
-                "target_role": remote.target_role,
-                "incarnation_id": remote.incarnation_id,
-                "hotel_id": remote.hotel_id,
-                "environment_id": preferred_environment_id,
-                "execution_mode": "preferred",
-                "availability_state": remote.availability_state,
-                "selection_reason": "preferred_incarnation_live",
-            }));
+        if allow_remote_execution {
+            if let Some(remote) = registry
+                .advertisements_for_role(&target_role)
+                .filter(|advertisement| {
+                    advertisement.node_id != local_node_id
+                        && advertisement.availability_state == "live"
+                        && advertisement.incarnation_id == incarnation_id
+                })
+                .next()
+            {
+                return Some(serde_json::json!({
+                    "target_node": remote.node_id,
+                    "target_role": remote.target_role,
+                    "incarnation_id": remote.incarnation_id,
+                    "hotel_id": remote.hotel_id,
+                    "environment_id": preferred_environment_id,
+                    "execution_mode": "preferred",
+                    "availability_state": remote.availability_state,
+                    "selection_reason": "preferred_incarnation_live",
+                }));
+            }
         }
     }
 
@@ -6598,22 +6666,24 @@ fn select_component_route(
         }));
     }
 
-    if let Some(remote) = select_remote_component_advertisement(
-        registry,
-        &target_role,
-        preferred_hotel_id,
-        local_node_id,
-    ) {
-        return Some(serde_json::json!({
-            "target_node": remote.node_id,
-            "target_role": remote.target_role,
-            "incarnation_id": remote.incarnation_id,
-            "hotel_id": remote.hotel_id,
-            "environment_id": preferred_environment_id,
-            "execution_mode": "capability",
-            "availability_state": remote.availability_state,
-            "selection_reason": remote.selection_hint.unwrap_or_else(|| "remote_latency_capacity".into()),
-        }));
+    if allow_remote_execution {
+        if let Some(remote) = select_remote_component_advertisement(
+            registry,
+            &target_role,
+            preferred_hotel_id,
+            local_node_id,
+        ) {
+            return Some(serde_json::json!({
+                "target_node": remote.node_id,
+                "target_role": remote.target_role,
+                "incarnation_id": remote.incarnation_id,
+                "hotel_id": remote.hotel_id,
+                "environment_id": preferred_environment_id,
+                "execution_mode": "capability",
+                "availability_state": remote.availability_state,
+                "selection_reason": remote.selection_hint.unwrap_or_else(|| "remote_latency_capacity".into()),
+            }));
+        }
     }
 
     Some(serde_json::json!({
@@ -6883,6 +6953,9 @@ fn select_remote_tool_advertisement(
     tool_name: &str,
     bindings: &serde_json::Value,
 ) -> Option<CapabilityAdvertisement> {
+    if !remote_execution_allowed(bindings) {
+        return None;
+    }
     let target_role = format!("tool.{tool_name}");
     let preferred_hotel_id = bindings
         .get("preferred_hotel_id")
@@ -10595,6 +10668,10 @@ mod tests {
             session.summary_json["agent_runtime_provenance"]["marker_strength"],
             "medium"
         );
+        assert_eq!(
+            session.summary_json["agent_runtime_provenance"]["placement_risk_level"],
+            "guarded"
+        );
 
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
@@ -10790,7 +10867,8 @@ mod tests {
                         "transport": "operator_chat",
                         "marker_kind": "transport_continuity",
                         "marker_source": "operator_chat",
-                        "marker_strength": "medium"
+                        "marker_strength": "medium",
+                        "placement_risk_level": "guarded"
                     }
                 }),
                 created_at: 1,
@@ -10852,6 +10930,18 @@ mod tests {
                 assert_eq!(
                     snapshot["summary"]["agent_runtime_provenance"]["marker_strength"],
                     "medium"
+                );
+                assert_eq!(
+                    snapshot["summary"]["agent_runtime_provenance"]["placement_risk_level"],
+                    "guarded"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_posture"]["placement_risk_level"],
+                    "guarded"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_posture"]["remote_execution_allowed"],
+                    true
                 );
             }
             other => panic!("unexpected session snapshot response: {other:?}"),
@@ -11276,6 +11366,38 @@ mod tests {
         assert_eq!(capabilities, vec!["text.generate".to_string()]);
     }
 
+    #[test]
+    fn compose_tool_assembly_suppresses_remote_execution_routes_when_placement_risk_elevated() {
+        let bindings = serde_json::json!({
+            "effective_toolset": ["echo"],
+            "effective_rights": ["tool.echo"],
+            "effective_posture": {
+                "placement_risk_level": "elevated",
+                "remote_execution_allowed": false
+            }
+        });
+        let remote_ads = vec![CapabilityAdvertisement {
+            hotel_id: "remote-hotel".into(),
+            node_id: "remote-node".into(),
+            incarnation_id: "remote-hotel:tool-echo".into(),
+            target_role: "tool.echo".into(),
+            availability_state: "live".into(),
+            selection_hint: Some("remote_latency_capacity".into()),
+            latency_hint_ms: Some(8),
+            max_concurrent_jobs: Some(8),
+            active_jobs: 0,
+            queue_depth: 0,
+        }];
+
+        let assembly = compose_tool_assembly(&bindings, &[], &[], &remote_ads, "local-aiua-01");
+
+        assert_eq!(assembly["tools_for_model"][0]["tool_name"], "echo");
+        assert!(
+            assembly["execution_routes"].get("echo").is_none(),
+            "elevated placement risk should suppress remote echo route"
+        );
+    }
+
     #[tokio::test]
     async fn session_snapshot_can_route_model_capability_to_remote_advertisement_when_local_model_missing()
      {
@@ -11524,6 +11646,143 @@ mod tests {
                 assert_eq!(
                     snapshot["component_route_assembly"]["execution_routes"]["text.generate"]["selection_reason"],
                     "live_local_fallback"
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn session_snapshot_suppresses_remote_model_route_when_placement_risk_elevated() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let registry = Arc::new(RwLock::new(NodeRegistry::new()));
+        registry.write().await.update_node(
+            NodeCapabilities {
+                node_id: "aria-node".into(),
+                roles: vec![ansible_mesh_core::NodeRole::AnsibleNode],
+                models: vec!["gemini".into()],
+                tools: vec![],
+                constraints: Default::default(),
+            },
+            vec![CapabilityAdvertisement {
+                hotel_id: "aria-architect-hotel".into(),
+                node_id: "aria-node".into(),
+                incarnation_id: "aria-architect-hotel:model-controller-gemini".into(),
+                target_role: "model".into(),
+                availability_state: "live".into(),
+                selection_hint: Some("remote_latency_capacity".into()),
+                latency_hint_ms: Some(8),
+                max_concurrent_jobs: Some(8),
+                active_jobs: 1,
+                queue_depth: 0,
+            }],
+            Some(ExecutionReachability {
+                protocol: "tcp-framed-v1".into(),
+                host: "aria-vps".into(),
+                port: 9002,
+            }),
+        );
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        )
+        .with_registry(registry);
+
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-elevated-risk-model".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: None,
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("123".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "agent_runtime_provenance": {
+                        "delivery_hotel": "local-hotel",
+                        "delivery_target_guest_id": "agent-jane:developer",
+                        "marker_kind": "receptor_ingress",
+                        "marker_source": "telegram",
+                        "marker_strength": "weak",
+                        "placement_risk_level": "elevated"
+                    },
+                    "bindings": {
+                        "effective_model_controller": "gemini-flash",
+                        "preferred_hotel_id": "aria-architect-hotel"
+                    }
+                }),
+                created_at: 1,
+                updated_at: 2,
+            })
+            .expect("session should seed");
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("agent connect");
+
+        let response = agent
+            .send_request(IpcRequest::GetConfig {
+                key: "__session_snapshot__:sess-elevated-risk-model".into(),
+            })
+            .await
+            .expect("snapshot request should succeed");
+
+        match response {
+            IpcResponse::ConfigData {
+                value_json: Some(value_json),
+                ..
+            } => {
+                let snapshot: serde_json::Value =
+                    serde_json::from_str(&value_json).expect("snapshot should decode");
+                assert_eq!(
+                    snapshot["bindings"]["effective_posture"]["placement_risk_level"],
+                    "elevated"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_posture"]["remote_execution_allowed"],
+                    false
+                );
+                assert_eq!(
+                    snapshot["component_route_assembly"]["execution_routes"]["text.generate"]["target_node"],
+                    "local-aiua-01"
+                );
+                assert_eq!(
+                    snapshot["component_route_assembly"]["execution_routes"]["text.generate"]["availability_state"],
+                    "materialization_required"
+                );
+                assert_eq!(
+                    snapshot["component_route_assembly"]["execution_routes"]["text.generate"]["selection_reason"],
+                    "local_requires_materialization"
                 );
             }
             other => panic!("unexpected response: {other:?}"),
