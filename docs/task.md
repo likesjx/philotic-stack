@@ -746,6 +746,7 @@ Seam IDs: `structured-model-envelope`, `hotel-gemini-oauth-flow`
 - [x] Add the first shared abstract-right catalog substrate and carry `effective_rights` into model-controller requests so lower execution layers can validate tool visibility against the hotel's key ring.
 - [x] Carry opportunistic `agent_graph_snapshot` continuity on transported agent-directed task payloads and hydrate it before local delivery so an agent that lands on another aiua can bring its graph with it even before background mesh sync catches up.
 - [x] Prefer explicit routed `agent_id` hints for transported graph continuity when the source hotel cannot infer ownership from a local session or guest incarnation, starting with remote operator-chat and peer-delegation paths.
+- [x] Carry `authority_hotel` alongside transported `agent_id` hints and only attach authoritative `agent_graph_snapshot` continuity when the sending hotel is the agent's actual home authority, so transport placement does not masquerade as durable identity ownership.
 - [ ] Replace the transitional durable-rule bridge behind `routing.policy.propose` with routing-specific policy records, evaluation history, and operator disposition state.
 - [ ] Fold model-graph metadata into live turn-routing-plan ranking so shared catalog truth informs selection without becoming mutable preference storage.
 - [ ] Define the shared catalog layer for models, tools, skills, and rights as reference knowledge outside hotel-owned mutable state.

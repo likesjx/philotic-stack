@@ -185,19 +185,32 @@ fn attach_agent_graph_snapshot(
     serde_json::to_string(&payload).unwrap_or_else(|_| task_json.to_string())
 }
 
-fn infer_agent_id_for_task(
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentTaskContext {
+    agent_id: String,
+    authority_hotel: Option<String>,
+}
+
+fn infer_agent_context_for_task(
     graph: &GraphDomain,
     target_role: &str,
     target_guest_id: Option<&str>,
     task_json: &str,
-) -> Option<String> {
+) -> Option<AgentTaskContext> {
     if target_role != "agent" {
         return None;
     }
 
     if let Ok(payload) = serde_json::from_str::<serde_json::Value>(task_json) {
         if let Some(agent_id) = payload.get("agent_id").and_then(serde_json::Value::as_str) {
-            return Some(agent_id.to_string());
+            return Some(AgentTaskContext {
+                agent_id: agent_id.to_string(),
+                authority_hotel: payload
+                    .get("authority_hotel")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| lookup_agent_authority_hotel(graph, agent_id)),
+            });
         }
         if let Some(session_id) = payload
             .get("session_id")
@@ -205,7 +218,10 @@ fn infer_agent_id_for_task(
         {
             if let Ok(Some(session)) = graph.get_session(session_id) {
                 if let Some(agent_id) = session.primary_agent_id {
-                    return Some(agent_id);
+                    return Some(AgentTaskContext {
+                        authority_hotel: lookup_agent_authority_hotel(graph, &agent_id),
+                        agent_id,
+                    });
                 }
             }
         }
@@ -216,7 +232,10 @@ fn infer_agent_id_for_task(
         .list_role_incarnations_by_guest_id(guest_id)
         .ok()
         .and_then(|mut roles| roles.drain(..).next())
-        .map(|role| role.agent_id)
+        .map(|role| AgentTaskContext {
+            authority_hotel: lookup_agent_authority_hotel(graph, &role.agent_id),
+            agent_id: role.agent_id,
+        })
 }
 
 fn apply_embedded_agent_graph_snapshot(task_json: &str) -> anyhow::Result<Option<String>> {
@@ -234,6 +253,14 @@ fn apply_embedded_agent_graph_snapshot(task_json: &str) -> anyhow::Result<Option
     let storage = SqliteAgentGraphStorage::open(&snapshot.agent_id, &path)?;
     storage.apply_snapshot(&snapshot)?;
     Ok(Some(snapshot.agent_id))
+}
+
+fn lookup_agent_authority_hotel(graph: &GraphDomain, agent_id: &str) -> Option<String> {
+    graph
+        .get_agent_identity(agent_id)
+        .ok()
+        .flatten()
+        .map(|identity| identity.authority_hotel)
 }
 
 fn declared_component_capabilities(bindings: &serde_json::Value) -> Vec<String> {
@@ -1061,6 +1088,7 @@ impl IpcServer {
             .unwrap_or_else(|| format!("operator-chat:{operator_session_id}:{target_agent_id}"));
         let turn_id = format!("operator-chat-turn-{}", Uuid::new_v4());
         let session_id = conversation_id.clone();
+        let authority_hotel = lookup_agent_authority_hotel(graph, target_agent_id);
 
         match client
             .send_request(IpcRequest::EmitTask {
@@ -1069,6 +1097,7 @@ impl IpcServer {
                 target_guest_id: Some(target_agent_id.to_string()),
                 task_json: serde_json::json!({
                     "agent_id": target_agent_id,
+                    "authority_hotel": authority_hotel,
                     "source": "operator_chat",
                     "transport": "operator_chat",
                     "session_id": session_id,
@@ -3335,17 +3364,26 @@ impl IpcServer {
                 target_guest_id,
                 task_json,
             } => {
-                let task_json = attach_agent_graph_snapshot(
-                    &task_json,
-                    infer_agent_id_for_task(
+                let task_json = match (
+                    infer_agent_context_for_task(
                         graph,
                         &target_role,
                         target_guest_id.as_deref(),
                         &task_json,
-                    )
-                    .as_deref(),
-                    local_node_id,
-                );
+                    ),
+                    Self::local_hotel_name(graph, local_node_id),
+                ) {
+                    (Some(context), Some(local_hotel))
+                        if context.authority_hotel.as_deref() == Some(local_hotel.as_str()) =>
+                    {
+                        attach_agent_graph_snapshot(
+                            &task_json,
+                            Some(&context.agent_id),
+                            local_node_id,
+                        )
+                    }
+                    _ => task_json,
+                };
                 let route_resolution = Self::resolve_agent_route(
                     graph,
                     inboxes,
@@ -3544,12 +3582,6 @@ impl IpcServer {
                 };
                 let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(event)).await;
 
-                let task_json = serde_json::json!({
-                    "action": "handoff_bundle",
-                    "session_id": session_id,
-                    "handoff_bundle": handoff_bundle,
-                })
-                .to_string();
                 let agent_id = match graph.get_session(&session_id) {
                     Ok(Some(session)) => session.primary_agent_id,
                     Ok(None) => None,
@@ -3561,6 +3593,17 @@ impl IpcServer {
                         );
                     }
                 };
+                let authority_hotel = agent_id
+                    .as_deref()
+                    .and_then(|agent_id| lookup_agent_authority_hotel(graph, agent_id));
+                let task_json = serde_json::json!({
+                    "action": "handoff_bundle",
+                    "agent_id": agent_id,
+                    "authority_hotel": authority_hotel,
+                    "session_id": session_id,
+                    "handoff_bundle": handoff_bundle,
+                })
+                .to_string();
                 let task_json =
                     attach_agent_graph_snapshot(&task_json, agent_id.as_deref(), local_node_id);
 
@@ -3652,13 +3695,6 @@ impl IpcServer {
                 };
                 let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(event)).await;
 
-                let task_json = serde_json::json!({
-                    "action": "handoff_return",
-                    "session_id": session_id,
-                    "summary": summary,
-                    "from_incarnation_id": identity.guest_id,
-                })
-                .to_string();
                 let agent_id = match graph.get_session(&session_id) {
                     Ok(Some(session)) => session.primary_agent_id,
                     Ok(None) => None,
@@ -3670,6 +3706,18 @@ impl IpcServer {
                         );
                     }
                 };
+                let authority_hotel = agent_id
+                    .as_deref()
+                    .and_then(|agent_id| lookup_agent_authority_hotel(graph, agent_id));
+                let task_json = serde_json::json!({
+                    "action": "handoff_return",
+                    "agent_id": agent_id,
+                    "authority_hotel": authority_hotel,
+                    "session_id": session_id,
+                    "summary": summary,
+                    "from_incarnation_id": identity.guest_id,
+                })
+                .to_string();
                 let task_json =
                     attach_agent_graph_snapshot(&task_json, agent_id.as_deref(), local_node_id);
                 match Self::queue_or_deliver_guest_task(
@@ -3722,6 +3770,7 @@ impl IpcServer {
 
                 // Generate a derived session_id ensuring isolation but persistence to the same chat
                 let session_id = format!("{}:peer:{}", chat_id, target_agent_id);
+                let authority_hotel = lookup_agent_authority_hotel(graph, &target_agent_id);
 
                 // Build the mesh envelope for TaskInvoke
                 let env = EventEnvelope {
@@ -3740,6 +3789,7 @@ impl IpcServer {
                         data: serde_json::json!({
                             "action": "peer.delegate",
                             "agent_id": target_agent_id,
+                            "authority_hotel": authority_hotel,
                             "session_id": session_id,
                             "chat_id": chat_id,
                             "source": source.unwrap_or_else(|| "peer".into()),
@@ -7216,6 +7266,31 @@ mod tests {
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .upsert_agent_identity(&AgentIdentityRecord {
+                agent_id: agent_id.into(),
+                persona_name: "Jane".into(),
+                authority_hotel: "local-hotel".into(),
+                bundle_json: serde_json::json!({}),
+            })
+            .expect("seed agent identity");
+        graph
             .upsert_session(&SessionRecord {
                 session_id: "sess-agent-graph-carry".into(),
                 session_kind: "conversation".into(),
@@ -7419,7 +7494,33 @@ mod tests {
         let agent_id = "agent-aria-01";
         let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
-        let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .upsert_agent_identity(&AgentIdentityRecord {
+                agent_id: agent_id.into(),
+                persona_name: "Aria".into(),
+                authority_hotel: "local-hotel".into(),
+                bundle_json: serde_json::json!({}),
+            })
+            .expect("seed agent identity");
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         if let Some(parent) = Path::new(&graph_db_path).parent() {
@@ -7467,6 +7568,7 @@ mod tests {
                 target_guest_id: Some("agent-aria:orchestrator".into()),
                 task_json: serde_json::json!({
                     "agent_id": agent_id,
+                    "authority_hotel": "local-hotel",
                     "turn_id": "turn-1",
                     "chat_id": "chat-1",
                     "content": "hello without session"
@@ -7489,6 +7591,121 @@ mod tests {
                 .expect("routing preferences array")
                 .len(),
             1
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+            std::env::remove_var("PHILOTIC_AGENT_GRAPH_DB");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        let _ = std::fs::remove_file(&graph_db_path);
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_task_does_not_attach_agent_graph_snapshot_for_foreign_authority_hotel() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let graph_db_template = test_agent_graph_db_template();
+        let agent_id = "agent-foreign-01";
+        let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .upsert_agent_identity(&AgentIdentityRecord {
+                agent_id: agent_id.into(),
+                persona_name: "Remote".into(),
+                authority_hotel: "remote-hotel".into(),
+                bundle_json: serde_json::json!({}),
+            })
+            .expect("seed remote authority agent identity");
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        if let Some(parent) = Path::new(&graph_db_path).parent() {
+            std::fs::create_dir_all(parent).expect("create agent graph parent");
+        }
+        let storage =
+            SqliteAgentGraphStorage::open(agent_id, Path::new(&graph_db_path)).expect("open db");
+        storage
+            .upsert_routing_preference(&AgentRoutingPreference {
+                agent_id: agent_id.into(),
+                preference_key: "foreign-pref".into(),
+                stage_kind: Some("cognition".into()),
+                capability: Some("text.generate".into()),
+                provider_hint: Some("google".into()),
+                model_ref: Some("gemini-2.5-flash".into()),
+                preference_level: 1,
+                weight: 5,
+                config_json: serde_json::json!({}),
+                updated_at: 0,
+            })
+            .expect("seed routing preference");
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+            std::env::set_var("PHILOTIC_AGENT_GRAPH_DB", &graph_db_template);
+        }
+
+        let mut agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-aria:orchestrator".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("agent connect");
+
+        agent
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: Some("agent-aria:orchestrator".into()),
+                task_json: serde_json::json!({
+                    "agent_id": agent_id,
+                    "authority_hotel": "remote-hotel",
+                    "turn_id": "turn-1",
+                    "chat_id": "chat-1",
+                    "content": "hello from foreign authority"
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit task");
+
+        let inbound = agent.recv_task().await.expect("recv task");
+        let IpcResponse::InboundTask { task_json, .. } = inbound else {
+            panic!("unexpected inbound response");
+        };
+        let payload: serde_json::Value =
+            serde_json::from_str(&task_json).expect("payload should decode");
+        assert!(
+            payload.get("agent_graph_snapshot").is_none(),
+            "foreign authority should not attach local graph snapshot"
         );
 
         unsafe {

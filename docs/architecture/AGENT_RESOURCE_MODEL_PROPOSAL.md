@@ -316,6 +316,13 @@ peer-delegation paths now do this so continuity does not depend on a lucky
 local session record or a guest-id shape the sending hotel cannot actually
 resolve.
 
+That continuity path is now explicitly home-hotel scoped. Routed payloads should
+carry `authority_hotel` alongside `agent_id`, and a sending hotel should only
+attach an authoritative `agent_graph_snapshot` when it is that agent's current
+home authority. Transport placement and durable identity ownership are related,
+but letting them quietly impersonate each other would be a very efficient way
+to smear agent selfhood across the mesh.
+
 This is dogfood: the mesh sync story for agent portability is proven by the
 same infrastructure everything else depends on. No second sync protocol.
 
@@ -521,8 +528,10 @@ leaves the system in a working state.
 - Import surface: apply incoming snapshot with LWW conflict resolution
 - Wire into existing mesh CRDT transport (no new sync protocol)
 - Opportunistically carry `agent_graph_snapshot` on transported agent-directed
-  task payloads when the source hotel knows the owning agent, and hydrate it
-  before local delivery on the receiving hotel
+  task payloads when the source hotel knows the owning agent, but only attach
+  that snapshot when the source hotel is the agent's `authority_hotel`; routed
+  payloads should carry both `agent_id` and `authority_hotel`, and the
+  receiving hotel hydrates the snapshot before local delivery
 - Agent portability proof: agent routed to remote hotel, graph follows via mesh
 - Two-tier authority invariant tests: hotel CG wins on grant conflicts
 
