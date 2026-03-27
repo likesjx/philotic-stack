@@ -124,8 +124,8 @@ The current implementation now also uses the stage plan at request assembly time
 Current transitional reality:
 
 - routing-policy proposals are semantically distinct from general behavior rules
-- persistence is not distinct yet; they currently ride the same durable rule store under explicit transitional labeling
-- this keeps the improvement loop real without pretending routing-specific authority already exists
+- persistence is now distinct: they store as dedicated `routing_policy` records with operator disposition and evaluation history
+- this keeps the improvement loop real without pretending the general rule store should own routing reflexes
 - model requests now carry stage-derived `routing_hints` so model-controller can see provider preference, model hint, controller role, capability, and envelope intent without becoming the owner of the turn
 
 This is intentionally still transitional:

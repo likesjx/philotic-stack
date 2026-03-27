@@ -821,6 +821,18 @@ pub enum IpcRequest {
         description: String,
         rationale: String,
     },
+    RecordRoutingPolicyProposal {
+        agent_id: String,
+        problem: String,
+        proposed_change: String,
+        evidence: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        affected_stage: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        affected_capability: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        learned_reflex_preference_key: Option<String>,
+    },
     /// List all durable rules owned by the given agent.
     ///
     /// Responds with [`IpcResponse::RuleList`].
@@ -838,6 +850,14 @@ pub enum IpcRequest {
         precedence: i32,
         reflexes_json: serde_json::Value,
         config_json: serde_json::Value,
+    },
+    AppendRoutingPolicyEvaluation {
+        proposal_id: String,
+        evaluation_kind: String,
+        decision: String,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_tool: Option<String>,
     },
     /// Agent declares a need for a resource; hotel responds with
     /// [`IpcResponse::ResourceGranted`], [`IpcResponse::ResourceDenied`], or
@@ -1075,6 +1095,9 @@ pub enum IpcResponse {
     /// Response to [`IpcRequest::ProposeRule`].
     RuleProposed {
         rule_id: String,
+    },
+    RoutingPolicyRecorded {
+        proposal_id: String,
     },
     /// Response to [`IpcRequest::ListRules`].
     RuleList {

@@ -712,9 +712,9 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
             description: "Propose a durable routing or cognition policy refinement for the \
                           agent. Use when repeated evidence suggests a turn stage, provider \
                           preference, context envelope, or affordance posture should be \
-                          adjusted. Always requires live operator approval and is currently \
-                          stored through the durable rule path until routing-specific policy \
-                          storage exists."
+                          adjusted. Always requires live operator approval and is stored as a \
+                          first-class routing policy artifact with disposition and evaluation \
+                          history."
                 .into(),
             input_schema: json!({
                 "type": "object",

@@ -16,7 +16,8 @@
 use crate::cron::CronJob;
 use crate::graph::{
     AbstractRightRecord, AbstractSkillRecord, AbstractToolRecord, GraphNode, RoleIncarnationRecord,
-    RuleRecord, ToolsetProfileRecord, WorkflowSkillRecord,
+    RoutingPolicyEvaluationRecord, RoutingPolicyRecord, RuleRecord, ToolsetProfileRecord,
+    WorkflowSkillRecord,
 };
 use crate::storage::{
     AgentIdentityRecord, GraphAdapter, GraphRunnerInstanceRecord, GuestRecord, HotelRecord,
@@ -38,6 +39,7 @@ pub const NODE_KIND_HOTEL: &str = "hotel";
 pub const NODE_KIND_ABSTRACT_TOOL: &str = "abstract_tool";
 pub const NODE_KIND_ABSTRACT_RIGHT: &str = "abstract_right";
 pub const NODE_KIND_RULE: &str = "rule";
+pub const NODE_KIND_ROUTING_POLICY: &str = "routing_policy";
 
 // Slice 2
 pub const NODE_KIND_GUEST: &str = "guest";
@@ -89,6 +91,10 @@ impl GraphDomain {
 
     fn rule_key(rule_id: &str) -> String {
         format!("{}:{}", NODE_KIND_RULE, rule_id)
+    }
+
+    fn routing_policy_key(proposal_id: &str) -> String {
+        format!("{}:{}", NODE_KIND_ROUTING_POLICY, proposal_id)
     }
 
     // ── Hotel methods ─────────────────────────────────────────────────────────
@@ -245,6 +251,56 @@ impl GraphDomain {
             }
         }
         Ok(rules)
+    }
+
+    pub fn upsert_routing_policy(&self, policy: &RoutingPolicyRecord) -> Result<()> {
+        let data = serde_json::to_value(policy)
+            .context("GraphDomain::upsert_routing_policy: serialize RoutingPolicyRecord")?;
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::routing_policy_key(&policy.proposal_id),
+            kind: NODE_KIND_ROUTING_POLICY.to_string(),
+            label: Some(policy.proposal_id.clone()),
+            data,
+        })
+    }
+
+    pub fn get_routing_policy(&self, proposal_id: &str) -> Result<Option<RoutingPolicyRecord>> {
+        match self
+            .adapter
+            .get_node(&Self::routing_policy_key(proposal_id))?
+        {
+            None => Ok(None),
+            Some(node) => {
+                let record = serde_json::from_value(node.data)
+                    .context("GraphDomain::get_routing_policy: deserialize RoutingPolicyRecord")?;
+                Ok(Some(record))
+            }
+        }
+    }
+
+    pub fn list_routing_policies(&self, agent_id: &str) -> Result<Vec<RoutingPolicyRecord>> {
+        let mut policies = Vec::new();
+        for node in self.adapter.list_nodes_by_kind(NODE_KIND_ROUTING_POLICY)? {
+            let record: RoutingPolicyRecord = serde_json::from_value(node.data)
+                .context("GraphDomain::list_routing_policies: deserialize RoutingPolicyRecord")?;
+            if record.agent_id == agent_id {
+                policies.push(record);
+            }
+        }
+        Ok(policies)
+    }
+
+    pub fn append_routing_policy_evaluation(
+        &self,
+        proposal_id: &str,
+        evaluation: RoutingPolicyEvaluationRecord,
+    ) -> Result<bool> {
+        let Some(mut record) = self.get_routing_policy(proposal_id)? else {
+            return Ok(false);
+        };
+        record.evaluations.push(evaluation);
+        self.upsert_routing_policy(&record)?;
+        Ok(true)
     }
 
     // ── Guest methods ─────────────────────────────────────────────────────────
@@ -1053,6 +1109,32 @@ mod tests {
         }
     }
 
+    fn routing_policy(id: &str, agent: &str) -> RoutingPolicyRecord {
+        RoutingPolicyRecord {
+            proposal_id: id.to_string(),
+            agent_id: agent.to_string(),
+            problem: "Voice ingress keeps surfacing remote tools too early.".to_string(),
+            proposed_change: "Dampen remote tool reflex during receptor ingress.".to_string(),
+            evidence: "Observed low-intent voice ingress requesting remote tools.".to_string(),
+            affected_stage: Some("ingress".to_string()),
+            affected_capability: Some("voice.transcribe".to_string()),
+            learned_reflex_preference_key: Some("operator-mesh-trust".to_string()),
+            operator_disposition: crate::graph::RoutingPolicyDispositionRecord {
+                state: "approved".to_string(),
+                reason: "Approved via operator-gated routing.policy.propose.".to_string(),
+                decided_at: 1_700_000_001,
+            },
+            evaluations: vec![crate::graph::RoutingPolicyEvaluationRecord {
+                evaluation_kind: "operator_disposition".to_string(),
+                decision: "approved".to_string(),
+                reason: "Approved via operator-gated tool execution.".to_string(),
+                created_at: 1_700_000_001,
+                source_tool: Some("routing.policy.propose".to_string()),
+            }],
+            created_at: 1_700_000_000,
+        }
+    }
+
     // ── Hotel ─────────────────────────────────────────────────────────────────
 
     #[test]
@@ -1420,5 +1502,64 @@ mod tests {
 
         assert_eq!(d.list_rules("agent-bob").unwrap().len(), 1);
         assert!(d.list_rules("agent-nobody").unwrap().is_empty());
+    }
+
+    #[test]
+    fn routing_policy_roundtrip() {
+        let d = make_domain();
+        d.upsert_routing_policy(&routing_policy("routing-001", "agent-alice"))
+            .unwrap();
+        let record = d
+            .get_routing_policy("routing-001")
+            .unwrap()
+            .expect("stored routing policy");
+        assert_eq!(record.agent_id, "agent-alice");
+        assert_eq!(record.operator_disposition.state, "approved");
+        assert_eq!(record.evaluations.len(), 1);
+    }
+
+    #[test]
+    fn routing_policy_list_filters_by_agent() {
+        let d = make_domain();
+        d.upsert_routing_policy(&routing_policy("routing-001", "agent-alice"))
+            .unwrap();
+        d.upsert_routing_policy(&routing_policy("routing-002", "agent-bob"))
+            .unwrap();
+        d.upsert_routing_policy(&routing_policy("routing-003", "agent-alice"))
+            .unwrap();
+
+        let alice = d.list_routing_policies("agent-alice").unwrap();
+        assert_eq!(alice.len(), 2);
+        assert_eq!(d.list_routing_policies("agent-bob").unwrap().len(), 1);
+        assert!(d.list_routing_policies("agent-nobody").unwrap().is_empty());
+    }
+
+    #[test]
+    fn append_routing_policy_evaluation_updates_history() {
+        let d = make_domain();
+        d.upsert_routing_policy(&routing_policy("routing-001", "agent-alice"))
+            .unwrap();
+        let appended = d
+            .append_routing_policy_evaluation(
+                "routing-001",
+                crate::graph::RoutingPolicyEvaluationRecord {
+                    evaluation_kind: "learned_reflex_writeback".to_string(),
+                    decision: "approved_writeback".to_string(),
+                    reason: "Learned reflex was persisted into the agent graph.".to_string(),
+                    created_at: 1_700_000_002,
+                    source_tool: Some("routing.policy.propose".to_string()),
+                },
+            )
+            .unwrap();
+        assert!(appended);
+        let record = d
+            .get_routing_policy("routing-001")
+            .unwrap()
+            .expect("stored routing policy");
+        assert_eq!(record.evaluations.len(), 2);
+        assert_eq!(
+            record.evaluations[1].evaluation_kind,
+            "learned_reflex_writeback"
+        );
     }
 }

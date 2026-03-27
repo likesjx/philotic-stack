@@ -257,6 +257,42 @@ pub struct RuleRecord {
     pub created_at: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoutingPolicyDispositionRecord {
+    pub state: String,
+    pub reason: String,
+    pub decided_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoutingPolicyEvaluationRecord {
+    pub evaluation_kind: String,
+    pub decision: String,
+    pub reason: String,
+    pub created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_tool: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoutingPolicyRecord {
+    pub proposal_id: String,
+    pub agent_id: String,
+    pub problem: String,
+    pub proposed_change: String,
+    pub evidence: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affected_stage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affected_capability: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learned_reflex_preference_key: Option<String>,
+    pub operator_disposition: RoutingPolicyDispositionRecord,
+    #[serde(default)]
+    pub evaluations: Vec<RoutingPolicyEvaluationRecord>,
+    pub created_at: u64,
+}
+
 /// A dedicated namespace for an agent's memory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryApartment {

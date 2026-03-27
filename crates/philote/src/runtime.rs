@@ -6863,43 +6863,41 @@ impl AgentRuntime {
                         .await;
                 }
 
-                let mut description = format!("Routing policy refinement: {}", proposed_change);
-                if !affected_stage.is_empty() || !affected_capability.is_empty() {
-                    let mut scope_parts = Vec::new();
-                    if !affected_stage.is_empty() {
-                        scope_parts.push(format!("stage={affected_stage}"));
-                    }
-                    if !affected_capability.is_empty() {
-                        scope_parts.push(format!("capability={affected_capability}"));
-                    }
-                    description.push_str(&format!(" [{}]", scope_parts.join(", ")));
-                }
-
-                let rationale = format!(
-                    "Observed routing/cognition issue: {problem}\nEvidence: {evidence}\nTransitional note: stored through durable rule infrastructure until routing-specific policy records exist."
-                );
-
                 let agent_id = self.agent_id.clone();
                 let result_text = match self
                     .ipc_client
-                    .send_request(IpcRequest::ProposeRule {
+                    .send_request(IpcRequest::RecordRoutingPolicyProposal {
                         agent_id: agent_id.clone(),
-                        description: description.clone(),
-                        rationale: rationale.clone(),
+                        problem: problem.clone(),
+                        proposed_change: proposed_change.clone(),
+                        evidence: evidence.clone(),
+                        affected_stage: if affected_stage.is_empty() {
+                            None
+                        } else {
+                            Some(affected_stage.clone())
+                        },
+                        affected_capability: if affected_capability.is_empty() {
+                            None
+                        } else {
+                            Some(affected_capability.clone())
+                        },
+                        learned_reflex_preference_key: learned_reflex
+                            .as_ref()
+                            .map(|reflex| reflex.preference_key.clone()),
                     })
                     .await
                 {
-                    Ok(IpcResponse::RuleProposed { rule_id }) => {
+                    Ok(IpcResponse::RoutingPolicyRecorded { proposal_id }) => {
                         let mut writeback_note = None;
                         if let Some(reflex) = learned_reflex.as_ref() {
                             let config_json = serde_json::json!({
-                                "reason": format!("approved write-back from routing.policy.propose rule {}", rule_id),
+                                "reason": format!("approved write-back from routing policy proposal {}", proposal_id),
                                 "problem": problem.clone(),
                                 "proposed_change": proposed_change.clone(),
                                 "evidence": evidence.clone(),
                                 "affected_stage": affected_stage.clone(),
                                 "affected_capability": affected_capability.clone(),
-                                "rule_id": rule_id.clone(),
+                                "proposal_id": proposal_id.clone(),
                                 "source_tool": "routing.policy.propose",
                             });
                             match self
@@ -6916,6 +6914,19 @@ impl AgentRuntime {
                                 Ok(IpcResponse::Standard { ok: true, .. }) => {
                                     let _ = self
                                         .ipc_client
+                                        .send_request(IpcRequest::AppendRoutingPolicyEvaluation {
+                                            proposal_id: proposal_id.clone(),
+                                            evaluation_kind: "learned_reflex_writeback".into(),
+                                            decision: "approved_writeback".into(),
+                                            reason: format!(
+                                                "Learned reflex '{}' was written into the agent graph.",
+                                                reflex.preference_key
+                                            ),
+                                            source_tool: Some("routing.policy.propose".into()),
+                                        })
+                                        .await;
+                                    let _ = self
+                                        .ipc_client
                                         .send_request(IpcRequest::UpdateTask {
                                             task_id: Uuid::new_v4(),
                                             state: "routing_reflex_writeback".into(),
@@ -6926,7 +6937,7 @@ impl AgentRuntime {
                                                 "reflex_evaluations": [{
                                                     "reflex_name": reflex.preference_key,
                                                     "decision": "approved_writeback",
-                                                    "reason": format!("approved learned reflex write-back from routing.policy.propose rule {}", rule_id),
+                                                    "reason": format!("approved learned reflex write-back from routing policy proposal {}", proposal_id),
                                                     "source_tool": "routing.policy.propose"
                                                 }]
                                             }),
@@ -6940,41 +6951,66 @@ impl AgentRuntime {
                                 Ok(IpcResponse::Standard {
                                     ok: false, message, ..
                                 }) => {
+                                    let _ = self
+                                        .ipc_client
+                                        .send_request(IpcRequest::AppendRoutingPolicyEvaluation {
+                                            proposal_id: proposal_id.clone(),
+                                            evaluation_kind: "learned_reflex_writeback".into(),
+                                            decision: "rejected".into(),
+                                            reason: format!(
+                                                "Hotel rejected learned reflex write-back: {}",
+                                                message
+                                            ),
+                                            source_tool: Some("routing.policy.propose".into()),
+                                        })
+                                        .await;
                                     writeback_note = Some(format!(
-                                        " Rule stored, but learned reflex write-back was rejected — {}.",
+                                        " Routing policy recorded, but learned reflex write-back was rejected — {}.",
                                         message
                                     ));
                                 }
                                 Ok(other) => {
+                                    let _ = self
+                                        .ipc_client
+                                        .send_request(IpcRequest::AppendRoutingPolicyEvaluation {
+                                            proposal_id: proposal_id.clone(),
+                                            evaluation_kind: "learned_reflex_writeback".into(),
+                                            decision: "unexpected_response".into(),
+                                            reason: format!(
+                                                "Unexpected response while writing learned reflex: {:?}",
+                                                other
+                                            ),
+                                            source_tool: Some("routing.policy.propose".into()),
+                                        })
+                                        .await;
                                     writeback_note = Some(format!(
-                                        " Rule stored, but learned reflex write-back returned an unexpected response: {:?}.",
+                                        " Routing policy recorded, but learned reflex write-back returned an unexpected response: {:?}.",
                                         other
                                     ));
                                 }
                                 Err(err) => {
+                                    let _ = self
+                                        .ipc_client
+                                        .send_request(IpcRequest::AppendRoutingPolicyEvaluation {
+                                            proposal_id: proposal_id.clone(),
+                                            evaluation_kind: "learned_reflex_writeback".into(),
+                                            decision: "ipc_error".into(),
+                                            reason: format!(
+                                                "IPC error while writing learned reflex: {}",
+                                                err
+                                            ),
+                                            source_tool: Some("routing.policy.propose".into()),
+                                        })
+                                        .await;
                                     writeback_note = Some(format!(
-                                        " Rule stored, but learned reflex write-back failed — {}.",
+                                        " Routing policy recorded, but learned reflex write-back failed — {}.",
                                         err
                                     ));
                                 }
                             }
                         }
-                        if let Some(state) = self.sessions.get_mut(&payload.session_id) {
-                            state.rules.push(serde_json::json!({
-                                "rule_id": rule_id,
-                                "description": description,
-                                "rationale": rationale,
-                                "proposal_kind": "routing_policy",
-                                "problem": problem,
-                                "affected_stage": affected_stage,
-                                "affected_capability": affected_capability,
-                                "learned_reflex_preference_key": learned_reflex
-                                    .as_ref()
-                                    .map(|reflex| reflex.preference_key.clone()),
-                            }));
-                        }
                         let mut message = format!(
-                            "Routing policy proposal stored for operator-governed review (id: {rule_id}). Transitional note: it currently rides on the durable rule store until routing-specific policy persistence exists."
+                            "Routing policy proposal recorded as a first-class routing policy artifact (id: {proposal_id}). Operator disposition is stored as approved, and future reflex outcomes will append to its evaluation history."
                         );
                         if let Some(note) = writeback_note {
                             message.push_str(&note);

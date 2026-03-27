@@ -5146,6 +5146,64 @@ impl IpcServer {
                     }
                 }
             }
+            IpcRequest::RecordRoutingPolicyProposal {
+                agent_id,
+                problem,
+                proposed_change,
+                evidence,
+                affected_stage,
+                affected_capability,
+                learned_reflex_preference_key,
+            } => {
+                use ansible_mesh_core::graph::{
+                    RoutingPolicyDispositionRecord, RoutingPolicyEvaluationRecord,
+                    RoutingPolicyRecord,
+                };
+                let proposal_id = Uuid::new_v4().to_string();
+                let created_at = unix_ts();
+                let record = RoutingPolicyRecord {
+                    proposal_id: proposal_id.clone(),
+                    agent_id: agent_id.clone(),
+                    problem,
+                    proposed_change,
+                    evidence,
+                    affected_stage,
+                    affected_capability,
+                    learned_reflex_preference_key,
+                    operator_disposition: RoutingPolicyDispositionRecord {
+                        state: "approved".into(),
+                        reason: "Approved via operator-gated routing.policy.propose execution."
+                            .into(),
+                        decided_at: created_at,
+                    },
+                    evaluations: vec![RoutingPolicyEvaluationRecord {
+                        evaluation_kind: "operator_disposition".into(),
+                        decision: "approved".into(),
+                        reason: "routing.policy.propose executed after operator approval.".into(),
+                        created_at,
+                        source_tool: Some("routing.policy.propose".into()),
+                    }],
+                    created_at,
+                };
+                match graph.upsert_routing_policy(&record) {
+                    Ok(()) => {
+                        info!(
+                            agent_id = %agent_id,
+                            proposal_id = %proposal_id,
+                            "Routing policy proposal stored via IPC"
+                        );
+                        IpcResponse::RoutingPolicyRecorded { proposal_id }
+                    }
+                    Err(err) => {
+                        error!("Failed to store routing policy proposal: {err}");
+                        IpcResponse::error(
+                            "record_routing_policy_proposal",
+                            "STORAGE_ERROR",
+                            err.to_string(),
+                        )
+                    }
+                }
+            }
             IpcRequest::ListRules { agent_id } => match graph.list_rules(&agent_id) {
                 Ok(rules) => {
                     let json_rules: Vec<serde_json::Value> = rules
@@ -5208,6 +5266,42 @@ impl IpcServer {
                     }
                 }
             }
+            IpcRequest::AppendRoutingPolicyEvaluation {
+                proposal_id,
+                evaluation_kind,
+                decision,
+                reason,
+                source_tool,
+            } => match graph.append_routing_policy_evaluation(
+                &proposal_id,
+                ansible_mesh_core::graph::RoutingPolicyEvaluationRecord {
+                    evaluation_kind,
+                    decision,
+                    reason,
+                    created_at: unix_ts(),
+                    source_tool,
+                },
+            ) {
+                Ok(true) => IpcResponse::success(
+                    "routing_policy_evaluation",
+                    Some(serde_json::json!({
+                        "proposal_id": proposal_id,
+                    })),
+                ),
+                Ok(false) => IpcResponse::error(
+                    "routing_policy_evaluation",
+                    "NOT_FOUND",
+                    format!("unknown routing policy proposal '{}'", proposal_id),
+                ),
+                Err(err) => {
+                    error!("Failed to append routing policy evaluation: {err}");
+                    IpcResponse::error(
+                        "routing_policy_evaluation",
+                        "STORAGE_ERROR",
+                        err.to_string(),
+                    )
+                }
+            },
             // Resource broker seam (agent-resource-broker). No callers yet;
             // hotel-side broker will be wired in the demand-derived-materialization seam.
             IpcRequest::ResourceRequest(_req) => IpcResponse::error(
@@ -14372,6 +14466,168 @@ mod tests {
         server_task.abort();
         let _ = server_task.await;
         let _ = std::fs::remove_file(&graph_db_path);
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn record_routing_policy_proposal_persists_specific_record_with_history() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("client connect");
+
+        let response = client
+            .send_request(IpcRequest::RecordRoutingPolicyProposal {
+                agent_id: "agent-routing-01".into(),
+                problem: "Weak receptor ingress keeps surfacing remote tool temptations.".into(),
+                proposed_change:
+                    "Deny remote tool reflex during receptor ingress until cognition owns the turn."
+                        .into(),
+                evidence: "Observed low-intent voice turns asking for remote tool execution."
+                    .into(),
+                affected_stage: Some("ingress".into()),
+                affected_capability: Some("voice.transcribe".into()),
+                learned_reflex_preference_key: Some("operator-mesh-trust".into()),
+            })
+            .await
+            .expect("record request");
+
+        let proposal_id = match response {
+            IpcResponse::RoutingPolicyRecorded { proposal_id } => proposal_id,
+            other => panic!("unexpected response: {other:?}"),
+        };
+
+        let stored = graph
+            .get_routing_policy(&proposal_id)
+            .expect("graph read")
+            .expect("stored proposal");
+        assert_eq!(stored.agent_id, "agent-routing-01");
+        assert_eq!(stored.operator_disposition.state, "approved");
+        assert_eq!(stored.evaluations.len(), 1);
+        assert_eq!(
+            stored.evaluations[0].evaluation_kind,
+            "operator_disposition"
+        );
+        assert_eq!(
+            stored.learned_reflex_preference_key.as_deref(),
+            Some("operator-mesh-trust")
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn append_routing_policy_evaluation_updates_durable_history() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("client connect");
+
+        let proposal_id = match client
+            .send_request(IpcRequest::RecordRoutingPolicyProposal {
+                agent_id: "agent-routing-01".into(),
+                problem: "Remote model routes are too eager during guarded posture.".into(),
+                proposed_change: "Keep component reflex but dampen remote tools.".into(),
+                evidence: "Observed guarded sessions still seeing remote tool temptations.".into(),
+                affected_stage: Some("cognition".into()),
+                affected_capability: Some("text.generate".into()),
+                learned_reflex_preference_key: Some("guarded-remote-tool-dampening".into()),
+            })
+            .await
+            .expect("record request")
+        {
+            IpcResponse::RoutingPolicyRecorded { proposal_id } => proposal_id,
+            other => panic!("unexpected response: {other:?}"),
+        };
+
+        let append_response = client
+            .send_request(IpcRequest::AppendRoutingPolicyEvaluation {
+                proposal_id: proposal_id.clone(),
+                evaluation_kind: "learned_reflex_writeback".into(),
+                decision: "approved_writeback".into(),
+                reason: "Learned reflex was persisted into the agent graph.".into(),
+                source_tool: Some("routing.policy.propose".into()),
+            })
+            .await
+            .expect("append request");
+
+        assert!(matches!(
+            append_response,
+            IpcResponse::Standard { ok: true, .. }
+        ));
+
+        let stored = graph
+            .get_routing_policy(&proposal_id)
+            .expect("graph read")
+            .expect("stored proposal");
+        assert_eq!(stored.evaluations.len(), 2);
+        assert_eq!(
+            stored.evaluations[1].evaluation_kind,
+            "learned_reflex_writeback"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
         if Path::new(&socket_path).exists() {
             let _ = std::fs::remove_file(&socket_path);
         }
