@@ -101,6 +101,41 @@ fn write_routing_preference_then_read_it_back() {
     assert_eq!(prefs[0]["weight"], 90);
 }
 
+#[test]
+fn write_reflex_preference_then_read_it_back() {
+    let (storage, _f) = open_storage("smoke-agent");
+
+    dispatch_ok(
+        &storage,
+        "agent.graph.write",
+        json!({
+            "entity": "reflex_preference",
+            "preference_key": "trusted-operator-mesh",
+            "precedence": 70,
+            "reflexes": {
+                "remote_tool_reflex": "allow",
+                "credential_scope_reflex": "mesh_scoped"
+            },
+            "config": {"reason": "learned operator trust"}
+        }),
+        "smoke-agent",
+    );
+
+    let result = dispatch_ok(
+        &storage,
+        "agent.graph.read",
+        json!({"entity": "reflex_preferences"}),
+        "smoke-agent",
+    );
+
+    let prefs = result["reflex_preferences"]
+        .as_array()
+        .expect("reflex_preferences array");
+    assert_eq!(prefs.len(), 1);
+    assert_eq!(prefs[0]["preference_key"], "trusted-operator-mesh");
+    assert_eq!(prefs[0]["reflexes_json"]["remote_tool_reflex"], "allow");
+}
+
 // ── agent.graph.declare ───────────────────────────────────────────────────────
 
 #[test]
@@ -188,6 +223,7 @@ fn sync_inserts_new_preference_from_snapshot() {
             updated_at: 1_000_000,
         }],
         routing_preferences: vec![],
+        reflex_preferences: vec![],
         declarations: vec![],
     };
 
@@ -198,6 +234,8 @@ fn sync_inserts_new_preference_from_snapshot() {
     assert_eq!(result["preferences_skipped"], 0);
     assert_eq!(result["routing_preferences_applied"], 0);
     assert_eq!(result["routing_preferences_skipped"], 0);
+    assert_eq!(result["reflex_preferences_applied"], 0);
+    assert_eq!(result["reflex_preferences_skipped"], 0);
 
     // Verify it is readable.
     let read_result = dispatch_ok(

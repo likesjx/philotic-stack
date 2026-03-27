@@ -89,6 +89,25 @@ pub struct AgentRoutingPreference {
     pub updated_at: u64,
 }
 
+/// Per-agent learned reflex preference for posture/affordance shaping.
+///
+/// These preferences are agent-owned overlay policy, not hotel grants and not
+/// session overrides. They should project as agent-learned reflex layers
+/// beneath explicit session overrides and above hotel defaults.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentReflexPreference {
+    pub agent_id: String,
+    pub preference_key: String,
+    #[serde(default)]
+    pub precedence: i32,
+    #[serde(default)]
+    pub reflexes_json: serde_json::Value,
+    #[serde(default)]
+    pub config_json: serde_json::Value,
+    #[serde(default)]
+    pub updated_at: u64,
+}
+
 /// A single entry in the agent experience ledger.
 ///
 /// Feeds the RL training pipeline via the router-listener tap (Seam 5).
@@ -147,6 +166,19 @@ pub struct SnapshotRoutingPreference {
     pub updated_at: u64,
 }
 
+/// A learned reflex preference entry inside an `AgentGraphSnapshot`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotReflexPreference {
+    pub preference_key: String,
+    #[serde(default)]
+    pub precedence: i32,
+    #[serde(default)]
+    pub reflexes_json: serde_json::Value,
+    #[serde(default)]
+    pub config_json: serde_json::Value,
+    pub updated_at: u64,
+}
+
 /// A resource declaration entry inside an `AgentGraphSnapshot`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotDeclaration {
@@ -173,6 +205,8 @@ pub struct AgentGraphSnapshot {
     pub preferences: Vec<SnapshotPreference>,
     #[serde(default)]
     pub routing_preferences: Vec<SnapshotRoutingPreference>,
+    #[serde(default)]
+    pub reflex_preferences: Vec<SnapshotReflexPreference>,
     pub declarations: Vec<SnapshotDeclaration>,
 }
 
@@ -183,6 +217,8 @@ pub struct MergeResult {
     pub preferences_skipped: usize,
     pub routing_preferences_applied: usize,
     pub routing_preferences_skipped: usize,
+    pub reflex_preferences_applied: usize,
+    pub reflex_preferences_skipped: usize,
     pub declarations_applied: usize,
     pub declarations_skipped: usize,
 }
@@ -231,6 +267,17 @@ pub trait AgentGraphStorage: Send + Sync {
         &self,
         preference_key: &str,
     ) -> Result<Option<AgentRoutingPreference>>;
+
+    // ── Reflex preferences ───────────────────────────────────────────────────
+
+    /// Upsert a learned reflex preference entry.
+    fn upsert_reflex_preference(&self, pref: &AgentReflexPreference) -> Result<()>;
+
+    /// Return all learned reflex preferences for this agent.
+    fn list_reflex_preferences(&self) -> Result<Vec<AgentReflexPreference>>;
+
+    /// Return one learned reflex preference by stable key, or `None` if not set.
+    fn get_reflex_preference(&self, preference_key: &str) -> Result<Option<AgentReflexPreference>>;
 
     // ── Resource declarations ────────────────────────────────────────────────
 
@@ -339,6 +386,16 @@ impl SqliteAgentGraphStorage {
                 PRIMARY KEY (agent_id, preference_key)
             );
 
+            CREATE TABLE IF NOT EXISTS reflex_preferences (
+                agent_id         TEXT NOT NULL,
+                preference_key   TEXT NOT NULL,
+                precedence       INTEGER NOT NULL DEFAULT 0,
+                reflexes_json    TEXT NOT NULL DEFAULT '{}',
+                config_json      TEXT NOT NULL DEFAULT '{}',
+                updated_at       INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (agent_id, preference_key)
+            );
+
             CREATE TABLE IF NOT EXISTS resource_declarations (
                 agent_id      TEXT NOT NULL,
                 resource_type TEXT NOT NULL,
@@ -374,6 +431,9 @@ impl SqliteAgentGraphStorage {
         );
         let _ = conn.execute_batch(
             "ALTER TABLE routing_preferences ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0;",
+        );
+        let _ = conn.execute_batch(
+            "ALTER TABLE reflex_preferences ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0;",
         );
         let _ = conn.execute_batch(
             "ALTER TABLE resource_declarations ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0;",
@@ -638,6 +698,91 @@ impl AgentGraphStorage for SqliteAgentGraphStorage {
         Ok(None)
     }
 
+    // ── Reflex preferences ───────────────────────────────────────────────────
+
+    fn upsert_reflex_preference(&self, pref: &AgentReflexPreference) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let reflexes = serde_json::to_string(&pref.reflexes_json)?;
+        let config = serde_json::to_string(&pref.config_json)?;
+        let updated_at = if pref.updated_at > 0 {
+            pref.updated_at
+        } else {
+            Self::now_epoch()
+        };
+        conn.execute(
+            "INSERT INTO reflex_preferences
+             (agent_id, preference_key, precedence, reflexes_json, config_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(agent_id, preference_key) DO UPDATE SET
+               precedence = excluded.precedence,
+               reflexes_json = excluded.reflexes_json,
+               config_json = excluded.config_json,
+               updated_at = excluded.updated_at",
+            params![
+                pref.agent_id,
+                pref.preference_key,
+                pref.precedence,
+                reflexes,
+                config,
+                updated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn list_reflex_preferences(&self) -> Result<Vec<AgentReflexPreference>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT agent_id, preference_key, precedence, reflexes_json, config_json, updated_at
+             FROM reflex_preferences WHERE agent_id = ?1 ORDER BY preference_key",
+        )?;
+        let rows = stmt.query_map(params![self.agent_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i32>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, u64>(5)?,
+            ))
+        })?;
+        let mut prefs = Vec::new();
+        for row in rows {
+            let (agent_id, preference_key, precedence, reflexes_str, cfg_str, updated_at) = row?;
+            prefs.push(AgentReflexPreference {
+                agent_id,
+                preference_key,
+                precedence,
+                reflexes_json: serde_json::from_str(&reflexes_str).unwrap_or_default(),
+                config_json: serde_json::from_str(&cfg_str).unwrap_or_default(),
+                updated_at,
+            });
+        }
+        Ok(prefs)
+    }
+
+    fn get_reflex_preference(&self, preference_key: &str) -> Result<Option<AgentReflexPreference>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT agent_id, preference_key, precedence, reflexes_json, config_json, updated_at
+             FROM reflex_preferences WHERE agent_id = ?1 AND preference_key = ?2",
+        )?;
+        let mut rows = stmt.query(params![self.agent_id, preference_key])?;
+        if let Some(row) = rows.next()? {
+            let reflexes_str: String = row.get(3)?;
+            let cfg_str: String = row.get(4)?;
+            return Ok(Some(AgentReflexPreference {
+                agent_id: row.get(0)?,
+                preference_key: row.get(1)?,
+                precedence: row.get(2)?,
+                reflexes_json: serde_json::from_str(&reflexes_str).unwrap_or_default(),
+                config_json: serde_json::from_str(&cfg_str).unwrap_or_default(),
+                updated_at: row.get(5)?,
+            }));
+        }
+        Ok(None)
+    }
+
     // ── Resource declarations ────────────────────────────────────────────────
 
     fn upsert_resource_declaration(&self, decl: &ResourceDeclaration) -> Result<()> {
@@ -811,6 +956,31 @@ impl AgentGraphStorage for SqliteAgentGraphStorage {
             });
         }
 
+        let mut reflex_pref_stmt = conn.prepare(
+            "SELECT preference_key, precedence, reflexes_json, config_json, updated_at
+             FROM reflex_preferences WHERE agent_id = ?1",
+        )?;
+        let reflex_pref_rows = reflex_pref_stmt.query_map(params![self.agent_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i32>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, u64>(4)?,
+            ))
+        })?;
+        let mut reflex_preferences = Vec::new();
+        for row in reflex_pref_rows {
+            let (preference_key, precedence, reflexes_str, cfg_str, updated_at) = row?;
+            reflex_preferences.push(SnapshotReflexPreference {
+                preference_key,
+                precedence,
+                reflexes_json: serde_json::from_str(&reflexes_str).unwrap_or_default(),
+                config_json: serde_json::from_str(&cfg_str).unwrap_or_default(),
+                updated_at,
+            });
+        }
+
         // Export resource declarations with timestamps.
         let mut decl_stmt = conn.prepare(
             "SELECT resource_type, config_hint, updated_at
@@ -846,6 +1016,7 @@ impl AgentGraphStorage for SqliteAgentGraphStorage {
             exported_at: Self::now_epoch(),
             preferences,
             routing_preferences,
+            reflex_preferences,
             declarations,
         })
     }
@@ -856,6 +1027,8 @@ impl AgentGraphStorage for SqliteAgentGraphStorage {
         let mut preferences_skipped = 0usize;
         let mut routing_preferences_applied = 0usize;
         let mut routing_preferences_skipped = 0usize;
+        let mut reflex_preferences_applied = 0usize;
+        let mut reflex_preferences_skipped = 0usize;
         let mut declarations_applied = 0usize;
         let mut declarations_skipped = 0usize;
 
@@ -923,6 +1096,37 @@ impl AgentGraphStorage for SqliteAgentGraphStorage {
             }
         }
 
+        for pref in &snapshot.reflex_preferences {
+            let reflexes_str =
+                serde_json::to_string(&pref.reflexes_json).unwrap_or_else(|_| "{}".to_string());
+            let config_str =
+                serde_json::to_string(&pref.config_json).unwrap_or_else(|_| "{}".to_string());
+            let rows_changed = conn.execute(
+                "INSERT INTO reflex_preferences
+                 (agent_id, preference_key, precedence, reflexes_json, config_json, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(agent_id, preference_key) DO UPDATE SET
+                   precedence = excluded.precedence,
+                   reflexes_json = excluded.reflexes_json,
+                   config_json = excluded.config_json,
+                   updated_at = excluded.updated_at
+                 WHERE excluded.updated_at > reflex_preferences.updated_at",
+                params![
+                    snapshot.agent_id,
+                    pref.preference_key,
+                    pref.precedence,
+                    reflexes_str,
+                    config_str,
+                    pref.updated_at
+                ],
+            )?;
+            if rows_changed > 0 {
+                reflex_preferences_applied += 1;
+            } else {
+                reflex_preferences_skipped += 1;
+            }
+        }
+
         for decl in &snapshot.declarations {
             let rt_str = serde_json::to_string(&decl.resource_type)
                 .unwrap_or_else(|_| "\"unknown\"".to_string());
@@ -952,6 +1156,8 @@ impl AgentGraphStorage for SqliteAgentGraphStorage {
             preferences_skipped,
             routing_preferences_applied,
             routing_preferences_skipped,
+            reflex_preferences_applied,
+            reflex_preferences_skipped,
             declarations_applied,
             declarations_skipped,
         })
@@ -1132,6 +1338,48 @@ mod tests {
         assert_eq!(prefs[0].preference_key, "cognition-gemini-flash");
     }
 
+    #[test]
+    fn reflex_preference_upsert_get() {
+        let (s, _f) = open_tmp("bjork");
+        let pref = AgentReflexPreference {
+            agent_id: "bjork".into(),
+            preference_key: "trusted-operator-mesh".into(),
+            precedence: 70,
+            reflexes_json: serde_json::json!({
+                "remote_tool_reflex": "allow",
+                "credential_scope_reflex": "mesh_scoped"
+            }),
+            config_json: serde_json::json!({"reason": "trusted operator history"}),
+            updated_at: 0,
+        };
+        s.upsert_reflex_preference(&pref).unwrap();
+        let got = s
+            .get_reflex_preference("trusted-operator-mesh")
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.precedence, 70);
+        assert_eq!(got.reflexes_json["remote_tool_reflex"], "allow");
+    }
+
+    #[test]
+    fn reflex_preference_list_returns_rows() {
+        let (s, _f) = open_tmp("bjork");
+        s.upsert_reflex_preference(&AgentReflexPreference {
+            agent_id: "bjork".into(),
+            preference_key: "guard-remote-tools".into(),
+            precedence: 65,
+            reflexes_json: serde_json::json!({
+                "remote_tool_reflex": "deny"
+            }),
+            config_json: serde_json::json!({}),
+            updated_at: 0,
+        })
+        .unwrap();
+        let prefs = s.list_reflex_preferences().unwrap();
+        assert_eq!(prefs.len(), 1);
+        assert_eq!(prefs[0].preference_key, "guard-remote-tools");
+    }
+
     // ── resource declarations ─────────────────────────────────────────────────
 
     #[test]
@@ -1254,6 +1502,7 @@ mod tests {
         assert_eq!(snap.preferences.len(), 1);
         assert_eq!(snap.preferences[0].tool_name, "bash.exec");
         assert!(snap.routing_preferences.is_empty());
+        assert!(snap.reflex_preferences.is_empty());
         assert_eq!(snap.declarations.len(), 1);
         assert_eq!(
             snap.declarations[0].resource_type,
@@ -1287,6 +1536,7 @@ mod tests {
                 updated_at: 1_000,
             }],
             routing_preferences: vec![],
+            reflex_preferences: vec![],
             declarations: vec![],
         };
 
@@ -1334,6 +1584,7 @@ mod tests {
                 updated_at: 1_000,
             }],
             declarations: vec![],
+            reflex_preferences: vec![],
         };
 
         let result = local.apply_snapshot(&snap).unwrap();
@@ -1346,6 +1597,51 @@ mod tests {
             .unwrap();
         assert_eq!(pref.provider_hint.as_deref(), Some("elevenlabs"));
         assert_eq!(pref.weight, 90);
+    }
+
+    #[test]
+    fn apply_snapshot_reflex_preference_lww_newer_wins() {
+        let (local, _f) = open_tmp("aria");
+        local
+            .upsert_reflex_preference(&AgentReflexPreference {
+                agent_id: "aria".into(),
+                preference_key: "operator-mesh".into(),
+                precedence: 60,
+                reflexes_json: serde_json::json!({"remote_tool_reflex": "deny"}),
+                config_json: serde_json::json!({}),
+                updated_at: 500,
+            })
+            .unwrap();
+
+        let snap = AgentGraphSnapshot {
+            agent_id: "aria".into(),
+            source_node_id: "node-b".into(),
+            exported_at: 2_000,
+            preferences: vec![],
+            routing_preferences: vec![],
+            reflex_preferences: vec![SnapshotReflexPreference {
+                preference_key: "operator-mesh".into(),
+                precedence: 75,
+                reflexes_json: serde_json::json!({
+                    "remote_tool_reflex": "allow",
+                    "credential_scope_reflex": "mesh_scoped"
+                }),
+                config_json: serde_json::json!({"reason": "learned trust"}),
+                updated_at: 1_000,
+            }],
+            declarations: vec![],
+        };
+
+        let result = local.apply_snapshot(&snap).unwrap();
+        assert_eq!(result.reflex_preferences_applied, 1);
+        assert_eq!(result.reflex_preferences_skipped, 0);
+
+        let pref = local
+            .get_reflex_preference("operator-mesh")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pref.precedence, 75);
+        assert_eq!(pref.reflexes_json["remote_tool_reflex"], "allow");
     }
 
     #[test]
@@ -1374,6 +1670,7 @@ mod tests {
                 updated_at: 500,
             }],
             routing_preferences: vec![],
+            reflex_preferences: vec![],
             declarations: vec![],
         };
 
@@ -1398,6 +1695,7 @@ mod tests {
             exported_at: 1_000,
             preferences: vec![],
             routing_preferences: vec![],
+            reflex_preferences: vec![],
             declarations: vec![SnapshotDeclaration {
                 resource_type: ResourceType::ToolRunner,
                 config_hint: None,
@@ -1425,6 +1723,7 @@ mod tests {
                 updated_at: 500,
             }],
             routing_preferences: vec![],
+            reflex_preferences: vec![],
             declarations: vec![],
         };
         let result = local.apply_snapshot(&snap).unwrap();

@@ -1901,7 +1901,7 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                 "properties": {
                     "entity": {
                         "type": "string",
-                        "enum": ["resource_grants", "tool_preferences", "routing_preferences", "resource_declarations"]
+                        "enum": ["resource_grants", "tool_preferences", "routing_preferences", "reflex_preferences", "resource_declarations"]
                     }
                 },
                 "required": ["entity"]
@@ -1916,7 +1916,7 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                 "properties": {
                     "entity": {
                         "type": "string",
-                        "enum": ["tool_preference", "routing_preference"]
+                        "enum": ["tool_preference", "routing_preference", "reflex_preference"]
                     },
                     "tool_name": { "type": "string" },
                     "preference_key": { "type": "string" },

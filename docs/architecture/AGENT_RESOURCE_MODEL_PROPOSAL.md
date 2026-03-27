@@ -411,6 +411,8 @@ an `effective_reflex_policy` with ordered layers:
 
 - an inferred `placement_inferred` layer from runtime provenance
 - optional hotel-projected `hotel_default` layers from bindings
+- optional agent-graph `agent_learned` layers projected from durable learned
+  reflex preferences
 - optional explicit `reflex_policy_records` for session-scoped override layers
   with `policy_scope`, `policy_source`, `origin_class`, `precedence`, and
   `reflexes`
@@ -419,6 +421,13 @@ an `effective_reflex_policy` with ordered layers:
 
 That keeps hotel inference, operator damping, and future agent-learned reflexes
 in one governable stack instead of quietly relying on merge order as policy.
+
+The first durable home for learned reflex posture should be the agent graph, not
+the hotel. In the current slice that means mesh-synced `reflex_preferences`
+records in the agent graph project into session bindings as `agent_learned`
+layers inside `effective_reflex_policy`. The hotel still owns grants and
+effective key rings; it merely projects the agent-owned learned posture into the
+runtime stack it enforces.
 
 In practice, a fresher active-incarnation update is the `p53` check here: if
 the runtime has newer local evidence that the session now belongs on a
