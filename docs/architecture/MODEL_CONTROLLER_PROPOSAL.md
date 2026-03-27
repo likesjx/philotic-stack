@@ -115,16 +115,16 @@ The first honest controller slice should therefore:
 Current implemented truth for this seam is still transitional:
 
 - `response.generate` now uses the Live websocket seam and returns canonical text output
-- `voice.dialogue` now uses the Live websocket seam and will transcode non-PCM blob-backed audio through a transitional ffmpeg enzyme before sending Gemini realtime PCM input
+- `voice.dialogue` now uses the Live websocket seam and prepares non-PCM blob-backed audio through the first shared `media-prep` enzyme, which currently uses a transitional ffmpeg-backed PCM path before sending Gemini realtime input
 - `philote` now treats cognitive-stage audio artifacts as first-class enough to short-circuit duplicate voice synthesis on voice turns, delivering the native-live artifact directly instead of reflexively asking another synth to repeat it
 - audio output currently re-enters Philotic through output transcription text rather than a first-class cognitive audio artifact
 - sequential in-session tool-response continuation is still a follow-on seam
 
 Interception boundary note:
 
-- the codec currently intercepts at the provider receptor (`model-router` native-live seam), because that is the first layer that knows Gemini Live specifically requires realtime PCM input
-- this is a transitional home, not necessarily the permanent one
-- a cleaner long-term shape is a shared media-prep enzyme between `philote` and provider invocation, but moving it earlier before cognitive audio artifacts are properly metabolized would just spread provider-specific physiology upstream
+- the codec pressure now has a first narrow shared home in `media-prep`, while interception still happens at the provider receptor (`model-router` native-live seam), because that is the first layer that knows Gemini Live specifically requires realtime PCM input
+- this is still transitional, not the permanent final anatomy
+- a cleaner long-term shape is to let `media-prep` grow into a broader shared interception substrate between `philote` and provider invocation, but moving all adaptation pressure earlier before more artifact paths are properly metabolized would just spread provider-specific physiology upstream
 
 ## OpenAI Provider Recommendation
 

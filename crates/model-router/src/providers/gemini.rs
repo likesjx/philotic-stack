@@ -7,11 +7,10 @@ use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use futures::{SinkExt, StreamExt};
+use media_prep::{PcmPrepPolicy, prepare_audio_ligand_for_pcm};
 use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -50,18 +49,6 @@ struct LiveTurnAccumulator {
 #[derive(Debug, Default)]
 struct NativeLiveTurnOutputMarker {
     resumption_handle: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum LiveAudioLigand {
-    Pcm {
-        bytes: Vec<u8>,
-        mime_type: String,
-    },
-    NeedsTranscoding {
-        bytes: Vec<u8>,
-        source_mime_type: String,
-    },
 }
 
 impl GeminiProvider {
@@ -796,29 +783,20 @@ impl GeminiProvider {
                 );
             }
             let bytes = response.bytes().await?.to_vec();
-            let ligand = Self::classify_live_audio_ligand(mime_type.as_ref(), bytes);
-            let (pcm_bytes, output_mime_type) = match ligand {
-                LiveAudioLigand::Pcm { bytes, mime_type } => (bytes, mime_type),
-                LiveAudioLigand::NeedsTranscoding {
-                    bytes,
-                    source_mime_type,
-                } => {
-                    let pcm_bytes = Self::transcode_audio_ligand_to_pcm(bytes, &source_mime_type)
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "failed to transcode live audio ligand from [{}] into Gemini PCM input",
-                                source_mime_type
-                            )
-                        })?;
-                    (pcm_bytes, "audio/pcm;rate=16000".to_string())
-                }
-            };
+            let prepared =
+                prepare_audio_ligand_for_pcm(mime_type.as_ref(), bytes, &PcmPrepPolicy::default())
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to prepare live audio ligand from [{}] into Gemini PCM input",
+                            mime_type
+                        )
+                    })?;
             chunks.push(json!({
                 "realtimeInput": {
                     "audio": {
-                        "mimeType": output_mime_type,
-                        "data": BASE64_STANDARD.encode(pcm_bytes)
+                        "mimeType": prepared.mime_type,
+                        "data": BASE64_STANDARD.encode(prepared.bytes)
                     }
                 }
             }));
@@ -829,86 +807,6 @@ impl GeminiProvider {
         }
 
         Ok(chunks)
-    }
-
-    fn classify_live_audio_ligand(mime_type: &str, bytes: Vec<u8>) -> LiveAudioLigand {
-        if mime_type
-            .trim()
-            .to_ascii_lowercase()
-            .starts_with("audio/pcm")
-        {
-            LiveAudioLigand::Pcm {
-                bytes,
-                mime_type: mime_type.trim().to_string(),
-            }
-        } else {
-            LiveAudioLigand::NeedsTranscoding {
-                bytes,
-                source_mime_type: mime_type.trim().to_string(),
-            }
-        }
-    }
-
-    async fn transcode_audio_ligand_to_pcm(
-        source_bytes: Vec<u8>,
-        source_mime_type: &str,
-    ) -> Result<Vec<u8>> {
-        let mut child = Command::new("ffmpeg")
-            .arg("-hide_banner")
-            .arg("-loglevel")
-            .arg("error")
-            .arg("-i")
-            .arg("pipe:0")
-            .arg("-f")
-            .arg("s16le")
-            .arg("-acodec")
-            .arg("pcm_s16le")
-            .arg("-ac")
-            .arg("1")
-            .arg("-ar")
-            .arg("16000")
-            .arg("pipe:1")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .with_context(|| {
-                format!(
-                    "failed to spawn ffmpeg for live audio transcoding from [{}]; install ffmpeg or provide PCM audio upstream",
-                    source_mime_type
-                )
-            })?;
-
-        let mut stdin = child
-            .stdin
-            .take()
-            .context("ffmpeg live transcoder missing stdin")?;
-        stdin
-            .write_all(&source_bytes)
-            .await
-            .context("failed to stream source audio into ffmpeg")?;
-        drop(stdin);
-
-        let output = child
-            .wait_with_output()
-            .await
-            .context("failed to await ffmpeg live transcoder")?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!(
-                "ffmpeg could not transcode live audio ligand from [{}]: {}",
-                source_mime_type,
-                stderr.trim()
-            );
-        }
-        if output.stdout.is_empty() {
-            bail!(
-                "ffmpeg returned empty PCM output while transcoding live audio ligand from [{}]",
-                source_mime_type
-            );
-        }
-
-        Ok(output.stdout)
     }
 
     async fn send_live_json<S>(ws: &mut S, payload: &Value) -> Result<()>
@@ -1929,33 +1827,6 @@ mod tests {
         assert_eq!(
             payload["setup"]["realtimeInputConfig"]["automaticActivityDetection"]["disabled"],
             serde_json::json!(true)
-        );
-    }
-
-    #[test]
-    fn classify_live_audio_ligand_preserves_pcm_input() {
-        let ligand =
-            GeminiProvider::classify_live_audio_ligand("audio/pcm;rate=16000", vec![1, 2, 3]);
-
-        assert_eq!(
-            ligand,
-            super::LiveAudioLigand::Pcm {
-                bytes: vec![1, 2, 3],
-                mime_type: "audio/pcm;rate=16000".into()
-            }
-        );
-    }
-
-    #[test]
-    fn classify_live_audio_ligand_marks_ogg_for_transcoding() {
-        let ligand = GeminiProvider::classify_live_audio_ligand("audio/ogg", vec![4, 5, 6]);
-
-        assert_eq!(
-            ligand,
-            super::LiveAudioLigand::NeedsTranscoding {
-                bytes: vec![4, 5, 6],
-                source_mime_type: "audio/ogg".into()
-            }
         );
     }
 
