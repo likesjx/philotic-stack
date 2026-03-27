@@ -298,6 +298,10 @@ smoke-remote-model:
 smoke-gemini-oauth:
     bash scripts/smoke-gemini-oauth-roundtrip.sh
 
+# Run the Gemini Live complete-turn smoke (fake local Live websocket; no external creds)
+smoke-gemini-live:
+    bash scripts/smoke-gemini-live-roundtrip.sh
+
 # Run the MLX model controller smoke (requires mlx_lm installed + Apple Silicon)
 smoke-mlx:
     bash scripts/smoke-mlx-controller.sh
@@ -335,6 +339,7 @@ smoke-suite:
     ./scripts/smoke-subagent-roundtrip.sh
     bash scripts/smoke-cognitive-roundtrip.sh
     bash scripts/smoke-cognitive-reentry-roundtrip.sh
+    bash scripts/smoke-gemini-live-roundtrip.sh
     bash scripts/smoke-graph-runner-roundtrip.sh
     bash scripts/smoke-agent-graph-roundtrip.sh
     bash scripts/smoke-desktop-membrane.sh
@@ -352,6 +357,7 @@ operator-checklist:
     @echo "  just verify-vertical-slice"
     @echo "    = just test-suite  (unit + integration tests)"
     @echo "    + just smoke-suite (binary roundtrip smokes, incl. desktop membrane)"
+    @echo "  just smoke-gemini-live        # fake local Gemini Live complete-turn continuity"
     @echo ""
     @echo "── Tier 2: External credentials required ───────────────────────"
     @echo "  just smoke-model-controller   # mesh-config.json + Gemini key"

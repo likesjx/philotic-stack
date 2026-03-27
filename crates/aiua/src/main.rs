@@ -12,6 +12,7 @@ use ansible_mesh_core::storage::{
 use ansible_mesh_core::{NodeCapabilities, NodeRole};
 use anyhow::{Context, Result};
 use axum::body::{Body, to_bytes};
+use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, Query, Request, State};
 use axum::http::{Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -322,6 +323,8 @@ enum StartupTest {
     CognitiveRoundTrip,
     #[value(name = "gemini-oauth-roundtrip", alias = "gemini-oauth")]
     GeminiOAuthRoundTrip,
+    #[value(name = "gemini-live-roundtrip", alias = "gemini-live")]
+    GeminiLiveRoundTrip,
     VoiceSample,
     #[value(name = "telegram-roundtrip", alias = "telegram-round-trip")]
     TelegramRoundTrip,
@@ -332,6 +335,7 @@ enum StartupTest {
 const STARTUP_TEST_TEXT_REPLY: &str = "startup text smoke ok";
 const STARTUP_TEST_COGNITIVE_REPLY: &str = "startup cognitive smoke ok";
 const STARTUP_TEST_GEMINI_OAUTH_REPLY: &str = "oauth-guest-ok";
+const STARTUP_TEST_GEMINI_LIVE_REPLY: &str = "gemini live startup ok";
 const STARTUP_TEST_TELEGRAM_TOKEN: &str = "startup-test-telegram-token";
 const STARTUP_TEST_GEMINI_API_KEY: &str = "startup-test-gemini-key";
 const STARTUP_TEST_TELEGRAM_TEXT_REPLY: &str = "startup telegram text smoke ok";
@@ -358,6 +362,14 @@ struct FakeTelegramFile {
 #[derive(Debug, Default)]
 struct FakeGeminiMediaState {
     requests: std::sync::Mutex<Vec<serde_json::Value>>,
+}
+
+#[derive(Debug, Default)]
+struct FakeGeminiLiveState {
+    websocket_connections: AtomicUsize,
+    setup_messages: AtomicUsize,
+    prompt_messages: AtomicUsize,
+    tool_response_messages: AtomicUsize,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -2514,6 +2526,31 @@ fn enable_guest_test_overrides(
                 guest.config_json = config.to_string();
             }
         }
+        StartupTest::GeminiLiveRoundTrip => {
+            graph.set_config_value(
+                "gemini_api_key",
+                &serde_json::Value::String(STARTUP_TEST_GEMINI_API_KEY.into()).to_string(),
+            )?;
+
+            for guest in &mut guests {
+                if guest.role != "model" {
+                    continue;
+                }
+
+                let mut config: serde_json::Value =
+                    serde_json::from_str(&guest.config_json).unwrap_or_default();
+                let env = config
+                    .as_object_mut()
+                    .and_then(|obj| obj.get_mut("env"))
+                    .and_then(serde_json::Value::as_object_mut)
+                    .context("guest config missing env object")?;
+                env.insert(
+                    "PHILOTIC_GEMINI_BASE_URL".into(),
+                    serde_json::Value::String(startup_test_gemini_base_url(hotel_name)),
+                );
+                guest.config_json = config.to_string();
+            }
+        }
         StartupTest::VoiceSample => {
             for guest in &mut guests {
                 if guest.role != "model.elevenlabs" {
@@ -2681,6 +2718,40 @@ fn spawn_fake_gemini_server(
     })
 }
 
+fn spawn_fake_gemini_live_server(
+    hotel_name: &str,
+    expected_reply: String,
+    state: Arc<FakeGeminiLiveState>,
+) -> tokio::task::JoinHandle<()> {
+    let bind_addr: SocketAddr = format!("127.0.0.1:{}", startup_test_gemini_port(hotel_name))
+        .parse()
+        .expect("startup fake Gemini Live socket address should parse");
+
+    let app = Router::new()
+        .route(
+            "/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent",
+            any(fake_gemini_live_handler),
+        )
+        .with_state((state, expected_reply));
+
+    tokio::spawn(async move {
+        let listener = match tokio::net::TcpListener::bind(bind_addr).await {
+            Ok(listener) => listener,
+            Err(err) => {
+                warn!(
+                    "Failed to bind fake Gemini Live startup server at {}: {}",
+                    bind_addr, err
+                );
+                return;
+            }
+        };
+
+        if let Err(err) = axum::serve(listener, app).await {
+            warn!("Fake Gemini Live startup server exited with error: {}", err);
+        }
+    })
+}
+
 async fn fake_gemini_handler(
     State(state): State<FakeGeminiOAuthState>,
     request: Request<Body>,
@@ -2818,6 +2889,184 @@ async fn fake_gemini_handler(
         })),
     )
         .into_response()
+}
+
+async fn fake_gemini_live_handler(
+    State((state, expected_reply)): State<(Arc<FakeGeminiLiveState>, String)>,
+    ws: WebSocketUpgrade,
+    request: Request<Body>,
+) -> Response {
+    let uses_api_key_query = request
+        .uri()
+        .query()
+        .map(|query| query.contains("key="))
+        .unwrap_or(false);
+    if !uses_api_key_query {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": { "message": "startup Gemini Live smoke expected api-key query auth" }
+            })),
+        )
+            .into_response();
+    }
+
+    ws.on_upgrade(move |socket| fake_gemini_live_session(socket, state, expected_reply))
+}
+
+async fn fake_gemini_live_session(
+    mut socket: WebSocket,
+    state: Arc<FakeGeminiLiveState>,
+    expected_reply: String,
+) {
+    state.websocket_connections.fetch_add(1, Ordering::Relaxed);
+
+    while let Some(Ok(message)) = socket.recv().await {
+        let text = match message {
+            WsMessage::Text(text) => text,
+            WsMessage::Binary(bytes) => match String::from_utf8(bytes.to_vec()) {
+                Ok(text) => text.into(),
+                Err(err) => {
+                    warn!(
+                        "Fake Gemini Live startup server received invalid binary frame: {}",
+                        err
+                    );
+                    break;
+                }
+            },
+            WsMessage::Close(_) => break,
+            WsMessage::Ping(_) | WsMessage::Pong(_) => continue,
+        };
+
+        let payload: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(payload) => payload,
+            Err(err) => {
+                warn!(
+                    "Fake Gemini Live startup server received invalid JSON: {}",
+                    err
+                );
+                break;
+            }
+        };
+
+        if payload.get("setup").is_some() {
+            state.setup_messages.fetch_add(1, Ordering::Relaxed);
+            if socket
+                .send(WsMessage::Text(
+                    serde_json::json!({ "setupComplete": {} })
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            continue;
+        }
+
+        if payload.get("clientContent").is_some() {
+            state.prompt_messages.fetch_add(1, Ordering::Relaxed);
+            let prompt = payload
+                .get("clientContent")
+                .and_then(|value| value.get("turns"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|turns| turns.first())
+                .and_then(|turn| turn.get("parts"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|parts| parts.first())
+                .and_then(|part| part.get("text"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if !prompt.contains(&expected_reply) {
+                warn!(
+                    "Fake Gemini Live startup server prompt missing expected reply token: {:?}",
+                    prompt
+                );
+                break;
+            }
+
+            let tool_call = serde_json::json!({
+                "sessionResumptionUpdate": {
+                    "resumable": true,
+                    "newHandle": "startup-live-handle"
+                },
+                "toolCall": {
+                    "functionCalls": [{
+                        "id": "startup-live-call-1",
+                        "name": "echo",
+                        "args": { "text": expected_reply }
+                    }]
+                }
+            });
+            if socket
+                .send(WsMessage::Text(tool_call.to_string().into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            continue;
+        }
+
+        if payload.get("toolResponse").is_some() {
+            state.tool_response_messages.fetch_add(1, Ordering::Relaxed);
+            let response = payload
+                .get("toolResponse")
+                .and_then(|value| value.get("functionResponses"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|responses| responses.first())
+                .cloned()
+                .unwrap_or_default();
+            let response_id = response
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let echoed = response
+                .get("response")
+                .and_then(|value| {
+                    value
+                        .get("result")
+                        .or_else(|| value.get("echo").map(|_| value))
+                })
+                .and_then(|value| value.get("echo"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if response_id != "startup-live-call-1" || echoed != expected_reply {
+                warn!(
+                    "Fake Gemini Live startup server received unexpected tool response id={:?} echo={:?}",
+                    response_id, echoed
+                );
+                break;
+            }
+
+            let content = serde_json::json!({
+                "serverContent": {
+                    "modelTurn": {
+                        "parts": [{ "text": expected_reply }]
+                    }
+                }
+            });
+            if socket
+                .send(WsMessage::Text(content.to_string().into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+
+            let complete = serde_json::json!({
+                "serverContent": {
+                    "generationComplete": true,
+                    "turnComplete": true
+                }
+            });
+            let _ = socket
+                .send(WsMessage::Text(complete.to_string().into()))
+                .await;
+            continue;
+        }
+    }
 }
 
 fn fake_telegram_router(state: Arc<FakeTelegramState>) -> Router {
@@ -3584,6 +3833,193 @@ async fn run_startup_test(
 
             info!(
                 "Startup Gemini OAuth round-trip received {:?} through provider {:?}",
+                content, trace_provider
+            );
+            Ok(())
+        }
+        StartupTest::GeminiLiveRoundTrip => {
+            let expected_reply = text
+                .unwrap_or(STARTUP_TEST_GEMINI_LIVE_REPLY)
+                .trim()
+                .to_string();
+            let prompt = format!("Reply with exactly: {}", expected_reply);
+            let live_state = Arc::new(FakeGeminiLiveState::default());
+            let fake_gemini = spawn_fake_gemini_live_server(
+                hotel_name,
+                expected_reply.clone(),
+                Arc::clone(&live_state),
+            );
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+            let mut client = PhiloticClient::connect_at(
+                socket_path,
+                GuestIdentity {
+                    guest_id: "aiua-startup-test-client".into(),
+                    role: "aiua-startup-test".into(),
+                    supported_tools: Vec::new(),
+                },
+            )
+            .await?;
+
+            let task_payload = |provider_options: Option<serde_json::Value>| {
+                serde_json::json!({
+                    "kind": "response.generate",
+                    "provider": "gemini",
+                    "model": "gemini-3.1-flash-live-preview",
+                    "prompt": prompt,
+                    "response_contract": {
+                        "channels": ["display_text"]
+                    },
+                    "tools_for_model": [{
+                        "tool_name": "echo",
+                        "description": "Echo back the provided text.",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {
+                                "text": { "type": "string" }
+                            },
+                            "required": ["text"]
+                        }
+                    }],
+                    "effective_rights": ["tool.echo"],
+                    "session_id": "startup-test:gemini-live-roundtrip",
+                    "turn_id": "startup-test-live-turn-1",
+                    "chat_id": "startup-test-chat",
+                    "reply_to": local_node_id.clone(),
+                    "reply_role": "aiua-startup-test",
+                    "final_reply_to": local_node_id.clone(),
+                    "final_reply_role": "aiua-startup-test",
+                    "final_reply_guest_id": "aiua-startup-test-client",
+                    "provider_options": provider_options.unwrap_or_else(|| serde_json::json!({}))
+                })
+            };
+
+            let response = client
+                .send_request(IpcRequest::EmitTask {
+                    target_node: local_node_id.clone(),
+                    target_role: "model".into(),
+                    target_guest_id: None,
+                    task_json: task_payload(None).to_string(),
+                })
+                .await?;
+
+            match response {
+                IpcResponse::Standard { ok: true, .. } => {}
+                other => anyhow::bail!("unexpected startup live emit response: {other:?}"),
+            }
+
+            let first_reply =
+                tokio::time::timeout(tokio::time::Duration::from_secs(30), client.recv_task())
+                    .await
+                    .context("timed out waiting for Gemini Live tool call")??;
+            let IpcResponse::InboundTask { task_json, .. } = first_reply else {
+                anyhow::bail!("unexpected startup live envelope: {first_reply:?}");
+            };
+            let payload: serde_json::Value = serde_json::from_str(&task_json)
+                .context("failed to decode startup Gemini Live tool call")?;
+            let tool_name = payload
+                .get("agent_action")
+                .and_then(|value| value.get("tool_name"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if tool_name != "echo" {
+                anyhow::bail!("unexpected startup Gemini Live tool call: {:?}", tool_name);
+            }
+            let function_call_id = payload
+                .get("agent_action")
+                .and_then(|value| value.get("model_result"))
+                .and_then(|value| value.get("native_live"))
+                .and_then(|value| value.get("pending_function_call_id"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if function_call_id != "startup-live-call-1" {
+                anyhow::bail!(
+                    "unexpected startup Gemini Live pending function call id: {:?}",
+                    function_call_id
+                );
+            }
+
+            let continuation = client
+                .send_request(IpcRequest::EmitTask {
+                    target_node: local_node_id.clone(),
+                    target_role: "model".into(),
+                    target_guest_id: None,
+                    task_json: task_payload(Some(serde_json::json!({
+                        "live_tool_response": {
+                            "function_call_id": function_call_id,
+                            "tool_name": "echo",
+                            "tool_response": {
+                                "echo": expected_reply
+                            }
+                        }
+                    })))
+                    .to_string(),
+                })
+                .await?;
+
+            match continuation {
+                IpcResponse::Standard { ok: true, .. } => {}
+                other => anyhow::bail!("unexpected startup live continuation response: {other:?}"),
+            }
+
+            let final_reply =
+                tokio::time::timeout(tokio::time::Duration::from_secs(30), client.recv_task())
+                    .await
+                    .context("timed out waiting for Gemini Live final response")??;
+            fake_gemini.abort();
+
+            let IpcResponse::InboundTask { task_json, .. } = final_reply else {
+                anyhow::bail!("unexpected startup live final envelope: {final_reply:?}");
+            };
+            let payload: serde_json::Value = serde_json::from_str(&task_json)
+                .context("failed to decode startup Gemini Live final reply")?;
+            let content = payload
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if content != expected_reply {
+                anyhow::bail!(
+                    "unexpected Gemini Live startup reply: expected {:?}, got {:?}",
+                    expected_reply,
+                    content
+                );
+            }
+            let trace_provider = payload
+                .get("agent_action")
+                .and_then(|value| value.get("model_result"))
+                .and_then(|value| value.get("trace"))
+                .and_then(|value| value.get("provider"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if trace_provider != "gemini" {
+                anyhow::bail!(
+                    "unexpected Gemini Live startup trace provider: {:?}",
+                    trace_provider
+                );
+            }
+
+            let websocket_connections = live_state.websocket_connections.load(Ordering::Relaxed);
+            let setup_messages = live_state.setup_messages.load(Ordering::Relaxed);
+            let prompt_messages = live_state.prompt_messages.load(Ordering::Relaxed);
+            let tool_response_messages = live_state.tool_response_messages.load(Ordering::Relaxed);
+            if websocket_connections != 1
+                || setup_messages != 1
+                || prompt_messages != 1
+                || tool_response_messages != 1
+            {
+                anyhow::bail!(
+                    "unexpected Gemini Live startup receptor counts: ws={} setup={} prompt={} tool_response={}",
+                    websocket_connections,
+                    setup_messages,
+                    prompt_messages,
+                    tool_response_messages
+                );
+            }
+
+            info!(
+                "Startup Gemini Live round-trip received {:?} through provider {:?} over one live websocket receptor",
                 content, trace_provider
             );
             Ok(())

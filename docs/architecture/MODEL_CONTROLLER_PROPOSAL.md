@@ -119,6 +119,7 @@ Current implemented truth for this seam is still transitional:
 - `philote` now treats cognitive-stage audio artifacts as first-class enough to short-circuit duplicate voice synthesis on voice turns, delivering the native-live artifact directly instead of reflexively asking another synth to repeat it
 - the first shared artifact-interception path now also lives in `media-prep` via a shared `audio_artifact` envelope, so `model-router`, `philote`, and `membrane` stop independently serializing, guessing at, and re-decoding the same payload shape
 - Gemini Live tool calls now preserve the live websocket session inside `model-router` across the tool round-trip, with `philote` carrying the pending function-call id back into the next cognitive request so the actual `toolResponse` returns over the same live receptor instead of restarting the turn from scratch
+- a startup-driven `smoke-gemini-live` path now proves the binary-level `response.generate -> tool_call -> toolResponse -> final reply` continuity against a fake local Live websocket receptor, so the complete-turn seam is smoke-green at the model-controller boundary rather than only test-green in crates
 - audio output currently re-enters Philotic through output transcription text rather than a first-class cognitive audio artifact
 - live tool-response continuation is now wired for the Gemini path, though broader native-live lifecycle governance and cleanup policy are still transitional
 
