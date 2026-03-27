@@ -3,7 +3,7 @@ title: "Agent-Centric Resource Model"
 doc_type: proposal
 domain: runtime-sessions
 status: accepted-current-slice
-last_updated: 2026-03-26
+last_updated: 2026-03-27
 tags:
   - resource-broker
   - demand-driven-materialization
@@ -332,11 +332,12 @@ runtime truth and canonical session snapshots instead of leaving it trapped in
 one inbound payload.
 
 Those placement records now also carry explicit marker typing. Runtime
-provenance should include at least a `marker_kind` and `marker_source` so the
-hotel can distinguish transport continuity markers from role-handoff markers,
-receptor ingress markers, or later routing enzymes. A marker is more useful
-when you know not just where it points, but what biological process expressed
-it.
+provenance should include at least a `marker_kind`, `marker_source`, and
+`marker_strength` so the hotel can distinguish transport continuity markers
+from role-handoff markers, receptor ingress markers, or later routing enzymes,
+and also tell how much placement authority that marker should have. A marker is
+more useful when you know not just where it points, but what biological
+process expressed it and how strongly it should count.
 
 That provenance now influences local runtime behavior too. When a session has
 no live active incarnation, or its recorded active incarnation is stale, the
@@ -365,6 +366,13 @@ markers immediately, because those are weak local hints. But explicit
 same conflict and keep steering fallback or parking toward their persisted
 guest, because they encode stronger continuity or intentional movement rather
 than a transient receptor signal.
+
+Strength should also shape whether a marker can trigger parking or
+rematerialization on its own. A weak `receptor_ingress` clue is good enough to
+steer delivery to a live local guest, but not good enough to request local
+parking/materialization when no such guest is currently expressed. Medium or
+strong continuity markers can keep that placement claim longer, because they
+are closer to deliberate continuity than incidental ingress.
 
 In practice, a fresher active-incarnation update is the `p53` check here: if
 the runtime has newer local evidence that the session now belongs on a

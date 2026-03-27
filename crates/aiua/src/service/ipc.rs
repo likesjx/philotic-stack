@@ -127,12 +127,14 @@ struct LocalDeliveryProvenanceHint {
     guest_id: String,
     updated_at: u64,
     marker_kind: Option<String>,
+    marker_strength: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PlacementMarkerPolicy {
     ttl_secs: u64,
     supersede_on_newer_active_incarnation_conflict: bool,
+    permit_parking_when_unregistered: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -169,23 +171,52 @@ fn load_agent_graph_routing_preferences(agent_id: &str) -> Option<Vec<serde_json
     )
 }
 
-fn placement_marker_policy(marker_kind: Option<&str>) -> PlacementMarkerPolicy {
+fn infer_marker_strength(
+    explicit_strength: Option<&str>,
+    marker_kind: Option<&str>,
+) -> Option<&'static str> {
+    match explicit_strength {
+        Some("weak") => Some("weak"),
+        Some("medium") => Some("medium"),
+        Some("strong") => Some("strong"),
+        Some(_) => Some("medium"),
+        None => match marker_kind {
+            Some("receptor_ingress") | Some("membrane_ingress") => Some("weak"),
+            Some("transport_continuity") => Some("medium"),
+            Some("role_handoff") => Some("strong"),
+            None | Some(_) => Some("medium"),
+        },
+    }
+}
+
+fn placement_marker_policy(
+    marker_kind: Option<&str>,
+    marker_strength: Option<&str>,
+) -> PlacementMarkerPolicy {
+    let inferred_strength = infer_marker_strength(marker_strength, marker_kind);
     match marker_kind {
         Some("receptor_ingress") | Some("membrane_ingress") => PlacementMarkerPolicy {
             ttl_secs: std::cmp::max(1, LOCAL_DELIVERY_PROVENANCE_TTL_SECS / 2),
             supersede_on_newer_active_incarnation_conflict: true,
+            permit_parking_when_unregistered: false,
         },
         Some("role_handoff") => PlacementMarkerPolicy {
             ttl_secs: LOCAL_DELIVERY_PROVENANCE_TTL_SECS.saturating_mul(2),
             supersede_on_newer_active_incarnation_conflict: false,
+            permit_parking_when_unregistered: true,
         },
         Some("transport_continuity") => PlacementMarkerPolicy {
             ttl_secs: LOCAL_DELIVERY_PROVENANCE_TTL_SECS,
             supersede_on_newer_active_incarnation_conflict: false,
+            permit_parking_when_unregistered: !matches!(inferred_strength, Some("weak")),
         },
         None | Some(_) => PlacementMarkerPolicy {
             ttl_secs: LOCAL_DELIVERY_PROVENANCE_TTL_SECS,
             supersede_on_newer_active_incarnation_conflict: true,
+            permit_parking_when_unregistered: matches!(
+                inferred_strength,
+                Some("medium") | Some("strong")
+            ),
         },
     }
 }
@@ -2171,7 +2202,12 @@ impl IpcServer {
             .get("marker_kind")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
-        let policy = placement_marker_policy(marker_kind.as_deref());
+        let marker_strength = provenance
+            .get("marker_strength")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .or_else(|| infer_marker_strength(None, marker_kind.as_deref()).map(str::to_string));
+        let policy = placement_marker_policy(marker_kind.as_deref(), marker_strength.as_deref());
         let freshness_anchor = provenance
             .get("updated_at")
             .and_then(serde_json::Value::as_u64)
@@ -2186,6 +2222,7 @@ impl IpcServer {
             guest_id: delivery_target_guest_id.to_string(),
             updated_at: freshness_anchor,
             marker_kind,
+            marker_strength,
         })
     }
 
@@ -2232,7 +2269,10 @@ impl IpcServer {
             session.active_incarnation_id.as_deref(),
             provenance_hint.as_ref(),
         ) {
-            let policy = placement_marker_policy(hint.marker_kind.as_deref());
+            let policy = placement_marker_policy(
+                hint.marker_kind.as_deref(),
+                hint.marker_strength.as_deref(),
+            );
             if policy.supersede_on_newer_active_incarnation_conflict
                 && active_guest_id != hint.guest_id
                 && session.updated_at > hint.updated_at
@@ -2246,9 +2286,8 @@ impl IpcServer {
                 return AgentRouteResolution::Deliver(Some(active_guest_id));
             }
 
-            if let Some(provenance_guest_id) =
-                provenance_hint.as_ref().map(|hint| hint.guest_id.as_str())
-            {
+            if let Some(hint) = provenance_hint.as_ref() {
+                let provenance_guest_id = hint.guest_id.as_str();
                 if provenance_guest_id != active_guest_id {
                     if is_registered(provenance_guest_id) {
                         warn!(
@@ -2260,11 +2299,17 @@ impl IpcServer {
                         ));
                     }
 
-                    if Self::configured_local_guest_exists(
-                        graph,
-                        local_node_id,
-                        provenance_guest_id,
-                    ) {
+                    let policy = placement_marker_policy(
+                        hint.marker_kind.as_deref(),
+                        hint.marker_strength.as_deref(),
+                    );
+                    if policy.permit_parking_when_unregistered
+                        && Self::configured_local_guest_exists(
+                            graph,
+                            local_node_id,
+                            provenance_guest_id,
+                        )
+                    {
                         info!(
                             "Active incarnation [{}] is not registered for session [{}]; parking inbound for persisted local delivery guest [{}].",
                             active_guest_id, session_id, provenance_guest_id
@@ -2314,7 +2359,17 @@ impl IpcServer {
                 return AgentRouteResolution::Deliver(Some(provenance_guest_id.to_string()));
             }
 
-            if Self::configured_local_guest_exists(graph, local_node_id, provenance_guest_id) {
+            let policy = placement_marker_policy(
+                provenance_hint
+                    .as_ref()
+                    .and_then(|hint| hint.marker_kind.as_deref()),
+                provenance_hint
+                    .as_ref()
+                    .and_then(|hint| hint.marker_strength.as_deref()),
+            );
+            if policy.permit_parking_when_unregistered
+                && Self::configured_local_guest_exists(graph, local_node_id, provenance_guest_id)
+            {
                 info!(
                     "Session [{}] has no active incarnation; parking inbound for persisted local delivery guest [{}] while materializing.",
                     session_id, provenance_guest_id
@@ -5616,6 +5671,13 @@ impl IpcServer {
                         .map(str::to_string)
                 })
                 .or_else(|| Some(event_kind.to_string()));
+            let marker_strength = payload
+                .get("placement_marker_strength")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    infer_marker_strength(None, marker_kind.as_deref()).map(str::to_string)
+                });
             let agent_id = payload
                 .get("agent_id")
                 .and_then(serde_json::Value::as_str)
@@ -5655,6 +5717,7 @@ impl IpcServer {
                 || transport.is_some()
                 || marker_kind.is_some()
                 || marker_source.is_some()
+                || marker_strength.is_some()
             {
                 let mut summary_json = session.summary_json.clone();
                 if !summary_json.is_object() {
@@ -5670,6 +5733,7 @@ impl IpcServer {
                     "transport": transport,
                     "marker_kind": marker_kind,
                     "marker_source": marker_source,
+                    "marker_strength": marker_strength,
                     "updated_at": now,
                 });
                 session.summary_json = summary_json;
@@ -9398,6 +9462,206 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_agent_route_does_not_park_for_weak_receptor_marker_without_live_guest() {
+        let _env_guard = ipc_env_guard();
+        let now = unix_ts();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: "/tmp/unused.sock".into(),
+                active_pid: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-jane-01".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-jane:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: false,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig::default(),
+            })
+            .expect("seed orchestrator role");
+        graph
+            .seed_guests(
+                "local-hotel",
+                &[
+                    GuestRecord {
+                        hotel_name: "local-hotel".into(),
+                        guest_id: "agent-jane:orchestrator".into(),
+                        role: "agent".into(),
+                        config_json: "{}".into(),
+                        is_active: true,
+                        active_pid: None,
+                        last_active_at: None,
+                    },
+                    GuestRecord {
+                        hotel_name: "local-hotel".into(),
+                        guest_id: "agent-jane:developer".into(),
+                        role: "agent".into(),
+                        config_json: "{}".into(),
+                        is_active: true,
+                        active_pid: None,
+                        last_active_at: None,
+                    },
+                ],
+            )
+            .expect("seed local guests");
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-weak-receptor-no-park".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: None,
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("123".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "agent_runtime_provenance": {
+                        "authority_hotel": "remote-hotel",
+                        "delivery_hotel": "local-hotel",
+                        "delivery_target_guest_id": "agent-jane:developer",
+                        "marker_kind": "receptor_ingress",
+                        "marker_source": "telegram",
+                        "marker_strength": "weak",
+                        "updated_at": now.saturating_sub(1)
+                    }
+                }),
+                created_at: now.saturating_sub(30),
+                updated_at: now,
+            })
+            .expect("session should seed");
+        let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let route = IpcServer::resolve_agent_route(
+            &graph,
+            &inboxes,
+            "local-aiua-01",
+            "agent",
+            None,
+            &serde_json::json!({
+                "session_id": "sess-weak-receptor-no-park",
+                "source": "telegram",
+                "chat_id": "123",
+                "content": "weak receptor should not trigger developer parking"
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert_eq!(
+            route,
+            AgentRouteResolution::Park {
+                guest_id: "agent-jane:orchestrator".into()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_agent_route_can_park_for_strong_custom_marker_without_live_guest() {
+        let _env_guard = ipc_env_guard();
+        let now = unix_ts();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: "/tmp/unused.sock".into(),
+                active_pid: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .seed_guests(
+                "local-hotel",
+                &[GuestRecord {
+                    hotel_name: "local-hotel".into(),
+                    guest_id: "agent-jane:developer".into(),
+                    role: "agent".into(),
+                    config_json: "{}".into(),
+                    is_active: true,
+                    active_pid: None,
+                    last_active_at: None,
+                }],
+            )
+            .expect("seed developer guest");
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-strong-marker-park".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: None,
+                channel_kind: Some("operator".into()),
+                channel_session_key: Some("chat-1".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "agent_runtime_provenance": {
+                        "authority_hotel": "remote-hotel",
+                        "delivery_hotel": "local-hotel",
+                        "delivery_target_guest_id": "agent-jane:developer",
+                        "marker_kind": "routing_enzyme",
+                        "marker_source": "routing_refinement",
+                        "marker_strength": "strong",
+                        "updated_at": now.saturating_sub(1)
+                    }
+                }),
+                created_at: now.saturating_sub(30),
+                updated_at: now,
+            })
+            .expect("session should seed");
+        let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let route = IpcServer::resolve_agent_route(
+            &graph,
+            &inboxes,
+            "local-aiua-01",
+            "agent",
+            None,
+            &serde_json::json!({
+                "session_id": "sess-strong-marker-park",
+                "source": "operator_chat",
+                "chat_id": "chat-1",
+                "content": "strong custom marker should preserve developer parking"
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert_eq!(
+            route,
+            AgentRouteResolution::Park {
+                guest_id: "agent-jane:developer".into()
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn handoff_to_live_role_switches_active_incarnation_and_delivers_bundle() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
@@ -10327,6 +10591,10 @@ mod tests {
             session.summary_json["agent_runtime_provenance"]["marker_source"],
             "operator_chat"
         );
+        assert_eq!(
+            session.summary_json["agent_runtime_provenance"]["marker_strength"],
+            "medium"
+        );
 
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
@@ -10521,7 +10789,8 @@ mod tests {
                         "delivery_target_guest_id": "agent-jane:orchestrator",
                         "transport": "operator_chat",
                         "marker_kind": "transport_continuity",
-                        "marker_source": "operator_chat"
+                        "marker_source": "operator_chat",
+                        "marker_strength": "medium"
                     }
                 }),
                 created_at: 1,
@@ -10579,6 +10848,10 @@ mod tests {
                 assert_eq!(
                     snapshot["summary"]["agent_runtime_provenance"]["marker_source"],
                     "operator_chat"
+                );
+                assert_eq!(
+                    snapshot["summary"]["agent_runtime_provenance"]["marker_strength"],
+                    "medium"
                 );
             }
             other => panic!("unexpected session snapshot response: {other:?}"),
