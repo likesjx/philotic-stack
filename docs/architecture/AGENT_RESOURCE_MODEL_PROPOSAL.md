@@ -331,6 +331,13 @@ summary. That makes home ownership vs current execution placement visible in
 runtime truth and canonical session snapshots instead of leaving it trapped in
 one inbound payload.
 
+Those placement records now also carry explicit marker typing. Runtime
+provenance should include at least a `marker_kind` and `marker_source` so the
+hotel can distinguish transport continuity markers from role-handoff markers,
+membrane ingress markers, or later routing enzymes. A marker is more useful
+when you know not just where it points, but what biological process expressed
+it.
+
 That provenance now influences local runtime behavior too. When a session has
 no live active incarnation, or its recorded active incarnation is stale, the
 hotel may prefer the persisted local `delivery_target_guest_id` for delivery or

@@ -5527,6 +5527,57 @@ impl IpcServer {
             session.summary_json = summary_json;
         }
         {
+            let marker_kind = payload
+                .get("placement_marker_kind")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    payload
+                        .get("transport")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|_| "transport_continuity".to_string())
+                })
+                .or_else(|| {
+                    payload
+                        .get("action")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|action| match action {
+                            "handoff_bundle" | "handoff_return" => Some("role_handoff".to_string()),
+                            _ => None,
+                        })
+                })
+                .or_else(|| {
+                    payload
+                        .get("source")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|_| "membrane_ingress".to_string())
+                });
+            let marker_source = payload
+                .get("placement_marker_source")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    payload
+                        .get("transport")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .or_else(|| {
+                    payload
+                        .get("action")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|action| match action {
+                            "handoff_bundle" | "handoff_return" => Some(action.to_string()),
+                            _ => None,
+                        })
+                })
+                .or_else(|| {
+                    payload
+                        .get("source")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .or_else(|| Some(event_kind.to_string()));
             let agent_id = payload
                 .get("agent_id")
                 .and_then(serde_json::Value::as_str)
@@ -5564,6 +5615,8 @@ impl IpcServer {
                 || delivery_target_role.is_some()
                 || delivery_target_guest_id.is_some()
                 || transport.is_some()
+                || marker_kind.is_some()
+                || marker_source.is_some()
             {
                 let mut summary_json = session.summary_json.clone();
                 if !summary_json.is_object() {
@@ -5577,6 +5630,8 @@ impl IpcServer {
                     "delivery_target_role": delivery_target_role,
                     "delivery_target_guest_id": delivery_target_guest_id,
                     "transport": transport,
+                    "marker_kind": marker_kind,
+                    "marker_source": marker_source,
                     "updated_at": now,
                 });
                 session.summary_json = summary_json;
@@ -9965,6 +10020,14 @@ mod tests {
             session.summary_json["agent_runtime_provenance"]["transport"],
             "operator_chat"
         );
+        assert_eq!(
+            session.summary_json["agent_runtime_provenance"]["marker_kind"],
+            "transport_continuity"
+        );
+        assert_eq!(
+            session.summary_json["agent_runtime_provenance"]["marker_source"],
+            "operator_chat"
+        );
 
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
@@ -10157,7 +10220,9 @@ mod tests {
                         "delivery_node_id": "local-aiua-01",
                         "delivery_target_role": "agent",
                         "delivery_target_guest_id": "agent-jane:orchestrator",
-                        "transport": "operator_chat"
+                        "transport": "operator_chat",
+                        "marker_kind": "transport_continuity",
+                        "marker_source": "operator_chat"
                     }
                 }),
                 created_at: 1,
@@ -10207,6 +10272,14 @@ mod tests {
                 assert_eq!(
                     snapshot["summary"]["agent_runtime_provenance"]["delivery_target_guest_id"],
                     "agent-jane:orchestrator"
+                );
+                assert_eq!(
+                    snapshot["summary"]["agent_runtime_provenance"]["marker_kind"],
+                    "transport_continuity"
+                );
+                assert_eq!(
+                    snapshot["summary"]["agent_runtime_provenance"]["marker_source"],
+                    "operator_chat"
                 );
             }
             other => panic!("unexpected session snapshot response: {other:?}"),
