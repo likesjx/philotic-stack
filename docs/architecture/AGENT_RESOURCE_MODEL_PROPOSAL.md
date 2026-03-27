@@ -337,6 +337,12 @@ hotel may prefer the persisted local `delivery_target_guest_id` for delivery or
 materialization before falling back to a generic orchestrator choice. In other
 words, placement is no longer just remembered; it is beginning to matter.
 
+This is a freshness-based hint, not a second lease system. Persisted local
+placement gets a bounded lifetime and should undergo apoptosis when it goes
+stale or is superseded by newer placement truth. The point is not to crown a
+new exclusive holder; it is to keep useful local continuity briefly alive
+without letting old placement memories haunt the runtime forever.
+
 This is dogfood: the mesh sync story for agent portability is proven by the
 same infrastructure everything else depends on. No second sync protocol.
 

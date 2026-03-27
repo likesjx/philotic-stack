@@ -85,6 +85,11 @@ const DESKTOP_MEMBRANE_LEASE_TTL_SECS: u64 = 45;
 #[cfg(test)]
 const DESKTOP_MEMBRANE_LEASE_TTL_SECS: u64 = 1;
 
+#[cfg(not(test))]
+const LOCAL_DELIVERY_PROVENANCE_TTL_SECS: u64 = 900;
+#[cfg(test)]
+const LOCAL_DELIVERY_PROVENANCE_TTL_SECS: u64 = 5;
+
 #[derive(Default)]
 struct SessionEnvelope {
     session_id: Option<String>,
@@ -2128,7 +2133,14 @@ impl IpcServer {
         let provenance = session.summary_json.get("agent_runtime_provenance")?;
         let delivery_hotel = provenance.get("delivery_hotel")?.as_str()?;
         let delivery_target_guest_id = provenance.get("delivery_target_guest_id")?.as_str()?;
+        let freshness_anchor = provenance
+            .get("updated_at")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(session.updated_at);
         if Some(delivery_hotel) != local_hotel_name {
+            return None;
+        }
+        if unix_ts().saturating_sub(freshness_anchor) > LOCAL_DELIVERY_PROVENANCE_TTL_SECS {
             return None;
         }
         Some(delivery_target_guest_id.to_string())
@@ -8303,6 +8315,7 @@ mod tests {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let now = unix_ts();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -8350,11 +8363,12 @@ mod tests {
                     "agent_runtime_provenance": {
                         "authority_hotel": "remote-hotel",
                         "delivery_hotel": "local-hotel",
-                        "delivery_target_guest_id": "agent-jane:developer"
+                        "delivery_target_guest_id": "agent-jane:developer",
+                        "updated_at": now
                     }
                 }),
-                created_at: 1,
-                updated_at: 2,
+                created_at: now,
+                updated_at: now,
             })
             .expect("session should seed");
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
@@ -8575,6 +8589,7 @@ mod tests {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let now = unix_ts();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         graph
@@ -8623,11 +8638,12 @@ mod tests {
                     "agent_runtime_provenance": {
                         "authority_hotel": "remote-hotel",
                         "delivery_hotel": "local-hotel",
-                        "delivery_target_guest_id": "agent-jane:developer"
+                        "delivery_target_guest_id": "agent-jane:developer",
+                        "updated_at": now
                     }
                 }),
-                created_at: 1,
-                updated_at: 2,
+                created_at: now,
+                updated_at: now,
             })
             .expect("session should seed");
 
@@ -8698,6 +8714,154 @@ mod tests {
             }
             other => panic!("unexpected developer inbound response: {other:?}"),
         }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_task_ignores_stale_persisted_local_delivery_guest_and_falls_back() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let now = unix_ts();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-jane-01".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-jane:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: false,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig::default(),
+            })
+            .expect("orchestrator role should seed");
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-role-provenance-stale".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: None,
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("123".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "agent_runtime_provenance": {
+                        "authority_hotel": "remote-hotel",
+                        "delivery_hotel": "local-hotel",
+                        "delivery_target_guest_id": "agent-jane:developer",
+                        "updated_at": now.saturating_sub(LOCAL_DELIVERY_PROVENANCE_TTL_SECS + 10)
+                    }
+                }),
+                created_at: now,
+                updated_at: now,
+            })
+            .expect("session should seed");
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut orchestrator = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane:orchestrator".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("orchestrator connect");
+        let mut developer = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane:developer".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("developer connect");
+        let mut membrane = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-local".into(),
+            role: "membrane".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("membrane connect");
+
+        let response = membrane
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: None,
+                task_json: serde_json::json!({
+                    "session_id": "sess-role-provenance-stale",
+                    "source": "telegram",
+                    "chat_id": "123",
+                    "content": "route with stale local provenance"
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit task");
+
+        assert!(matches!(response, IpcResponse::Standard { ok: true, .. }));
+
+        let delivered = tokio::time::timeout(
+            tokio::time::Duration::from_secs(1),
+            orchestrator.recv_task(),
+        )
+        .await
+        .expect("orchestrator should receive stale-provenance fallback task")
+        .expect("orchestrator recv should succeed");
+        match delivered {
+            IpcResponse::InboundTask { task_json, .. } => {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("payload should decode");
+                assert_eq!(payload["content"], "route with stale local provenance");
+            }
+            other => panic!("unexpected orchestrator inbound response: {other:?}"),
+        }
+
+        assert!(
+            tokio::time::timeout(
+                tokio::time::Duration::from_millis(200),
+                developer.recv_task()
+            )
+            .await
+            .is_err(),
+            "developer should not receive task when persisted local provenance is stale"
+        );
 
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
