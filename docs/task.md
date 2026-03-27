@@ -741,8 +741,12 @@ Seam IDs: `structured-model-envelope`, `hotel-gemini-oauth-flow`
 - [x] Make approval interrupts stage-aware: redirect low-intent free-form approval asks back to direct response and reject non-cognitive approval interrupts while preserving real scripted/tool gates.
 - [x] Define a governed `routing.policy.propose` tool and companion `routing.refinement` skill so the agent can reflexively suggest cognition/routing policy updates under operator approval and memory write-back.
 - [x] Add first-class agent-graph routing preferences plus active `agent.graph.read`/`agent.graph.write` tool definitions so routing posture can be stored in agent-local graph state instead of only prompt text.
+- [x] Feed stored agent-graph routing preferences into live `TurnRoutingPlan` compilation by projecting them through hotel session bindings and applying advisory provider/model hints per stage.
 - [ ] Replace the transitional durable-rule bridge behind `routing.policy.propose` with routing-specific policy records, evaluation history, and operator disposition state.
-- [ ] Feed agent-graph routing preferences and future model-graph metadata into live turn-routing-plan compilation and ranking.
+- [ ] Fold model-graph metadata into live turn-routing-plan ranking so shared catalog truth informs selection without becoming mutable preference storage.
+- [ ] Define the shared catalog layer for models, tools, skills, and rights as reference knowledge outside hotel-owned mutable state.
+- [ ] Make the hotel's projected session bindings the explicit effective key ring for tools, skills, rights, and scoped execution credentials.
+- [ ] Audit `model-router`, tool assembly, and runner dispatch so lower execution layers consume projected rights but never inject or widen them.
 - [x] Add a rebuild-first local watched-UAT workflow so stale materialized binaries and stale sockets do not masquerade as runtime regressions.
 - [ ] Define hotel CLI OAuth UX:
   - browser launch

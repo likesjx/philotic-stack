@@ -119,13 +119,14 @@ The current implementation now also uses the stage plan at request assembly time
 - low-intent cognitive turns now ask for fewer side channels, hide skill guidance, and replace detailed approval posture with a simple direct-reply steer
 - inappropriate free-form approval interrupts now redirect low-intent cognitive turns back to direct response and reject non-cognitive stages instead of surfacing stray approval cards
 - reflexive routing refinement now has its first governed hook: `routing.policy.propose` plus the `routing.refinement` abstract skill let the agent surface repeatable routing-policy changes for operator review instead of silently rewriting its own turn-routing reflexes
+- stored agent-graph routing preferences are now projected into session bindings and applied as advisory provider/model overrides during turn-plan compilation, so voice ingress/cognition/egress can start honoring learned agent-local posture without confusing the shared model graph for mutable preference state
 
 Current transitional reality:
 
 - routing-policy proposals are semantically distinct from general behavior rules
 - persistence is not distinct yet; they currently ride the same durable rule store under explicit transitional labeling
 - this keeps the improvement loop real without pretending routing-specific authority already exists
-- model requests now carry stage-derived `routing_hints` so model-controller can see provider preference, controller role, capability, and envelope intent without becoming the owner of the turn
+- model requests now carry stage-derived `routing_hints` so model-controller can see provider preference, model hint, controller role, capability, and envelope intent without becoming the owner of the turn
 
 This is intentionally still transitional:
 

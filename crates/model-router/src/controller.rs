@@ -194,6 +194,7 @@ pub struct Affordances {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RoutingHints {
     pub implementation: Option<String>,
+    pub model_ref: Option<String>,
     pub controller_role: Option<String>,
     pub capability: Option<String>,
     pub context_envelope: Option<String>,
@@ -284,7 +285,8 @@ impl ControllerTask {
             model: task
                 .get("model")
                 .and_then(Value::as_str)
-                .map(str::to_string),
+                .map(str::to_string)
+                .or_else(|| routing_hints.model_ref.clone()),
             prompt: task
                 .get("prompt")
                 .and_then(Value::as_str)
@@ -952,6 +954,10 @@ fn parse_routing_hints(value: Option<&Value>) -> RoutingHints {
     RoutingHints {
         implementation: object
             .get("implementation")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        model_ref: object
+            .get("model_ref")
             .and_then(Value::as_str)
             .map(str::to_string),
         controller_role: object
@@ -1715,6 +1721,7 @@ mod tests {
             "text": "hello",
             "routing_hints": {
                 "implementation": "elevenlabs",
+                "model_ref": "eleven_multilingual_v2",
                 "controller_role": "model.elevenlabs",
                 "capability": "voice.synthesize",
                 "context_envelope": "egress",
@@ -1727,6 +1734,10 @@ mod tests {
         assert_eq!(
             task.routing_hints.implementation.as_deref(),
             Some("elevenlabs")
+        );
+        assert_eq!(
+            task.routing_hints.model_ref.as_deref(),
+            Some("eleven_multilingual_v2")
         );
         assert_eq!(
             task.routing_hints.controller_role.as_deref(),
@@ -1742,6 +1753,7 @@ mod tests {
         );
         assert_eq!(task.routing_hints.stage.as_deref(), Some("egress"));
         assert_eq!(task.routing_hints.streaming, Some(true));
+        assert_eq!(task.model.as_deref(), Some("eleven_multilingual_v2"));
     }
 
     #[test]

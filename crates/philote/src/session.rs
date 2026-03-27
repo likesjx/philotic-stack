@@ -313,6 +313,8 @@ pub struct TurnRoutingStagePlan {
     pub controller_role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_ref: Option<String>,
     #[serde(default)]
     pub streaming: bool,
 }
@@ -650,6 +652,25 @@ pub struct AgentProfile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RoutingPreferenceBinding {
+    pub preference_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_ref: Option<String>,
+    #[serde(default)]
+    pub preference_level: i32,
+    #[serde(default)]
+    pub weight: i32,
+    #[serde(default)]
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SessionBindings {
     #[serde(default)]
     pub effective_toolset: Vec<String>,
@@ -675,6 +696,8 @@ pub struct SessionBindings {
     pub preferred_hotel_id: Option<String>,
     #[serde(default)]
     pub preferred_environment_id: Option<String>,
+    #[serde(default)]
+    pub routing_preferences: Vec<RoutingPreferenceBinding>,
     #[serde(default)]
     pub allowed_tool_runner_incarnations: Vec<ToolRunnerIncarnationBinding>,
 }
@@ -3905,6 +3928,7 @@ mod tests {
                         context_envelope: TurnContextEnvelopeKind::Ingress,
                         controller_role: "model.elevenlabs".into(),
                         provider_hint: Some("elevenlabs".into()),
+                        model_ref: None,
                         streaming: true,
                     },
                     TurnRoutingStagePlan {
@@ -3914,6 +3938,7 @@ mod tests {
                         context_envelope: TurnContextEnvelopeKind::Cognitive,
                         controller_role: "model".into(),
                         provider_hint: None,
+                        model_ref: None,
                         streaming: true,
                     },
                 ],
@@ -4294,6 +4319,7 @@ mod tests {
                 preferred_tool_runner: None,
                 preferred_hotel_id: None,
                 preferred_environment_id: None,
+                routing_preferences: Vec::new(),
                 allowed_tool_runner_incarnations: Vec::new(),
             }
         );
@@ -4726,6 +4752,7 @@ mod tests {
             preferred_tool_runner: None,
             preferred_hotel_id: None,
             preferred_environment_id: None,
+            routing_preferences: Vec::new(),
             allowed_tool_runner_incarnations: Vec::new(),
         };
 

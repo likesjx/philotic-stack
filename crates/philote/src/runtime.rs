@@ -8,9 +8,9 @@ use crate::protocol::{
 };
 use crate::session::{
     ActivePlan, AgentProfile, ApprovalInterruptDisposition, ComponentRouteAssembly,
-    MediaRoutingPolicy, RecalledMemoryRecord, SessionState, ToolExecutionRoute, TtsMode,
-    TurnContextEnvelopeKind, TurnRoutingPlan, TurnRoutingStageKind, TurnRoutingStagePlan,
-    VoiceResponsePolicy, WorkingTurn, merge_session_index,
+    MediaRoutingPolicy, RecalledMemoryRecord, RoutingPreferenceBinding, SessionState,
+    ToolExecutionRoute, TtsMode, TurnContextEnvelopeKind, TurnRoutingPlan, TurnRoutingStageKind,
+    TurnRoutingStagePlan, VoiceResponsePolicy, WorkingTurn, merge_session_index,
 };
 use anyhow::Result;
 use memory_core::{
@@ -391,6 +391,7 @@ fn compile_turn_routing_plan(
     media_routing: Option<&MediaRouting>,
     voice_policy: Option<&VoiceResponsePolicy>,
     had_voice_input: bool,
+    routing_preferences: &[RoutingPreferenceBinding],
 ) -> TurnRoutingPlan {
     let mut stages = Vec::new();
 
@@ -406,6 +407,7 @@ fn compile_turn_routing_plan(
             context_envelope: TurnContextEnvelopeKind::Ingress,
             controller_role: controller_role.into(),
             provider_hint: role_to_provider_hint(controller_role),
+            model_ref: None,
             streaming: routing.capability == "voice.transcribe",
         });
     }
@@ -417,6 +419,7 @@ fn compile_turn_routing_plan(
         context_envelope: TurnContextEnvelopeKind::Cognitive,
         controller_role: DEFAULT_TEXT_MODEL_ROLE.into(),
         provider_hint: role_to_provider_hint(DEFAULT_TEXT_MODEL_ROLE),
+        model_ref: None,
         streaming: true,
     });
 
@@ -436,11 +439,12 @@ fn compile_turn_routing_plan(
             context_envelope: TurnContextEnvelopeKind::Egress,
             controller_role: controller_role.into(),
             provider_hint: role_to_provider_hint(controller_role),
+            model_ref: None,
             streaming: true,
         });
     }
 
-    TurnRoutingPlan {
+    let mut plan = TurnRoutingPlan {
         trigger: if media_routing
             .map(|routing| routing.capability == "voice.transcribe")
             .unwrap_or(false)
@@ -452,6 +456,61 @@ fn compile_turn_routing_plan(
             "text_input".into()
         },
         stages,
+    };
+    apply_routing_preferences(&mut plan, routing_preferences);
+    plan
+}
+
+fn stage_kind_name(kind: TurnRoutingStageKind) -> &'static str {
+    match kind {
+        TurnRoutingStageKind::Ingress => "ingress",
+        TurnRoutingStageKind::Cognition => "cognition",
+        TurnRoutingStageKind::Egress => "egress",
+    }
+}
+
+fn select_stage_routing_preference<'a>(
+    stage: &TurnRoutingStagePlan,
+    routing_preferences: &'a [RoutingPreferenceBinding],
+) -> Option<&'a RoutingPreferenceBinding> {
+    routing_preferences
+        .iter()
+        .filter(|pref| pref.preference_level >= 0)
+        .filter(|pref| pref.provider_hint.is_some() || pref.model_ref.is_some())
+        .filter(|pref| {
+            pref.stage_kind
+                .as_deref()
+                .map(|kind| kind == stage_kind_name(stage.kind))
+                .unwrap_or(true)
+        })
+        .filter(|pref| {
+            pref.capability
+                .as_deref()
+                .map(|capability| capability == stage.capability)
+                .unwrap_or(true)
+        })
+        .max_by(|left, right| {
+            left.preference_level
+                .cmp(&right.preference_level)
+                .then_with(|| left.weight.cmp(&right.weight))
+                .then_with(|| left.updated_at.cmp(&right.updated_at))
+                .then_with(|| left.preference_key.cmp(&right.preference_key))
+        })
+}
+
+fn apply_routing_preferences(
+    plan: &mut TurnRoutingPlan,
+    routing_preferences: &[RoutingPreferenceBinding],
+) {
+    for stage in &mut plan.stages {
+        if let Some(preference) = select_stage_routing_preference(stage, routing_preferences) {
+            if preference.provider_hint.is_some() {
+                stage.provider_hint = preference.provider_hint.clone();
+            }
+            if preference.model_ref.is_some() {
+                stage.model_ref = preference.model_ref.clone();
+            }
+        }
     }
 }
 
@@ -468,6 +527,7 @@ fn stage_plan(
 fn stage_routing_hints(stage: &TurnRoutingStagePlan) -> serde_json::Value {
     serde_json::json!({
         "implementation": stage.provider_hint,
+        "model_ref": stage.model_ref,
         "controller_role": stage.controller_role,
         "capability": stage.capability,
         "context_envelope": match stage.context_envelope {
@@ -1083,10 +1143,19 @@ impl AgentRuntime {
             .get(&session_id)
             .map(|s| s.agent_profile.voice_response_policy.clone())
             .unwrap_or_default();
+        let routing_preferences = self
+            .sessions
+            .get(&session_id)
+            .map(|s| s.bindings.routing_preferences.clone())
+            .unwrap_or_default();
         let media_attachments = media_analysis_attachments(&task);
         let media_routing = resolve_media_routing(&media_policy, media_attachments);
-        let turn_routing_plan =
-            compile_turn_routing_plan(media_routing.as_ref(), Some(&voice_policy), had_voice_input);
+        let turn_routing_plan = compile_turn_routing_plan(
+            media_routing.as_ref(),
+            Some(&voice_policy),
+            had_voice_input,
+            &routing_preferences,
+        );
         let awaiting_transcription_reentry = media_routing
             .as_ref()
             .map(|routing| routing.action == "transcribe")
@@ -6915,6 +6984,9 @@ impl AgentRuntime {
         let new_skillset: Option<Vec<String>> = bindings
             .get("effective_skillset")
             .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let new_routing_preferences = bindings
+            .get("routing_preferences")
+            .and_then(|v| serde_json::from_value::<Vec<RoutingPreferenceBinding>>(v.clone()).ok());
         let new_component_routes = snapshot
             .get("component_route_assembly")
             .cloned()
@@ -6930,6 +7002,12 @@ impl AgentRuntime {
         if let Some(skillset) = new_skillset {
             if skillset != state.bindings.effective_skillset {
                 state.bindings.effective_skillset = skillset;
+                changed = true;
+            }
+        }
+        if let Some(routing_preferences) = new_routing_preferences {
+            if routing_preferences != state.bindings.routing_preferences {
+                state.bindings.routing_preferences = routing_preferences;
                 changed = true;
             }
         }
@@ -7090,7 +7168,7 @@ async fn run_bash_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentRuntime, DEFAULT_TEXT_MODEL_ROLE, DEFAULT_VOICE_MODEL_ROLE, LOCAL_NODE,
+        AgentRuntime, DEFAULT_TEXT_MODEL_ROLE, DEFAULT_VOICE_MODEL_ROLE, LOCAL_NODE, MediaRouting,
         compile_turn_routing_plan, extract_model_error, extract_model_error_payload,
         format_role_command_reply, format_roles_report, media_analysis_attachments,
         normalized_user_content, parse_memory_candidate, resolve_media_routing,
@@ -7824,13 +7902,14 @@ mod tests {
             ..Default::default()
         };
 
-        let plan = compile_turn_routing_plan(Some(&media_routing), Some(&voice_policy), true);
+        let plan = compile_turn_routing_plan(Some(&media_routing), Some(&voice_policy), true, &[]);
 
         assert_eq!(plan.trigger, "voice_input");
         assert_eq!(plan.stages.len(), 3);
         assert_eq!(plan.stages[0].kind, TurnRoutingStageKind::Ingress);
         assert_eq!(plan.stages[0].capability, "voice.transcribe");
         assert_eq!(plan.stages[0].controller_role, DEFAULT_VOICE_MODEL_ROLE);
+        assert_eq!(plan.stages[0].model_ref, None);
         assert_eq!(plan.stages[1].kind, TurnRoutingStageKind::Cognition);
         assert_eq!(plan.stages[1].capability, "text.generate");
         assert_eq!(plan.stages[1].controller_role, DEFAULT_TEXT_MODEL_ROLE);
@@ -7840,12 +7919,77 @@ mod tests {
 
     #[test]
     fn compile_turn_routing_plan_for_text_turn_only_has_cognition() {
-        let plan = compile_turn_routing_plan(None, None, false);
+        let plan = compile_turn_routing_plan(None, None, false, &[]);
 
         assert_eq!(plan.trigger, "text_input");
         assert_eq!(plan.stages.len(), 1);
         assert_eq!(plan.stages[0].kind, TurnRoutingStageKind::Cognition);
         assert_eq!(plan.stages[0].capability, "text.generate");
+    }
+
+    #[test]
+    fn compile_turn_routing_plan_applies_agent_graph_routing_preferences() {
+        use crate::session::RoutingPreferenceBinding;
+
+        let routing_preferences = vec![RoutingPreferenceBinding {
+            preference_key: "voice-ingress-elevenlabs-scribe".into(),
+            stage_kind: Some("ingress".into()),
+            capability: Some("voice.transcribe".into()),
+            provider_hint: Some("elevenlabs".into()),
+            model_ref: Some("scribe_v1".into()),
+            preference_level: 1,
+            weight: 90,
+            updated_at: 123,
+        }];
+        let media_routing = MediaRouting {
+            action: "transcribe".into(),
+            capability: "voice.transcribe",
+            attachments: vec![blob_backed_attachment("voice")],
+        };
+
+        let plan =
+            compile_turn_routing_plan(Some(&media_routing), None, true, &routing_preferences);
+
+        assert_eq!(plan.stages[0].provider_hint.as_deref(), Some("elevenlabs"));
+        assert_eq!(plan.stages[0].model_ref.as_deref(), Some("scribe_v1"));
+    }
+
+    #[test]
+    fn merge_snapshot_bindings_updates_routing_preferences() {
+        use crate::session::RoutingPreferenceBinding;
+
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        let snapshot = serde_json::json!({
+            "bindings": {
+                "routing_preferences": [{
+                    "preference_key": "cognition-gemini-flash",
+                    "stage_kind": "cognition",
+                    "capability": "text.generate",
+                    "provider_hint": "gemini",
+                    "model_ref": "gemini-flash",
+                    "preference_level": 1,
+                    "weight": 80,
+                    "updated_at": 42
+                }]
+            }
+        });
+
+        AgentRuntime::merge_snapshot_bindings(&mut state, &snapshot);
+
+        assert_eq!(
+            state.bindings.routing_preferences,
+            vec![RoutingPreferenceBinding {
+                preference_key: "cognition-gemini-flash".into(),
+                stage_kind: Some("cognition".into()),
+                capability: Some("text.generate".into()),
+                provider_hint: Some("gemini".into()),
+                model_ref: Some("gemini-flash".into()),
+                preference_level: 1,
+                weight: 80,
+                updated_at: 42,
+            }]
+        );
     }
 
     #[test]

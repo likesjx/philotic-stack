@@ -3,7 +3,7 @@ title: "Model Controller Proposal"
 doc_type: proposal
 domain: tooling-execution
 status: accepted-current-slice
-last_updated: 2026-03-19
+last_updated: 2026-03-26
 tags:
   - model-controller
   - models
@@ -63,6 +63,7 @@ For the current direction:
 - treat native multimodal voice-capable models as a separate response path, not as disguised ElevenLabs TTS
 - let the hotel own OAuth UX, token storage, and token refresh
 - let model-controller guests consume short-lived auth material from the hotel/config path
+- let the hotel and session binding path project the effective rights and scoped execution posture; model-router may consume that posture, but must not inject new rights or widen the capability surface on its own
 - keep API key support as the operational fallback for Gemini
 - keep OpenAI-specific advanced features in explicit provider extensions until they prove they belong in the shared contract
 
@@ -176,6 +177,11 @@ These should live in `provider_options` until multiple providers justify promoti
 - provider-native audio generation knobs
 
 This is the important guardrail: provider-aware does not mean provider-owned. Philotic should learn from OpenAI's capabilities without letting one vendor's convenience surface become the canonical worldview.
+
+Related guardrail: execution-aware does not mean rights-aware. `model-router`
+may honor routing hints, model hints, and short-lived provider auth material,
+but it must not become the place where new session rights appear because a
+provider makes them easy to expose.
 
 ## OpenAI Auth Recommendation
 
@@ -555,6 +561,7 @@ Policy note:
 - stage-aware projection should also narrow prompt/context affordance cues such as skill guidance and approval posture, not just the explicit tool list
 - approval interrupts should be stage-aware too: valid for real tool/workflow gates, redirected on low-intent conversational turns, and rejected on non-cognitive transform/synthesis stages
 - routing self-improvement should be governed: the first `routing.policy.propose` path should surface a durable operator-reviewed proposal, not silently mutate controller choice or stage policy at runtime
+- agent-local routing preferences can now flow in as advisory `routing_hints` from the active session binding path; model-controller may use those hints to honor provider/model bias, but it still must not become the authority for turn ownership or mutable routing policy
 
 ## Optimization-Oriented Response Channels
 

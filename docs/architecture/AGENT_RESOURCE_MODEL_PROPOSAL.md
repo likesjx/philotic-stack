@@ -39,8 +39,9 @@ active_seams:
 
 Define an architecture where agents are active participants in their own
 resource lifecycle — declaring what they need, requesting it at runtime, and
-owning their own graph state — while the hotel remains the authority on rights,
-routing, and system-level resource management.
+owning their own graph state — while the hotel remains the authority on
+effective runtime rights, bindings, routing, and system-level resource
+management.
 
 The current model is hotel-push: the hotel decides what guests to run and what
 resources agents receive. This proposal moves to an agent-pull model: agents
@@ -265,6 +266,17 @@ AgentGraph {
 }
 ```
 
+The agent graph is the home for mutable agent-owned overlay state:
+
+- routing preferences
+- tool and skill preferences
+- local policy refinements
+- role-local cognitive configuration
+- learned experience and evaluation traces
+
+It is not the canonical home for shared catalog truth about what models, tools,
+skills, or rights exist in the system at large.
+
 ### Storage substrate
 
 The agent graph tool-runner uses the existing `AgentGraphStorage` trait — an
@@ -277,6 +289,7 @@ CG. The implementation is a reusable middle layer that:
 - starts with the SQLite backend already in production
 - allows a backend swap (RocksDB, or anything else) later via a single impl
   swap, with no changes to callers
+- now feeds stored routing preferences back into live session snapshot bindings so `philote` can compile advisory turn-routing overrides from agent-local graph state instead of relying on prompt-only preference residue
 
 The abstraction layer is the asset. The backend is a deployment-time decision.
 
@@ -319,6 +332,39 @@ Two graphs. Two authority domains. Both mesh-synced.
   Revocation flows from the hotel; the agent graph copy becomes stale on
   revocation, not authoritative.
 - When the hotel CG and agent graph disagree on a grant, the hotel CG wins.
+
+### Shared catalogs vs effective grants
+
+This proposal now assumes a third conceptual layer beside the two write
+authorities above:
+
+- a **shared catalog knowledge layer** for models, tools, skills, rights,
+  compatibility edges, and policy templates
+- an **agent overlay layer** in the agent graph for local preferences,
+  learned posture, and cognitive configuration
+- a **hotel effective-state layer** for what is actually granted, bound,
+  materialized, and enforceable right now
+
+The shared catalog layer should not quietly become hotel-owned mutable state
+just because the hotel happens to project parts of it.
+
+The hotel owns the effective key ring:
+
+- which tools/skills/rights are active for this session
+- which bindings are currently projected
+- which scoped credentials or grants are usable right now
+- which runners/controllers are allowed to execute on the agent's behalf
+
+That means lower routing/execution layers consume an already-authorized
+envelope. They do not mint rights, widen grants, or invent new effective
+capabilities mid-turn.
+
+Transitional note:
+
+- current session bindings may temporarily carry projections derived from both
+  hotel state and agent-owned overlay state
+- that relay path does not make the hotel the conceptual owner of the overlay
+- it also does not make downstream routers the owner of rights
 
 ---
 

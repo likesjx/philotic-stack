@@ -5,13 +5,13 @@ use crate::service::lease::{
     LeaseRenewOutcome, RuntimeLeaseRegistry,
 };
 use crate::vault::{SecretAccess, resolve_secret};
+use ansible_mesh_core::agent_graph_storage::{AgentGraphStorage, SqliteAgentGraphStorage};
 use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
 use ansible_mesh_core::graph::{AbstractSkillRecord, SkillValidationState};
 use ansible_mesh_core::registry::{
     CapabilityAdvertisement, ExecutionReachability, NodeRegistry, NodeStatus,
 };
-use ansible_mesh_core::{NodeCapabilities, NodeConstraints};
 use ansible_mesh_core::storage::{
     ComponentManifest, GuestRecord, HotelRecord, SessionEventRecord, SessionParticipantRecord,
     SessionRecord, SessionTurnRecord,
@@ -19,20 +19,19 @@ use ansible_mesh_core::storage::{
 use ansible_mesh_core::validation::{
     SkillDraft, apply_validation_to_record, validate_skill_layer1,
 };
+use ansible_mesh_core::{NodeCapabilities, NodeConstraints};
 use philotic_client::{
     DesktopMembraneAgentView, DesktopMembraneGuestView, DesktopMembraneStatusView,
     DesktopMembraneTargetGuestInventoryView, DesktopMembraneTargetReachabilityView,
-    DesktopMembraneTargetStatusView, DesktopMembraneTargetView, GuestIdentity,
-    HookRoute, HookSubscription, IpcRequest, IpcResponse, LeaseEnvelope, LeaseStatus,
-    OperatorAgentView, OperatorChatTurnReply, OperatorSurfaceQueryHandoff,
-    OperatorTargetAgentInventoryView, OperatorTargetGuestInventoryView,
-    OperatorTargetStatusView, PhiloticClient, SubagentDelegation,
-    OPERATOR_CHAT_REPLY_ROLE,
-    OPERATOR_SURFACE_QUERY_HANDOFF_KIND, OPERATOR_SURFACE_QUERY_REPLY_ROLE,
-    OPERATOR_SURFACE_QUERY_ROLE,
+    DesktopMembraneTargetStatusView, DesktopMembraneTargetView, GuestIdentity, HookRoute,
+    HookSubscription, IpcRequest, IpcResponse, LeaseEnvelope, LeaseStatus,
+    OPERATOR_CHAT_REPLY_ROLE, OPERATOR_SURFACE_QUERY_HANDOFF_KIND,
+    OPERATOR_SURFACE_QUERY_REPLY_ROLE, OPERATOR_SURFACE_QUERY_ROLE, OperatorAgentView,
+    OperatorChatTurnReply, OperatorSurfaceQueryHandoff, OperatorTargetAgentInventoryView,
+    OperatorTargetGuestInventoryView, OperatorTargetStatusView, PhiloticClient, SubagentDelegation,
 };
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -119,6 +118,32 @@ struct RoutingPreferences {
     preferred_tool_runner: Option<String>,
     preferred_hotel_id: Option<String>,
     preferred_environment_id: Option<String>,
+}
+
+fn agent_graph_db_path(agent_id: &str) -> PathBuf {
+    std::env::var("PHILOTIC_AGENT_GRAPH_DB")
+        .map(|value| PathBuf::from(value.replace("{agent_id}", agent_id)))
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            PathBuf::from(home)
+                .join(".philotic")
+                .join(format!("agent-graph-{agent_id}.db"))
+        })
+}
+
+fn load_agent_graph_routing_preferences(agent_id: &str) -> Option<Vec<serde_json::Value>> {
+    let path = agent_graph_db_path(agent_id);
+    if !path.exists() {
+        return None;
+    }
+    let storage = SqliteAgentGraphStorage::open(agent_id, &path).ok()?;
+    let preferences = storage.list_routing_preferences().ok()?;
+    Some(
+        preferences
+            .into_iter()
+            .filter_map(|preference| serde_json::to_value(preference).ok())
+            .collect(),
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -909,7 +934,8 @@ impl IpcServer {
                     "final_reply_to": local_node_id,
                     "final_reply_role": reply_role,
                     "final_reply_guest_id": reply_guest_id
-                }).to_string(),
+                })
+                .to_string(),
             })
             .await?
         {
@@ -920,9 +946,10 @@ impl IpcServer {
         let mut observed_events = Vec::new();
         let mut observed_partial_replies = Vec::new();
         let payload = loop {
-            let reply = tokio::time::timeout(std::time::Duration::from_secs(30), client.recv_task())
-                .await
-                .map_err(|_| anyhow::anyhow!("timed out waiting for operator chat reply"))??;
+            let reply =
+                tokio::time::timeout(std::time::Duration::from_secs(30), client.recv_task())
+                    .await
+                    .map_err(|_| anyhow::anyhow!("timed out waiting for operator chat reply"))??;
             let IpcResponse::InboundTask { task_json, .. } = reply else {
                 anyhow::bail!("unexpected operator chat reply envelope: {reply:?}");
             };
@@ -1146,11 +1173,7 @@ impl IpcServer {
         }
     }
 
-    fn target_hotel_name(
-        graph: &GraphDomain,
-        status: &NodeStatus,
-        source_hotel: &str,
-    ) -> String {
+    fn target_hotel_name(graph: &GraphDomain, status: &NodeStatus, source_hotel: &str) -> String {
         status
             .advertisements
             .first()
@@ -2320,15 +2343,17 @@ impl IpcServer {
                     Err(e) => IpcResponse::error("toolset_profile", "PROFILE_ERROR", e.to_string()),
                 }
             }
-            IpcRequest::ListToolsetProfiles {} => {
-                match graph.list_toolset_profiles() {
-                    Ok(profiles) => IpcResponse::success(
-                        "list_toolset_profiles",
-                        Some(serde_json::to_value(&profiles).unwrap_or(serde_json::Value::Array(vec![]))),
+            IpcRequest::ListToolsetProfiles {} => match graph.list_toolset_profiles() {
+                Ok(profiles) => IpcResponse::success(
+                    "list_toolset_profiles",
+                    Some(
+                        serde_json::to_value(&profiles).unwrap_or(serde_json::Value::Array(vec![])),
                     ),
-                    Err(e) => IpcResponse::error("list_toolset_profiles", "PROFILES_ERROR", e.to_string()),
+                ),
+                Err(e) => {
+                    IpcResponse::error("list_toolset_profiles", "PROFILES_ERROR", e.to_string())
                 }
-            }
+            },
             IpcRequest::SetConfig { key, value_json } => {
                 info!("SetConfig requested: {}", key);
                 match graph.set_config_value(&key, &value_json) {
@@ -2336,17 +2361,27 @@ impl IpcServer {
                     Err(e) => IpcResponse::error("config", "CONFIG_ERROR", e.to_string()),
                 }
             }
-            IpcRequest::RotateSecret { secret_ref, plaintext } => {
+            IpcRequest::RotateSecret {
+                secret_ref,
+                plaintext,
+            } => {
                 info!("RotateSecret requested for ref: {}", secret_ref);
                 match crate::vault::rotate_secret(graph, &secret_ref, &plaintext) {
                     Ok(()) => IpcResponse::success("secret", None),
                     Err(e) => IpcResponse::error("secret", "SECRET_ERROR", e.to_string()),
                 }
             }
-            IpcRequest::AddVaultEntry { vault_name, plaintext, allowed_roles } => {
+            IpcRequest::AddVaultEntry {
+                vault_name,
+                plaintext,
+                allowed_roles,
+            } => {
                 info!("AddVaultEntry requested: {}", vault_name);
                 match Self::handle_add_vault_entry(graph, vault_name, plaintext, allowed_roles) {
-                    Ok(secret_ref) => IpcResponse::success("vault", Some(serde_json::json!({ "secret_ref": secret_ref }))),
+                    Ok(secret_ref) => IpcResponse::success(
+                        "vault",
+                        Some(serde_json::json!({ "secret_ref": secret_ref })),
+                    ),
                     Err(e) => IpcResponse::error("vault", "VAULT_ERROR", e.to_string()),
                 }
             }
@@ -2978,11 +3013,9 @@ impl IpcServer {
                     Ok(operator_chat_reply) => IpcResponse::OperatorChatTurnReply {
                         operator_chat_reply,
                     },
-                    Err(err) => IpcResponse::error(
-                        "operator_chat",
-                        "OPERATOR_CHAT_ERROR",
-                        err.to_string(),
-                    ),
+                    Err(err) => {
+                        IpcResponse::error("operator_chat", "OPERATOR_CHAT_ERROR", err.to_string())
+                    }
                 }
             }
             IpcRequest::ListDesktopMembraneAgents => {
@@ -3230,7 +3263,9 @@ impl IpcServer {
                                         .await;
                                 }
                                 Err(err) => {
-                                    warn!("Cross-hotel proxy failed to connect to {peer_path}: {err}");
+                                    warn!(
+                                        "Cross-hotel proxy failed to connect to {peer_path}: {err}"
+                                    );
                                 }
                             }
                         });
@@ -3311,13 +3346,13 @@ impl IpcServer {
                         }
                     };
                 let task_id = Uuid::new_v4();
-                
+
                 // Construct the SessionControl envelope for durable mesh ledger tracking
                 let ts = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                    
+
                 let event = EventEnvelope {
                     event_id: task_id,
                     seq: 0,
@@ -3349,7 +3384,7 @@ impl IpcServer {
                     "handoff_bundle": handoff_bundle,
                 })
                 .to_string();
-                
+
                 match Self::queue_or_deliver_guest_task(
                     graph,
                     inboxes,
@@ -3412,7 +3447,7 @@ impl IpcServer {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                    
+
                 let event = EventEnvelope {
                     event_id: task_id,
                     seq: 0,
@@ -4402,30 +4437,43 @@ impl IpcServer {
             IpcRequest::RegisterComponent { manifest } => {
                 Self::handle_register_component(graph, materialization_requester, manifest).await
             }
-            IpcRequest::ListGraphInstances {} => {
-                match graph.get_graph_runner_registry() {
-                    Ok(records) => {
-                        let instances: Vec<serde_json::Value> = records
-                            .into_iter()
-                            .map(|r| serde_json::json!({
+            IpcRequest::ListGraphInstances {} => match graph.get_graph_runner_registry() {
+                Ok(records) => {
+                    let instances: Vec<serde_json::Value> = records
+                        .into_iter()
+                        .map(|r| {
+                            serde_json::json!({
                                 "graph_id": r.graph_id,
                                 "instance_id": r.instance_id,
                                 "registered_at": r.registered_at,
-                            }))
-                            .collect();
-                        IpcResponse::GraphInstanceList { instances }
-                    }
-                    Err(e) => IpcResponse::error("list_graph_instances", "STORAGE_ERROR", e.to_string()),
+                            })
+                        })
+                        .collect();
+                    IpcResponse::GraphInstanceList { instances }
                 }
-            }
-            IpcRequest::ListComponents {} => {
-                Self::handle_list_components(graph, local_node_id)
-            }
+                Err(e) => {
+                    IpcResponse::error("list_graph_instances", "STORAGE_ERROR", e.to_string())
+                }
+            },
+            IpcRequest::ListComponents {} => Self::handle_list_components(graph, local_node_id),
             IpcRequest::SetComponentActive { guest_id, active } => {
-                Self::handle_set_component_active(graph, materialization_requester, local_node_id, &guest_id, active).await
+                Self::handle_set_component_active(
+                    graph,
+                    materialization_requester,
+                    local_node_id,
+                    &guest_id,
+                    active,
+                )
+                .await
             }
             IpcRequest::RestartComponent { guest_id } => {
-                Self::handle_restart_component(graph, materialization_requester, local_node_id, &guest_id).await
+                Self::handle_restart_component(
+                    graph,
+                    materialization_requester,
+                    local_node_id,
+                    &guest_id,
+                )
+                .await
             }
             IpcRequest::SeedRemoteIncarnation {
                 node_id,
@@ -4488,48 +4536,36 @@ impl IpcServer {
                 Ok(jobs) => IpcResponse::CronJobList { jobs },
                 Err(e) => IpcResponse::Error(format!("ListCronJobs failed: {e}")),
             },
-            IpcRequest::EnableCronJob { job_id } => {
-                match graph.get_cron_job(&job_id) {
-                    Ok(Some(mut job)) => {
-                        job.enabled = true;
-                        match graph.upsert_cron_job(&job) {
-                            Ok(_) => {
-                                Self::broadcast_cron_sync_upsert(
-                                    dispatcher_tx,
-                                    local_node_id,
-                                    &job,
-                                )
+            IpcRequest::EnableCronJob { job_id } => match graph.get_cron_job(&job_id) {
+                Ok(Some(mut job)) => {
+                    job.enabled = true;
+                    match graph.upsert_cron_job(&job) {
+                        Ok(_) => {
+                            Self::broadcast_cron_sync_upsert(dispatcher_tx, local_node_id, &job)
                                 .await;
-                                IpcResponse::success("enable_cron_job", None)
-                            }
-                            Err(e) => IpcResponse::Error(format!("EnableCronJob failed: {e}")),
+                            IpcResponse::success("enable_cron_job", None)
                         }
+                        Err(e) => IpcResponse::Error(format!("EnableCronJob failed: {e}")),
                     }
-                    Ok(None) => IpcResponse::Error(format!("cron job not found: {job_id}")),
-                    Err(e) => IpcResponse::Error(format!("EnableCronJob failed: {e}")),
                 }
-            }
-            IpcRequest::DisableCronJob { job_id } => {
-                match graph.get_cron_job(&job_id) {
-                    Ok(Some(mut job)) => {
-                        job.enabled = false;
-                        match graph.upsert_cron_job(&job) {
-                            Ok(_) => {
-                                Self::broadcast_cron_sync_upsert(
-                                    dispatcher_tx,
-                                    local_node_id,
-                                    &job,
-                                )
+                Ok(None) => IpcResponse::Error(format!("cron job not found: {job_id}")),
+                Err(e) => IpcResponse::Error(format!("EnableCronJob failed: {e}")),
+            },
+            IpcRequest::DisableCronJob { job_id } => match graph.get_cron_job(&job_id) {
+                Ok(Some(mut job)) => {
+                    job.enabled = false;
+                    match graph.upsert_cron_job(&job) {
+                        Ok(_) => {
+                            Self::broadcast_cron_sync_upsert(dispatcher_tx, local_node_id, &job)
                                 .await;
-                                IpcResponse::success("disable_cron_job", None)
-                            }
-                            Err(e) => IpcResponse::Error(format!("DisableCronJob failed: {e}")),
+                            IpcResponse::success("disable_cron_job", None)
                         }
+                        Err(e) => IpcResponse::Error(format!("DisableCronJob failed: {e}")),
                     }
-                    Ok(None) => IpcResponse::Error(format!("cron job not found: {job_id}")),
-                    Err(e) => IpcResponse::Error(format!("DisableCronJob failed: {e}")),
                 }
-            }
+                Ok(None) => IpcResponse::Error(format!("cron job not found: {job_id}")),
+                Err(e) => IpcResponse::Error(format!("DisableCronJob failed: {e}")),
+            },
         }
     }
 
@@ -4619,15 +4655,23 @@ impl IpcServer {
         };
 
         if let Err(e) = graph.upsert_guest(&record) {
-            error!("RegisterComponent: failed to upsert guest {}: {}", guest_id, e);
+            error!(
+                "RegisterComponent: failed to upsert guest {}: {}",
+                guest_id, e
+            );
             return IpcResponse::error("register_component", "UPSERT_FAILED", e.to_string());
         }
 
         // Store component-specific config for readback via GetConfig.
         if !manifest.component_config.is_null() {
             let config_key = format!("component:{}", guest_id);
-            if let Err(e) = graph.set_config_value(&config_key, &manifest.component_config.to_string()) {
-                warn!("RegisterComponent: failed to store component config for {}: {}", guest_id, e);
+            if let Err(e) =
+                graph.set_config_value(&config_key, &manifest.component_config.to_string())
+            {
+                warn!(
+                    "RegisterComponent: failed to store component config for {}: {}",
+                    guest_id, e
+                );
             }
         }
 
@@ -4643,7 +4687,10 @@ impl IpcServer {
         if manifest.auto_start {
             if let Some(requester) = materialization_requester {
                 if let Err(e) = requester.ensure_guest_active(&guest_id).await {
-                    warn!("RegisterComponent: ensure_guest_active failed for {}: {}", guest_id, e);
+                    warn!(
+                        "RegisterComponent: ensure_guest_active failed for {}: {}",
+                        guest_id, e
+                    );
                 }
             }
         }
@@ -4724,7 +4771,11 @@ impl IpcServer {
         let hotel_name = match Self::local_hotel_name(graph, local_node_id) {
             Some(h) => h,
             None => {
-                return IpcResponse::error("list_components", "HOTEL_NOT_FOUND", "local hotel record not found");
+                return IpcResponse::error(
+                    "list_components",
+                    "HOTEL_NOT_FOUND",
+                    "local hotel record not found",
+                );
             }
         };
 
@@ -4748,9 +4799,15 @@ impl IpcServer {
             .filter_map(|g| {
                 // Infer component type from role prefix — only model-controllers and tool-runners
                 // are surfaced here. Agents, membrane, and other guests belong in /api/guests.
-                let component_type = if g.role == "model" || g.role.starts_with("model.") || g.role.starts_with("model-controller") {
+                let component_type = if g.role == "model"
+                    || g.role.starts_with("model.")
+                    || g.role.starts_with("model-controller")
+                {
                     "model-controller"
-                } else if g.role == "tool" || g.role.starts_with("tool.") || g.role.starts_with("tool-runner") {
+                } else if g.role == "tool"
+                    || g.role.starts_with("tool.")
+                    || g.role.starts_with("tool-runner")
+                {
                     "tool-runner"
                 } else {
                     return None;
@@ -4811,7 +4868,11 @@ impl IpcServer {
         let hotel_name = match Self::local_hotel_name(graph, local_node_id) {
             Some(h) => h,
             None => {
-                return IpcResponse::error("set_component_active", "HOTEL_NOT_FOUND", "local hotel record not found");
+                return IpcResponse::error(
+                    "set_component_active",
+                    "HOTEL_NOT_FOUND",
+                    "local hotel record not found",
+                );
             }
         };
 
@@ -4859,7 +4920,10 @@ impl IpcServer {
             info!(guest_id = %guest_id, "component activated");
         }
 
-        IpcResponse::success("set_component_active", Some(serde_json::json!({ "guest_id": guest_id, "active": active })))
+        IpcResponse::success(
+            "set_component_active",
+            Some(serde_json::json!({ "guest_id": guest_id, "active": active })),
+        )
     }
 
     async fn handle_restart_component(
@@ -4871,7 +4935,11 @@ impl IpcServer {
         let hotel_name = match Self::local_hotel_name(graph, local_node_id) {
             Some(h) => h,
             None => {
-                return IpcResponse::error("restart_component", "HOTEL_NOT_FOUND", "local hotel record not found");
+                return IpcResponse::error(
+                    "restart_component",
+                    "HOTEL_NOT_FOUND",
+                    "local hotel record not found",
+                );
             }
         };
 
@@ -4911,11 +4979,7 @@ impl IpcServer {
         // Respawn.
         if let Some(req) = materialization_requester {
             if let Err(e) = req.ensure_guest_active(guest_id).await {
-                return IpcResponse::error(
-                    "restart_component",
-                    "SPAWN_FAILED",
-                    e.to_string(),
-                );
+                return IpcResponse::error("restart_component", "SPAWN_FAILED", e.to_string());
             }
         } else {
             return IpcResponse::error(
@@ -4926,7 +4990,10 @@ impl IpcServer {
         }
 
         info!(guest_id = %guest_id, "component restarted");
-        IpcResponse::success("restart_component", Some(serde_json::json!({ "guest_id": guest_id })))
+        IpcResponse::success(
+            "restart_component",
+            Some(serde_json::json!({ "guest_id": guest_id })),
+        )
     }
 
     fn record_apartment_checkpoint(
@@ -5421,6 +5488,21 @@ impl IpcServer {
             }
         }
 
+        if let Some(agent_id) = session.primary_agent_id.as_deref() {
+            if let Some(routing_preferences) = load_agent_graph_routing_preferences(agent_id) {
+                if let Some(obj) = bindings.as_object_mut() {
+                    obj.insert(
+                        "routing_preferences".to_string(),
+                        serde_json::Value::Array(routing_preferences),
+                    );
+                } else {
+                    bindings = serde_json::json!({
+                        "routing_preferences": routing_preferences,
+                    });
+                }
+            }
+        }
+
         // Expand dynamic skill implied_tools into effective_toolset and carry prompt-facing
         // skill guidance so philote can project more than just skill names.
         // For each skill in effective_skillset, load its AbstractSkillRecord and merge
@@ -5467,10 +5549,8 @@ impl IpcServer {
                                 toolset.push(implied.clone());
                             }
                         }
-                        let guidance = format!(
-                            "{} — {}",
-                            skill_record.skill_name, skill_record.description
-                        );
+                        let guidance =
+                            format!("{} — {}", skill_record.skill_name, skill_record.description);
                         if !skill_guidance.contains(&guidance) {
                             skill_guidance.push(guidance);
                         }
@@ -5677,9 +5757,7 @@ async fn live_role_subscribers(
     subscribers
 }
 
-fn load_tool_runner_registry(
-    graph: &GraphDomain,
-) -> anyhow::Result<Vec<ToolRunnerRegistryEntry>> {
+fn load_tool_runner_registry(graph: &GraphDomain) -> anyhow::Result<Vec<ToolRunnerRegistryEntry>> {
     let Some(raw) = graph.get_config_value("tool_runner_registry")? else {
         return Ok(Vec::new());
     };
@@ -6583,7 +6661,7 @@ mod tests {
     use ansible_mesh_core::registry::{CapabilityAdvertisement, NodeRegistry};
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
     use ansible_mesh_core::storage::{
-        AgentIdentityRecord, GuestRecord, GraphStorage, HotelRecord, SecretRecord,
+        AgentIdentityRecord, GraphStorage, GuestRecord, HotelRecord, SecretRecord,
         SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,
     };
     use base64::Engine;
@@ -6697,9 +6775,7 @@ mod tests {
         }
     }
 
-    fn expect_operator_target_guests(
-        response: IpcResponse,
-    ) -> OperatorTargetGuestInventoryView {
+    fn expect_operator_target_guests(response: IpcResponse) -> OperatorTargetGuestInventoryView {
         match response {
             IpcResponse::OperatorTargetGuestsView {
                 operator_target_guests,
@@ -6708,9 +6784,7 @@ mod tests {
         }
     }
 
-    fn expect_operator_target_agents(
-        response: IpcResponse,
-    ) -> OperatorTargetAgentInventoryView {
+    fn expect_operator_target_agents(response: IpcResponse) -> OperatorTargetAgentInventoryView {
         match response {
             IpcResponse::OperatorTargetAgentsView {
                 operator_target_agents,
@@ -6732,10 +6806,7 @@ mod tests {
     struct TestGraphAdapter;
 
     impl ansible_mesh_core::storage::GraphAdapter for TestGraphAdapter {
-        fn upsert_node(
-            &self,
-            _node: &ansible_mesh_core::graph::GraphNode,
-        ) -> anyhow::Result<()> {
+        fn upsert_node(&self, _node: &ansible_mesh_core::graph::GraphNode) -> anyhow::Result<()> {
             Ok(())
         }
         fn get_node(
@@ -6753,10 +6824,7 @@ mod tests {
         ) -> anyhow::Result<Vec<ansible_mesh_core::graph::GraphNode>> {
             Ok(vec![])
         }
-        fn upsert_edge(
-            &self,
-            _edge: &ansible_mesh_core::graph::GraphEdge,
-        ) -> anyhow::Result<()> {
+        fn upsert_edge(&self, _edge: &ansible_mesh_core::graph::GraphEdge) -> anyhow::Result<()> {
             Ok(())
         }
         fn delete_edge(&self, _edge_key: &str) -> anyhow::Result<()> {
@@ -8444,7 +8512,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");
@@ -8516,7 +8589,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
 
         graph
             .upsert_agent_identity(&AgentIdentityRecord {
@@ -8642,7 +8720,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
 
         // Seed profile with known allowed_tools and allowed_skills.
         graph
@@ -8762,7 +8845,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
 
         graph
             .upsert_session(&SessionRecord {
@@ -8838,7 +8926,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
 
         graph
             .upsert_session(&SessionRecord {
@@ -8972,8 +9065,13 @@ mod tests {
                 port: 9002,
             }),
         );
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone())
-            .with_registry(registry);
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        )
+        .with_registry(registry);
 
         graph
             .upsert_session(&SessionRecord {
@@ -9092,8 +9190,13 @@ mod tests {
                 port: 9002,
             }),
         );
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone())
-            .with_registry(registry);
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        )
+        .with_registry(registry);
 
         graph
             .upsert_session(&SessionRecord {
@@ -9225,8 +9328,13 @@ mod tests {
                 port: 9002,
             }),
         );
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone())
-            .with_registry(registry);
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        )
+        .with_registry(registry);
 
         let mut hotel = crate::default_hotel_record("local");
         hotel.ipc_socket_path = socket_path.clone();
@@ -9323,7 +9431,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
 
         graph
             .upsert_session(&SessionRecord {
@@ -9440,7 +9553,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
 
         graph
             .upsert_session(&SessionRecord {
@@ -9585,7 +9703,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
 
         graph
             .upsert_session(&SessionRecord {
@@ -9758,8 +9881,13 @@ mod tests {
                 port: 9002,
             }),
         );
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone())
-            .with_registry(registry);
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        )
+        .with_registry(registry);
 
         graph
             .upsert_session(&SessionRecord {
@@ -9846,7 +9974,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");
@@ -9891,7 +10024,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
 
         graph
             .upsert_session(&SessionRecord {
@@ -9988,7 +10126,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
 
         for session_id in ["sess-1", "sess-2"] {
             graph
@@ -10135,7 +10278,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");
@@ -10209,7 +10357,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");
@@ -10282,7 +10435,12 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");
@@ -10369,7 +10527,12 @@ mod tests {
         let (dispatcher_tx, mut dispatcher_rx) = mpsc::channel(16);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");
@@ -10619,7 +10782,12 @@ mod tests {
         let (dispatcher_tx, mut dispatcher_rx) = mpsc::channel(16);
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");
@@ -11481,7 +11649,12 @@ mod tests {
                 }],
             )
             .expect("seed membrane guest");
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");
@@ -12900,10 +13073,16 @@ mod tests {
         );
 
         let local_server_task = tokio::spawn(async move {
-            local_server.run().await.expect("local ipc server should run");
+            local_server
+                .run()
+                .await
+                .expect("local ipc server should run");
         });
         let remote_server_task = tokio::spawn(async move {
-            remote_server.run().await.expect("remote ipc server should run");
+            remote_server
+                .run()
+                .await
+                .expect("remote ipc server should run");
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -13012,7 +13191,10 @@ mod tests {
         .expect("remote agent connect");
 
         let remote_agent_task = tokio::spawn(async move {
-            let inbound = remote_agent.recv_task().await.expect("remote agent recv task");
+            let inbound = remote_agent
+                .recv_task()
+                .await
+                .expect("remote agent recv task");
             let IpcResponse::InboundTask { task_json, .. } = inbound else {
                 panic!("unexpected inbound response to remote agent");
             };
