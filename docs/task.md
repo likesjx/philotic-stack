@@ -767,6 +767,7 @@ Seam IDs: `structured-model-envelope`, `hotel-gemini-oauth-flow`
 - [x] Add a real operator lifecycle for routing-policy records: list them, revise disposition later, and append durable disposition evaluations instead of freezing governance at birth approval.
 - [x] Make rejected routing-policy disposition actually inhibit linked `agent_learned` reflex projection during session binding assembly, and surface suppression markers for observability.
 - [x] Add a hotel-side reward system for linked `agent_learned` reflexes: approved routing-policy disposition now reinforces projection with a precedence boost and explicit reward markers.
+- [x] Feed hotel-projected reward and immune markers into live cognition-stage turn-routing-plan ranking in `philote`, so reinforced or suppressed agent-learned reflex posture can bias explicit provider/model preference selection without becoming a second router.
 - [ ] Fold model-graph metadata into live turn-routing-plan ranking so shared catalog truth informs selection without becoming mutable preference storage.
 - [ ] Define the shared catalog layer for models, tools, skills, and rights as reference knowledge outside hotel-owned mutable state.
 - [ ] Extend the hotel's projected key ring beyond `effective_rights` for tools/skills/component capabilities into scoped execution credentials and richer right classes.

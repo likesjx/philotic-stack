@@ -8,9 +8,10 @@ use crate::protocol::{
 };
 use crate::session::{
     ActivePlan, AgentProfile, ApprovalInterruptDisposition, ComponentRouteAssembly,
-    MediaRoutingPolicy, RecalledMemoryRecord, RoutingPreferenceBinding, SessionState,
-    ToolExecutionRoute, TtsMode, TurnContextEnvelopeKind, TurnRoutingPlan, TurnRoutingStageKind,
-    TurnRoutingStagePlan, VoiceResponsePolicy, WorkingTurn, merge_session_index,
+    MediaRoutingPolicy, RecalledMemoryRecord, RoutingPreferenceBinding, SessionBindings,
+    SessionState, ToolExecutionRoute, TtsMode, TurnContextEnvelopeKind, TurnRoutingPlan,
+    TurnRoutingStageKind, TurnRoutingStagePlan, VoiceResponsePolicy, WorkingTurn,
+    merge_session_index,
 };
 use anyhow::Result;
 use memory_core::{
@@ -432,6 +433,7 @@ fn compile_turn_routing_plan(
     voice_policy: Option<&VoiceResponsePolicy>,
     had_voice_input: bool,
     routing_preferences: &[RoutingPreferenceBinding],
+    bindings: &SessionBindings,
 ) -> TurnRoutingPlan {
     let mut stages = Vec::new();
 
@@ -497,7 +499,7 @@ fn compile_turn_routing_plan(
         },
         stages,
     };
-    apply_routing_preferences(&mut plan, routing_preferences);
+    apply_routing_preferences(&mut plan, routing_preferences, bindings);
     plan
 }
 
@@ -512,6 +514,7 @@ fn stage_kind_name(kind: TurnRoutingStageKind) -> &'static str {
 fn select_stage_routing_preference<'a>(
     stage: &TurnRoutingStagePlan,
     routing_preferences: &'a [RoutingPreferenceBinding],
+    bindings: &SessionBindings,
 ) -> Option<&'a RoutingPreferenceBinding> {
     routing_preferences
         .iter()
@@ -530,20 +533,109 @@ fn select_stage_routing_preference<'a>(
                 .unwrap_or(true)
         })
         .max_by(|left, right| {
-            left.preference_level
-                .cmp(&right.preference_level)
-                .then_with(|| left.weight.cmp(&right.weight))
+            routing_preference_score(left, stage, bindings)
+                .cmp(&routing_preference_score(right, stage, bindings))
                 .then_with(|| left.updated_at.cmp(&right.updated_at))
                 .then_with(|| left.preference_key.cmp(&right.preference_key))
         })
 }
 
+fn routing_preference_score(
+    preference: &RoutingPreferenceBinding,
+    stage: &TurnRoutingStagePlan,
+    bindings: &SessionBindings,
+) -> i32 {
+    preference.preference_level * 100
+        + preference.weight
+        + routing_preference_reflex_adjustment(preference, stage, bindings)
+}
+
+fn routing_preference_reflex_adjustment(
+    preference: &RoutingPreferenceBinding,
+    stage: &TurnRoutingStagePlan,
+    bindings: &SessionBindings,
+) -> i32 {
+    let touches_explicit_route =
+        preference.provider_hint.is_some() || preference.model_ref.is_some();
+    if !touches_explicit_route || stage.kind == TurnRoutingStageKind::Ingress {
+        return 0;
+    }
+
+    let remote_component_reflex = bindings
+        .effective_reflexes
+        .get("remote_component_reflex")
+        .and_then(|value| value.as_str());
+    let reward_bonus = bindings
+        .reflex_policy_agent_rewards
+        .iter()
+        .filter(|marker| reflex_marker_matches_preference(marker, preference))
+        .count() as i32
+        * 5;
+    let immune_penalty = bindings
+        .reflex_policy_agent_suppressions
+        .iter()
+        .filter(|marker| reflex_marker_matches_preference(marker, preference))
+        .count() as i32
+        * 5;
+
+    match remote_component_reflex {
+        Some("allow") => reward_bonus,
+        Some("deny") => -immune_penalty,
+        _ => 0,
+    }
+}
+
+fn reflex_marker_matches_preference(
+    marker: &serde_json::Value,
+    preference: &RoutingPreferenceBinding,
+) -> bool {
+    let Some(obj) = marker.as_object() else {
+        return false;
+    };
+
+    let preference_key = obj
+        .get("preference_key")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(preference_key) = preference_key {
+        return preference_key == preference.preference_key;
+    }
+
+    let provider_hint = obj
+        .get("provider_hint")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(provider_hint) = provider_hint {
+        if preference.provider_hint.as_deref() == Some(provider_hint) {
+            return true;
+        }
+    }
+
+    let model_ref = obj
+        .get("model_ref")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(model_ref) = model_ref {
+        if preference.model_ref.as_deref() == Some(model_ref) {
+            return true;
+        }
+    }
+
+    false
+}
+
 fn apply_routing_preferences(
     plan: &mut TurnRoutingPlan,
     routing_preferences: &[RoutingPreferenceBinding],
+    bindings: &SessionBindings,
 ) {
     for stage in &mut plan.stages {
-        if let Some(preference) = select_stage_routing_preference(stage, routing_preferences) {
+        if let Some(preference) =
+            select_stage_routing_preference(stage, routing_preferences, bindings)
+        {
             if preference.provider_hint.is_some() {
                 stage.provider_hint = preference.provider_hint.clone();
             }
@@ -1188,6 +1280,11 @@ impl AgentRuntime {
             .get(&session_id)
             .map(|s| s.bindings.routing_preferences.clone())
             .unwrap_or_default();
+        let routing_bindings = self
+            .sessions
+            .get(&session_id)
+            .map(|s| s.bindings.clone())
+            .unwrap_or_default();
         let media_attachments = media_analysis_attachments(&task);
         let media_routing = resolve_media_routing(&media_policy, media_attachments);
         let turn_routing_plan = compile_turn_routing_plan(
@@ -1195,6 +1292,7 @@ impl AgentRuntime {
             Some(&voice_policy),
             had_voice_input,
             &routing_preferences,
+            &routing_bindings,
         );
         let awaiting_transcription_reentry = media_routing
             .as_ref()
@@ -7192,6 +7290,13 @@ impl AgentRuntime {
         let new_routing_preferences = bindings
             .get("routing_preferences")
             .and_then(|v| serde_json::from_value::<Vec<RoutingPreferenceBinding>>(v.clone()).ok());
+        let new_effective_reflexes = bindings.get("effective_reflexes").cloned();
+        let new_reflex_policy_agent_rewards = bindings
+            .get("reflex_policy_agent_rewards")
+            .and_then(|v| serde_json::from_value::<Vec<serde_json::Value>>(v.clone()).ok());
+        let new_reflex_policy_agent_suppressions = bindings
+            .get("reflex_policy_agent_suppressions")
+            .and_then(|v| serde_json::from_value::<Vec<serde_json::Value>>(v.clone()).ok());
         let new_component_routes = snapshot
             .get("component_route_assembly")
             .cloned()
@@ -7219,6 +7324,24 @@ impl AgentRuntime {
         if let Some(routing_preferences) = new_routing_preferences {
             if routing_preferences != state.bindings.routing_preferences {
                 state.bindings.routing_preferences = routing_preferences;
+                changed = true;
+            }
+        }
+        if let Some(effective_reflexes) = new_effective_reflexes {
+            if effective_reflexes != state.bindings.effective_reflexes {
+                state.bindings.effective_reflexes = effective_reflexes;
+                changed = true;
+            }
+        }
+        if let Some(rewards) = new_reflex_policy_agent_rewards {
+            if rewards != state.bindings.reflex_policy_agent_rewards {
+                state.bindings.reflex_policy_agent_rewards = rewards;
+                changed = true;
+            }
+        }
+        if let Some(suppressions) = new_reflex_policy_agent_suppressions {
+            if suppressions != state.bindings.reflex_policy_agent_suppressions {
+                state.bindings.reflex_policy_agent_suppressions = suppressions;
                 changed = true;
             }
         }
@@ -8143,7 +8266,7 @@ mod tests {
 
     #[test]
     fn compile_turn_routing_plan_for_voice_turn_has_three_stages() {
-        use crate::session::MediaRoutingPolicy;
+        use crate::session::{MediaRoutingPolicy, SessionBindings};
 
         let policy = MediaRoutingPolicy {
             voice_action: Some("transcribe".into()),
@@ -8156,7 +8279,13 @@ mod tests {
             ..Default::default()
         };
 
-        let plan = compile_turn_routing_plan(Some(&media_routing), Some(&voice_policy), true, &[]);
+        let plan = compile_turn_routing_plan(
+            Some(&media_routing),
+            Some(&voice_policy),
+            true,
+            &[],
+            &SessionBindings::default(),
+        );
 
         assert_eq!(plan.trigger, "voice_input");
         assert_eq!(plan.stages.len(), 3);
@@ -8173,7 +8302,9 @@ mod tests {
 
     #[test]
     fn compile_turn_routing_plan_for_text_turn_only_has_cognition() {
-        let plan = compile_turn_routing_plan(None, None, false, &[]);
+        use crate::session::SessionBindings;
+
+        let plan = compile_turn_routing_plan(None, None, false, &[], &SessionBindings::default());
 
         assert_eq!(plan.trigger, "text_input");
         assert_eq!(plan.stages.len(), 1);
@@ -8183,7 +8314,7 @@ mod tests {
 
     #[test]
     fn compile_turn_routing_plan_applies_agent_graph_routing_preferences() {
-        use crate::session::RoutingPreferenceBinding;
+        use crate::session::{RoutingPreferenceBinding, SessionBindings};
 
         let routing_preferences = vec![RoutingPreferenceBinding {
             preference_key: "voice-ingress-elevenlabs-scribe".into(),
@@ -8201,11 +8332,105 @@ mod tests {
             attachments: vec![blob_backed_attachment("voice")],
         };
 
-        let plan =
-            compile_turn_routing_plan(Some(&media_routing), None, true, &routing_preferences);
+        let plan = compile_turn_routing_plan(
+            Some(&media_routing),
+            None,
+            true,
+            &routing_preferences,
+            &SessionBindings::default(),
+        );
 
         assert_eq!(plan.stages[0].provider_hint.as_deref(), Some("elevenlabs"));
         assert_eq!(plan.stages[0].model_ref.as_deref(), Some("scribe_v1"));
+    }
+
+    #[test]
+    fn compile_turn_routing_plan_rewards_approved_agent_reflexes_for_cognition_selection() {
+        use crate::session::{RoutingPreferenceBinding, SessionBindings};
+
+        let routing_preferences = vec![
+            RoutingPreferenceBinding {
+                preference_key: "cognition-local".into(),
+                stage_kind: Some("cognition".into()),
+                capability: Some("text.generate".into()),
+                provider_hint: Some("mlx".into()),
+                model_ref: Some("mlx/qwen".into()),
+                preference_level: 1,
+                weight: 89,
+                updated_at: 10,
+            },
+            RoutingPreferenceBinding {
+                preference_key: "cognition-remote".into(),
+                stage_kind: Some("cognition".into()),
+                capability: Some("text.generate".into()),
+                provider_hint: Some("gemini".into()),
+                model_ref: Some("gemini-3.1-flash".into()),
+                preference_level: 1,
+                weight: 90,
+                updated_at: 9,
+            },
+        ];
+        let bindings = SessionBindings {
+            effective_reflexes: serde_json::json!({
+                "remote_component_reflex": "allow"
+            }),
+            reflex_policy_agent_rewards: vec![serde_json::json!({
+                "preference_key": "cognition-remote",
+                "regulatory_system": "reward"
+            })],
+            ..Default::default()
+        };
+
+        let plan = compile_turn_routing_plan(None, None, false, &routing_preferences, &bindings);
+
+        assert_eq!(plan.stages[0].provider_hint.as_deref(), Some("gemini"));
+        assert_eq!(
+            plan.stages[0].model_ref.as_deref(),
+            Some("gemini-3.1-flash")
+        );
+    }
+
+    #[test]
+    fn compile_turn_routing_plan_immune_system_dampens_remote_cognition_selection() {
+        use crate::session::{RoutingPreferenceBinding, SessionBindings};
+
+        let routing_preferences = vec![
+            RoutingPreferenceBinding {
+                preference_key: "cognition-local".into(),
+                stage_kind: Some("cognition".into()),
+                capability: Some("text.generate".into()),
+                provider_hint: Some("mlx".into()),
+                model_ref: Some("mlx/qwen".into()),
+                preference_level: 1,
+                weight: 89,
+                updated_at: 10,
+            },
+            RoutingPreferenceBinding {
+                preference_key: "cognition-remote".into(),
+                stage_kind: Some("cognition".into()),
+                capability: Some("text.generate".into()),
+                provider_hint: Some("gemini".into()),
+                model_ref: Some("gemini-3.1-flash".into()),
+                preference_level: 1,
+                weight: 90,
+                updated_at: 9,
+            },
+        ];
+        let bindings = SessionBindings {
+            effective_reflexes: serde_json::json!({
+                "remote_component_reflex": "deny"
+            }),
+            reflex_policy_agent_suppressions: vec![serde_json::json!({
+                "preference_key": "cognition-remote",
+                "regulatory_system": "immune"
+            })],
+            ..Default::default()
+        };
+
+        let plan = compile_turn_routing_plan(None, None, false, &routing_preferences, &bindings);
+
+        assert_eq!(plan.stages[0].provider_hint.as_deref(), Some("mlx"));
+        assert_eq!(plan.stages[0].model_ref.as_deref(), Some("mlx/qwen"));
     }
 
     #[test]

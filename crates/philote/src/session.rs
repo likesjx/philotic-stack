@@ -702,6 +702,12 @@ pub struct SessionBindings {
     #[serde(default)]
     pub routing_preferences: Vec<RoutingPreferenceBinding>,
     #[serde(default)]
+    pub effective_reflexes: serde_json::Value,
+    #[serde(default)]
+    pub reflex_policy_agent_rewards: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub reflex_policy_agent_suppressions: Vec<serde_json::Value>,
+    #[serde(default)]
     pub allowed_tool_runner_incarnations: Vec<ToolRunnerIncarnationBinding>,
 }
 
@@ -4336,6 +4342,9 @@ mod tests {
                 preferred_hotel_id: None,
                 preferred_environment_id: None,
                 routing_preferences: Vec::new(),
+                effective_reflexes: serde_json::Value::Null,
+                reflex_policy_agent_rewards: Vec::new(),
+                reflex_policy_agent_suppressions: Vec::new(),
                 allowed_tool_runner_incarnations: Vec::new(),
             }
         );
@@ -4807,6 +4816,9 @@ mod tests {
             preferred_hotel_id: None,
             preferred_environment_id: None,
             routing_preferences: Vec::new(),
+            effective_reflexes: serde_json::Value::Null,
+            reflex_policy_agent_rewards: Vec::new(),
+            reflex_policy_agent_suppressions: Vec::new(),
             allowed_tool_runner_incarnations: Vec::new(),
         };
 

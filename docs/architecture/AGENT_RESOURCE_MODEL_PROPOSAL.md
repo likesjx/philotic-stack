@@ -488,6 +488,13 @@ So the hotel now projects both an immune system and a reward system onto
 agent-owned learned posture, which is much healthier than either permanent
 permission or permanent suspicion.
 
+That reinforcement is no longer just decorative endocrine paperwork. The
+current slice also lets `philote` consume those reward and immune markers while
+ranking competing explicit cognition-stage routing preferences, so approved
+agent-learned reflex posture can gently bias live turn-routing-plan selection
+and rejected posture can dampen it without turning the hotel into a second
+router.
+
 In practice, a fresher active-incarnation update is the `p53` check here: if
 the runtime has newer local evidence that the session now belongs on a
 different active guest, older delivery provenance should die immediately rather
