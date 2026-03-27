@@ -290,6 +290,36 @@ Current implemented truth for this seam:
   about native-live species, but execution still refuses them until a provider
   implementation is wired honestly
 
+### Gemini 3.1 Flash Live provider pressure
+
+As of March 27, 2026, the official Gemini Live API docs and the Gemini 3.1
+Flash Live model card make the next boundary pressure explicit:
+
+- Gemini 3.1 Flash Live is a stateful Live API session, not a plain
+  `generateContent` request/response call
+- Live API audio input is raw PCM streamed with `send_realtime_input`
+- audio output is returned as chunked model-turn parts
+- Gemini 3.1 Flash Live uses sequential function calling, not non-blocking tool
+  execution
+- session management includes explicit lifecycle concerns like generation
+  completion and session resumption
+
+That means the current `ModelProvider::invoke(&ControllerTask) ->
+ProviderOutput` seam is insufficient for a first-class Gemini Live provider on
+its own. The smallest honest implementation path is:
+
+1. keep `response.generate` / `voice.dialogue` as the routed capability species
+2. add a session-shaped provider runtime under `model-router` for Live API work
+3. let `philote` remain turn owner while the Gemini Live session acts as a
+   stage-local execution enzyme
+4. surface tool calls, partial replies, audio chunks, and turn-complete signals
+   back through the canonical controller response/event contracts instead of
+   letting the provider become a hidden parallel loop
+
+The important guardrail is that Gemini Live should arrive as a session-shaped
+execution substrate below the agent, not as a magical realtime exception that
+quietly becomes the real orchestrator.
+
 ## Request Classes
 
 Keep one model-controller boundary, but introduce an explicit `request_class` field inside the request envelope.
