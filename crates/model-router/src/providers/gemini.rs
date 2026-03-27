@@ -619,6 +619,12 @@ impl ModelProvider for GeminiProvider {
             TaskKind::MediaAnalyze | TaskKind::AudioTranscribe => {
                 self.media_request_payload(task).await?
             }
+            TaskKind::ResponseGenerate => {
+                bail!("Gemini native response.generate is not wired yet in this provider")
+            }
+            TaskKind::VoiceDialogue => {
+                bail!("Gemini native voice.dialogue is not wired yet in this provider")
+            }
             TaskKind::VoiceSynthesize => bail!("Gemini does not support voice synthesis"),
             TaskKind::Embed => bail!("Gemini does not support local embedding (use OnnxProvider)"),
         };
