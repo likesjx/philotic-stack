@@ -776,7 +776,8 @@ Seam IDs: `structured-model-envelope`, `hotel-gemini-oauth-flow`
 - [x] Wire the first provider implementation for native-live species honestly, starting with explicit `response.generate` / `voice.dialogue` behavior instead of a magical realtime bypass.
 - [x] Add a session-shaped native-live provider seam under `model-router` for Gemini 3.1 Flash Live style execution, covering Live API connection lifecycle, streamed PCM audio I/O, sequential tool-response turns, and resumable session markers instead of pretending `ModelProvider::invoke` is already the right shape.
 - [x] Wire the actual Gemini Live session transport on that seam for the first honest slice: websocket setup, native text `response.generate`, PCM-gated `voice.dialogue`, partial text/transcription mapping, live tool-call parsing, and session-resumption markers.
-- [ ] Extend the Gemini Live seam past the first honest slice: upstream PCM conversion for transported voice blobs, first-class audio-artifact return into cognition, and true in-session tool-response continuation instead of one-turn surfacing only.
+- [x] Extend the Gemini Live seam with upstream PCM conversion for transported voice blobs, using a transitional ffmpeg-backed enzyme so current OGG voice ligands can cross the Live receptor.
+- [ ] Extend the Gemini Live seam further with first-class audio-artifact return into cognition and true in-session tool-response continuation instead of one-turn surfacing only.
 - [ ] Define the shared catalog layer for models, tools, skills, and rights as reference knowledge outside hotel-owned mutable state.
 - [ ] Extend the hotel's projected key ring beyond `effective_rights` for tools/skills/component capabilities into scoped execution credentials and richer right classes.
 - [ ] Audit `model-router` and runner dispatch beyond current tool/component assembly so lower execution layers consume projected rights but never inject or widen them.

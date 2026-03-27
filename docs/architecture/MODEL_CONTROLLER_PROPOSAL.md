@@ -115,7 +115,7 @@ The first honest controller slice should therefore:
 Current implemented truth for this seam is still transitional:
 
 - `response.generate` now uses the Live websocket seam and returns canonical text output
-- `voice.dialogue` now uses the Live websocket seam when given blob-backed PCM audio
+- `voice.dialogue` now uses the Live websocket seam and will transcode non-PCM blob-backed audio through a transitional ffmpeg enzyme before sending Gemini realtime PCM input
 - audio output currently re-enters Philotic through output transcription text rather than a first-class cognitive audio artifact
 - sequential in-session tool-response continuation is still a follow-on seam
 
