@@ -554,6 +554,7 @@ Policy note:
 - cognitive re-entry should reuse the same tool-projection policy as initial turns rather than bypassing it with a raw bound-tool replay
 - stage-aware projection should also narrow prompt/context affordance cues such as skill guidance and approval posture, not just the explicit tool list
 - approval interrupts should be stage-aware too: valid for real tool/workflow gates, redirected on low-intent conversational turns, and rejected on non-cognitive transform/synthesis stages
+- routing self-improvement should be governed: the first `routing.policy.propose` path should surface a durable operator-reviewed proposal, not silently mutate controller choice or stage policy at runtime
 
 ## Optimization-Oriented Response Channels
 

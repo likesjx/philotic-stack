@@ -3508,6 +3508,7 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
             | "memory.recall"
             | "memory.remember"
             | "rule.propose"
+            | "routing.policy.propose"
             | "skill.register"
             | "skill.list"
             | "skill.assign"
@@ -3864,8 +3865,8 @@ mod tests {
         RefreshRequest, RoleActivation, SessionBindings, SessionState, TaskRunnerBaseConfig,
         ToolRunnerIncarnationBinding, TransportReplyTargetBinding, TtsMode,
         TurnContextEnvelopeKind, TurnRecord, TurnRoutingPlan, TurnRoutingStageKind,
-        TurnRoutingStagePlan, VoiceResponsePolicy, WorkingTurn,
-        default_tool_assembly_for_bindings, merge_session_index, session_checkpoint_memory_type,
+        TurnRoutingStagePlan, VoiceResponsePolicy, WorkingTurn, default_tool_assembly_for_bindings,
+        merge_session_index, session_checkpoint_memory_type,
     };
     use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
     use uuid::Uuid;
@@ -4575,6 +4576,23 @@ mod tests {
         assert!(props.contains_key("command"));
         assert!(props.contains_key("working_dir"));
         assert!(props.contains_key("timeout_secs"));
+    }
+
+    #[test]
+    fn routing_policy_propose_requires_approval_and_routing_refinement_implies_it() {
+        use crate::catalog::{skill_implied_tools, tool_class, tool_requires_approval};
+
+        assert_eq!(tool_class("routing.policy.propose"), Some("config"));
+        assert!(tool_requires_approval("routing.policy.propose"));
+        assert_eq!(
+            skill_implied_tools("routing.refinement"),
+            &[
+                "session.status",
+                "memory.recall",
+                "memory.remember",
+                "routing.policy.propose",
+            ]
+        );
     }
 
     #[test]

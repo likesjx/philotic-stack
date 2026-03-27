@@ -1861,12 +1861,16 @@ impl AgentRuntime {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
 
-            // rule.propose always requires live operator approval — cannot be preapproved or bypassed.
-            // Rules are durable and permanently affect agent behavior, so human confirmation is required.
-            // (bypass_approval does NOT bypass rule.propose — that one is unconditional.)
-            let is_rule_propose = !bypass_approval && tool_call.tool_name == "rule.propose";
+            // Durable self-governance proposals always require live operator approval — cannot be
+            // preapproved or bypassed. This currently covers both general rules and routing-policy
+            // refinements, since either one changes future agent behavior.
+            let is_durable_governance_proposal = !bypass_approval
+                && matches!(
+                    tool_call.tool_name.as_str(),
+                    "rule.propose" | "routing.policy.propose"
+                );
 
-            if is_admin_role_creation || is_rule_propose || force_approval {
+            if is_admin_role_creation || is_durable_governance_proposal || force_approval {
                 // Set pending_tool_call so the approval handler can read it for class lookup.
                 if let Some(state) = self.sessions.get_mut(&session_id) {
                     state.set_pending_tool_call(tool_call.clone());
@@ -1890,11 +1894,21 @@ impl AgentRuntime {
                         ),
                         format!("Admin role '{}' approved.", role_name_hint),
                     )
-                } else if is_rule_propose {
-                    (
-                        "Rule proposal requires your explicit live approval.".to_string(),
-                        "Rule proposal approved.".to_string(),
-                    )
+                } else if is_durable_governance_proposal {
+                    let (reason, approved_response) =
+                        if tool_call.tool_name == "routing.policy.propose" {
+                            (
+                                "Routing policy proposal requires your explicit live approval."
+                                    .to_string(),
+                                "Routing policy proposal approved.".to_string(),
+                            )
+                        } else {
+                            (
+                                "Rule proposal requires your explicit live approval.".to_string(),
+                                "Rule proposal approved.".to_string(),
+                            )
+                        };
+                    (reason, approved_response)
                 } else {
                     (
                         format!(
@@ -1914,7 +1928,7 @@ impl AgentRuntime {
                         session_id,
                         turn_id,
                         synthetic,
-                        is_admin_role_creation || is_rule_propose,
+                        is_admin_role_creation || is_durable_governance_proposal,
                     )
                     .await;
             }
@@ -6613,6 +6627,135 @@ impl AgentRuntime {
                     }
                     Ok(_) => "rule.propose: unexpected response from hotel.".into(),
                     Err(e) => format!("rule.propose: IPC error — {e}"),
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    handoff_bundle: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(result_text),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: None,
+                    tool_name: Some(payload.tool_name),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                })
+                .await
+            }
+
+            "routing.policy.propose" => {
+                let problem = payload
+                    .arguments
+                    .get("problem")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let proposed_change = payload
+                    .arguments
+                    .get("proposed_change")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let evidence = payload
+                    .arguments
+                    .get("evidence")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let affected_stage = payload
+                    .arguments
+                    .get("affected_stage")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let affected_capability = payload
+                    .arguments
+                    .get("affected_capability")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+
+                if problem.is_empty() || proposed_change.is_empty() || evidence.is_empty() {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "routing.policy.propose: 'problem', 'proposed_change', and 'evidence' are required.".into(),
+                        )
+                        .await;
+                }
+
+                let mut description = format!("Routing policy refinement: {}", proposed_change);
+                if !affected_stage.is_empty() || !affected_capability.is_empty() {
+                    let mut scope_parts = Vec::new();
+                    if !affected_stage.is_empty() {
+                        scope_parts.push(format!("stage={affected_stage}"));
+                    }
+                    if !affected_capability.is_empty() {
+                        scope_parts.push(format!("capability={affected_capability}"));
+                    }
+                    description.push_str(&format!(" [{}]", scope_parts.join(", ")));
+                }
+
+                let rationale = format!(
+                    "Observed routing/cognition issue: {problem}\nEvidence: {evidence}\nTransitional note: stored through durable rule infrastructure until routing-specific policy records exist."
+                );
+
+                let agent_id = self.agent_id.clone();
+                let result_text = match self
+                    .ipc_client
+                    .send_request(IpcRequest::ProposeRule {
+                        agent_id: agent_id.clone(),
+                        description: description.clone(),
+                        rationale: rationale.clone(),
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::RuleProposed { rule_id }) => {
+                        if let Some(state) = self.sessions.get_mut(&payload.session_id) {
+                            state.rules.push(serde_json::json!({
+                                "rule_id": rule_id,
+                                "description": description,
+                                "rationale": rationale,
+                                "proposal_kind": "routing_policy",
+                                "problem": problem,
+                                "affected_stage": affected_stage,
+                                "affected_capability": affected_capability,
+                            }));
+                        }
+                        format!(
+                            "Routing policy proposal stored for operator-governed review (id: {rule_id}). Transitional note: it currently rides on the durable rule store until routing-specific policy persistence exists."
+                        )
+                    }
+                    Ok(IpcResponse::Standard {
+                        ok: true, message, ..
+                    }) => message,
+                    Ok(IpcResponse::Standard {
+                        ok: false, message, ..
+                    }) => {
+                        format!("routing.policy.propose: hotel rejected — {message}")
+                    }
+                    Ok(_) => "routing.policy.propose: unexpected response from hotel.".into(),
+                    Err(e) => format!("routing.policy.propose: IPC error — {e}"),
                 };
 
                 self.handle_tool_result(InboundTaskPayload {

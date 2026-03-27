@@ -35,6 +35,12 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
         "handoff.back" => &["session.status", "handoff.back"],
         "role.governance" => &["session.status", "agent.configure", "role.configure"],
         "memory" => &["memory.recall", "memory.remember"],
+        "routing.refinement" => &[
+            "session.status",
+            "memory.recall",
+            "memory.remember",
+            "routing.policy.propose",
+        ],
         _ => &[],
     }
 }
@@ -639,6 +645,47 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     }
                 },
                 "required": ["description", "rationale"]
+            }),
+            class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "routing.policy.propose".into(),
+        ToolDefinition {
+            tool_name: "routing.policy.propose".into(),
+            description: "Propose a durable routing or cognition policy refinement for the \
+                          agent. Use when repeated evidence suggests a turn stage, provider \
+                          preference, context envelope, or affordance posture should be \
+                          adjusted. Always requires live operator approval and is currently \
+                          stored through the durable rule path until routing-specific policy \
+                          storage exists."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "problem": {
+                        "type": "string",
+                        "description": "Short description of the recurring routing or cognition problem being observed. Max 512 characters."
+                    },
+                    "proposed_change": {
+                        "type": "string",
+                        "description": "The durable routing or cognition policy update being proposed in the imperative. Max 512 characters."
+                    },
+                    "evidence": {
+                        "type": "string",
+                        "description": "Concrete evidence motivating the change: failed turn shapes, repeated user corrections, latency/cost mismatch, or provider misfit. Max 1024 characters."
+                    },
+                    "affected_stage": {
+                        "type": "string",
+                        "description": "Optional stage hint such as ingress, cognition, or egress."
+                    },
+                    "affected_capability": {
+                        "type": "string",
+                        "description": "Optional capability hint such as voice.transcribe, text.generate, or voice.synthesize."
+                    }
+                },
+                "required": ["problem", "proposed_change", "evidence"]
             }),
             class: Some("config".into()),
         },
