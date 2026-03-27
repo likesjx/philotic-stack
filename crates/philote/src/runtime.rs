@@ -111,6 +111,22 @@ fn extract_model_audio_artifact(model_result: Option<&Value>) -> Option<String> 
     extract_audio_artifact_json(model_result)
 }
 
+fn extract_native_live_pending_function_call_id(task: &InboundTaskPayload) -> Option<String> {
+    task.agent_action
+        .as_ref()
+        .and_then(|action| action.get("model_result"))
+        .and_then(|model_result| model_result.get("native_live"))
+        .and_then(|native_live| native_live.get("pending_function_call_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+fn parse_native_live_tool_response_content(content: &str) -> Value {
+    serde_json::from_str::<Value>(content).unwrap_or_else(|_| Value::String(content.to_string()))
+}
+
 fn should_attempt_provider_repair(error: &TaskErrorPayload, state: Option<&SessionState>) -> bool {
     error.kind == "provider_failure"
         && error.retryable.unwrap_or(false)
@@ -2030,6 +2046,12 @@ impl AgentRuntime {
                 .await
             }
             AgentAction::ToolCall(tool_call) => {
+                if let Some(function_call_id) = extract_native_live_pending_function_call_id(&task)
+                {
+                    if let Some(state) = self.sessions.get_mut(&session_id) {
+                        state.set_pending_native_live_function_call_id(function_call_id);
+                    }
+                }
                 self.handle_tool_call(session_id, turn_id, tool_call).await
             }
             AgentAction::RequestApproval(approval) => {
@@ -2680,6 +2702,8 @@ impl AgentRuntime {
                     tool_name: tool_result.tool_name.clone(),
                     arguments: serde_json::json!({}),
                 });
+            let pending_native_live_function_call_id =
+                state.take_pending_native_live_function_call_id();
 
             state.push_tool_history(tool_call, tool_result.clone());
             state.clear_pending_tool_call();
@@ -2731,6 +2755,17 @@ impl AgentRuntime {
                             active_turn.final_reply_role.clone(),
                             active_turn.final_reply_guest_id.clone(),
                             tools,
+                            pending_native_live_function_call_id.map(|function_call_id| {
+                                serde_json::json!({
+                                    "live_tool_response": {
+                                        "function_call_id": function_call_id,
+                                        "tool_name": tool_result.tool_name,
+                                        "tool_response": parse_native_live_tool_response_content(
+                                            &tool_result.content,
+                                        ),
+                                    }
+                                })
+                            }),
                             state.checkpoint_memory_type(),
                             state.checkpoint_json(),
                             state.clone(),
@@ -2774,6 +2809,7 @@ impl AgentRuntime {
                 final_reply_role,
                 final_reply_guest_id,
                 tools_for_model,
+                provider_options,
                 checkpoint_memory_type,
                 checkpoint_json,
                 index_state,
@@ -2824,7 +2860,7 @@ impl AgentRuntime {
                         self.sessions.get(&session_id),
                         TurnRoutingStageKind::Cognition,
                     ),
-                    provider_options: None,
+                    provider_options,
                     chat_id,
                     reply_to: local_node_id(),
                     reply_role: "agent".into(),
@@ -9182,6 +9218,29 @@ mod tests {
         });
 
         assert!(super::extract_model_audio_artifact(Some(&model_result)).is_none());
+    }
+
+    #[test]
+    fn extracts_native_live_pending_function_call_id_from_model_result() {
+        let task: InboundTaskPayload = serde_json::from_value(serde_json::json!({
+            "action": "model_response",
+            "agent_action": {
+                "kind": "tool_call",
+                "tool_name": "session.status",
+                "arguments": {},
+                "model_result": {
+                    "native_live": {
+                        "pending_function_call_id": "call-1"
+                    }
+                }
+            }
+        }))
+        .expect("payload should parse");
+
+        assert_eq!(
+            super::extract_native_live_pending_function_call_id(&task).as_deref(),
+            Some("call-1")
+        );
     }
 
     // ── bash.exec tests ──────────────────────────────────────────────────────

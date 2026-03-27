@@ -201,6 +201,8 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                     match provider.invoke_live(&controller_task).await {
                         Ok(output) => {
                             let latency_ms = dispatch_start.elapsed().as_millis() as u64;
+                            let native_live_model_result =
+                                native_live_tool_call_model_result(&output);
                             match output.final_output {
                                 ProviderOutput::ToolCall {
                                     tool_name,
@@ -220,7 +222,7 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                         &reply,
                                         tool_name,
                                         arguments,
-                                        None,
+                                        native_live_model_result,
                                     )
                                     .await?;
                                 }
@@ -646,6 +648,27 @@ async fn emit_tool_call_response(
     Ok(())
 }
 
+fn native_live_tool_call_model_result(
+    output: &crate::controller::NativeLiveTurnOutput,
+) -> Option<Value> {
+    if output.session_marker.is_none() && output.pending_function_call_id.is_none() {
+        return None;
+    }
+
+    Some(json!({
+        "native_live": {
+            "session_marker": output.session_marker.as_ref().map(|marker| {
+                json!({
+                    "provider_session_id": marker.provider_session_id,
+                    "resumption_handle": marker.resumption_handle,
+                    "protocol": marker.protocol,
+                })
+            }),
+            "pending_function_call_id": output.pending_function_call_id,
+        }
+    }))
+}
+
 async fn emit_failure(
     ipc_client: &mut PhiloticClient,
     reply: &ReplyRoute,
@@ -834,7 +857,11 @@ mod failure_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{StubResponse, parse_stub_response, short_circuit_response, validate_stub_prompt};
+    use super::{
+        StubResponse, native_live_tool_call_model_result, parse_stub_response,
+        short_circuit_response, validate_stub_prompt,
+    };
+    use crate::controller::{NativeLiveSessionMarker, NativeLiveTurnOutput, ProviderOutput};
     use serde_json::json;
 
     #[test]
@@ -903,5 +930,35 @@ mod tests {
         });
 
         validate_stub_prompt(&task, &stub).expect("composed prompt should satisfy stub checks");
+    }
+
+    #[test]
+    fn native_live_tool_call_model_result_carries_function_call_id_and_marker() {
+        let output = NativeLiveTurnOutput {
+            final_output: ProviderOutput::ToolCall {
+                tool_name: "session.status".into(),
+                arguments: json!({}),
+            },
+            partial_text_deltas: Vec::new(),
+            session_marker: Some(NativeLiveSessionMarker {
+                provider_session_id: None,
+                resumption_handle: Some("resume-123".into()),
+                protocol: Some("gemini-live-v1beta".into()),
+            }),
+            pending_function_call_id: Some("call-1".into()),
+            generation_complete: false,
+            turn_complete: false,
+        };
+
+        let model_result =
+            native_live_tool_call_model_result(&output).expect("metadata should be present");
+        assert_eq!(
+            model_result["native_live"]["pending_function_call_id"],
+            json!("call-1")
+        );
+        assert_eq!(
+            model_result["native_live"]["session_marker"]["resumption_handle"],
+            json!("resume-123")
+        );
     }
 }

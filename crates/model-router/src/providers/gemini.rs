@@ -10,16 +10,25 @@ use futures::{SinkExt, StreamExt};
 use media_prep::{PcmPrepPolicy, prepare_audio_ligand_for_pcm};
 use serde_json::{Value, json};
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::sync::LazyLock;
 use std::time::Duration;
+use tokio::net::TcpStream;
+use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::info;
 
 const GEMINI_LIVE_DEFAULT_MODEL: &str = "gemini-3.1-flash-live-preview";
 const GEMINI_LIVE_PROTOCOL: &str = "gemini-live-v1beta";
 const GEMINI_LIVE_MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
+type GeminiLiveSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+static GEMINI_LIVE_SESSION_POOL: LazyLock<Mutex<HashMap<String, GeminiLiveSession>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GeminiAuth {
@@ -49,6 +58,10 @@ struct LiveTurnAccumulator {
 #[derive(Debug, Default)]
 struct NativeLiveTurnOutputMarker {
     resumption_handle: Option<String>,
+}
+
+struct GeminiLiveSession {
+    ws: GeminiLiveSocket,
 }
 
 impl GeminiProvider {
@@ -735,6 +748,54 @@ impl GeminiProvider {
         json!({ "setup": setup })
     }
 
+    fn live_session_key(task: &ControllerTask) -> Option<String> {
+        Some(format!(
+            "{}:{}",
+            task.session_id.as_deref()?.trim(),
+            task.turn_id.as_deref()?.trim()
+        ))
+        .filter(|key| !key.contains(':') || !key.starts_with(':') && !key.ends_with(':'))
+    }
+
+    async fn store_live_session(task: &ControllerTask, ws: GeminiLiveSocket) {
+        if let Some(key) = Self::live_session_key(task) {
+            GEMINI_LIVE_SESSION_POOL
+                .lock()
+                .await
+                .insert(key, GeminiLiveSession { ws });
+        }
+    }
+
+    async fn take_live_session(task: &ControllerTask) -> Option<GeminiLiveSession> {
+        let key = Self::live_session_key(task)?;
+        GEMINI_LIVE_SESSION_POOL.lock().await.remove(&key)
+    }
+
+    fn live_tool_response_payload(task: &ControllerTask) -> Option<Value> {
+        let live_tool_response = task.provider_options.get("live_tool_response")?;
+        let function_call_id = live_tool_response.get("function_call_id")?.as_str()?.trim();
+        let tool_name = live_tool_response.get("tool_name")?.as_str()?.trim();
+        let tool_response = live_tool_response.get("tool_response")?.clone();
+        if function_call_id.is_empty() || tool_name.is_empty() {
+            return None;
+        }
+
+        let response = match tool_response {
+            Value::Object(_) => tool_response,
+            other => json!({ "result": other }),
+        };
+
+        Some(json!({
+            "toolResponse": {
+                "functionResponses": [{
+                    "id": function_call_id,
+                    "name": tool_name,
+                    "response": response,
+                }]
+            }
+        }))
+    }
+
     fn live_client_prompt_message(task: &ControllerTask, turn_complete: bool) -> Option<Value> {
         let prompt = task.composed_prompt_text()?;
         if prompt.trim().is_empty() {
@@ -857,7 +918,10 @@ impl GeminiProvider {
         }
     }
 
-    fn parse_live_tool_call(task: &ControllerTask, body: &Value) -> Result<Option<ProviderOutput>> {
+    fn parse_live_tool_call(
+        task: &ControllerTask,
+        body: &Value,
+    ) -> Result<Option<(ProviderOutput, Option<String>)>> {
         let alias_map = Self::gemini_function_aliases(&task.tools);
         let Some(function_call) = body
             .get("toolCall")
@@ -877,6 +941,13 @@ impl GeminiProvider {
             return Ok(None);
         }
 
+        let function_call_id = function_call
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
+
         let tool_name = alias_map
             .iter()
             .find_map(|(gemini_alias, original)| {
@@ -890,10 +961,13 @@ impl GeminiProvider {
             .unwrap_or_else(|| json!({}));
         Self::validate_tool_call(task, &tool_name, &arguments)?;
 
-        Ok(Some(ProviderOutput::ToolCall {
-            tool_name,
-            arguments,
-        }))
+        Ok(Some((
+            ProviderOutput::ToolCall {
+                tool_name,
+                arguments,
+            },
+            function_call_id,
+        )))
     }
 
     fn absorb_live_server_content(acc: &mut LiveTurnAccumulator, body: &Value) {
@@ -1015,6 +1089,7 @@ impl GeminiProvider {
             },
             partial_text_deltas,
             session_marker,
+            pending_function_call_id: None,
             generation_complete: acc.generation_complete,
             turn_complete: acc.turn_complete || task.kind == TaskKind::ResponseGenerate,
         })
@@ -1168,51 +1243,78 @@ impl NativeLiveProvider for GeminiProvider {
     }
 
     async fn invoke_live(&self, task: &ControllerTask) -> Result<NativeLiveTurnOutput> {
-        let request = self.live_connect_request()?;
-        let (mut ws, _) = connect_async(request)
-            .await
-            .context("failed to connect to Gemini Live websocket endpoint")?;
-
-        Self::send_live_json(&mut ws, &self.live_setup_payload(task)).await?;
-
-        loop {
-            let message = Self::recv_live_json(&mut ws).await?;
-            if message.get("setupComplete").is_some() {
-                break;
+        let continuing_tool_response = task.provider_options.contains_key("live_tool_response");
+        let mut ws = if let Some(existing_session) = Self::take_live_session(task).await {
+            existing_session.ws
+        } else {
+            if continuing_tool_response {
+                bail!(
+                    "Gemini Live tool-response continuation requested without an active live session"
+                );
             }
-            if let Some(tool_call) = Self::parse_live_tool_call(task, &message)? {
-                return Ok(NativeLiveTurnOutput {
-                    final_output: tool_call,
-                    partial_text_deltas: Vec::new(),
-                    session_marker: None,
-                    generation_complete: false,
-                    turn_complete: false,
-                });
+            let request = self.live_connect_request()?;
+            let (mut ws, _) = connect_async(request)
+                .await
+                .context("failed to connect to Gemini Live websocket endpoint")?;
+
+            Self::send_live_json(&mut ws, &self.live_setup_payload(task)).await?;
+
+            loop {
+                let message = Self::recv_live_json(&mut ws).await?;
+                if message.get("setupComplete").is_some() {
+                    break;
+                }
+                if let Some((tool_call, function_call_id)) =
+                    Self::parse_live_tool_call(task, &message)?
+                {
+                    Self::store_live_session(task, ws).await;
+                    return Ok(NativeLiveTurnOutput {
+                        final_output: tool_call,
+                        partial_text_deltas: Vec::new(),
+                        session_marker: None,
+                        pending_function_call_id: function_call_id,
+                        generation_complete: false,
+                        turn_complete: false,
+                    });
+                }
             }
+
+            ws
+        };
+
+        if let Some(tool_response_payload) = Self::live_tool_response_payload(task) {
+            Self::send_live_json(&mut ws, &tool_response_payload).await?;
         }
 
         match task.kind {
             TaskKind::ResponseGenerate => {
-                if let Some(message) = Self::live_client_prompt_message(task, true) {
-                    Self::send_live_json(&mut ws, &message).await?;
-                } else {
-                    bail!("response.generate task missing prompt for Gemini Live");
+                if !continuing_tool_response {
+                    if let Some(message) = Self::live_client_prompt_message(task, true) {
+                        Self::send_live_json(&mut ws, &message).await?;
+                    } else {
+                        bail!("response.generate task missing prompt for Gemini Live");
+                    }
                 }
             }
             TaskKind::VoiceDialogue => {
-                if let Some(message) = Self::live_client_prompt_message(task, false) {
-                    Self::send_live_json(&mut ws, &message).await?;
-                }
-                Self::send_live_json(
-                    &mut ws,
-                    &json!({ "realtimeInput": { "activityStart": {} } }),
-                )
-                .await?;
-                for chunk in self.live_audio_chunks(task).await? {
-                    Self::send_live_json(&mut ws, &chunk).await?;
-                }
-                Self::send_live_json(&mut ws, &json!({ "realtimeInput": { "activityEnd": {} } }))
+                if !continuing_tool_response {
+                    if let Some(message) = Self::live_client_prompt_message(task, false) {
+                        Self::send_live_json(&mut ws, &message).await?;
+                    }
+                    Self::send_live_json(
+                        &mut ws,
+                        &json!({ "realtimeInput": { "activityStart": {} } }),
+                    )
                     .await?;
+                    for chunk in self.live_audio_chunks(task).await? {
+                        Self::send_live_json(&mut ws, &chunk).await?;
+                    }
+                    Self::send_live_json(
+                        &mut ws,
+                        &json!({ "realtimeInput": { "activityEnd": {} } }),
+                    )
+                    .await?;
+                }
             }
             other => bail!(
                 "Gemini Live native provider received unsupported live task [{}]",
@@ -1225,7 +1327,9 @@ impl NativeLiveProvider for GeminiProvider {
             let message = Self::recv_live_json(&mut ws).await?;
             Self::absorb_live_session_marker(&mut acc, &message);
 
-            if let Some(tool_call) = Self::parse_live_tool_call(task, &message)? {
+            if let Some((tool_call, function_call_id)) = Self::parse_live_tool_call(task, &message)?
+            {
+                Self::store_live_session(task, ws).await;
                 return Ok(NativeLiveTurnOutput {
                     final_output: tool_call,
                     partial_text_deltas: if !acc.text_fragments.is_empty() {
@@ -1240,6 +1344,7 @@ impl NativeLiveProvider for GeminiProvider {
                             protocol: Some(GEMINI_LIVE_PROTOCOL.into()),
                         }
                     }),
+                    pending_function_call_id: function_call_id,
                     generation_complete: acc.generation_complete,
                     turn_complete: acc.turn_complete,
                 });
@@ -1424,6 +1529,8 @@ mod tests {
         ControllerTask {
             kind: TaskKind::TextGenerate,
             request_class: RequestClass::Cognitive,
+            session_id: None,
+            turn_id: None,
             provider: None,
             model: None,
             prompt: Some("test prompt".into()),
@@ -1634,6 +1741,8 @@ mod tests {
         let task = ControllerTask {
             kind: TaskKind::MediaAnalyze,
             request_class: RequestClass::Transform,
+            session_id: None,
+            turn_id: None,
             provider: None,
             model: None,
             prompt: Some("Describe this media".into()),
@@ -1677,6 +1786,8 @@ mod tests {
         let task = ControllerTask {
             kind: TaskKind::AudioTranscribe,
             request_class: RequestClass::Transform,
+            session_id: None,
+            turn_id: None,
             provider: None,
             model: None,
             prompt: Some("Transcribe this audio verbatim.".into()),
@@ -1720,6 +1831,8 @@ mod tests {
         let response_generate = ControllerTask {
             kind: TaskKind::ResponseGenerate,
             request_class: RequestClass::Cognitive,
+            session_id: None,
+            turn_id: None,
             provider: None,
             model: Some("gemini-3.1-flash-live-preview".into()),
             prompt: Some("Respond with native audio and text.".into()),
@@ -1742,6 +1855,8 @@ mod tests {
         let voice_dialogue = ControllerTask {
             kind: TaskKind::VoiceDialogue,
             request_class: RequestClass::Cognitive,
+            session_id: None,
+            turn_id: None,
             provider: None,
             model: Some("gemini-3.1-flash-live-preview".into()),
             prompt: Some("Continue this live conversation.".into()),
@@ -1781,6 +1896,8 @@ mod tests {
         let task = ControllerTask {
             kind: TaskKind::VoiceDialogue,
             request_class: RequestClass::Cognitive,
+            session_id: None,
+            turn_id: None,
             provider: None,
             model: Some("gemini-3.1-flash-live-preview".into()),
             prompt: Some("Continue this live conversation.".into()),
@@ -1988,12 +2105,13 @@ mod tests {
             .expect("live tool call should parse")
             .expect("tool call should be present");
         assert_eq!(
-            output,
+            output.0,
             crate::controller::ProviderOutput::ToolCall {
                 tool_name: "session.status".into(),
                 arguments: serde_json::json!({})
             }
         );
+        assert_eq!(output.1.as_deref(), Some("call-1"));
     }
 
     #[test]
@@ -2012,6 +2130,54 @@ mod tests {
         assert_eq!(
             acc.session_marker.resumption_handle.as_deref(),
             Some("resume-123")
+        );
+    }
+
+    #[test]
+    fn live_tool_response_payload_wraps_json_tool_result_for_function_response() {
+        let mut provider_options = serde_json::Map::new();
+        provider_options.insert(
+            "live_tool_response".into(),
+            serde_json::json!({
+                "function_call_id": "call-1",
+                "tool_name": "session.status",
+                "tool_response": { "ok": true }
+            }),
+        );
+        let task = ControllerTask {
+            kind: TaskKind::ResponseGenerate,
+            request_class: RequestClass::Cognitive,
+            session_id: Some("session-1".into()),
+            turn_id: Some("turn-1".into()),
+            provider: None,
+            model: Some("gemini-3.1-flash-live-preview".into()),
+            prompt: Some("Continue.".into()),
+            text: None,
+            spoken_text: None,
+            display_text: None,
+            voice: None,
+            voice_id: None,
+            output_format: None,
+            language_code: None,
+            response_contract: Default::default(),
+            context: Default::default(),
+            context_projection: Default::default(),
+            affordances: Default::default(),
+            routing_hints: RoutingHints::default(),
+            provider_options,
+            effective_rights: Vec::new(),
+            tools: vec![],
+        };
+
+        let payload =
+            GeminiProvider::live_tool_response_payload(&task).expect("payload should exist");
+        assert_eq!(
+            payload["toolResponse"]["functionResponses"][0]["id"],
+            serde_json::json!("call-1")
+        );
+        assert_eq!(
+            payload["toolResponse"]["functionResponses"][0]["response"]["ok"],
+            serde_json::json!(true)
         );
     }
 }

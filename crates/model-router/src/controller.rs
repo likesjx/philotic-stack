@@ -216,6 +216,8 @@ pub struct RoutingHints {
 pub struct ControllerTask {
     pub kind: TaskKind,
     pub request_class: RequestClass,
+    pub session_id: Option<String>,
+    pub turn_id: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub prompt: Option<String>,
@@ -290,6 +292,14 @@ impl ControllerTask {
         let controller_task = Self {
             kind,
             request_class,
+            session_id: task
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            turn_id: task
+                .get("turn_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             provider: task
                 .get("provider")
                 .and_then(Value::as_str)
@@ -1336,6 +1346,7 @@ pub struct NativeLiveTurnOutput {
     pub final_output: ProviderOutput,
     pub partial_text_deltas: Vec<String>,
     pub session_marker: Option<NativeLiveSessionMarker>,
+    pub pending_function_call_id: Option<String>,
     pub generation_complete: bool,
     pub turn_complete: bool,
 }

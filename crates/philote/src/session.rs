@@ -1023,6 +1023,9 @@ pub struct SessionState {
     pub tool_assembly: ToolAssembly,
     pub recent_turns: Vec<TurnRecord>,
     pub active_turn: Option<WorkingTurn>,
+    /// Pending Gemini/other native-live function call id that should receive the next
+    /// tool response over the same live session rather than restarting cognition.
+    pub pending_native_live_function_call_id: Option<String>,
     /// Subagents spawned during this session that have not yet been released or aborted.
     pub active_subagents: Vec<SpawnedSubagentRef>,
     /// Working summary carried in from the most recent inbound handoff bundle.
@@ -1052,6 +1055,7 @@ impl SessionState {
             bindings,
             recent_turns: Vec::new(),
             active_turn: None,
+            pending_native_live_function_call_id: None,
             last_handoff_summary: None,
             active_subagents: Vec::new(),
             rules: Vec::new(),
@@ -1060,6 +1064,7 @@ impl SessionState {
 
     pub fn start_turn(&mut self, turn: WorkingTurn) {
         self.active_turn = Some(turn);
+        self.pending_native_live_function_call_id = None;
     }
 
     pub fn set_active_turn_phase(&mut self, phase: TurnPhase) {
@@ -1084,6 +1089,14 @@ impl SessionState {
         if let Some(turn) = self.active_turn.as_mut() {
             turn.pending_tool_call = None;
         }
+    }
+
+    pub fn set_pending_native_live_function_call_id(&mut self, function_call_id: String) {
+        self.pending_native_live_function_call_id = Some(function_call_id);
+    }
+
+    pub fn take_pending_native_live_function_call_id(&mut self) -> Option<String> {
+        self.pending_native_live_function_call_id.take()
     }
 
     pub fn set_pending_approval(&mut self, approval: ApprovalRequest) {
@@ -3189,6 +3202,7 @@ impl SessionState {
             "status": self.status,
             "approval_policy": self.approval_policy,
             "bindings": self.bindings,
+            "pending_native_live_function_call_id": self.pending_native_live_function_call_id,
             "active_turn": active_turn,
             "recent_turns": self.recent_turns.iter().map(|turn| {
                 json!({
@@ -3441,6 +3455,10 @@ impl SessionState {
             tool_assembly,
             recent_turns,
             active_turn,
+            pending_native_live_function_call_id: checkpoint
+                .get("pending_native_live_function_call_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
             active_subagents: Vec::new(),
             last_handoff_summary: None,
             rules: checkpoint

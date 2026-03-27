@@ -118,8 +118,9 @@ Current implemented truth for this seam is still transitional:
 - `voice.dialogue` now uses the Live websocket seam and prepares non-PCM blob-backed audio through the first shared `media-prep` enzyme, which currently uses a transitional ffmpeg-backed PCM path before sending Gemini realtime input
 - `philote` now treats cognitive-stage audio artifacts as first-class enough to short-circuit duplicate voice synthesis on voice turns, delivering the native-live artifact directly instead of reflexively asking another synth to repeat it
 - the first shared artifact-interception path now also lives in `media-prep` via a shared `audio_artifact` envelope, so `model-router`, `philote`, and `membrane` stop independently serializing, guessing at, and re-decoding the same payload shape
+- Gemini Live tool calls now preserve the live websocket session inside `model-router` across the tool round-trip, with `philote` carrying the pending function-call id back into the next cognitive request so the actual `toolResponse` returns over the same live receptor instead of restarting the turn from scratch
 - audio output currently re-enters Philotic through output transcription text rather than a first-class cognitive audio artifact
-- sequential in-session tool-response continuation is still a follow-on seam
+- live tool-response continuation is now wired for the Gemini path, though broader native-live lifecycle governance and cleanup policy are still transitional
 
 Interception boundary note:
 
@@ -127,6 +128,7 @@ Interception boundary note:
 - artifact-envelope pressure now has a first shared home there too, because outbound audio artifacts were already crossing `model-router` -> `philote` -> `membrane` with duplicated local decoding logic
 - this is still transitional, not the permanent final anatomy
 - a cleaner long-term shape is to let `media-prep` grow into a broader shared interception substrate between `philote` and provider invocation, but moving all adaptation pressure earlier before more artifact paths are properly metabolized would just spread provider-specific physiology upstream
+- similarly, live-session continuity is currently kept inside the long-lived `model-router` process as a provider-local pool keyed by session/turn rather than a fully generalized hotel-level substrate, because the pressure is proven for Gemini Live function-calling turns but not yet broad enough to justify a larger authority shift
 
 ## OpenAI Provider Recommendation
 
