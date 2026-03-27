@@ -1,7 +1,5 @@
 use anyhow::{Context, Result};
-use philotic_client::{
-    ComponentManifest, GuestIdentity, IpcRequest, IpcResponse, PhiloticClient,
-};
+use philotic_client::{ComponentManifest, GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
 use std::path::PathBuf;
 
 use crate::start::socket_path;
@@ -37,9 +35,14 @@ pub async fn add(manifest_path: PathBuf) -> Result<()> {
             registered_guest_id,
             registered_role,
         } => {
-            println!("\n  OK  guest_id={}  role={}", registered_guest_id, registered_role);
+            println!(
+                "\n  OK  guest_id={}  role={}",
+                registered_guest_id, registered_role
+            );
         }
-        IpcResponse::Standard { ok: false, message, .. } => {
+        IpcResponse::Standard {
+            ok: false, message, ..
+        } => {
             anyhow::bail!("hotel rejected component registration: {message}");
         }
         IpcResponse::Error(msg) => {
@@ -65,7 +68,10 @@ pub async fn list() -> Result<()> {
         .context("IPC request failed")?;
 
     match resp {
-        IpcResponse::ConfigData { value_json: Some(json), .. } => {
+        IpcResponse::ConfigData {
+            value_json: Some(json),
+            ..
+        } => {
             let guests: Vec<serde_json::Value> = serde_json::from_str(&json)
                 .unwrap_or_else(|_| vec![serde_json::json!({"raw": json})]);
             if guests.is_empty() {
@@ -83,7 +89,9 @@ pub async fn list() -> Result<()> {
                 }
             }
         }
-        IpcResponse::ConfigData { value_json: None, .. } => {
+        IpcResponse::ConfigData {
+            value_json: None, ..
+        } => {
             println!("No components registered.");
         }
         other => {
@@ -112,9 +120,10 @@ pub async fn remove(guest_id: String) -> Result<()> {
         .context("failed to fetch component config from hotel")?;
 
     let component_config = match resp {
-        IpcResponse::ConfigData { value_json: Some(ref json), .. } => {
-            serde_json::from_str(json).unwrap_or(serde_json::Value::Null)
-        }
+        IpcResponse::ConfigData {
+            value_json: Some(ref json),
+            ..
+        } => serde_json::from_str(json).unwrap_or(serde_json::Value::Null),
         _ => serde_json::Value::Null,
     };
 
@@ -144,7 +153,10 @@ pub async fn remove(guest_id: String) -> Result<()> {
         .context("IPC request failed")?;
 
     match resp2 {
-        IpcResponse::ComponentRegistered { registered_guest_id, .. } => {
+        IpcResponse::ComponentRegistered {
+            registered_guest_id,
+            ..
+        } => {
             println!("Component {} deactivated.", registered_guest_id);
         }
         other => {

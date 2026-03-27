@@ -60,10 +60,7 @@ impl OnnxProvider {
         let whisper_handle = cache
             .pull_whisper(&config.transcribe.repo_id, config.prefer_quantized)
             .with_context(|| {
-                format!(
-                    "failed to pull Whisper model {}",
-                    config.transcribe.repo_id
-                )
+                format!("failed to pull Whisper model {}", config.transcribe.repo_id)
             })?;
         let whisper_backend = WhisperBackend::load(&whisper_handle, &config.transcribe)
             .context("failed to load WhisperBackend")?;

@@ -19,8 +19,7 @@ const DRIVER_ROLE: &str = "agent-graph-smoke-driver";
 async fn main() -> Result<()> {
     let target_node =
         std::env::var("PHILOTIC_TARGET_NODE").unwrap_or_else(|_| "local-aiua-01".to_string());
-    let agent_id =
-        std::env::var("PHILOTIC_AGENT_ID").unwrap_or_else(|_| "smoke-agent".to_string());
+    let agent_id = std::env::var("PHILOTIC_AGENT_ID").unwrap_or_else(|_| "smoke-agent".to_string());
 
     let mut client = PhiloticClient::connect(GuestIdentity {
         guest_id: DRIVER_GUEST_ID.into(),
@@ -90,7 +89,9 @@ async fn main() -> Result<()> {
     .context("agent.graph.sync emit")?;
     println!("agent.graph.sync dispatched");
 
-    println!("agent-graph smoke driver: all tasks dispatched — side effects will be verified via sqlite3");
+    println!(
+        "agent-graph smoke driver: all tasks dispatched — side effects will be verified via sqlite3"
+    );
     Ok(())
 }
 

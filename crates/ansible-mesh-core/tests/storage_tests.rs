@@ -15,9 +15,8 @@ use ansible_mesh_core::sqlite_storage::{
     SqliteCursorStorage, SqliteEventStorage, SqliteGraphStorage,
 };
 use ansible_mesh_core::storage::{
-    CursorStorage, EventStorage, GuestRecord, HotelRecord, SecretRecord,
-    SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,
-    VaultRegistryEntry,
+    CursorStorage, EventStorage, GuestRecord, HotelRecord, SecretRecord, SessionEventRecord,
+    SessionParticipantRecord, SessionRecord, SessionTurnRecord, VaultRegistryEntry,
 };
 use ansible_mesh_core::{NodeCapabilities, NodeRole};
 use std::sync::Arc;

@@ -515,7 +515,7 @@ mod tests {
     use super::*;
     use ansible_mesh_core::domain::GraphDomain;
     use ansible_mesh_core::graph::{GraphEdge, GraphNode};
-    use ansible_mesh_core::storage::{GuestRecord, GraphAdapter};
+    use ansible_mesh_core::storage::{GraphAdapter, GuestRecord};
     use anyhow::Result;
     use serde_json::json;
     use std::collections::HashMap;
@@ -582,10 +582,7 @@ mod tests {
             if kind == "guest" {
                 let call_index = self.list_guest_calls.fetch_add(1, Ordering::SeqCst);
                 if self.clear_guests_on_second_list && call_index >= 1 {
-                    self.nodes
-                        .lock()
-                        .unwrap()
-                        .retain(|_, n| n.kind != "guest");
+                    self.nodes.lock().unwrap().retain(|_, n| n.kind != "guest");
                 }
             }
             Ok(self
