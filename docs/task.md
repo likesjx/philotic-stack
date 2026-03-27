@@ -758,6 +758,7 @@ Seam IDs: `structured-model-envelope`, `hotel-gemini-oauth-flow`
 - [x] Derive `placement_risk_level` from placement provenance and project it into session posture so elevated-risk sessions suppress remote execution routes without mutating the hotel's underlying rights key ring.
 - [x] Split posture-derived right policy by class so guarded sessions can still use remote model/component execution while denying remote tool execution and shrinking credential scope instead of collapsing all remote reach into one boolean.
 - [x] Adopt `effective_reflexes` naming for fast posture-derived runtime behavior (`remote_tool_reflex`, `remote_component_reflex`, `credential_scope_reflex`) while keeping `effective_right_policy` as a transitional compatibility bridge.
+- [x] Add the first governable reflex record shape with session-level `reflex_overrides` and `reflex_evaluations`, and project overrides back onto `effective_reflexes` instead of keeping reflex behavior purely inferred.
 - [ ] Replace the transitional durable-rule bridge behind `routing.policy.propose` with routing-specific policy records, evaluation history, and operator disposition state.
 - [ ] Fold model-graph metadata into live turn-routing-plan ranking so shared catalog truth informs selection without becoming mutable preference storage.
 - [ ] Define the shared catalog layer for models, tools, skills, and rights as reference knowledge outside hotel-owned mutable state.

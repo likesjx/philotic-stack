@@ -395,6 +395,16 @@ with fields like `remote_tool_reflex`, `remote_component_reflex`, and
 remain as a transitional compatibility bridge, but reflexes are the intended
 operator-facing language for these quick risk/posture responses.
 
+Reflexes should also be governable, not just inferred. The first honest shape
+for that is lightweight session-level reflex records:
+
+- `reflex_overrides` for explicit operator or workflow damping/amplification
+- `reflex_evaluations` for why a reflex fired, was overridden, or should later
+  be revised
+
+Those records do not replace grants. They explain and adjust the fast posture
+layer that sits downstream of grants.
+
 In practice, a fresher active-incarnation update is the `p53` check here: if
 the runtime has newer local evidence that the session now belongs on a
 different active guest, older delivery provenance should die immediately rather

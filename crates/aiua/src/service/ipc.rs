@@ -323,6 +323,29 @@ fn effective_reflexes_from_placement_risk(placement_risk_level: &str) -> serde_j
     }
 }
 
+fn merge_reflex_overrides(
+    inferred_reflexes: serde_json::Value,
+    overrides: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let mut reflexes = inferred_reflexes;
+    let Some(overrides) = overrides.and_then(serde_json::Value::as_object) else {
+        return reflexes;
+    };
+    let Some(obj) = reflexes.as_object_mut() else {
+        return reflexes;
+    };
+    for key in [
+        "remote_tool_reflex",
+        "remote_component_reflex",
+        "credential_scope_reflex",
+    ] {
+        if let Some(value) = overrides.get(key) {
+            obj.insert(key.to_string(), value.clone());
+        }
+    }
+    reflexes
+}
+
 fn load_agent_graph_snapshot(agent_id: &str, source_node_id: &str) -> Option<serde_json::Value> {
     let path = agent_graph_db_path(agent_id);
     if !path.exists() {
@@ -5721,6 +5744,22 @@ impl IpcServer {
             summary_json["tool_assembly"] = tool_assembly.clone();
             session.summary_json = summary_json;
         }
+        if let Some(reflex_overrides) = payload.get("reflex_overrides") {
+            let mut summary_json = session.summary_json.clone();
+            if !summary_json.is_object() {
+                summary_json = serde_json::json!({});
+            }
+            summary_json["reflex_overrides"] = reflex_overrides.clone();
+            session.summary_json = summary_json;
+        }
+        if let Some(reflex_evaluations) = payload.get("reflex_evaluations") {
+            let mut summary_json = session.summary_json.clone();
+            if !summary_json.is_object() {
+                summary_json = serde_json::json!({});
+            }
+            summary_json["reflex_evaluations"] = reflex_evaluations.clone();
+            session.summary_json = summary_json;
+        }
         {
             let marker_kind = payload
                 .get("placement_marker_kind")
@@ -5918,6 +5957,46 @@ impl IpcServer {
             payload,
             now,
         );
+        Self::append_explicit_reflex_events(
+            graph,
+            &session.session_id,
+            turn_id.as_deref(),
+            participant_role.unwrap_or("system"),
+            payload,
+            now,
+        );
+    }
+
+    fn append_explicit_reflex_events(
+        graph: &GraphDomain,
+        session_id: &str,
+        turn_id: Option<&str>,
+        component_id: &str,
+        payload: &serde_json::Value,
+        now: u64,
+    ) {
+        if let Some(reflex_overrides) = payload.get("reflex_overrides") {
+            let _ = graph.append_session_event(&SessionEventRecord {
+                event_id: Uuid::new_v4().to_string(),
+                session_id: session_id.to_string(),
+                turn_id: turn_id.map(str::to_string),
+                component_id: component_id.to_string(),
+                kind: "reflex_overrides_updated".into(),
+                payload_json: reflex_overrides.clone(),
+                created_at: now,
+            });
+        }
+        if let Some(reflex_evaluations) = payload.get("reflex_evaluations") {
+            let _ = graph.append_session_event(&SessionEventRecord {
+                event_id: Uuid::new_v4().to_string(),
+                session_id: session_id.to_string(),
+                turn_id: turn_id.map(str::to_string),
+                component_id: component_id.to_string(),
+                kind: "reflex_evaluations_recorded".into(),
+                payload_json: reflex_evaluations.clone(),
+                created_at: now,
+            });
+        }
     }
 
     fn upsert_tool_runner_registry_entry(
@@ -6303,8 +6382,10 @@ impl IpcServer {
                 })
                 .unwrap_or("guarded");
             if let Some(obj) = bindings.as_object_mut() {
-                let effective_reflexes =
-                    effective_reflexes_from_placement_risk(placement_risk_level);
+                let effective_reflexes = merge_reflex_overrides(
+                    effective_reflexes_from_placement_risk(placement_risk_level),
+                    session.summary_json.get("reflex_overrides"),
+                );
                 let effective_right_policy = serde_json::json!({
                     "remote_tool_execution": effective_reflexes["remote_tool_reflex"],
                     "remote_component_execution": effective_reflexes["remote_component_reflex"],
@@ -11064,6 +11145,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn canonical_session_snapshot_applies_reflex_overrides_over_inferred_reflexes() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-reflex-override".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: Some("agent-jane:orchestrator".into()),
+                channel_kind: Some("operator".into()),
+                channel_session_key: Some("chat-1".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "agent_runtime_provenance": {
+                        "marker_kind": "transport_continuity",
+                        "marker_source": "operator_chat",
+                        "marker_strength": "medium",
+                        "placement_risk_level": "guarded"
+                    },
+                    "reflex_overrides": {
+                        "remote_tool_reflex": "allow",
+                        "credential_scope_reflex": "mesh_scoped"
+                    },
+                    "reflex_evaluations": [{
+                        "reflex_name": "remote_tool_reflex",
+                        "decision": "operator_override",
+                        "reason": "trusted operator session"
+                    }]
+                }),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("seed session");
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("client connect");
+
+        let response = client
+            .send_request(IpcRequest::GetConfig {
+                key: "__session_snapshot__:sess-reflex-override".into(),
+            })
+            .await
+            .expect("session snapshot request");
+
+        match response {
+            IpcResponse::ConfigData {
+                value_json: Some(value_json),
+                ..
+            } => {
+                let snapshot: serde_json::Value =
+                    serde_json::from_str(&value_json).expect("snapshot should decode");
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflexes"]["remote_tool_reflex"],
+                    "allow"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflexes"]["remote_component_reflex"],
+                    "allow"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflexes"]["credential_scope_reflex"],
+                    "mesh_scoped"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_right_policy"]["remote_tool_execution"],
+                    "allow"
+                );
+                assert_eq!(
+                    snapshot["summary"]["reflex_overrides"]["remote_tool_reflex"],
+                    "allow"
+                );
+                assert_eq!(
+                    snapshot["summary"]["reflex_evaluations"][0]["decision"],
+                    "operator_override"
+                );
+            }
+            other => panic!("unexpected session snapshot response: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
     async fn session_snapshot_seeds_bindings_from_toolset_profile_on_fresh_role_session() {
         let _guard = ipc_env_guard();
         let socket_path = test_socket_path();
@@ -13108,6 +13305,96 @@ mod tests {
             events
                 .iter()
                 .any(|event| event.kind == "approval_policy_changed")
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn update_task_with_reflex_governance_updates_session_summary_and_event_log() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("agent connect");
+
+        agent
+            .send_request(IpcRequest::UpdateTask {
+                task_id: Uuid::new_v4(),
+                state: "session_reflexes_updated".into(),
+                payload: serde_json::json!({
+                    "session_id": "sess-reflex-events",
+                    "turn_id": "turn-reflex-1",
+                    "chat_id": "123",
+                    "reflex_overrides": {
+                        "remote_tool_reflex": "allow",
+                        "credential_scope_reflex": "mesh_scoped"
+                    },
+                    "reflex_evaluations": [{
+                        "reflex_name": "remote_tool_reflex",
+                        "decision": "operator_override",
+                        "reason": "trusted operator session"
+                    }]
+                }),
+            })
+            .await
+            .expect("update task should succeed");
+
+        let session = graph
+            .get_session("sess-reflex-events")
+            .expect("session lookup should work")
+            .expect("session should exist");
+        assert_eq!(
+            session.summary_json["reflex_overrides"]["remote_tool_reflex"],
+            "allow"
+        );
+        assert_eq!(
+            session.summary_json["reflex_evaluations"][0]["decision"],
+            "operator_override"
+        );
+
+        let events = graph
+            .list_session_events("sess-reflex-events", 20)
+            .expect("event listing should work");
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "reflex_overrides_updated")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "reflex_evaluations_recorded")
         );
 
         unsafe {
