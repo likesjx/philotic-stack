@@ -382,6 +382,12 @@ continuity. Rights do not change, but the projected execution posture can
 narrow: elevated-risk sessions can be forced into local-only execution until a
 stronger continuity or handoff marker is expressed.
 
+That narrowing is now beginning to split by right class rather than one blunt
+switch. A guarded session can still be allowed to use remote model/component
+execution while denying remote tool execution and shrinking credential scope.
+The hotel still owns grants; posture only narrows how far those grants may
+reach in the current session.
+
 In practice, a fresher active-incarnation update is the `p53` check here: if
 the runtime has newer local evidence that the session now belongs on a
 different active guest, older delivery provenance should die immediately rather

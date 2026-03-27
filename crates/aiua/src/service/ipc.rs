@@ -251,6 +251,24 @@ fn remote_execution_allowed(bindings: &serde_json::Value) -> bool {
         .unwrap_or(true)
 }
 
+fn remote_tool_execution_allowed(bindings: &serde_json::Value) -> bool {
+    bindings
+        .get("effective_right_policy")
+        .and_then(|policy| policy.get("remote_tool_execution"))
+        .and_then(serde_json::Value::as_str)
+        .map(|value| value == "allow")
+        .unwrap_or_else(|| remote_execution_allowed(bindings))
+}
+
+fn remote_component_execution_allowed(bindings: &serde_json::Value) -> bool {
+    bindings
+        .get("effective_right_policy")
+        .and_then(|policy| policy.get("remote_component_execution"))
+        .and_then(serde_json::Value::as_str)
+        .map(|value| value == "allow")
+        .unwrap_or_else(|| remote_execution_allowed(bindings))
+}
+
 fn load_agent_graph_snapshot(agent_id: &str, source_node_id: &str) -> Option<serde_json::Value> {
     let path = agent_graph_db_path(agent_id);
     if !path.exists() {
@@ -6231,6 +6249,23 @@ impl IpcServer {
                 })
                 .unwrap_or("guarded");
             if let Some(obj) = bindings.as_object_mut() {
+                let effective_right_policy = match placement_risk_level {
+                    "elevated" => serde_json::json!({
+                        "remote_tool_execution": "deny",
+                        "remote_component_execution": "deny",
+                        "credential_scope": "local_only",
+                    }),
+                    "low" => serde_json::json!({
+                        "remote_tool_execution": "allow",
+                        "remote_component_execution": "allow",
+                        "credential_scope": "mesh_scoped",
+                    }),
+                    _ => serde_json::json!({
+                        "remote_tool_execution": "deny",
+                        "remote_component_execution": "allow",
+                        "credential_scope": "local_scoped",
+                    }),
+                };
                 obj.insert(
                     "effective_posture".to_string(),
                     serde_json::json!({
@@ -6238,6 +6273,7 @@ impl IpcServer {
                         "remote_execution_allowed": placement_risk_level != "elevated",
                     }),
                 );
+                obj.insert("effective_right_policy".to_string(), effective_right_policy);
             }
         }
 
@@ -6584,7 +6620,7 @@ fn select_component_route(
             }
         })
         .unwrap_or_else(|| default_component_role(capability).to_string());
-    let allow_remote_execution = remote_execution_allowed(bindings);
+    let allow_remote_execution = remote_component_execution_allowed(bindings);
 
     if let Some(incarnation_id) = binding
         .and_then(|route| route.get("incarnation"))
@@ -6953,7 +6989,7 @@ fn select_remote_tool_advertisement(
     tool_name: &str,
     bindings: &serde_json::Value,
 ) -> Option<CapabilityAdvertisement> {
-    if !remote_execution_allowed(bindings) {
+    if !remote_tool_execution_allowed(bindings) {
         return None;
     }
     let target_role = format!("tool.{tool_name}");
@@ -10943,6 +10979,18 @@ mod tests {
                     snapshot["bindings"]["effective_posture"]["remote_execution_allowed"],
                     true
                 );
+                assert_eq!(
+                    snapshot["bindings"]["effective_right_policy"]["remote_tool_execution"],
+                    "deny"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_right_policy"]["remote_component_execution"],
+                    "allow"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_right_policy"]["credential_scope"],
+                    "local_scoped"
+                );
             }
             other => panic!("unexpected session snapshot response: {other:?}"),
         }
@@ -11395,6 +11443,79 @@ mod tests {
         assert!(
             assembly["execution_routes"].get("echo").is_none(),
             "elevated placement risk should suppress remote echo route"
+        );
+    }
+
+    #[test]
+    fn compose_tool_assembly_suppresses_remote_tool_routes_when_right_policy_is_guarded() {
+        let bindings = serde_json::json!({
+            "effective_toolset": ["echo"],
+            "effective_rights": ["tool.echo"],
+            "effective_posture": {
+                "placement_risk_level": "guarded",
+                "remote_execution_allowed": true
+            },
+            "effective_right_policy": {
+                "remote_tool_execution": "deny",
+                "remote_component_execution": "allow",
+                "credential_scope": "local_scoped"
+            }
+        });
+        let remote_ads = vec![CapabilityAdvertisement {
+            hotel_id: "remote-hotel".into(),
+            node_id: "remote-node".into(),
+            incarnation_id: "remote-hotel:tool-echo".into(),
+            target_role: "tool.echo".into(),
+            availability_state: "live".into(),
+            selection_hint: Some("remote_latency_capacity".into()),
+            latency_hint_ms: Some(8),
+            max_concurrent_jobs: Some(8),
+            active_jobs: 0,
+            queue_depth: 0,
+        }];
+
+        let assembly = compose_tool_assembly(&bindings, &[], &[], &remote_ads, "local-aiua-01");
+
+        assert_eq!(assembly["tools_for_model"][0]["tool_name"], "echo");
+        assert!(
+            assembly["execution_routes"].get("echo").is_none(),
+            "guarded right policy should suppress remote echo route"
+        );
+    }
+
+    #[test]
+    fn compose_tool_assembly_allows_remote_tool_routes_when_right_policy_is_low_risk() {
+        let bindings = serde_json::json!({
+            "effective_toolset": ["echo"],
+            "effective_rights": ["tool.echo"],
+            "effective_posture": {
+                "placement_risk_level": "low",
+                "remote_execution_allowed": true
+            },
+            "effective_right_policy": {
+                "remote_tool_execution": "allow",
+                "remote_component_execution": "allow",
+                "credential_scope": "mesh_scoped"
+            }
+        });
+        let remote_ads = vec![CapabilityAdvertisement {
+            hotel_id: "remote-hotel".into(),
+            node_id: "remote-node".into(),
+            incarnation_id: "remote-hotel:tool-echo".into(),
+            target_role: "tool.echo".into(),
+            availability_state: "live".into(),
+            selection_hint: Some("remote_latency_capacity".into()),
+            latency_hint_ms: Some(8),
+            max_concurrent_jobs: Some(8),
+            active_jobs: 0,
+            queue_depth: 0,
+        }];
+
+        let assembly = compose_tool_assembly(&bindings, &[], &[], &remote_ads, "local-aiua-01");
+
+        assert_eq!(
+            assembly["execution_routes"]["echo"]["target_node"],
+            "remote-node"
         );
     }
 
