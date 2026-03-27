@@ -753,6 +753,7 @@ Seam IDs: `structured-model-envelope`, `hotel-gemini-oauth-flow`
 - [x] Treat persisted local delivery provenance as a freshness-based placement hint with TTL-based apoptosis, so stale local placement dies cleanly instead of haunting routing/materialization forever.
 - [x] Supersede older local placement provenance immediately when fresher active-incarnation truth appears, so the runtime has a `p53`-style conflict kill switch instead of waiting for TTL alone.
 - [x] Differentiate placement-marker apoptosis by marker class so short-lived `receptor_ingress` continuity dies faster than transport or handoff markers instead of every marker pretending to have the same half-life.
+- [x] Differentiate placement-marker supersession posture by marker class so newer local active-incarnation truth kills weak `receptor_ingress` markers immediately but explicit `transport_continuity` and `role_handoff` markers can preserve their placement target under conflict.
 - [ ] Replace the transitional durable-rule bridge behind `routing.policy.propose` with routing-specific policy records, evaluation history, and operator disposition state.
 - [ ] Fold model-graph metadata into live turn-routing-plan ranking so shared catalog truth informs selection without becoming mutable preference storage.
 - [ ] Define the shared catalog layer for models, tools, skills, and rights as reference knowledge outside hotel-owned mutable state.

@@ -358,6 +358,14 @@ placement across hotels. `role_handoff` markers can reasonably live a little
 longer because they encode an intentional operator or workflow move rather than
 an incidental ingress stain.
 
+They should not all resolve conflict the same way either. A fresh
+`active_incarnation_id` update should kill older `receptor_ingress` placement
+markers immediately, because those are weak local hints. But explicit
+`transport_continuity` and `role_handoff` markers can remain valid under that
+same conflict and keep steering fallback or parking toward their persisted
+guest, because they encode stronger continuity or intentional movement rather
+than a transient receptor signal.
+
 In practice, a fresher active-incarnation update is the `p53` check here: if
 the runtime has newer local evidence that the session now belongs on a
 different active guest, older delivery provenance should die immediately rather
