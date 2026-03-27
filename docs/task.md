@@ -740,7 +740,9 @@ Seam IDs: `structured-model-envelope`, `hotel-gemini-oauth-flow`
 - [x] Extend stage-aware affordance policy into prompt/context projection: hide skill guidance and detailed approval posture on non-cognitive and low-intent turns.
 - [x] Make approval interrupts stage-aware: redirect low-intent free-form approval asks back to direct response and reject non-cognitive approval interrupts while preserving real scripted/tool gates.
 - [x] Define a governed `routing.policy.propose` tool and companion `routing.refinement` skill so the agent can reflexively suggest cognition/routing policy updates under operator approval and memory write-back.
+- [x] Add first-class agent-graph routing preferences plus active `agent.graph.read`/`agent.graph.write` tool definitions so routing posture can be stored in agent-local graph state instead of only prompt text.
 - [ ] Replace the transitional durable-rule bridge behind `routing.policy.propose` with routing-specific policy records, evaluation history, and operator disposition state.
+- [ ] Feed agent-graph routing preferences and future model-graph metadata into live turn-routing-plan compilation and ranking.
 - [x] Add a rebuild-first local watched-UAT workflow so stale materialized binaries and stale sockets do not masquerade as runtime regressions.
 - [ ] Define hotel CLI OAuth UX:
   - browser launch

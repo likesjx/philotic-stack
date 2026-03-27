@@ -57,10 +57,48 @@ fn write_tool_preference_then_read_it_back() {
         "smoke-agent",
     );
 
-    let prefs = result["tool_preferences"].as_array().expect("tool_preferences array");
+    let prefs = result["tool_preferences"]
+        .as_array()
+        .expect("tool_preferences array");
     assert_eq!(prefs.len(), 1);
     assert_eq!(prefs[0]["tool_name"], "bash.exec");
     assert_eq!(prefs[0]["preference_level"], 1);
+}
+
+#[test]
+fn write_routing_preference_then_read_it_back() {
+    let (storage, _f) = open_storage("smoke-agent");
+
+    dispatch_ok(
+        &storage,
+        "agent.graph.write",
+        json!({
+            "entity": "routing_preference",
+            "preference_key": "voice-ingress-elevenlabs",
+            "stage_kind": "ingress",
+            "capability": "voice.transcribe",
+            "provider_hint": "elevenlabs",
+            "preference_level": 1,
+            "weight": 90,
+            "config": {"reason": "voice specialist"}
+        }),
+        "smoke-agent",
+    );
+
+    let result = dispatch_ok(
+        &storage,
+        "agent.graph.read",
+        json!({"entity": "routing_preferences"}),
+        "smoke-agent",
+    );
+
+    let prefs = result["routing_preferences"]
+        .as_array()
+        .expect("routing_preferences array");
+    assert_eq!(prefs.len(), 1);
+    assert_eq!(prefs[0]["preference_key"], "voice-ingress-elevenlabs");
+    assert_eq!(prefs[0]["provider_hint"], "elevenlabs");
+    assert_eq!(prefs[0]["weight"], 90);
 }
 
 // ── agent.graph.declare ───────────────────────────────────────────────────────
@@ -83,7 +121,9 @@ fn declare_resource_and_read_back() {
         "smoke-agent",
     );
 
-    let decls = result["resource_declarations"].as_array().expect("declarations array");
+    let decls = result["resource_declarations"]
+        .as_array()
+        .expect("declarations array");
     assert_eq!(decls.len(), 1);
     assert_eq!(decls[0]["resource_type"], "model_router");
     assert_eq!(decls[0]["config_hint"], "gemini");
@@ -93,8 +133,8 @@ fn declare_resource_and_read_back() {
 
 #[test]
 fn recall_returns_experience_traces() {
-    use ansible_mesh_core::agent_graph_storage::AgentGraphStorage;
     use ansible_mesh_core::agent_graph_storage::AgentExperienceTrace;
+    use ansible_mesh_core::agent_graph_storage::AgentGraphStorage;
 
     let (storage, _f) = open_storage("smoke-agent");
 
@@ -121,7 +161,10 @@ fn recall_returns_experience_traces() {
     );
 
     let traces = result["traces"].as_array().expect("traces array");
-    assert!(!traces.is_empty(), "experience ledger should contain at least one trace");
+    assert!(
+        !traces.is_empty(),
+        "experience ledger should contain at least one trace"
+    );
     assert_eq!(traces[0]["event_type"], "tool_call");
 }
 
@@ -144,6 +187,7 @@ fn sync_inserts_new_preference_from_snapshot() {
             config_json: json!({"setting": true}),
             updated_at: 1_000_000,
         }],
+        routing_preferences: vec![],
         declarations: vec![],
     };
 
@@ -152,6 +196,8 @@ fn sync_inserts_new_preference_from_snapshot() {
 
     assert_eq!(result["preferences_applied"], 1);
     assert_eq!(result["preferences_skipped"], 0);
+    assert_eq!(result["routing_preferences_applied"], 0);
+    assert_eq!(result["routing_preferences_skipped"], 0);
 
     // Verify it is readable.
     let read_result = dispatch_ok(
@@ -169,7 +215,12 @@ fn sync_inserts_new_preference_from_snapshot() {
 #[test]
 fn unknown_tool_returns_error_not_panic() {
     let (storage, _f) = open_storage("smoke-agent");
-    let raw = tools::dispatch(&storage, "agent.graph.nonexistent", &json!({}), "smoke-agent");
+    let raw = tools::dispatch(
+        &storage,
+        "agent.graph.nonexistent",
+        &json!({}),
+        "smoke-agent",
+    );
     let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(v["ok"], false);
     assert!(v["error"].as_str().is_some());

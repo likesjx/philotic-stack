@@ -4588,8 +4588,8 @@ mod tests {
             skill_implied_tools("routing.refinement"),
             &[
                 "session.status",
-                "memory.recall",
-                "memory.remember",
+                "agent.graph.read",
+                "agent.graph.write",
                 "routing.policy.propose",
             ]
         );

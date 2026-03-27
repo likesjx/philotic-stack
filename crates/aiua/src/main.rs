@@ -1891,6 +1891,45 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             class: "workspace".into(),
         },
         AbstractToolRecord {
+            tool_name: "agent.graph.read".into(),
+            description: "Read structured state from the agent's own graph substrate, including agent-local routing and tool preferences.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "entity": {
+                        "type": "string",
+                        "enum": ["resource_grants", "tool_preferences", "routing_preferences", "resource_declarations"]
+                    }
+                },
+                "required": ["entity"]
+            }),
+            class: "capability".into(),
+        },
+        AbstractToolRecord {
+            tool_name: "agent.graph.write".into(),
+            description: "Write an agent-local graph preference record such as a tool or routing preference. Does not mutate hotel authority directly.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "entity": {
+                        "type": "string",
+                        "enum": ["tool_preference", "routing_preference"]
+                    },
+                    "tool_name": { "type": "string" },
+                    "preference_key": { "type": "string" },
+                    "stage_kind": { "type": "string" },
+                    "capability": { "type": "string" },
+                    "provider_hint": { "type": "string" },
+                    "model_ref": { "type": "string" },
+                    "preference_level": { "type": "integer" },
+                    "weight": { "type": "integer" },
+                    "config": {}
+                },
+                "required": ["entity"]
+            }),
+            class: "capability".into(),
+        },
+        AbstractToolRecord {
             tool_name: "agent.configure".into(),
             description: "Update an agent configuration field. Supports approval_policy, \
                           profile, and bindings sections. Requires operator approval unless \
@@ -1978,16 +2017,17 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
         },
         AbstractSkillRecord {
             skill_name: "routing.refinement".into(),
-            description: "Notice repeated routing failures or stage-affordance mismatches, gather evidence from current context and memory, and propose a governed routing-policy refinement instead of silently mutating behavior.".into(),
+            description: "Notice repeated routing failures or stage-affordance mismatches, inspect and update agent-local routing preferences in the agent graph, and escalate durable routing-policy refinements for operator review instead of silently mutating behavior.".into(),
             implied_tools: vec![
                 "session.status".into(),
-                "memory.recall".into(),
-                "memory.remember".into(),
+                "agent.graph.read".into(),
+                "agent.graph.write".into(),
                 "routing.policy.propose".into(),
             ],
             validation_state: ansible_mesh_core::graph::SkillValidationState::Validated,
             field_sources: serde_json::json!({
                 "transitional_note": "Uses durable rule storage as the current governed persistence path for routing-policy proposals.",
+                "agent_graph_note": "Agent-local routing preferences are stored in the active agent graph and may reference model-graph facts indirectly via stable capability/provider/model identifiers.",
             }),
             ..Default::default()
         },

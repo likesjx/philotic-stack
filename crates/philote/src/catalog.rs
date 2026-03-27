@@ -37,8 +37,8 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
         "memory" => &["memory.recall", "memory.remember"],
         "routing.refinement" => &[
             "session.status",
-            "memory.recall",
-            "memory.remember",
+            "agent.graph.read",
+            "agent.graph.write",
             "routing.policy.propose",
         ],
         _ => &[],
@@ -102,6 +102,61 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                 "required": ["text"]
             }),
             class: Some("utility".into()),
+        },
+    );
+
+    m.insert(
+        "agent.graph.read".into(),
+        ToolDefinition {
+            tool_name: "agent.graph.read".into(),
+            description: "Read structured state from the agent's own graph substrate. Use this \
+                          to inspect agent-local preferences, declarations, and other cognitive \
+                          policy records without reaching into hotel-owned authority."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "entity": {
+                        "type": "string",
+                        "enum": ["resource_grants", "tool_preferences", "routing_preferences", "resource_declarations"],
+                        "description": "The agent-graph entity collection to read."
+                    }
+                },
+                "required": ["entity"]
+            }),
+            class: Some("capability".into()),
+        },
+    );
+
+    m.insert(
+        "agent.graph.write".into(),
+        ToolDefinition {
+            tool_name: "agent.graph.write".into(),
+            description: "Write an agent-local graph preference or configuration record. Use for \
+                          governed self-configuration inside the agent graph, such as tool or \
+                          routing preferences. This does not mutate hotel authority or the shared \
+                          model graph directly."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "entity": {
+                        "type": "string",
+                        "enum": ["tool_preference", "routing_preference"]
+                    },
+                    "tool_name": { "type": "string" },
+                    "preference_key": { "type": "string" },
+                    "stage_kind": { "type": "string" },
+                    "capability": { "type": "string" },
+                    "provider_hint": { "type": "string" },
+                    "model_ref": { "type": "string" },
+                    "preference_level": { "type": "integer" },
+                    "weight": { "type": "integer" },
+                    "config": {}
+                },
+                "required": ["entity"]
+            }),
+            class: Some("capability".into()),
         },
     );
 

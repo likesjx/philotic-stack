@@ -3,7 +3,7 @@ title: "Agent-Centric Resource Model"
 doc_type: proposal
 domain: runtime-sessions
 status: proposed
-last_updated: 2026-03-22
+last_updated: 2026-03-26
 tags:
   - resource-broker
   - demand-driven-materialization
@@ -250,6 +250,7 @@ AgentGraph {
 
   // Cognitive configuration
   tool_preferences:           [...],
+  routing_preferences:        [...],
   memory_policy:              MemoryPolicy,
   context_assembly_config:    ContextAssemblyConfig,
   active_skills:              [SkillRecord],
@@ -271,7 +272,7 @@ extension of the same `GraphStorage` abstraction already in use for the hotel
 CG. The implementation is a reusable middle layer that:
 
 - defines the domain operations the agent graph needs (`get_resource_grants`,
-  `upsert_tool_preference`, `record_experience_trace`, etc.)
+  `upsert_tool_preference`, `upsert_routing_preference`, `record_experience_trace`, etc.)
 - hides the backend behind the trait boundary
 - starts with the SQLite backend already in production
 - allows a backend swap (RocksDB, or anything else) later via a single impl
