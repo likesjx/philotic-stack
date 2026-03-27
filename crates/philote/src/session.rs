@@ -2099,6 +2099,16 @@ impl SessionState {
         }
 
         all_tools
+            .into_iter()
+            .filter(|tool| {
+                !self
+                    .tool_assembly
+                    .policy_annotations
+                    .get(&tool.tool_name)
+                    .map(|annotation| annotation.approval_required)
+                    .unwrap_or(false)
+            })
+            .collect()
     }
 
     pub fn project_tools_for_envelope(
@@ -5707,6 +5717,20 @@ mod tests {
         state.add_tool_binding("session.status");
 
         let projected = state.project_tools_for_turn("use echo hello there");
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].tool_name, "echo");
+    }
+
+    #[test]
+    fn generic_cognitive_turn_suppresses_approval_gated_tools() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("echo");
+        state.add_tool_binding("handoff.to_role");
+
+        let projected = state.project_tools_for_turn("Please help me think through this design.");
+
         assert_eq!(projected.len(), 1);
         assert_eq!(projected[0].tool_name, "echo");
     }
