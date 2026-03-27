@@ -86,6 +86,7 @@ Pin and prove the first design contract for:
 - a structured model response envelope with explicit response channels for optimization-oriented outputs
 - a first `request_class` split so cognitive calls can carry agent context and affordances without forcing every model call to pretend it is part of the reasoning loop
 - a proposal-backed OpenAI provider slice covering standard text/tool/structured-output support, hotel-owned OAuth, and model-specific capability overrides
+- a first honest Gemini Live provider slice on the native-live seam: websocket setup, text-native `response.generate`, PCM-gated `voice.dialogue`, dedicated live tool-call parsing, and resumable-session markers without pretending classic one-shot invocation already had the right physiology
 
 Current confidence for the implemented structured-envelope slice:
 
@@ -97,6 +98,26 @@ Current confidence for the implemented structured-envelope slice:
 - not yet `watched-live-green` for end-to-end role/context projection in a live session
 
 Linked task surface: [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md)
+
+## Gemini Live Pressure
+
+Gemini 3.1 Flash Live is now important design pressure on this boundary because it is not a
+fancier `generateContent` POST. It is a stateful Live API session with websocket setup,
+realtime input, dedicated tool-call messages, and session-resumption updates.
+
+The first honest controller slice should therefore:
+
+- use the native-live provider seam rather than overextending `ModelProvider::invoke`
+- treat `response.generate` and `voice.dialogue` as native-live capability species
+- keep tool calls surfaced back into the canonical controller envelope rather than letting the provider become turn owner
+- keep voice input requirements explicit: Gemini Live expects raw PCM audio on the realtime input path, so upstream transport conversion is a separate seam rather than something the provider should fake
+
+Current implemented truth for this seam is still transitional:
+
+- `response.generate` now uses the Live websocket seam and returns canonical text output
+- `voice.dialogue` now uses the Live websocket seam when given blob-backed PCM audio
+- audio output currently re-enters Philotic through output transcription text rather than a first-class cognitive audio artifact
+- sequential in-session tool-response continuation is still a follow-on seam
 
 ## OpenAI Provider Recommendation
 

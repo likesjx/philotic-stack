@@ -201,21 +201,47 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                     match provider.invoke_live(&controller_task).await {
                         Ok(output) => {
                             let latency_ms = dispatch_start.elapsed().as_millis() as u64;
-                            record_routing_trace(
-                                trace_store.as_deref(),
-                                &reply,
-                                &provider_id,
-                                &task_kind,
-                                "success",
-                                None,
-                                latency_ms,
-                            );
-                            let response = ControllerResponseEnvelope::from_output(
-                                &controller_task,
-                                provider.id(),
-                                output.final_output,
-                            )?;
-                            emit_text_response(&mut ipc_client, &reply, response).await?;
+                            match output.final_output {
+                                ProviderOutput::ToolCall {
+                                    tool_name,
+                                    arguments,
+                                } => {
+                                    record_routing_trace(
+                                        trace_store.as_deref(),
+                                        &reply,
+                                        &provider_id,
+                                        &task_kind,
+                                        "tool_call",
+                                        None,
+                                        latency_ms,
+                                    );
+                                    emit_tool_call_response(
+                                        &mut ipc_client,
+                                        &reply,
+                                        tool_name,
+                                        arguments,
+                                        None,
+                                    )
+                                    .await?;
+                                }
+                                output => {
+                                    record_routing_trace(
+                                        trace_store.as_deref(),
+                                        &reply,
+                                        &provider_id,
+                                        &task_kind,
+                                        "success",
+                                        None,
+                                        latency_ms,
+                                    );
+                                    let response = ControllerResponseEnvelope::from_output(
+                                        &controller_task,
+                                        provider.id(),
+                                        output,
+                                    )?;
+                                    emit_text_response(&mut ipc_client, &reply, response).await?;
+                                }
+                            }
                         }
                         Err(err) => {
                             let latency_ms = dispatch_start.elapsed().as_millis() as u64;

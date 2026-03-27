@@ -6,9 +6,19 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::borrow::Cow;
+use std::time::Duration;
+use tokio::time::timeout;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 use tracing::info;
+
+const GEMINI_LIVE_DEFAULT_MODEL: &str = "gemini-3.1-flash-live-preview";
+const GEMINI_LIVE_PROTOCOL: &str = "gemini-live-v1beta";
+const GEMINI_LIVE_MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GeminiAuth {
@@ -24,6 +34,20 @@ pub struct GeminiProvider {
     auth: Option<GeminiAuth>,
     default_model: String,
     base_url: String,
+}
+
+#[derive(Debug, Default)]
+struct LiveTurnAccumulator {
+    text_fragments: Vec<String>,
+    transcript_fragments: Vec<String>,
+    generation_complete: bool,
+    turn_complete: bool,
+    session_marker: NativeLiveTurnOutputMarker,
+}
+
+#[derive(Debug, Default)]
+struct NativeLiveTurnOutputMarker {
+    resumption_handle: Option<String>,
 }
 
 impl GeminiProvider {
@@ -92,6 +116,72 @@ impl GeminiProvider {
                 "{}/v1beta/models/{}:generateContent",
                 self.base_url, model
             )),
+        }
+    }
+
+    fn live_endpoint_url(&self) -> Result<reqwest::Url> {
+        let mut url = reqwest::Url::parse(&self.base_url)
+            .with_context(|| format!("invalid Gemini base_url [{}]", self.base_url))?;
+        let live_scheme = match url.scheme() {
+            "https" => "wss",
+            "http" => "ws",
+            other => bail!(
+                "Gemini Live requires http(s) base_url so it can derive ws(s); got [{}]",
+                other
+            ),
+        };
+        url.set_scheme(live_scheme).map_err(|_| {
+            anyhow::anyhow!("failed to convert Gemini base_url to websocket scheme")
+        })?;
+        url.set_path(
+            "/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent",
+        );
+        url.set_query(None);
+        if let Some(GeminiAuth::ApiKey(api_key)) = self.auth.as_ref() {
+            url.query_pairs_mut().append_pair("key", api_key);
+        }
+        Ok(url)
+    }
+
+    fn live_connect_request(&self) -> Result<axum::http::Request<()>> {
+        let mut request = self
+            .live_endpoint_url()?
+            .to_string()
+            .into_client_request()
+            .context("failed to build Gemini Live websocket request")?;
+
+        if let Some(GeminiAuth::OAuthBearer {
+            access_token,
+            project_id,
+        }) = self.auth.as_ref()
+        {
+            request.headers_mut().insert(
+                axum::http::header::AUTHORIZATION,
+                axum::http::HeaderValue::from_str(&format!("Bearer {access_token}"))
+                    .context("invalid Gemini OAuth authorization header")?,
+            );
+            if let Some(project_id) = project_id {
+                request.headers_mut().insert(
+                    "x-goog-user-project",
+                    axum::http::HeaderValue::from_str(project_id)
+                        .context("invalid Gemini OAuth project header")?,
+                );
+            }
+        }
+
+        Ok(request)
+    }
+
+    fn live_model_name(task: &ControllerTask) -> String {
+        let model = task
+            .model
+            .as_deref()
+            .or_else(|| task.routing_hints.model_ref.as_deref())
+            .unwrap_or(GEMINI_LIVE_DEFAULT_MODEL);
+        if model.starts_with("models/") {
+            model.to_string()
+        } else {
+            format!("models/{model}")
         }
     }
 
@@ -579,6 +669,353 @@ impl GeminiProvider {
             }
         }
     }
+
+    fn live_response_modalities(task: &ControllerTask) -> Vec<String> {
+        if let Some(items) = task
+            .provider_options
+            .get("response_modalities")
+            .and_then(Value::as_array)
+        {
+            let parsed = items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|item| item.trim().to_ascii_uppercase())
+                .filter(|item| !item.is_empty())
+                .collect::<Vec<_>>();
+            if !parsed.is_empty() {
+                return parsed;
+            }
+        }
+
+        match task.kind {
+            TaskKind::VoiceDialogue => vec!["AUDIO".into()],
+            TaskKind::ResponseGenerate => vec!["TEXT".into()],
+            _ => vec!["TEXT".into()],
+        }
+    }
+
+    fn live_setup_payload(&self, task: &ControllerTask) -> Value {
+        let response_modalities = Self::live_response_modalities(task);
+        let wants_audio_output = response_modalities.iter().any(|item| item == "AUDIO");
+        let mut setup = json!({
+            "model": Self::live_model_name(task),
+            "generationConfig": {
+                "responseModalities": response_modalities
+            },
+            "sessionResumption": {}
+        });
+
+        if let Some(handle) = task
+            .provider_option_str("resumption_handle")
+            .or_else(|| task.provider_option_str("session_resumption_handle"))
+        {
+            setup["sessionResumption"]["handle"] = Value::String(handle.to_string());
+        }
+
+        if !task.tools.is_empty() {
+            setup["tools"] = json!([{
+                "functionDeclarations": Self::function_declarations(&task.tools)
+            }]);
+        }
+
+        if task.kind == TaskKind::VoiceDialogue {
+            setup["realtimeInputConfig"] = json!({
+                "automaticActivityDetection": {
+                    "disabled": true
+                }
+            });
+            setup["inputAudioTranscription"] = json!({});
+        }
+
+        if wants_audio_output {
+            setup["outputAudioTranscription"] = json!({});
+        }
+
+        json!({ "setup": setup })
+    }
+
+    fn live_client_prompt_message(task: &ControllerTask, turn_complete: bool) -> Option<Value> {
+        let prompt = task.composed_prompt_text()?;
+        if prompt.trim().is_empty() {
+            return None;
+        }
+        Some(json!({
+            "clientContent": {
+                "turns": [{
+                    "role": "user",
+                    "parts": [{ "text": prompt }]
+                }],
+                "turnComplete": turn_complete
+            }
+        }))
+    }
+
+    async fn live_audio_chunks(&self, task: &ControllerTask) -> Result<Vec<Value>> {
+        let mut chunks = Vec::new();
+        for attachment in task.media_attachments().iter().filter(|attachment| {
+            attachment
+                .url
+                .as_deref()
+                .map(|url| !url.trim().is_empty())
+                .unwrap_or(false)
+                && attachment
+                    .transport_error
+                    .as_deref()
+                    .map(|error| error.trim().is_empty())
+                    .unwrap_or(true)
+        }) {
+            let mime_type = attachment_mime_type(attachment)
+                .with_context(|| format!("attachment {:?} missing mime type", attachment.kind))?;
+            if !mime_type.starts_with("audio/pcm") {
+                bail!(
+                    "Gemini Live voice.dialogue currently requires PCM audio input; attachment mime type [{}] needs an upstream conversion enzyme before it can cross this receptor",
+                    mime_type
+                );
+            }
+
+            let url = attachment
+                .url
+                .as_deref()
+                .context("live audio attachment missing download url")?;
+            let response = self.http_client.get(url).send().await?;
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                bail!(
+                    "failed to fetch live audio attachment from {}: HTTP {} {}",
+                    url,
+                    status,
+                    body
+                );
+            }
+            let bytes = response.bytes().await?;
+            chunks.push(json!({
+                "realtimeInput": {
+                    "audio": {
+                        "mimeType": mime_type,
+                        "data": BASE64_STANDARD.encode(bytes)
+                    }
+                }
+            }));
+        }
+
+        if chunks.is_empty() {
+            bail!("voice.dialogue requires at least one blob-backed PCM audio attachment");
+        }
+
+        Ok(chunks)
+    }
+
+    async fn send_live_json<S>(ws: &mut S, payload: &Value) -> Result<()>
+    where
+        S: futures::Sink<WsMessage, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+    {
+        ws.send(WsMessage::Text(
+            serde_json::to_string(payload)
+                .context("failed to serialize Gemini Live websocket payload")?
+                .into(),
+        ))
+        .await
+        .context("failed to send Gemini Live websocket payload")
+    }
+
+    async fn recv_live_json<S>(ws: &mut S) -> Result<Value>
+    where
+        S: futures::Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    {
+        loop {
+            let message = timeout(GEMINI_LIVE_MESSAGE_TIMEOUT, ws.next())
+                .await
+                .context("timed out waiting for Gemini Live websocket message")?
+                .context("Gemini Live websocket closed before completing the turn")?
+                .context("Gemini Live websocket returned an error")?;
+
+            match message {
+                WsMessage::Text(text) => {
+                    return serde_json::from_str(&text)
+                        .context("failed to parse Gemini Live websocket JSON message");
+                }
+                WsMessage::Binary(bytes) => {
+                    return serde_json::from_slice(&bytes)
+                        .context("failed to parse Gemini Live websocket binary JSON message");
+                }
+                WsMessage::Ping(_) | WsMessage::Pong(_) => continue,
+                WsMessage::Close(frame) => {
+                    bail!(
+                        "Gemini Live websocket closed before completing the turn{}",
+                        frame
+                            .as_ref()
+                            .map(|frame| format!(": {}", frame.reason))
+                            .unwrap_or_default()
+                    )
+                }
+                other => bail!("unexpected Gemini Live websocket frame: {:?}", other),
+            }
+        }
+    }
+
+    fn parse_live_tool_call(task: &ControllerTask, body: &Value) -> Result<Option<ProviderOutput>> {
+        let alias_map = Self::gemini_function_aliases(&task.tools);
+        let Some(function_call) = body
+            .get("toolCall")
+            .and_then(|value| value.get("functionCalls"))
+            .and_then(Value::as_array)
+            .and_then(|calls| calls.first())
+        else {
+            return Ok(None);
+        };
+
+        let alias = function_call
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if alias.is_empty() {
+            return Ok(None);
+        }
+
+        let tool_name = alias_map
+            .iter()
+            .find_map(|(gemini_alias, original)| {
+                (gemini_alias == alias).then_some(original.clone())
+            })
+            .unwrap_or_else(|| alias.to_string());
+        let arguments = function_call
+            .get("args")
+            .or_else(|| function_call.get("arguments"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        Self::validate_tool_call(task, &tool_name, &arguments)?;
+
+        Ok(Some(ProviderOutput::ToolCall {
+            tool_name,
+            arguments,
+        }))
+    }
+
+    fn absorb_live_server_content(acc: &mut LiveTurnAccumulator, body: &Value) {
+        let Some(server_content) = body.get("serverContent") else {
+            return;
+        };
+
+        if server_content
+            .get("generationComplete")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            acc.generation_complete = true;
+        }
+        if server_content
+            .get("turnComplete")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            acc.turn_complete = true;
+        }
+
+        if let Some(text) = server_content
+            .get("outputTranscription")
+            .and_then(|value| value.get("text"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            acc.transcript_fragments.push(text.to_string());
+        }
+
+        if let Some(parts) = server_content
+            .get("modelTurn")
+            .and_then(|value| value.get("parts"))
+            .and_then(Value::as_array)
+        {
+            for part in parts {
+                if let Some(text) = part
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                {
+                    acc.text_fragments.push(text.to_string());
+                }
+            }
+        }
+    }
+
+    fn absorb_live_session_marker(acc: &mut LiveTurnAccumulator, body: &Value) {
+        let Some(update) = body.get("sessionResumptionUpdate") else {
+            return;
+        };
+
+        let resumable = update
+            .get("resumable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let new_handle = update
+            .get("newHandle")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|handle| !handle.is_empty());
+        if resumable {
+            acc.session_marker.resumption_handle = new_handle.map(str::to_string);
+        }
+    }
+
+    fn finalize_live_output(
+        task: &ControllerTask,
+        acc: LiveTurnAccumulator,
+    ) -> Result<NativeLiveTurnOutput> {
+        let display_text = acc
+            .text_fragments
+            .iter()
+            .last()
+            .cloned()
+            .or_else(|| acc.transcript_fragments.iter().last().cloned())
+            .unwrap_or_default();
+
+        if display_text.trim().is_empty() {
+            bail!("Gemini Live returned an empty response");
+        }
+
+        let spoken_text = acc
+            .transcript_fragments
+            .iter()
+            .last()
+            .cloned()
+            .or_else(|| (!display_text.is_empty()).then_some(display_text.clone()));
+
+        let partial_text_deltas = if !acc.text_fragments.is_empty() {
+            acc.text_fragments.clone()
+        } else {
+            acc.transcript_fragments.clone()
+        };
+
+        let session_marker = acc.session_marker.resumption_handle.map(|handle| {
+            crate::controller::NativeLiveSessionMarker {
+                provider_session_id: None,
+                resumption_handle: Some(handle),
+                protocol: Some(GEMINI_LIVE_PROTOCOL.into()),
+            }
+        });
+
+        Ok(NativeLiveTurnOutput {
+            final_output: ProviderOutput::Text {
+                content: display_text.clone(),
+                display_text: Some(display_text),
+                spoken_text,
+                partial_replies: partial_text_deltas.clone(),
+                working_memory_delta: None,
+                follow_up_questions: Vec::new(),
+                intent_summary: None,
+                memory_concept: None,
+                memory_candidate: None,
+                active_plan: None,
+            },
+            partial_text_deltas,
+            session_marker,
+            generation_complete: acc.generation_complete,
+            turn_complete: acc.turn_complete || task.kind == TaskKind::ResponseGenerate,
+        })
+    }
 }
 
 #[async_trait]
@@ -728,17 +1165,91 @@ impl NativeLiveProvider for GeminiProvider {
     }
 
     async fn invoke_live(&self, task: &ControllerTask) -> Result<NativeLiveTurnOutput> {
-        let model = task
-            .model
-            .as_deref()
-            .or_else(|| task.routing_hints.model_ref.as_deref())
-            .unwrap_or("gemini-3.1-flash-live-preview");
-        bail!(
-            "Gemini Live API session substrate is not wired yet for [{}] using model [{}]; \
-this path needs WebSocket session management, streamed PCM audio I/O, sequential tool responses, and session resumption rather than the current one-shot generateContent seam",
-            task.kind.as_str(),
-            model
-        )
+        let request = self.live_connect_request()?;
+        let (mut ws, _) = connect_async(request)
+            .await
+            .context("failed to connect to Gemini Live websocket endpoint")?;
+
+        Self::send_live_json(&mut ws, &self.live_setup_payload(task)).await?;
+
+        loop {
+            let message = Self::recv_live_json(&mut ws).await?;
+            if message.get("setupComplete").is_some() {
+                break;
+            }
+            if let Some(tool_call) = Self::parse_live_tool_call(task, &message)? {
+                return Ok(NativeLiveTurnOutput {
+                    final_output: tool_call,
+                    partial_text_deltas: Vec::new(),
+                    session_marker: None,
+                    generation_complete: false,
+                    turn_complete: false,
+                });
+            }
+        }
+
+        match task.kind {
+            TaskKind::ResponseGenerate => {
+                if let Some(message) = Self::live_client_prompt_message(task, true) {
+                    Self::send_live_json(&mut ws, &message).await?;
+                } else {
+                    bail!("response.generate task missing prompt for Gemini Live");
+                }
+            }
+            TaskKind::VoiceDialogue => {
+                if let Some(message) = Self::live_client_prompt_message(task, false) {
+                    Self::send_live_json(&mut ws, &message).await?;
+                }
+                Self::send_live_json(
+                    &mut ws,
+                    &json!({ "realtimeInput": { "activityStart": {} } }),
+                )
+                .await?;
+                for chunk in self.live_audio_chunks(task).await? {
+                    Self::send_live_json(&mut ws, &chunk).await?;
+                }
+                Self::send_live_json(&mut ws, &json!({ "realtimeInput": { "activityEnd": {} } }))
+                    .await?;
+            }
+            other => bail!(
+                "Gemini Live native provider received unsupported live task [{}]",
+                other.as_str()
+            ),
+        }
+
+        let mut acc = LiveTurnAccumulator::default();
+        loop {
+            let message = Self::recv_live_json(&mut ws).await?;
+            Self::absorb_live_session_marker(&mut acc, &message);
+
+            if let Some(tool_call) = Self::parse_live_tool_call(task, &message)? {
+                return Ok(NativeLiveTurnOutput {
+                    final_output: tool_call,
+                    partial_text_deltas: if !acc.text_fragments.is_empty() {
+                        acc.text_fragments.clone()
+                    } else {
+                        acc.transcript_fragments.clone()
+                    },
+                    session_marker: acc.session_marker.resumption_handle.map(|handle| {
+                        crate::controller::NativeLiveSessionMarker {
+                            provider_session_id: None,
+                            resumption_handle: Some(handle),
+                            protocol: Some(GEMINI_LIVE_PROTOCOL.into()),
+                        }
+                    }),
+                    generation_complete: acc.generation_complete,
+                    turn_complete: acc.turn_complete,
+                });
+            }
+
+            Self::absorb_live_server_content(&mut acc, &message);
+
+            if acc.turn_complete {
+                break;
+            }
+        }
+
+        Self::finalize_live_output(task, acc)
     }
 }
 
@@ -1040,6 +1551,43 @@ mod tests {
     }
 
     #[test]
+    fn live_api_key_endpoint_uses_ws_path_and_query_key() {
+        let provider = GeminiProvider::new(
+            reqwest::Client::new(),
+            Some(GeminiAuth::ApiKey("api-key".into())),
+            None,
+        );
+
+        let url = provider.live_endpoint_url().unwrap();
+        assert_eq!(
+            url.as_str(),
+            "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=api-key"
+        );
+    }
+
+    #[test]
+    fn live_oauth_request_uses_bearer_headers() {
+        let provider = GeminiProvider::new(
+            reqwest::Client::new(),
+            Some(GeminiAuth::OAuthBearer {
+                access_token: "oauth-token".into(),
+                project_id: Some("proj-123".into()),
+            }),
+            None,
+        );
+
+        let request = provider.live_connect_request().unwrap();
+        assert_eq!(
+            request.headers().get("authorization").unwrap(),
+            "Bearer oauth-token"
+        );
+        assert_eq!(
+            request.headers().get("x-goog-user-project").unwrap(),
+            "proj-123"
+        );
+    }
+
+    #[test]
     fn image_attachment_defaults_to_jpeg() {
         let attachment = AttachmentInput {
             kind: Some("photo".into()),
@@ -1226,6 +1774,60 @@ mod tests {
     }
 
     #[test]
+    fn live_setup_payload_enables_audio_transcription_for_voice_dialogue() {
+        let task = ControllerTask {
+            kind: TaskKind::VoiceDialogue,
+            request_class: RequestClass::Cognitive,
+            provider: None,
+            model: Some("gemini-3.1-flash-live-preview".into()),
+            prompt: Some("Continue this live conversation.".into()),
+            text: None,
+            spoken_text: None,
+            display_text: None,
+            voice: None,
+            voice_id: None,
+            output_format: None,
+            language_code: None,
+            response_contract: Default::default(),
+            context: ContextEnvelope {
+                attachments: vec![AttachmentInput {
+                    kind: Some("voice".into()),
+                    file_id: Some("voice-1".into()),
+                    mime_type: Some("audio/pcm;rate=16000".into()),
+                    url: Some("http://127.0.0.1:9001/download/sha256-voice-1".into()),
+                    blob_ref: Some("sha256-voice-1".into()),
+                    transport_error: None,
+                }],
+                ..Default::default()
+            },
+            context_projection: Default::default(),
+            affordances: Default::default(),
+            routing_hints: RoutingHints::default(),
+            provider_options: Default::default(),
+            effective_rights: Vec::new(),
+            tools: vec![],
+        };
+
+        let provider = GeminiProvider::new(
+            reqwest::Client::new(),
+            Some(GeminiAuth::ApiKey("api-key".into())),
+            None,
+        );
+        let payload = provider.live_setup_payload(&task);
+
+        assert_eq!(
+            payload["setup"]["generationConfig"]["responseModalities"],
+            serde_json::json!(["AUDIO"])
+        );
+        assert!(payload["setup"]["inputAudioTranscription"].is_object());
+        assert!(payload["setup"]["outputAudioTranscription"].is_object());
+        assert_eq!(
+            payload["setup"]["realtimeInputConfig"]["automaticActivityDetection"]["disabled"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
     fn rejects_tool_call_missing_required_argument() {
         let task = minimal_text_task_with_tools(vec![serde_json::json!({
             "tool_name": "echo",
@@ -1355,6 +1957,58 @@ mod tests {
                 tool_name: "session.status".into(),
                 arguments: serde_json::json!({})
             }
+        );
+    }
+
+    #[test]
+    fn live_tool_call_maps_alias_back_to_original_tool_name() {
+        let task = minimal_text_task_with_tools(vec![serde_json::json!({
+            "tool_name": "session.status",
+            "description": "Session status",
+            "input_schema": {
+                "type": "object",
+                "properties": {}
+            }
+        })]);
+
+        let body = serde_json::json!({
+            "toolCall": {
+                "functionCalls": [{
+                    "id": "call-1",
+                    "name": "session_status",
+                    "args": {}
+                }]
+            }
+        });
+
+        let output = GeminiProvider::parse_live_tool_call(&task, &body)
+            .expect("live tool call should parse")
+            .expect("tool call should be present");
+        assert_eq!(
+            output,
+            crate::controller::ProviderOutput::ToolCall {
+                tool_name: "session.status".into(),
+                arguments: serde_json::json!({})
+            }
+        );
+    }
+
+    #[test]
+    fn absorb_live_session_marker_captures_latest_resumption_handle() {
+        let mut acc = super::LiveTurnAccumulator::default();
+        GeminiProvider::absorb_live_session_marker(
+            &mut acc,
+            &serde_json::json!({
+                "sessionResumptionUpdate": {
+                    "newHandle": "resume-123",
+                    "resumable": true
+                }
+            }),
+        );
+
+        assert_eq!(
+            acc.session_marker.resumption_handle.as_deref(),
+            Some("resume-123")
         );
     }
 }

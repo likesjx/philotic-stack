@@ -47,9 +47,18 @@ The Gemini path now has two explicit execution seams:
 - classic one-shot provider invocation for `text.generate`, `media.analyze`, and `voice.transcribe`
 - a native-live provider seam for `response.generate` / `voice.dialogue`
 
-That live seam is structural truth only for now. Gemini still returns an
-explicit not-yet-wired failure there until the WebSocket session substrate is
-implemented.
+That live seam is now partially wired:
+
+- `response.generate` can execute over the Gemini Live websocket path and return canonical text output
+- `voice.dialogue` can execute over the Gemini Live websocket path when given blob-backed PCM audio
+- native-live tool calls are intercepted before response-envelope serialization, just like the classic path
+- session resumption handles are captured on the live seam
+
+Important current limitations:
+
+- cognitive-stage audio still re-enters the system as output transcription text rather than a first-class audio artifact
+- most current transported voice blobs are still OGG-shaped, so native-live voice turns need an upstream PCM conversion enzyme
+- sequential in-session tool-response continuation is still a follow-on seam rather than fully implemented physiology
 
 Voice synthesis is intentionally transitional here. The ElevenLabs guest can own provider
 invocation, but first-class audio delivery still belongs to the future voice machine and
