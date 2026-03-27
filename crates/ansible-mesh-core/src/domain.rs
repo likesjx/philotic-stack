@@ -1159,6 +1159,7 @@ mod tests {
             description: format!("Description for {}", name),
             input_schema: serde_json::json!({"type": "object"}),
             class: "utility".to_string(),
+            tool_markers: Vec::new(),
         }
     }
 
@@ -1282,6 +1283,7 @@ mod tests {
         let t = d.get_abstract_tool("bash.exec").unwrap().unwrap();
         assert_eq!(t.tool_name, "bash.exec");
         assert_eq!(t.class, "utility");
+        assert!(t.tool_markers.is_empty());
     }
 
     #[test]
@@ -1513,6 +1515,7 @@ mod tests {
         let sk = AbstractSkillRecord {
             skill_name: "code-review".to_string(),
             description: "Reviews code.".to_string(),
+            skill_markers: vec!["governed".to_string()],
             ..Default::default()
         };
         d.upsert_abstract_skill(&sk).unwrap();
@@ -1522,6 +1525,13 @@ mod tests {
                 .unwrap()
                 .skill_name,
             "code-review"
+        );
+        assert_eq!(
+            d.get_abstract_skill("code-review")
+                .unwrap()
+                .unwrap()
+                .skill_markers,
+            vec!["governed".to_string()]
         );
         assert_eq!(d.list_abstract_skills().unwrap().len(), 1);
     }

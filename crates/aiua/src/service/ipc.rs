@@ -186,6 +186,36 @@ fn load_shared_model_markers(graph: &GraphDomain) -> Option<Vec<serde_json::Valu
     Some(markers)
 }
 
+fn load_shared_tool_markers(graph: &GraphDomain) -> Option<Vec<serde_json::Value>> {
+    let mut markers = graph
+        .list_abstract_tools()
+        .ok()?
+        .into_iter()
+        .filter_map(|record| serde_json::to_value(record).ok())
+        .collect::<Vec<_>>();
+    markers.sort_by(|left, right| {
+        left.get("tool_name")
+            .and_then(serde_json::Value::as_str)
+            .cmp(&right.get("tool_name").and_then(serde_json::Value::as_str))
+    });
+    Some(markers)
+}
+
+fn load_shared_skill_markers(graph: &GraphDomain) -> Option<Vec<serde_json::Value>> {
+    let mut markers = graph
+        .list_abstract_skills()
+        .ok()?
+        .into_iter()
+        .filter_map(|record| serde_json::to_value(record).ok())
+        .collect::<Vec<_>>();
+    markers.sort_by(|left, right| {
+        left.get("skill_name")
+            .and_then(serde_json::Value::as_str)
+            .cmp(&right.get("skill_name").and_then(serde_json::Value::as_str))
+    });
+    Some(markers)
+}
+
 fn latest_routing_policy_reflex_dispositions(
     graph: &GraphDomain,
     agent_id: &str,
@@ -6760,6 +6790,30 @@ impl IpcServer {
                 });
             }
         }
+        if let Some(shared_tool_markers) = load_shared_tool_markers(graph) {
+            if let Some(obj) = bindings.as_object_mut() {
+                obj.insert(
+                    "shared_tool_markers".to_string(),
+                    serde_json::Value::Array(shared_tool_markers),
+                );
+            } else {
+                bindings = serde_json::json!({
+                    "shared_tool_markers": shared_tool_markers,
+                });
+            }
+        }
+        if let Some(shared_skill_markers) = load_shared_skill_markers(graph) {
+            if let Some(obj) = bindings.as_object_mut() {
+                obj.insert(
+                    "shared_skill_markers".to_string(),
+                    serde_json::Value::Array(shared_skill_markers),
+                );
+            } else {
+                bindings = serde_json::json!({
+                    "shared_skill_markers": shared_skill_markers,
+                });
+            }
+        }
 
         // Expand dynamic skill implied_tools into effective_toolset and carry prompt-facing
         // skill guidance so philote can project more than just skill names.
@@ -7425,12 +7479,17 @@ fn compose_tool_assembly(
     let tools_for_model = toolset
         .iter()
         .map(|tool_name| {
+            let marker = shared_tool_receptor_record(bindings, tool_name);
             serde_json::json!({
                 "tool_name": tool_name,
-                "description": format!("Execute the {} tool.", tool_name),
-                "input_schema": {
-                    "type": "object"
-                }
+                "description": marker
+                    .and_then(|value: &serde_json::Value| value.get("description"))
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!(format!("Execute the {} tool.", tool_name))),
+                "input_schema": marker
+                    .and_then(|value: &serde_json::Value| value.get("input_schema"))
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({ "type": "object" }))
             })
         })
         .collect::<Vec<_>>();
@@ -7475,6 +7534,9 @@ fn compose_tool_assembly(
                         .any(|supported| supported == tool_name)
             });
             if registered.is_none() && live_runner.is_none() {
+                if tool_has_marker(bindings, tool_name, "local_only") {
+                    return None;
+                }
                 let remote = select_remote_tool_advertisement(remote_tool_ads, tool_name, bindings)?;
                 return Some((
                     tool_name.to_string(),
@@ -7537,12 +7599,19 @@ fn compose_tool_assembly(
     let policy_annotations = toolset
         .iter()
         .map(|tool_name| {
+            let marker = shared_tool_receptor_record(bindings, tool_name);
+            let tool_markers = tool_ligand_markers(bindings, tool_name);
             (
                 tool_name.to_string(),
                 serde_json::json!({
-                    "policy_class": format!("tool:{tool_name}"),
-                    "approval_required": false,
+                    "policy_class": marker
+                        .and_then(|value: &serde_json::Value| value.get("class"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(|class| format!("tool:{class}"))
+                        .unwrap_or_else(|| format!("tool:{tool_name}")),
+                    "approval_required": tool_markers.iter().any(|marker| marker == "high_agency"),
                     "credential_scope_reflex": credential_scope_reflex(bindings),
+                    "tool_markers": tool_markers,
                 }),
             )
         })
@@ -7589,6 +7658,40 @@ fn default_visible_toolset(bindings: &serde_json::Value) -> Vec<String> {
         .into_iter()
         .filter(|tool_name| has_right(&rights, &tool_right(tool_name)))
         .collect()
+}
+
+fn shared_tool_receptor_record<'a>(
+    bindings: &'a serde_json::Value,
+    tool_name: &str,
+) -> Option<&'a serde_json::Value> {
+    bindings
+        .get("shared_tool_markers")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|marker| {
+            marker.get("tool_name").and_then(serde_json::Value::as_str) == Some(tool_name)
+        })
+}
+
+fn tool_ligand_markers(bindings: &serde_json::Value, tool_name: &str) -> Vec<String> {
+    shared_tool_receptor_record(bindings, tool_name)
+        .and_then(|marker: &serde_json::Value| marker.get("tool_markers"))
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn tool_has_marker(bindings: &serde_json::Value, tool_name: &str, marker_name: &str) -> bool {
+    tool_ligand_markers(bindings, tool_name)
+        .iter()
+        .any(|marker| marker == marker_name)
 }
 
 fn remote_tool_advertisements(
@@ -7861,12 +7964,17 @@ fn compose_tool_assembly_from_incarnations(
     let tools_for_model = toolset
         .iter()
         .map(|tool_name| {
+            let marker = shared_tool_receptor_record(bindings, tool_name);
             serde_json::json!({
                 "tool_name": tool_name,
-                "description": format!("Execute the {} tool.", tool_name),
-                "input_schema": {
-                    "type": "object"
-                }
+                "description": marker
+                    .and_then(|value: &serde_json::Value| value.get("description"))
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!(format!("Execute the {} tool.", tool_name))),
+                "input_schema": marker
+                    .and_then(|value: &serde_json::Value| value.get("input_schema"))
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({ "type": "object" }))
             })
         })
         .collect::<Vec<_>>();
@@ -7874,6 +7982,17 @@ fn compose_tool_assembly_from_incarnations(
     let execution_routes = toolset
         .iter()
         .filter_map(|tool_name| {
+            if tool_has_marker(bindings, tool_name, "local_only")
+                && incarnations.iter().all(|incarnation| {
+                    incarnation
+                        .target_node
+                        .as_deref()
+                        .map(|node| node != "local-aiua-01")
+                        .unwrap_or(true)
+                })
+            {
+                return None;
+            }
             select_allowed_incarnation(incarnations, tool_name, &preferences).map(|incarnation| {
                 (
                     tool_name.to_string(),
@@ -7898,11 +8017,18 @@ fn compose_tool_assembly_from_incarnations(
     let policy_annotations = toolset
         .iter()
         .map(|tool_name| {
+            let marker = shared_tool_receptor_record(bindings, tool_name);
+            let tool_markers = tool_ligand_markers(bindings, tool_name);
             (
                 tool_name.to_string(),
                 serde_json::json!({
-                    "policy_class": format!("tool:{tool_name}"),
-                    "approval_required": false
+                    "policy_class": marker
+                        .and_then(|value: &serde_json::Value| value.get("class"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(|class| format!("tool:{class}"))
+                        .unwrap_or_else(|| format!("tool:{tool_name}")),
+                    "approval_required": tool_markers.iter().any(|marker| marker == "high_agency"),
+                    "tool_markers": tool_markers
                 }),
             )
         })
@@ -12313,6 +12439,19 @@ mod tests {
         let bindings = serde_json::json!({
             "effective_toolset": ["echo", "agent.configure"],
             "effective_rights": ["tool.echo"],
+            "shared_tool_markers": [{
+                "tool_name": "echo",
+                "class": "utility",
+                "description": "Echo tool from shared catalog.",
+                "input_schema": { "type": "object" },
+                "tool_markers": ["remote_safe", "low_agency"]
+            }, {
+                "tool_name": "agent.configure",
+                "class": "config",
+                "description": "Agent configure tool from shared catalog.",
+                "input_schema": { "type": "object" },
+                "tool_markers": ["high_agency", "local_only"]
+            }],
         });
 
         let assembly = compose_tool_assembly(&bindings, &[], &[], &[], "local-aiua-01");
@@ -12326,6 +12465,36 @@ mod tests {
             assembly["execution_routes"]
                 .get("agent.configure")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn compose_tool_assembly_uses_shared_tool_markers_for_policy_annotations() {
+        let bindings = serde_json::json!({
+            "effective_toolset": ["agent.configure"],
+            "effective_rights": ["tool.agent.configure"],
+            "shared_tool_markers": [{
+                "tool_name": "agent.configure",
+                "class": "config",
+                "description": "Agent configure tool from shared catalog.",
+                "input_schema": { "type": "object", "properties": {"config_path": {"type": "string"}} },
+                "tool_markers": ["high_agency", "local_only"]
+            }],
+        });
+
+        let assembly = compose_tool_assembly(&bindings, &[], &[], &[], "local-aiua-01");
+
+        assert_eq!(
+            assembly["policy_annotations"]["agent.configure"]["policy_class"],
+            "tool:config"
+        );
+        assert_eq!(
+            assembly["policy_annotations"]["agent.configure"]["approval_required"],
+            true
+        );
+        assert_eq!(
+            assembly["tools_for_model"][0]["description"],
+            "Agent configure tool from shared catalog."
         );
     }
 
@@ -12418,6 +12587,13 @@ mod tests {
         let bindings = serde_json::json!({
             "effective_toolset": ["echo"],
             "effective_rights": ["tool.echo"],
+            "shared_tool_markers": [{
+                "tool_name": "echo",
+                "class": "utility",
+                "description": "Echo tool from shared catalog.",
+                "input_schema": { "type": "object" },
+                "tool_markers": ["remote_safe", "low_agency"]
+            }],
             "effective_posture": {
                 "placement_risk_level": "guarded",
                 "remote_execution_allowed": true
@@ -12451,6 +12627,49 @@ mod tests {
         assert_eq!(
             assembly["policy_annotations"]["echo"]["credential_scope_reflex"],
             "local_scoped"
+        );
+    }
+
+    #[test]
+    fn compose_tool_assembly_suppresses_remote_route_for_local_only_tool_marker() {
+        let bindings = serde_json::json!({
+            "effective_toolset": ["workspace.read"],
+            "effective_rights": ["tool.workspace.read"],
+            "shared_tool_markers": [{
+                "tool_name": "workspace.read",
+                "class": "workspace",
+                "description": "Workspace read tool from shared catalog.",
+                "input_schema": { "type": "object" },
+                "tool_markers": ["workspace_bound", "local_only"]
+            }],
+            "effective_posture": {
+                "placement_risk_level": "low",
+                "remote_execution_allowed": true
+            },
+            "effective_right_policy": {
+                "remote_tool_execution": "allow",
+                "remote_component_execution": "allow",
+                "credential_scope": "mesh_scoped"
+            }
+        });
+        let remote_ads = vec![CapabilityAdvertisement {
+            hotel_id: "remote-hotel".into(),
+            node_id: "remote-node".into(),
+            incarnation_id: "remote-hotel:tool-workspace-read".into(),
+            target_role: "tool.workspace.read".into(),
+            availability_state: "live".into(),
+            selection_hint: Some("remote_latency_capacity".into()),
+            latency_hint_ms: Some(8),
+            max_concurrent_jobs: Some(8),
+            active_jobs: 0,
+            queue_depth: 0,
+        }];
+
+        let assembly = compose_tool_assembly(&bindings, &[], &[], &remote_ads, "local-aiua-01");
+
+        assert!(
+            assembly["execution_routes"].get("workspace.read").is_none(),
+            "local_only marker should suppress remote-only workspace route"
         );
     }
 
@@ -14645,6 +14864,108 @@ mod tests {
                 assert_eq!(
                     snapshot["bindings"]["shared_model_markers"][0]["provider_hint"],
                     "gemini"
+                );
+            }
+            other => panic!("unexpected session snapshot response: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_session_snapshot_projects_shared_tool_and_skill_markers_from_graph() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_abstract_tool(&ansible_mesh_core::graph::AbstractToolRecord {
+                tool_name: "agent.configure".into(),
+                description: "Agent configure tool from shared catalog.".into(),
+                input_schema: serde_json::json!({ "type": "object" }),
+                class: "config".into(),
+                tool_markers: vec!["high_agency".into(), "local_only".into()],
+            })
+            .expect("seed abstract tool");
+        graph
+            .upsert_abstract_skill(&ansible_mesh_core::graph::AbstractSkillRecord {
+                skill_name: "routing.refinement".into(),
+                description: "Routing refinement skill from shared catalog.".into(),
+                implied_tools: vec!["routing.policy.propose".into()],
+                skill_markers: vec!["adaptive".into(), "governed".into()],
+                ..Default::default()
+            })
+            .expect("seed abstract skill");
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-shared-tool-skill-markers".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: Some("agent-jane-01:orchestrator".into()),
+                channel_kind: Some("operator".into()),
+                channel_session_key: Some("chat-1".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("seed session");
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("client connect");
+
+        let response = client
+            .send_request(IpcRequest::GetConfig {
+                key: "__session_snapshot__:sess-shared-tool-skill-markers".into(),
+            })
+            .await
+            .expect("session snapshot request");
+
+        match response {
+            IpcResponse::ConfigData {
+                value_json: Some(value_json),
+                ..
+            } => {
+                let snapshot: serde_json::Value =
+                    serde_json::from_str(&value_json).expect("snapshot should decode");
+                assert_eq!(
+                    snapshot["bindings"]["shared_tool_markers"][0]["tool_name"],
+                    "agent.configure"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["shared_skill_markers"][0]["skill_name"],
+                    "routing.refinement"
                 );
             }
             other => panic!("unexpected session snapshot response: {other:?}"),

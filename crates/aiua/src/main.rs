@@ -1838,6 +1838,7 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                 .into(),
             input_schema: serde_json::json!({ "type": "object", "properties": {} }),
             class: "session".into(),
+            tool_markers: vec!["session_introspection".into()],
         },
         AbstractToolRecord {
             tool_name: "echo".into(),
@@ -1852,6 +1853,7 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                 "required": ["text"]
             }),
             class: "utility".into(),
+            tool_markers: vec!["remote_safe".into(), "low_agency".into()],
         },
         AbstractToolRecord {
             tool_name: "workspace.list".into(),
@@ -1868,6 +1870,7 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                 }
             }),
             class: "workspace".into(),
+            tool_markers: vec!["workspace_bound".into(), "local_only".into()],
         },
         AbstractToolRecord {
             tool_name: "workspace.read".into(),
@@ -1893,6 +1896,7 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                 "required": ["path"]
             }),
             class: "workspace".into(),
+            tool_markers: vec!["workspace_bound".into(), "local_only".into()],
         },
         AbstractToolRecord {
             tool_name: "agent.graph.read".into(),
@@ -1908,6 +1912,7 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                 "required": ["entity"]
             }),
             class: "capability".into(),
+            tool_markers: vec!["agent_memory".into(), "local_only".into()],
         },
         AbstractToolRecord {
             tool_name: "agent.graph.write".into(),
@@ -1932,6 +1937,7 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                 "required": ["entity"]
             }),
             class: "capability".into(),
+            tool_markers: vec!["agent_memory".into(), "high_agency".into(), "local_only".into()],
         },
         AbstractToolRecord {
             tool_name: "agent.configure".into(),
@@ -1952,6 +1958,7 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                 "required": ["config_path", "value"]
             }),
             class: "config".into(),
+            tool_markers: vec!["high_agency".into(), "local_only".into()],
         },
     ];
 
@@ -2155,18 +2162,21 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             skill_name: "handoff.to_role".into(),
             description: "Handoff to a specialist role cleanly, explicitly transferring context, goals, and known constraints so the target can start work immediately without thrashing.".into(),
             implied_tools: vec!["session.status".into()],
+            skill_markers: vec!["workflow".into(), "governed".into()],
             ..Default::default()
         },
         AbstractSkillRecord {
             skill_name: "handoff.back".into(),
             description: "Return a session from a specialist role back to the orchestrator with a concise summary of completed work, open questions, and the next recommended action.".into(),
             implied_tools: vec!["session.status".into()],
+            skill_markers: vec!["workflow".into(), "governed".into()],
             ..Default::default()
         },
         AbstractSkillRecord {
             skill_name: "role.governance".into(),
             description: "Govern role definitions deliberately for the current agent identity, reasoning explicitly about purpose, capability posture, handoff behavior, and limits before proposing changes.".into(),
             implied_tools: vec!["session.status".into(), "agent.configure".into(), "role.configure".into()],
+            skill_markers: vec!["governed".into(), "high_agency".into()],
             ..Default::default()
         },
         AbstractSkillRecord {
@@ -2188,18 +2198,21 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                 ],
                 "repo_skill_path": "skills/role-authoring/SKILL.md"
             }),
+            skill_markers: vec!["governed".into(), "high_agency".into()],
             ..Default::default()
         },
         AbstractSkillRecord {
             skill_name: "delegate.to_peer".into(),
             description: "Cross-agent delegation: hand off a bounded task to another trusted peer agent on the mesh instead of changing roles. Best for leveraging a different identity, rather than shifting internal capabilities.".into(),
             implied_tools: vec!["delegate.to_peer".into()],
+            skill_markers: vec!["workflow".into(), "delegation".into()],
             ..Default::default()
         },
         AbstractSkillRecord {
             skill_name: "delegate.to_external_cognitive_peer".into(),
             description: "External delegation: hand off a bounded task to an unmanaged external system like Claude Code or Codex. Best when crossing deep security or execution boundaries where managed Philotic actors cannot natively reach.".into(),
             implied_tools: vec!["delegate.to_external_cognitive_peer".into()],
+            skill_markers: vec!["workflow".into(), "delegation".into()],
             ..Default::default()
         },
         AbstractSkillRecord {
@@ -2216,6 +2229,7 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                 "transitional_note": "Uses durable rule storage as the current governed persistence path for routing-policy proposals.",
                 "agent_graph_note": "Agent-local routing preferences are stored in the active agent graph and may reference model-graph facts indirectly via stable capability/provider/model identifiers.",
             }),
+            skill_markers: vec!["adaptive".into(), "governed".into()],
             ..Default::default()
         },
     ];
@@ -2336,6 +2350,7 @@ fn seed_skill_crafting(graph: &GraphDomain) -> anyhow::Result<()> {
             "subagent.spawn".into(),
             "role.configure".into(),
         ],
+        skill_markers: vec!["governed".into(), "high_agency".into()],
         validation_state: SkillValidationState::Validated,
         source_snapshot: None,
         field_sources: serde_json::json!({}),

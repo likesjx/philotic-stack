@@ -769,6 +769,7 @@ Seam IDs: `structured-model-envelope`, `hotel-gemini-oauth-flow`
 - [x] Add a hotel-side reward system for linked `agent_learned` reflexes: approved routing-policy disposition now reinforces projection with a precedence boost and explicit reward markers.
 - [x] Feed hotel-projected reward and immune markers into live cognition-stage turn-routing-plan ranking in `philote`, so reinforced or suppressed agent-learned reflex posture can bias explicit provider/model preference selection without becoming a second router.
 - [x] Fold shared model-catalog metadata into live turn-routing-plan ranking via hotel-projected `abstract_model` markers, so shared graph truth can bias stage-aware provider/model selection without becoming mutable preference storage.
+- [x] Project shared `abstract_tool` / `abstract_skill` markers through hotel bindings and use shared tool ligands at the runner boundary to shape tool schema, approval sensitivity, and `local_only` routing suppression without widening rights.
 - [ ] Define the shared catalog layer for models, tools, skills, and rights as reference knowledge outside hotel-owned mutable state.
 - [ ] Extend the hotel's projected key ring beyond `effective_rights` for tools/skills/component capabilities into scoped execution credentials and richer right classes.
 - [ ] Audit `model-router` and runner dispatch beyond current tool/component assembly so lower execution layers consume projected rights but never inject or widen them.

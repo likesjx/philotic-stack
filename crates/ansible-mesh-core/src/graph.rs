@@ -66,6 +66,8 @@ pub struct AbstractToolRecord {
     pub input_schema: serde_json::Value,
     /// Approval and projection class: "session", "workspace", "utility", "capability"
     pub class: String,
+    #[serde(default)]
+    pub tool_markers: Vec<String>,
 }
 
 /// A system-wide shared model definition stored in the context graph.
@@ -146,6 +148,8 @@ pub struct AbstractSkillRecord {
     pub description: String,
     #[serde(default)]
     pub implied_tools: Vec<String>,
+    #[serde(default)]
+    pub skill_markers: Vec<String>,
     #[serde(default)]
     pub validation_state: SkillValidationState,
     #[serde(default, skip_serializing_if = "Option::is_none")]

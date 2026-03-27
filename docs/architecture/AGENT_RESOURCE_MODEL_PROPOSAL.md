@@ -510,6 +510,26 @@ expressed, allowed, or dampened in the current session. Otherwise the shared
 catalog quietly turns into a self-authorizing gland, which is both efficient
 and horrifying.
 
+The current slice now makes that pattern real for tools and skills too:
+
+- `abstract_tool` records carry durable `tool_markers` as shared ligands for
+  runner/tool assembly
+- `abstract_skill` records carry `skill_markers` that hotel projection can
+  expose for later workflow and policy consumers
+- hotel snapshot assembly now projects those shared records into bindings as
+  `shared_tool_markers` and `shared_skill_markers`
+- tool assembly consumes shared tool ligands to shape model-visible tool
+  descriptions and input schemas, mark `high_agency` tools as
+  approval-sensitive, and suppress remote-only routing for `local_only` tools
+- those ligands remain advisory tissue only: they do not widen
+  `effective_rights`, mint scoped credentials, or authorize execution on their
+  own
+
+Biology note: the shared graph is acting like a ligand library here, while the
+hotel/runtime boundary is the receptor surface that decides what actually
+binds. That is much healthier than letting the catalog secrete its own
+hormones and call it governance.
+
 In practice, a fresher active-incarnation update is the `p53` check here: if
 the runtime has newer local evidence that the session now belongs on a
 different active guest, older delivery provenance should die immediately rather
