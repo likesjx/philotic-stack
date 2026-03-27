@@ -252,6 +252,31 @@ For staged turns, the model-controller should remain the executor per stage, not
 
 with the session/agent still owning continuity, tools, approvals, and final response policy across the whole turn.
 
+The next honest refinement is to make the capability species explicit instead of
+leaving them as scattered strings. Current known turn-routed species should be
+treated as:
+
+- stage-local transform species:
+  - `media.analyze`
+  - `image.describe`
+  - `document.summarize`
+  - `voice.transcribe`
+- stage-local cognitive species:
+  - `text.generate`
+- stage-local synthesis species:
+  - `voice.synthesize`
+  - `sound.generate`
+  - `music.generate`
+- collapsible native-live species:
+  - `response.generate`
+  - `voice.dialogue`
+
+`response.generate` and `voice.dialogue` are the important native-live species.
+They are allowed to collapse `ingress + cognition` under policy, but they
+should not automatically become whole-turn owners. They still need explicit
+envelope, approval, tool, and routing rules before they are allowed to bypass
+the simpler staged pipeline.
+
 ## Request Classes
 
 Keep one model-controller boundary, but introduce an explicit `request_class` field inside the request envelope.

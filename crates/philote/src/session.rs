@@ -305,6 +305,136 @@ pub enum TurnContextEnvelopeKind {
     Egress,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnCapabilityCompositionKind {
+    StageLocal,
+    CollapsibleIngressCognition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnRoutedCapabilitySpecies {
+    TextGenerate,
+    MediaAnalyze,
+    VoiceTranscribe,
+    VoiceSynthesize,
+    ImageDescribe,
+    DocumentSummarize,
+    ResponseGenerate,
+    VoiceDialogue,
+    SoundGenerate,
+    MusicGenerate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnRoutedCapabilityProfile {
+    pub species: TurnRoutedCapabilitySpecies,
+    pub capability: &'static str,
+    pub request_class: &'static str,
+    pub default_stage_kind: TurnRoutingStageKind,
+    pub default_context_envelope: TurnContextEnvelopeKind,
+    pub composition: TurnCapabilityCompositionKind,
+    pub default_streaming: bool,
+}
+
+pub fn turn_routed_capability_profile(capability: &str) -> Option<TurnRoutedCapabilityProfile> {
+    let profile = match capability {
+        "text.generate" => TurnRoutedCapabilityProfile {
+            species: TurnRoutedCapabilitySpecies::TextGenerate,
+            capability: "text.generate",
+            request_class: "cognitive",
+            default_stage_kind: TurnRoutingStageKind::Cognition,
+            default_context_envelope: TurnContextEnvelopeKind::Cognitive,
+            composition: TurnCapabilityCompositionKind::StageLocal,
+            default_streaming: true,
+        },
+        "media.analyze" => TurnRoutedCapabilityProfile {
+            species: TurnRoutedCapabilitySpecies::MediaAnalyze,
+            capability: "media.analyze",
+            request_class: "transform",
+            default_stage_kind: TurnRoutingStageKind::Ingress,
+            default_context_envelope: TurnContextEnvelopeKind::Ingress,
+            composition: TurnCapabilityCompositionKind::StageLocal,
+            default_streaming: false,
+        },
+        "voice.transcribe" => TurnRoutedCapabilityProfile {
+            species: TurnRoutedCapabilitySpecies::VoiceTranscribe,
+            capability: "voice.transcribe",
+            request_class: "transform",
+            default_stage_kind: TurnRoutingStageKind::Ingress,
+            default_context_envelope: TurnContextEnvelopeKind::Ingress,
+            composition: TurnCapabilityCompositionKind::StageLocal,
+            default_streaming: true,
+        },
+        "voice.synthesize" => TurnRoutedCapabilityProfile {
+            species: TurnRoutedCapabilitySpecies::VoiceSynthesize,
+            capability: "voice.synthesize",
+            request_class: "synthesis",
+            default_stage_kind: TurnRoutingStageKind::Egress,
+            default_context_envelope: TurnContextEnvelopeKind::Egress,
+            composition: TurnCapabilityCompositionKind::StageLocal,
+            default_streaming: true,
+        },
+        "image.describe" => TurnRoutedCapabilityProfile {
+            species: TurnRoutedCapabilitySpecies::ImageDescribe,
+            capability: "image.describe",
+            request_class: "transform",
+            default_stage_kind: TurnRoutingStageKind::Ingress,
+            default_context_envelope: TurnContextEnvelopeKind::Ingress,
+            composition: TurnCapabilityCompositionKind::StageLocal,
+            default_streaming: false,
+        },
+        "document.summarize" => TurnRoutedCapabilityProfile {
+            species: TurnRoutedCapabilitySpecies::DocumentSummarize,
+            capability: "document.summarize",
+            request_class: "transform",
+            default_stage_kind: TurnRoutingStageKind::Ingress,
+            default_context_envelope: TurnContextEnvelopeKind::Ingress,
+            composition: TurnCapabilityCompositionKind::StageLocal,
+            default_streaming: false,
+        },
+        "response.generate" => TurnRoutedCapabilityProfile {
+            species: TurnRoutedCapabilitySpecies::ResponseGenerate,
+            capability: "response.generate",
+            request_class: "cognitive",
+            default_stage_kind: TurnRoutingStageKind::Cognition,
+            default_context_envelope: TurnContextEnvelopeKind::Cognitive,
+            composition: TurnCapabilityCompositionKind::CollapsibleIngressCognition,
+            default_streaming: true,
+        },
+        "voice.dialogue" => TurnRoutedCapabilityProfile {
+            species: TurnRoutedCapabilitySpecies::VoiceDialogue,
+            capability: "voice.dialogue",
+            request_class: "cognitive",
+            default_stage_kind: TurnRoutingStageKind::Cognition,
+            default_context_envelope: TurnContextEnvelopeKind::Cognitive,
+            composition: TurnCapabilityCompositionKind::CollapsibleIngressCognition,
+            default_streaming: true,
+        },
+        "sound.generate" => TurnRoutedCapabilityProfile {
+            species: TurnRoutedCapabilitySpecies::SoundGenerate,
+            capability: "sound.generate",
+            request_class: "synthesis",
+            default_stage_kind: TurnRoutingStageKind::Egress,
+            default_context_envelope: TurnContextEnvelopeKind::Egress,
+            composition: TurnCapabilityCompositionKind::StageLocal,
+            default_streaming: true,
+        },
+        "music.generate" => TurnRoutedCapabilityProfile {
+            species: TurnRoutedCapabilitySpecies::MusicGenerate,
+            capability: "music.generate",
+            request_class: "synthesis",
+            default_stage_kind: TurnRoutingStageKind::Egress,
+            default_context_envelope: TurnContextEnvelopeKind::Egress,
+            composition: TurnCapabilityCompositionKind::StageLocal,
+            default_streaming: false,
+        },
+        _ => return None,
+    };
+    Some(profile)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnRoutingStagePlan {
     pub kind: TurnRoutingStageKind,

@@ -9,9 +9,10 @@ use crate::protocol::{
 use crate::session::{
     ActivePlan, AgentProfile, ApprovalInterruptDisposition, ComponentRouteAssembly,
     MediaRoutingPolicy, RecalledMemoryRecord, RoutingPreferenceBinding, SessionBindings,
-    SessionState, ToolExecutionRoute, TtsMode, TurnContextEnvelopeKind, TurnRoutingPlan,
-    TurnRoutingStageKind, TurnRoutingStagePlan, VoiceResponsePolicy, WorkingTurn,
-    merge_session_index,
+    SessionState, ToolExecutionRoute, TtsMode, TurnCapabilityCompositionKind,
+    TurnContextEnvelopeKind, TurnRoutedCapabilityProfile, TurnRoutedCapabilitySpecies,
+    TurnRoutingPlan, TurnRoutingStageKind, TurnRoutingStagePlan, VoiceResponsePolicy, WorkingTurn,
+    merge_session_index, turn_routed_capability_profile,
 };
 use anyhow::Result;
 use memory_core::{
@@ -438,31 +439,52 @@ fn compile_turn_routing_plan(
     let mut stages = Vec::new();
 
     if let Some(routing) = media_routing {
+        let profile = turn_routed_capability_profile(routing.capability).unwrap_or(
+            TurnRoutedCapabilityProfile {
+                species: TurnRoutedCapabilitySpecies::MediaAnalyze,
+                capability: "media.analyze",
+                request_class: "transform",
+                default_stage_kind: TurnRoutingStageKind::Ingress,
+                default_context_envelope: TurnContextEnvelopeKind::Ingress,
+                composition: TurnCapabilityCompositionKind::StageLocal,
+                default_streaming: false,
+            },
+        );
         let controller_role = match routing.capability {
             "voice.transcribe" => DEFAULT_VOICE_MODEL_ROLE,
             _ => DEFAULT_TEXT_MODEL_ROLE,
         };
         stages.push(TurnRoutingStagePlan {
-            kind: TurnRoutingStageKind::Ingress,
+            kind: profile.default_stage_kind,
             capability: routing.capability.to_string(),
-            request_class: "transform".into(),
-            context_envelope: TurnContextEnvelopeKind::Ingress,
+            request_class: profile.request_class.into(),
+            context_envelope: profile.default_context_envelope,
             controller_role: controller_role.into(),
             provider_hint: role_to_provider_hint(controller_role),
             model_ref: None,
-            streaming: routing.capability == "voice.transcribe",
+            streaming: profile.default_streaming,
         });
     }
 
+    let cognition_profile =
+        turn_routed_capability_profile("text.generate").unwrap_or(TurnRoutedCapabilityProfile {
+            species: TurnRoutedCapabilitySpecies::TextGenerate,
+            capability: "text.generate",
+            request_class: "cognitive",
+            default_stage_kind: TurnRoutingStageKind::Cognition,
+            default_context_envelope: TurnContextEnvelopeKind::Cognitive,
+            composition: TurnCapabilityCompositionKind::StageLocal,
+            default_streaming: true,
+        });
     stages.push(TurnRoutingStagePlan {
-        kind: TurnRoutingStageKind::Cognition,
-        capability: "text.generate".into(),
-        request_class: "cognitive".into(),
-        context_envelope: TurnContextEnvelopeKind::Cognitive,
+        kind: cognition_profile.default_stage_kind,
+        capability: cognition_profile.capability.into(),
+        request_class: cognition_profile.request_class.into(),
+        context_envelope: cognition_profile.default_context_envelope,
         controller_role: DEFAULT_TEXT_MODEL_ROLE.into(),
         provider_hint: role_to_provider_hint(DEFAULT_TEXT_MODEL_ROLE),
         model_ref: None,
-        streaming: true,
+        streaming: cognition_profile.default_streaming,
     });
 
     let tts_mode_enabled = voice_policy
@@ -474,15 +496,26 @@ fn compile_turn_routing_plan(
         .unwrap_or(false);
     if tts_mode_enabled {
         let controller_role = DEFAULT_VOICE_MODEL_ROLE;
+        let egress_profile = turn_routed_capability_profile("voice.synthesize").unwrap_or(
+            TurnRoutedCapabilityProfile {
+                species: TurnRoutedCapabilitySpecies::VoiceSynthesize,
+                capability: "voice.synthesize",
+                request_class: "synthesis",
+                default_stage_kind: TurnRoutingStageKind::Egress,
+                default_context_envelope: TurnContextEnvelopeKind::Egress,
+                composition: TurnCapabilityCompositionKind::StageLocal,
+                default_streaming: true,
+            },
+        );
         stages.push(TurnRoutingStagePlan {
-            kind: TurnRoutingStageKind::Egress,
-            capability: "voice.synthesize".into(),
-            request_class: "synthesis".into(),
-            context_envelope: TurnContextEnvelopeKind::Egress,
+            kind: egress_profile.default_stage_kind,
+            capability: egress_profile.capability.into(),
+            request_class: egress_profile.request_class.into(),
+            context_envelope: egress_profile.default_context_envelope,
             controller_role: controller_role.into(),
             provider_hint: role_to_provider_hint(controller_role),
             model_ref: None,
-            streaming: true,
+            streaming: egress_profile.default_streaming,
         });
     }
 
@@ -7614,7 +7647,8 @@ mod tests {
     };
     use crate::session::{
         ApprovalPolicy, ComponentExecutionRoute, ComponentRouteAssembly, ComponentRouteBinding,
-        SessionState, TtsMode, TurnRoutingStageKind, VoiceResponsePolicy, WorkingTurn,
+        SessionState, TtsMode, TurnCapabilityCompositionKind, TurnRoutedCapabilitySpecies,
+        TurnRoutingStageKind, VoiceResponsePolicy, WorkingTurn, turn_routed_capability_profile,
     };
     use philotic_client::TaskErrorPayload;
     use uuid::Uuid;
@@ -8659,6 +8693,44 @@ mod tests {
             state.bindings.shared_model_markers[0]["model_ref"],
             serde_json::json!("gemini-3.1-flash")
         );
+    }
+
+    #[test]
+    fn turn_routed_capability_taxonomy_marks_native_live_species_as_collapsible() {
+        let response_generate =
+            turn_routed_capability_profile("response.generate").expect("profile");
+        assert_eq!(
+            response_generate.species,
+            TurnRoutedCapabilitySpecies::ResponseGenerate
+        );
+        assert_eq!(
+            response_generate.composition,
+            TurnCapabilityCompositionKind::CollapsibleIngressCognition
+        );
+
+        let voice_dialogue = turn_routed_capability_profile("voice.dialogue").expect("profile");
+        assert_eq!(
+            voice_dialogue.species,
+            TurnRoutedCapabilitySpecies::VoiceDialogue
+        );
+        assert_eq!(
+            voice_dialogue.composition,
+            TurnCapabilityCompositionKind::CollapsibleIngressCognition
+        );
+    }
+
+    #[test]
+    fn turn_routed_capability_taxonomy_keeps_transcribe_and_synthesize_stage_local() {
+        let transcribe = turn_routed_capability_profile("voice.transcribe").expect("profile");
+        assert_eq!(transcribe.default_stage_kind, TurnRoutingStageKind::Ingress);
+        assert_eq!(
+            transcribe.composition,
+            TurnCapabilityCompositionKind::StageLocal
+        );
+
+        let synth = turn_routed_capability_profile("voice.synthesize").expect("profile");
+        assert_eq!(synth.default_stage_kind, TurnRoutingStageKind::Egress);
+        assert_eq!(synth.composition, TurnCapabilityCompositionKind::StageLocal);
     }
 
     #[test]
