@@ -547,7 +547,22 @@ fn routing_preference_score(
 ) -> i32 {
     preference.preference_level * 100
         + preference.weight
+        + routing_preference_catalog_signal(preference, stage, bindings)
         + routing_preference_reflex_adjustment(preference, stage, bindings)
+}
+
+fn routing_preference_catalog_signal(
+    preference: &RoutingPreferenceBinding,
+    stage: &TurnRoutingStagePlan,
+    bindings: &SessionBindings,
+) -> i32 {
+    bindings
+        .shared_model_markers
+        .iter()
+        .filter(|marker| model_marker_matches_preference(marker, preference))
+        .map(|marker| model_marker_stage_signal(marker, stage))
+        .max()
+        .unwrap_or(0)
 }
 
 fn routing_preference_reflex_adjustment(
@@ -625,6 +640,81 @@ fn reflex_marker_matches_preference(
     }
 
     false
+}
+
+fn model_marker_matches_preference(
+    marker: &serde_json::Value,
+    preference: &RoutingPreferenceBinding,
+) -> bool {
+    let Some(obj) = marker.as_object() else {
+        return false;
+    };
+    let marker_model_ref = obj
+        .get("model_ref")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let (Some(marker_model_ref), Some(preference_model_ref)) =
+        (marker_model_ref, preference.model_ref.as_deref())
+    {
+        return marker_model_ref == preference_model_ref;
+    }
+
+    let marker_provider_hint = obj
+        .get("provider_hint")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let (Some(marker_provider_hint), Some(preference_provider_hint)) =
+        (marker_provider_hint, preference.provider_hint.as_deref())
+    {
+        return marker_provider_hint == preference_provider_hint;
+    }
+
+    false
+}
+
+fn model_marker_stage_signal(marker: &serde_json::Value, stage: &TurnRoutingStagePlan) -> i32 {
+    let Some(obj) = marker.as_object() else {
+        return 0;
+    };
+    let capability_markers = obj
+        .get("capability_markers")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let stage_capability_match = capability_markers
+        .iter()
+        .filter_map(|value| value.as_str())
+        .any(|capability| capability == stage.capability);
+    if !stage_capability_match {
+        return 0;
+    }
+
+    let speed_marker = obj
+        .get("speed_marker")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0) as i32;
+    let thinking_marker = obj
+        .get("thinking_marker")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0) as i32;
+    let tool_use_marker = obj
+        .get("tool_use_marker")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0) as i32;
+    let audio_native_marker = obj
+        .get("audio_native_marker")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0) as i32;
+
+    match stage.kind {
+        TurnRoutingStageKind::Ingress => speed_marker + audio_native_marker,
+        TurnRoutingStageKind::Cognition => {
+            speed_marker / 3 + thinking_marker / 2 + tool_use_marker / 2
+        }
+        TurnRoutingStageKind::Egress => speed_marker + audio_native_marker,
+    }
 }
 
 fn apply_routing_preferences(
@@ -7297,6 +7387,9 @@ impl AgentRuntime {
         let new_reflex_policy_agent_suppressions = bindings
             .get("reflex_policy_agent_suppressions")
             .and_then(|v| serde_json::from_value::<Vec<serde_json::Value>>(v.clone()).ok());
+        let new_shared_model_markers = bindings
+            .get("shared_model_markers")
+            .and_then(|v| serde_json::from_value::<Vec<serde_json::Value>>(v.clone()).ok());
         let new_component_routes = snapshot
             .get("component_route_assembly")
             .cloned()
@@ -7342,6 +7435,12 @@ impl AgentRuntime {
         if let Some(suppressions) = new_reflex_policy_agent_suppressions {
             if suppressions != state.bindings.reflex_policy_agent_suppressions {
                 state.bindings.reflex_policy_agent_suppressions = suppressions;
+                changed = true;
+            }
+        }
+        if let Some(shared_model_markers) = new_shared_model_markers {
+            if shared_model_markers != state.bindings.shared_model_markers {
+                state.bindings.shared_model_markers = shared_model_markers;
                 changed = true;
             }
         }
@@ -8434,6 +8533,65 @@ mod tests {
     }
 
     #[test]
+    fn compile_turn_routing_plan_uses_shared_model_markers_to_bias_cognition_selection() {
+        use crate::session::{RoutingPreferenceBinding, SessionBindings};
+
+        let routing_preferences = vec![
+            RoutingPreferenceBinding {
+                preference_key: "cognition-local".into(),
+                stage_kind: Some("cognition".into()),
+                capability: Some("text.generate".into()),
+                provider_hint: Some("mlx".into()),
+                model_ref: Some("mlx/qwen".into()),
+                preference_level: 1,
+                weight: 90,
+                updated_at: 10,
+            },
+            RoutingPreferenceBinding {
+                preference_key: "cognition-remote".into(),
+                stage_kind: Some("cognition".into()),
+                capability: Some("text.generate".into()),
+                provider_hint: Some("gemini".into()),
+                model_ref: Some("gemini-3.1-flash".into()),
+                preference_level: 1,
+                weight: 90,
+                updated_at: 9,
+            },
+        ];
+        let bindings = SessionBindings {
+            shared_model_markers: vec![
+                serde_json::json!({
+                    "model_ref": "mlx/qwen",
+                    "provider_hint": "mlx",
+                    "capability_markers": ["text.generate"],
+                    "speed_marker": 55,
+                    "thinking_marker": 55,
+                    "tool_use_marker": 45,
+                    "audio_native_marker": 0
+                }),
+                serde_json::json!({
+                    "model_ref": "gemini-3.1-flash",
+                    "provider_hint": "gemini",
+                    "capability_markers": ["text.generate"],
+                    "speed_marker": 90,
+                    "thinking_marker": 75,
+                    "tool_use_marker": 80,
+                    "audio_native_marker": 0
+                }),
+            ],
+            ..Default::default()
+        };
+
+        let plan = compile_turn_routing_plan(None, None, false, &routing_preferences, &bindings);
+
+        assert_eq!(plan.stages[0].provider_hint.as_deref(), Some("gemini"));
+        assert_eq!(
+            plan.stages[0].model_ref.as_deref(),
+            Some("gemini-3.1-flash")
+        );
+    }
+
+    #[test]
     fn merge_snapshot_bindings_updates_routing_preferences() {
         use crate::session::RoutingPreferenceBinding;
 
@@ -8473,6 +8631,33 @@ mod tests {
                 weight: 80,
                 updated_at: 42,
             }]
+        );
+    }
+
+    #[test]
+    fn merge_snapshot_bindings_updates_shared_model_markers() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        let snapshot = serde_json::json!({
+            "bindings": {
+                "shared_model_markers": [{
+                    "model_ref": "gemini-3.1-flash",
+                    "provider_hint": "gemini",
+                    "capability_markers": ["text.generate", "media.analyze"],
+                    "speed_marker": 90,
+                    "thinking_marker": 72,
+                    "tool_use_marker": 84,
+                    "audio_native_marker": 20
+                }]
+            }
+        });
+
+        AgentRuntime::merge_snapshot_bindings(&mut state, &snapshot);
+
+        assert_eq!(state.bindings.shared_model_markers.len(), 1);
+        assert_eq!(
+            state.bindings.shared_model_markers[0]["model_ref"],
+            serde_json::json!("gemini-3.1-flash")
         );
     }
 

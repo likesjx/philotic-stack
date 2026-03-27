@@ -495,6 +495,21 @@ agent-learned reflex posture can gently bias live turn-routing-plan selection
 and rejected posture can dampen it without turning the hotel into a second
 router.
 
+The next shared-catalog step now has a first concrete expression too: the hotel
+graph carries `abstract_model` records as static reference tissue, projects
+those model markers into session bindings, and `philote` consumes them as a
+bounded catalog signal during stage-aware route ranking. That keeps model
+metadata in the shared graph where it can be reused across agents, while still
+making the routing reflex live in the consumer boundary rather than in the
+catalog itself.
+
+The same pattern should carry to tools, skills, and rights at the runner
+boundary. Shared graph records provide static markers, class hints, and policy
+affordances; hotel projection and runner assembly decide what is actually
+expressed, allowed, or dampened in the current session. Otherwise the shared
+catalog quietly turns into a self-authorizing gland, which is both efficient
+and horrifying.
+
 In practice, a fresher active-incarnation update is the `p53` check here: if
 the runtime has newer local evidence that the session now belongs on a
 different active guest, older delivery provenance should die immediately rather

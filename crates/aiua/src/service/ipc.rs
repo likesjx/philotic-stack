@@ -171,6 +171,21 @@ fn load_agent_graph_routing_preferences(agent_id: &str) -> Option<Vec<serde_json
     )
 }
 
+fn load_shared_model_markers(graph: &GraphDomain) -> Option<Vec<serde_json::Value>> {
+    let mut markers = graph
+        .list_abstract_models()
+        .ok()?
+        .into_iter()
+        .filter_map(|record| serde_json::to_value(record).ok())
+        .collect::<Vec<_>>();
+    markers.sort_by(|left, right| {
+        left.get("model_ref")
+            .and_then(serde_json::Value::as_str)
+            .cmp(&right.get("model_ref").and_then(serde_json::Value::as_str))
+    });
+    Some(markers)
+}
+
 fn latest_routing_policy_reflex_dispositions(
     graph: &GraphDomain,
     agent_id: &str,
@@ -6730,6 +6745,19 @@ impl IpcServer {
                         "reflex_policy_agent_rewards": reflex_policy_agent_rewards,
                     });
                 }
+            }
+        }
+
+        if let Some(shared_model_markers) = load_shared_model_markers(graph) {
+            if let Some(obj) = bindings.as_object_mut() {
+                obj.insert(
+                    "shared_model_markers".to_string(),
+                    serde_json::Value::Array(shared_model_markers),
+                );
+            } else {
+                bindings = serde_json::json!({
+                    "shared_model_markers": shared_model_markers,
+                });
             }
         }
 
@@ -14530,6 +14558,103 @@ mod tests {
         server_task.abort();
         let _ = server_task.await;
         let _ = std::fs::remove_file(&graph_db_path);
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_session_snapshot_projects_shared_model_markers_from_graph() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_abstract_model(&ansible_mesh_core::graph::AbstractModelRecord {
+                model_ref: "gemini-3.1-flash".into(),
+                provider_hint: "gemini".into(),
+                description: "Fast cognitive model marker.".into(),
+                capability_markers: vec!["text.generate".into()],
+                endpoint_stem: Some("google.generativeai".into()),
+                speed_marker: 90,
+                thinking_marker: 72,
+                tool_use_marker: 84,
+                audio_native_marker: 20,
+            })
+            .expect("seed abstract model");
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-shared-model-markers".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: Some("agent-jane-01:orchestrator".into()),
+                channel_kind: Some("operator".into()),
+                channel_session_key: Some("chat-1".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("seed session");
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("client connect");
+
+        let response = client
+            .send_request(IpcRequest::GetConfig {
+                key: "__session_snapshot__:sess-shared-model-markers".into(),
+            })
+            .await
+            .expect("session snapshot request");
+
+        match response {
+            IpcResponse::ConfigData {
+                value_json: Some(value_json),
+                ..
+            } => {
+                let snapshot: serde_json::Value =
+                    serde_json::from_str(&value_json).expect("snapshot should decode");
+                assert_eq!(
+                    snapshot["bindings"]["shared_model_markers"][0]["model_ref"],
+                    "gemini-3.1-flash"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["shared_model_markers"][0]["provider_hint"],
+                    "gemini"
+                );
+            }
+            other => panic!("unexpected session snapshot response: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
         if Path::new(&socket_path).exists() {
             let _ = std::fs::remove_file(&socket_path);
         }

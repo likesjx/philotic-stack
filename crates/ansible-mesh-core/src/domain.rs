@@ -15,9 +15,9 @@
 
 use crate::cron::CronJob;
 use crate::graph::{
-    AbstractRightRecord, AbstractSkillRecord, AbstractToolRecord, GraphNode, RoleIncarnationRecord,
-    RoutingPolicyEvaluationRecord, RoutingPolicyRecord, RuleRecord, ToolsetProfileRecord,
-    WorkflowSkillRecord,
+    AbstractModelRecord, AbstractRightRecord, AbstractSkillRecord, AbstractToolRecord, GraphNode,
+    RoleIncarnationRecord, RoutingPolicyEvaluationRecord, RoutingPolicyRecord, RuleRecord,
+    ToolsetProfileRecord, WorkflowSkillRecord,
 };
 use crate::storage::{
     AgentIdentityRecord, GraphAdapter, GraphRunnerInstanceRecord, GuestRecord, HotelRecord,
@@ -37,6 +37,7 @@ use std::sync::Arc;
 // Slice 1
 pub const NODE_KIND_HOTEL: &str = "hotel";
 pub const NODE_KIND_ABSTRACT_TOOL: &str = "abstract_tool";
+pub const NODE_KIND_ABSTRACT_MODEL: &str = "abstract_model";
 pub const NODE_KIND_ABSTRACT_RIGHT: &str = "abstract_right";
 pub const NODE_KIND_RULE: &str = "rule";
 pub const NODE_KIND_ROUTING_POLICY: &str = "routing_policy";
@@ -83,6 +84,10 @@ impl GraphDomain {
 
     fn abstract_tool_key(tool_name: &str) -> String {
         format!("{}:{}", NODE_KIND_ABSTRACT_TOOL, tool_name)
+    }
+
+    fn abstract_model_key(model_ref: &str) -> String {
+        format!("{}:{}", NODE_KIND_ABSTRACT_MODEL, model_ref)
     }
 
     fn abstract_right_key(right_name: &str) -> String {
@@ -169,6 +174,45 @@ impl GraphDomain {
             .map(|n| {
                 serde_json::from_value(n.data)
                     .context("GraphDomain::list_abstract_tools: deserialize AbstractToolRecord")
+            })
+            .collect()
+    }
+
+    /// Upsert an abstract model record as a graph node.
+    pub fn upsert_abstract_model(&self, model: &AbstractModelRecord) -> Result<()> {
+        let data = serde_json::to_value(model)
+            .context("GraphDomain::upsert_abstract_model: serialize AbstractModelRecord")?;
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::abstract_model_key(&model.model_ref),
+            kind: NODE_KIND_ABSTRACT_MODEL.to_string(),
+            label: Some(model.model_ref.clone()),
+            data,
+        })
+    }
+
+    /// Load an abstract model record by model_ref.
+    pub fn get_abstract_model(&self, model_ref: &str) -> Result<Option<AbstractModelRecord>> {
+        match self
+            .adapter
+            .get_node(&Self::abstract_model_key(model_ref))?
+        {
+            None => Ok(None),
+            Some(node) => {
+                let record = serde_json::from_value(node.data)
+                    .context("GraphDomain::get_abstract_model: deserialize AbstractModelRecord")?;
+                Ok(Some(record))
+            }
+        }
+    }
+
+    /// List all abstract model records.
+    pub fn list_abstract_models(&self) -> Result<Vec<AbstractModelRecord>> {
+        self.adapter
+            .list_nodes_by_kind(NODE_KIND_ABSTRACT_MODEL)?
+            .into_iter()
+            .map(|n| {
+                serde_json::from_value(n.data)
+                    .context("GraphDomain::list_abstract_models: deserialize AbstractModelRecord")
             })
             .collect()
     }
@@ -1072,7 +1116,8 @@ impl GraphDomain {
 mod tests {
     use super::*;
     use crate::graph::{
-        AbstractRightRecord, AbstractSkillRecord, RoleIncarnationRecord, ToolsetProfileRecord,
+        AbstractModelRecord, AbstractRightRecord, AbstractSkillRecord, RoleIncarnationRecord,
+        ToolsetProfileRecord,
     };
     use crate::sqlite_storage::SqliteGraphStorage;
     use crate::storage::{
@@ -1114,6 +1159,27 @@ mod tests {
             description: format!("Description for {}", name),
             input_schema: serde_json::json!({"type": "object"}),
             class: "utility".to_string(),
+        }
+    }
+
+    fn model(
+        model_ref: &str,
+        provider_hint: &str,
+        capability_markers: &[&str],
+    ) -> AbstractModelRecord {
+        AbstractModelRecord {
+            model_ref: model_ref.to_string(),
+            provider_hint: provider_hint.to_string(),
+            description: format!("Description for {}", model_ref),
+            capability_markers: capability_markers
+                .iter()
+                .map(|v| (*v).to_string())
+                .collect(),
+            endpoint_stem: None,
+            speed_marker: 80,
+            thinking_marker: 70,
+            tool_use_marker: 60,
+            audio_native_marker: 0,
         }
     }
 
@@ -1233,6 +1299,38 @@ mod tests {
             d.upsert_abstract_tool(&tool(name)).unwrap();
         }
         assert_eq!(d.list_abstract_tools().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn abstract_model_roundtrip() {
+        let d = make_domain();
+        d.upsert_abstract_model(&model(
+            "gemini-3.1-flash",
+            "gemini",
+            &["text.generate", "media.analyze"],
+        ))
+        .unwrap();
+        let record = d.get_abstract_model("gemini-3.1-flash").unwrap().unwrap();
+        assert_eq!(record.provider_hint, "gemini");
+        assert_eq!(
+            record.capability_markers,
+            vec!["text.generate", "media.analyze"]
+        );
+    }
+
+    #[test]
+    fn abstract_model_list() {
+        let d = make_domain();
+        d.upsert_abstract_model(&model("gemini-3.1-flash", "gemini", &["text.generate"]))
+            .unwrap();
+        d.upsert_abstract_model(&model("scribe_v1", "elevenlabs", &["voice.transcribe"]))
+            .unwrap();
+        let models = d.list_abstract_models().unwrap();
+        assert_eq!(models.len(), 2);
+        assert!(models
+            .iter()
+            .any(|record| record.model_ref == "gemini-3.1-flash"));
+        assert!(models.iter().any(|record| record.model_ref == "scribe_v1"));
     }
 
     #[test]

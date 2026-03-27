@@ -68,6 +68,30 @@ pub struct AbstractToolRecord {
     pub class: String,
 }
 
+/// A system-wide shared model definition stored in the context graph.
+///
+/// Node kind: `abstract_model`. Node key: `abstract_model:{model_ref}`.
+/// These are static model markers used to inform routing and policy projection;
+/// they do not grant rights or declare live availability.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AbstractModelRecord {
+    pub model_ref: String,
+    pub provider_hint: String,
+    pub description: String,
+    #[serde(default)]
+    pub capability_markers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_stem: Option<String>,
+    #[serde(default)]
+    pub speed_marker: i32,
+    #[serde(default)]
+    pub thinking_marker: i32,
+    #[serde(default)]
+    pub tool_use_marker: i32,
+    #[serde(default)]
+    pub audio_native_marker: i32,
+}
+
 /// A system-wide shared right definition stored in the context graph.
 ///
 /// Node kind: `abstract_right`. Node key: `abstract_right:{right_name}`.

@@ -708,6 +708,8 @@ pub struct SessionBindings {
     #[serde(default)]
     pub reflex_policy_agent_suppressions: Vec<serde_json::Value>,
     #[serde(default)]
+    pub shared_model_markers: Vec<serde_json::Value>,
+    #[serde(default)]
     pub allowed_tool_runner_incarnations: Vec<ToolRunnerIncarnationBinding>,
 }
 
@@ -4345,6 +4347,7 @@ mod tests {
                 effective_reflexes: serde_json::Value::Null,
                 reflex_policy_agent_rewards: Vec::new(),
                 reflex_policy_agent_suppressions: Vec::new(),
+                shared_model_markers: Vec::new(),
                 allowed_tool_runner_incarnations: Vec::new(),
             }
         );
@@ -4819,6 +4822,7 @@ mod tests {
             effective_reflexes: serde_json::Value::Null,
             reflex_policy_agent_rewards: Vec::new(),
             reflex_policy_agent_suppressions: Vec::new(),
+            shared_model_markers: Vec::new(),
             allowed_tool_runner_incarnations: Vec::new(),
         };
 

@@ -1,7 +1,8 @@
 use ansible_mesh_core::beacon::BeaconDaemon;
 use ansible_mesh_core::catalog_rights::{component_right, skill_right, tool_right};
 use ansible_mesh_core::graph::{
-    AbstractRightRecord, AbstractSkillRecord, AbstractToolRecord, ToolsetProfileRecord,
+    AbstractModelRecord, AbstractRightRecord, AbstractSkillRecord, AbstractToolRecord,
+    ToolsetProfileRecord,
 };
 use ansible_mesh_core::heartbeat::emit_heartbeat;
 use ansible_mesh_core::registry::{CapabilityAdvertisement, ExecutionReachability, NodeRegistry};
@@ -2082,6 +2083,63 @@ fn seed_abstract_right_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
 
     for right in &catalog {
         graph.upsert_abstract_right(right)?;
+    }
+    Ok(())
+}
+
+/// Seed the built-in abstract model catalog into the context graph.
+fn seed_abstract_model_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
+    let catalog = [
+        AbstractModelRecord {
+            model_ref: "gemini-3.1-flash".into(),
+            provider_hint: "gemini".into(),
+            description: "Fast multimodal cognitive model with strong general tool-use posture."
+                .into(),
+            capability_markers: vec!["text.generate".into(), "media.analyze".into()],
+            endpoint_stem: Some("google.generativeai".into()),
+            speed_marker: 90,
+            thinking_marker: 72,
+            tool_use_marker: 84,
+            audio_native_marker: 20,
+        },
+        AbstractModelRecord {
+            model_ref: "mlx/qwen".into(),
+            provider_hint: "mlx".into(),
+            description: "Local cognitive model marker for low-latency on-device text turns."
+                .into(),
+            capability_markers: vec!["text.generate".into()],
+            endpoint_stem: Some("local.mlx".into()),
+            speed_marker: 68,
+            thinking_marker: 78,
+            tool_use_marker: 62,
+            audio_native_marker: 0,
+        },
+        AbstractModelRecord {
+            model_ref: "scribe_v1".into(),
+            provider_hint: "elevenlabs".into(),
+            description: "Streaming transcription model marker for receptor ingress.".into(),
+            capability_markers: vec!["voice.transcribe".into()],
+            endpoint_stem: Some("api.elevenlabs.io/v1/speech-to-text".into()),
+            speed_marker: 88,
+            thinking_marker: 10,
+            tool_use_marker: 0,
+            audio_native_marker: 95,
+        },
+        AbstractModelRecord {
+            model_ref: "eleven_multilingual_v2".into(),
+            provider_hint: "elevenlabs".into(),
+            description: "Streaming voice synthesis model marker for response egress.".into(),
+            capability_markers: vec!["voice.synthesize".into()],
+            endpoint_stem: Some("api.elevenlabs.io/v1/text-to-speech".into()),
+            speed_marker: 86,
+            thinking_marker: 0,
+            tool_use_marker: 0,
+            audio_native_marker: 98,
+        },
+    ];
+
+    for model in &catalog {
+        graph.upsert_abstract_model(model)?;
     }
     Ok(())
 }
@@ -4475,6 +4533,7 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
 
     seed_orchestrator_roles(&graph_domain, &all_profiles)?;
     seed_abstract_tool_catalog(&graph_domain)?;
+    seed_abstract_model_catalog(&graph_domain)?;
     seed_abstract_right_catalog(&graph_domain)?;
     seed_abstract_skill_catalog(&graph_domain)?;
     seed_toolset_profiles(&graph_domain)?;
@@ -4606,6 +4665,7 @@ async fn main() -> Result<()> {
     let mut hotel = reconcile_hotel_record(&graph_domain_arc, &hotel_name)?;
 
     seed_abstract_tool_catalog(&graph_domain_arc)?;
+    seed_abstract_model_catalog(&graph_domain_arc)?;
     seed_abstract_right_catalog(&graph_domain_arc)?;
     seed_abstract_skill_catalog(&graph_domain_arc)?;
     seed_toolset_profiles(&graph_domain_arc)?;
