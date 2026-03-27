@@ -263,6 +263,34 @@ fn lookup_agent_authority_hotel(graph: &GraphDomain, agent_id: &str) -> Option<S
         .map(|identity| identity.authority_hotel)
 }
 
+fn attach_delivery_context(
+    graph: &GraphDomain,
+    local_node_id: &str,
+    target_role: &str,
+    target_guest_id: Option<&str>,
+    task_json: &str,
+) -> String {
+    let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(task_json) else {
+        return task_json.to_string();
+    };
+    let Some(obj) = payload.as_object_mut() else {
+        return task_json.to_string();
+    };
+    obj.entry("delivery_node_id".to_string())
+        .or_insert_with(|| serde_json::json!(local_node_id));
+    if let Some(hotel_name) = IpcServer::local_hotel_name(graph, local_node_id) {
+        obj.entry("delivery_hotel".to_string())
+            .or_insert_with(|| serde_json::json!(hotel_name));
+    }
+    obj.entry("delivery_target_role".to_string())
+        .or_insert_with(|| serde_json::json!(target_role));
+    if let Some(target_guest_id) = target_guest_id {
+        obj.entry("delivery_target_guest_id".to_string())
+            .or_insert_with(|| serde_json::json!(target_guest_id));
+    }
+    serde_json::to_string(&payload).unwrap_or_else(|_| task_json.to_string())
+}
+
 fn declared_component_capabilities(bindings: &serde_json::Value) -> Vec<String> {
     let mut capabilities =
         BTreeSet::from(["media.analyze".to_string(), "text.generate".to_string()]);
@@ -2262,6 +2290,13 @@ impl IpcServer {
         task_json: String,
         activate_session_id: Option<String>,
     ) -> anyhow::Result<bool> {
+        let task_json = attach_delivery_context(
+            graph,
+            local_node_id,
+            target_role,
+            Some(guest_id),
+            &task_json,
+        );
         let is_live = {
             let guard = inboxes.lock().await;
             guard
@@ -3396,6 +3431,17 @@ impl IpcServer {
                 let resolved_target_guest_id = match &route_resolution {
                     AgentRouteResolution::Deliver(guest_id) => guest_id.clone(),
                     AgentRouteResolution::Park { guest_id } => Some(guest_id.clone()),
+                };
+                let task_json = if target_node == local_node_id {
+                    attach_delivery_context(
+                        graph,
+                        local_node_id,
+                        &target_role,
+                        resolved_target_guest_id.as_deref(),
+                        &task_json,
+                    )
+                } else {
+                    task_json
                 };
                 info!(
                     "EmitTask mapped to TaskInvoke for {}/{} guest={:?}",
@@ -5382,6 +5428,62 @@ impl IpcServer {
             }
             summary_json["tool_assembly"] = tool_assembly.clone();
             session.summary_json = summary_json;
+        }
+        {
+            let agent_id = payload
+                .get("agent_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .or_else(|| envelope.primary_agent_id.clone());
+            let authority_hotel = payload
+                .get("authority_hotel")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let delivery_hotel = payload
+                .get("delivery_hotel")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let delivery_node_id = payload
+                .get("delivery_node_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let delivery_target_role = payload
+                .get("delivery_target_role")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let delivery_target_guest_id = payload
+                .get("delivery_target_guest_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let transport = payload
+                .get("transport")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+
+            if agent_id.is_some()
+                || authority_hotel.is_some()
+                || delivery_hotel.is_some()
+                || delivery_node_id.is_some()
+                || delivery_target_role.is_some()
+                || delivery_target_guest_id.is_some()
+                || transport.is_some()
+            {
+                let mut summary_json = session.summary_json.clone();
+                if !summary_json.is_object() {
+                    summary_json = serde_json::json!({});
+                }
+                summary_json["agent_runtime_provenance"] = serde_json::json!({
+                    "agent_id": agent_id,
+                    "authority_hotel": authority_hotel,
+                    "delivery_hotel": delivery_hotel,
+                    "delivery_node_id": delivery_node_id,
+                    "delivery_target_role": delivery_target_role,
+                    "delivery_target_guest_id": delivery_target_guest_id,
+                    "transport": transport,
+                    "updated_at": now,
+                });
+                session.summary_json = summary_json;
+            }
         }
         session.updated_at = now;
         let _ = graph.upsert_session(&session);
@@ -9082,6 +9184,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn emit_task_persists_agent_runtime_provenance_with_authority_and_delivery_context() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+            })
+            .expect("seed local hotel");
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let agent_identity = GuestIdentity {
+            guest_id: "agent-aria:orchestrator".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let mut agent = PhiloticClient::connect(agent_identity)
+            .await
+            .expect("agent connect");
+
+        agent
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: Some("agent-aria:orchestrator".into()),
+                task_json: serde_json::json!({
+                    "agent_id": "agent-aria-01",
+                    "authority_hotel": "remote-hotel",
+                    "transport": "operator_chat",
+                    "session_id": "sess-provenance",
+                    "turn_id": "turn-1",
+                    "chat_id": "chat-1",
+                    "content": "hello from elsewhere"
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit task");
+
+        let session = graph
+            .get_session("sess-provenance")
+            .expect("session lookup should work")
+            .expect("session should exist");
+        assert_eq!(
+            session.summary_json["agent_runtime_provenance"]["agent_id"],
+            "agent-aria-01"
+        );
+        assert_eq!(
+            session.summary_json["agent_runtime_provenance"]["authority_hotel"],
+            "remote-hotel"
+        );
+        assert_eq!(
+            session.summary_json["agent_runtime_provenance"]["delivery_hotel"],
+            "local-hotel"
+        );
+        assert_eq!(
+            session.summary_json["agent_runtime_provenance"]["delivery_node_id"],
+            "local-aiua-01"
+        );
+        assert_eq!(
+            session.summary_json["agent_runtime_provenance"]["delivery_target_guest_id"],
+            "agent-aria:orchestrator"
+        );
+        assert_eq!(
+            session.summary_json["agent_runtime_provenance"]["delivery_target_role"],
+            "agent"
+        );
+        assert_eq!(
+            session.summary_json["agent_runtime_provenance"]["transport"],
+            "operator_chat"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
     async fn get_config_can_return_canonical_session_snapshot() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
@@ -9200,6 +9413,121 @@ mod tests {
                 assert_eq!(snapshot["recent_turns"][0]["assistant_content"], "hi");
             }
             other => panic!("unexpected response: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_session_snapshot_includes_agent_runtime_provenance() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+            })
+            .expect("seed local hotel");
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-runtime-provenance".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: Some("agent-jane:orchestrator".into()),
+                channel_kind: Some("operator".into()),
+                channel_session_key: Some("chat-1".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "agent_runtime_provenance": {
+                        "agent_id": "agent-jane-01",
+                        "authority_hotel": "remote-hotel",
+                        "delivery_hotel": "local-hotel",
+                        "delivery_node_id": "local-aiua-01",
+                        "delivery_target_role": "agent",
+                        "delivery_target_guest_id": "agent-jane:orchestrator",
+                        "transport": "operator_chat"
+                    }
+                }),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("seed session");
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("client connect");
+
+        let response = client
+            .send_request(IpcRequest::GetConfig {
+                key: "__session_snapshot__:sess-runtime-provenance".into(),
+            })
+            .await
+            .expect("session snapshot request");
+
+        match response {
+            IpcResponse::ConfigData {
+                value_json: Some(value_json),
+                ..
+            } => {
+                let snapshot: serde_json::Value =
+                    serde_json::from_str(&value_json).expect("snapshot should decode");
+                assert_eq!(
+                    snapshot["summary"]["agent_runtime_provenance"]["authority_hotel"],
+                    "remote-hotel"
+                );
+                assert_eq!(
+                    snapshot["summary"]["agent_runtime_provenance"]["delivery_hotel"],
+                    "local-hotel"
+                );
+                assert_eq!(
+                    snapshot["summary"]["agent_runtime_provenance"]["delivery_target_guest_id"],
+                    "agent-jane:orchestrator"
+                );
+            }
+            other => panic!("unexpected session snapshot response: {other:?}"),
         }
 
         unsafe {

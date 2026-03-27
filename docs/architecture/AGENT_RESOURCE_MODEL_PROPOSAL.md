@@ -323,6 +323,14 @@ home authority. Transport placement and durable identity ownership are related,
 but letting them quietly impersonate each other would be a very efficient way
 to smear agent selfhood across the mesh.
 
+Receiving hotels now also persist that provenance into session runtime state.
+When agent-directed work is delivered locally, the hotel decorates it with
+delivery context like `delivery_hotel`, `delivery_node_id`, and the concrete
+target guest/role, then records that beside `authority_hotel` in session
+summary. That makes home ownership vs current execution placement visible in
+runtime truth and canonical session snapshots instead of leaving it trapped in
+one inbound payload.
+
 This is dogfood: the mesh sync story for agent portability is proven by the
 same infrastructure everything else depends on. No second sync protocol.
 
