@@ -253,20 +253,74 @@ fn remote_execution_allowed(bindings: &serde_json::Value) -> bool {
 
 fn remote_tool_execution_allowed(bindings: &serde_json::Value) -> bool {
     bindings
-        .get("effective_right_policy")
-        .and_then(|policy| policy.get("remote_tool_execution"))
+        .get("effective_reflexes")
+        .and_then(|reflexes| reflexes.get("remote_tool_reflex"))
         .and_then(serde_json::Value::as_str)
         .map(|value| value == "allow")
+        .or_else(|| {
+            bindings
+                .get("effective_right_policy")
+                .and_then(|policy| policy.get("remote_tool_execution"))
+                .and_then(serde_json::Value::as_str)
+                .map(|value| value == "allow")
+        })
         .unwrap_or_else(|| remote_execution_allowed(bindings))
 }
 
 fn remote_component_execution_allowed(bindings: &serde_json::Value) -> bool {
     bindings
-        .get("effective_right_policy")
-        .and_then(|policy| policy.get("remote_component_execution"))
+        .get("effective_reflexes")
+        .and_then(|reflexes| reflexes.get("remote_component_reflex"))
         .and_then(serde_json::Value::as_str)
         .map(|value| value == "allow")
+        .or_else(|| {
+            bindings
+                .get("effective_right_policy")
+                .and_then(|policy| policy.get("remote_component_execution"))
+                .and_then(serde_json::Value::as_str)
+                .map(|value| value == "allow")
+        })
         .unwrap_or_else(|| remote_execution_allowed(bindings))
+}
+
+fn credential_scope_reflex(bindings: &serde_json::Value) -> &'static str {
+    bindings
+        .get("effective_reflexes")
+        .and_then(|reflexes| reflexes.get("credential_scope_reflex"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            bindings
+                .get("effective_right_policy")
+                .and_then(|policy| policy.get("credential_scope"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .and_then(|value| match value {
+            "local_only" => Some("local_only"),
+            "local_scoped" => Some("local_scoped"),
+            "mesh_scoped" => Some("mesh_scoped"),
+            _ => None,
+        })
+        .unwrap_or("local_scoped")
+}
+
+fn effective_reflexes_from_placement_risk(placement_risk_level: &str) -> serde_json::Value {
+    match placement_risk_level {
+        "elevated" => serde_json::json!({
+            "remote_tool_reflex": "deny",
+            "remote_component_reflex": "deny",
+            "credential_scope_reflex": "local_only",
+        }),
+        "low" => serde_json::json!({
+            "remote_tool_reflex": "allow",
+            "remote_component_reflex": "allow",
+            "credential_scope_reflex": "mesh_scoped",
+        }),
+        _ => serde_json::json!({
+            "remote_tool_reflex": "deny",
+            "remote_component_reflex": "allow",
+            "credential_scope_reflex": "local_scoped",
+        }),
+    }
 }
 
 fn load_agent_graph_snapshot(agent_id: &str, source_node_id: &str) -> Option<serde_json::Value> {
@@ -6249,23 +6303,13 @@ impl IpcServer {
                 })
                 .unwrap_or("guarded");
             if let Some(obj) = bindings.as_object_mut() {
-                let effective_right_policy = match placement_risk_level {
-                    "elevated" => serde_json::json!({
-                        "remote_tool_execution": "deny",
-                        "remote_component_execution": "deny",
-                        "credential_scope": "local_only",
-                    }),
-                    "low" => serde_json::json!({
-                        "remote_tool_execution": "allow",
-                        "remote_component_execution": "allow",
-                        "credential_scope": "mesh_scoped",
-                    }),
-                    _ => serde_json::json!({
-                        "remote_tool_execution": "deny",
-                        "remote_component_execution": "allow",
-                        "credential_scope": "local_scoped",
-                    }),
-                };
+                let effective_reflexes =
+                    effective_reflexes_from_placement_risk(placement_risk_level);
+                let effective_right_policy = serde_json::json!({
+                    "remote_tool_execution": effective_reflexes["remote_tool_reflex"],
+                    "remote_component_execution": effective_reflexes["remote_component_reflex"],
+                    "credential_scope": effective_reflexes["credential_scope_reflex"],
+                });
                 obj.insert(
                     "effective_posture".to_string(),
                     serde_json::json!({
@@ -6273,6 +6317,7 @@ impl IpcServer {
                         "remote_execution_allowed": placement_risk_level != "elevated",
                     }),
                 );
+                obj.insert("effective_reflexes".to_string(), effective_reflexes);
                 obj.insert("effective_right_policy".to_string(), effective_right_policy);
             }
         }
@@ -6923,7 +6968,8 @@ fn compose_tool_assembly(
                 tool_name.to_string(),
                 serde_json::json!({
                     "policy_class": format!("tool:{tool_name}"),
-                    "approval_required": false
+                    "approval_required": false,
+                    "credential_scope_reflex": credential_scope_reflex(bindings),
                 }),
             )
         })
@@ -10980,6 +11026,18 @@ mod tests {
                     true
                 );
                 assert_eq!(
+                    snapshot["bindings"]["effective_reflexes"]["remote_tool_reflex"],
+                    "deny"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflexes"]["remote_component_reflex"],
+                    "allow"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["effective_reflexes"]["credential_scope_reflex"],
+                    "local_scoped"
+                );
+                assert_eq!(
                     snapshot["bindings"]["effective_right_policy"]["remote_tool_execution"],
                     "deny"
                 );
@@ -11481,6 +11539,10 @@ mod tests {
             assembly["execution_routes"].get("echo").is_none(),
             "guarded right policy should suppress remote echo route"
         );
+        assert_eq!(
+            assembly["policy_annotations"]["echo"]["credential_scope_reflex"],
+            "local_scoped"
+        );
     }
 
     #[test]
@@ -11516,6 +11578,10 @@ mod tests {
         assert_eq!(
             assembly["execution_routes"]["echo"]["target_node"],
             "remote-node"
+        );
+        assert_eq!(
+            assembly["policy_annotations"]["echo"]["credential_scope_reflex"],
+            "mesh_scoped"
         );
     }
 

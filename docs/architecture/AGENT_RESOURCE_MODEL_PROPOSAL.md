@@ -388,6 +388,13 @@ execution while denying remote tool execution and shrinking credential scope.
 The hotel still owns grants; posture only narrows how far those grants may
 reach in the current session.
 
+Naming note: the fast, posture-derived behaviors should be called
+`reflexes`. In runtime projection this now shows up as `effective_reflexes`
+with fields like `remote_tool_reflex`, `remote_component_reflex`, and
+`credential_scope_reflex`. The older `effective_right_policy` projection can
+remain as a transitional compatibility bridge, but reflexes are the intended
+operator-facing language for these quick risk/posture responses.
+
 In practice, a fresher active-incarnation update is the `p53` check here: if
 the runtime has newer local evidence that the session now belongs on a
 different active guest, older delivery provenance should die immediately rather
