@@ -30,6 +30,10 @@ impl TaskKind {
             Self::Embed => "text.embed",
         }
     }
+
+    pub fn is_native_live(&self) -> bool {
+        matches!(self, Self::ResponseGenerate | Self::VoiceDialogue)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1321,6 +1325,29 @@ pub trait ModelProvider: Send + Sync {
     async fn invoke(&self, task: &ControllerTask) -> Result<ProviderOutput>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NativeLiveSessionMarker {
+    pub provider_session_id: Option<String>,
+    pub resumption_handle: Option<String>,
+    pub protocol: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NativeLiveTurnOutput {
+    pub final_output: ProviderOutput,
+    pub partial_text_deltas: Vec<String>,
+    pub session_marker: Option<NativeLiveSessionMarker>,
+    pub generation_complete: bool,
+    pub turn_complete: bool,
+}
+
+#[async_trait]
+pub trait NativeLiveProvider: Send + Sync {
+    fn id(&self) -> &'static str;
+    fn supports_live(&self, task: &ControllerTask) -> bool;
+    async fn invoke_live(&self, task: &ControllerTask) -> Result<NativeLiveTurnOutput>;
+}
+
 #[derive(Clone)]
 pub struct ProviderRegistry {
     providers: Vec<Arc<dyn ModelProvider>>,
@@ -1352,6 +1379,45 @@ impl ProviderRegistry {
             .find(|provider| provider.supports(task))
             .cloned()
             .with_context(|| format!("no provider registered for {}", task.kind.as_str()))
+    }
+}
+
+#[derive(Clone)]
+pub struct NativeLiveRegistry {
+    providers: Vec<Arc<dyn NativeLiveProvider>>,
+}
+
+impl NativeLiveRegistry {
+    pub fn new(providers: Vec<Arc<dyn NativeLiveProvider>>) -> Self {
+        Self { providers }
+    }
+
+    pub fn resolve(&self, task: &ControllerTask) -> Result<Arc<dyn NativeLiveProvider>> {
+        if let Some(provider_id) = task.provider_hint() {
+            return self
+                .providers
+                .iter()
+                .find(|provider| provider.id() == provider_id && provider.supports_live(task))
+                .cloned()
+                .with_context(|| {
+                    format!(
+                        "requested native-live provider [{}] does not support {}",
+                        provider_id,
+                        task.kind.as_str()
+                    )
+                });
+        }
+
+        self.providers
+            .iter()
+            .find(|provider| provider.supports_live(task))
+            .cloned()
+            .with_context(|| {
+                format!(
+                    "no native-live provider registered for {}",
+                    task.kind.as_str()
+                )
+            })
     }
 }
 
@@ -1468,8 +1534,9 @@ async fn fetch_secret_string(
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioArtifact, ControllerResponseEnvelope, ControllerTask, ProviderOutput,
-        ProviderRegistry, RequestClass, TaskKind, serialize_audio_artifact,
+        AudioArtifact, ControllerResponseEnvelope, ControllerTask, NativeLiveRegistry,
+        NativeLiveTurnOutput, ProviderOutput, ProviderRegistry, RequestClass, TaskKind,
+        serialize_audio_artifact,
     };
     use anyhow::Result;
     use async_trait::async_trait;
@@ -1477,6 +1544,11 @@ mod tests {
     use std::sync::Arc;
 
     struct FakeProvider {
+        id: &'static str,
+        kind: TaskKind,
+    }
+
+    struct FakeLiveProvider {
         id: &'static str,
         kind: TaskKind,
     }
@@ -1493,6 +1565,21 @@ mod tests {
 
         async fn invoke(&self, _task: &ControllerTask) -> Result<super::ProviderOutput> {
             unreachable!("invoke is not used in registry tests")
+        }
+    }
+
+    #[async_trait]
+    impl super::NativeLiveProvider for FakeLiveProvider {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+
+        fn supports_live(&self, task: &ControllerTask) -> bool {
+            task.kind == self.kind
+        }
+
+        async fn invoke_live(&self, _task: &ControllerTask) -> Result<NativeLiveTurnOutput> {
+            unreachable!("invoke_live is not used in registry tests")
         }
     }
 
@@ -2070,6 +2157,36 @@ mod tests {
 
         let provider = registry.resolve(&task).unwrap();
         assert_eq!(provider.id(), "elevenlabs");
+    }
+
+    #[test]
+    fn native_live_registry_prefers_matching_provider_hint() {
+        let registry = NativeLiveRegistry::new(vec![
+            Arc::new(FakeLiveProvider {
+                id: "gemini",
+                kind: TaskKind::VoiceDialogue,
+            }),
+            Arc::new(FakeLiveProvider {
+                id: "other-live",
+                kind: TaskKind::ResponseGenerate,
+            }),
+        ]);
+
+        let task = ControllerTask::from_value(&json!({
+            "kind": "voice.dialogue",
+            "provider": "gemini",
+            "prompt": "Continue this voice conversation naturally.",
+            "attachments": [{
+                "kind": "voice",
+                "file_id": "voice-1",
+                "mime_type": "audio/ogg",
+                "blob_download_url": "http://127.0.0.1:9001/download/sha256-audio-1"
+            }]
+        }))
+        .unwrap();
+
+        let provider = registry.resolve(&task).unwrap();
+        assert_eq!(provider.id(), "gemini");
     }
 
     #[test]

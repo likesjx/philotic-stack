@@ -21,6 +21,7 @@ Rules that prevent `model-router` bugs should live here, in nearby provider code
 - Tool-enabled turns must preserve real tool schemas when the provider supports them.
 - Non-tool text replies should return structured channels when those channels were requested.
 - Provider-native features are allowed, but they must map back into the shared controller response envelope cleanly.
+- Native-live providers must use the session-shaped live seam rather than pretending a stateful streaming protocol is just another one-shot `invoke()` call.
 
 See:
 
@@ -40,6 +41,15 @@ Routing constraints supported: `latency_ms`, `privacy`, `cost_tier`.
 - `model-controller-gemini` registers as role `model`
 - `model-controller-elevenlabs` registers as role `model.elevenlabs`
 - the legacy `model-router` binary remains as an all-in-one compatibility binary during transition
+
+The Gemini path now has two explicit execution seams:
+
+- classic one-shot provider invocation for `text.generate`, `media.analyze`, and `voice.transcribe`
+- a native-live provider seam for `response.generate` / `voice.dialogue`
+
+That live seam is structural truth only for now. Gemini still returns an
+explicit not-yet-wired failure there until the WebSocket session substrate is
+implemented.
 
 Voice synthesis is intentionally transitional here. The ElevenLabs guest can own provider
 invocation, but first-class audio delivery still belongs to the future voice machine and

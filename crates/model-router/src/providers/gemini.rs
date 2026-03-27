@@ -1,4 +1,7 @@
-use crate::controller::{AttachmentInput, ControllerTask, ModelProvider, ProviderOutput, TaskKind};
+use crate::controller::{
+    AttachmentInput, ControllerTask, ModelProvider, NativeLiveProvider, NativeLiveTurnOutput,
+    ProviderOutput, TaskKind,
+};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use base64::Engine;
@@ -635,14 +638,14 @@ impl ModelProvider for GeminiProvider {
                 .unwrap_or_else(|| "<missing prompt>".into());
             info!(
                 "PHILOTIC_DEBUG_MODEL_REQUESTS gemini composed prompt provider={} model={:?}:\n{}",
-                self.id(),
+                ModelProvider::id(self),
                 task.model,
                 prompt
             );
             match serde_json::to_string_pretty(&payload) {
                 Ok(json) => info!(
                     "PHILOTIC_DEBUG_MODEL_REQUESTS gemini provider payload provider={} model={:?}:\n{}",
-                    self.id(),
+                    ModelProvider::id(self),
                     task.model,
                     json
                 ),
@@ -708,6 +711,34 @@ impl ModelProvider for GeminiProvider {
                 active_plan: None,
             })
         }
+    }
+}
+
+#[async_trait]
+impl NativeLiveProvider for GeminiProvider {
+    fn id(&self) -> &'static str {
+        "gemini"
+    }
+
+    fn supports_live(&self, task: &ControllerTask) -> bool {
+        matches!(
+            task.kind,
+            TaskKind::ResponseGenerate | TaskKind::VoiceDialogue
+        )
+    }
+
+    async fn invoke_live(&self, task: &ControllerTask) -> Result<NativeLiveTurnOutput> {
+        let model = task
+            .model
+            .as_deref()
+            .or_else(|| task.routing_hints.model_ref.as_deref())
+            .unwrap_or("gemini-3.1-flash-live-preview");
+        bail!(
+            "Gemini Live API session substrate is not wired yet for [{}] using model [{}]; \
+this path needs WebSocket session management, streamed PCM audio I/O, sequential tool responses, and session resumption rather than the current one-shot generateContent seam",
+            task.kind.as_str(),
+            model
+        )
     }
 }
 
@@ -871,7 +902,8 @@ impl GeminiProvider {
 mod tests {
     use super::{GeminiAuth, GeminiProvider};
     use crate::controller::{
-        AttachmentInput, ContextEnvelope, ControllerTask, RequestClass, RoutingHints, TaskKind,
+        AttachmentInput, ContextEnvelope, ControllerTask, NativeLiveProvider, RequestClass,
+        RoutingHints, TaskKind,
     };
 
     fn minimal_text_task_with_tools(tools: Vec<serde_json::Value>) -> ControllerTask {
@@ -1125,6 +1157,72 @@ mod tests {
         };
 
         assert!(crate::controller::ModelProvider::supports(&provider, &task));
+    }
+
+    #[test]
+    fn gemini_supports_native_live_task_kinds_on_live_provider_seam() {
+        let provider = GeminiProvider::new(
+            reqwest::Client::new(),
+            Some(GeminiAuth::ApiKey("api-key".into())),
+            None,
+        );
+        let response_generate = ControllerTask {
+            kind: TaskKind::ResponseGenerate,
+            request_class: RequestClass::Cognitive,
+            provider: None,
+            model: Some("gemini-3.1-flash-live-preview".into()),
+            prompt: Some("Respond with native audio and text.".into()),
+            text: None,
+            spoken_text: None,
+            display_text: None,
+            voice: None,
+            voice_id: None,
+            output_format: None,
+            language_code: None,
+            response_contract: Default::default(),
+            context: Default::default(),
+            context_projection: Default::default(),
+            affordances: Default::default(),
+            routing_hints: RoutingHints::default(),
+            provider_options: Default::default(),
+            effective_rights: Vec::new(),
+            tools: vec![],
+        };
+        let voice_dialogue = ControllerTask {
+            kind: TaskKind::VoiceDialogue,
+            request_class: RequestClass::Cognitive,
+            provider: None,
+            model: Some("gemini-3.1-flash-live-preview".into()),
+            prompt: Some("Continue this live conversation.".into()),
+            text: None,
+            spoken_text: None,
+            display_text: None,
+            voice: None,
+            voice_id: None,
+            output_format: None,
+            language_code: None,
+            response_contract: Default::default(),
+            context: ContextEnvelope {
+                attachments: vec![AttachmentInput {
+                    kind: Some("voice".into()),
+                    file_id: Some("voice-1".into()),
+                    mime_type: Some("audio/ogg".into()),
+                    url: Some("http://127.0.0.1:9001/download/sha256-voice-1".into()),
+                    blob_ref: Some("sha256-voice-1".into()),
+                    transport_error: None,
+                }],
+                ..Default::default()
+            },
+            context_projection: Default::default(),
+            affordances: Default::default(),
+            routing_hints: RoutingHints::default(),
+            provider_options: Default::default(),
+            effective_rights: Vec::new(),
+            tools: vec![],
+        };
+
+        assert!(provider.supports_live(&response_generate));
+        assert!(provider.supports_live(&voice_dialogue));
     }
 
     #[test]

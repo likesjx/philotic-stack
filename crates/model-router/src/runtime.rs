@@ -1,6 +1,6 @@
 use crate::controller::{
-    ControllerResponseEnvelope, ControllerTask, ModelProvider, ProviderConfigs, ProviderOutput,
-    ProviderRegistry, TaskKind,
+    ControllerResponseEnvelope, ControllerTask, ModelProvider, NativeLiveProvider,
+    NativeLiveRegistry, ProviderConfigs, ProviderOutput, ProviderRegistry, TaskKind,
 };
 use ansible_mesh_core::router_trace::{
     RouterTraceStorage, RouterTrainingRecord, SqliteRouterTraceStorage,
@@ -21,6 +21,8 @@ fn local_node_id() -> String {
 
 type ProviderFactory =
     dyn Fn(reqwest::Client, &ProviderConfigs) -> Vec<Arc<dyn ModelProvider>> + Send + Sync;
+type NativeLiveProviderFactory =
+    dyn Fn(reqwest::Client, &ProviderConfigs) -> Vec<Arc<dyn NativeLiveProvider>> + Send + Sync;
 
 pub struct ControllerGuestConfig {
     pub guest_id: &'static str,
@@ -29,6 +31,7 @@ pub struct ControllerGuestConfig {
     /// now handled through the normal model-response artifact path, so this flag is ignored.
     pub allow_inline_audio: bool,
     pub providers: Box<ProviderFactory>,
+    pub live_providers: Box<NativeLiveProviderFactory>,
 }
 
 #[derive(Debug, Clone)]
@@ -164,101 +167,177 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                     http_client.clone(),
                     &provider_configs,
                 ));
-
-                let provider = match providers.resolve(&controller_task) {
-                    Ok(provider) => provider,
-                    Err(err) => {
-                        emit_failure(
-                            &mut ipc_client,
-                            &reply,
-                            Some(controller_task.kind.as_str()),
-                            None,
-                            format!("No model provider available for task: {}", err),
-                        )
-                        .await?;
-                        continue;
-                    }
-                };
-
-                info!(
-                    "Dispatching {} task from role [{}] to provider [{}]",
-                    controller_task.kind.as_str(),
-                    config.role,
-                    provider.id()
-                );
+                let live_providers = NativeLiveRegistry::new((config.live_providers)(
+                    http_client.clone(),
+                    &provider_configs,
+                ));
 
                 let dispatch_start = Instant::now();
-                let provider_id = provider.id().to_string();
                 let task_kind = controller_task.kind.as_str().to_string();
+                if controller_task.kind.is_native_live() {
+                    let provider = match live_providers.resolve(&controller_task) {
+                        Ok(provider) => provider,
+                        Err(err) => {
+                            emit_failure(
+                                &mut ipc_client,
+                                &reply,
+                                Some(controller_task.kind.as_str()),
+                                None,
+                                format!("No native-live provider available for task: {}", err),
+                            )
+                            .await?;
+                            continue;
+                        }
+                    };
 
-                match provider.invoke(&controller_task).await {
-                    Ok(ProviderOutput::ToolCall {
-                        tool_name,
-                        arguments,
-                    }) => {
-                        let latency_ms = dispatch_start.elapsed().as_millis() as u64;
-                        record_routing_trace(
-                            trace_store.as_deref(),
-                            &reply,
-                            &provider_id,
-                            &task_kind,
-                            "tool_call",
-                            None,
-                            latency_ms,
-                        );
-                        emit_tool_call_response(
-                            &mut ipc_client,
-                            &reply,
+                    info!(
+                        "Dispatching {} task from role [{}] to native-live provider [{}]",
+                        controller_task.kind.as_str(),
+                        config.role,
+                        provider.id()
+                    );
+
+                    let provider_id = provider.id().to_string();
+                    match provider.invoke_live(&controller_task).await {
+                        Ok(output) => {
+                            let latency_ms = dispatch_start.elapsed().as_millis() as u64;
+                            record_routing_trace(
+                                trace_store.as_deref(),
+                                &reply,
+                                &provider_id,
+                                &task_kind,
+                                "success",
+                                None,
+                                latency_ms,
+                            );
+                            let response = ControllerResponseEnvelope::from_output(
+                                &controller_task,
+                                provider.id(),
+                                output.final_output,
+                            )?;
+                            emit_text_response(&mut ipc_client, &reply, response).await?;
+                        }
+                        Err(err) => {
+                            let latency_ms = dispatch_start.elapsed().as_millis() as u64;
+                            let failure_code = classify_provider_failure(
+                                Some(task_kind.as_str()),
+                                Some(provider_id.as_str()),
+                                &err.to_string(),
+                            )
+                            .code;
+                            record_routing_trace(
+                                trace_store.as_deref(),
+                                &reply,
+                                &provider_id,
+                                &task_kind,
+                                "failure",
+                                failure_code.as_deref(),
+                                latency_ms,
+                            );
+                            error!("Native-live provider invocation failed: {}", err);
+                            emit_failure(
+                                &mut ipc_client,
+                                &reply,
+                                Some(controller_task.kind.as_str()),
+                                Some(provider.id()),
+                                format!("Native-live provider invocation failed: {}", err),
+                            )
+                            .await?;
+                        }
+                    }
+                } else {
+                    let provider = match providers.resolve(&controller_task) {
+                        Ok(provider) => provider,
+                        Err(err) => {
+                            emit_failure(
+                                &mut ipc_client,
+                                &reply,
+                                Some(controller_task.kind.as_str()),
+                                None,
+                                format!("No model provider available for task: {}", err),
+                            )
+                            .await?;
+                            continue;
+                        }
+                    };
+
+                    info!(
+                        "Dispatching {} task from role [{}] to provider [{}]",
+                        controller_task.kind.as_str(),
+                        config.role,
+                        provider.id()
+                    );
+
+                    let provider_id = provider.id().to_string();
+                    match provider.invoke(&controller_task).await {
+                        Ok(ProviderOutput::ToolCall {
                             tool_name,
                             arguments,
-                            None,
-                        )
-                        .await?;
-                    }
-                    Ok(output) => {
-                        let latency_ms = dispatch_start.elapsed().as_millis() as u64;
-                        record_routing_trace(
-                            trace_store.as_deref(),
-                            &reply,
-                            &provider_id,
-                            &task_kind,
-                            "success",
-                            None,
-                            latency_ms,
-                        );
-                        let response = ControllerResponseEnvelope::from_output(
-                            &controller_task,
-                            provider.id(),
-                            output,
-                        )?;
-                        emit_text_response(&mut ipc_client, &reply, response).await?;
-                    }
-                    Err(err) => {
-                        let latency_ms = dispatch_start.elapsed().as_millis() as u64;
-                        let failure_code = classify_provider_failure(
-                            Some(task_kind.as_str()),
-                            Some(provider_id.as_str()),
-                            &err.to_string(),
-                        )
-                        .code;
-                        record_routing_trace(
-                            trace_store.as_deref(),
-                            &reply,
-                            &provider_id,
-                            &task_kind,
-                            "failure",
-                            failure_code.as_deref(),
-                            latency_ms,
-                        );
-                        error!("Provider invocation failed: {}", err);
-                        emit_failure(
-                            &mut ipc_client,
-                            &reply,
-                            Some(controller_task.kind.as_str()),
-                            Some(provider.id()),
-                            format!("Provider invocation failed: {}", err),
-                        )
-                        .await?;
+                        }) => {
+                            let latency_ms = dispatch_start.elapsed().as_millis() as u64;
+                            record_routing_trace(
+                                trace_store.as_deref(),
+                                &reply,
+                                &provider_id,
+                                &task_kind,
+                                "tool_call",
+                                None,
+                                latency_ms,
+                            );
+                            emit_tool_call_response(
+                                &mut ipc_client,
+                                &reply,
+                                tool_name,
+                                arguments,
+                                None,
+                            )
+                            .await?;
+                        }
+                        Ok(output) => {
+                            let latency_ms = dispatch_start.elapsed().as_millis() as u64;
+                            record_routing_trace(
+                                trace_store.as_deref(),
+                                &reply,
+                                &provider_id,
+                                &task_kind,
+                                "success",
+                                None,
+                                latency_ms,
+                            );
+                            let response = ControllerResponseEnvelope::from_output(
+                                &controller_task,
+                                provider.id(),
+                                output,
+                            )?;
+                            emit_text_response(&mut ipc_client, &reply, response).await?;
+                        }
+                        Err(err) => {
+                            let latency_ms = dispatch_start.elapsed().as_millis() as u64;
+                            let failure_code = classify_provider_failure(
+                                Some(task_kind.as_str()),
+                                Some(provider_id.as_str()),
+                                &err.to_string(),
+                            )
+                            .code;
+                            record_routing_trace(
+                                trace_store.as_deref(),
+                                &reply,
+                                &provider_id,
+                                &task_kind,
+                                "failure",
+                                failure_code.as_deref(),
+                                latency_ms,
+                            );
+                            error!("Provider invocation failed: {}", err);
+                            emit_failure(
+                                &mut ipc_client,
+                                &reply,
+                                Some(controller_task.kind.as_str()),
+                                Some(provider.id()),
+                                format!("Provider invocation failed: {}", err),
+                            )
+                            .await?;
+                        }
                     }
                 }
             }

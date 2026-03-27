@@ -286,9 +286,11 @@ Current implemented truth for this seam:
 - that chosen cognition species now flows through initial outbound request
   assembly and cognitive re-entry paths instead of being confined to plan
   metadata
-- providers still must opt in explicitly; parsing and plan compilation now know
-  about native-live species, but execution still refuses them until a provider
-  implementation is wired honestly
+- `model-router` now has a separate native-live provider seam alongside the
+  classic one-shot `ModelProvider::invoke` path, so session-shaped providers
+  have a real home instead of being smuggled through the request/response seam
+- Gemini is now bound to that native-live seam explicitly, but still returns an
+  honest not-yet-wired failure until the WebSocket session substrate lands
 
 ### Gemini 3.1 Flash Live provider pressure
 
