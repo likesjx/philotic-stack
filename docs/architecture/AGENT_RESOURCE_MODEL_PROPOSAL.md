@@ -472,6 +472,22 @@ that:
 - suppression leaves a visible marker in bindings so the inhibition is
   inspectable instead of mysteriously biochemical
 
+That gives the hotel a real immune system.
+
+The matching reward system matters too. Approved linked routing-policy
+disposition should do more than merely stop suppressing a reflex; it should
+reinforce the posture the operator is explicitly endorsing. The current slice
+therefore also adds:
+
+- approved disposition applies a small precedence boost to the linked
+  `agent_learned` reflex layer during projection
+- reward leaves an explicit marker in bindings so reinforcement is inspectable
+  too
+
+So the hotel now projects both an immune system and a reward system onto
+agent-owned learned posture, which is much healthier than either permanent
+permission or permanent suspicion.
+
 In practice, a fresher active-incarnation update is the `p53` check here: if
 the runtime has newer local evidence that the session now belongs on a
 different active guest, older delivery provenance should die immediately rather
