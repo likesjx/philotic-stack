@@ -311,6 +311,15 @@ enum Command {
         #[arg(long, default_value = "default")]
         hotel: String,
     },
+    /// Import config deltas into an existing hotel's Context Graph without reseeding guests.
+    ImportConfig {
+        /// Path to the JSON config file to apply
+        #[arg(long)]
+        file: String,
+        /// Hotel section to import (default: "default")
+        #[arg(long, default_value = "default")]
+        hotel: String,
+    },
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -5009,6 +5018,66 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Import config deltas into the Context Graph DB and exit.
+/// This updates config keys and agent identity bundles without reseeding guests.
+async fn run_import_config_command(file: &str, hotel_name: &str) -> Result<()> {
+    info!(
+        "Importing config deltas from '{}' into hotel '{}'...",
+        file, hotel_name
+    );
+
+    let db_path_buf;
+    let db_path: &Path = if let Some(ref pdir) = profile_dir() {
+        fs::create_dir_all(pdir)
+            .with_context(|| format!("create profile dir {}", pdir.display()))?;
+        db_path_buf = pdir.join("context.db");
+        &db_path_buf
+    } else {
+        Path::new("aiua_context.db")
+    };
+    let graph_storage = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open(db_path)?;
+    let graph_domain = GraphDomain::new(Arc::new(graph_storage.adapter()));
+    let hotel = reconcile_hotel_record(&graph_domain, hotel_name)?;
+    graph_domain.upsert_hotel(&hotel)?;
+
+    let config_data = fs::read_to_string(file).context("Failed to read config file")?;
+    let config_json: serde_json::Value =
+        serde_json::from_str(&config_data).context("Invalid JSON in config file")?;
+
+    let entries = extract_context_graph_entries(&config_json, Some(hotel_name));
+    let mut config_count = 0usize;
+    for (key, value) in entries {
+        let val_str = if value.is_string() {
+            serde_json::to_string(&value)?
+        } else {
+            value.to_string()
+        };
+        graph_domain.set_config_value(&key, &val_str)?;
+        config_count += 1;
+    }
+
+    let all_profiles = all_agent_profiles_from_config(&config_json, hotel_name);
+    let mut identity_count = 0usize;
+    for profile in &all_profiles {
+        let agent_config = raw_agent_config_for_key(&config_json, hotel_name, &profile.agent_key);
+        let identity =
+            agent_identity_record_for_profile(profile, hotel_name, agent_config.as_ref());
+        graph_domain
+            .upsert_agent_identity(&identity)
+            .with_context(|| format!("Failed to upsert identity for {}", identity.agent_id))?;
+        identity_count += 1;
+    }
+
+    println!(
+        "✓ Config imported into DB ({}).\n  Updated {} config key(s) and {} agent identity bundle(s) for hotel '{}'.",
+        db_path.display(),
+        config_count,
+        identity_count,
+        hotel_name
+    );
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -5030,6 +5099,10 @@ async fn main() -> Result<()> {
 
     if let Some(Command::Load { file, hotel }) = args.command {
         return run_load_command(&file, &hotel).await;
+    }
+
+    if let Some(Command::ImportConfig { file, hotel }) = args.command {
+        return run_import_config_command(&file, &hotel).await;
     }
 
     info!("Starting Philotic Ansible Daemon Boot Sequence...");
