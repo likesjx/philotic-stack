@@ -343,6 +343,11 @@ stale or is superseded by newer placement truth. The point is not to crown a
 new exclusive holder; it is to keep useful local continuity briefly alive
 without letting old placement memories haunt the runtime forever.
 
+In practice, a fresher active-incarnation update is the `p53` check here: if
+the runtime has newer local evidence that the session now belongs on a
+different active guest, older delivery provenance should die immediately rather
+than waiting out its full TTL.
+
 This is dogfood: the mesh sync story for agent portability is proven by the
 same infrastructure everything else depends on. No second sync protocol.
 

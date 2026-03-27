@@ -750,6 +750,7 @@ Seam IDs: `structured-model-envelope`, `hotel-gemini-oauth-flow`
 - [x] Persist agent runtime provenance into session state and canonical session snapshots on the receiving hotel so `authority_hotel` and current delivery placement stay visible after transport instead of disappearing once the task is delivered.
 - [x] Use persisted local delivery provenance to influence local agent routing and materialization when a session has no usable active incarnation, so foreign-owned sessions can keep executing on the intended local guest instead of immediately collapsing back to generic orchestrator fallback.
 - [x] Treat persisted local delivery provenance as a freshness-based placement hint with TTL-based apoptosis, so stale local placement dies cleanly instead of haunting routing/materialization forever.
+- [x] Supersede older local placement provenance immediately when fresher active-incarnation truth appears, so the runtime has a `p53`-style conflict kill switch instead of waiting for TTL alone.
 - [ ] Replace the transitional durable-rule bridge behind `routing.policy.propose` with routing-specific policy records, evaluation history, and operator disposition state.
 - [ ] Fold model-graph metadata into live turn-routing-plan ranking so shared catalog truth informs selection without becoming mutable preference storage.
 - [ ] Define the shared catalog layer for models, tools, skills, and rights as reference knowledge outside hotel-owned mutable state.
