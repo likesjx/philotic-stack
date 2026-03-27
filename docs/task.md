@@ -480,6 +480,7 @@ Seam IDs: `context-envelope-contract`, `memory-local-tools`, `active-plan-stream
 - [x] Add `tool_history` as a context envelope section in `model_context_from_projection` — always present, empty on initial turn, populated on re-entry.
 - [x] Add `ToolHistoryEntry` to `ContextEnvelope` in model-router; parse and render `[Tool call history]` in `composed_prompt_text()`.
 - [x] `handle_tool_result` now uses `build_reentry_context_envelope()` — model-router receives full structured envelope on every re-entry.
+- [x] Keep `build_reentry_context_envelope()` on the same cognitive tool-projection policy as initial turns, so low-intent re-entry does not bypass affordance suppression.
 - [ ] `active_plan` as context section (deferred to Slice 4).
 
 ### Slice 2 — Settings Tree

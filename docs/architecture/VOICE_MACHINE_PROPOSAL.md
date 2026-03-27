@@ -64,9 +64,10 @@ Added to `AgentProfile` in `agent-core/src/session.rs`. Controls what happens wh
 | `voice_action` | `None` → `"analyze_media"` | Action/capability used for voice/audio attachments |
 | `image_action` | `None` → `"analyze_media"` | Action/capability used for photo/image attachments |
 | `document_action` | `None` → `"analyze_media"` | Action/capability used for document attachments |
-| `strip_tools_on_media` | `true` | Suppress tools on media turns |
 
 Action → capability mapping: `"transcribe"` → `voice.transcribe`, `"describe"` → `image.describe`, `"summarize"` → `document.summarize`, anything else → `media.analyze`.
+
+Tool suppression is no longer configured here. Media routing picks the ingress action; staged turn routing owns whether a given stage sees tools at all.
 
 `model-router` gained `TaskKind::AudioTranscribe` (`voice.transcribe`). Gemini handles it via the same inline-bytes path, using a transcription-focused prompt. A dedicated STT guest can be wired by pointing the `voice.transcribe` component route at it.
 
@@ -114,6 +115,7 @@ The current implementation now also uses the stage plan at request assembly time
 - ingress transform calls get a slimmer context envelope with no tool history, no recalled memory, and only a minimal recent dialogue window
 - non-cognitive stages suppress tool projection entirely, even if the session has tools bound
 - cognitive calls keep the full reasoning envelope
+- cognitive re-entry now respects the same projection policy instead of re-exposing the full bound toolset by accident
 - low-intent cognitive turns now ask for fewer side channels, so gratitude/ack turns do not request planning or memory artifacts by default
 - model requests now carry stage-derived `routing_hints` so model-controller can see provider preference, controller role, capability, and envelope intent without becoming the owner of the turn
 
@@ -130,8 +132,7 @@ This is intentionally still transitional:
   "agent_profile": {
     "media_routing_policy": {
       "voice_action": "transcribe",
-      "image_action": "analyze_media",
-      "strip_tools_on_media": true
+      "image_action": "analyze_media"
     },
     "voice_response_policy": {
       "mode": "auto",

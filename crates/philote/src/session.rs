@@ -433,9 +433,6 @@ pub struct MediaRoutingPolicy {
     /// Action to use for document attachments. None = "analyze_media".
     #[serde(default)]
     pub document_action: Option<String>,
-    /// When true (default), tools are stripped from the model request on media turns.
-    #[serde(default = "default_true")]
-    pub strip_tools_on_media: bool,
 }
 
 impl Default for MediaRoutingPolicy {
@@ -445,7 +442,6 @@ impl Default for MediaRoutingPolicy {
             voice_action: None,
             image_action: None,
             document_action: None,
-            strip_tools_on_media: true,
         }
     }
 }
@@ -1636,12 +1632,15 @@ impl SessionState {
     /// Unlike `build_reentry_prompt`, this produces the complete structured envelope
     /// so that model-router receives identity, instructions, memory, dialogue_window,
     /// active_turn, and tool_history on every cognitive re-entry — not just a flat prompt.
+    /// Re-entry still respects cognitive tool-projection policy rather than replaying
+    /// the raw bound toolset unconditionally.
     pub fn build_reentry_context_envelope(
         &self,
     ) -> Option<(String, Value, Value, Vec<ToolDefinition>)> {
         let turn = self.active_turn.as_ref()?;
         let user_content = turn.user_content.clone();
-        let tools = self.tool_assembly.tools_for_model.clone();
+        let tools =
+            self.project_tools_for_envelope(&user_content, TurnContextEnvelopeKind::Cognitive);
         let (prompt, context, context_projection) = self.model_request_payloads_for_envelope(
             &user_content,
             &tools,
@@ -5127,6 +5126,47 @@ mod tests {
 
         assert_eq!(channels.len(), 1);
         assert_eq!(channels[0].as_str(), Some("spoken_text"));
+    }
+
+    #[test]
+    fn low_intent_reentry_context_respects_tool_projection_policy() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.add_tool_binding("echo");
+        state.add_tool_binding("workspace.read");
+        state.start_turn(WorkingTurn {
+            task_id: Uuid::nil(),
+            turn_id: "turn-thanks".into(),
+            chat_id: "123".into(),
+            user_content: "Thanks, that helped a lot.".into(),
+            final_reply_to: "local-aiua-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase: TurnPhase::WaitingModel,
+            iteration: 1,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
+            active_plan: None,
+            consecutive_step_failures: 0,
+            provider_repair_note: None,
+            provider_repair_attempts: 0,
+            pending_text_reply: None,
+            had_voice_input: false,
+            turn_routing_plan: None,
+            awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
+        });
+
+        let (_, _, _, projected_tools) = state
+            .build_reentry_context_envelope()
+            .expect("reentry envelope should exist");
+
+        assert!(
+            projected_tools.is_empty(),
+            "low-intent reentry should not re-expose the full bound toolset"
+        );
     }
 
     #[test]
