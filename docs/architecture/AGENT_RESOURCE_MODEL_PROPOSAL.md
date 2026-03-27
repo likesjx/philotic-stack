@@ -331,6 +331,12 @@ summary. That makes home ownership vs current execution placement visible in
 runtime truth and canonical session snapshots instead of leaving it trapped in
 one inbound payload.
 
+That provenance now influences local runtime behavior too. When a session has
+no live active incarnation, or its recorded active incarnation is stale, the
+hotel may prefer the persisted local `delivery_target_guest_id` for delivery or
+materialization before falling back to a generic orchestrator choice. In other
+words, placement is no longer just remembered; it is beginning to matter.
+
 This is dogfood: the mesh sync story for agent portability is proven by the
 same infrastructure everything else depends on. No second sync protocol.
 

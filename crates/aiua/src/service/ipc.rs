@@ -2121,6 +2121,19 @@ impl IpcServer {
             .unwrap_or(false)
     }
 
+    fn local_delivery_guest_from_provenance(
+        session: &SessionRecord,
+        local_hotel_name: Option<&str>,
+    ) -> Option<String> {
+        let provenance = session.summary_json.get("agent_runtime_provenance")?;
+        let delivery_hotel = provenance.get("delivery_hotel")?.as_str()?;
+        let delivery_target_guest_id = provenance.get("delivery_target_guest_id")?.as_str()?;
+        if Some(delivery_hotel) != local_hotel_name {
+            return None;
+        }
+        Some(delivery_target_guest_id.to_string())
+    }
+
     async fn resolve_agent_route(
         graph: &GraphDomain,
         inboxes: &InboxRegistry,
@@ -2145,6 +2158,7 @@ impl IpcServer {
         let Some(session) = session else {
             return AgentRouteResolution::Deliver(None);
         };
+        let local_hotel_name = Self::local_hotel_name(graph, local_node_id);
 
         let live_agent_guests: Vec<String> = {
             let guard = inboxes.lock().await;
@@ -2157,10 +2171,40 @@ impl IpcServer {
         };
 
         let is_registered = |guest_id: &str| live_agent_guests.iter().any(|live| live == guest_id);
+        let provenance_guest_id =
+            Self::local_delivery_guest_from_provenance(&session, local_hotel_name.as_deref());
 
         if let Some(active_guest_id) = session.active_incarnation_id.clone() {
             if is_registered(&active_guest_id) {
                 return AgentRouteResolution::Deliver(Some(active_guest_id));
+            }
+
+            if let Some(provenance_guest_id) = provenance_guest_id.as_deref() {
+                if provenance_guest_id != active_guest_id {
+                    if is_registered(provenance_guest_id) {
+                        warn!(
+                            "Active incarnation [{}] is not registered for session [{}]; preferring persisted local delivery guest [{}].",
+                            active_guest_id, session_id, provenance_guest_id
+                        );
+                        return AgentRouteResolution::Deliver(Some(
+                            provenance_guest_id.to_string(),
+                        ));
+                    }
+
+                    if Self::configured_local_guest_exists(
+                        graph,
+                        local_node_id,
+                        provenance_guest_id,
+                    ) {
+                        info!(
+                            "Active incarnation [{}] is not registered for session [{}]; parking inbound for persisted local delivery guest [{}].",
+                            active_guest_id, session_id, provenance_guest_id
+                        );
+                        return AgentRouteResolution::Park {
+                            guest_id: provenance_guest_id.to_string(),
+                        };
+                    }
+                }
             }
 
             if let Some(orchestrator_guest_id) =
@@ -2188,6 +2232,26 @@ impl IpcServer {
                 active_guest_id, session_id
             );
             return AgentRouteResolution::Deliver(Some(active_guest_id));
+        }
+
+        if let Some(provenance_guest_id) = provenance_guest_id.as_deref() {
+            if is_registered(provenance_guest_id) {
+                info!(
+                    "Session [{}] has no active incarnation; routing inbound task to persisted local delivery guest [{}].",
+                    session_id, provenance_guest_id
+                );
+                return AgentRouteResolution::Deliver(Some(provenance_guest_id.to_string()));
+            }
+
+            if Self::configured_local_guest_exists(graph, local_node_id, provenance_guest_id) {
+                info!(
+                    "Session [{}] has no active incarnation; parking inbound for persisted local delivery guest [{}] while materializing.",
+                    session_id, provenance_guest_id
+                );
+                return AgentRouteResolution::Park {
+                    guest_id: provenance_guest_id.to_string(),
+                };
+            }
         }
 
         let orchestrator_guest_id =
@@ -8235,6 +8299,151 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn emit_task_prefers_persisted_local_delivery_guest_when_no_active_incarnation() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-jane-01".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-jane:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: false,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig::default(),
+            })
+            .expect("orchestrator role should seed");
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-role-provenance-preferred".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: None,
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("123".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "agent_runtime_provenance": {
+                        "authority_hotel": "remote-hotel",
+                        "delivery_hotel": "local-hotel",
+                        "delivery_target_guest_id": "agent-jane:developer"
+                    }
+                }),
+                created_at: 1,
+                updated_at: 2,
+            })
+            .expect("session should seed");
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut orchestrator = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane:orchestrator".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("orchestrator connect");
+        let mut developer = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane:developer".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("developer connect");
+        let mut membrane = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-local".into(),
+            role: "membrane".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("membrane connect");
+
+        let response = membrane
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: None,
+                task_json: serde_json::json!({
+                    "session_id": "sess-role-provenance-preferred",
+                    "source": "telegram",
+                    "chat_id": "123",
+                    "content": "route to persisted local guest"
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit task");
+
+        assert!(matches!(response, IpcResponse::Standard { ok: true, .. }));
+
+        let delivered =
+            tokio::time::timeout(tokio::time::Duration::from_secs(1), developer.recv_task())
+                .await
+                .expect("developer should receive provenance-directed task before timeout")
+                .expect("developer recv should succeed");
+        match delivered {
+            IpcResponse::InboundTask { task_json, .. } => {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("payload should decode");
+                assert_eq!(payload["content"], "route to persisted local guest");
+                assert_eq!(payload["delivery_target_guest_id"], "agent-jane:developer");
+            }
+            other => panic!("unexpected developer inbound response: {other:?}"),
+        }
+
+        assert!(
+            tokio::time::timeout(
+                tokio::time::Duration::from_millis(200),
+                orchestrator.recv_task()
+            )
+            .await
+            .is_err(),
+            "orchestrator should not receive task when persisted local placement points at developer"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
     async fn emit_task_parks_for_missing_active_incarnation_and_flushes_after_register() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
@@ -8347,6 +8556,145 @@ mod tests {
         match delivered {
             IpcResponse::InboundTask { task_json, .. } => {
                 assert_eq!(task_json, task_payload);
+            }
+            other => panic!("unexpected developer inbound response: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_task_parks_for_persisted_local_delivery_guest_and_flushes_after_register() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .seed_guests(
+                "local-hotel",
+                &[GuestRecord {
+                    hotel_name: "local-hotel".into(),
+                    guest_id: "agent-jane:developer".into(),
+                    role: "agent".into(),
+                    config_json: "{}".into(),
+                    is_active: true,
+                    active_pid: None,
+                    last_active_at: None,
+                }],
+            )
+            .expect("seed developer guest");
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-role-provenance-park".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: None,
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("123".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({
+                    "agent_runtime_provenance": {
+                        "authority_hotel": "remote-hotel",
+                        "delivery_hotel": "local-hotel",
+                        "delivery_target_guest_id": "agent-jane:developer"
+                    }
+                }),
+                created_at: 1,
+                updated_at: 2,
+            })
+            .expect("session should seed");
+
+        let requester = Arc::new(MockMaterializationRequester::default());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        )
+        .with_materialization_requester(requester.clone());
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut membrane = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-local".into(),
+            role: "membrane".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("membrane connect");
+
+        let response = membrane
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: None,
+                task_json: serde_json::json!({
+                    "session_id": "sess-role-provenance-park",
+                    "source": "telegram",
+                    "chat_id": "123",
+                    "content": "park for persisted local guest"
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit task");
+
+        assert!(matches!(response, IpcResponse::Standard { ok: true, .. }));
+        assert_eq!(requester.calls.load(Ordering::SeqCst), 1);
+
+        let mut developer = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane:developer".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("developer connect");
+
+        let delivered =
+            tokio::time::timeout(tokio::time::Duration::from_secs(1), developer.recv_task())
+                .await
+                .expect("developer should receive parked provenance-directed task")
+                .expect("developer recv should succeed");
+        match delivered {
+            IpcResponse::InboundTask { task_json, .. } => {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("payload should decode");
+                assert_eq!(payload["content"], "park for persisted local guest");
+                assert_eq!(payload["delivery_target_guest_id"], "agent-jane:developer");
             }
             other => panic!("unexpected developer inbound response: {other:?}"),
         }
