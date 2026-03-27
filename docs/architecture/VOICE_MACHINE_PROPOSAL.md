@@ -117,6 +117,7 @@ The current implementation now also uses the stage plan at request assembly time
 - cognitive calls keep the full reasoning envelope
 - cognitive re-entry now respects the same projection policy instead of re-exposing the full bound toolset by accident
 - low-intent cognitive turns now ask for fewer side channels, hide skill guidance, and replace detailed approval posture with a simple direct-reply steer
+- inappropriate free-form approval interrupts now redirect low-intent cognitive turns back to direct response and reject non-cognitive stages instead of surfacing stray approval cards
 - model requests now carry stage-derived `routing_hints` so model-controller can see provider preference, controller role, capability, and envelope intent without becoming the owner of the turn
 
 This is intentionally still transitional:

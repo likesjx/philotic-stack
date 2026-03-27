@@ -738,6 +738,8 @@ Seam IDs: `structured-model-envelope`, `hotel-gemini-oauth-flow`
 - [x] Make staged routing operational in model request assembly: trim ingress context envelopes and forward stage-derived routing hints into model-controller requests.
 - [x] Make stage policy influence affordances and output contracts: suppress tools on non-cognitive stages and request slimmer response channels for low-intent cognitive turns.
 - [x] Extend stage-aware affordance policy into prompt/context projection: hide skill guidance and detailed approval posture on non-cognitive and low-intent turns.
+- [x] Make approval interrupts stage-aware: redirect low-intent free-form approval asks back to direct response and reject non-cognitive approval interrupts while preserving real scripted/tool gates.
+- [ ] Define a governed `routing.policy.propose` tool and companion routing-refinement skill so the agent can reflexively suggest cognition/routing policy updates under operator approval and memory write-back.
 - [x] Add a rebuild-first local watched-UAT workflow so stale materialized binaries and stale sockets do not masquerade as runtime regressions.
 - [ ] Define hotel CLI OAuth UX:
   - browser launch

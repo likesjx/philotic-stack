@@ -7,10 +7,10 @@ use crate::protocol::{
     TaskRunnerOverlay, ToolExecutionPayload, TransportAttachment, TurnEventPayload,
 };
 use crate::session::{
-    ActivePlan, AgentProfile, ComponentRouteAssembly, MediaRoutingPolicy, RecalledMemoryRecord,
-    SessionState, ToolExecutionRoute, TtsMode, TurnContextEnvelopeKind, TurnRoutingPlan,
-    TurnRoutingStageKind, TurnRoutingStagePlan, VoiceResponsePolicy, WorkingTurn,
-    merge_session_index,
+    ActivePlan, AgentProfile, ApprovalInterruptDisposition, ComponentRouteAssembly,
+    MediaRoutingPolicy, RecalledMemoryRecord, SessionState, ToolExecutionRoute, TtsMode,
+    TurnContextEnvelopeKind, TurnRoutingPlan, TurnRoutingStageKind, TurnRoutingStagePlan,
+    VoiceResponsePolicy, WorkingTurn, merge_session_index,
 };
 use anyhow::Result;
 use memory_core::{
@@ -1520,6 +1520,61 @@ impl AgentRuntime {
         always_require_human: bool,
     ) -> Result<()> {
         let approval = Self::normalize_approval_request(approval);
+        let disposition = self
+            .sessions
+            .get(&session_id)
+            .map(|state| state.approval_interrupt_disposition(&approval, always_require_human))
+            .unwrap_or(ApprovalInterruptDisposition::Allow);
+
+        match disposition {
+            ApprovalInterruptDisposition::Allow => {}
+            ApprovalInterruptDisposition::RedirectToDirectResponse { note } => {
+                let chat_id = self
+                    .sessions
+                    .get(&session_id)
+                    .and_then(|state| state.active_turn.as_ref())
+                    .map(|turn| turn.chat_id.clone())
+                    .unwrap_or_default();
+                let task_id = self
+                    .sessions
+                    .get(&session_id)
+                    .and_then(|state| state.active_turn.as_ref())
+                    .map(|turn| turn.task_id);
+                if let Some(task_id) = task_id {
+                    let _ = self
+                        .ipc_client
+                        .send_request(IpcRequest::UpdateTask {
+                            task_id,
+                            state: "approval_redirected".into(),
+                            payload: serde_json::json!({
+                                "session_id": session_id,
+                                "turn_id": turn_id,
+                                "chat_id": chat_id,
+                                "approval_request": {
+                                    "approval_id": approval.approval_id,
+                                    "reason": approval.reason,
+                                },
+                                "policy_action": "redirect_to_direct_response"
+                            }),
+                        })
+                        .await;
+                }
+                return self
+                    .resume_turn_with_steering(
+                        session_id,
+                        turn_id,
+                        chat_id,
+                        note,
+                        "approval_redirected",
+                        "[Turn policy correction]",
+                    )
+                    .await;
+            }
+            ApprovalInterruptDisposition::RejectAsInvalidStage { reason } => {
+                return self.fail_active_turn(session_id, turn_id, reason).await;
+            }
+        }
+
         // `always_require_human` bypasses the approval policy entirely — the human operator
         // must approve in this session. Used for admin role creation, which cannot be
         // preapproved or bypassed by `auto_approve_all`.

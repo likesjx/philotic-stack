@@ -382,6 +382,13 @@ pub struct ModelReentryPlan {
     pub tools_for_model: Vec<ToolDefinition>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalInterruptDisposition {
+    Allow,
+    RedirectToDirectResponse { note: String },
+    RejectAsInvalidStage { reason: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ApprovalPolicy {
     #[serde(default)]
@@ -1126,6 +1133,67 @@ impl SessionState {
             }
         }
         false
+    }
+
+    fn active_turn_stage_for_approval(&self) -> Option<TurnRoutingStageKind> {
+        let turn = self.active_turn.as_ref()?;
+        if turn.awaiting_transcription_reentry {
+            return Some(TurnRoutingStageKind::Ingress);
+        }
+        if turn.pending_text_reply.is_some() {
+            return Some(TurnRoutingStageKind::Egress);
+        }
+        Some(TurnRoutingStageKind::Cognition)
+    }
+
+    pub fn approval_interrupt_disposition(
+        &self,
+        approval: &ApprovalRequest,
+        always_require_human: bool,
+    ) -> ApprovalInterruptDisposition {
+        if always_require_human {
+            return ApprovalInterruptDisposition::Allow;
+        }
+
+        let Some(turn) = self.active_turn.as_ref() else {
+            return ApprovalInterruptDisposition::Allow;
+        };
+
+        if turn.pending_tool_call.is_some() {
+            return ApprovalInterruptDisposition::Allow;
+        }
+
+        if approval
+            .approval_id
+            .as_deref()
+            .map(|id| id.starts_with("scripted_gate:"))
+            .unwrap_or(false)
+        {
+            return ApprovalInterruptDisposition::Allow;
+        }
+
+        match self.active_turn_stage_for_approval() {
+            Some(TurnRoutingStageKind::Ingress) | Some(TurnRoutingStageKind::Egress) => {
+                let stage = match self.active_turn_stage_for_approval() {
+                    Some(TurnRoutingStageKind::Ingress) => "ingress",
+                    Some(TurnRoutingStageKind::Egress) => "egress",
+                    _ => "non-cognitive",
+                };
+                ApprovalInterruptDisposition::RejectAsInvalidStage {
+                    reason: format!(
+                        "Approval interrupts are not valid during the {stage} stage. \
+                         This stage should complete its transform/synthesis contract without \
+                         surfacing an operator approval request."
+                    ),
+                }
+            }
+            _ if Self::low_intent_turn(&turn.user_content) => {
+                ApprovalInterruptDisposition::RedirectToDirectResponse {
+                    note: "Approval interrupts are not appropriate for this low-intent turn. Do not ask for approval or propose side-effecting actions here. Reply directly to the user unless they explicitly request an action.".into(),
+                }
+            }
+            _ => ApprovalInterruptDisposition::Allow,
+        }
     }
 
     pub fn set_preapprove_this_session(&mut self) {
@@ -3790,12 +3858,13 @@ fn apply_string_list_op(list: &mut Vec<String>, item: &str, operation: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        ApprovalPolicy, ComponentExecutionRoute, ComponentRouteAssembly, ComponentRouteBinding,
-        ContextAuthority, ContextLayerId, ContextMutability, HookRequest, HookResult,
-        PromotionAction, RecalledMemoryRecord, RefreshRequest, RoleActivation, SessionBindings,
-        SessionState, TaskRunnerBaseConfig, ToolRunnerIncarnationBinding,
-        TransportReplyTargetBinding, TtsMode, TurnContextEnvelopeKind, TurnRecord, TurnRoutingPlan,
-        TurnRoutingStageKind, TurnRoutingStagePlan, VoiceResponsePolicy, WorkingTurn,
+        ApprovalInterruptDisposition, ApprovalPolicy, ComponentExecutionRoute,
+        ComponentRouteAssembly, ComponentRouteBinding, ContextAuthority, ContextLayerId,
+        ContextMutability, HookRequest, HookResult, PromotionAction, RecalledMemoryRecord,
+        RefreshRequest, RoleActivation, SessionBindings, SessionState, TaskRunnerBaseConfig,
+        ToolRunnerIncarnationBinding, TransportReplyTargetBinding, TtsMode,
+        TurnContextEnvelopeKind, TurnRecord, TurnRoutingPlan, TurnRoutingStageKind,
+        TurnRoutingStagePlan, VoiceResponsePolicy, WorkingTurn,
         default_tool_assembly_for_bindings, merge_session_index, session_checkpoint_memory_type,
     };
     use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
@@ -4332,6 +4401,135 @@ mod tests {
 
         assert!(state.approval_policy_allows(&approval, Some(&workspace_call)));
         assert!(!state.approval_policy_allows(&approval, Some(&config_call)));
+    }
+
+    #[test]
+    fn low_intent_freeform_approval_interrupts_redirect_to_direct_response() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.start_turn(WorkingTurn {
+            task_id: Uuid::nil(),
+            turn_id: "turn-1".into(),
+            chat_id: "123".into(),
+            user_content: "Thanks, that solved it.".into(),
+            final_reply_to: "local-aiua-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase: TurnPhase::WaitingModel,
+            iteration: 1,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
+            active_plan: None,
+            consecutive_step_failures: 0,
+            provider_repair_note: None,
+            provider_repair_attempts: 0,
+            pending_text_reply: None,
+            had_voice_input: false,
+            turn_routing_plan: None,
+            awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
+        });
+
+        let disposition = state.approval_interrupt_disposition(
+            &ApprovalRequest {
+                approval_id: None,
+                reason: "Approval required".into(),
+                approved_response: "Approved.".into(),
+            },
+            false,
+        );
+
+        assert!(matches!(
+            disposition,
+            ApprovalInterruptDisposition::RedirectToDirectResponse { .. }
+        ));
+    }
+
+    #[test]
+    fn ingress_approval_interrupts_are_rejected() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.start_turn(WorkingTurn {
+            task_id: Uuid::nil(),
+            turn_id: "turn-voice".into(),
+            chat_id: "123".into(),
+            user_content: "Please transcribe this voice note.".into(),
+            final_reply_to: "local-aiua-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase: TurnPhase::WaitingModel,
+            iteration: 1,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
+            active_plan: None,
+            consecutive_step_failures: 0,
+            provider_repair_note: None,
+            provider_repair_attempts: 0,
+            pending_text_reply: None,
+            had_voice_input: true,
+            turn_routing_plan: None,
+            awaiting_transcription_reentry: true,
+            scripted_loop_context: None,
+        });
+
+        let disposition = state.approval_interrupt_disposition(
+            &ApprovalRequest {
+                approval_id: None,
+                reason: "Approval required".into(),
+                approved_response: "Approved.".into(),
+            },
+            false,
+        );
+
+        assert!(matches!(
+            disposition,
+            ApprovalInterruptDisposition::RejectAsInvalidStage { .. }
+        ));
+    }
+
+    #[test]
+    fn scripted_gate_approval_interrupts_remain_allowed() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.start_turn(WorkingTurn {
+            task_id: Uuid::nil(),
+            turn_id: "turn-1".into(),
+            chat_id: "123".into(),
+            user_content: "Build a plan for this migration.".into(),
+            final_reply_to: "local-aiua-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase: TurnPhase::WaitingModel,
+            iteration: 1,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
+            active_plan: None,
+            consecutive_step_failures: 0,
+            provider_repair_note: None,
+            provider_repair_attempts: 0,
+            pending_text_reply: None,
+            had_voice_input: false,
+            turn_routing_plan: None,
+            awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
+        });
+
+        let disposition = state.approval_interrupt_disposition(
+            &ApprovalRequest {
+                approval_id: Some("scripted_gate:review".into()),
+                reason: "Plan ready for review.".into(),
+                approved_response: "Plan approved.".into(),
+            },
+            false,
+        );
+
+        assert_eq!(disposition, ApprovalInterruptDisposition::Allow);
     }
 
     #[test]
