@@ -1898,7 +1898,11 @@ impl SessionState {
         user_content: &str,
         projected_tools: &[ToolDefinition],
     ) -> String {
-        let projection = self.build_context_projection_with_tools(user_content, projected_tools);
+        let projection = self.build_context_projection_for_envelope(
+            user_content,
+            projected_tools,
+            TurnContextEnvelopeKind::Cognitive,
+        );
         self.render_prompt_from_projection(&projection)
     }
 
@@ -1911,6 +1915,19 @@ impl SessionState {
         &self,
         user_content: &str,
         projected_tools: &[ToolDefinition],
+    ) -> ContextProjection {
+        self.build_context_projection_for_envelope(
+            user_content,
+            projected_tools,
+            TurnContextEnvelopeKind::Cognitive,
+        )
+    }
+
+    fn build_context_projection_for_envelope(
+        &self,
+        user_content: &str,
+        projected_tools: &[ToolDefinition],
+        envelope_kind: TurnContextEnvelopeKind,
     ) -> ContextProjection {
         let turn_id = self
             .active_turn
@@ -1926,9 +1943,10 @@ impl SessionState {
             started_at: None,
         });
 
-        let identity = self.project_agent_self();
+        let identity = self.project_agent_self_for_envelope(user_content, envelope_kind);
         let relationship = self.project_user(user_content);
-        let knowledge = self.project_knowledge(user_content, projected_tools);
+        let knowledge =
+            self.project_knowledge_for_envelope(user_content, projected_tools, envelope_kind);
         let recalled_memory = self.project_recalled_memory();
         let working = self.project_working_state();
         let session = self.project_session_context(projected_tools);
@@ -2268,7 +2286,36 @@ impl SessionState {
         });
     }
 
+    fn low_intent_turn(user_content: &str) -> bool {
+        let normalized = normalized_turn_text(user_content);
+        normalized.is_empty() || looks_like_conversational_goal(&normalized)
+    }
+
+    fn should_project_skill_affordances(
+        user_content: &str,
+        envelope_kind: TurnContextEnvelopeKind,
+    ) -> bool {
+        matches!(envelope_kind, TurnContextEnvelopeKind::Cognitive)
+            && !Self::low_intent_turn(user_content)
+    }
+
+    fn should_project_approval_policy_details(
+        user_content: &str,
+        envelope_kind: TurnContextEnvelopeKind,
+    ) -> bool {
+        matches!(envelope_kind, TurnContextEnvelopeKind::Cognitive)
+            && !Self::low_intent_turn(user_content)
+    }
+
     pub fn project_agent_self(&self) -> String {
+        self.project_agent_self_for_envelope("", TurnContextEnvelopeKind::Cognitive)
+    }
+
+    fn project_agent_self_for_envelope(
+        &self,
+        user_content: &str,
+        envelope_kind: TurnContextEnvelopeKind,
+    ) -> String {
         let mut lines = Vec::new();
 
         if let Some(identity) = self
@@ -2298,13 +2345,17 @@ impl SessionState {
             );
         }
 
-        if !self.bindings.effective_skillset.is_empty() {
+        if Self::should_project_skill_affordances(user_content, envelope_kind)
+            && !self.bindings.effective_skillset.is_empty()
+        {
             lines.push(format!(
                 "Current skill posture: {}.",
                 self.bindings.effective_skillset.join(", ")
             ));
         }
-        if !self.bindings.effective_skill_guidance.is_empty() {
+        if Self::should_project_skill_affordances(user_content, envelope_kind)
+            && !self.bindings.effective_skill_guidance.is_empty()
+        {
             lines.push(format!(
                 "\n[Skill guidance]\n{}",
                 self.bindings.effective_skill_guidance.join("\n\n")
@@ -2385,8 +2436,21 @@ impl SessionState {
 
     pub fn project_knowledge(
         &self,
+        user_content: &str,
+        projected_tools: &[ToolDefinition],
+    ) -> String {
+        self.project_knowledge_for_envelope(
+            user_content,
+            projected_tools,
+            TurnContextEnvelopeKind::Cognitive,
+        )
+    }
+
+    fn project_knowledge_for_envelope(
+        &self,
         _user_content: &str,
         _projected_tools: &[ToolDefinition],
+        envelope_kind: TurnContextEnvelopeKind,
     ) -> String {
         let mut sections = Vec::new();
 
@@ -2402,33 +2466,41 @@ impl SessionState {
             sections.push(recent.trim_end().to_string());
         }
 
-        let mut policy = String::from("[Approval policy]\n");
-        if self.approval_policy.auto_approve_all {
-            policy.push_str(
-                "This session is pre-approved. Do not ask for approval for actions in this session unless the action is explicitly forbidden.\n",
-            );
-        } else if !self.approval_policy.preapproved_tools.is_empty()
-            || !self.approval_policy.preapproved_classes.is_empty()
-        {
-            if !self.approval_policy.preapproved_tools.is_empty() {
-                policy.push_str(&format!(
-                    "Pre-approved tools: {}.\n",
-                    self.approval_policy.preapproved_tools.join(", ")
-                ));
+        if Self::should_project_approval_policy_details(_user_content, envelope_kind) {
+            let mut policy = String::from("[Approval policy]\n");
+            if self.approval_policy.auto_approve_all {
+                policy.push_str(
+                    "This session is pre-approved. Do not ask for approval for actions in this session unless the action is explicitly forbidden.\n",
+                );
+            } else if !self.approval_policy.preapproved_tools.is_empty()
+                || !self.approval_policy.preapproved_classes.is_empty()
+            {
+                if !self.approval_policy.preapproved_tools.is_empty() {
+                    policy.push_str(&format!(
+                        "Pre-approved tools: {}.\n",
+                        self.approval_policy.preapproved_tools.join(", ")
+                    ));
+                }
+                if !self.approval_policy.preapproved_classes.is_empty() {
+                    policy.push_str(&format!(
+                        "Pre-approved classes: {}.\n",
+                        self.approval_policy.preapproved_classes.join(", ")
+                    ));
+                }
+                policy.push_str("Do not request approval for pre-approved actions.\n");
+            } else {
+                policy.push_str(
+                    "No pre-approvals are configured. Request approval before side-effecting actions.\n",
+                );
             }
-            if !self.approval_policy.preapproved_classes.is_empty() {
-                policy.push_str(&format!(
-                    "Pre-approved classes: {}.\n",
-                    self.approval_policy.preapproved_classes.join(", ")
-                ));
-            }
-            policy.push_str("Do not request approval for pre-approved actions.\n");
-        } else {
-            policy.push_str(
-                "No pre-approvals are configured. Request approval before side-effecting actions.\n",
+            sections.push(policy.trim_end().to_string());
+        } else if matches!(envelope_kind, TurnContextEnvelopeKind::Cognitive) {
+            sections.push(
+                "[Turn policy]\nThis appears to be a low-intent conversational turn. Prefer a direct reply over tool use or approval-seeking unless the user explicitly asks for an action."
+                    .to_string(),
             );
         }
-        sections.push(policy.trim_end().to_string());
+
         if !self.summary_text().is_empty() {
             sections.push(format!("[Recent summary]\n{}.", self.summary_text()));
         }
@@ -2780,7 +2852,11 @@ impl SessionState {
         projected_tools: &[ToolDefinition],
         envelope_kind: TurnContextEnvelopeKind,
     ) -> (String, Value, Value) {
-        let projection = self.build_context_projection_with_tools(user_content, projected_tools);
+        let projection = self.build_context_projection_for_envelope(
+            user_content,
+            projected_tools,
+            envelope_kind,
+        );
         let prompt = self.render_prompt_from_projection(&projection);
         let full_context = self.model_context_from_projection(&projection);
         let context = self.context_for_envelope(&full_context, envelope_kind);
@@ -3964,6 +4040,80 @@ mod tests {
         assert!(
             knowledge.contains("[voice message]"),
             "placeholder must appear in context"
+        );
+    }
+
+    #[test]
+    fn low_intent_cognitive_prompt_omits_skill_guidance_and_detailed_approval_policy() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.bindings.effective_skillset = vec!["planning".into()];
+        state.bindings.effective_skill_guidance =
+            vec!["Use the planning skill to build multi-step execution plans.".into()];
+        state.approval_policy.preapproved_tools = vec!["workspace.read".into()];
+        state.approval_policy.preapproved_classes = vec!["workspace".into()];
+
+        let (prompt, context, _) = state.model_request_payloads_for_envelope(
+            "Thanks, that solved it.",
+            &[],
+            TurnContextEnvelopeKind::Cognitive,
+        );
+
+        assert!(
+            !prompt.contains("Current skill posture:"),
+            "low-intent prompt should not advertise skill posture"
+        );
+        assert!(
+            !prompt.contains("[Skill guidance]"),
+            "low-intent prompt should not include skill guidance"
+        );
+        assert!(
+            !prompt.contains("Pre-approved tools:"),
+            "low-intent prompt should not dump detailed approval posture"
+        );
+        assert!(
+            prompt.contains("[Turn policy]"),
+            "low-intent prompt should carry the simpler turn-policy steer"
+        );
+        let memory_text = context["memory"]
+            .as_array()
+            .expect("memory array")
+            .iter()
+            .filter_map(|item| item.get("text").and_then(|v| v.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !memory_text.contains("Pre-approved tools:"),
+            "low-intent context should not include detailed approval posture"
+        );
+    }
+
+    #[test]
+    fn ingress_prompt_omits_skill_guidance_and_approval_policy_details() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.bindings.effective_skillset = vec!["planning".into()];
+        state.bindings.effective_skill_guidance =
+            vec!["Use the planning skill to build multi-step execution plans.".into()];
+        state.approval_policy.preapproved_tools = vec!["workspace.read".into()];
+
+        let (prompt, _, _) = state.model_request_payloads_for_envelope(
+            "Please transcribe this voice note.",
+            &[],
+            TurnContextEnvelopeKind::Ingress,
+        );
+
+        assert!(
+            !prompt.contains("Current skill posture:"),
+            "ingress prompt should not advertise skill posture"
+        );
+        assert!(
+            !prompt.contains("[Skill guidance]"),
+            "ingress prompt should not include skill guidance"
+        );
+        assert!(
+            !prompt.contains("[Approval policy]"),
+            "ingress prompt should not include approval policy details"
         );
     }
 

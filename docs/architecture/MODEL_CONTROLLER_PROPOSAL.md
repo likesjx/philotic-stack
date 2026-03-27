@@ -552,6 +552,7 @@ Policy note:
 - transform stages should usually request narrow output, not planning/memory channels
 - low-intent cognitive turns should be allowed to request a slimmer channel set than active problem-solving turns
 - cognitive re-entry should reuse the same tool-projection policy as initial turns rather than bypassing it with a raw bound-tool replay
+- stage-aware projection should also narrow prompt/context affordance cues such as skill guidance and approval posture, not just the explicit tool list
 
 ## Optimization-Oriented Response Channels
 
