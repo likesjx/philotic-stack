@@ -222,6 +222,13 @@ fn resolve_model_execution_target(
     (local_node_id(), target_role, None)
 }
 
+fn resolve_stage_execution_target(
+    state: Option<&SessionState>,
+    stage: &TurnRoutingStagePlan,
+) -> (String, String, Option<String>) {
+    resolve_model_execution_target(state, stage.capability.as_str(), &stage.controller_role)
+}
+
 fn normalized_user_content(task: &InboundTaskPayload) -> Option<String> {
     if let Some(content) = task
         .content
@@ -932,6 +939,9 @@ fn apply_routing_preferences(
         {
             if preference.provider_hint.is_some() {
                 stage.provider_hint = preference.provider_hint.clone();
+                stage.controller_role = implementation_to_model_role(
+                    preference.provider_hint.as_deref().unwrap_or_default(),
+                );
             }
             if preference.model_ref.is_some() {
                 stage.model_ref = preference.model_ref.clone();
@@ -1726,11 +1736,8 @@ impl AgentRuntime {
                     stage,
                 )
             };
-        let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
-            self.sessions.get(&session_id),
-            stage.capability.as_str(),
-            DEFAULT_TEXT_MODEL_ROLE,
-        );
+        let (target_node, target_role, target_guest_id) =
+            resolve_stage_execution_target(self.sessions.get(&session_id), &stage);
 
         let attachment_kinds: Vec<&str> = attachments
             .iter()
@@ -2869,10 +2876,9 @@ impl AgentRuntime {
                     final_reply_guest_id,
                 };
 
-                let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
+                let (target_node, target_role, target_guest_id) = resolve_stage_execution_target(
                     self.sessions.get(&session_id),
-                    cognitive_stage.capability.as_str(),
-                    DEFAULT_TEXT_MODEL_ROLE,
+                    &cognitive_stage,
                 );
 
                 info!(
@@ -3022,11 +3028,8 @@ impl AgentRuntime {
             }
         }
 
-        let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
-            self.sessions.get(&session_id),
-            cognitive_stage.capability.as_str(),
-            DEFAULT_TEXT_MODEL_ROLE,
-        );
+        let (target_node, target_role, target_guest_id) =
+            resolve_stage_execution_target(self.sessions.get(&session_id), &cognitive_stage);
 
         self.ipc_client
             .send_request(IpcRequest::EmitTask {
@@ -8734,6 +8737,41 @@ mod tests {
 
         assert_eq!(plan.stages[0].provider_hint.as_deref(), Some("elevenlabs"));
         assert_eq!(plan.stages[0].model_ref.as_deref(), Some("scribe_v1"));
+        assert_eq!(plan.stages[0].controller_role, DEFAULT_VOICE_MODEL_ROLE);
+    }
+
+    #[test]
+    fn stage_preference_promotes_dispatch_to_provider_specific_controller_role() {
+        use crate::session::{RoutingPreferenceBinding, SessionBindings};
+
+        let routing_preferences = vec![RoutingPreferenceBinding {
+            preference_key: "voice-ingress-elevenlabs-scribe".into(),
+            stage_kind: Some("ingress".into()),
+            capability: Some("voice.transcribe".into()),
+            provider_hint: Some("elevenlabs".into()),
+            model_ref: Some("scribe_v1".into()),
+            preference_level: 1,
+            weight: 90,
+            updated_at: 123,
+        }];
+        let media_routing = MediaRouting {
+            action: "transcribe".into(),
+            capability: "voice.transcribe",
+            attachments: vec![blob_backed_attachment("voice")],
+        };
+
+        let plan = compile_turn_routing_plan(
+            Some(&media_routing),
+            None,
+            true,
+            &routing_preferences,
+            &SessionBindings::default(),
+        );
+        let target = super::resolve_stage_execution_target(None, &plan.stages[0]);
+
+        assert_eq!(target.0, super::local_node_id());
+        assert_eq!(target.1, DEFAULT_VOICE_MODEL_ROLE);
+        assert!(target.2.is_none());
     }
 
     #[test]
