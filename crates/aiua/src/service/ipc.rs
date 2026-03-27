@@ -196,6 +196,9 @@ fn infer_agent_id_for_task(
     }
 
     if let Ok(payload) = serde_json::from_str::<serde_json::Value>(task_json) {
+        if let Some(agent_id) = payload.get("agent_id").and_then(serde_json::Value::as_str) {
+            return Some(agent_id.to_string());
+        }
         if let Some(session_id) = payload
             .get("session_id")
             .and_then(serde_json::Value::as_str)
@@ -1065,6 +1068,7 @@ impl IpcServer {
                 target_role: "agent".into(),
                 target_guest_id: Some(target_agent_id.to_string()),
                 task_json: serde_json::json!({
+                    "agent_id": target_agent_id,
                     "source": "operator_chat",
                     "transport": "operator_chat",
                     "session_id": session_id,
@@ -3735,6 +3739,7 @@ impl IpcServer {
                     payload: ansible_mesh_core::event::EventPayload::Inline {
                         data: serde_json::json!({
                             "action": "peer.delegate",
+                            "agent_id": target_agent_id,
                             "session_id": session_id,
                             "chat_id": chat_id,
                             "source": source.unwrap_or_else(|| "peer".into()),
@@ -7393,6 +7398,98 @@ mod tests {
             .expect("list routing preferences");
         assert_eq!(prefs.len(), 1);
         assert_eq!(prefs[0].preference_key, "cognition-gemini-flash");
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+            std::env::remove_var("PHILOTIC_AGENT_GRAPH_DB");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        let _ = std::fs::remove_file(&graph_db_path);
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_task_attaches_agent_graph_snapshot_from_explicit_agent_id_without_session() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let graph_db_template = test_agent_graph_db_template();
+        let agent_id = "agent-aria-01";
+        let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        if let Some(parent) = Path::new(&graph_db_path).parent() {
+            std::fs::create_dir_all(parent).expect("create agent graph parent");
+        }
+        let storage =
+            SqliteAgentGraphStorage::open(agent_id, Path::new(&graph_db_path)).expect("open db");
+        storage
+            .upsert_routing_preference(&AgentRoutingPreference {
+                agent_id: agent_id.into(),
+                preference_key: "egress-elevenlabs".into(),
+                stage_kind: Some("egress".into()),
+                capability: Some("voice.synthesize".into()),
+                provider_hint: Some("elevenlabs".into()),
+                model_ref: Some("eleven_multilingual_v2".into()),
+                preference_level: 1,
+                weight: 8,
+                config_json: serde_json::json!({}),
+                updated_at: 0,
+            })
+            .expect("seed routing preference");
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+            std::env::set_var("PHILOTIC_AGENT_GRAPH_DB", &graph_db_template);
+        }
+
+        let mut agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-aria:orchestrator".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("agent connect");
+
+        agent
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: Some("agent-aria:orchestrator".into()),
+                task_json: serde_json::json!({
+                    "agent_id": agent_id,
+                    "turn_id": "turn-1",
+                    "chat_id": "chat-1",
+                    "content": "hello without session"
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit task");
+
+        let inbound = agent.recv_task().await.expect("recv task");
+        let IpcResponse::InboundTask { task_json, .. } = inbound else {
+            panic!("unexpected inbound response");
+        };
+        let payload: serde_json::Value =
+            serde_json::from_str(&task_json).expect("payload should decode");
+        assert_eq!(payload["agent_graph_snapshot"]["agent_id"], agent_id);
+        assert_eq!(
+            payload["agent_graph_snapshot"]["routing_preferences"]
+                .as_array()
+                .expect("routing preferences array")
+                .len(),
+            1
+        );
 
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");

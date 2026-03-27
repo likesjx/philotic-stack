@@ -310,6 +310,12 @@ directly to the task payload. The receiving hotel hydrates that snapshot into
 its local per-agent store before delivery. This does not replace mesh sync; it
 reduces the very awkward window where an agent arrives before its graph does.
 
+That ownership hint should prefer an explicit `agent_id` carried in the routed
+payload when session-derived inference is unavailable. Remote operator-chat and
+peer-delegation paths now do this so continuity does not depend on a lucky
+local session record or a guest-id shape the sending hotel cannot actually
+resolve.
+
 This is dogfood: the mesh sync story for agent portability is proven by the
 same infrastructure everything else depends on. No second sync protocol.
 
