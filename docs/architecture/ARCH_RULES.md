@@ -1,3 +1,17 @@
+---
+title: "Architectural Rule Registry"
+doc_type: reference
+domain: governance
+status: active
+last_updated: 2026-03-26
+tags:
+  - rules
+  - governance
+  - architecture
+related_docs:
+  - ARCH_RULES_AND_ROADMAP_PROPOSAL.md
+---
+
 # Architectural Rule Registry
 
 Standing constraints extracted from accepted and implemented proposals.

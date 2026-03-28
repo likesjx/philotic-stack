@@ -1,3 +1,18 @@
+---
+title: "Seam Roadmap"
+doc_type: reference
+domain: governance
+status: active
+last_updated: 2026-03-26
+tags:
+  - roadmap
+  - seams
+  - dependencies
+related_docs:
+  - SEAM_REGISTRY.md
+  - ARCH_RULES_AND_ROADMAP_PROPOSAL.md
+---
+
 # Seam Roadmap
 
 Dependency-ordered view of implementation seams across active proposals.
