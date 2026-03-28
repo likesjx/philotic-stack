@@ -4,10 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **This protocol is mandatory on every session start — including sessions that resume from a summary or continue mid-task. A context summary is not a substitute for bootstrap. Do not skip these steps.**
 
-Every session MUST begin with these three steps in order:
+Every session MUST begin with these steps in order:
 1.  **Read [AGENTS.md](file:///Users/jaredlikes/code/philotic-stack/AGENTS.md)**: Adopt the standing protocol.
-2.  **Orient and Recall**: Run `just session-start` first. It should attempt to revive the local Muninn service if it is merely down. Then use the `$muninn-memory-habit` and `$proposal-maintainer` mindset. Retrieve project context via Muninn and align your plan with the current `Disposition` of active architecture proposals and [docs/task.md](file:///Users/jaredlikes/code/philotic-stack/docs/task.md).
-3.  **Verify Green Status**: Run `just check` and `just test` (or the relevant smoke) to confirm the baseline is stable before editing.
+2.  **Query the Project Graph**: Run `phil graph status` to orient. If the graph server is running, use MCP tools (`graph_status`, `graph_proposals`) for a complete picture of what's in flight. The graph is faster and more complete than reading raw files. See `$graph-intelligence` skill.
+3.  **Orient and Recall**: Run `just session-start` to bootstrap Muninn. Use `$muninn-memory-habit` for cognitive context. The graph gives you structural facts; Muninn gives you learned context.
+4.  **Verify Green Status**: Run `just check` and `just test` (or the relevant smoke) to confirm the baseline is stable before editing.
+5.  **Record Decisions**: After completing work, use `graph_decide` (MCP) or `phil graph decide` to record what you did and why. This creates the audit trail.
 
 If `just session-start` cannot recover Muninn, stop and alert the user/operator immediately. Do not continue with meaningful work until explicit approval is given to proceed without Muninn.
 
@@ -34,6 +36,15 @@ just start-model            # cargo run -p model-router (Gemini/ElevenLabs)
 just workstream-start <slug>    # create sibling worktree
 just workstream-status <slug>   # show git status + hot-file overlap
 just workstream-overlap <slug>  # show risky overlap vs origin/main
+
+# Project Graph (context engine)
+phil graph scan               # scan code, docs, git into the graph
+phil graph serve               # start graph server (REST :8900, MCP :8901)
+phil graph status              # orientation — counts and proposal pipeline
+phil graph proposals           # all proposals with current status
+phil graph seams               # all registered seams
+phil graph skeleton <crate>    # PlantUML diagram for a crate
+phil graph search "<text>"     # full-text search across code and docs
 ```
 
 The hotel daemon requires `mesh-config.json` in root — copy from `mesh-config.example.json`.

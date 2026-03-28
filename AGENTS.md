@@ -23,6 +23,21 @@ Philotic is a distributed AI agent operating system built around:
 
 Read [CLAUDE.md](/Users/jaredlikes/code/philotic-stack/CLAUDE.md) for the concise repository map and command inventory.
 
+### Project Graph
+
+The project intelligence graph (`phil graph`) is the primary orientation tool.
+It contains the full codebase structure (types, functions, traits), all proposals
+and seams, git history, and a decision audit trail. Use it instead of reading
+raw files when possible.
+
+- **Orient**: `phil graph status` or MCP `graph_status` at session start
+- **Inspect**: `phil graph skeleton <crate>` for type diagrams, `graph_snippet` for code
+- **Search**: `phil graph search "<text>"` across code and docs
+- **Record**: `graph_decide` after every significant decision
+
+The graph gives you structural facts. Muninn gives you cognitive context
+(learnings, preferences, patterns). Use both. See `$graph-intelligence` skill.
+
 ## 2. Working Principles
 
 ### 2.1 One Canonical Owner Per State Type
