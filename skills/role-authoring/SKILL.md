@@ -5,7 +5,7 @@ catalog:
   skill_name: role.authoring
   implied_tools:
     - session.status
-    - role.configure
+    - role.create_or_update
     - handoff.to_role
   validation_state: validated
   skill_markers:
@@ -20,7 +20,7 @@ catalog:
       - reasoning.handoff_posture_and_limits
     repo_skill_path: skills/role-authoring/SKILL.md
     workflow_handoff: role.create_or_update
-    transitional_note: role.authoring remains prompt-facing and still implies the low-level role.configure tool as a compatibility bridge until workflow invocation is surfaced directly.
+    transitional_note: role.authoring remains prompt-facing while runtime execution still resolves through the low-level role.configure mutation surface under the governed role.create_or_update workflow.
 ---
 
 # Role Authoring

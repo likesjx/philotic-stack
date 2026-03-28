@@ -2026,6 +2026,60 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             class: "config".into(),
             tool_markers: vec!["high_agency".into(), "local_only".into()],
         },
+        AbstractToolRecord {
+            tool_name: "role.create_or_update".into(),
+            description: "Governed workflow surface for creating or updating a role incarnation for the current agent identity. Prompt-facing orchestration should use this surface instead of treating low-level role mutation as the cognitive plan.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "role_name": { "type": "string" },
+                    "toolset_profile": { "type": "string" },
+                    "role_identity_addendum": { "type": "string" },
+                    "role_manifest": { "type": "string" },
+                    "is_admin": { "type": "boolean" },
+                    "inactive_ttl_seconds": { "type": "integer" },
+                    "iteration_cap": { "type": "integer" },
+                    "approval_policy": { "type": "string" },
+                    "model_profile": { "type": "string" },
+                    "context_window_policy": { "type": "string" },
+                    "reasoning": {
+                        "type": "object",
+                        "properties": {
+                            "purpose": { "type": "string" },
+                            "toolset_rationale": { "type": "string" },
+                            "handoff_posture_and_limits": { "type": "string" }
+                        },
+                        "required": ["purpose", "toolset_rationale", "handoff_posture_and_limits"]
+                    }
+                },
+                "required": ["role_name", "toolset_profile", "reasoning"]
+            }),
+            class: "config".into(),
+            tool_markers: vec!["workflow".into(), "high_agency".into(), "local_only".into()],
+        },
+        AbstractToolRecord {
+            tool_name: "role.configure".into(),
+            description: "Low-level compatibility surface for mutating a role incarnation. Prefer role.create_or_update for prompt-facing workflow use.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "role_name": { "type": "string" },
+                    "toolset_profile": { "type": "string" },
+                    "reasoning": {
+                        "type": "object",
+                        "properties": {
+                            "purpose": { "type": "string" },
+                            "toolset_rationale": { "type": "string" },
+                            "handoff_posture_and_limits": { "type": "string" }
+                        },
+                        "required": ["purpose", "toolset_rationale", "handoff_posture_and_limits"]
+                    }
+                },
+                "required": ["role_name", "toolset_profile", "reasoning"]
+            }),
+            class: "config".into(),
+            tool_markers: vec!["compatibility".into(), "high_agency".into(), "local_only".into()],
+        },
     ];
 
     for tool in &catalog {
@@ -2078,6 +2132,18 @@ fn seed_abstract_right_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             description: "Allows visibility and invocation of the agent.configure tool.".into(),
             target_kind: "tool".into(),
             target_ref: "agent.configure".into(),
+        },
+        AbstractRightRecord {
+            right_name: tool_right("role.create_or_update"),
+            description: "Allows visibility and invocation of the role.create_or_update workflow surface.".into(),
+            target_kind: "tool".into(),
+            target_ref: "role.create_or_update".into(),
+        },
+        AbstractRightRecord {
+            right_name: tool_right("role.configure"),
+            description: "Allows visibility and invocation of the low-level role.configure compatibility surface.".into(),
+            target_kind: "tool".into(),
+            target_ref: "role.configure".into(),
         },
         AbstractRightRecord {
             right_name: skill_right("handoff.to_role"),
@@ -2355,7 +2421,11 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
         AbstractSkillRecord {
             skill_name: "role.governance".into(),
             description: "Govern role definitions deliberately for the current agent identity, reasoning explicitly about purpose, capability posture, handoff behavior, and limits before proposing changes.".into(),
-            implied_tools: vec!["session.status".into(), "agent.configure".into(), "role.configure".into()],
+            implied_tools: vec![
+                "session.status".into(),
+                "agent.configure".into(),
+                "role.create_or_update".into(),
+            ],
             skill_markers: vec!["governed".into(), "high_agency".into()],
             ..Default::default()
         },
@@ -2442,7 +2512,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "session.status".into(),
                 "echo".into(),
                 "agent.configure".into(),
-                "role.configure".into(),
+                "role.create_or_update".into(),
                 "skill.register".into(),
                 "subagent.spawn".into(),
                 "workspace.list".into(),
@@ -2498,7 +2568,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "skill.assign".into(),
                 "skill.revoke".into(),
                 "subagent.spawn".into(),
-                "role.configure".into(),
+                "role.create_or_update".into(),
                 "workspace.list".into(),
                 "workspace.read".into(),
                 "bash.exec".into(),
@@ -2542,7 +2612,7 @@ fn seed_skill_crafting(graph: &GraphDomain) -> anyhow::Result<()> {
             "skill.assign".into(),
             "skill.revoke".into(),
             "subagent.spawn".into(),
-            "role.configure".into(),
+            "role.create_or_update".into(),
         ],
         skill_markers: vec!["governed".into(), "high_agency".into()],
         validation_state: SkillValidationState::Validated,
@@ -2555,7 +2625,9 @@ fn seed_skill_crafting(graph: &GraphDomain) -> anyhow::Result<()> {
 
 /// Governance document seeded for every agent's orchestrator role.
 /// This is the agent's self-description — it tells the agent what it IS, what it can do,
-/// what requires approval, and how to delegate. Agents can update this via role.configure.
+/// what requires approval, and how to delegate. Agents can update this via the
+/// governed role.create_or_update workflow, which currently resolves through
+/// the low-level role.configure mutation surface.
 const ORCHESTRATOR_MANIFEST: &str = "\
 You are in orchestrator posture — the sovereign identity layer of your agent.
 
@@ -2569,21 +2641,21 @@ Responsibilities:
 Rules:
 - Reason explicitly before creating a role: purpose, toolset, handoff posture, limits.
 - Use the role.authoring skill to assemble the role lens, then execute the role.create_or_update workflow; do not treat role.configure itself as the cognitive plan.
-- role.configure always requires: role_name, toolset_profile, reasoning.purpose, reasoning.toolset_rationale, and reasoning.handoff_posture_and_limits.
+- role.create_or_update always requires: role_name, toolset_profile, reasoning.purpose, reasoning.toolset_rationale, and reasoning.handoff_posture_and_limits. Runtime execution still resolves through role.configure as a transitional hotel mutation surface.
 - After role creation succeeds, hand off into the new role only when the operator asked to use it immediately.
 - Do not bypass the approval gate; if a tool requires operator approval, surface it clearly.
 - Keep soul_text and core identity stable — those changes require operator approval.
 - Use handoff.to_role for sustained specialist work; use subagent.spawn for parallel bounded tasks.
 
 Approval posture:
-- Governance tools (role.configure, skill.register, handoff.to_role, handoff.back) run without per-action approval.
+- Governance tools (role.create_or_update, skill.register, handoff.to_role, handoff.back) run without per-action approval.
 - Self-configuration (agent.configure for approval_policy, profile, bindings) runs without approval.
 - Shell execution (bash.exec) and core identity field changes require operator approval.";
 
 /// Seeds an orchestrator RoleIncarnationRecord for each agent profile.
 ///
 /// This ensures every agent has a fully populated toolset and manifest from the first session
-/// turn, breaking the chicken-and-egg where role.configure requires tools that only appear
+/// turn, breaking the chicken-and-egg where role creation requires tools that only appear
 /// after a role exists.
 fn seed_orchestrator_roles(graph: &GraphDomain, profiles: &[AgentProfile]) -> anyhow::Result<()> {
     for profile in profiles {
@@ -5816,7 +5888,7 @@ mod tests {
         hotel_base_port, hotel_ipc_socket_path, load_role_authoring_skill_record,
         load_role_create_or_update_workflow_record, local_capability_advertisements,
         nearest_available_base_port, resolve_runtime_ports, seed_abstract_skill_catalog,
-        seed_workflow_skill_catalog, startup_test_gemini_base_url,
+        seed_abstract_tool_catalog, seed_workflow_skill_catalog, startup_test_gemini_base_url,
     };
     use ansible_mesh_core::domain::GraphDomain;
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
@@ -6009,6 +6081,31 @@ mod tests {
     }
 
     #[test]
+    fn seed_abstract_tool_catalog_includes_role_create_workflow_surface() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite graph");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+
+        seed_abstract_tool_catalog(&graph).expect("seed abstract tools");
+
+        let workflow_tool = graph
+            .get_abstract_tool("role.create_or_update")
+            .expect("read abstract tool")
+            .expect("workflow tool present");
+        assert_eq!(workflow_tool.class, "config");
+        assert!(workflow_tool.tool_markers.contains(&"workflow".to_string()));
+
+        let low_level_tool = graph
+            .get_abstract_tool("role.configure")
+            .expect("read legacy tool")
+            .expect("legacy tool present");
+        assert!(
+            low_level_tool
+                .tool_markers
+                .contains(&"compatibility".to_string())
+        );
+    }
+
+    #[test]
     fn role_authoring_catalog_seed_comes_from_repo_skill_frontmatter() {
         let record = load_role_authoring_skill_record().expect("load role authoring skill");
 
@@ -6026,7 +6123,7 @@ mod tests {
             record.implied_tools,
             vec![
                 "session.status".to_string(),
-                "role.configure".to_string(),
+                "role.create_or_update".to_string(),
                 "handoff.to_role".to_string()
             ]
         );

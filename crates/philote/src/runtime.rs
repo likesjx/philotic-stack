@@ -1096,8 +1096,10 @@ fn format_roles_report(active_incarnation_id: Option<&str>, roles: &[serde_json:
     lines.join("\n")
 }
 
-/// Locally cached role configuration, populated when `role.configure` succeeds.
-/// Used to reconstruct `RoleActivation` on inbound handoff without an IPC round-trip.
+/// Locally cached role configuration, populated when role configuration succeeds via
+/// the prompt-facing `role.create_or_update` workflow surface or the legacy
+/// `role.configure` compatibility alias. Used to reconstruct `RoleActivation`
+/// on inbound handoff without an IPC round-trip.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct CachedRoleConfig {
@@ -1115,7 +1117,8 @@ pub struct AgentRuntime {
     sessions: HashMap<String, SessionState>,
     /// MuninnDB config fetched from hotel at startup. None = NullMemoryEngine.
     muninn_config: Option<MuninnConfig>,
-    /// Role configurations registered via `role.configure`, keyed by role_name.
+    /// Role configurations registered via role configuration workflow/tool execution,
+    /// keyed by role_name.
     configured_roles: HashMap<String, CachedRoleConfig>,
     /// Agent profile (identity_text, soul_text, etc.) fetched from hotel at startup.
     /// Applied to every new session so the correct persona is used from the first turn.
@@ -2461,7 +2464,10 @@ impl AgentRuntime {
             // This check runs before the normal force_approval gate so it can set always_require_human.
             // Bypassed when bypass_approval is true (already resolved by the operator).
             let is_admin_role_creation = !bypass_approval
-                && tool_call.tool_name == "role.configure"
+                && matches!(
+                    tool_call.tool_name.as_str(),
+                    "role.configure" | "role.create_or_update"
+                )
                 && tool_call
                     .arguments
                     .get("is_admin")
@@ -5843,8 +5849,9 @@ impl AgentRuntime {
                 })
                 .await
             }
-            "role.configure" => {
+            "role.configure" | "role.create_or_update" => {
                 let args = &payload.arguments;
+                let tool_surface = payload.tool_name.as_str();
 
                 macro_rules! require_str_arg {
                     ($key:literal) => {
@@ -5856,8 +5863,8 @@ impl AgentRuntime {
                                         payload.session_id,
                                         payload.turn_id,
                                         format!(
-                                            "role.configure: missing required argument '{}'",
-                                            $key
+                                            "{}: missing required argument '{}'",
+                                            tool_surface, $key
                                         ),
                                     )
                                     .await;
@@ -5874,7 +5881,10 @@ impl AgentRuntime {
                         .fail_active_turn(
                             payload.session_id,
                             payload.turn_id,
-                            "role.configure: missing required object argument 'reasoning'".into(),
+                            format!(
+                                "{}: missing required object argument 'reasoning'",
+                                tool_surface
+                            ),
                         )
                         .await;
                 }
@@ -5994,14 +6004,14 @@ impl AgentRuntime {
                         let e = TaskErrorPayload::ipc_failure(
                             "aiua",
                             "UNEXPECTED_RESPONSE",
-                            "role.configure: unexpected hotel response",
+                            format!("{tool_surface}: unexpected hotel response"),
                         );
                         (e.display_message(), Some(e))
                     }
                     Err(e) => {
                         let err = TaskErrorPayload::transport_error(
                             "philote",
-                            format!("role.configure: IPC transport error — {e}"),
+                            format!("{tool_surface}: IPC transport error — {e}"),
                         );
                         (err.display_message(), Some(err))
                     }

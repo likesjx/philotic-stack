@@ -4140,6 +4140,10 @@ fn default_visible_toolset(bindings: &SessionBindings) -> Vec<String> {
         }
     }
 
+    if toolset.iter().any(|t| t == "role.create_or_update") {
+        toolset.retain(|t| t != "role.configure");
+    }
+
     if bindings.effective_rights.is_empty() {
         return toolset;
     }
@@ -4164,6 +4168,7 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
             | "skill.assign"
             | "skill.revoke"
             | "subagent.spawn"
+            | "role.create_or_update"
             | "role.configure"
             | "handoff.to_role"
             | "handoff.back"
@@ -5262,6 +5267,16 @@ mod tests {
     }
 
     #[test]
+    fn role_governance_implies_role_create_workflow_surface() {
+        use crate::catalog::skill_implied_tools;
+
+        assert_eq!(
+            skill_implied_tools("role.governance"),
+            &["session.status", "agent.configure", "role.create_or_update"]
+        );
+    }
+
+    #[test]
     fn agent_configure_apply_mutates_approval_policy() {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
@@ -6253,6 +6268,26 @@ mod tests {
 
         assert_eq!(projected.len(), 1);
         assert_eq!(projected[0].tool_name, "echo");
+    }
+
+    #[test]
+    fn role_create_workflow_surface_suppresses_legacy_role_configure_projection() {
+        let mut bindings = SessionBindings::default();
+        bindings.effective_toolset = vec![
+            "role.configure".into(),
+            "role.create_or_update".into(),
+            "echo".into(),
+        ];
+
+        let assembly = default_tool_assembly_for_bindings(&bindings);
+        let tool_names: Vec<&str> = assembly
+            .tools_for_model
+            .iter()
+            .map(|tool| tool.tool_name.as_str())
+            .collect();
+
+        assert!(tool_names.contains(&"role.create_or_update"));
+        assert!(!tool_names.contains(&"role.configure"));
     }
 
     #[test]

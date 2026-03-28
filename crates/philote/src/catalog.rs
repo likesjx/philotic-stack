@@ -33,7 +33,8 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
     match skill_name {
         "handoff.to_role" => &["session.status", "handoff.to_role", "handoff.back"],
         "handoff.back" => &["session.status", "handoff.back"],
-        "role.governance" => &["session.status", "agent.configure", "role.configure"],
+        "role.governance" => &["session.status", "agent.configure", "role.create_or_update"],
+        "role.authoring" => &["session.status", "role.create_or_update", "handoff.to_role"],
         "memory" => &["memory.recall", "memory.remember"],
         "routing.refinement" => &[
             "session.status",
@@ -601,14 +602,86 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
     );
 
     m.insert(
+        "role.create_or_update".into(),
+        ToolDefinition {
+            tool_name: "role.create_or_update".into(),
+            description: "Governed workflow surface for creating or updating a role incarnation for \
+                          the current agent identity. Use this to validate and apply a role lens \
+                          deliberately, including purpose, toolset, handoff posture, and limits. \
+                          Runtime execution currently resolves through the low-level role.configure \
+                          hotel mutation path for compatibility. Always include role_name, \
+                          toolset_profile, and the full reasoning object with purpose, \
+                          toolset_rationale, and handoff_posture_and_limits."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "role_name": {
+                        "type": "string",
+                        "description": "The name of the role (e.g. 'developer', 'researcher')."
+                    },
+                    "toolset_profile": {
+                        "type": "string",
+                        "description": "The profile name determining default tools/skills (e.g. 'codex', 'research', 'utility')."
+                    },
+                    "role_identity_addendum": {
+                        "type": "string",
+                        "description": "Additive persona/identity instructions for this specific role."
+                    },
+                    "role_manifest": {
+                        "type": "string",
+                        "description": "Governance document for this role — focus, rules, delegation posture, and approval constraints. Written in natural language. The agent sees this as its [Governance] context block when the role is active. Should describe: what this role does, what tools are available and when to use them, what requires approval, and when to hand off."
+                    },
+                    "is_admin": {
+                        "type": "boolean",
+                        "description": "If true, this role has admin authority — it may update operator-owned records such as the orchestrator manifest. Only existing admin roles may create other admin roles. Setting this to true always triggers a live operator approval interrupt that cannot be preapproved or bypassed."
+                    },
+                    "inactive_ttl_seconds": {
+                        "type": "integer",
+                        "description": "Seconds of inactivity before the role is suspended/terminated."
+                    },
+                    "iteration_cap": {
+                        "type": "integer",
+                        "description": "Maximum model-turn iterations allowed for this role before it must return or stop."
+                    },
+                    "approval_policy": {
+                        "type": "string",
+                        "description": "Stringified JSON describing the approval policy structure."
+                    },
+                    "model_profile": {
+                        "type": "string",
+                        "description": "Stringified JSON describing model preferences (provider, temperature)."
+                    },
+                    "context_window_policy": {
+                        "type": "string",
+                        "description": "Stringified JSON describing context packaging rules."
+                    },
+                    "reasoning": {
+                        "type": "object",
+                        "description": "Required reasoning for this role's existence, purpose, and capability posture.",
+                        "properties": {
+                            "purpose": { "type": "string" },
+                            "toolset_rationale": { "type": "string" },
+                            "handoff_posture_and_limits": { "type": "string" }
+                        },
+                        "required": ["purpose", "toolset_rationale", "handoff_posture_and_limits"]
+                    }
+                },
+                "required": ["role_name", "toolset_profile", "reasoning"]
+            }),
+            class: Some("config".into()),
+        },
+    );
+
+    m.insert(
         "role.configure".into(),
         ToolDefinition {
             tool_name: "role.configure".into(),
-            description: "Create or update a role incarnation for the current agent identity. \
-                          Requires reasoning about: purpose, toolset, skillset, handoff posture, \
-                          and limits (TTL, iteration caps). Only the orchestrator can use this tool. \
-                          Always include role_name, toolset_profile, and the full reasoning object \
-                          with purpose, toolset_rationale, and handoff_posture_and_limits."
+            description: "Low-level compatibility surface for mutating a role incarnation for the \
+                          current agent identity. Prefer the governed role.create_or_update workflow \
+                          surface for prompt-facing role authoring. This tool still executes the \
+                          underlying hotel mutation path and requires the same role_name, \
+                          toolset_profile, and reasoning object."
                 .into(),
             input_schema: json!({
                 "type": "object",

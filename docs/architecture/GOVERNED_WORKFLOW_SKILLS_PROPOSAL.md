@@ -92,6 +92,8 @@ The graph now also has its first real `WorkflowSkillRecord` seeds for:
 
 For the role seam, the hotel no longer keeps that catalog truth only as hand-maintained Rust literals. The `role.authoring` abstract skill and `role.create_or_update` workflow now compile from repo-local markdown frontmatter embedded into the binary, which keeps installed hotels self-contained without making runtime seeding depend on a live source checkout.
 
+`philote` now also prefers the workflow-shaped prompt surface directly: when both are available, `role.create_or_update` is projected to the model and the low-level `role.configure` tool is suppressed as compatibility residue. Execution still resolves through the existing `ConfigureRole` hotel path, so the workflow is now prompt-real before it is yet a fully separate runtime organ.
+
 The lifecycle and validation model for delegation skills is now fully defined in [SKILL_LIFECYCLE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SKILL_LIFECYCLE_PROPOSAL.md). That document owns: the `draft → validated → registered → active → deprecated / invalid / suspended` state machine, the three validation layers, `HookKind`, `IdleBehavior`, `SubagentLeaseTerms`, the updated required `SubagentDelegation` fields, new IPC verbs and responses, the field sourcing map, and the `skill-creator` meta-skill and tool contracts.
 
 `WorkflowSkillRecord` now gains:
