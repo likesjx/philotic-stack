@@ -419,6 +419,23 @@ impl GraphEngine {
         Ok(count as usize)
     }
 
+    /// Full-text search over nodes by name.
+    pub fn search_nodes(&self, query: &str) -> Result<Vec<Node>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT n.id, n.kind, n.name, n.properties, n.file_path, n.worktree, n.created_at, n.updated_at
+             FROM nodes n
+             JOIN nodes_fts fts ON n.rowid = fts.rowid
+             WHERE nodes_fts MATCH ?1
+             LIMIT 100",
+        )?;
+        let rows = stmt.query_map(params![query], |row| Ok(row_to_node(row)))?;
+        let mut nodes = Vec::new();
+        for row in rows {
+            nodes.push(row??);
+        }
+        Ok(nodes)
+    }
+
     /// Count all snippets.
     pub fn count_snippets(&self) -> Result<usize> {
         let count: i64 = self

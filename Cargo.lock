@@ -2828,6 +2828,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "philotic-graph"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "graph-intelligence",
+ "memory-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "philotic-sandbox"
 version = "0.1.0"
 dependencies = [
@@ -2859,9 +2876,11 @@ dependencies = [
  "dirs 5.0.1",
  "ed25519-dalek",
  "glob",
+ "graph-intelligence",
  "hex",
  "inquire",
  "philotic-client",
+ "philotic-graph",
  "rand 0.8.5",
  "rusqlite",
  "rust-embed",

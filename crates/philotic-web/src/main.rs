@@ -132,6 +132,12 @@ enum Command {
         action: ComponentAction,
     },
 
+    /// Project intelligence graph — scan, query, and serve the codebase graph
+    Graph {
+        #[command(subcommand)]
+        action: GraphAction,
+    },
+
     /// Start the local management web server (REST + WebSocket)
     Serve {
         /// Port to listen on (default: 7700)
@@ -149,6 +155,48 @@ enum Command {
         /// Allowed CORS origins, comma-separated (default: http://localhost:5173)
         #[arg(long)]
         allow_origins: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum GraphAction {
+    /// Run a full scan of code, docs, and git state
+    Scan,
+
+    /// Start the graph server (REST + MCP + WebSocket)
+    Serve {
+        /// HTTP port for REST API
+        #[arg(long, default_value = "8900")]
+        port: u16,
+
+        /// MCP port for agent tools
+        #[arg(long, default_value = "8901")]
+        mcp_port: u16,
+
+        /// Path to graph database
+        #[arg(long, default_value = "philotic-graph.db")]
+        db: String,
+    },
+
+    /// Show graph status summary
+    Status,
+
+    /// Generate PlantUML skeleton for a crate
+    Skeleton {
+        /// Crate name
+        crate_name: String,
+    },
+
+    /// List all proposals with status
+    Proposals,
+
+    /// List all seams
+    Seams,
+
+    /// Search the graph
+    Search {
+        /// Search query
+        query: String,
     },
 }
 
@@ -253,6 +301,144 @@ async fn main() -> Result<()> {
             ComponentAction::List => component::list().await,
             ComponentAction::Remove { guest_id } => component::remove(guest_id).await,
         },
+        Command::Graph { action } => {
+            use philotic_graph::PhiloticGraphConfig;
+            use graph_intelligence::{GraphEngine, scanner};
+
+            let config = PhiloticGraphConfig::default();
+
+            match action {
+                GraphAction::Scan => {
+                    let mut engine = GraphEngine::open(&config.db_path)?;
+                    let root = std::env::current_dir()?;
+                    let result = scanner::full_scan(&root, &config.to_scan_config(), &mut engine)?;
+                    println!("Scan complete:");
+                    println!(
+                        "  {} crates, {} modules, {} types, {} functions",
+                        result.crates, result.modules, result.types, result.functions
+                    );
+                    println!(
+                        "  {} tests, {} snippets, {} docs",
+                        result.tests, result.snippets, result.docs
+                    );
+                    println!(
+                        "  {} commits, {} branches",
+                        result.commits, result.branches
+                    );
+                    println!("  Duration: {}ms", result.duration_ms);
+                    Ok(())
+                }
+                GraphAction::Serve { port, mcp_port, db } => {
+                    let mut cfg = config;
+                    cfg.http_port = port;
+                    cfg.mcp_port = mcp_port;
+                    cfg.db_path = db;
+                    let repo_root = std::env::current_dir()?.to_string_lossy().to_string();
+                    let server_config = cfg.to_server_config(&repo_root);
+                    graph_intelligence::server::serve(server_config).await
+                }
+                GraphAction::Status => {
+                    let engine = GraphEngine::open(&config.db_path)?;
+                    let proposals = engine.query_nodes(
+                        Some(graph_intelligence::schema::NodeKind::Proposal),
+                        None,
+                    )?;
+                    let crates = engine.query_nodes(
+                        Some(graph_intelligence::schema::NodeKind::Crate),
+                        None,
+                    )?;
+                    let types = engine.query_nodes(
+                        Some(graph_intelligence::schema::NodeKind::Type),
+                        None,
+                    )?;
+                    let fns = engine.query_nodes(
+                        Some(graph_intelligence::schema::NodeKind::Function),
+                        None,
+                    )?;
+
+                    println!("Graph Intelligence Status");
+                    println!("{}", "\u{2500}".repeat(25));
+                    println!("  Proposals:  {}", proposals.len());
+                    println!("  Crates:     {}", crates.len());
+                    println!("  Types:      {}", types.len());
+                    println!("  Functions:  {}", fns.len());
+
+                    let mut by_status: std::collections::HashMap<String, usize> =
+                        std::collections::HashMap::new();
+                    for p in &proposals {
+                        let status = p
+                            .properties
+                            .get("status")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        *by_status.entry(status.to_string()).or_default() += 1;
+                    }
+                    println!("\n  Proposal Pipeline:");
+                    for (status, count) in &by_status {
+                        println!("    {status:<30} {count}");
+                    }
+                    Ok(())
+                }
+                GraphAction::Skeleton { crate_name } => {
+                    let engine = GraphEngine::open(&config.db_path)?;
+                    let uml =
+                        graph_intelligence::plantuml::generate_crate_diagram(&engine, &crate_name)?;
+                    println!("{uml}");
+                    Ok(())
+                }
+                GraphAction::Proposals => {
+                    let engine = GraphEngine::open(&config.db_path)?;
+                    let proposals = engine.query_nodes(
+                        Some(graph_intelligence::schema::NodeKind::Proposal),
+                        None,
+                    )?;
+                    println!("{:<45} {:<25} {}", "PROPOSAL", "STATUS", "DOMAIN");
+                    println!("{}", "\u{2500}".repeat(90));
+                    for p in &proposals {
+                        let status = p
+                            .properties
+                            .get("status")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?");
+                        let domain = p
+                            .properties
+                            .get("domain")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?");
+                        println!("{:<45} {:<25} {}", p.name, status, domain);
+                    }
+                    Ok(())
+                }
+                GraphAction::Seams => {
+                    let engine = GraphEngine::open(&config.db_path)?;
+                    let seams = engine.query_nodes(
+                        Some(graph_intelligence::schema::NodeKind::Seam),
+                        None,
+                    )?;
+                    println!("Registered seams: {}", seams.len());
+                    for s in &seams {
+                        println!("  {}", s.name);
+                    }
+                    Ok(())
+                }
+                GraphAction::Search { query } => {
+                    let engine = GraphEngine::open(&config.db_path)?;
+                    let nodes = engine.search_nodes(&query)?;
+                    let snippets = engine.search_snippets(&query)?;
+                    println!("Nodes matching '{}': {}", query, nodes.len());
+                    for n in nodes.iter().take(20) {
+                        println!("  [{:?}] {} \u{2014} {}", n.kind, n.id, n.name);
+                    }
+                    if !snippets.is_empty() {
+                        println!("\nSnippets matching '{}': {}", query, snippets.len());
+                        for s in snippets.iter().take(10) {
+                            println!("  [{}] {} \u{2014} {}", s.kind.as_str(), s.node_id, s.signature);
+                        }
+                    }
+                    Ok(())
+                }
+            }
+        }
         Command::Serve {
             port,
             db,
