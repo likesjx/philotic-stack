@@ -61,6 +61,18 @@ pub fn known_agents() -> Vec<AgentIdentity> {
             description: "External coding agent (OpenAI)".into(),
         },
         AgentIdentity {
+            name: "windsurf-cascade".into(),
+            display_name: "Windsurf Cascade".into(),
+            role: "external-agent".into(),
+            description: "External coding agent (Windsurf)".into(),
+        },
+        AgentIdentity {
+            name: "gemini-antigravity".into(),
+            display_name: "Gemini Antigravity".into(),
+            role: "external-agent".into(),
+            description: "External coding agent (Google)".into(),
+        },
+        AgentIdentity {
             name: "human".into(),
             display_name: "Human Operator".into(),
             role: "operator".into(),
