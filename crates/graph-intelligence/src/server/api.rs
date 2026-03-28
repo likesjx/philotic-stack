@@ -3,11 +3,12 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path as AxumPath, Query, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
+use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 
@@ -16,6 +17,12 @@ use crate::scanner::{full_scan, ScanConfig};
 
 use super::ws::ChangeEvent;
 use super::AppState;
+
+// ── Embedded UI assets ──
+
+#[derive(RustEmbed)]
+#[folder = "ui/"]
+struct UiAssets;
 
 // ── Query parameter types ──
 
@@ -112,6 +119,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/mutations", get(list_mutations))
         .route("/api/scan", post(trigger_scan))
         .layer(CorsLayer::permissive())
+        .fallback(get(handle_ui_static))
         .with_state(state)
 }
 
@@ -526,6 +534,36 @@ async fn update_node(
         "node": node,
         "mutation_id": mutation.id,
     })))
+}
+
+// ── Embedded UI handlers ──
+
+async fn handle_ui_static(uri: axum::http::Uri) -> impl IntoResponse {
+    let path = uri.path().trim_start_matches('/');
+
+    // Serve the requested asset if it exists
+    if !path.is_empty() {
+        if let Some(asset) = UiAssets::get(path) {
+            let mime = asset.metadata.mimetype();
+            return (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, mime.to_string())],
+                asset.data.into_owned(),
+            )
+                .into_response();
+        }
+    }
+
+    // SPA fallback — serve index.html for any unknown path
+    match UiAssets::get("index.html") {
+        Some(index) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8".to_string())],
+            index.data.into_owned(),
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "UI not available").into_response(),
+    }
 }
 
 // ── Error helpers ──

@@ -81,6 +81,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     let mcp_addr = format!("0.0.0.0:{}", config.mcp_port);
 
     eprintln!("HTTP/WS server listening on {}", http_addr);
+    eprintln!("Web UI available at http://localhost:{}", config.http_port);
     eprintln!("MCP server listening on {}", mcp_addr);
 
     // Build the MCP router

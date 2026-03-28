@@ -1,0 +1,1355 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Graph Intelligence — Philotic Stack</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+  --bg: #0a0c14;
+  --surface: #161b2e;
+  --border: #1e2540;
+  --accent: #00e5ff;
+  --success: #00e676;
+  --amber: #ffc107;
+  --orange: #ff6d00;
+  --muted: #4a5370;
+  --text: #e8eaf0;
+  --text-secondary: #8892b0;
+  --font: 'Inter', system-ui, -apple-system, sans-serif;
+  --mono: 'JetBrains Mono', monospace;
+  --radius: 8px;
+}
+
+html, body { height: 100%; background: var(--bg); color: var(--text); font-family: var(--font); font-size: 14px; }
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* ── Layout ── */
+.app { display: flex; height: 100vh; }
+
+.sidebar {
+  width: 220px;
+  min-width: 220px;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+}
+
+.sidebar-header {
+  padding: 20px 16px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.sidebar-header h1 {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--accent);
+  letter-spacing: 0.5px;
+}
+
+.sidebar-header .subtitle {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-top: 2px;
+}
+
+.sidebar nav { flex: 1; padding: 8px 0; }
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 500;
+  transition: background 0.15s, color 0.15s;
+  border-left: 3px solid transparent;
+}
+
+.nav-item:hover { background: rgba(0,229,255,0.05); color: var(--text); }
+.nav-item.active { color: var(--accent); border-left-color: var(--accent); background: rgba(0,229,255,0.08); }
+
+.nav-icon { width: 18px; text-align: center; font-size: 15px; opacity: 0.8; }
+
+.main { flex: 1; overflow-y: auto; padding: 24px 28px; }
+
+.view { display: none; }
+.view.active { display: block; }
+
+/* ── Common ── */
+h2 { font-size: 20px; font-weight: 700; margin-bottom: 20px; }
+h3 { font-size: 15px; font-weight: 600; margin-bottom: 12px; color: var(--text-secondary); }
+
+.loading { color: var(--text-secondary); font-style: italic; padding: 20px 0; }
+.error { color: var(--orange); padding: 12px; background: rgba(255,109,0,0.1); border-radius: var(--radius); margin: 8px 0; }
+
+/* ── Stats Cards ── */
+.stats-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+  margin-bottom: 24px;
+}
+
+.stat-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  text-align: center;
+}
+
+.stat-card .value {
+  font-size: 28px;
+  font-weight: 700;
+  color: var(--accent);
+  line-height: 1.2;
+}
+
+.stat-card .label {
+  font-size: 11px;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-top: 4px;
+}
+
+/* ── Pipeline Bar ── */
+.pipeline-bar {
+  display: flex;
+  height: 32px;
+  border-radius: var(--radius);
+  overflow: hidden;
+  margin-bottom: 24px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+
+.pipeline-segment {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--bg);
+  min-width: 40px;
+  transition: flex 0.3s;
+}
+
+/* ── Tables ── */
+.table-wrap {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+table { width: 100%; border-collapse: collapse; }
+thead th {
+  text-align: left;
+  padding: 10px 14px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-secondary);
+  background: rgba(0,0,0,0.2);
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  user-select: none;
+}
+thead th:hover { color: var(--accent); }
+
+tbody td {
+  padding: 9px 14px;
+  font-size: 13px;
+  border-bottom: 1px solid var(--border);
+}
+
+tbody tr:last-child td { border-bottom: none; }
+tbody tr:hover { background: rgba(0,229,255,0.03); }
+
+/* ── Badges ── */
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: lowercase;
+}
+
+.badge-proposed { background: rgba(0,229,255,0.15); color: var(--accent); }
+.badge-accepted { background: rgba(0,229,255,0.25); color: var(--accent); }
+.badge-in-progress, .badge-in_progress { background: rgba(255,193,7,0.2); color: var(--amber); }
+.badge-implemented { background: rgba(0,230,118,0.15); color: var(--success); }
+.badge-deferred { background: rgba(74,83,112,0.3); color: var(--muted); }
+.badge-kind {
+  background: rgba(0,229,255,0.1);
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: 10px;
+}
+
+/* ── Kanban ── */
+.kanban {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 12px;
+  margin-bottom: 24px;
+}
+
+.kanban-col {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  min-height: 200px;
+}
+
+.kanban-col-header {
+  padding: 12px;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.kanban-col-header .count {
+  background: rgba(255,255,255,0.08);
+  padding: 1px 7px;
+  border-radius: 10px;
+  font-size: 11px;
+}
+
+.kanban-cards { padding: 8px; }
+
+.kanban-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+
+.kanban-card:hover { border-color: var(--accent); }
+
+.kanban-card .card-name {
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 4px;
+  word-break: break-word;
+}
+
+.kanban-card .card-domain {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.kanban-card .card-seams {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 4px;
+}
+
+/* ── Detail Panel ── */
+.detail-panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px;
+  margin-top: 16px;
+}
+
+.detail-panel h3 { color: var(--accent); margin-bottom: 16px; }
+
+.detail-section { margin-bottom: 16px; }
+.detail-section h4 {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-secondary);
+  margin-bottom: 8px;
+}
+
+.detail-props {
+  display: grid;
+  grid-template-columns: 120px 1fr;
+  gap: 4px 12px;
+  font-size: 13px;
+}
+
+.detail-props .prop-key { color: var(--text-secondary); }
+.detail-props .prop-val { color: var(--text); word-break: break-word; }
+
+.detail-list {
+  list-style: none;
+  padding: 0;
+}
+
+.detail-list li {
+  padding: 4px 0;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.detail-list li::before {
+  content: '→ ';
+  color: var(--accent);
+}
+
+/* ── Tree ── */
+.tree-item {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: 8px;
+  background: var(--surface);
+}
+
+.tree-header {
+  padding: 10px 14px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.tree-header:hover { background: rgba(0,229,255,0.03); }
+
+.tree-chevron {
+  transition: transform 0.2s;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.tree-chevron.open { transform: rotate(90deg); }
+
+.tree-children {
+  display: none;
+  padding: 0 14px 12px 32px;
+}
+
+.tree-children.open { display: block; }
+
+.tree-child {
+  padding: 4px 0;
+  font-size: 13px;
+  cursor: pointer;
+  color: var(--text-secondary);
+}
+
+.tree-child:hover { color: var(--accent); }
+
+.tree-child-detail {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-left: 16px;
+}
+
+/* ── Code Blocks ── */
+pre.code-block {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--text);
+  margin: 8px 0;
+}
+
+/* ── Search ── */
+.search-input-wrap {
+  margin-bottom: 20px;
+}
+
+.search-input-wrap input {
+  width: 100%;
+  max-width: 600px;
+  padding: 10px 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 14px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.search-input-wrap input:focus { border-color: var(--accent); }
+.search-input-wrap input::placeholder { color: var(--muted); }
+
+.search-results { margin-top: 12px; }
+
+.search-result {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  margin-bottom: 8px;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+
+.search-result:hover { border-color: var(--accent); }
+
+.search-result .result-name { font-weight: 600; font-size: 14px; }
+.search-result .result-path { font-size: 12px; color: var(--text-secondary); margin-top: 2px; font-family: var(--mono); }
+
+/* ── Activity ── */
+.activity-item {
+  display: grid;
+  grid-template-columns: 140px 80px 1fr 1fr;
+  gap: 12px;
+  padding: 8px 14px;
+  font-size: 13px;
+  border-bottom: 1px solid var(--border);
+}
+
+.activity-item:last-child { border-bottom: none; }
+
+.activity-time { color: var(--text-secondary); font-family: var(--mono); font-size: 12px; }
+.activity-agent { color: var(--accent); font-weight: 500; }
+.activity-action { color: var(--text); }
+.activity-reason { color: var(--text-secondary); font-style: italic; }
+
+/* ── Buttons ── */
+.btn {
+  display: inline-block;
+  padding: 6px 14px;
+  background: rgba(0,229,255,0.1);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.btn:hover { background: rgba(0,229,255,0.2); }
+
+/* ── Responsive ── */
+@media (max-width: 900px) {
+  .sidebar { width: 56px; min-width: 56px; }
+  .sidebar-header h1, .sidebar-header .subtitle, .nav-label { display: none; }
+  .nav-item { justify-content: center; padding: 12px; border-left: none; border-bottom: 2px solid transparent; }
+  .nav-item.active { border-bottom-color: var(--accent); border-left-color: transparent; }
+  .kanban { grid-template-columns: 1fr; }
+  .stats-row { grid-template-columns: repeat(3, 1fr); }
+  .activity-item { grid-template-columns: 1fr; gap: 2px; }
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- Sidebar -->
+  <div class="sidebar">
+    <div class="sidebar-header">
+      <h1>GRAPH INTEL</h1>
+      <div class="subtitle">Philotic Stack</div>
+    </div>
+    <nav>
+      <div class="nav-item active" data-view="dashboard">
+        <span class="nav-icon">◈</span>
+        <span class="nav-label">Dashboard</span>
+      </div>
+      <div class="nav-item" data-view="proposals">
+        <span class="nav-icon">◆</span>
+        <span class="nav-label">Proposals</span>
+      </div>
+      <div class="nav-item" data-view="seams">
+        <span class="nav-icon">⬡</span>
+        <span class="nav-label">Seams</span>
+      </div>
+      <div class="nav-item" data-view="crates">
+        <span class="nav-icon">⧉</span>
+        <span class="nav-label">Crates</span>
+      </div>
+      <div class="nav-item" data-view="search">
+        <span class="nav-icon">⌕</span>
+        <span class="nav-label">Search</span>
+      </div>
+      <div class="nav-item" data-view="timeline">
+        <span class="nav-icon">◷</span>
+        <span class="nav-label">Timeline</span>
+      </div>
+    </nav>
+  </div>
+
+  <!-- Main Content -->
+  <div class="main">
+
+    <!-- Dashboard View -->
+    <div id="view-dashboard" class="view active">
+      <h2>Dashboard</h2>
+      <div id="stats-row" class="stats-row">
+        <div class="loading">Loading stats…</div>
+      </div>
+      <h3>Proposal Pipeline</h3>
+      <div id="pipeline-bar" class="pipeline-bar"></div>
+      <h3>Recent Activity</h3>
+      <div id="activity-feed" class="table-wrap" style="margin-bottom:24px">
+        <div class="loading" style="padding:16px">Loading activity…</div>
+      </div>
+      <h3>Crate Overview</h3>
+      <div id="crate-table" class="table-wrap">
+        <div class="loading" style="padding:16px">Loading crates…</div>
+      </div>
+    </div>
+
+    <!-- Proposals View -->
+    <div id="view-proposals" class="view">
+      <h2>Proposals</h2>
+      <div id="kanban" class="kanban">
+        <div class="loading">Loading proposals…</div>
+      </div>
+      <div id="proposal-detail"></div>
+    </div>
+
+    <!-- Seams View -->
+    <div id="view-seams" class="view">
+      <h2>Seams</h2>
+      <div id="seams-table" class="table-wrap">
+        <div class="loading" style="padding:16px">Loading seams…</div>
+      </div>
+      <div id="seam-detail"></div>
+    </div>
+
+    <!-- Crates View -->
+    <div id="view-crates" class="view">
+      <h2>Crates</h2>
+      <div id="crate-tree">
+        <div class="loading">Loading crates…</div>
+      </div>
+    </div>
+
+    <!-- Search View -->
+    <div id="view-search" class="view">
+      <h2>Search</h2>
+      <div class="search-input-wrap">
+        <input id="search-input" type="text" placeholder="Search nodes, types, functions, snippets…" />
+      </div>
+      <div id="search-results" class="search-results"></div>
+    </div>
+
+    <!-- Timeline View -->
+    <div id="view-timeline" class="view">
+      <h2>Mutation Timeline</h2>
+      <div id="timeline-feed" class="table-wrap">
+        <div class="loading" style="padding:16px">Loading timeline…</div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+// ── API helpers ──
+
+const API = '';
+
+async function api(path) {
+  const res = await fetch(API + path);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(err.error || res.statusText);
+  }
+  const ct = res.headers.get('content-type') || '';
+  if (ct.includes('application/json')) return res.json();
+  return res.text();
+}
+
+function el(tag, attrs, ...children) {
+  const e = document.createElement(tag);
+  if (attrs) for (const [k, v] of Object.entries(attrs)) {
+    if (k === 'className') e.className = v;
+    else if (k === 'onclick') e.addEventListener('click', v);
+    else if (k === 'innerHTML') e.innerHTML = v;
+    else if (k === 'textContent') e.textContent = v;
+    else e.setAttribute(k, v);
+  }
+  for (const c of children) {
+    if (typeof c === 'string') e.appendChild(document.createTextNode(c));
+    else if (c) e.appendChild(c);
+  }
+  return e;
+}
+
+function showError(container, msg) {
+  container.innerHTML = '';
+  container.appendChild(el('div', { className: 'error' }, msg));
+}
+
+function getStatus(props) {
+  if (!props) return 'unknown';
+  const p = typeof props === 'string' ? JSON.parse(props) : props;
+  return (p.status || p.disposition || 'unknown').toLowerCase().replace(/\s+/g, '-');
+}
+
+function getProp(props, key) {
+  if (!props) return '';
+  const p = typeof props === 'string' ? JSON.parse(props) : props;
+  return p[key] || '';
+}
+
+function formatTime(ts) {
+  if (!ts) return '—';
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return ts;
+  return d.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+// ── Navigation ──
+
+const views = ['dashboard', 'proposals', 'seams', 'crates', 'search', 'timeline'];
+let currentView = 'dashboard';
+
+document.querySelectorAll('.nav-item').forEach(item => {
+  item.addEventListener('click', () => {
+    const view = item.dataset.view;
+    switchView(view);
+  });
+});
+
+function switchView(view) {
+  currentView = view;
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.toggle('active', n.dataset.view === view));
+  document.querySelectorAll('.view').forEach(v => v.classList.toggle('active', v.id === 'view-' + view));
+  loadView(view);
+}
+
+const loaded = {};
+function loadView(view) {
+  if (loaded[view]) return;
+  loaded[view] = true;
+  switch (view) {
+    case 'dashboard': loadDashboard(); break;
+    case 'proposals': loadProposals(); break;
+    case 'seams': loadSeams(); break;
+    case 'crates': loadCrates(); break;
+    case 'search': initSearch(); break;
+    case 'timeline': loadTimeline(); break;
+  }
+}
+
+// ── Dashboard ──
+
+async function loadDashboard() {
+  try {
+    const [status, mutations, crates, proposals] = await Promise.all([
+      api('/api/status'),
+      api('/api/mutations?limit=10'),
+      api('/api/nodes?kind=crate'),
+      api('/api/proposals'),
+    ]);
+    renderStats(status);
+    renderPipeline(proposals);
+    renderActivity(mutations);
+    renderCrateTable(crates);
+  } catch (err) {
+    showError(document.getElementById('stats-row'), 'Failed to load dashboard: ' + err.message);
+  }
+}
+
+function renderStats(status) {
+  const c = status.node_counts || {};
+  const cards = [
+    { label: 'Proposals', value: c.proposal || 0 },
+    { label: 'Crates', value: c.crate || 0 },
+    { label: 'Types', value: c.type || 0 },
+    { label: 'Functions', value: c.function || 0 },
+    { label: 'Tests', value: c.test || 0 },
+    { label: 'Snippets', value: status.snippet_count || 0 },
+  ];
+  const row = document.getElementById('stats-row');
+  row.innerHTML = '';
+  cards.forEach(c => {
+    row.appendChild(el('div', { className: 'stat-card' },
+      el('div', { className: 'value', textContent: String(c.value) }),
+      el('div', { className: 'label', textContent: c.label })
+    ));
+  });
+}
+
+function renderPipeline(proposals) {
+  const counts = { proposed: 0, accepted: 0, 'in-progress': 0, implemented: 0, deferred: 0 };
+  proposals.forEach(p => {
+    const s = getStatus(p.properties);
+    if (counts.hasOwnProperty(s)) counts[s]++;
+    else counts.proposed++;
+  });
+  const total = proposals.length || 1;
+  const colors = {
+    proposed: 'var(--accent)',
+    accepted: '#4dd0e1',
+    'in-progress': 'var(--amber)',
+    implemented: 'var(--success)',
+    deferred: 'var(--muted)',
+  };
+  const labels = {
+    proposed: 'Proposed',
+    accepted: 'Accepted',
+    'in-progress': 'In Progress',
+    implemented: 'Implemented',
+    deferred: 'Deferred',
+  };
+  const bar = document.getElementById('pipeline-bar');
+  bar.innerHTML = '';
+  for (const [key, count] of Object.entries(counts)) {
+    if (count === 0) continue;
+    const pct = Math.max((count / total) * 100, 8);
+    const seg = el('div', {
+      className: 'pipeline-segment',
+      title: labels[key] + ': ' + count,
+    }, labels[key] + ' ' + count);
+    seg.style.flex = pct;
+    seg.style.background = colors[key];
+    bar.appendChild(seg);
+  }
+}
+
+function renderActivity(mutations) {
+  const container = document.getElementById('activity-feed');
+  if (!mutations.length) {
+    container.innerHTML = '<div style="padding:16px;color:var(--text-secondary)">No recent activity</div>';
+    return;
+  }
+  container.innerHTML = '';
+  mutations.forEach(m => {
+    container.appendChild(el('div', { className: 'activity-item' },
+      el('span', { className: 'activity-time', textContent: formatTime(m.timestamp) }),
+      el('span', { className: 'activity-agent', textContent: m.agent || '—' }),
+      el('span', { className: 'activity-action', textContent: (m.action || '') + (m.target_node ? ' → ' + m.target_node : '') }),
+      el('span', { className: 'activity-reason', textContent: m.reason || '' })
+    ));
+  });
+}
+
+function renderCrateTable(crates) {
+  const container = document.getElementById('crate-table');
+  container.innerHTML = '';
+  const table = el('table');
+  const thead = el('thead', null, el('tr', null,
+    el('th', { textContent: 'Name' }),
+    el('th', { textContent: 'File Path' }),
+    el('th', { textContent: 'Kind' })
+  ));
+  table.appendChild(thead);
+  const tbody = el('tbody');
+  crates.forEach(c => {
+    tbody.appendChild(el('tr', null,
+      el('td', { textContent: c.name }),
+      el('td', { textContent: c.file_path || '—', style: 'font-family:var(--mono);font-size:12px;color:var(--text-secondary)' }),
+      el('td', null, el('span', { className: 'badge badge-kind', textContent: c.kind }))
+    ));
+  });
+  table.appendChild(tbody);
+  container.appendChild(table);
+}
+
+// ── Proposals (Kanban) ──
+
+let proposalsCache = [];
+
+async function loadProposals() {
+  const container = document.getElementById('kanban');
+  try {
+    proposalsCache = await api('/api/proposals');
+    renderKanban(proposalsCache);
+  } catch (err) {
+    showError(container, 'Failed to load proposals: ' + err.message);
+  }
+}
+
+function renderKanban(proposals) {
+  const columns = {
+    proposed: [],
+    accepted: [],
+    'in-progress': [],
+    implemented: [],
+    deferred: [],
+  };
+  const labels = {
+    proposed: 'Proposed',
+    accepted: 'Accepted',
+    'in-progress': 'In Progress',
+    implemented: 'Implemented',
+    deferred: 'Deferred',
+  };
+  const headerColors = {
+    proposed: 'var(--accent)',
+    accepted: '#4dd0e1',
+    'in-progress': 'var(--amber)',
+    implemented: 'var(--success)',
+    deferred: 'var(--muted)',
+  };
+
+  proposals.forEach(p => {
+    const s = getStatus(p.properties);
+    if (columns[s]) columns[s].push(p);
+    else columns.proposed.push(p);
+  });
+
+  const container = document.getElementById('kanban');
+  container.innerHTML = '';
+  container.className = 'kanban';
+
+  for (const [key, items] of Object.entries(columns)) {
+    const col = el('div', { className: 'kanban-col' });
+    const header = el('div', { className: 'kanban-col-header' });
+    header.style.borderBottom = '2px solid ' + headerColors[key];
+    header.appendChild(el('span', { textContent: labels[key] }));
+    header.appendChild(el('span', { className: 'count', textContent: String(items.length) }));
+    col.appendChild(header);
+
+    const cardsWrap = el('div', { className: 'kanban-cards' });
+    items.forEach(p => {
+      const domain = getProp(p.properties, 'domain') || '';
+      const seams = getProp(p.properties, 'active_seams');
+      const seamCount = Array.isArray(seams) ? seams.length : 0;
+
+      const card = el('div', {
+        className: 'kanban-card',
+        onclick: () => showProposalDetail(p.id),
+      },
+        el('div', { className: 'card-name', textContent: p.name }),
+        domain ? el('div', { className: 'card-domain', textContent: domain }) : null,
+        seamCount > 0 ? el('div', { className: 'card-seams', textContent: seamCount + ' seam' + (seamCount !== 1 ? 's' : '') }) : null
+      );
+      cardsWrap.appendChild(card);
+    });
+    col.appendChild(cardsWrap);
+    container.appendChild(col);
+  }
+}
+
+async function showProposalDetail(id) {
+  const container = document.getElementById('proposal-detail');
+  container.innerHTML = '<div class="loading">Loading proposal detail…</div>';
+  try {
+    const data = await api('/api/nodes/' + encodeURIComponent(id));
+    const node = data;
+    const props = typeof node.properties === 'string' ? JSON.parse(node.properties) : (node.properties || {});
+    const edges = node._edges || { outgoing: [], incoming: [] };
+
+    const panel = el('div', { className: 'detail-panel' });
+    panel.appendChild(el('h3', null, node.name));
+
+    // Properties
+    const propsSection = el('div', { className: 'detail-section' });
+    propsSection.appendChild(el('h4', { textContent: 'Properties' }));
+    const propsGrid = el('div', { className: 'detail-props' });
+    for (const [k, v] of Object.entries(props)) {
+      propsGrid.appendChild(el('span', { className: 'prop-key', textContent: k }));
+      const val = Array.isArray(v) ? v.join(', ') : String(v);
+      propsGrid.appendChild(el('span', { className: 'prop-val', textContent: val }));
+    }
+    propsSection.appendChild(propsGrid);
+    panel.appendChild(propsSection);
+
+    // Related seams (outgoing implements edges)
+    const seamsEdges = edges.outgoing.filter(e => e.relation === 'implements');
+    if (seamsEdges.length > 0) {
+      const seamsSection = el('div', { className: 'detail-section' });
+      seamsSection.appendChild(el('h4', { textContent: 'Seams (' + seamsEdges.length + ')' }));
+      const list = el('ul', { className: 'detail-list' });
+      seamsEdges.forEach(e => list.appendChild(el('li', { textContent: e.target_id })));
+      seamsSection.appendChild(list);
+      panel.appendChild(seamsSection);
+    }
+
+    // Implementing code
+    const implEdges = edges.outgoing.filter(e => e.relation === 'implemented_by');
+    if (implEdges.length > 0) {
+      const implSection = el('div', { className: 'detail-section' });
+      implSection.appendChild(el('h4', { textContent: 'Implementing Code (' + implEdges.length + ')' }));
+      const list = el('ul', { className: 'detail-list' });
+      implEdges.forEach(e => list.appendChild(el('li', { textContent: e.target_id })));
+      implSection.appendChild(list);
+      panel.appendChild(implSection);
+    }
+
+    // Incoming edges
+    if (edges.incoming.length > 0) {
+      const inSection = el('div', { className: 'detail-section' });
+      inSection.appendChild(el('h4', { textContent: 'Incoming Edges (' + edges.incoming.length + ')' }));
+      const list = el('ul', { className: 'detail-list' });
+      edges.incoming.forEach(e => list.appendChild(el('li', { textContent: e.relation + ' ← ' + e.source_id })));
+      inSection.appendChild(list);
+      panel.appendChild(inSection);
+    }
+
+    container.innerHTML = '';
+    container.appendChild(panel);
+  } catch (err) {
+    showError(container, 'Failed to load proposal: ' + err.message);
+  }
+}
+
+// ── Seams ──
+
+async function loadSeams() {
+  const container = document.getElementById('seams-table');
+  try {
+    const seams = await api('/api/seams');
+    container.innerHTML = '';
+    const table = el('table');
+    const thead = el('thead', null, el('tr', null,
+      el('th', { textContent: 'Name' }),
+      el('th', { textContent: 'Status' }),
+      el('th', { textContent: 'Dependencies' })
+    ));
+    table.appendChild(thead);
+    const tbody = el('tbody');
+    seams.forEach(s => {
+      const node = s.node;
+      const status = getStatus(node.properties);
+      const deps = (s.dependencies || []).join(', ') || '—';
+      const row = el('tr', {
+        style: 'cursor:pointer',
+        onclick: () => showSeamDetail(node.id),
+      },
+        el('td', { textContent: node.name }),
+        el('td', null, el('span', { className: 'badge badge-' + status, textContent: status })),
+        el('td', { textContent: deps, style: 'font-size:12px;color:var(--text-secondary)' })
+      );
+      tbody.appendChild(row);
+    });
+    table.appendChild(tbody);
+    container.appendChild(table);
+  } catch (err) {
+    showError(container, 'Failed to load seams: ' + err.message);
+  }
+}
+
+async function showSeamDetail(id) {
+  const container = document.getElementById('seam-detail');
+  container.innerHTML = '<div class="loading">Loading seam detail…</div>';
+  try {
+    const data = await api('/api/nodes/' + encodeURIComponent(id));
+    const props = typeof data.properties === 'string' ? JSON.parse(data.properties) : (data.properties || {});
+    const edges = data._edges || { outgoing: [], incoming: [] };
+
+    const panel = el('div', { className: 'detail-panel' });
+    panel.appendChild(el('h3', null, data.name));
+
+    // Properties
+    const propsSection = el('div', { className: 'detail-section' });
+    propsSection.appendChild(el('h4', { textContent: 'Properties' }));
+    const propsGrid = el('div', { className: 'detail-props' });
+    for (const [k, v] of Object.entries(props)) {
+      propsGrid.appendChild(el('span', { className: 'prop-key', textContent: k }));
+      const val = Array.isArray(v) ? v.join(', ') : String(v);
+      propsGrid.appendChild(el('span', { className: 'prop-val', textContent: val }));
+    }
+    propsSection.appendChild(propsGrid);
+    panel.appendChild(propsSection);
+
+    // Proposal (incoming implements)
+    const proposalEdges = edges.incoming.filter(e => e.relation === 'implements');
+    if (proposalEdges.length > 0) {
+      const sec = el('div', { className: 'detail-section' });
+      sec.appendChild(el('h4', { textContent: 'Belongs to Proposal' }));
+      const list = el('ul', { className: 'detail-list' });
+      proposalEdges.forEach(e => list.appendChild(el('li', { textContent: e.source_id })));
+      sec.appendChild(list);
+      panel.appendChild(sec);
+    }
+
+    // Implementing code (outgoing implemented_by)
+    const implEdges = edges.outgoing.filter(e => e.relation === 'implemented_by');
+    if (implEdges.length > 0) {
+      const sec = el('div', { className: 'detail-section' });
+      sec.appendChild(el('h4', { textContent: 'Implementing Code' }));
+      const list = el('ul', { className: 'detail-list' });
+      implEdges.forEach(e => list.appendChild(el('li', { textContent: e.target_id })));
+      sec.appendChild(list);
+      panel.appendChild(sec);
+    }
+
+    container.innerHTML = '';
+    container.appendChild(panel);
+  } catch (err) {
+    showError(container, 'Failed to load seam detail: ' + err.message);
+  }
+}
+
+// ── Crates (Tree) ──
+
+async function loadCrates() {
+  const container = document.getElementById('crate-tree');
+  try {
+    const crates = await api('/api/nodes?kind=crate');
+    container.innerHTML = '';
+    if (crates.length === 0) {
+      container.innerHTML = '<div style="color:var(--text-secondary)">No crates found. Run a scan first.</div>';
+      return;
+    }
+    crates.forEach(c => {
+      const item = el('div', { className: 'tree-item' });
+
+      const header = el('div', { className: 'tree-header' });
+      const chevron = el('span', { className: 'tree-chevron', textContent: '▶' });
+      header.appendChild(chevron);
+      header.appendChild(el('span', { textContent: c.name }));
+
+      // PlantUML button
+      const pumlBtn = el('button', {
+        className: 'btn',
+        textContent: 'PlantUML',
+        onclick: (ev) => { ev.stopPropagation(); loadPlantUML(c.name, childrenDiv); },
+        style: 'margin-left:auto',
+      });
+      header.appendChild(pumlBtn);
+
+      const childrenDiv = el('div', { className: 'tree-children' });
+
+      let expanded = false;
+      let childrenLoaded = false;
+
+      header.addEventListener('click', async () => {
+        expanded = !expanded;
+        chevron.classList.toggle('open', expanded);
+        childrenDiv.classList.toggle('open', expanded);
+        if (expanded && !childrenLoaded) {
+          childrenLoaded = true;
+          await loadCrateChildren(c.id, c.name, childrenDiv);
+        }
+      });
+
+      item.appendChild(header);
+      item.appendChild(childrenDiv);
+      container.appendChild(item);
+    });
+  } catch (err) {
+    showError(container, 'Failed to load crates: ' + err.message);
+  }
+}
+
+async function loadCrateChildren(crateId, crateName, container) {
+  container.innerHTML = '<div class="loading">Loading modules…</div>';
+  try {
+    const data = await api('/api/nodes/' + encodeURIComponent(crateId));
+    const edges = data._edges || { outgoing: [], incoming: [] };
+    const moduleIds = edges.outgoing.filter(e => e.relation === 'contains').map(e => e.target_id);
+
+    container.innerHTML = '';
+    if (moduleIds.length === 0) {
+      container.appendChild(el('div', { style: 'color:var(--text-secondary);font-size:13px', textContent: 'No modules found' }));
+      return;
+    }
+
+    for (const mid of moduleIds) {
+      try {
+        const mod = await api('/api/nodes/' + encodeURIComponent(mid));
+        const modItem = el('div', { style: 'margin-bottom:4px' });
+
+        const modHeader = el('div', {
+          className: 'tree-child',
+          style: 'font-weight:500;cursor:pointer',
+        });
+        const modChevron = el('span', { className: 'tree-chevron', textContent: '▶', style: 'margin-right:6px;font-size:10px' });
+        modHeader.appendChild(modChevron);
+        modHeader.appendChild(document.createTextNode(mod.name));
+
+        const modChildren = el('div', { style: 'display:none;margin-left:16px' });
+
+        let modExpanded = false;
+        let modLoaded = false;
+
+        modHeader.addEventListener('click', async () => {
+          modExpanded = !modExpanded;
+          modChevron.classList.toggle('open', modExpanded);
+          modChildren.style.display = modExpanded ? 'block' : 'none';
+          if (modExpanded && !modLoaded) {
+            modLoaded = true;
+            await loadModuleChildren(mid, modChildren);
+          }
+        });
+
+        modItem.appendChild(modHeader);
+        modItem.appendChild(modChildren);
+        container.appendChild(modItem);
+      } catch (_) {
+        container.appendChild(el('div', { className: 'tree-child', textContent: mid }));
+      }
+    }
+  } catch (err) {
+    container.innerHTML = '';
+    showError(container, 'Failed to load modules: ' + err.message);
+  }
+}
+
+async function loadModuleChildren(moduleId, container) {
+  container.innerHTML = '<div class="loading" style="font-size:12px">Loading…</div>';
+  try {
+    const data = await api('/api/nodes/' + encodeURIComponent(moduleId));
+    const edges = data._edges || { outgoing: [], incoming: [] };
+    const childIds = edges.outgoing.filter(e => e.relation === 'contains').map(e => e.target_id);
+
+    container.innerHTML = '';
+    if (childIds.length === 0) {
+      container.appendChild(el('div', { style: 'color:var(--text-secondary);font-size:12px', textContent: 'No types or functions' }));
+      return;
+    }
+
+    for (const cid of childIds) {
+      try {
+        const child = await api('/api/nodes/' + encodeURIComponent(cid));
+        const childEl = el('div', {
+          className: 'tree-child',
+          style: 'cursor:pointer',
+          onclick: () => loadSnippetForNode(cid, snippetDiv),
+        });
+        childEl.appendChild(el('span', { className: 'badge badge-kind', textContent: child.kind, style: 'margin-right:6px' }));
+        childEl.appendChild(document.createTextNode(child.name));
+
+        const snippetDiv = el('div');
+        container.appendChild(childEl);
+        container.appendChild(snippetDiv);
+      } catch (_) {
+        container.appendChild(el('div', { className: 'tree-child', textContent: cid }));
+      }
+    }
+  } catch (err) {
+    container.innerHTML = '';
+    showError(container, err.message);
+  }
+}
+
+async function loadSnippetForNode(nodeId, container) {
+  if (container.dataset.loaded) { container.innerHTML = ''; container.dataset.loaded = ''; return; }
+  container.innerHTML = '<div class="loading" style="font-size:12px">Loading snippet…</div>';
+  try {
+    const snippets = await api('/api/snippets/' + encodeURIComponent(nodeId));
+    container.innerHTML = '';
+    container.dataset.loaded = '1';
+    if (snippets.length === 0) {
+      container.appendChild(el('div', { style: 'color:var(--text-secondary);font-size:12px;margin-left:16px', textContent: 'No snippets' }));
+      return;
+    }
+    snippets.forEach(s => {
+      container.appendChild(el('pre', { className: 'code-block', textContent: s.signature }));
+    });
+  } catch (err) {
+    showError(container, err.message);
+  }
+}
+
+async function loadPlantUML(crateName, container) {
+  try {
+    const diagram = await api('/api/skeleton/' + encodeURIComponent(crateName));
+    // Find existing plantuml block or create one
+    let existing = container.querySelector('.plantuml-block');
+    if (existing) { existing.remove(); return; }
+    const block = el('pre', { className: 'code-block plantuml-block', textContent: diagram });
+    container.appendChild(block);
+    container.classList.add('open');
+  } catch (err) {
+    showError(container, 'PlantUML error: ' + err.message);
+  }
+}
+
+// ── Search ──
+
+let searchTimeout;
+
+function initSearch() {
+  const input = document.getElementById('search-input');
+  input.addEventListener('input', () => {
+    clearTimeout(searchTimeout);
+    searchTimeout = setTimeout(() => doSearch(input.value.trim()), 300);
+  });
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { clearTimeout(searchTimeout); doSearch(input.value.trim()); }
+  });
+}
+
+async function doSearch(query) {
+  const container = document.getElementById('search-results');
+  if (!query) { container.innerHTML = ''; return; }
+  container.innerHTML = '<div class="loading">Searching…</div>';
+  try {
+    const data = await api('/api/search?q=' + encodeURIComponent(query));
+    container.innerHTML = '';
+    const nodes = data.nodes || [];
+    const snippets = data.snippets || [];
+
+    if (nodes.length === 0 && snippets.length === 0) {
+      container.innerHTML = '<div style="color:var(--text-secondary)">No results found</div>';
+      return;
+    }
+
+    nodes.forEach(n => {
+      const result = el('div', { className: 'search-result', onclick: () => navigateToNode(n) },
+        el('div', { className: 'result-name' },
+          el('span', { className: 'badge badge-kind', textContent: n.kind, style: 'margin-right:8px' }),
+          document.createTextNode(n.name)
+        ),
+        n.file_path ? el('div', { className: 'result-path', textContent: n.file_path }) : null
+      );
+      container.appendChild(result);
+    });
+
+    if (snippets.length > 0) {
+      container.appendChild(el('h3', { textContent: 'Code Snippets', style: 'margin-top:16px' }));
+      snippets.forEach(s => {
+        const result = el('div', { className: 'search-result' },
+          el('div', { className: 'result-name' },
+            el('span', { className: 'badge badge-kind', textContent: s.kind || 'snippet', style: 'margin-right:8px' }),
+            document.createTextNode(s.signature || s.name || s.id)
+          ),
+          s.file_path ? el('div', { className: 'result-path', textContent: s.file_path + (s.line_start ? ':' + s.line_start : '') }) : null,
+          s.signature ? el('pre', { className: 'code-block', textContent: s.signature }) : null
+        );
+        container.appendChild(result);
+      });
+    }
+  } catch (err) {
+    showError(container, 'Search failed: ' + err.message);
+  }
+}
+
+function navigateToNode(node) {
+  const kind = node.kind;
+  if (kind === 'proposal') {
+    switchView('proposals');
+    loaded.proposals = false;
+    loadProposals().then(() => showProposalDetail(node.id));
+  } else if (kind === 'seam') {
+    switchView('seams');
+    loaded.seams = false;
+    loadSeams().then(() => showSeamDetail(node.id));
+  } else if (kind === 'crate') {
+    switchView('crates');
+  } else {
+    // Show node detail inline
+    showNodeDetail(node);
+  }
+}
+
+async function showNodeDetail(node) {
+  const container = document.getElementById('search-results');
+  try {
+    const data = await api('/api/nodes/' + encodeURIComponent(node.id));
+    const props = typeof data.properties === 'string' ? JSON.parse(data.properties) : (data.properties || {});
+    const edges = data._edges || { outgoing: [], incoming: [] };
+
+    const panel = el('div', { className: 'detail-panel', style: 'margin-top:16px' });
+    panel.appendChild(el('h3', null,
+      el('span', { className: 'badge badge-kind', textContent: data.kind, style: 'margin-right:8px' }),
+      document.createTextNode(data.name)
+    ));
+
+    const propsGrid = el('div', { className: 'detail-props' });
+    if (data.file_path) {
+      propsGrid.appendChild(el('span', { className: 'prop-key', textContent: 'file' }));
+      propsGrid.appendChild(el('span', { className: 'prop-val', textContent: data.file_path, style: 'font-family:var(--mono);font-size:12px' }));
+    }
+    for (const [k, v] of Object.entries(props)) {
+      propsGrid.appendChild(el('span', { className: 'prop-key', textContent: k }));
+      const val = Array.isArray(v) ? v.join(', ') : String(v);
+      propsGrid.appendChild(el('span', { className: 'prop-val', textContent: val }));
+    }
+    panel.appendChild(propsGrid);
+
+    if (edges.outgoing.length > 0) {
+      const sec = el('div', { className: 'detail-section', style: 'margin-top:12px' });
+      sec.appendChild(el('h4', { textContent: 'Outgoing Edges' }));
+      const list = el('ul', { className: 'detail-list' });
+      edges.outgoing.forEach(e => list.appendChild(el('li', { textContent: e.relation + ' → ' + e.target_id })));
+      sec.appendChild(list);
+      panel.appendChild(sec);
+    }
+
+    if (edges.incoming.length > 0) {
+      const sec = el('div', { className: 'detail-section', style: 'margin-top:12px' });
+      sec.appendChild(el('h4', { textContent: 'Incoming Edges' }));
+      const list = el('ul', { className: 'detail-list' });
+      edges.incoming.forEach(e => list.appendChild(el('li', { textContent: e.relation + ' ← ' + e.source_id })));
+      sec.appendChild(list);
+      panel.appendChild(sec);
+    }
+
+    // Try to load snippets
+    try {
+      const snippets = await api('/api/snippets/' + encodeURIComponent(node.id));
+      if (snippets.length > 0) {
+        const sec = el('div', { className: 'detail-section', style: 'margin-top:12px' });
+        sec.appendChild(el('h4', { textContent: 'Snippets' }));
+        snippets.forEach(s => sec.appendChild(el('pre', { className: 'code-block', textContent: s.signature })));
+        panel.appendChild(sec);
+      }
+    } catch (_) {}
+
+    container.appendChild(panel);
+  } catch (err) {
+    showError(container, err.message);
+  }
+}
+
+// ── Timeline ──
+
+async function loadTimeline() {
+  const container = document.getElementById('timeline-feed');
+  try {
+    const mutations = await api('/api/mutations?limit=50');
+    container.innerHTML = '';
+    if (mutations.length === 0) {
+      container.innerHTML = '<div style="padding:16px;color:var(--text-secondary)">No mutations recorded</div>';
+      return;
+    }
+    const table = el('table');
+    const thead = el('thead', null, el('tr', null,
+      el('th', { textContent: 'Time' }),
+      el('th', { textContent: 'Agent' }),
+      el('th', { textContent: 'Action' }),
+      el('th', { textContent: 'Target' }),
+      el('th', { textContent: 'Reason' })
+    ));
+    table.appendChild(thead);
+    const tbody = el('tbody');
+    mutations.forEach(m => {
+      tbody.appendChild(el('tr', null,
+        el('td', { textContent: formatTime(m.timestamp), style: 'font-family:var(--mono);font-size:12px;color:var(--text-secondary);white-space:nowrap' }),
+        el('td', { textContent: m.agent || '—', style: 'color:var(--accent);font-weight:500' }),
+        el('td', { textContent: m.action || '—' }),
+        el('td', { textContent: m.target_node || '—', style: 'font-family:var(--mono);font-size:12px' }),
+        el('td', { textContent: m.reason || '—', style: 'color:var(--text-secondary);font-style:italic' })
+      ));
+    });
+    table.appendChild(tbody);
+    container.appendChild(table);
+  } catch (err) {
+    showError(container, 'Failed to load timeline: ' + err.message);
+  }
+}
+
+// ── Init ──
+loadView('dashboard');
+</script>
+</body>
+</html>
