@@ -85,6 +85,11 @@ The graph now has the first `AbstractSkillRecord` substrate plus seeded entries 
 - `handoff.back`
 - `role.governance`
 
+The graph now also has its first real `WorkflowSkillRecord` seeds for:
+
+- `handoff.to_role`
+- `role.create_or_update`
+
 The lifecycle and validation model for delegation skills is now fully defined in [SKILL_LIFECYCLE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SKILL_LIFECYCLE_PROPOSAL.md). That document owns: the `draft → validated → registered → active → deprecated / invalid / suspended` state machine, the three validation layers, `HookKind`, `IdleBehavior`, `SubagentLeaseTerms`, the updated required `SubagentDelegation` fields, new IPC verbs and responses, the field sourcing map, and the `skill-creator` meta-skill and tool contracts.
 
 `WorkflowSkillRecord` now gains:
@@ -95,7 +100,7 @@ The lifecycle and validation model for delegation skills is now fully defined in
 
 What is still missing:
 
-- a dedicated full `WorkflowSkillRecord` persisted separately from `AbstractSkillRecord` (currently lifecycle fields extend the shared record)
+- runtime invocation of `WorkflowSkillRecord` separately from the low-level tool surfaces it currently points at
 - role metadata inputs for target selection in `handoff.to_role`
 - explicit peer-delegation and external-cognitive-peer variants
 - invocation/runtime enforcement beyond current handoff IPC

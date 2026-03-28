@@ -117,7 +117,7 @@ Seam IDs: `role-incarnation-records`, `active-membrane-routing`, `handoff-skill`
 - [x] Add `RoleIncarnationRecord` and `TurnLoopConfig` to the context graph (`role_incarnation` node kind).
 - [x] Add `upsert_role_incarnation` / `get_role_incarnation` / `list_role_incarnations` to `GraphStorage`.
 - [x] Add `ConfigureRole` IPC action (orchestrator → hotel); hotel enforces orchestrator-only writes for the same agent identity.
-- [x] Define the first rigid orchestrator-only role-governance workflow skill for create/update, including required reasoning about purpose, toolset, skillset, handoff posture, and limits.
+- [x] Define the first rigid orchestrator-owned role creation/update workflow contract, with `role.authoring` narrowed to cognitive payload assembly and `role.create_or_update` seeded as the governed workflow home over the existing `role.configure` execution surface.
 - [x] Seed session bindings from the role's `toolset_profile` when a role incarnation session is initialized.
 - [ ] Define the canonical shared-self role contract:
   - base identity and durable memory remain shared

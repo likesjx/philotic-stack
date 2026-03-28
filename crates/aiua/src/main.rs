@@ -2,7 +2,7 @@ use ansible_mesh_core::beacon::BeaconDaemon;
 use ansible_mesh_core::catalog_rights::{component_right, skill_right, tool_right};
 use ansible_mesh_core::graph::{
     AbstractModelRecord, AbstractRightRecord, AbstractSkillRecord, AbstractToolRecord,
-    ToolsetProfileRecord,
+    ToolsetProfileRecord, WorkflowSkillRecord,
 };
 use ansible_mesh_core::heartbeat::emit_heartbeat;
 use ansible_mesh_core::registry::{CapabilityAdvertisement, ExecutionReachability, NodeRegistry};
@@ -2220,7 +2220,7 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
         },
         AbstractSkillRecord {
             skill_name: "role.authoring".into(),
-            description: "Create or update roles through role.configure using a complete payload. Gather missing role inputs first, always include role_name and reasoning fields, and optionally hand off into the new role once creation succeeds.".into(),
+            description: "Author a complete role lens before governed execution. Gather missing role inputs first, assemble the manifest/purpose/toolset/handoff fields cleanly, and prepare a complete payload for the role.create_or_update workflow instead of treating role mutation as an ad hoc skill call.".into(),
             implied_tools: vec![
                 "session.status".into(),
                 "role.configure".into(),
@@ -2235,7 +2235,9 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                     "reasoning.toolset_rationale",
                     "reasoning.handoff_posture_and_limits"
                 ],
-                "repo_skill_path": "skills/role-authoring/SKILL.md"
+                "repo_skill_path": "skills/role-authoring/SKILL.md",
+                "workflow_handoff": "role.create_or_update",
+                "transitional_note": "role.authoring remains prompt-facing and still implies the low-level role.configure tool as a compatibility bridge until workflow invocation is surfaced directly."
             }),
             skill_markers: vec!["governed".into(), "high_agency".into()],
             ..Default::default()
@@ -2275,6 +2277,79 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
 
     for skill in &catalog {
         graph.upsert_abstract_skill(skill)?;
+    }
+    Ok(())
+}
+
+fn seed_workflow_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
+    let catalog = [
+        WorkflowSkillRecord {
+            workflow_name: "handoff.to_role".into(),
+            workflow_kind: "handoff.to_role".into(),
+            owner_scope: "orchestrator".into(),
+            target_class: "same_identity_role".into(),
+            description: "Governed same-identity role handoff that selects a target role lens, packages context, and transfers session custody without widening authority.".into(),
+            target_selection_policy: serde_json::json!({
+                "inputs": ["target_role.role_name", "target_role.role_manifest", "target_role.toolset_profile"],
+                "selection_mode": "role_lens_first"
+            }),
+            context_requirements: serde_json::json!({
+                "required_fields": ["goal", "context_excerpt", "active_constraints", "relevant_session_facts"],
+                "field_sources": "target role manifest/toolset lens plus current turn state"
+            }),
+            return_contract: serde_json::json!({
+                "modes": ["return_when_complete", "return_on_block", "stay_active_until_manual_return"]
+            }),
+            governance: serde_json::json!({
+                "execution_surface": "handoff.to_role",
+                "approval_mode": "same_identity_low_friction"
+            }),
+            rollout_state: "active".into(),
+        },
+        WorkflowSkillRecord {
+            workflow_name: "role.create_or_update".into(),
+            workflow_kind: "role.configure".into(),
+            owner_scope: "orchestrator".into(),
+            target_class: "same_identity_role_definition".into(),
+            description: "Governed role-definition workflow that validates a role lens, mutates the role incarnation record, updates capability posture, optionally materializes the worker, and may hand off after success.".into(),
+            target_selection_policy: serde_json::json!({
+                "inputs": ["role_name", "toolset_profile", "role_manifest", "reasoning"],
+                "selection_mode": "same_agent_role_record"
+            }),
+            context_requirements: serde_json::json!({
+                "required_fields": [
+                    "role_name",
+                    "toolset_profile",
+                    "reasoning.purpose",
+                    "reasoning.toolset_rationale",
+                    "reasoning.handoff_posture_and_limits"
+                ],
+                "optional_fields": [
+                    "role_identity_addendum",
+                    "role_manifest",
+                    "inactive_ttl_seconds",
+                    "iteration_cap",
+                    "approval_policy",
+                    "model_profile",
+                    "context_window_policy"
+                ],
+                "supporting_skill": "role.authoring"
+            }),
+            return_contract: serde_json::json!({
+                "ack": "ConfigureRoleOk",
+                "post_success_options": ["stay_in_orchestrator", "handoff.to_role"]
+            }),
+            governance: serde_json::json!({
+                "execution_surface": "role.configure",
+                "materialization": "ensure_role_materialized_on_new_or_breaking_change",
+                "transitional_note": "runtime execution still flows through role.configure until workflow invocation becomes first-class"
+            }),
+            rollout_state: "active".into(),
+        },
+    ];
+
+    for workflow in &catalog {
+        graph.upsert_workflow_skill(workflow)?;
     }
     Ok(())
 }
@@ -2413,7 +2488,7 @@ Responsibilities:
 
 Rules:
 - Reason explicitly before creating a role: purpose, toolset, handoff posture, limits.
-- Use the role.authoring skill when preparing a role.configure call so required fields are not omitted.
+- Use the role.authoring skill to assemble the role lens, then execute the role.create_or_update workflow; do not treat role.configure itself as the cognitive plan.
 - role.configure always requires: role_name, toolset_profile, reasoning.purpose, reasoning.toolset_rationale, and reasoning.handoff_posture_and_limits.
 - After role creation succeeds, hand off into the new role only when the operator asked to use it immediately.
 - Do not bypass the approval gate; if a tool requires operator approval, surface it clearly.
@@ -5015,6 +5090,7 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
     seed_abstract_model_catalog(&graph_domain)?;
     seed_abstract_right_catalog(&graph_domain)?;
     seed_abstract_skill_catalog(&graph_domain)?;
+    seed_workflow_skill_catalog(&graph_domain)?;
     seed_toolset_profiles(&graph_domain)?;
     seed_skill_crafting(&graph_domain)?;
 
@@ -5211,6 +5287,7 @@ async fn main() -> Result<()> {
     seed_abstract_model_catalog(&graph_domain_arc)?;
     seed_abstract_right_catalog(&graph_domain_arc)?;
     seed_abstract_skill_catalog(&graph_domain_arc)?;
+    seed_workflow_skill_catalog(&graph_domain_arc)?;
     seed_toolset_profiles(&graph_domain_arc)?;
     seed_skill_crafting(&graph_domain_arc)?;
 
@@ -5657,7 +5734,8 @@ mod tests {
         enable_guest_test_overrides, execution_reachability_for_hotel,
         extract_context_graph_entries, guest_seed_for_profile, guest_supervision_enabled,
         hotel_base_port, hotel_ipc_socket_path, local_capability_advertisements,
-        nearest_available_base_port, resolve_runtime_ports, startup_test_gemini_base_url,
+        nearest_available_base_port, resolve_runtime_ports, seed_abstract_skill_catalog,
+        seed_workflow_skill_catalog, startup_test_gemini_base_url,
     };
     use ansible_mesh_core::domain::GraphDomain;
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
@@ -5813,6 +5891,35 @@ mod tests {
         assert!(
             ads.iter()
                 .all(|ad| ad.selection_hint.as_deref() == Some("local_materialization_required"))
+        );
+    }
+
+    #[test]
+    fn seed_workflow_skill_catalog_projects_role_creation_as_workflow() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite graph");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+
+        seed_abstract_skill_catalog(&graph).expect("seed abstract skills");
+        seed_workflow_skill_catalog(&graph).expect("seed workflow skills");
+
+        let authoring = graph
+            .get_abstract_skill("role.authoring")
+            .expect("read abstract skill")
+            .expect("role.authoring skill");
+        assert_eq!(
+            authoring.field_sources["workflow_handoff"],
+            serde_json::json!("role.create_or_update")
+        );
+
+        let workflow = graph
+            .get_workflow_skill("role.create_or_update")
+            .expect("read workflow skill")
+            .expect("role create workflow");
+        assert_eq!(workflow.workflow_kind, "role.configure");
+        assert_eq!(workflow.owner_scope, "orchestrator");
+        assert_eq!(
+            workflow.governance["execution_surface"],
+            serde_json::json!("role.configure")
         );
     }
 

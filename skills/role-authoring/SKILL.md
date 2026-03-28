@@ -1,17 +1,17 @@
 ---
 name: role-authoring
-description: Use this skill when creating or updating agent roles through role.configure. It gathers the missing role definition inputs, explains the required payload shape, and optionally hands off to the new role after creation.
+description: Use this skill when authoring or revising an agent role lens before governed execution. It gathers the missing role definition inputs, explains the required payload shape, and prepares the payload for the role.create_or_update workflow.
 ---
 
 # Role Authoring
 
-Use this skill when an orchestrator agent needs to create or update a role with `role.configure`.
+Use this skill when an orchestrator agent needs to author or revise a role lens before running the governed `role.create_or_update` workflow.
 
 ## Purpose
 
-`role.configure` is a low-level tool. This skill supplies the procedure and required payload shape so the agent does not guess and omit required fields.
+`role.configure` is a low-level mutation tool. This skill supplies the authoring procedure and required payload shape so the agent does not guess and omit required fields before the workflow executes that mutation.
 
-## Required role.configure shape
+## Required role.create_or_update payload shape
 
 Always provide:
 
@@ -42,14 +42,14 @@ Provide when available or needed:
    - rules / manifest
    - handoff posture
    - limits
-3. Normalize the request into a complete `role.configure` payload.
-4. Call `role.configure`.
+3. Normalize the request into a complete `role.create_or_update` payload.
+4. Execute the governed `role.create_or_update` workflow, which currently runs through `role.configure` as a transitional execution surface.
 5. Summarize what was created or changed.
 6. If the user asked to use the new role immediately, hand off with `handoff.to_role`.
 
 ## Guardrails
 
-- Do not call `role.configure` without `role_name`.
+- Do not execute the workflow without `role_name`.
 - Do not create admin roles unless the operator explicitly requests admin authority.
 - Prefer updating an existing role when the request is clearly a refinement.
 - If the role purpose or toolset is ambiguous, ask the smallest question needed before calling the tool.

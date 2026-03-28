@@ -1582,6 +1582,31 @@ mod tests {
         assert_eq!(loaded.allowed_tools, vec!["bash.exec"]);
     }
 
+    #[test]
+    fn workflow_skill_roundtrip() {
+        let d = make_domain();
+        let wf = WorkflowSkillRecord {
+            workflow_name: "role.create_or_update".to_string(),
+            workflow_kind: "role.configure".to_string(),
+            owner_scope: "orchestrator".to_string(),
+            target_class: "same_identity_role_definition".to_string(),
+            description: "Governed role creation workflow.".to_string(),
+            target_selection_policy: serde_json::json!({"selection_mode": "same_agent_role_record"}),
+            context_requirements: serde_json::json!({"required_fields": ["role_name", "toolset_profile"]}),
+            return_contract: serde_json::json!({"ack": "ConfigureRoleOk"}),
+            governance: serde_json::json!({"execution_surface": "role.configure"}),
+            rollout_state: "active".to_string(),
+        };
+        d.upsert_workflow_skill(&wf).unwrap();
+        let loaded = d
+            .get_workflow_skill("role.create_or_update")
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.workflow_kind, "role.configure");
+        assert_eq!(loaded.owner_scope, "orchestrator");
+        assert_eq!(d.list_workflow_skills().unwrap().len(), 1);
+    }
+
     // ── Config, vault registry, muninn endpoint ───────────────────────────────
 
     #[test]
