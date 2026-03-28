@@ -34,7 +34,7 @@ async fn main() -> Result<()> {
         .filter(|value| !value.is_empty());
 
     let identity = GuestIdentity {
-        guest_id,
+        guest_id: guest_id.clone(),
         role: "agent".into(),
         supported_tools: Vec::new(),
     };
@@ -45,6 +45,6 @@ async fn main() -> Result<()> {
             .send_request(philotic_client::IpcRequest::SubscribeInbox { role })
             .await?;
     }
-    let mut runtime = AgentRuntime::new(ipc_client, agent_id);
+    let mut runtime = AgentRuntime::new(ipc_client, agent_id, guest_id);
     runtime.run().await
 }

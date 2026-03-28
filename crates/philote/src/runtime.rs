@@ -8,11 +8,11 @@ use crate::protocol::{
 };
 use crate::session::{
     ActivePlan, AgentProfile, ApprovalInterruptDisposition, ComponentRouteAssembly,
-    MediaRoutingPolicy, RecalledMemoryRecord, RoutingPreferenceBinding, SessionBindings,
-    SessionState, TargetRoleLens, ToolExecutionRoute, TtsMode, TurnCapabilityCompositionKind,
-    TurnContextEnvelopeKind, TurnRoutedCapabilityProfile, TurnRoutedCapabilitySpecies,
-    TurnRoutingPlan, TurnRoutingStageKind, TurnRoutingStagePlan, VoiceResponsePolicy, WorkingTurn,
-    merge_session_index, turn_routed_capability_profile,
+    MediaRoutingPolicy, RecalledMemoryRecord, RoleActivation, RoutingPreferenceBinding,
+    SessionBindings, SessionState, TargetRoleLens, ToolExecutionRoute, TtsMode,
+    TurnCapabilityCompositionKind, TurnContextEnvelopeKind, TurnRoutedCapabilityProfile,
+    TurnRoutedCapabilitySpecies, TurnRoutingPlan, TurnRoutingStageKind, TurnRoutingStagePlan,
+    VoiceResponsePolicy, WorkingTurn, merge_session_index, turn_routed_capability_profile,
 };
 use anyhow::Result;
 use media_prep::{extract_audio_artifact_json, parse_audio_artifact_json};
@@ -1057,6 +1057,34 @@ fn format_role_command_reply(command: &SlashCommand, became_active: bool) -> Str
 const ROLE_HANDOFF_MAX_ATTEMPTS: usize = 8;
 const DEFAULT_ROLE_HANDOFF_RETRY_MS: u64 = 250;
 
+fn is_specific_same_self_role_governance(tool_call: &ToolCall) -> bool {
+    matches!(
+        tool_call.tool_name.as_str(),
+        "role.configure" | "role.create_or_update"
+    ) && !tool_call
+        .arguments
+        .get("is_admin")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        && tool_call
+            .arguments
+            .get("role_name")
+            .and_then(|v| v.as_str())
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+        && tool_call
+            .arguments
+            .get("toolset_profile")
+            .and_then(|v| v.as_str())
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+        && tool_call
+            .arguments
+            .get("reasoning")
+            .and_then(|v| v.as_object())
+            .is_some()
+}
+
 fn command_bypasses_turn_start(command: &SlashCommand) -> bool {
     matches!(
         command,
@@ -1114,6 +1142,7 @@ struct CachedRoleConfig {
 pub struct AgentRuntime {
     ipc_client: PhiloticClient,
     agent_id: String,
+    guest_id: String,
     sessions: HashMap<String, SessionState>,
     /// MuninnDB config fetched from hotel at startup. None = NullMemoryEngine.
     muninn_config: Option<MuninnConfig>,
@@ -1126,10 +1155,15 @@ pub struct AgentRuntime {
 }
 
 impl AgentRuntime {
-    pub fn new(ipc_client: PhiloticClient, agent_id: impl Into<String>) -> Self {
+    pub fn new(
+        ipc_client: PhiloticClient,
+        agent_id: impl Into<String>,
+        guest_id: impl Into<String>,
+    ) -> Self {
         Self {
             ipc_client,
             agent_id: agent_id.into(),
+            guest_id: guest_id.into(),
             sessions: HashMap::new(),
             muninn_config: None,
             configured_roles: HashMap::new(),
@@ -2431,7 +2465,10 @@ impl AgentRuntime {
             // synthesize an ApprovalRequest before executing. This runs independently of
             // whether the model itself requested approval — it is the agent's safety gate.
             // Skipped when bypass_approval is true (i.e. we are resuming after a resolution).
-            let force_approval = if bypass_approval {
+            let is_specific_same_self_role_governance =
+                !bypass_approval && is_specific_same_self_role_governance(&tool_call);
+
+            let force_approval = if bypass_approval || is_specific_same_self_role_governance {
                 false
             } else {
                 self.sessions
@@ -4687,10 +4724,11 @@ impl AgentRuntime {
             let state = self.sessions.entry(session_id.clone()).or_insert_with(|| {
                 SessionState::new(session_id.clone(), self.agent_id.clone(), "handoff".into())
             });
+            state.active_incarnation_id = Some(self.guest_id.clone());
 
             let activation = crate::session::RoleActivation {
                 role_name: to_role.clone(),
-                active_incarnation_id: None,
+                active_incarnation_id: Some(self.guest_id.clone()),
                 activation_reason: bundle
                     .handoff_reason
                     .clone()
@@ -7884,6 +7922,13 @@ impl AgentRuntime {
         let new_shared_model_markers = bindings
             .get("shared_model_markers")
             .and_then(|v| serde_json::from_value::<Vec<serde_json::Value>>(v.clone()).ok());
+        let new_active_incarnation_id = snapshot
+            .get("active_incarnation_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let new_role_activation = snapshot
+            .get("role_activation")
+            .and_then(|v| serde_json::from_value::<RoleActivation>(v.clone()).ok());
         let new_component_routes = snapshot
             .get("component_route_assembly")
             .cloned()
@@ -7943,6 +7988,14 @@ impl AgentRuntime {
                 state.bindings.shared_model_markers = shared_model_markers;
                 changed = true;
             }
+        }
+        if new_active_incarnation_id != state.active_incarnation_id {
+            state.active_incarnation_id = new_active_incarnation_id;
+            changed = true;
+        }
+        if new_role_activation != state.role_activation {
+            state.role_activation = new_role_activation;
+            changed = true;
         }
         if let Some(component_routes) = new_component_routes {
             if component_routes != state.component_route_assembly {
@@ -8163,9 +8216,9 @@ mod tests {
     use super::{
         AgentRuntime, DEFAULT_TEXT_MODEL_ROLE, DEFAULT_VOICE_MODEL_ROLE, LOCAL_NODE, MediaRouting,
         compile_turn_routing_plan, extract_model_error, extract_model_error_payload,
-        format_role_command_reply, format_roles_report, media_analysis_attachments,
-        normalized_user_content, parse_memory_candidate, resolve_media_routing,
-        resolve_model_execution_target, should_attempt_provider_repair,
+        format_role_command_reply, format_roles_report, is_specific_same_self_role_governance,
+        media_analysis_attachments, normalized_user_content, parse_memory_candidate,
+        resolve_media_routing, resolve_model_execution_target, should_attempt_provider_repair,
     };
     use crate::commands::SlashCommand;
     use crate::r#loop::{ApprovalRequest, ToolCall, TurnPhase};
@@ -8174,8 +8227,9 @@ mod tests {
     };
     use crate::session::{
         ApprovalPolicy, ComponentExecutionRoute, ComponentRouteAssembly, ComponentRouteBinding,
-        SessionState, TtsMode, TurnCapabilityCompositionKind, TurnRoutedCapabilitySpecies,
-        TurnRoutingStageKind, VoiceResponsePolicy, WorkingTurn, turn_routed_capability_profile,
+        RoleActivation, SessionState, TtsMode, TurnCapabilityCompositionKind,
+        TurnRoutedCapabilitySpecies, TurnRoutingStageKind, VoiceResponsePolicy, WorkingTurn,
+        turn_routed_capability_profile,
     };
     use philotic_client::TaskErrorPayload;
     use uuid::Uuid;
@@ -9426,6 +9480,50 @@ mod tests {
     }
 
     #[test]
+    fn merge_snapshot_bindings_updates_active_role_state_from_snapshot() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.active_incarnation_id = Some("agent-jane:orchestrator".into());
+        state.role_activation = Some(RoleActivation {
+            role_name: "orchestrator".into(),
+            active_incarnation_id: Some("agent-jane:orchestrator".into()),
+            activation_reason: "default_identity_posture".into(),
+            ..Default::default()
+        });
+
+        let snapshot = serde_json::json!({
+            "active_incarnation_id": "agent-jane:systems-architect",
+            "role_activation": {
+                "role_name": "systems-architect",
+                "active_incarnation_id": "agent-jane:systems-architect",
+                "activation_reason": "session_active_incarnation"
+            },
+            "bindings": {}
+        });
+
+        AgentRuntime::merge_snapshot_bindings(&mut state, &snapshot);
+
+        assert_eq!(
+            state.active_incarnation_id.as_deref(),
+            Some("agent-jane:systems-architect")
+        );
+        assert_eq!(
+            state
+                .role_activation
+                .as_ref()
+                .map(|role| role.role_name.as_str()),
+            Some("systems-architect")
+        );
+        assert_eq!(
+            state
+                .role_activation
+                .as_ref()
+                .and_then(|role| role.active_incarnation_id.as_deref()),
+            Some("agent-jane:systems-architect")
+        );
+    }
+
+    #[test]
     fn turn_routed_capability_taxonomy_marks_native_live_species_as_collapsible() {
         let response_generate =
             turn_routed_capability_profile("response.generate").expect("profile");
@@ -9491,6 +9589,43 @@ mod tests {
             format_role_command_reply(&SlashCommand::Back, false),
             "Switching back to orchestrator once it finishes materializing."
         );
+    }
+
+    #[test]
+    fn explicit_same_self_role_governance_counts_as_specificity_not_pending_approval() {
+        let tool_call = ToolCall {
+            tool_name: "role.create_or_update".into(),
+            arguments: serde_json::json!({
+                "role_name": "virtuosa",
+                "toolset_profile": "voice",
+                "reasoning": {
+                    "purpose": "specialize in performance and voice delivery",
+                    "toolset_rationale": "voice tools and performance posture",
+                    "handoff_posture_and_limits": "same-self voice specialization only"
+                }
+            }),
+        };
+
+        assert!(is_specific_same_self_role_governance(&tool_call));
+    }
+
+    #[test]
+    fn admin_role_governance_still_requires_live_operator_gate() {
+        let tool_call = ToolCall {
+            tool_name: "role.create_or_update".into(),
+            arguments: serde_json::json!({
+                "role_name": "root-operator",
+                "toolset_profile": "admin",
+                "is_admin": true,
+                "reasoning": {
+                    "purpose": "admin mutation",
+                    "toolset_rationale": "admin tooling",
+                    "handoff_posture_and_limits": "sensitive"
+                }
+            }),
+        };
+
+        assert!(!is_specific_same_self_role_governance(&tool_call));
     }
 
     #[test]
