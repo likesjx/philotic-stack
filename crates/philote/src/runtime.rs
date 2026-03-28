@@ -86,6 +86,42 @@ fn parse_learned_reflex_writeback(
     }))
 }
 
+fn infer_role_handoff_trigger_class(role_name: &str) -> Option<&'static str> {
+    let normalized = role_name.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+    if normalized.contains("dev") || normalized.contains("code") || normalized.contains("implement")
+    {
+        return Some("implementation");
+    }
+    if normalized.contains("research") || normalized.contains("investigat") {
+        return Some("research");
+    }
+    if normalized.contains("anal") || normalized.contains("review") || normalized.contains("audit")
+    {
+        return Some("analysis");
+    }
+    None
+}
+
+fn build_same_self_role_handoff_reflex(role_name: &str) -> Option<LearnedReflexWriteback> {
+    let trigger_class = infer_role_handoff_trigger_class(role_name)?;
+    let role_name = role_name.trim();
+    Some(LearnedReflexWriteback {
+        preference_key: format!("same-self-role-handoff:{role_name}"),
+        precedence: 70,
+        reflexes_json: serde_json::json!({
+            "role_handoff_reflex": {
+                "target_role": role_name,
+                "trigger_class": trigger_class,
+                "source": "successful_same_self_handoff",
+                "tool_name": "handoff.to_role",
+            }
+        }),
+    })
+}
+
 #[cfg(test)]
 const LOCAL_NODE: &str = "local-aiua-01";
 
@@ -6603,6 +6639,7 @@ impl AgentRuntime {
                     ..Default::default()
                 };
 
+                let handoff_reflex = build_same_self_role_handoff_reflex(&role_name);
                 let (content, tool_err) = match self
                     .request_role_handoff_with_backoff(
                         payload.session_id.clone(),
@@ -6613,10 +6650,38 @@ impl AgentRuntime {
                 {
                     Ok(IpcResponse::HandoffAck {
                         handoff_guest_id, ..
-                    }) => (
-                        format!("Handed off to role '{role_name}' (guest {handoff_guest_id})."),
-                        None,
-                    ),
+                    }) => {
+                        if let Some(reflex) = handoff_reflex.as_ref() {
+                            let config_json = serde_json::json!({
+                                "reason": format!("remembered successful same-self handoff to role '{role_name}'"),
+                                "role_name": role_name,
+                                "trigger_class": infer_role_handoff_trigger_class(&role_name),
+                                "source_tool": "handoff.to_role",
+                                "source_turn": payload.turn_id,
+                            });
+                            if let Err(err) = self
+                                .ipc_client
+                                .send_request(IpcRequest::UpsertAgentReflexPreference {
+                                    agent_id: self.agent_id.clone(),
+                                    preference_key: reflex.preference_key.clone(),
+                                    precedence: reflex.precedence,
+                                    reflexes_json: reflex.reflexes_json.clone(),
+                                    config_json,
+                                })
+                                .await
+                            {
+                                warn!(
+                                    role_name = %role_name,
+                                    error = %err,
+                                    "Failed to remember successful same-self role handoff reflex"
+                                );
+                            }
+                        }
+                        (
+                            format!("Handed off to role '{role_name}' (guest {handoff_guest_id})."),
+                            None,
+                        )
+                    }
                     Ok(IpcResponse::HandoffPending { .. }) => (
                         format!("Switching to role '{role_name}' once it finishes materializing."),
                         None,
@@ -7737,6 +7802,9 @@ impl AgentRuntime {
             .get("routing_preferences")
             .and_then(|v| serde_json::from_value::<Vec<RoutingPreferenceBinding>>(v.clone()).ok());
         let new_effective_reflexes = bindings.get("effective_reflexes").cloned();
+        let new_reflex_policy_agent_layers = bindings
+            .get("reflex_policy_agent_layers")
+            .and_then(|v| serde_json::from_value::<Vec<serde_json::Value>>(v.clone()).ok());
         let new_reflex_policy_agent_rewards = bindings
             .get("reflex_policy_agent_rewards")
             .and_then(|v| serde_json::from_value::<Vec<serde_json::Value>>(v.clone()).ok());
@@ -7779,6 +7847,12 @@ impl AgentRuntime {
         if let Some(effective_reflexes) = new_effective_reflexes {
             if effective_reflexes != state.bindings.effective_reflexes {
                 state.bindings.effective_reflexes = effective_reflexes;
+                changed = true;
+            }
+        }
+        if let Some(layers) = new_reflex_policy_agent_layers {
+            if layers != state.bindings.reflex_policy_agent_layers {
+                state.bindings.reflex_policy_agent_layers = layers;
                 changed = true;
             }
         }
@@ -8398,6 +8472,59 @@ mod tests {
         .expect_err("parse should fail");
 
         assert!(err.contains("learned_reflex.reflexes must be an object"));
+    }
+
+    #[test]
+    fn build_same_self_role_handoff_reflex_for_developer_role() {
+        let reflex =
+            super::build_same_self_role_handoff_reflex("developer").expect("reflex should exist");
+
+        assert_eq!(reflex.preference_key, "same-self-role-handoff:developer");
+        assert_eq!(reflex.precedence, 70);
+        assert_eq!(
+            reflex.reflexes_json["role_handoff_reflex"]["target_role"],
+            serde_json::json!("developer")
+        );
+        assert_eq!(
+            reflex.reflexes_json["role_handoff_reflex"]["trigger_class"],
+            serde_json::json!("implementation")
+        );
+    }
+
+    #[test]
+    fn merge_snapshot_bindings_updates_agent_reflex_layers() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        let snapshot = serde_json::json!({
+            "bindings": {
+                "reflex_policy_agent_layers": [{
+                    "policy_scope": "agent_learned",
+                    "policy_source": "agent_graph",
+                    "origin_class": "agent_learned",
+                    "precedence": 70,
+                    "preference_key": "same-self-role-handoff:developer",
+                    "config": {
+                        "reason": "remembered successful same-self handoff to developer",
+                        "role_name": "developer",
+                        "trigger_class": "implementation"
+                    },
+                    "reflexes": {
+                        "role_handoff_reflex": {
+                            "target_role": "developer",
+                            "trigger_class": "implementation"
+                        }
+                    }
+                }]
+            }
+        });
+
+        AgentRuntime::merge_snapshot_bindings(&mut state, &snapshot);
+
+        assert_eq!(state.bindings.reflex_policy_agent_layers.len(), 1);
+        assert_eq!(
+            state.bindings.reflex_policy_agent_layers[0]["preference_key"],
+            serde_json::json!("same-self-role-handoff:developer")
+        );
     }
 
     #[test]

@@ -834,6 +834,8 @@ pub struct SessionBindings {
     #[serde(default)]
     pub effective_reflexes: serde_json::Value,
     #[serde(default)]
+    pub reflex_policy_agent_layers: Vec<serde_json::Value>,
+    #[serde(default)]
     pub reflex_policy_agent_rewards: Vec<serde_json::Value>,
     #[serde(default)]
     pub reflex_policy_agent_suppressions: Vec<serde_json::Value>,
@@ -841,6 +843,13 @@ pub struct SessionBindings {
     pub shared_model_markers: Vec<serde_json::Value>,
     #[serde(default)]
     pub allowed_tool_runner_incarnations: Vec<ToolRunnerIncarnationBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RememberedRoleHandoffReflex {
+    target_role: String,
+    trigger_class: String,
+    preference_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -2116,6 +2125,17 @@ impl SessionState {
             }
         }
 
+        if self.remembered_role_handoff_target(&normalized).is_some() {
+            let projected = all_tools
+                .iter()
+                .filter(|tool| tool.tool_name == "handoff.to_role")
+                .cloned()
+                .collect::<Vec<_>>();
+            if !projected.is_empty() {
+                return projected;
+            }
+        }
+
         if looks_like_conversational_goal(&normalized) {
             return Vec::new();
         }
@@ -2145,6 +2165,46 @@ impl SessionState {
             TurnContextEnvelopeKind::Cognitive => self.project_tools_for_turn(user_content),
             TurnContextEnvelopeKind::Ingress | TurnContextEnvelopeKind::Egress => Vec::new(),
         }
+    }
+
+    fn remembered_role_handoff_reflexes(&self) -> Vec<RememberedRoleHandoffReflex> {
+        self.bindings
+            .reflex_policy_agent_layers
+            .iter()
+            .filter_map(|layer| {
+                let reflex = layer.get("reflexes")?.get("role_handoff_reflex")?;
+                let target_role = reflex.get("target_role")?.as_str()?.trim();
+                let trigger_class = reflex.get("trigger_class")?.as_str()?.trim();
+                if target_role.is_empty() || trigger_class.is_empty() {
+                    return None;
+                }
+                Some(RememberedRoleHandoffReflex {
+                    target_role: target_role.to_string(),
+                    trigger_class: trigger_class.to_string(),
+                    preference_key: layer
+                        .get("preference_key")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                })
+            })
+            .collect()
+    }
+
+    fn remembered_role_handoff_target(&self, normalized: &str) -> Option<String> {
+        self.remembered_role_handoff_reflexes()
+            .into_iter()
+            .find(|reflex| {
+                if self
+                    .role_activation
+                    .as_ref()
+                    .map(|role| role.role_name.eq_ignore_ascii_case(&reflex.target_role))
+                    .unwrap_or(false)
+                {
+                    return false;
+                }
+                trigger_class_matches_goal(&reflex.trigger_class, normalized)
+            })
+            .map(|reflex| reflex.target_role)
     }
 
     pub fn cognitive_response_contract(
@@ -2639,6 +2699,25 @@ impl SessionState {
             lines.push(format!(
                 "\n[Skill guidance]\n{}",
                 self.bindings.effective_skill_guidance.join("\n\n")
+            ));
+        }
+
+        let remembered_role_reflexes = self.remembered_role_handoff_reflexes();
+        if Self::should_project_skill_affordances(user_content, envelope_kind)
+            && !remembered_role_reflexes.is_empty()
+        {
+            let descriptions = remembered_role_reflexes
+                .into_iter()
+                .map(|reflex| {
+                    format!(
+                        "{}-shaped work often hands off to role '{}'",
+                        reflex.trigger_class, reflex.target_role
+                    )
+                })
+                .collect::<Vec<_>>();
+            lines.push(format!(
+                "Remembered role-shift reflexes: {}.",
+                descriptions.join("; ")
             ));
         }
 
@@ -3549,6 +3628,38 @@ fn looks_like_conversational_goal(normalized: &str) -> bool {
 
 fn is_role_reflex_tool(tool_name: &str) -> bool {
     matches!(tool_name, "handoff.to_role" | "handoff.back")
+}
+
+fn trigger_class_matches_goal(trigger_class: &str, normalized: &str) -> bool {
+    match trigger_class {
+        "implementation" => [
+            "implement",
+            "implementation",
+            "code",
+            "patch",
+            "fix",
+            "refactor",
+            "wire",
+            "build",
+            "debug",
+        ]
+        .iter()
+        .any(|needle| normalized.contains(needle)),
+        "research" => [
+            "research",
+            "investigate",
+            "look into",
+            "explore",
+            "compare",
+            "survey",
+        ]
+        .iter()
+        .any(|needle| normalized.contains(needle)),
+        "analysis" => ["analy", "assess", "inspect", "review", "evaluate", "audit"]
+            .iter()
+            .any(|needle| normalized.contains(needle)),
+        _ => false,
+    }
 }
 
 fn looks_like_role_handoff_goal(normalized: &str) -> bool {
@@ -4560,6 +4671,7 @@ mod tests {
                 preferred_environment_id: None,
                 routing_preferences: Vec::new(),
                 effective_reflexes: serde_json::Value::Null,
+                reflex_policy_agent_layers: Vec::new(),
                 reflex_policy_agent_rewards: Vec::new(),
                 reflex_policy_agent_suppressions: Vec::new(),
                 shared_model_markers: Vec::new(),
@@ -5037,6 +5149,7 @@ mod tests {
             preferred_environment_id: None,
             routing_preferences: Vec::new(),
             effective_reflexes: serde_json::Value::Null,
+            reflex_policy_agent_layers: Vec::new(),
             reflex_policy_agent_rewards: Vec::new(),
             reflex_policy_agent_suppressions: Vec::new(),
             shared_model_markers: Vec::new(),
@@ -5820,6 +5933,69 @@ mod tests {
 
         assert_eq!(projected.len(), 1);
         assert_eq!(projected[0].tool_name, "handoff.back");
+    }
+
+    #[test]
+    fn remembered_role_handoff_reflex_projects_handoff_to_role_for_matching_work() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("handoff.to_role");
+        state.bindings.reflex_policy_agent_layers = vec![serde_json::json!({
+            "policy_scope": "agent_learned",
+            "policy_source": "agent_graph",
+            "origin_class": "agent_learned",
+            "precedence": 70,
+            "preference_key": "same-self-role-handoff:developer",
+            "config": {
+                "reason": "remembered successful same-self handoff to developer",
+                "role_name": "developer",
+                "trigger_class": "implementation"
+            },
+            "reflexes": {
+                "role_handoff_reflex": {
+                    "target_role": "developer",
+                    "trigger_class": "implementation"
+                }
+            }
+        })];
+
+        let projected =
+            state.project_tools_for_turn("Please implement the patch and wire the fix.");
+
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].tool_name, "handoff.to_role");
+    }
+
+    #[test]
+    fn remembered_role_handoff_reflex_is_rendered_in_prompt() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.bindings.reflex_policy_agent_layers = vec![serde_json::json!({
+            "policy_scope": "agent_learned",
+            "policy_source": "agent_graph",
+            "origin_class": "agent_learned",
+            "precedence": 70,
+            "preference_key": "same-self-role-handoff:developer",
+            "config": {
+                "reason": "remembered successful same-self handoff to developer",
+                "role_name": "developer",
+                "trigger_class": "implementation"
+            },
+            "reflexes": {
+                "role_handoff_reflex": {
+                    "target_role": "developer",
+                    "trigger_class": "implementation"
+                }
+            }
+        })];
+
+        let prompt = state.project_agent_self_for_envelope(
+            "Please implement the patch and wire the fix.",
+            TurnContextEnvelopeKind::Cognitive,
+        );
+
+        assert!(prompt.contains("Remembered role-shift reflexes: implementation-shaped work often hands off to role 'developer'."));
     }
 
     #[test]

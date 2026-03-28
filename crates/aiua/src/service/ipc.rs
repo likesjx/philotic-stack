@@ -301,6 +301,7 @@ fn load_agent_graph_reflex_preferences(
                     "precedence": precedence,
                     "reason": preference.config_json.get("reason").cloned().unwrap_or(serde_json::Value::Null),
                     "preference_key": preference.preference_key,
+                    "config": preference.config_json,
                     "regulatory_system": if precedence > preference.precedence { "reward" } else { "baseline" },
                     "reflexes": preference.reflexes_json,
         }));
@@ -15176,6 +15177,10 @@ mod tests {
                 assert_eq!(
                     snapshot["bindings"]["effective_reflex_policy"]["layers"][2]["origin_class"],
                     "agent_learned"
+                );
+                assert_eq!(
+                    snapshot["bindings"]["reflex_policy_agent_layers"][0]["config"]["reason"],
+                    "learned trust from prior approved sessions"
                 );
                 assert_eq!(
                     snapshot["bindings"]["effective_reflexes"]["remote_tool_reflex"],
