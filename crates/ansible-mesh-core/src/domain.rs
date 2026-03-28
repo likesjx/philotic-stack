@@ -16,8 +16,8 @@
 use crate::cron::CronJob;
 use crate::graph::{
     AbstractModelRecord, AbstractRightRecord, AbstractSkillRecord, AbstractToolRecord, GraphNode,
-    RoleIncarnationRecord, RoutingPolicyEvaluationRecord, RoutingPolicyRecord, RuleRecord,
-    ToolsetProfileRecord, WorkflowSkillRecord,
+    RoleIncarnationRecord, RoleReadinessState, RoutingPolicyEvaluationRecord, RoutingPolicyRecord,
+    RuleRecord, ToolsetProfileRecord, WorkflowSkillRecord,
 };
 use crate::storage::{
     AgentIdentityRecord, GraphAdapter, GraphRunnerInstanceRecord, GuestRecord, HotelRecord,
@@ -737,6 +737,38 @@ impl GraphDomain {
             }
         }
         Ok(out)
+    }
+
+    pub fn list_role_incarnations_by_routing_role(
+        &self,
+        routing_role: &str,
+    ) -> Result<Vec<RoleIncarnationRecord>> {
+        let mut out = Vec::new();
+        for node in self
+            .adapter
+            .list_nodes_by_kind(NODE_KIND_ROLE_INCARNATION)?
+        {
+            let record: RoleIncarnationRecord = serde_json::from_value(node.data).context(
+                "GraphDomain::list_role_incarnations_by_routing_role: deserialize RoleIncarnationRecord",
+            )?;
+            if record.routing_role() == routing_role {
+                out.push(record);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn set_role_incarnation_readiness(
+        &self,
+        agent_id: &str,
+        role_name: &str,
+        readiness_state: RoleReadinessState,
+    ) -> Result<()> {
+        if let Some(mut rec) = self.get_role_incarnation(agent_id, role_name)? {
+            rec.readiness_state = readiness_state;
+            self.upsert_role_incarnation(&rec)?;
+        }
+        Ok(())
     }
 
     // ── Secret methods ────────────────────────────────────────────────────────
@@ -1469,6 +1501,7 @@ mod tests {
             role_identity_addendum: None,
             role_manifest: None,
             is_admin: false,
+            readiness_state: RoleReadinessState::Configured,
             inactive_ttl_seconds: None,
             turn_loop_config: TurnLoopConfig::default(),
         };

@@ -1030,6 +1030,12 @@ pub enum IpcResponse {
         handoff_guest_id: String,
         became_active: bool,
     },
+    HandoffPending {
+        role_name: String,
+        readiness: String,
+        #[serde(default)]
+        retry_after_ms: Option<u64>,
+    },
     HandoffBackAck {
         handoff_guest_id: String,
         became_active: bool,

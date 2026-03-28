@@ -238,6 +238,29 @@ pub struct TurnLoopConfig {
     pub loop_script: Option<LoopScript>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RoleReadinessState {
+    #[default]
+    Configured,
+    Materializing,
+    Materialized,
+    Routable,
+    ActiveInSession,
+}
+
+impl RoleReadinessState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Configured => "configured",
+            Self::Materializing => "materializing",
+            Self::Materialized => "materialized",
+            Self::Routable => "routable",
+            Self::ActiveInSession => "active_in_session",
+        }
+    }
+}
+
 /// A long-lived named role incarnation for an agent.
 ///
 /// Node kind: `role_incarnation`. Node key: `role_incarnation:{agent_id}:{role_name}`.
@@ -258,10 +281,18 @@ pub struct RoleIncarnationRecord {
     /// Only the hotel seed or an existing admin role may create a role with is_admin: true.
     #[serde(default)]
     pub is_admin: bool,
+    #[serde(default)]
+    pub readiness_state: RoleReadinessState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inactive_ttl_seconds: Option<u64>,
     #[serde(default)]
     pub turn_loop_config: TurnLoopConfig,
+}
+
+impl RoleIncarnationRecord {
+    pub fn routing_role(&self) -> String {
+        format!("role:{}:{}", self.agent_id, self.role_name)
+    }
 }
 
 /// A durable behavioral constraint stored in the context graph.

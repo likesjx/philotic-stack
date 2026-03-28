@@ -1054,6 +1054,9 @@ fn format_role_command_reply(command: &SlashCommand, became_active: bool) -> Str
     }
 }
 
+const ROLE_HANDOFF_MAX_ATTEMPTS: usize = 8;
+const DEFAULT_ROLE_HANDOFF_RETRY_MS: u64 = 250;
+
 fn command_bypasses_turn_start(command: &SlashCommand) -> bool {
     matches!(
         command,
@@ -1129,6 +1132,50 @@ impl AgentRuntime {
             configured_roles: HashMap::new(),
             default_agent_profile: AgentProfile::default(),
         }
+    }
+
+    async fn request_role_handoff_with_backoff(
+        &mut self,
+        session_id: String,
+        role_name: String,
+        handoff_bundle: HandoffBundle,
+    ) -> Result<IpcResponse> {
+        for attempt in 0..ROLE_HANDOFF_MAX_ATTEMPTS {
+            let response = self
+                .ipc_client
+                .send_request(IpcRequest::HandoffToRole {
+                    session_id: session_id.clone(),
+                    role_name: role_name.clone(),
+                    handoff_bundle: handoff_bundle.clone(),
+                })
+                .await?;
+            match response {
+                IpcResponse::HandoffPending {
+                    role_name,
+                    readiness,
+                    retry_after_ms,
+                } if attempt + 1 < ROLE_HANDOFF_MAX_ATTEMPTS => {
+                    let retry_after_ms = retry_after_ms
+                        .unwrap_or(DEFAULT_ROLE_HANDOFF_RETRY_MS)
+                        .max(25);
+                    info!(
+                        role_name = %role_name,
+                        readiness = %readiness,
+                        retry_after_ms,
+                        attempt = attempt + 1,
+                        "Role handoff still materializing; retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(retry_after_ms)).await;
+                }
+                other => return Ok(other),
+            }
+        }
+
+        Ok(IpcResponse::HandoffPending {
+            role_name,
+            readiness: "materializing".into(),
+            retry_after_ms: Some(DEFAULT_ROLE_HANDOFF_RETRY_MS),
+        })
     }
 
     /// Fetch this agent's identity bundle from the hotel and store it as the default profile.
@@ -4751,13 +4798,12 @@ impl AgentRuntime {
                         expected_return_mode: Some("required".into()),
                         cleanup_actions: vec!["switch_active_role".into()],
                     });
-                self.ipc_client
-                    .send_request(IpcRequest::HandoffToRole {
-                        session_id: session_id.clone(),
-                        role_name: role_name.clone(),
-                        handoff_bundle,
-                    })
-                    .await?
+                self.request_role_handoff_with_backoff(
+                    session_id.clone(),
+                    role_name.clone(),
+                    handoff_bundle,
+                )
+                .await?
             }
             SlashCommand::Back => {
                 self.ipc_client
@@ -4799,6 +4845,18 @@ impl AgentRuntime {
                     "became_active": became_active,
                 }),
                 became_active.then_some(handoff_guest_id),
+            ),
+            IpcResponse::HandoffPending { .. } => (
+                format_role_command_reply(&command, false),
+                "role_handoff_materializing",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "turn_id": command_turn_id,
+                    "chat_id": command_chat_id,
+                    "role_command": "handoff_to_role",
+                    "became_active": false,
+                }),
+                None,
             ),
             IpcResponse::HandoffBackAck {
                 handoff_guest_id,
@@ -6546,18 +6604,21 @@ impl AgentRuntime {
                 };
 
                 let (content, tool_err) = match self
-                    .ipc_client
-                    .send_request(IpcRequest::HandoffToRole {
-                        session_id: payload.session_id.clone(),
-                        role_name: role_name.clone(),
+                    .request_role_handoff_with_backoff(
+                        payload.session_id.clone(),
+                        role_name.clone(),
                         handoff_bundle,
-                    })
+                    )
                     .await
                 {
                     Ok(IpcResponse::HandoffAck {
                         handoff_guest_id, ..
                     }) => (
                         format!("Handed off to role '{role_name}' (guest {handoff_guest_id})."),
+                        None,
+                    ),
+                    Ok(IpcResponse::HandoffPending { .. }) => (
+                        format!("Switching to role '{role_name}' once it finishes materializing."),
                         None,
                     ),
                     Ok(IpcResponse::Error(msg)) => {

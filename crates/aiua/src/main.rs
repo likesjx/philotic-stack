@@ -2422,6 +2422,7 @@ fn seed_orchestrator_roles(graph: &GraphDomain, profiles: &[AgentProfile]) -> an
             role_identity_addendum: None,
             role_manifest: Some(ORCHESTRATOR_MANIFEST.into()),
             is_admin: false,
+            readiness_state: ansible_mesh_core::graph::RoleReadinessState::Configured,
             inactive_ttl_seconds: None,
             turn_loop_config: ansible_mesh_core::graph::TurnLoopConfig::default(),
         };

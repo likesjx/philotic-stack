@@ -13,7 +13,9 @@ use ansible_mesh_core::catalog_rights::{
 };
 use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
-use ansible_mesh_core::graph::{AbstractSkillRecord, SkillValidationState};
+use ansible_mesh_core::graph::{
+    AbstractSkillRecord, RoleIncarnationRecord, RoleReadinessState, SkillValidationState,
+};
 use ansible_mesh_core::registry::{
     CapabilityAdvertisement, ExecutionReachability, NodeRegistry, NodeStatus,
 };
@@ -2820,14 +2822,21 @@ impl IpcServer {
         session.active_incarnation_id = Some(guest_id.to_string());
         session.updated_at = unix_ts();
         graph.upsert_session(&session)?;
+        for role_record in graph.list_role_incarnations_by_guest_id(guest_id)? {
+            graph.set_role_incarnation_readiness(
+                &role_record.agent_id,
+                &role_record.role_name,
+                RoleReadinessState::ActiveInSession,
+            )?;
+        }
         Ok(())
     }
 
-    fn resolve_role_guest_id(
+    fn resolve_role_incarnation(
         graph: &GraphDomain,
         session_id: &str,
         role_name: &str,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<RoleIncarnationRecord> {
         let Some(session) = graph.get_session(session_id)? else {
             anyhow::bail!("session [{}] not found", session_id);
         };
@@ -2841,7 +2850,174 @@ impl IpcServer {
                 agent_id
             );
         };
-        Ok(role_record.guest_id)
+        Ok(role_record)
+    }
+
+    fn role_worker_manifest(
+        graph: &GraphDomain,
+        local_node_id: &str,
+        role_record: &RoleIncarnationRecord,
+    ) -> anyhow::Result<ComponentManifest> {
+        let hotel_name = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
+            anyhow::anyhow!("local hotel record missing for node [{local_node_id}]")
+        })?;
+        let hotel = graph
+            .get_hotel(&hotel_name)?
+            .ok_or_else(|| anyhow::anyhow!("hotel [{hotel_name}] not found"))?;
+        let mut env = HashMap::new();
+        env.insert(
+            "PHILOTIC_HOTEL_SOCKET".into(),
+            hotel.ipc_socket_path.to_string(),
+        );
+        env.insert("PHILOTIC_NODE_ID".into(), local_node_id.to_string());
+        env.insert("PHILOTIC_AGENT_ID".into(), role_record.agent_id.clone());
+        env.insert("PHILOTIC_GUEST_ID".into(), role_record.guest_id.clone());
+        env.insert("PHILOTIC_ROLE_NAME".into(), role_record.role_name.clone());
+        env.insert("PHILOTIC_ROLE_INBOX".into(), role_record.routing_role());
+
+        Ok(ComponentManifest {
+            guest_id: role_record.guest_id.clone(),
+            role: "agent".into(),
+            hotel: hotel_name,
+            command: "philote".into(),
+            args: Vec::new(),
+            env,
+            component_config: serde_json::json!({
+                "component_kind": "role_worker",
+                "agent_id": role_record.agent_id,
+                "role_name": role_record.role_name,
+                "routing_role": role_record.routing_role(),
+            }),
+            auto_start: true,
+        })
+    }
+
+    async fn role_route_is_live(
+        inboxes: &InboxRegistry,
+        routing_role: &str,
+        guest_id: &str,
+    ) -> bool {
+        let guard = inboxes.lock().await;
+        guard
+            .get(routing_role)
+            .into_iter()
+            .flatten()
+            .any(|subscriber| subscriber.guest_id == guest_id)
+    }
+
+    async fn deliver_live_guest_task(
+        graph: &GraphDomain,
+        inboxes: &InboxRegistry,
+        local_node_id: &str,
+        target_role: &str,
+        guest_id: &str,
+        task_id: Uuid,
+        task_json: String,
+        activate_session_id: Option<String>,
+    ) -> anyhow::Result<bool> {
+        let task_json = attach_delivery_context(
+            graph,
+            local_node_id,
+            target_role,
+            Some(guest_id),
+            &task_json,
+        );
+        let is_live = {
+            let guard = inboxes.lock().await;
+            guard
+                .get(target_role)
+                .into_iter()
+                .flatten()
+                .any(|subscriber| subscriber.guest_id == guest_id)
+        };
+        if !is_live {
+            return Ok(false);
+        }
+        if let Some(session_id) = activate_session_id.as_deref() {
+            Self::update_session_active_incarnation(graph, session_id, guest_id)?;
+        }
+        Self::deliver_inbound_task(
+            inboxes,
+            local_node_id,
+            target_role,
+            Some(guest_id),
+            task_id,
+            task_json,
+        )
+        .await;
+        Ok(true)
+    }
+
+    fn role_guest_process_is_live(
+        graph: &GraphDomain,
+        local_node_id: &str,
+        guest_id: &str,
+    ) -> anyhow::Result<bool> {
+        let Some(local_hotel_name) = Self::local_hotel_name(graph, local_node_id) else {
+            return Ok(false);
+        };
+        let guest = graph
+            .list_guests(&local_hotel_name, false)?
+            .into_iter()
+            .find(|guest| guest.guest_id == guest_id);
+        Ok(guest
+            .and_then(|guest| guest.active_pid)
+            .and_then(|pid| pid.parse::<u32>().ok())
+            .is_some_and(Self::pid_exists))
+    }
+
+    async fn ensure_role_materialized(
+        graph: &GraphDomain,
+        inboxes: &InboxRegistry,
+        materialization_requester: Option<&dyn GuestMaterializationRequester>,
+        local_node_id: &str,
+        agent_id: &str,
+        role_name: &str,
+    ) -> anyhow::Result<RoleReadinessState> {
+        let role_record = graph
+            .get_role_incarnation(agent_id, role_name)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("role [{role_name}] is not configured for agent [{agent_id}]")
+            })?;
+
+        if Self::role_route_is_live(inboxes, &role_record.routing_role(), &role_record.guest_id)
+            .await
+        {
+            let readiness = if matches!(
+                role_record.readiness_state,
+                RoleReadinessState::ActiveInSession
+            ) {
+                RoleReadinessState::ActiveInSession
+            } else {
+                RoleReadinessState::Routable
+            };
+            graph.set_role_incarnation_readiness(agent_id, role_name, readiness.clone())?;
+            return Ok(readiness);
+        }
+
+        let manifest = Self::role_worker_manifest(graph, local_node_id, &role_record)?;
+        match Self::handle_register_component(graph, materialization_requester, manifest).await {
+            IpcResponse::ComponentRegistered { .. } => {}
+            IpcResponse::Standard { ok: true, .. } => {}
+            IpcResponse::Error(msg) => anyhow::bail!(msg),
+            other => anyhow::bail!("unexpected role materialization response: {other:?}"),
+        }
+
+        let readiness = if Self::role_route_is_live(
+            inboxes,
+            &role_record.routing_role(),
+            &role_record.guest_id,
+        )
+        .await
+        {
+            RoleReadinessState::Routable
+        } else if Self::role_guest_process_is_live(graph, local_node_id, &role_record.guest_id)? {
+            RoleReadinessState::Materialized
+        } else {
+            RoleReadinessState::Materializing
+        };
+        graph.set_role_incarnation_readiness(agent_id, role_name, readiness.clone())?;
+        Ok(readiness)
     }
 
     async fn queue_or_deliver_guest_task(
@@ -3398,6 +3574,26 @@ impl IpcServer {
                     subscribed_roles,
                 )
                 .await;
+                if let Some(guest_id) = guest.as_ref().map(|subscriber| subscriber.guest_id.clone())
+                {
+                    if let Ok(role_records) = graph.list_role_incarnations_by_routing_role(&role) {
+                        for role_record in role_records
+                            .into_iter()
+                            .filter(|record| record.guest_id == guest_id)
+                        {
+                            if let Err(err) = graph.set_role_incarnation_readiness(
+                                &role_record.agent_id,
+                                &role_record.role_name,
+                                RoleReadinessState::Routable,
+                            ) {
+                                warn!(
+                                    "Failed to mark role [{}] routable on SubscribeInbox: {}",
+                                    role_record.role_name, err
+                                );
+                            }
+                        }
+                    }
+                }
                 IpcResponse::success("sub", None)
             }
             IpcRequest::AcquireTelegramPollLease {
@@ -4150,9 +4346,9 @@ impl IpcServer {
                     );
                 }
 
-                let target_guest_id =
-                    match Self::resolve_role_guest_id(graph, &session_id, &role_name) {
-                        Ok(guest_id) => guest_id,
+                let target_role =
+                    match Self::resolve_role_incarnation(graph, &session_id, &role_name) {
+                        Ok(role_record) => role_record,
                         Err(err) => {
                             return IpcResponse::error(
                                 "handoff_to_role",
@@ -4161,6 +4357,38 @@ impl IpcServer {
                             );
                         }
                     };
+                let readiness = match Self::ensure_role_materialized(
+                    graph,
+                    inboxes,
+                    materialization_requester,
+                    local_node_id,
+                    &target_role.agent_id,
+                    &role_name,
+                )
+                .await
+                {
+                    Ok(readiness) => readiness,
+                    Err(err) => {
+                        return IpcResponse::error(
+                            "handoff_to_role",
+                            "HANDOFF_MATERIALIZATION_FAILED",
+                            err.to_string(),
+                        );
+                    }
+                };
+                if matches!(
+                    readiness,
+                    RoleReadinessState::Configured
+                        | RoleReadinessState::Materializing
+                        | RoleReadinessState::Materialized
+                ) {
+                    return IpcResponse::HandoffPending {
+                        role_name,
+                        readiness: readiness.as_str().into(),
+                        retry_after_ms: Some(250),
+                    };
+                }
+                let target_guest_id = target_role.guest_id.clone();
                 let task_id = Uuid::new_v4();
 
                 // Construct the SessionControl envelope for durable mesh ledger tracking
@@ -4219,13 +4447,11 @@ impl IpcServer {
                 let task_json =
                     attach_agent_graph_snapshot(&task_json, agent_id.as_deref(), local_node_id);
 
-                match Self::queue_or_deliver_guest_task(
+                match Self::deliver_live_guest_task(
                     graph,
                     inboxes,
-                    parked_inbound,
-                    materialization_requester,
                     local_node_id,
-                    "agent",
+                    &target_role.routing_role(),
                     &target_guest_id,
                     task_id,
                     task_json,
@@ -4233,10 +4459,34 @@ impl IpcServer {
                 )
                 .await
                 {
-                    Ok(active) => IpcResponse::HandoffAck {
-                        handoff_guest_id: target_guest_id,
-                        became_active: active,
-                    },
+                    Ok(true) => {
+                        if let Err(err) = graph.set_role_incarnation_readiness(
+                            &target_role.agent_id,
+                            &target_role.role_name,
+                            RoleReadinessState::ActiveInSession,
+                        ) {
+                            warn!(
+                                "Failed to mark role [{}] active in session: {}",
+                                target_role.role_name, err
+                            );
+                        }
+                        IpcResponse::HandoffAck {
+                            handoff_guest_id: target_guest_id,
+                            became_active: true,
+                        }
+                    }
+                    Ok(false) => {
+                        let _ = graph.set_role_incarnation_readiness(
+                            &target_role.agent_id,
+                            &target_role.role_name,
+                            RoleReadinessState::Materializing,
+                        );
+                        IpcResponse::HandoffPending {
+                            role_name,
+                            readiness: RoleReadinessState::Materializing.as_str().into(),
+                            retry_after_ms: Some(250),
+                        }
+                    }
                     Err(err) => IpcResponse::error(
                         "handoff_to_role",
                         "HANDOFF_DELIVERY_FAILED",
@@ -4264,9 +4514,9 @@ impl IpcServer {
                     );
                 }
                 let target_role = return_to.unwrap_or_else(|| "orchestrator".into());
-                let target_guest_id =
-                    match Self::resolve_role_guest_id(graph, &session_id, &target_role) {
-                        Ok(guest_id) => guest_id,
+                let target_role_record =
+                    match Self::resolve_role_incarnation(graph, &session_id, &target_role) {
+                        Ok(role_record) => role_record,
                         Err(err) => {
                             return IpcResponse::error(
                                 "handoff_back",
@@ -4275,6 +4525,7 @@ impl IpcServer {
                             );
                         }
                     };
+                let target_guest_id = target_role_record.guest_id.clone();
                 let task_id = Uuid::new_v4();
 
                 let ts = std::time::SystemTime::now()
@@ -4818,6 +5069,11 @@ impl IpcServer {
                     );
                 }
 
+                let previous = graph
+                    .get_role_incarnation(&agent_id, &role_name)
+                    .ok()
+                    .flatten();
+                let is_new_role = previous.is_none();
                 let record = ansible_mesh_core::graph::RoleIncarnationRecord {
                     agent_id: agent_id.clone(),
                     role_name: role_name.clone(),
@@ -4826,6 +5082,12 @@ impl IpcServer {
                     role_identity_addendum,
                     role_manifest,
                     is_admin,
+                    readiness_state: graph
+                        .get_role_incarnation(&agent_id, &role_name)
+                        .ok()
+                        .flatten()
+                        .map(|record| record.readiness_state)
+                        .unwrap_or_default(),
                     inactive_ttl_seconds,
                     turn_loop_config: ansible_mesh_core::graph::TurnLoopConfig {
                         iteration_cap,
@@ -4850,6 +5112,102 @@ impl IpcServer {
                     role_name = %role_name,
                     "Role incarnation configured via IPC"
                 );
+
+                let breaking_change = previous.as_ref().is_some_and(|existing| {
+                    existing.guest_id != record.guest_id
+                        || existing.toolset_profile != record.toolset_profile
+                        || existing.role_manifest != record.role_manifest
+                        || existing.turn_loop_config.model_profile
+                            != record.turn_loop_config.model_profile
+                });
+
+                if is_new_role || breaking_change {
+                    if let Err(err) = graph.set_role_incarnation_readiness(
+                        &agent_id,
+                        &role_name,
+                        RoleReadinessState::Configured,
+                    ) {
+                        warn!(
+                            "Failed to reset readiness for role [{}] before materialization: {}",
+                            role_name, err
+                        );
+                    }
+                    let manifest = match Self::role_worker_manifest(graph, local_node_id, &record) {
+                        Ok(manifest) => manifest,
+                        Err(err) => {
+                            return IpcResponse::error(
+                                "configure_role",
+                                "ROLE_COMPONENT_CONFIG_FAILED",
+                                err.to_string(),
+                            );
+                        }
+                    };
+                    match Self::handle_register_component(
+                        graph,
+                        materialization_requester,
+                        manifest,
+                    )
+                    .await
+                    {
+                        IpcResponse::ComponentRegistered { .. }
+                        | IpcResponse::Standard { ok: true, .. } => {}
+                        IpcResponse::Error(msg) => {
+                            return IpcResponse::error(
+                                "configure_role",
+                                "ROLE_COMPONENT_REGISTER_FAILED",
+                                msg,
+                            );
+                        }
+                        other => {
+                            return IpcResponse::error(
+                                "configure_role",
+                                "ROLE_COMPONENT_REGISTER_FAILED",
+                                format!("unexpected role worker registration response: {other:?}"),
+                            );
+                        }
+                    }
+                    if breaking_change {
+                        match Self::handle_restart_component(
+                            graph,
+                            materialization_requester,
+                            local_node_id,
+                            &record.guest_id,
+                        )
+                        .await
+                        {
+                            IpcResponse::Standard { ok: true, .. } => {}
+                            IpcResponse::Error(msg) => {
+                                return IpcResponse::error(
+                                    "configure_role",
+                                    "ROLE_COMPONENT_RESTART_FAILED",
+                                    msg,
+                                );
+                            }
+                            other => {
+                                return IpcResponse::error(
+                                    "configure_role",
+                                    "ROLE_COMPONENT_RESTART_FAILED",
+                                    format!("unexpected role worker restart response: {other:?}"),
+                                );
+                            }
+                        }
+                    }
+                    if let Err(err) = Self::ensure_role_materialized(
+                        graph,
+                        inboxes,
+                        materialization_requester,
+                        local_node_id,
+                        &agent_id,
+                        &role_name,
+                    )
+                    .await
+                    {
+                        warn!(
+                            "Role [{}] was configured but eager materialization failed: {}",
+                            role_name, err
+                        );
+                    }
+                }
 
                 IpcResponse::ConfigureRoleOk { role_name }
             }
@@ -9212,6 +9570,7 @@ mod tests {
                 role_identity_addendum: None,
                 role_manifest: None,
                 is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
             })
@@ -9318,6 +9677,7 @@ mod tests {
                 role_identity_addendum: None,
                 role_manifest: None,
                 is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
             })
@@ -9442,6 +9802,7 @@ mod tests {
                 role_identity_addendum: None,
                 role_manifest: None,
                 is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
             })
@@ -9859,6 +10220,7 @@ mod tests {
                 role_identity_addendum: None,
                 role_manifest: None,
                 is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
             })
@@ -10007,6 +10369,7 @@ mod tests {
                 role_identity_addendum: None,
                 role_manifest: None,
                 is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
             })
@@ -10403,6 +10766,7 @@ mod tests {
                 role_identity_addendum: None,
                 role_manifest: None,
                 is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
             })
@@ -10603,6 +10967,7 @@ mod tests {
                 role_identity_addendum: None,
                 role_manifest: None,
                 is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
             })
@@ -10637,6 +11002,12 @@ mod tests {
         })
         .await
         .expect("developer connect");
+        developer
+            .send_request(IpcRequest::SubscribeInbox {
+                role: "role:agent-jane-01:developer".into(),
+            })
+            .await
+            .expect("developer role inbox subscribe");
 
         let response = orchestrator
             .send_request(IpcRequest::HandoffToRole {
@@ -10720,7 +11091,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handoff_to_missing_role_parks_until_register_then_switches_active_incarnation() {
+    async fn handoff_to_missing_role_returns_pending_until_role_inbox_is_routable() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
@@ -10782,6 +11153,7 @@ mod tests {
                 role_identity_addendum: None,
                 role_manifest: None,
                 is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
             })
@@ -10842,12 +11214,16 @@ mod tests {
             .expect("handoff request");
 
         match response {
-            IpcResponse::HandoffAck {
-                handoff_guest_id,
-                became_active,
+            IpcResponse::HandoffPending {
+                role_name,
+                readiness,
+                ..
             } => {
-                assert_eq!(handoff_guest_id, "agent-jane:developer");
-                assert!(!became_active);
+                assert_eq!(role_name, "developer");
+                assert!(
+                    matches!(readiness.as_str(), "materializing" | "materialized"),
+                    "unexpected readiness: {readiness}"
+                );
             }
             other => panic!("unexpected handoff response: {other:?}"),
         }
@@ -10869,6 +11245,51 @@ mod tests {
         })
         .await
         .expect("developer connect");
+        developer
+            .send_request(IpcRequest::SubscribeInbox {
+                role: "role:agent-jane-01:developer".into(),
+            })
+            .await
+            .expect("developer role inbox subscribe");
+
+        let response = orchestrator
+            .send_request(IpcRequest::HandoffToRole {
+                session_id: "sess-handoff-park".into(),
+                role_name: "developer".into(),
+                handoff_bundle: HandoffBundle {
+                    goal: "implement later".into(),
+                    context_excerpt: "waiting for startup".into(),
+                    session_id: "sess-handoff-park".into(),
+                    initiating_turn_id: "turn-1".into(),
+                    return_to: Some("orchestrator".into()),
+                    handoff_reason: Some("manual_role_switch".into()),
+                    active_goal: Some("implement later".into()),
+                    active_constraints: vec!["same_identity_role_handoff".into()],
+                    relevant_session_facts: vec!["session_status=active".into()],
+                    working_summary: Some(
+                        "phase=waiting_model, iteration=1, pending_tool=false, pending_approval=false"
+                            .into(),
+                    ),
+                    from_role: Some("orchestrator".into()),
+                    to_role: Some("developer".into()),
+                    suggested_memory_refs: Vec::new(),
+                    expected_return_mode: Some("required".into()),
+                    cleanup_actions: vec!["switch_active_role".into()],
+                },
+            })
+            .await
+            .expect("handoff retry");
+
+        match response {
+            IpcResponse::HandoffAck {
+                handoff_guest_id,
+                became_active,
+            } => {
+                assert_eq!(handoff_guest_id, "agent-jane:developer");
+                assert!(became_active);
+            }
+            other => panic!("unexpected retry handoff response: {other:?}"),
+        }
 
         let delivered =
             tokio::time::timeout(tokio::time::Duration::from_secs(1), developer.recv_task())
@@ -11584,6 +12005,7 @@ mod tests {
                 role_identity_addendum: Some("Focus on implementation and code changes.".into()),
                 role_manifest: None,
                 is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
             })
@@ -12156,6 +12578,7 @@ mod tests {
                 role_identity_addendum: None,
                 role_manifest: None,
                 is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
             })
@@ -18498,6 +18921,103 @@ mod tests {
             IpcResponse::ConfigureRoleOk { role_name } => assert_eq!(role_name, "developer"),
             other => panic!("expected ConfigureRoleOk, got {:?}", other),
         }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn configure_role_eagerly_materializes_new_role_worker() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+            })
+            .expect("seed local hotel");
+        let requester = Arc::new(MockMaterializationRequester::default());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        )
+        .with_materialization_requester(requester.clone());
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut orchestrator = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane-01:orchestrator".into(),
+            role: "orchestrator".into(),
+            supported_tools: vec![],
+        })
+        .await
+        .expect("orchestrator connect");
+
+        let resp = orchestrator
+            .send_request(IpcRequest::ConfigureRole {
+                agent_id: "agent-jane-01".into(),
+                role_name: "developer".into(),
+                guest_id: "agent-jane:developer".into(),
+                calling_role: "orchestrator".into(),
+                toolset_profile: "developer".into(),
+                role_identity_addendum: Some("Addendum".into()),
+                role_manifest: None,
+                is_admin: false,
+                inactive_ttl_seconds: Some(60),
+                iteration_cap: Some(10),
+                approval_policy: Some("auto".into()),
+                model_profile: Some("fast".into()),
+                context_window_policy: Some("standard".into()),
+            })
+            .await
+            .expect("configure request");
+
+        match resp {
+            IpcResponse::ConfigureRoleOk { role_name } => assert_eq!(role_name, "developer"),
+            other => panic!("expected ConfigureRoleOk, got {:?}", other),
+        }
+
+        assert_eq!(requester.calls.load(Ordering::SeqCst), 2);
+        let role = graph
+            .get_role_incarnation("agent-jane-01", "developer")
+            .expect("role lookup")
+            .expect("role exists");
+        assert_eq!(role.guest_id, "agent-jane:developer");
+        assert!(matches!(
+            role.readiness_state,
+            RoleReadinessState::Materializing
+                | RoleReadinessState::Materialized
+                | RoleReadinessState::Routable
+        ));
 
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");

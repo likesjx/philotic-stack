@@ -9,7 +9,8 @@
 use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
 use ansible_mesh_core::graph::{
-    AbstractSkillRecord, RoleIncarnationRecord, ToolsetProfileRecord, TurnLoopConfig,
+    AbstractSkillRecord, RoleIncarnationRecord, RoleReadinessState, ToolsetProfileRecord,
+    TurnLoopConfig,
 };
 use ansible_mesh_core::sqlite_storage::{
     SqliteCursorStorage, SqliteEventStorage, SqliteGraphStorage,
@@ -94,6 +95,7 @@ fn sample_role_incarnation(role_name: &str) -> RoleIncarnationRecord {
         role_identity_addendum: Some(format!("You are the {role_name} role.")),
         role_manifest: None,
         is_admin: false,
+        readiness_state: RoleReadinessState::Configured,
         inactive_ttl_seconds: Some(900),
         turn_loop_config: TurnLoopConfig {
             iteration_cap: Some(12),
@@ -861,6 +863,7 @@ fn graph_storage_lists_role_incarnations_by_agent() {
             role_identity_addendum: None,
             role_manifest: None,
             is_admin: false,
+            readiness_state: RoleReadinessState::Configured,
             inactive_ttl_seconds: None,
             turn_loop_config: TurnLoopConfig::default(),
         })

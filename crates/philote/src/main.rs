@@ -23,14 +23,28 @@ async fn main() -> Result<()> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| DEFAULT_AGENT_ID.to_string());
+    let guest_id = std::env::var("PHILOTIC_GUEST_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| agent_id.clone());
+    let role_inbox = std::env::var("PHILOTIC_ROLE_INBOX")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
 
     let identity = GuestIdentity {
-        guest_id: agent_id.clone(),
+        guest_id,
         role: "agent".into(),
         supported_tools: Vec::new(),
     };
 
-    let ipc_client = philotic_client::PhiloticClient::connect(identity).await?;
+    let mut ipc_client = philotic_client::PhiloticClient::connect(identity).await?;
+    if let Some(role) = role_inbox {
+        ipc_client
+            .send_request(philotic_client::IpcRequest::SubscribeInbox { role })
+            .await?;
+    }
     let mut runtime = AgentRuntime::new(ipc_client, agent_id);
     runtime.run().await
 }
