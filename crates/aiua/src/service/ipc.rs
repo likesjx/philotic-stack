@@ -5754,6 +5754,75 @@ impl IpcServer {
                     }
                 }
             }
+            IpcRequest::RecordRoleHandoffReflexEvidence {
+                agent_id,
+                role_name,
+                trigger_class,
+                source_turn,
+            } => {
+                use ansible_mesh_core::agent_graph_storage::AgentReflexPreference;
+                let path = agent_graph_db_path(&agent_id);
+                let result = (|| -> anyhow::Result<serde_json::Value> {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    let storage = SqliteAgentGraphStorage::open(&agent_id, &path)?;
+                    let preference_key = format!("same-self-role-handoff:{role_name}");
+                    let existing = storage.get_reflex_preference(&preference_key)?;
+                    let previous_count = existing
+                        .as_ref()
+                        .and_then(|pref| pref.config_json.get("success_count"))
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    let success_count = previous_count + 1;
+                    let reinforced = success_count >= 2;
+                    let existing_precedence =
+                        existing.as_ref().map(|pref| pref.precedence).unwrap_or(70);
+                    let updated_at = existing.as_ref().map(|pref| pref.updated_at).unwrap_or(0);
+
+                    storage.upsert_reflex_preference(&AgentReflexPreference {
+                        agent_id: agent_id.clone(),
+                        preference_key: preference_key.clone(),
+                        precedence: existing_precedence,
+                        reflexes_json: serde_json::json!({
+                            "role_handoff_reflex": {
+                                "target_role": role_name,
+                                "trigger_class": trigger_class,
+                                "source": "successful_same_self_handoff",
+                                "tool_name": "handoff.to_role",
+                            }
+                        }),
+                        config_json: serde_json::json!({
+                            "reason": format!("remembered successful same-self handoff to role '{role_name}'"),
+                            "role_name": role_name,
+                            "trigger_class": trigger_class,
+                            "source_tool": "handoff.to_role",
+                            "source_turn": source_turn,
+                            "success_count": success_count,
+                            "habit_state": if reinforced { "reinforced" } else { "candidate" },
+                        }),
+                        updated_at,
+                    })?;
+                    Ok(serde_json::json!({
+                        "preference_key": preference_key,
+                        "success_count": success_count,
+                        "habit_state": if reinforced { "reinforced" } else { "candidate" },
+                    }))
+                })();
+                match result {
+                    Ok(payload) => {
+                        IpcResponse::success("role_handoff_reflex_evidence", Some(payload))
+                    }
+                    Err(err) => {
+                        error!("Failed to record role handoff reflex evidence: {err}");
+                        IpcResponse::error(
+                            "record_role_handoff_reflex_evidence",
+                            "STORAGE_ERROR",
+                            err.to_string(),
+                        )
+                    }
+                }
+            }
             IpcRequest::AppendRoutingPolicyEvaluation {
                 proposal_id,
                 evaluation_kind,
@@ -15467,6 +15536,73 @@ mod tests {
         assert_eq!(
             pref.config_json["reason"],
             "approved routing.policy.propose write-back"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+            std::env::remove_var("PHILOTIC_AGENT_GRAPH_DB");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        let _ = std::fs::remove_file(&graph_db_path);
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn record_role_handoff_reflex_evidence_accumulates_success_count() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let graph_db_template = test_agent_graph_db_template();
+        let agent_id = "agent-role-reflex-01";
+        let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
+        let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+            std::env::set_var("PHILOTIC_AGENT_GRAPH_DB", &graph_db_template);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-local".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("client connect");
+
+        for turn_id in ["turn-1", "turn-2"] {
+            let response = client
+                .send_request(IpcRequest::RecordRoleHandoffReflexEvidence {
+                    agent_id: agent_id.into(),
+                    role_name: "developer".into(),
+                    trigger_class: "implementation".into(),
+                    source_turn: Some(turn_id.into()),
+                })
+                .await
+                .expect("role reflex evidence request");
+            assert!(matches!(response, IpcResponse::Standard { ok: true, .. }));
+        }
+
+        let storage =
+            SqliteAgentGraphStorage::open(agent_id, Path::new(&graph_db_path)).expect("open db");
+        let pref = storage
+            .get_reflex_preference("same-self-role-handoff:developer")
+            .expect("read reflex pref")
+            .expect("stored role reflex pref");
+        assert_eq!(pref.config_json["success_count"], 2);
+        assert_eq!(pref.config_json["habit_state"], "reinforced");
+        assert_eq!(
+            pref.reflexes_json["role_handoff_reflex"]["trigger_class"],
+            "implementation"
         );
 
         unsafe {

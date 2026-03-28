@@ -6652,28 +6652,27 @@ impl AgentRuntime {
                         handoff_guest_id, ..
                     }) => {
                         if let Some(reflex) = handoff_reflex.as_ref() {
-                            let config_json = serde_json::json!({
-                                "reason": format!("remembered successful same-self handoff to role '{role_name}'"),
-                                "role_name": role_name,
-                                "trigger_class": infer_role_handoff_trigger_class(&role_name),
-                                "source_tool": "handoff.to_role",
-                                "source_turn": payload.turn_id,
-                            });
+                            let trigger_class = reflex
+                                .reflexes_json
+                                .get("role_handoff_reflex")
+                                .and_then(|value| value.get("trigger_class"))
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("implementation")
+                                .to_string();
                             if let Err(err) = self
                                 .ipc_client
-                                .send_request(IpcRequest::UpsertAgentReflexPreference {
+                                .send_request(IpcRequest::RecordRoleHandoffReflexEvidence {
                                     agent_id: self.agent_id.clone(),
-                                    preference_key: reflex.preference_key.clone(),
-                                    precedence: reflex.precedence,
-                                    reflexes_json: reflex.reflexes_json.clone(),
-                                    config_json,
+                                    role_name: role_name.clone(),
+                                    trigger_class,
+                                    source_turn: Some(payload.turn_id.clone()),
                                 })
                                 .await
                             {
                                 warn!(
                                     role_name = %role_name,
                                     error = %err,
-                                    "Failed to remember successful same-self role handoff reflex"
+                                    "Failed to record successful same-self role handoff evidence"
                                 );
                             }
                         }
