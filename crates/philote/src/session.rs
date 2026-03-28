@@ -2094,6 +2094,28 @@ impl SessionState {
             return explicitly_named;
         }
 
+        if looks_like_role_return_goal(&normalized) {
+            let projected = all_tools
+                .iter()
+                .filter(|tool| tool.tool_name == "handoff.back")
+                .cloned()
+                .collect::<Vec<_>>();
+            if !projected.is_empty() {
+                return projected;
+            }
+        }
+
+        if looks_like_role_handoff_goal(&normalized) {
+            let projected = all_tools
+                .iter()
+                .filter(|tool| tool.tool_name == "handoff.to_role")
+                .cloned()
+                .collect::<Vec<_>>();
+            if !projected.is_empty() {
+                return projected;
+            }
+        }
+
         if looks_like_conversational_goal(&normalized) {
             return Vec::new();
         }
@@ -2101,6 +2123,9 @@ impl SessionState {
         all_tools
             .into_iter()
             .filter(|tool| {
+                if is_role_reflex_tool(&tool.tool_name) {
+                    return false;
+                }
                 !self
                     .tool_assembly
                     .policy_annotations
@@ -3522,6 +3547,38 @@ fn looks_like_conversational_goal(normalized: &str) -> bool {
         .any(|prefix| normalized.starts_with(prefix))
 }
 
+fn is_role_reflex_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "handoff.to_role" | "handoff.back")
+}
+
+fn looks_like_role_handoff_goal(normalized: &str) -> bool {
+    [
+        "switch to ",
+        "switch into ",
+        "hand off to ",
+        "handoff to ",
+        "shift to ",
+        "move to role ",
+        "use role ",
+        "activate role ",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
+}
+
+fn looks_like_role_return_goal(normalized: &str) -> bool {
+    [
+        "switch back",
+        "go back",
+        "return to orchestrator",
+        "back to orchestrator",
+        "handoff back",
+        "hand back",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
+}
+
 fn normalized_turn_text(user_content: &str) -> String {
     user_content
         .trim()
@@ -4752,6 +4809,8 @@ mod tests {
         assert!(tool_requires_approval("agent.configure"));
         assert!(!tool_requires_approval("echo"));
         assert!(!tool_requires_approval("workspace.read"));
+        assert!(!tool_requires_approval("handoff.to_role"));
+        assert!(!tool_requires_approval("handoff.back"));
     }
 
     #[test]
@@ -5733,6 +5792,34 @@ mod tests {
 
         assert_eq!(projected.len(), 1);
         assert_eq!(projected[0].tool_name, "echo");
+    }
+
+    #[test]
+    fn role_shift_intent_projects_handoff_to_role_naturally() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("echo");
+        state.add_tool_binding("handoff.to_role");
+
+        let projected = state.project_tools_for_turn("Switch to developer for this task.");
+
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].tool_name, "handoff.to_role");
+    }
+
+    #[test]
+    fn role_return_intent_projects_handoff_back_naturally() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("handoff.back");
+        state.role_activation = Some(make_role_activation("developer"));
+
+        let projected = state.project_tools_for_turn("Switch back to orchestrator.");
+
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].tool_name, "handoff.back");
     }
 
     #[test]

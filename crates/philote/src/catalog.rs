@@ -54,16 +54,14 @@ pub fn tool_class(tool_name: &str) -> Option<&'static str> {
 }
 
 /// Returns true if the tool requires operator approval before execution, regardless
-/// of what the model requests. Tools in class "config", "handoff", or "shell" require
-/// approval by default; others do not unless explicitly flagged.
+/// of what the model requests. Tools in class "config" or "shell" require
+/// approval by default; same-self handoff tools are governed by projection/reflex
+/// policy instead of per-action approval.
 pub fn tool_requires_approval(tool_name: &str) -> bool {
-    if tool_name == "handoff.back" {
+    if matches!(tool_name, "handoff.to_role" | "handoff.back") {
         return false;
     }
-    matches!(
-        tool_class(tool_name),
-        Some("config") | Some("handoff") | Some("shell")
-    )
+    matches!(tool_class(tool_name), Some("config") | Some("shell"))
 }
 
 fn build_catalog() -> HashMap<String, ToolDefinition> {
