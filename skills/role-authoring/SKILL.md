@@ -1,6 +1,26 @@
 ---
 name: role-authoring
 description: Use this skill when authoring or revising an agent role lens before governed execution. It gathers the missing role definition inputs, explains the required payload shape, and prepares the payload for the role.create_or_update workflow.
+catalog:
+  skill_name: role.authoring
+  implied_tools:
+    - session.status
+    - role.configure
+    - handoff.to_role
+  validation_state: validated
+  skill_markers:
+    - governed
+    - high_agency
+  field_sources:
+    required_fields:
+      - role_name
+      - toolset_profile
+      - reasoning.purpose
+      - reasoning.toolset_rationale
+      - reasoning.handoff_posture_and_limits
+    repo_skill_path: skills/role-authoring/SKILL.md
+    workflow_handoff: role.create_or_update
+    transitional_note: role.authoring remains prompt-facing and still implies the low-level role.configure tool as a compatibility bridge until workflow invocation is surfaced directly.
 ---
 
 # Role Authoring

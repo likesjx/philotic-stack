@@ -26,6 +26,7 @@ use philotic_client::{
     OPERATOR_SURFACE_QUERY_ROLE, OperatorSurfaceQueryHandoff, OperatorTargetGuestInventoryView,
     OperatorTargetStatusView, PhiloticClient,
 };
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
@@ -65,6 +66,50 @@ use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::event::EventEnvelope;
 use auth::AuthCommand;
 use vault::{SecretInput, store_secret};
+
+const ROLE_AUTHORING_SKILL_MD: &str = include_str!("../../../skills/role-authoring/SKILL.md");
+const ROLE_CREATE_OR_UPDATE_WORKFLOW_MD: &str =
+    include_str!("../../../workflows/role-create-or-update/WORKFLOW.md");
+
+#[derive(Debug, Deserialize)]
+struct RepoCatalogSkillFrontmatter {
+    skill_name: String,
+    #[serde(default)]
+    implied_tools: Vec<String>,
+    #[serde(default)]
+    validation_state: Option<String>,
+    #[serde(default)]
+    skill_markers: Vec<String>,
+    #[serde(default)]
+    field_sources: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct RepoSkillFrontmatter {
+    name: String,
+    description: String,
+    catalog: RepoCatalogSkillFrontmatter,
+}
+
+#[derive(Debug, Deserialize)]
+struct RepoWorkflowCatalogFrontmatter {
+    workflow_name: String,
+    workflow_kind: String,
+    owner_scope: String,
+    target_class: String,
+    description: String,
+    target_selection_policy: serde_json::Value,
+    context_requirements: serde_json::Value,
+    return_contract: serde_json::Value,
+    governance: serde_json::Value,
+    rollout_state: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RepoWorkflowFrontmatter {
+    name: String,
+    workflow: RepoWorkflowCatalogFrontmatter,
+}
 
 /// Instructions for the strictly-serialized DB writer thread
 pub enum LedgerCommand {
@@ -2172,12 +2217,108 @@ fn seed_abstract_model_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn parse_repo_frontmatter<T>(label: &str, markdown: &str) -> anyhow::Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let mut lines = markdown.lines();
+    anyhow::ensure!(
+        matches!(lines.next(), Some("---")),
+        "{label}: missing frontmatter start fence"
+    );
+    let mut yaml = String::new();
+    let mut closed = false;
+    for line in lines {
+        if line == "---" {
+            closed = true;
+            break;
+        }
+        yaml.push_str(line);
+        yaml.push('\n');
+    }
+    anyhow::ensure!(closed, "{label}: missing frontmatter end fence");
+    serde_yaml::from_str(&yaml).with_context(|| format!("{label}: parse frontmatter"))
+}
+
+fn parse_skill_validation_state(
+    raw: Option<&str>,
+) -> ansible_mesh_core::graph::SkillValidationState {
+    match raw.unwrap_or("validated") {
+        "draft" => ansible_mesh_core::graph::SkillValidationState::Draft,
+        "registered" => ansible_mesh_core::graph::SkillValidationState::Registered,
+        "deprecated" => ansible_mesh_core::graph::SkillValidationState::Deprecated,
+        "invalid" => ansible_mesh_core::graph::SkillValidationState::Invalid {
+            errors: vec!["repo-frontmatter requested invalid state".into()],
+        },
+        "suspended" => ansible_mesh_core::graph::SkillValidationState::Suspended {
+            reason: "repo-frontmatter requested suspended state".into(),
+        },
+        _ => ansible_mesh_core::graph::SkillValidationState::Validated,
+    }
+}
+
+fn load_role_authoring_skill_record() -> anyhow::Result<AbstractSkillRecord> {
+    let frontmatter: RepoSkillFrontmatter =
+        parse_repo_frontmatter("role-authoring skill", ROLE_AUTHORING_SKILL_MD)?;
+    anyhow::ensure!(
+        frontmatter.catalog.skill_name == "role.authoring",
+        "role-authoring skill: expected catalog.skill_name=role.authoring, got {}",
+        frontmatter.catalog.skill_name
+    );
+    anyhow::ensure!(
+        frontmatter.name == "role-authoring",
+        "role-authoring skill: expected name=role-authoring, got {}",
+        frontmatter.name
+    );
+    Ok(AbstractSkillRecord {
+        skill_name: frontmatter.catalog.skill_name,
+        description: frontmatter.description,
+        implied_tools: frontmatter.catalog.implied_tools,
+        validation_state: parse_skill_validation_state(
+            frontmatter.catalog.validation_state.as_deref(),
+        ),
+        field_sources: frontmatter.catalog.field_sources,
+        skill_markers: frontmatter.catalog.skill_markers,
+        ..Default::default()
+    })
+}
+
+fn load_role_create_or_update_workflow_record() -> anyhow::Result<WorkflowSkillRecord> {
+    let frontmatter: RepoWorkflowFrontmatter = parse_repo_frontmatter(
+        "role-create-or-update workflow",
+        ROLE_CREATE_OR_UPDATE_WORKFLOW_MD,
+    )?;
+    anyhow::ensure!(
+        frontmatter.name == "role-create-or-update",
+        "role-create-or-update workflow: expected name=role-create-or-update, got {}",
+        frontmatter.name
+    );
+    anyhow::ensure!(
+        frontmatter.workflow.workflow_name == "role.create_or_update",
+        "role-create-or-update workflow: expected workflow_name=role.create_or_update, got {}",
+        frontmatter.workflow.workflow_name
+    );
+    Ok(WorkflowSkillRecord {
+        workflow_name: frontmatter.workflow.workflow_name,
+        workflow_kind: frontmatter.workflow.workflow_kind,
+        owner_scope: frontmatter.workflow.owner_scope,
+        target_class: frontmatter.workflow.target_class,
+        description: frontmatter.workflow.description,
+        target_selection_policy: frontmatter.workflow.target_selection_policy,
+        context_requirements: frontmatter.workflow.context_requirements,
+        return_contract: frontmatter.workflow.return_contract,
+        governance: frontmatter.workflow.governance,
+        rollout_state: frontmatter.workflow.rollout_state,
+    })
+}
+
 /// Seed the built-in abstract skill catalog into the context graph.
 ///
 /// These skills are prompt-facing posture records first; their implied tool
 /// grants stay intentionally narrow until the governed handoff and role
 /// provisioning layers are fully wired.
 fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
+    let role_authoring = load_role_authoring_skill_record()?;
     let catalog = [
         AbstractSkillRecord {
             skill_name: "handoff.to_role".into(),
@@ -2218,30 +2359,7 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             skill_markers: vec!["governed".into(), "high_agency".into()],
             ..Default::default()
         },
-        AbstractSkillRecord {
-            skill_name: "role.authoring".into(),
-            description: "Author a complete role lens before governed execution. Gather missing role inputs first, assemble the manifest/purpose/toolset/handoff fields cleanly, and prepare a complete payload for the role.create_or_update workflow instead of treating role mutation as an ad hoc skill call.".into(),
-            implied_tools: vec![
-                "session.status".into(),
-                "role.configure".into(),
-                "handoff.to_role".into(),
-            ],
-            validation_state: ansible_mesh_core::graph::SkillValidationState::Validated,
-            field_sources: serde_json::json!({
-                "required_fields": [
-                    "role_name",
-                    "toolset_profile",
-                    "reasoning.purpose",
-                    "reasoning.toolset_rationale",
-                    "reasoning.handoff_posture_and_limits"
-                ],
-                "repo_skill_path": "skills/role-authoring/SKILL.md",
-                "workflow_handoff": "role.create_or_update",
-                "transitional_note": "role.authoring remains prompt-facing and still implies the low-level role.configure tool as a compatibility bridge until workflow invocation is surfaced directly."
-            }),
-            skill_markers: vec!["governed".into(), "high_agency".into()],
-            ..Default::default()
-        },
+        role_authoring,
         AbstractSkillRecord {
             skill_name: "delegate.to_peer".into(),
             description: "Cross-agent delegation: hand off a bounded task to another trusted peer agent on the mesh instead of changing roles. Best for leveraging a different identity, rather than shifting internal capabilities.".into(),
@@ -2282,6 +2400,7 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
 }
 
 fn seed_workflow_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
+    let role_create_or_update = load_role_create_or_update_workflow_record()?;
     let catalog = [
         WorkflowSkillRecord {
             workflow_name: "handoff.to_role".into(),
@@ -2306,46 +2425,7 @@ fn seed_workflow_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             }),
             rollout_state: "active".into(),
         },
-        WorkflowSkillRecord {
-            workflow_name: "role.create_or_update".into(),
-            workflow_kind: "role.configure".into(),
-            owner_scope: "orchestrator".into(),
-            target_class: "same_identity_role_definition".into(),
-            description: "Governed role-definition workflow that validates a role lens, mutates the role incarnation record, updates capability posture, optionally materializes the worker, and may hand off after success.".into(),
-            target_selection_policy: serde_json::json!({
-                "inputs": ["role_name", "toolset_profile", "role_manifest", "reasoning"],
-                "selection_mode": "same_agent_role_record"
-            }),
-            context_requirements: serde_json::json!({
-                "required_fields": [
-                    "role_name",
-                    "toolset_profile",
-                    "reasoning.purpose",
-                    "reasoning.toolset_rationale",
-                    "reasoning.handoff_posture_and_limits"
-                ],
-                "optional_fields": [
-                    "role_identity_addendum",
-                    "role_manifest",
-                    "inactive_ttl_seconds",
-                    "iteration_cap",
-                    "approval_policy",
-                    "model_profile",
-                    "context_window_policy"
-                ],
-                "supporting_skill": "role.authoring"
-            }),
-            return_contract: serde_json::json!({
-                "ack": "ConfigureRoleOk",
-                "post_success_options": ["stay_in_orchestrator", "handoff.to_role"]
-            }),
-            governance: serde_json::json!({
-                "execution_surface": "role.configure",
-                "materialization": "ensure_role_materialized_on_new_or_breaking_change",
-                "transitional_note": "runtime execution still flows through role.configure until workflow invocation becomes first-class"
-            }),
-            rollout_state: "active".into(),
-        },
+        role_create_or_update,
     ];
 
     for workflow in &catalog {
@@ -5733,7 +5813,8 @@ mod tests {
         default_agent_profile_for_hotel, default_guest_seed, default_hotel_record,
         enable_guest_test_overrides, execution_reachability_for_hotel,
         extract_context_graph_entries, guest_seed_for_profile, guest_supervision_enabled,
-        hotel_base_port, hotel_ipc_socket_path, local_capability_advertisements,
+        hotel_base_port, hotel_ipc_socket_path, load_role_authoring_skill_record,
+        load_role_create_or_update_workflow_record, local_capability_advertisements,
         nearest_available_base_port, resolve_runtime_ports, seed_abstract_skill_catalog,
         seed_workflow_skill_catalog, startup_test_gemini_base_url,
     };
@@ -5920,6 +6001,51 @@ mod tests {
         assert_eq!(
             workflow.governance["execution_surface"],
             serde_json::json!("role.configure")
+        );
+        assert_eq!(
+            workflow.governance["source_workflow_path"],
+            serde_json::json!("workflows/role-create-or-update/WORKFLOW.md")
+        );
+    }
+
+    #[test]
+    fn role_authoring_catalog_seed_comes_from_repo_skill_frontmatter() {
+        let record = load_role_authoring_skill_record().expect("load role authoring skill");
+
+        assert_eq!(record.skill_name, "role.authoring");
+        assert!(
+            record
+                .description
+                .contains("role.create_or_update workflow")
+        );
+        assert_eq!(
+            record.field_sources["repo_skill_path"],
+            serde_json::json!("skills/role-authoring/SKILL.md")
+        );
+        assert_eq!(
+            record.implied_tools,
+            vec![
+                "session.status".to_string(),
+                "role.configure".to_string(),
+                "handoff.to_role".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn role_create_workflow_seed_comes_from_repo_workflow_frontmatter() {
+        let workflow = load_role_create_or_update_workflow_record()
+            .expect("load role create or update workflow");
+
+        assert_eq!(workflow.workflow_name, "role.create_or_update");
+        assert_eq!(workflow.workflow_kind, "role.configure");
+        assert_eq!(
+            workflow.governance["source_workflow_path"],
+            serde_json::json!("workflows/role-create-or-update/WORKFLOW.md")
+        );
+        assert_eq!(
+            workflow.context_requirements["supporting_skill"],
+            serde_json::json!("role.authoring")
         );
     }
 
