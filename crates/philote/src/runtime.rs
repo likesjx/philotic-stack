@@ -9,7 +9,7 @@ use crate::protocol::{
 use crate::session::{
     ActivePlan, AgentProfile, ApprovalInterruptDisposition, ComponentRouteAssembly,
     MediaRoutingPolicy, RecalledMemoryRecord, RoutingPreferenceBinding, SessionBindings,
-    SessionState, ToolExecutionRoute, TtsMode, TurnCapabilityCompositionKind,
+    SessionState, TargetRoleLens, ToolExecutionRoute, TtsMode, TurnCapabilityCompositionKind,
     TurnContextEnvelopeKind, TurnRoutedCapabilityProfile, TurnRoutedCapabilitySpecies,
     TurnRoutingPlan, TurnRoutingStageKind, TurnRoutingStagePlan, VoiceResponsePolicy, WorkingTurn,
     merge_session_index, turn_routed_capability_profile,
@@ -4805,6 +4805,8 @@ impl AgentRuntime {
     ) -> Result<()> {
         let response = match &command {
             SlashCommand::Role { role_name } => {
+                let target_role_lens =
+                    resolve_target_role_lens(&mut self.ipc_client, &self.agent_id, role_name).await;
                 let handoff_bundle = self
                     .sessions
                     .get(&session_id)
@@ -4814,6 +4816,7 @@ impl AgentRuntime {
                             &command_turn_id,
                             "manual_role_switch",
                             Some("orchestrator".into()),
+                            target_role_lens.as_ref(),
                         )
                     })
                     .unwrap_or_else(|| HandoffBundle {
@@ -6625,9 +6628,42 @@ impl AgentRuntime {
                     .map(|r| r.role_name.clone())
                     .or_else(|| Some("orchestrator".into()));
 
+                let target_role_lens =
+                    resolve_target_role_lens(&mut self.ipc_client, &self.agent_id, &role_name)
+                        .await;
+
                 let handoff_bundle = HandoffBundle {
                     goal: active_goal.clone().unwrap_or_else(|| reason.clone()),
-                    context_excerpt: context_summary,
+                    context_excerpt: if let Some(lens) = target_role_lens.as_ref() {
+                        let mut context = context_summary.clone();
+                        if let Some(toolset_profile) = lens.toolset_profile.as_deref() {
+                            context.push_str(&format!(
+                                "\nTarget role toolset profile: {toolset_profile}."
+                            ));
+                        }
+                        if let Some(addendum) = lens.role_identity_addendum.as_deref() {
+                            context
+                                .push_str(&format!("\nTarget role identity addendum: {addendum}"));
+                        }
+                        if let Some(manifest) = lens
+                            .role_manifest
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|text| !text.is_empty())
+                        {
+                            let excerpt: String = manifest.chars().take(240).collect();
+                            context.push_str(&format!("\nTarget role manifest excerpt: {excerpt}"));
+                        }
+                        if !lens.allowed_skills.is_empty() {
+                            context.push_str(&format!(
+                                "\nTarget role allowed skills: {}",
+                                lens.allowed_skills.join(", ")
+                            ));
+                        }
+                        context
+                    } else {
+                        context_summary
+                    },
                     session_id: payload.session_id.clone(),
                     initiating_turn_id: payload.turn_id.clone(),
                     handoff_reason: Some(reason),
@@ -8025,6 +8061,66 @@ async fn run_bash_command(
         "exit_code": exit_code,
         "success": success,
     }))
+}
+
+async fn resolve_target_role_lens(
+    ipc_client: &mut PhiloticClient,
+    agent_id: &str,
+    role_name: &str,
+) -> Option<TargetRoleLens> {
+    let roles = match ipc_client
+        .send_request(IpcRequest::ListRoleIncarnations {
+            agent_id: agent_id.to_string(),
+        })
+        .await
+    {
+        Ok(IpcResponse::Standard {
+            ok: true,
+            data: Some(data),
+            ..
+        }) => data
+            .get("roles")
+            .cloned()
+            .and_then(|value| {
+                serde_json::from_value::<Vec<ansible_mesh_core::graph::RoleIncarnationRecord>>(
+                    value,
+                )
+                .ok()
+            })
+            .unwrap_or_default(),
+        _ => return None,
+    };
+
+    let role = roles
+        .into_iter()
+        .find(|role| role.role_name.eq_ignore_ascii_case(role_name))?;
+    let toolset_profile = role.toolset_profile.clone();
+    let toolset = match ipc_client
+        .send_request(IpcRequest::GetToolsetProfile {
+            profile_name: toolset_profile.clone(),
+        })
+        .await
+    {
+        Ok(IpcResponse::Standard {
+            ok: true,
+            data: Some(data),
+            ..
+        }) => serde_json::from_value::<ansible_mesh_core::graph::ToolsetProfileRecord>(data).ok(),
+        _ => None,
+    };
+
+    Some(TargetRoleLens {
+        role_name: role.role_name,
+        toolset_profile: Some(toolset_profile),
+        toolset_description: toolset
+            .as_ref()
+            .and_then(|profile| profile.description.clone()),
+        role_identity_addendum: role.role_identity_addendum,
+        role_manifest: role.role_manifest,
+        allowed_skills: toolset
+            .map(|profile| profile.allowed_skills)
+            .unwrap_or_default(),
+    })
 }
 
 #[cfg(test)]

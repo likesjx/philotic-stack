@@ -845,6 +845,21 @@ pub struct SessionBindings {
     pub allowed_tool_runner_incarnations: Vec<ToolRunnerIncarnationBinding>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TargetRoleLens {
+    pub role_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolset_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolset_description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_identity_addendum: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_manifest: Option<String>,
+    #[serde(default)]
+    pub allowed_skills: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RememberedRoleHandoffReflex {
     target_role: String,
@@ -852,6 +867,10 @@ struct RememberedRoleHandoffReflex {
     preference_key: Option<String>,
     success_count: u64,
     reinforced: bool,
+    toolset_profile: Option<String>,
+    role_identity_addendum: Option<String>,
+    role_manifest_excerpt: Option<String>,
+    allowed_skills: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -2198,6 +2217,33 @@ impl SessionState {
                         .and_then(serde_json::Value::as_str)
                         .map(|state| state == "reinforced")
                         .unwrap_or(false),
+                    toolset_profile: layer
+                        .get("config")
+                        .and_then(|config| config.get("toolset_profile"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    role_identity_addendum: layer
+                        .get("config")
+                        .and_then(|config| config.get("role_identity_addendum"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    role_manifest_excerpt: layer
+                        .get("config")
+                        .and_then(|config| config.get("role_manifest_excerpt"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    allowed_skills: layer
+                        .get("config")
+                        .and_then(|config| config.get("allowed_skills"))
+                        .and_then(serde_json::Value::as_array)
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(serde_json::Value::as_str)
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                 })
             })
             .collect()
@@ -2742,13 +2788,27 @@ impl SessionState {
                 .map(|reflex| {
                     if self.role_handoff_reflex_is_expressed(&reflex) {
                         format!(
-                            "{}-shaped work often hands off to role '{}' (evidence={})",
-                            reflex.trigger_class, reflex.target_role, reflex.success_count
+                            "{}-shaped work often hands off to role '{}'{} (evidence={})",
+                            reflex.trigger_class,
+                            reflex.target_role,
+                            reflex
+                                .toolset_profile
+                                .as_deref()
+                                .map(|profile| format!(" via toolset {}", profile))
+                                .unwrap_or_default(),
+                            reflex.success_count
                         )
                     } else {
                         format!(
-                            "{}-shaped work may want handoff to role '{}' (evidence={})",
-                            reflex.trigger_class, reflex.target_role, reflex.success_count
+                            "{}-shaped work may want handoff to role '{}'{} (evidence={})",
+                            reflex.trigger_class,
+                            reflex.target_role,
+                            reflex
+                                .role_manifest_excerpt
+                                .as_deref()
+                                .map(|excerpt| format!(" because {}", excerpt))
+                                .unwrap_or_default(),
+                            reflex.success_count
                         )
                     }
                 })
@@ -3097,6 +3157,7 @@ impl SessionState {
         initiating_turn_id: &str,
         handoff_reason: &str,
         return_to: Option<String>,
+        target_role_lens: Option<&TargetRoleLens>,
     ) -> HandoffBundle {
         let active_goal = self
             .active_turn
@@ -3127,6 +3188,20 @@ impl SessionState {
         if self.approval_policy.auto_approve_all {
             relevant_session_facts.push("approval=preapproved".into());
         }
+        if let Some(lens) = target_role_lens {
+            if let Some(toolset_profile) = lens.toolset_profile.as_deref() {
+                relevant_session_facts.push(format!("target_toolset_profile={toolset_profile}"));
+            }
+            if !lens.allowed_skills.is_empty() {
+                relevant_session_facts.push(format!(
+                    "target_allowed_skills={}",
+                    lens.allowed_skills.join(",")
+                ));
+            }
+            if lens.role_manifest.is_some() {
+                relevant_session_facts.push("target_role_manifest=present".into());
+            }
+        }
 
         let from_role = self
             .role_activation
@@ -3134,11 +3209,46 @@ impl SessionState {
             .map(|r| r.role_name.clone())
             .or_else(|| Some("orchestrator".into()));
 
+        let role_lens_summary = target_role_lens
+            .map(|lens| {
+                let mut parts = Vec::new();
+                if let Some(toolset_profile) = lens.toolset_profile.as_deref() {
+                    parts.push(format!("toolset={toolset_profile}"));
+                }
+                if let Some(addendum) = lens.role_identity_addendum.as_deref() {
+                    parts.push(format!("identity_addendum={addendum}"));
+                }
+                if let Some(manifest) = lens
+                    .role_manifest
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                {
+                    let excerpt: String = manifest.chars().take(180).collect();
+                    parts.push(format!("manifest_excerpt={excerpt}"));
+                }
+                if !lens.allowed_skills.is_empty() {
+                    parts.push(format!("allowed_skills={}", lens.allowed_skills.join(",")));
+                }
+                (!parts.is_empty()).then_some(parts.join(" | "))
+            })
+            .flatten();
+
         HandoffBundle {
-            goal: format!("Switch active role to {target_role} for this session."),
+            goal: format!(
+                "Switch active role to {target_role} for this session{}.",
+                role_lens_summary
+                    .as_deref()
+                    .map(|summary| format!(" using role lens [{summary}]"))
+                    .unwrap_or_default()
+            ),
             context_excerpt: format!(
-                "Same-identity role handoff requested. Current summary: {}",
-                self.summary_text()
+                "Same-identity role handoff requested. Current summary: {}{}",
+                self.summary_text(),
+                role_lens_summary
+                    .as_deref()
+                    .map(|summary| format!("\nTarget role lens: {summary}"))
+                    .unwrap_or_default()
             ),
             session_id: self.session_id.clone(),
             initiating_turn_id: initiating_turn_id.to_string(),
@@ -3150,6 +3260,10 @@ impl SessionState {
             active_constraints: vec![
                 format!("transport_source={}", self.source),
                 "same_identity_role_handoff".into(),
+                target_role_lens
+                    .and_then(|lens| lens.toolset_profile.as_deref())
+                    .map(|profile| format!("target_toolset_profile={profile}"))
+                    .unwrap_or_else(|| "target_toolset_profile=unknown".into()),
             ],
             relevant_session_facts,
             working_summary,
@@ -5441,6 +5555,7 @@ mod tests {
             "turn-handoff-1",
             "manual_role_switch",
             Some("orchestrator".into()),
+            None,
         );
 
         assert_eq!(bundle.handoff_reason.as_deref(), Some("manual_role_switch"));
@@ -5462,6 +5577,70 @@ mod tests {
             bundle
                 .cleanup_actions
                 .contains(&"persist_role_local_working_state".to_string())
+        );
+    }
+
+    #[test]
+    fn same_identity_handoff_bundle_includes_target_role_lens_context() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.start_turn(WorkingTurn {
+            task_id: Uuid::nil(),
+            turn_id: "turn-handoff-2".into(),
+            chat_id: "123".into(),
+            user_content: "implement the fix".into(),
+            final_reply_to: "local-aiua-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase: TurnPhase::WaitingModel,
+            iteration: 1,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
+            active_plan: None,
+            consecutive_step_failures: 0,
+            provider_repair_note: None,
+            provider_repair_attempts: 0,
+            pending_text_reply: None,
+            had_voice_input: false,
+            turn_routing_plan: None,
+            awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
+        });
+
+        let bundle = state.build_same_identity_handoff_bundle(
+            "developer",
+            "turn-handoff-2",
+            "manual_role_switch",
+            Some("orchestrator".into()),
+            Some(&crate::session::TargetRoleLens {
+                role_name: "developer".into(),
+                toolset_profile: Some("codex".into()),
+                toolset_description: Some(
+                    "Codex specialist role profile — workspace read access.".into(),
+                ),
+                role_identity_addendum: Some("Focus on implementation and code changes.".into()),
+                role_manifest: Some(
+                    "Developer role: focus on implementation, code changes, and concrete patches."
+                        .into(),
+                ),
+                allowed_skills: vec!["handoff.back".into()],
+            }),
+        );
+
+        assert!(bundle.goal.contains("toolset=codex"));
+        assert!(bundle.context_excerpt.contains("Target role lens:"));
+        assert!(bundle.context_excerpt.contains("manifest_excerpt="));
+        assert!(
+            bundle
+                .relevant_session_facts
+                .contains(&"target_toolset_profile=codex".to_string())
+        );
+        assert!(
+            bundle
+                .relevant_session_facts
+                .contains(&"target_allowed_skills=handoff.back".to_string())
         );
     }
 

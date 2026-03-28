@@ -2183,6 +2183,24 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             skill_name: "handoff.to_role".into(),
             description: "Handoff to a specialist role cleanly, explicitly transferring context, goals, and known constraints so the target can start work immediately without thrashing.".into(),
             implied_tools: vec!["session.status".into()],
+            validation_state: ansible_mesh_core::graph::SkillValidationState::Validated,
+            field_sources: serde_json::json!({
+                "required_inputs": [
+                    "target_role.role_name",
+                    "target_role.toolset_profile",
+                    "target_role.role_manifest_or_identity_addendum",
+                    "current_turn.active_goal_or_summary"
+                ],
+                "workflow_note": "Use the target role's manifest, toolset profile, and role rules as the primary lens for handoff intent assembly rather than ad hoc trigger inference.",
+                "handoff_packet_fields": [
+                    "goal",
+                    "context_excerpt",
+                    "active_constraints",
+                    "relevant_session_facts",
+                    "expected_return_mode",
+                    "cleanup_actions"
+                ]
+            }),
             skill_markers: vec!["workflow".into(), "governed".into()],
             ..Default::default()
         },

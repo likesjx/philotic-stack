@@ -5767,6 +5767,13 @@ impl IpcServer {
                         std::fs::create_dir_all(parent)?;
                     }
                     let storage = SqliteAgentGraphStorage::open(&agent_id, &path)?;
+                    let role_record = graph.get_role_incarnation(&agent_id, &role_name)?;
+                    let toolset_profile = role_record
+                        .as_ref()
+                        .map(|role| role.toolset_profile.clone());
+                    let toolset_record = toolset_profile.as_deref().and_then(|profile_name| {
+                        graph.get_toolset_profile(profile_name).ok().flatten()
+                    });
                     let preference_key = format!("same-self-role-handoff:{role_name}");
                     let existing = storage.get_reflex_preference(&preference_key)?;
                     let previous_count = existing
@@ -5779,6 +5786,72 @@ impl IpcServer {
                     let existing_precedence =
                         existing.as_ref().map(|pref| pref.precedence).unwrap_or(70);
                     let updated_at = existing.as_ref().map(|pref| pref.updated_at).unwrap_or(0);
+                    let existing_config = existing
+                        .as_ref()
+                        .map(|pref| pref.config_json.clone())
+                        .unwrap_or_default();
+                    let toolset_profile = toolset_profile.or_else(|| {
+                        existing_config
+                            .get("toolset_profile")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    });
+                    let toolset_description = toolset_record
+                        .as_ref()
+                        .and_then(|profile| profile.description.clone())
+                        .or_else(|| {
+                            existing_config
+                                .get("toolset_description")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string)
+                        });
+                    let allowed_skills = toolset_record
+                        .as_ref()
+                        .map(|profile| profile.allowed_skills.clone())
+                        .filter(|skills| !skills.is_empty())
+                        .or_else(|| {
+                            existing_config
+                                .get("allowed_skills")
+                                .and_then(serde_json::Value::as_array)
+                                .map(|skills| {
+                                    skills
+                                        .iter()
+                                        .filter_map(serde_json::Value::as_str)
+                                        .map(str::to_string)
+                                        .collect::<Vec<_>>()
+                                })
+                                .filter(|skills| !skills.is_empty())
+                        })
+                        .unwrap_or_default();
+                    let role_identity_addendum = role_record
+                        .as_ref()
+                        .and_then(|role| role.role_identity_addendum.clone())
+                        .or_else(|| {
+                            existing_config
+                                .get("role_identity_addendum")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string)
+                        });
+                    let role_manifest_excerpt = role_record
+                        .as_ref()
+                        .and_then(|role| role.role_manifest.as_deref())
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty())
+                        .map(|text| text.chars().take(180).collect::<String>())
+                        .or_else(|| {
+                            existing_config
+                                .get("role_manifest_excerpt")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string)
+                        });
+                    let manifest_instructed = role_record
+                        .as_ref()
+                        .and_then(|role| role.role_manifest.as_ref())
+                        .is_some()
+                        || existing_config
+                            .get("manifest_instructed")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
 
                     storage.upsert_reflex_preference(&AgentReflexPreference {
                         agent_id: agent_id.clone(),
@@ -5798,6 +5871,13 @@ impl IpcServer {
                             "trigger_class": trigger_class,
                             "source_tool": "handoff.to_role",
                             "source_turn": source_turn,
+                            "toolset_profile": toolset_profile,
+                            "toolset_description": toolset_description,
+                            "allowed_skills": allowed_skills,
+                            "role_identity_addendum": role_identity_addendum,
+                            "role_manifest_excerpt": role_manifest_excerpt,
+                            "workflow_skill": "handoff.to_role",
+                            "manifest_instructed": manifest_instructed,
                             "success_count": success_count,
                             "habit_state": if reinforced { "reinforced" } else { "candidate" },
                         }),
@@ -9061,8 +9141,41 @@ mod tests {
         let agent_id = "agent-jane-01";
         let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
-        let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        graph
+            .upsert_toolset_profile(&ansible_mesh_core::graph::ToolsetProfileRecord {
+                profile_name: "codex".into(),
+                allowed_tools: vec!["session.status".into(), "workspace.read".into()],
+                allowed_classes: vec!["session".into(), "workspace".into()],
+                allowed_skills: vec!["handoff.back".into()],
+                description: Some("Codex specialist role profile — workspace read access.".into()),
+            })
+            .expect("seed toolset profile");
+        graph
+            .upsert_role_incarnation(&ansible_mesh_core::graph::RoleIncarnationRecord {
+                agent_id: agent_id.into(),
+                role_name: "developer".into(),
+                guest_id: format!("{agent_id}:developer"),
+                toolset_profile: "codex".into(),
+                role_identity_addendum: Some("Focus on implementation and code changes.".into()),
+                role_manifest: Some(
+                    "Developer role: focus on implementation, code changes, and concrete patches."
+                        .into(),
+                ),
+                is_admin: false,
+                readiness_state: ansible_mesh_core::graph::RoleReadinessState::Configured,
+                inactive_ttl_seconds: None,
+                turn_loop_config: ansible_mesh_core::graph::TurnLoopConfig::default(),
+            })
+            .expect("seed role incarnation");
 
         if let Some(parent) = Path::new(&graph_db_path).parent() {
             std::fs::create_dir_all(parent).expect("create agent graph parent");
@@ -15558,7 +15671,34 @@ mod tests {
         let agent_id = "agent-role-reflex-01";
         let graph_db_path = graph_db_template.replace("{agent_id}", agent_id);
         let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(8);
-        let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_toolset_profile(&ansible_mesh_core::graph::ToolsetProfileRecord {
+                profile_name: "codex".into(),
+                allowed_tools: vec!["workspace.read".into()],
+                allowed_classes: vec!["workflow".into()],
+                allowed_skills: vec!["handoff.back".into()],
+                description: Some("Implementation-focused role lens.".into()),
+            })
+            .expect("toolset profile should seed");
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: agent_id.into(),
+                role_name: "developer".into(),
+                guest_id: format!("{agent_id}:developer"),
+                toolset_profile: "codex".into(),
+                role_identity_addendum: Some("Focus on implementation and code changes.".into()),
+                role_manifest: Some(
+                    "Use the developer role lens to focus on implementation, code changes, and debugging."
+                        .into(),
+                ),
+                is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig::default(),
+            })
+            .expect("role incarnation should seed");
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -15600,6 +15740,12 @@ mod tests {
             .expect("stored role reflex pref");
         assert_eq!(pref.config_json["success_count"], 2);
         assert_eq!(pref.config_json["habit_state"], "reinforced");
+        assert_eq!(pref.config_json["toolset_profile"], "codex");
+        assert_eq!(pref.config_json["allowed_skills"][0], "handoff.back");
+        assert_eq!(
+            pref.config_json["role_identity_addendum"],
+            "Focus on implementation and code changes."
+        );
         assert_eq!(
             pref.reflexes_json["role_handoff_reflex"]["trigger_class"],
             "implementation"
