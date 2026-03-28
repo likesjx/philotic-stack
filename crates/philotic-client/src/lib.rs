@@ -786,6 +786,14 @@ pub enum IpcRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context_window_policy: Option<String>,
     },
+    /// Execute a governed workflow through the hotel's workflow plane.
+    ExecuteWorkflow {
+        workflow_name: String,
+        agent_id: String,
+        /// The active persona role of the calling agent (e.g. "orchestrator").
+        calling_role: String,
+        arguments: serde_json::Value,
+    },
     /// Write a config value to the hotel's context graph (operator/management only).
     SetConfig {
         key: String,
@@ -1100,6 +1108,12 @@ pub enum IpcResponse {
     /// Response to [`IpcRequest::ConfigureRole`].
     ConfigureRoleOk {
         role_name: String,
+    },
+    /// Response to [`IpcRequest::ExecuteWorkflow`].
+    WorkflowExecutionOk {
+        workflow_name: String,
+        #[serde(default)]
+        result: serde_json::Value,
     },
     Error(String),
     Standard {

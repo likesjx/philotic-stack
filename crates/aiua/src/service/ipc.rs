@@ -3051,6 +3051,211 @@ impl IpcServer {
         Ok(readiness)
     }
 
+    async fn configure_role_record(
+        graph: &GraphDomain,
+        inboxes: &InboxRegistry,
+        materialization_requester: Option<&dyn GuestMaterializationRequester>,
+        local_node_id: &str,
+        current_identity: Option<&GuestIdentity>,
+        agent_id: String,
+        role_name: String,
+        guest_id: String,
+        calling_role: String,
+        toolset_profile: String,
+        role_identity_addendum: Option<String>,
+        role_manifest: Option<String>,
+        is_admin: bool,
+        inactive_ttl_seconds: Option<u64>,
+        iteration_cap: Option<u32>,
+        approval_policy: Option<String>,
+        model_profile: Option<String>,
+        context_window_policy: Option<String>,
+    ) -> IpcResponse {
+        let Some(identity) = current_identity else {
+            return IpcResponse::error(
+                "configure_role",
+                "CONFIGURE_UNREGISTERED",
+                "guest must register before configuring roles",
+            );
+        };
+        if calling_role != "orchestrator" {
+            return IpcResponse::error(
+                "configure_role",
+                "CONFIGURE_FORBIDDEN",
+                "only agents operating in the orchestrator persona may configure role incarnations",
+            );
+        }
+        if !identity.guest_id.starts_with(&agent_id) {
+            return IpcResponse::error(
+                "configure_role",
+                "CONFIGURE_FORBIDDEN",
+                "orchestrator guests may only configure roles for their own agent identity",
+            );
+        }
+        let caller_agent_id = identity
+            .guest_id
+            .strip_suffix(&format!(":{}", identity.role))
+            .unwrap_or(&identity.guest_id);
+        let caller_is_admin = graph
+            .get_role_incarnation(caller_agent_id, &identity.role)
+            .ok()
+            .flatten()
+            .map(|r| r.is_admin)
+            .unwrap_or(false);
+
+        if role_name == "orchestrator" && !caller_is_admin {
+            return IpcResponse::error(
+                "configure_role",
+                "CONFIGURE_FORBIDDEN",
+                "the orchestrator role record is operator-owned; only admin roles may update it",
+            );
+        }
+
+        if is_admin && !caller_is_admin {
+            return IpcResponse::error(
+                "configure_role",
+                "CONFIGURE_FORBIDDEN",
+                "only admin roles may create other admin roles",
+            );
+        }
+
+        let previous = graph
+            .get_role_incarnation(&agent_id, &role_name)
+            .ok()
+            .flatten();
+        let is_new_role = previous.is_none();
+        let record = ansible_mesh_core::graph::RoleIncarnationRecord {
+            agent_id: agent_id.clone(),
+            role_name: role_name.clone(),
+            guest_id,
+            toolset_profile,
+            role_identity_addendum,
+            role_manifest,
+            is_admin,
+            readiness_state: graph
+                .get_role_incarnation(&agent_id, &role_name)
+                .ok()
+                .flatten()
+                .map(|record| record.readiness_state)
+                .unwrap_or_default(),
+            inactive_ttl_seconds,
+            turn_loop_config: ansible_mesh_core::graph::TurnLoopConfig {
+                iteration_cap,
+                approval_policy,
+                model_profile,
+                context_window_policy,
+                loop_script: None,
+            },
+        };
+
+        if let Err(e) = graph.upsert_role_incarnation(&record) {
+            warn!("Failed to persist role config [{}]: {}", role_name, e);
+            return IpcResponse::error(
+                "configure_role",
+                "ROLE_PERSIST_FAILED",
+                format!("Failed to persist role config: {e}"),
+            );
+        }
+
+        info!(
+            agent_id = %agent_id,
+            role_name = %role_name,
+            "Role incarnation configured via IPC"
+        );
+
+        let breaking_change = previous.as_ref().is_some_and(|existing| {
+            existing.guest_id != record.guest_id
+                || existing.toolset_profile != record.toolset_profile
+                || existing.role_manifest != record.role_manifest
+                || existing.turn_loop_config.model_profile != record.turn_loop_config.model_profile
+        });
+
+        if is_new_role || breaking_change {
+            if let Err(err) = graph.set_role_incarnation_readiness(
+                &agent_id,
+                &role_name,
+                RoleReadinessState::Configured,
+            ) {
+                warn!(
+                    "Failed to reset readiness for role [{}] before materialization: {}",
+                    role_name, err
+                );
+            }
+            let manifest = match Self::role_worker_manifest(graph, local_node_id, &record) {
+                Ok(manifest) => manifest,
+                Err(err) => {
+                    return IpcResponse::error(
+                        "configure_role",
+                        "ROLE_COMPONENT_CONFIG_FAILED",
+                        err.to_string(),
+                    );
+                }
+            };
+            match Self::handle_register_component(graph, materialization_requester, manifest).await
+            {
+                IpcResponse::ComponentRegistered { .. }
+                | IpcResponse::Standard { ok: true, .. } => {}
+                IpcResponse::Error(msg) => {
+                    return IpcResponse::error(
+                        "configure_role",
+                        "ROLE_COMPONENT_REGISTER_FAILED",
+                        msg,
+                    );
+                }
+                other => {
+                    return IpcResponse::error(
+                        "configure_role",
+                        "ROLE_COMPONENT_REGISTER_FAILED",
+                        format!("unexpected role worker registration response: {other:?}"),
+                    );
+                }
+            }
+            if breaking_change {
+                match Self::handle_restart_component(
+                    graph,
+                    materialization_requester,
+                    local_node_id,
+                    &record.guest_id,
+                )
+                .await
+                {
+                    IpcResponse::Standard { ok: true, .. } => {}
+                    IpcResponse::Error(msg) => {
+                        return IpcResponse::error(
+                            "configure_role",
+                            "ROLE_COMPONENT_RESTART_FAILED",
+                            msg,
+                        );
+                    }
+                    other => {
+                        return IpcResponse::error(
+                            "configure_role",
+                            "ROLE_COMPONENT_RESTART_FAILED",
+                            format!("unexpected role worker restart response: {other:?}"),
+                        );
+                    }
+                }
+            }
+            if let Err(err) = Self::ensure_role_materialized(
+                graph,
+                inboxes,
+                materialization_requester,
+                local_node_id,
+                &agent_id,
+                &role_name,
+            )
+            .await
+            {
+                warn!(
+                    "Role [{}] was configured but eager materialization failed: {}",
+                    role_name, err
+                );
+            }
+        }
+
+        IpcResponse::ConfigureRoleOk { role_name }
+    }
+
     async fn queue_or_deliver_guest_task(
         graph: &GraphDomain,
         inboxes: &InboxRegistry,
@@ -5045,203 +5250,129 @@ impl IpcServer {
                 model_profile,
                 context_window_policy,
             } => {
-                let Some(identity) = current_identity.as_ref() else {
-                    return IpcResponse::error(
-                        "configure_role",
-                        "CONFIGURE_UNREGISTERED",
-                        "guest must register before configuring roles",
-                    );
-                };
-                // Check the agent's active persona role, not the IPC process type.
-                // The IPC process type is always "agent" for philote — what matters
-                // is the session-level persona role ("orchestrator") passed explicitly.
-                if calling_role != "orchestrator" {
-                    return IpcResponse::error(
-                        "configure_role",
-                        "CONFIGURE_FORBIDDEN",
-                        "only agents operating in the orchestrator persona may configure role incarnations",
-                    );
-                }
-                if !identity.guest_id.starts_with(&agent_id) {
-                    return IpcResponse::error(
-                        "configure_role",
-                        "CONFIGURE_FORBIDDEN",
-                        "orchestrator guests may only configure roles for their own agent identity",
-                    );
-                }
-                // Determine whether the calling guest has admin authority by looking up their
-                // role incarnation record. Only admin roles may update operator-owned records.
-                let caller_agent_id = identity
-                    .guest_id
-                    .strip_suffix(&format!(":{}", identity.role))
-                    .unwrap_or(&identity.guest_id);
-                let caller_is_admin = graph
-                    .get_role_incarnation(caller_agent_id, &identity.role)
-                    .ok()
-                    .flatten()
-                    .map(|r| r.is_admin)
-                    .unwrap_or(false);
-
-                // The orchestrator role record is operator-owned. Only admin roles may update it.
-                if role_name == "orchestrator" && !caller_is_admin {
-                    return IpcResponse::error(
-                        "configure_role",
-                        "CONFIGURE_FORBIDDEN",
-                        "the orchestrator role record is operator-owned; only admin roles may update it",
-                    );
-                }
-
-                // Prevent privilege escalation: only admin roles may create other admin roles.
-                if is_admin && !caller_is_admin {
-                    return IpcResponse::error(
-                        "configure_role",
-                        "CONFIGURE_FORBIDDEN",
-                        "only admin roles may create other admin roles",
-                    );
-                }
-
-                let previous = graph
-                    .get_role_incarnation(&agent_id, &role_name)
-                    .ok()
-                    .flatten();
-                let is_new_role = previous.is_none();
-                let record = ansible_mesh_core::graph::RoleIncarnationRecord {
-                    agent_id: agent_id.clone(),
-                    role_name: role_name.clone(),
+                Self::configure_role_record(
+                    graph,
+                    inboxes,
+                    materialization_requester,
+                    local_node_id,
+                    current_identity.as_ref(),
+                    agent_id,
+                    role_name,
                     guest_id,
+                    calling_role,
                     toolset_profile,
                     role_identity_addendum,
                     role_manifest,
                     is_admin,
-                    readiness_state: graph
-                        .get_role_incarnation(&agent_id, &role_name)
-                        .ok()
-                        .flatten()
-                        .map(|record| record.readiness_state)
-                        .unwrap_or_default(),
                     inactive_ttl_seconds,
-                    turn_loop_config: ansible_mesh_core::graph::TurnLoopConfig {
-                        iteration_cap,
-                        approval_policy,
-                        model_profile,
-                        context_window_policy,
-                        loop_script: None,
-                    },
-                };
-
-                if let Err(e) = graph.upsert_role_incarnation(&record) {
-                    warn!("Failed to persist role config [{}]: {}", role_name, e);
-                    return IpcResponse::error(
-                        "configure_role",
-                        "ROLE_PERSIST_FAILED",
-                        format!("Failed to persist role config: {e}"),
-                    );
-                }
-
-                info!(
-                    agent_id = %agent_id,
-                    role_name = %role_name,
-                    "Role incarnation configured via IPC"
-                );
-
-                let breaking_change = previous.as_ref().is_some_and(|existing| {
-                    existing.guest_id != record.guest_id
-                        || existing.toolset_profile != record.toolset_profile
-                        || existing.role_manifest != record.role_manifest
-                        || existing.turn_loop_config.model_profile
-                            != record.turn_loop_config.model_profile
-                });
-
-                if is_new_role || breaking_change {
-                    if let Err(err) = graph.set_role_incarnation_readiness(
-                        &agent_id,
-                        &role_name,
-                        RoleReadinessState::Configured,
-                    ) {
-                        warn!(
-                            "Failed to reset readiness for role [{}] before materialization: {}",
-                            role_name, err
+                    iteration_cap,
+                    approval_policy,
+                    model_profile,
+                    context_window_policy,
+                )
+                .await
+            }
+            IpcRequest::ExecuteWorkflow {
+                workflow_name,
+                agent_id,
+                calling_role,
+                arguments,
+            } => match workflow_name.as_str() {
+                "role.create_or_update" => {
+                    let Some(role_name) = arguments
+                        .get("role_name")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                    else {
+                        return IpcResponse::error(
+                            "execute_workflow",
+                            "WORKFLOW_ARGUMENT_INVALID",
+                            "role.create_or_update requires role_name",
+                        );
+                    };
+                    let Some(toolset_profile) = arguments
+                        .get("toolset_profile")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                    else {
+                        return IpcResponse::error(
+                            "execute_workflow",
+                            "WORKFLOW_ARGUMENT_INVALID",
+                            "role.create_or_update requires toolset_profile",
+                        );
+                    };
+                    if !arguments.get("reasoning").is_some_and(|v| v.is_object()) {
+                        return IpcResponse::error(
+                            "execute_workflow",
+                            "WORKFLOW_ARGUMENT_INVALID",
+                            "role.create_or_update requires reasoning object",
                         );
                     }
-                    let manifest = match Self::role_worker_manifest(graph, local_node_id, &record) {
-                        Ok(manifest) => manifest,
-                        Err(err) => {
-                            return IpcResponse::error(
-                                "configure_role",
-                                "ROLE_COMPONENT_CONFIG_FAILED",
-                                err.to_string(),
-                            );
-                        }
-                    };
-                    match Self::handle_register_component(
-                        graph,
-                        materialization_requester,
-                        manifest,
-                    )
-                    .await
-                    {
-                        IpcResponse::ComponentRegistered { .. }
-                        | IpcResponse::Standard { ok: true, .. } => {}
-                        IpcResponse::Error(msg) => {
-                            return IpcResponse::error(
-                                "configure_role",
-                                "ROLE_COMPONENT_REGISTER_FAILED",
-                                msg,
-                            );
-                        }
-                        other => {
-                            return IpcResponse::error(
-                                "configure_role",
-                                "ROLE_COMPONENT_REGISTER_FAILED",
-                                format!("unexpected role worker registration response: {other:?}"),
-                            );
-                        }
-                    }
-                    if breaking_change {
-                        match Self::handle_restart_component(
-                            graph,
-                            materialization_requester,
-                            local_node_id,
-                            &record.guest_id,
-                        )
-                        .await
-                        {
-                            IpcResponse::Standard { ok: true, .. } => {}
-                            IpcResponse::Error(msg) => {
-                                return IpcResponse::error(
-                                    "configure_role",
-                                    "ROLE_COMPONENT_RESTART_FAILED",
-                                    msg,
-                                );
-                            }
-                            other => {
-                                return IpcResponse::error(
-                                    "configure_role",
-                                    "ROLE_COMPONENT_RESTART_FAILED",
-                                    format!("unexpected role worker restart response: {other:?}"),
-                                );
-                            }
-                        }
-                    }
-                    if let Err(err) = Self::ensure_role_materialized(
+                    let guest_id = arguments
+                        .get("guest_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("{agent_id}:{role_name}"));
+                    let response = Self::configure_role_record(
                         graph,
                         inboxes,
                         materialization_requester,
                         local_node_id,
-                        &agent_id,
-                        &role_name,
+                        current_identity.as_ref(),
+                        agent_id,
+                        role_name.clone(),
+                        guest_id,
+                        calling_role,
+                        toolset_profile,
+                        arguments
+                            .get("role_identity_addendum")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                        arguments
+                            .get("role_manifest")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                        arguments
+                            .get("is_admin")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
+                        arguments
+                            .get("inactive_ttl_seconds")
+                            .and_then(|v| v.as_u64()),
+                        arguments
+                            .get("iteration_cap")
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as u32),
+                        arguments
+                            .get("approval_policy")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                        arguments
+                            .get("model_profile")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                        arguments
+                            .get("context_window_policy")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
                     )
-                    .await
-                    {
-                        warn!(
-                            "Role [{}] was configured but eager materialization failed: {}",
-                            role_name, err
-                        );
+                    .await;
+                    match response {
+                        IpcResponse::ConfigureRoleOk { role_name } => {
+                            IpcResponse::WorkflowExecutionOk {
+                                workflow_name,
+                                result: serde_json::json!({ "role_name": role_name }),
+                            }
+                        }
+                        other => other,
                     }
                 }
-
-                IpcResponse::ConfigureRoleOk { role_name }
-            }
+                _ => IpcResponse::error(
+                    "execute_workflow",
+                    "WORKFLOW_UNKNOWN",
+                    format!("unknown workflow [{workflow_name}]"),
+                ),
+            },
             IpcRequest::RegisterSkill {
                 skill_name,
                 description,
@@ -19325,6 +19456,101 @@ mod tests {
         match resp {
             IpcResponse::ConfigureRoleOk { role_name } => assert_eq!(role_name, "developer"),
             other => panic!("expected ConfigureRoleOk, got {:?}", other),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_role_create_workflow_persists_config_successfully() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _) = mpsc::channel(8);
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+            })
+            .expect("seed local hotel");
+        let requester = Arc::new(MockMaterializationRequester::default());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        )
+        .with_materialization_requester(requester);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut orchestrator = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane-01:orchestrator".into(),
+            role: "orchestrator".into(),
+            supported_tools: vec![],
+        })
+        .await
+        .expect("orchestrator connect");
+
+        let resp = orchestrator
+            .send_request(IpcRequest::ExecuteWorkflow {
+                workflow_name: "role.create_or_update".into(),
+                agent_id: "agent-jane-01".into(),
+                calling_role: "orchestrator".into(),
+                arguments: serde_json::json!({
+                    "role_name": "developer",
+                    "toolset_profile": "developer",
+                    "role_identity_addendum": "Addendum",
+                    "inactive_ttl_seconds": 60,
+                    "iteration_cap": 10,
+                    "approval_policy": "auto",
+                    "model_profile": "fast",
+                    "context_window_policy": "standard",
+                    "reasoning": {
+                        "purpose": "Focused implementation role.",
+                        "toolset_rationale": "Use developer posture.",
+                        "handoff_posture_and_limits": "Return when done."
+                    }
+                }),
+            })
+            .await
+            .expect("workflow request");
+
+        match resp {
+            IpcResponse::WorkflowExecutionOk {
+                workflow_name,
+                result,
+            } => {
+                assert_eq!(workflow_name, "role.create_or_update");
+                assert_eq!(result["role_name"].as_str(), Some("developer"));
+            }
+            other => panic!("expected WorkflowExecutionOk, got {:?}", other),
         }
 
         unsafe {

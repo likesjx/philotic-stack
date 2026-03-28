@@ -5929,24 +5929,95 @@ impl AgentRuntime {
                     .map(|r| r.role_name.clone())
                     .unwrap_or_else(|| "orchestrator".to_string());
 
-                let req = IpcRequest::ConfigureRole {
-                    agent_id: self.agent_id.clone(),
-                    role_name: role_name.clone(),
-                    guest_id: format!("{}:{}", self.agent_id, role_name),
-                    calling_role,
-                    toolset_profile,
-                    role_identity_addendum,
-                    role_manifest,
-                    is_admin,
-                    inactive_ttl_seconds,
-                    iteration_cap,
-                    approval_policy,
-                    model_profile,
-                    context_window_policy,
+                let req = if tool_surface == "role.create_or_update" {
+                    IpcRequest::ExecuteWorkflow {
+                        workflow_name: "role.create_or_update".into(),
+                        agent_id: self.agent_id.clone(),
+                        calling_role,
+                        arguments: serde_json::json!({
+                            "role_name": role_name.clone(),
+                            "guest_id": format!("{}:{}", self.agent_id, role_name),
+                            "toolset_profile": toolset_profile,
+                            "role_identity_addendum": role_identity_addendum,
+                            "role_manifest": role_manifest,
+                            "is_admin": is_admin,
+                            "inactive_ttl_seconds": inactive_ttl_seconds,
+                            "iteration_cap": iteration_cap,
+                            "approval_policy": approval_policy,
+                            "model_profile": model_profile,
+                            "context_window_policy": context_window_policy,
+                            "reasoning": args.get("reasoning").cloned().unwrap_or(serde_json::json!({}))
+                        }),
+                    }
+                } else {
+                    IpcRequest::ConfigureRole {
+                        agent_id: self.agent_id.clone(),
+                        role_name: role_name.clone(),
+                        guest_id: format!("{}:{}", self.agent_id, role_name),
+                        calling_role,
+                        toolset_profile,
+                        role_identity_addendum,
+                        role_manifest,
+                        is_admin,
+                        inactive_ttl_seconds,
+                        iteration_cap,
+                        approval_policy,
+                        model_profile,
+                        context_window_policy,
+                    }
                 };
 
                 let (content, tool_err) = match self.ipc_client.send_request(req).await {
                     Ok(IpcResponse::ConfigureRoleOk { role_name: name }) => {
+                        self.configured_roles.insert(
+                            name.clone(),
+                            CachedRoleConfig {
+                                toolset_profile: args
+                                    .get("toolset_profile")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("default")
+                                    .to_string(),
+                                role_identity_addendum: args
+                                    .get("role_identity_addendum")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string),
+                                role_manifest: args
+                                    .get("role_manifest")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string),
+                                iteration_cap: args
+                                    .get("iteration_cap")
+                                    .and_then(|v| v.as_u64())
+                                    .map(|v| v as u32),
+                                approval_policy: args
+                                    .get("approval_policy")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string),
+                                turn_loop_config: args
+                                    .get("turn_loop_config")
+                                    .and_then(|v| {
+                                        serde_json::from_value::<
+                                            ansible_mesh_core::graph::TurnLoopConfig,
+                                        >(v.clone())
+                                        .ok()
+                                    })
+                                    .unwrap_or_default(),
+                            },
+                        );
+                        (
+                            format!("Successfully configured role incarnation for '{}'.", name),
+                            None,
+                        )
+                    }
+                    Ok(IpcResponse::WorkflowExecutionOk {
+                        workflow_name: _,
+                        result,
+                    }) => {
+                        let name = result
+                            .get("role_name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(&role_name)
+                            .to_string();
                         self.configured_roles.insert(
                             name.clone(),
                             CachedRoleConfig {

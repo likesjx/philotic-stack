@@ -92,7 +92,7 @@ The graph now also has its first real `WorkflowSkillRecord` seeds for:
 
 For the role seam, the hotel no longer keeps that catalog truth only as hand-maintained Rust literals. The `role.authoring` abstract skill and `role.create_or_update` workflow now compile from repo-local markdown frontmatter embedded into the binary, which keeps installed hotels self-contained without making runtime seeding depend on a live source checkout.
 
-`philote` now also prefers the workflow-shaped prompt surface directly: when both are available, `role.create_or_update` is projected to the model and the low-level `role.configure` tool is suppressed as compatibility residue. Execution still resolves through the existing `ConfigureRole` hotel path, so the workflow is now prompt-real before it is yet a fully separate runtime organ.
+`philote` now also prefers the workflow-shaped prompt surface directly: when both are available, `role.create_or_update` is projected to the model and the low-level `role.configure` tool is suppressed as compatibility residue. The role seam now also has a distinct hotel-side workflow execution plane via `ExecuteWorkflow { workflow_name: "role.create_or_update" }`, though that workflow still resolves internally through the existing role mutation machinery rather than a fully generic workflow executor.
 
 The lifecycle and validation model for delegation skills is now fully defined in [SKILL_LIFECYCLE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SKILL_LIFECYCLE_PROPOSAL.md). That document owns: the `draft → validated → registered → active → deprecated / invalid / suspended` state machine, the three validation layers, `HookKind`, `IdleBehavior`, `SubagentLeaseTerms`, the updated required `SubagentDelegation` fields, new IPC verbs and responses, the field sourcing map, and the `skill-creator` meta-skill and tool contracts.
 
@@ -104,7 +104,7 @@ The lifecycle and validation model for delegation skills is now fully defined in
 
 What is still missing:
 
-- runtime invocation of `WorkflowSkillRecord` separately from the low-level tool surfaces it currently points at
+- a generic runtime invocation plane for `WorkflowSkillRecord` beyond the current role seam
 - role metadata inputs for target selection in `handoff.to_role`
 - explicit peer-delegation and external-cognitive-peer variants
 - invocation/runtime enforcement beyond current handoff IPC
