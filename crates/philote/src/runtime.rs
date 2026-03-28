@@ -86,42 +86,6 @@ fn parse_learned_reflex_writeback(
     }))
 }
 
-fn infer_role_handoff_trigger_class(role_name: &str) -> Option<&'static str> {
-    let normalized = role_name.trim().to_ascii_lowercase();
-    if normalized.is_empty() {
-        return None;
-    }
-    if normalized.contains("dev") || normalized.contains("code") || normalized.contains("implement")
-    {
-        return Some("implementation");
-    }
-    if normalized.contains("research") || normalized.contains("investigat") {
-        return Some("research");
-    }
-    if normalized.contains("anal") || normalized.contains("review") || normalized.contains("audit")
-    {
-        return Some("analysis");
-    }
-    None
-}
-
-fn build_same_self_role_handoff_reflex(role_name: &str) -> Option<LearnedReflexWriteback> {
-    let trigger_class = infer_role_handoff_trigger_class(role_name)?;
-    let role_name = role_name.trim();
-    Some(LearnedReflexWriteback {
-        preference_key: format!("same-self-role-handoff:{role_name}"),
-        precedence: 70,
-        reflexes_json: serde_json::json!({
-            "role_handoff_reflex": {
-                "target_role": role_name,
-                "trigger_class": trigger_class,
-                "source": "successful_same_self_handoff",
-                "tool_name": "handoff.to_role",
-            }
-        }),
-    })
-}
-
 #[cfg(test)]
 const LOCAL_NODE: &str = "local-aiua-01";
 
@@ -6675,7 +6639,6 @@ impl AgentRuntime {
                     ..Default::default()
                 };
 
-                let handoff_reflex = build_same_self_role_handoff_reflex(&role_name);
                 let (content, tool_err) = match self
                     .request_role_handoff_with_backoff(
                         payload.session_id.clone(),
@@ -6687,30 +6650,21 @@ impl AgentRuntime {
                     Ok(IpcResponse::HandoffAck {
                         handoff_guest_id, ..
                     }) => {
-                        if let Some(reflex) = handoff_reflex.as_ref() {
-                            let trigger_class = reflex
-                                .reflexes_json
-                                .get("role_handoff_reflex")
-                                .and_then(|value| value.get("trigger_class"))
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or("implementation")
-                                .to_string();
-                            if let Err(err) = self
-                                .ipc_client
-                                .send_request(IpcRequest::RecordRoleHandoffReflexEvidence {
-                                    agent_id: self.agent_id.clone(),
-                                    role_name: role_name.clone(),
-                                    trigger_class,
-                                    source_turn: Some(payload.turn_id.clone()),
-                                })
-                                .await
-                            {
-                                warn!(
-                                    role_name = %role_name,
-                                    error = %err,
-                                    "Failed to record successful same-self role handoff evidence"
-                                );
-                            }
+                        if let Err(err) = self
+                            .ipc_client
+                            .send_request(IpcRequest::RecordRoleHandoffReflexEvidence {
+                                agent_id: self.agent_id.clone(),
+                                role_name: role_name.clone(),
+                                legacy_trigger_class: None,
+                                source_turn: Some(payload.turn_id.clone()),
+                            })
+                            .await
+                        {
+                            warn!(
+                                role_name = %role_name,
+                                error = %err,
+                                "Failed to record successful same-self role handoff evidence"
+                            );
                         }
                         (
                             format!("Handed off to role '{role_name}' (guest {handoff_guest_id})."),
@@ -8567,23 +8521,6 @@ mod tests {
         .expect_err("parse should fail");
 
         assert!(err.contains("learned_reflex.reflexes must be an object"));
-    }
-
-    #[test]
-    fn build_same_self_role_handoff_reflex_for_developer_role() {
-        let reflex =
-            super::build_same_self_role_handoff_reflex("developer").expect("reflex should exist");
-
-        assert_eq!(reflex.preference_key, "same-self-role-handoff:developer");
-        assert_eq!(reflex.precedence, 70);
-        assert_eq!(
-            reflex.reflexes_json["role_handoff_reflex"]["target_role"],
-            serde_json::json!("developer")
-        );
-        assert_eq!(
-            reflex.reflexes_json["role_handoff_reflex"]["trigger_class"],
-            serde_json::json!("implementation")
-        );
     }
 
     #[test]

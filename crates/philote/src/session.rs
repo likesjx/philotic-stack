@@ -863,7 +863,7 @@ pub struct TargetRoleLens {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RememberedRoleHandoffReflex {
     target_role: String,
-    trigger_class: String,
+    legacy_trigger_class: Option<String>,
     preference_key: Option<String>,
     success_count: u64,
     reinforced: bool,
@@ -871,6 +871,9 @@ struct RememberedRoleHandoffReflex {
     role_identity_addendum: Option<String>,
     role_manifest_excerpt: Option<String>,
     allowed_skills: Vec<String>,
+    manifest_markers: Vec<String>,
+    skill_markers: Vec<String>,
+    toolset_markers: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -2195,13 +2198,59 @@ impl SessionState {
             .filter_map(|layer| {
                 let reflex = layer.get("reflexes")?.get("role_handoff_reflex")?;
                 let target_role = reflex.get("target_role")?.as_str()?.trim();
-                let trigger_class = reflex.get("trigger_class")?.as_str()?.trim();
-                if target_role.is_empty() || trigger_class.is_empty() {
+                let legacy_trigger_class = reflex
+                    .get("trigger_class")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+                let manifest_markers = layer
+                    .get("config")
+                    .and_then(|config| config.get("manifest_markers"))
+                    .and_then(serde_json::Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let skill_markers = layer
+                    .get("config")
+                    .and_then(|config| config.get("skill_markers"))
+                    .and_then(serde_json::Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let toolset_markers = layer
+                    .get("config")
+                    .and_then(|config| config.get("toolset_markers"))
+                    .and_then(serde_json::Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                if target_role.is_empty()
+                    || (legacy_trigger_class.is_none()
+                        && manifest_markers.is_empty()
+                        && skill_markers.is_empty()
+                        && toolset_markers.is_empty())
+                {
                     return None;
                 }
                 Some(RememberedRoleHandoffReflex {
                     target_role: target_role.to_string(),
-                    trigger_class: trigger_class.to_string(),
+                    legacy_trigger_class,
                     preference_key: layer
                         .get("preference_key")
                         .and_then(serde_json::Value::as_str)
@@ -2244,6 +2293,9 @@ impl SessionState {
                                 .collect()
                         })
                         .unwrap_or_default(),
+                    manifest_markers,
+                    skill_markers,
+                    toolset_markers,
                 })
             })
             .collect()
@@ -2264,7 +2316,7 @@ impl SessionState {
                 if !self.role_handoff_reflex_is_expressed(reflex) {
                     return false;
                 }
-                trigger_class_matches_goal(&reflex.trigger_class, normalized)
+                role_handoff_reflex_matches_goal(reflex, normalized)
             })
             .map(|reflex| reflex.target_role)
     }
@@ -2787,9 +2839,10 @@ impl SessionState {
                 .into_iter()
                 .map(|reflex| {
                     if self.role_handoff_reflex_is_expressed(&reflex) {
+                        let marker_summary = remembered_role_receptor_summary(&reflex);
                         format!(
-                            "{}-shaped work often hands off to role '{}'{} (evidence={})",
-                            reflex.trigger_class,
+                            "{} often hands off to role '{}'{} (evidence={})",
+                            marker_summary,
                             reflex.target_role,
                             reflex
                                 .toolset_profile
@@ -2799,9 +2852,10 @@ impl SessionState {
                             reflex.success_count
                         )
                     } else {
+                        let marker_summary = remembered_role_receptor_summary(&reflex);
                         format!(
-                            "{}-shaped work may want handoff to role '{}'{} (evidence={})",
-                            reflex.trigger_class,
+                            "{} may want handoff to role '{}'{} (evidence={})",
+                            marker_summary,
                             reflex.target_role,
                             reflex
                                 .role_manifest_excerpt
@@ -3780,6 +3834,83 @@ fn looks_like_conversational_goal(normalized: &str) -> bool {
 
 fn is_role_reflex_tool(tool_name: &str) -> bool {
     matches!(tool_name, "handoff.to_role" | "handoff.back")
+}
+
+fn remembered_role_receptor_summary(reflex: &RememberedRoleHandoffReflex) -> String {
+    if !reflex.manifest_markers.is_empty() {
+        return format!(
+            "manifest-shaped work ({})",
+            reflex
+                .manifest_markers
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if !reflex.skill_markers.is_empty() {
+        return format!(
+            "skill-shaped work ({})",
+            reflex
+                .skill_markers
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if !reflex.toolset_markers.is_empty() {
+        return format!(
+            "toolset-shaped work ({})",
+            reflex
+                .toolset_markers
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    reflex
+        .legacy_trigger_class
+        .as_deref()
+        .map(|class| format!("{class}-shaped work"))
+        .unwrap_or_else(|| "role-shaped work".into())
+}
+
+fn role_handoff_reflex_matches_goal(
+    reflex: &RememberedRoleHandoffReflex,
+    normalized: &str,
+) -> bool {
+    let goal_tokens = normalized
+        .split_whitespace()
+        .filter(|token| token.len() >= 4)
+        .collect::<Vec<_>>();
+    let has_declared_receptors = !reflex.manifest_markers.is_empty()
+        || !reflex.skill_markers.is_empty()
+        || !reflex.toolset_markers.is_empty();
+    if has_declared_receptors {
+        return reflex
+            .manifest_markers
+            .iter()
+            .chain(reflex.skill_markers.iter())
+            .chain(reflex.toolset_markers.iter())
+            .any(|marker| {
+                normalized.contains(marker)
+                    || goal_tokens.iter().any(|token| {
+                        let min_prefix = token.len().min(marker.len()).min(6);
+                        min_prefix >= 5
+                            && token[..min_prefix].eq_ignore_ascii_case(&marker[..min_prefix])
+                    })
+            });
+    }
+    reflex
+        .legacy_trigger_class
+        .as_deref()
+        .map(|trigger_class| trigger_class_matches_goal(trigger_class, normalized))
+        .unwrap_or(false)
 }
 
 fn trigger_class_matches_goal(trigger_class: &str, normalized: &str) -> bool {
@@ -6168,6 +6299,7 @@ mod tests {
                 "reason": "remembered successful same-self handoff to developer",
                 "role_name": "developer",
                 "trigger_class": "implementation",
+                "manifest_markers": ["implementation", "debugging", "code"],
                 "success_count": 2,
                 "habit_state": "reinforced"
             },
@@ -6202,6 +6334,7 @@ mod tests {
                 "reason": "remembered successful same-self handoff to developer",
                 "role_name": "developer",
                 "trigger_class": "implementation",
+                "manifest_markers": ["implementation", "debugging", "code"],
                 "success_count": 1,
                 "habit_state": "candidate"
             },
@@ -6235,6 +6368,7 @@ mod tests {
                 "reason": "remembered successful same-self handoff to developer",
                 "role_name": "developer",
                 "trigger_class": "implementation",
+                "manifest_markers": ["implementation", "debugging", "code"],
                 "success_count": 1,
                 "habit_state": "candidate"
             },
@@ -6271,6 +6405,8 @@ mod tests {
                 "reason": "remembered successful same-self handoff to developer",
                 "role_name": "developer",
                 "trigger_class": "implementation",
+                "manifest_markers": ["implementation", "debugging", "code"],
+                "toolset_profile": "codex",
                 "success_count": 1,
                 "habit_state": "candidate"
             },
@@ -6287,7 +6423,75 @@ mod tests {
             TurnContextEnvelopeKind::Cognitive,
         );
 
-        assert!(prompt.contains("Remembered role-shift reflexes: implementation-shaped work may want handoff to role 'developer' (evidence=1)."));
+        assert!(prompt.contains(
+            "Remembered role-shift reflexes: manifest-shaped work (implementation, debugging, code) may want handoff to role 'developer' (evidence=1)."
+        ));
+    }
+
+    #[test]
+    fn manifest_marker_role_handoff_reflex_projects_handoff_without_trigger_class() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("handoff.to_role");
+        state.bindings.reflex_policy_agent_layers = vec![serde_json::json!({
+            "policy_scope": "agent_learned",
+            "policy_source": "agent_graph",
+            "origin_class": "agent_learned",
+            "precedence": 70,
+            "preference_key": "same-self-role-handoff:developer",
+            "config": {
+                "reason": "remembered successful same-self handoff to developer",
+                "role_name": "developer",
+                "manifest_markers": ["implementation", "debugging", "code"],
+                "success_count": 2,
+                "habit_state": "reinforced"
+            },
+            "reflexes": {
+                "role_handoff_reflex": {
+                    "target_role": "developer"
+                }
+            }
+        })];
+
+        let projected =
+            state.project_tools_for_turn("Please implement the patch and wire the fix.");
+
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].tool_name, "handoff.to_role");
+    }
+
+    #[test]
+    fn toolset_marker_role_handoff_reflex_projects_handoff_for_named_toolset_work() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("handoff.to_role");
+        state.bindings.reflex_policy_agent_layers = vec![serde_json::json!({
+            "policy_scope": "agent_learned",
+            "policy_source": "agent_graph",
+            "origin_class": "agent_learned",
+            "precedence": 70,
+            "preference_key": "same-self-role-handoff:developer",
+            "config": {
+                "reason": "remembered successful same-self handoff to developer",
+                "role_name": "developer",
+                "toolset_markers": ["codex"],
+                "success_count": 2,
+                "habit_state": "reinforced"
+            },
+            "reflexes": {
+                "role_handoff_reflex": {
+                    "target_role": "developer"
+                }
+            }
+        })];
+
+        let projected =
+            state.project_tools_for_turn("Use the codex developer posture for this change.");
+
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].tool_name, "handoff.to_role");
     }
 
     #[test]

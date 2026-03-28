@@ -92,6 +92,36 @@ const LOCAL_DELIVERY_PROVENANCE_TTL_SECS: u64 = 900;
 #[cfg(test)]
 const LOCAL_DELIVERY_PROVENANCE_TTL_SECS: u64 = 5;
 
+fn normalize_marker_text(text: &str) -> String {
+    text.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch.is_ascii_whitespace() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+}
+
+fn collect_role_receptor_markers(values: &[&str]) -> Vec<String> {
+    let mut markers = BTreeSet::new();
+    const STOPWORDS: &[&str] = &[
+        "the", "and", "for", "with", "from", "that", "this", "into", "role", "focus", "uses",
+        "use", "work", "mode", "lens", "agent", "same", "self", "your", "their",
+    ];
+    for value in values {
+        let normalized = normalize_marker_text(value);
+        for token in normalized.split_whitespace() {
+            if token.len() < 4 || STOPWORDS.contains(&token) {
+                continue;
+            }
+            markers.insert(token.to_string());
+        }
+    }
+    markers.into_iter().collect()
+}
+
 #[derive(Default)]
 struct SessionEnvelope {
     session_id: Option<String>,
@@ -5757,7 +5787,7 @@ impl IpcServer {
             IpcRequest::RecordRoleHandoffReflexEvidence {
                 agent_id,
                 role_name,
-                trigger_class,
+                legacy_trigger_class,
                 source_turn,
             } => {
                 use ansible_mesh_core::agent_graph_storage::AgentReflexPreference;
@@ -5852,6 +5882,77 @@ impl IpcServer {
                             .get("manifest_instructed")
                             .and_then(serde_json::Value::as_bool)
                             .unwrap_or(false);
+                    let manifest_markers = {
+                        let mut sources = Vec::new();
+                        sources.push(role_name.as_str());
+                        if let Some(text) = role_identity_addendum.as_deref() {
+                            sources.push(text);
+                        }
+                        if let Some(text) = role_manifest_excerpt.as_deref() {
+                            sources.push(text);
+                        }
+                        let collected = collect_role_receptor_markers(&sources);
+                        if collected.is_empty() {
+                            existing_config
+                                .get("manifest_markers")
+                                .and_then(serde_json::Value::as_array)
+                                .map(|items| {
+                                    items
+                                        .iter()
+                                        .filter_map(serde_json::Value::as_str)
+                                        .map(str::to_string)
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default()
+                        } else {
+                            collected
+                        }
+                    };
+                    let skill_markers = if !allowed_skills.is_empty() {
+                        collect_role_receptor_markers(
+                            &allowed_skills
+                                .iter()
+                                .map(String::as_str)
+                                .collect::<Vec<_>>(),
+                        )
+                    } else {
+                        existing_config
+                            .get("skill_markers")
+                            .and_then(serde_json::Value::as_array)
+                            .map(|items| {
+                                items
+                                    .iter()
+                                    .filter_map(serde_json::Value::as_str)
+                                    .map(str::to_string)
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default()
+                    };
+                    let toolset_markers = {
+                        let mut sources = Vec::new();
+                        if let Some(text) = toolset_profile.as_deref() {
+                            sources.push(text);
+                        }
+                        if let Some(text) = toolset_description.as_deref() {
+                            sources.push(text);
+                        }
+                        let collected = collect_role_receptor_markers(&sources);
+                        if collected.is_empty() {
+                            existing_config
+                                .get("toolset_markers")
+                                .and_then(serde_json::Value::as_array)
+                                .map(|items| {
+                                    items
+                                        .iter()
+                                        .filter_map(serde_json::Value::as_str)
+                                        .map(str::to_string)
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default()
+                        } else {
+                            collected
+                        }
+                    };
 
                     storage.upsert_reflex_preference(&AgentReflexPreference {
                         agent_id: agent_id.clone(),
@@ -5860,7 +5961,7 @@ impl IpcServer {
                         reflexes_json: serde_json::json!({
                             "role_handoff_reflex": {
                                 "target_role": role_name,
-                                "trigger_class": trigger_class,
+                                "trigger_class": legacy_trigger_class,
                                 "source": "successful_same_self_handoff",
                                 "tool_name": "handoff.to_role",
                             }
@@ -5868,7 +5969,7 @@ impl IpcServer {
                         config_json: serde_json::json!({
                             "reason": format!("remembered successful same-self handoff to role '{role_name}'"),
                             "role_name": role_name,
-                            "trigger_class": trigger_class,
+                            "trigger_class": legacy_trigger_class,
                             "source_tool": "handoff.to_role",
                             "source_turn": source_turn,
                             "toolset_profile": toolset_profile,
@@ -5876,6 +5977,9 @@ impl IpcServer {
                             "allowed_skills": allowed_skills,
                             "role_identity_addendum": role_identity_addendum,
                             "role_manifest_excerpt": role_manifest_excerpt,
+                            "manifest_markers": manifest_markers,
+                            "skill_markers": skill_markers,
+                            "toolset_markers": toolset_markers,
                             "workflow_skill": "handoff.to_role",
                             "manifest_instructed": manifest_instructed,
                             "success_count": success_count,
@@ -15724,7 +15828,7 @@ mod tests {
                 .send_request(IpcRequest::RecordRoleHandoffReflexEvidence {
                     agent_id: agent_id.into(),
                     role_name: "developer".into(),
-                    trigger_class: "implementation".into(),
+                    legacy_trigger_class: Some("implementation".into()),
                     source_turn: Some(turn_id.into()),
                 })
                 .await
@@ -15742,6 +15846,20 @@ mod tests {
         assert_eq!(pref.config_json["habit_state"], "reinforced");
         assert_eq!(pref.config_json["toolset_profile"], "codex");
         assert_eq!(pref.config_json["allowed_skills"][0], "handoff.back");
+        assert!(
+            pref.config_json["manifest_markers"]
+                .as_array()
+                .expect("manifest markers array")
+                .iter()
+                .any(|item| item == "implementation")
+        );
+        assert!(
+            pref.config_json["toolset_markers"]
+                .as_array()
+                .expect("toolset markers array")
+                .iter()
+                .any(|item| item == "codex")
+        );
         assert_eq!(
             pref.config_json["role_identity_addendum"],
             "Focus on implementation and code changes."

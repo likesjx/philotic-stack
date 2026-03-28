@@ -860,7 +860,8 @@ pub enum IpcRequest {
     RecordRoleHandoffReflexEvidence {
         agent_id: String,
         role_name: String,
-        trigger_class: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        legacy_trigger_class: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source_turn: Option<String>,
     },
