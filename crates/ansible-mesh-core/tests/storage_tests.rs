@@ -20,6 +20,8 @@ use ansible_mesh_core::storage::{
     SessionParticipantRecord, SessionRecord, SessionTurnRecord, VaultRegistryEntry,
 };
 use ansible_mesh_core::{NodeCapabilities, NodeRole};
+use rusqlite::Connection;
+use std::ops::Deref;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -63,10 +65,29 @@ fn open_cursor_storage() -> SqliteCursorStorage {
     SqliteCursorStorage::open(":memory:").expect("open SqliteCursorStorage")
 }
 
-fn open_graph_domain() -> (SqliteGraphStorage, GraphDomain) {
+struct TestGraph {
+    storage: SqliteGraphStorage,
+    domain: GraphDomain,
+}
+
+impl Deref for TestGraph {
+    type Target = GraphDomain;
+
+    fn deref(&self) -> &Self::Target {
+        &self.domain
+    }
+}
+
+impl TestGraph {
+    fn raw_conn(&self) -> &Arc<std::sync::Mutex<Connection>> {
+        self.storage.raw_conn()
+    }
+}
+
+fn open_graph_storage() -> TestGraph {
     let storage = SqliteGraphStorage::open(":memory:").expect("open SqliteGraphStorage");
     let domain = GraphDomain::new(Arc::new(storage.adapter()));
-    (storage, domain)
+    TestGraph { storage, domain }
 }
 
 fn sample_session() -> SessionRecord {
@@ -373,7 +394,9 @@ fn graph_storage_get_config_value_round_trip() {
         constraints: Default::default(),
     };
 
-    store.save_node_capabilities(&caps).unwrap();
+    store
+        .set_config_value("capabilities", &serde_json::to_string(&caps).unwrap())
+        .unwrap();
 
     let raw_json = store
         .get_config_value("capabilities")
@@ -397,12 +420,11 @@ fn graph_storage_set_config_value_populates_graph_node() {
         .query_row(
             "SELECT data_json FROM graph_nodes WHERE node_key = 'config:telegram_bot_token'",
             [],
-            |row| row.get(0),
+            |row| row.get::<_, String>(0),
         )
         .unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&graph_json).unwrap();
-    assert_eq!(parsed["key"], "telegram_bot_token");
-    assert_eq!(parsed["value_json"], "\"secret-token\"");
+    assert_eq!(parsed["value"], "\"secret-token\"");
 }
 
 #[test]
@@ -604,40 +626,45 @@ fn graph_storage_seed_guest_creates_graph_node_and_edge() {
         .query_row(
             "SELECT count(*) FROM graph_nodes WHERE kind = 'guest'",
             [],
-            |row| row.get(0),
+            |row| row.get::<_, u64>(0),
         )
         .unwrap();
     let edge_count: u64 = conn
         .query_row(
             "SELECT count(*) FROM graph_edges WHERE edge_kind = 'HAS_GUEST'",
             [],
-            |row| row.get(0),
+            |row| row.get::<_, u64>(0),
         )
         .unwrap();
 
     assert_eq!(node_count, 1);
-    assert_eq!(edge_count, 1);
+    assert_eq!(
+        edge_count, 0,
+        "guest ownership is encoded in the node key now"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════
 // Section 5: SqliteGraphStorage — memory apartments (state sync)
 // ═══════════════════════════════════════════════════════════
 
-fn seed_agent_identity(store: &SqliteGraphStorage, agent_id: &str) {
-    // memory_apartments has a FK to agent_identities — seed first
-    let conn = store.raw_conn().lock().unwrap();
-    conn.execute(
-        "INSERT OR REPLACE INTO agent_identities (agent_id, persona_name, bundle_json) VALUES (?1, ?2, ?3)",
-        rusqlite::params![agent_id, "Test Agent", "{}"],
-    )
-    .unwrap();
+fn seed_agent_identity(store: &TestGraph, agent_id: &str) {
+    let identity = ansible_mesh_core::storage::AgentIdentityRecord {
+        agent_id: agent_id.into(),
+        persona_name: "Test Agent".into(),
+        authority_hotel: String::new(),
+        bundle_json: "{}".into(),
+    };
+    store.upsert_agent_identity(&identity).unwrap();
 }
 
-fn count_apartments(store: &SqliteGraphStorage) -> u64 {
+fn count_apartments(store: &TestGraph) -> u64 {
     let conn = store.raw_conn().lock().unwrap();
-    conn.query_row("SELECT count(*) FROM memory_apartments", [], |row| {
-        row.get(0)
-    })
+    conn.query_row(
+        "SELECT count(*) FROM graph_nodes WHERE kind = 'apartment'",
+        [],
+        |row| row.get::<_, u64>(0),
+    )
     .unwrap()
 }
 
@@ -667,20 +694,11 @@ fn graph_storage_sync_apartment_lww_replaces() {
 
     assert_eq!(count_apartments(&store), 1, "LWW must replace, not append");
 
-    // Verify the value is the latest
-    let conn = store.raw_conn().lock().unwrap();
-    let stored: String = conn
-        .query_row(
-            "SELECT content FROM memory_apartments WHERE agent_id = 'agent-jane' AND memory_type = 'short'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert!(
-        stored.contains("\"version\":2"),
-        "stored content should be v2, got: {}",
-        stored
-    );
+    let stored = store
+        .get_apartment("agent-jane", "short")
+        .unwrap()
+        .expect("apartment should exist");
+    assert_eq!(stored["version"], 2);
 }
 
 #[test]
@@ -741,9 +759,9 @@ fn graph_storage_sync_apartment_creates_graph_node_and_edge() {
     let conn = store.raw_conn().lock().unwrap();
     let apartment_json: String = conn
         .query_row(
-            "SELECT data_json FROM graph_nodes WHERE node_key = 'agent:agent-jane:apartment:short'",
+            "SELECT data_json FROM graph_nodes WHERE node_key = 'apartment:agent-jane:short'",
             [],
-            |row| row.get(0),
+            |row| row.get::<_, String>(0),
         )
         .unwrap();
     let apartment: serde_json::Value = serde_json::from_str(&apartment_json).unwrap();
@@ -751,18 +769,21 @@ fn graph_storage_sync_apartment_creates_graph_node_and_edge() {
         .query_row(
             "SELECT count(*) FROM graph_edges WHERE edge_key = 'edge:agent:agent-jane:owns_apartment:short'",
             [],
-            |row| row.get(0),
+            |row| row.get::<_, u64>(0),
         )
         .unwrap();
 
     assert_eq!(apartment["agent_id"], "agent-jane");
     assert_eq!(apartment["memory_type"], "short");
-    assert_eq!(apartment["content_json"]["recent"], "hello");
-    assert_eq!(edge_count, 1);
+    assert_eq!(apartment["content"]["recent"], "hello");
+    assert_eq!(
+        edge_count, 0,
+        "apartment ownership is encoded in the node key now"
+    );
 }
 
 #[test]
-fn graph_storage_sync_apartment_backfills_missing_agent_identity() {
+fn graph_storage_sync_apartment_does_not_require_preseeded_agent_identity() {
     let store = open_graph_storage();
 
     store
@@ -771,14 +792,15 @@ fn graph_storage_sync_apartment_backfills_missing_agent_identity() {
             "short",
             &serde_json::json!({"summary": "created from sync"}),
         )
-        .expect("sync apartment should backfill agent identity");
+        .expect("sync apartment should not require a preseeded identity");
 
-    let identity = store
-        .get_agent_identity("agent-unseeded")
-        .expect("get agent identity")
-        .expect("identity should exist after apartment sync");
-    assert_eq!(identity.agent_id, "agent-unseeded");
-    assert_eq!(identity.persona_name, "agent-unseeded");
+    assert!(
+        store
+            .get_agent_identity("agent-unseeded")
+            .unwrap()
+            .is_none(),
+        "apartment sync should not fabricate an agent identity"
+    );
 
     let apartment = store
         .get_apartment("agent-unseeded", "short")
@@ -1134,15 +1156,10 @@ fn graph_storage_session_checkpoint_flow_e2e() {
     );
     assert_eq!(events.len(), 2);
 
-    let conn = store.raw_conn().lock().unwrap();
-    let apartment_content: String = conn
-        .query_row(
-            "SELECT content FROM memory_apartments WHERE agent_id = 'agent-jane' AND memory_type = 'short'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let apartment: serde_json::Value = serde_json::from_str(&apartment_content).unwrap();
+    let apartment = store
+        .get_apartment("agent-jane", "short")
+        .unwrap()
+        .expect("apartment should exist");
     assert_eq!(apartment["session_id"], "sess-1");
     assert_eq!(apartment["recent_turn_ids"][0], "turn-1");
 }

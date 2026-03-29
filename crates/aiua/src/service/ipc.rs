@@ -9186,8 +9186,14 @@ mod tests {
                 task_json,
                 ..
             } => {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("payload should decode");
                 assert_eq!(source_node, "local-aiua-01");
-                assert_eq!(task_json, task_payload);
+                assert_eq!(payload["source"], "telegram");
+                assert_eq!(payload["chat_id"], "12345");
+                assert_eq!(payload["content"], "hello from telegram");
+                assert_eq!(payload["delivery_node_id"], "local-aiua-01");
+                assert_eq!(payload["delivery_target_role"], "agent");
             }
             other => panic!("unexpected inbound response: {other:?}"),
         }
@@ -10064,7 +10070,18 @@ mod tests {
         .expect("orchestrator recv should succeed");
         match delivered {
             IpcResponse::InboundTask { task_json, .. } => {
-                assert_eq!(task_json, task_payload);
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("payload should decode");
+                assert_eq!(payload["session_id"], "sess-role-fallback");
+                assert_eq!(payload["source"], "telegram");
+                assert_eq!(payload["chat_id"], "123");
+                assert_eq!(payload["content"], "route to fallback orchestrator");
+                assert_eq!(payload["delivery_node_id"], "local-aiua-01");
+                assert_eq!(payload["delivery_target_role"], "agent");
+                assert_eq!(
+                    payload["delivery_target_guest_id"],
+                    "agent-jane:orchestrator"
+                );
             }
             other => panic!("unexpected orchestrator inbound response: {other:?}"),
         }
@@ -10171,7 +10188,18 @@ mod tests {
         .expect("orchestrator recv should succeed");
         match delivered {
             IpcResponse::InboundTask { task_json, .. } => {
-                assert_eq!(task_json, task_payload);
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("payload should decode");
+                assert_eq!(payload["session_id"], "sess-role-default");
+                assert_eq!(payload["source"], "telegram");
+                assert_eq!(payload["chat_id"], "123");
+                assert_eq!(payload["content"], "route to default orchestrator");
+                assert_eq!(payload["delivery_node_id"], "local-aiua-01");
+                assert_eq!(payload["delivery_target_role"], "agent");
+                assert_eq!(
+                    payload["delivery_target_guest_id"],
+                    "agent-jane:orchestrator"
+                );
             }
             other => panic!("unexpected orchestrator inbound response: {other:?}"),
         }
@@ -10448,7 +10476,16 @@ mod tests {
                 .expect("developer recv should succeed");
         match delivered {
             IpcResponse::InboundTask { task_json, .. } => {
-                assert_eq!(task_json, task_payload);
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("payload should decode");
+                assert_eq!(payload["session_id"], "sess-role-park");
+                assert_eq!(payload["source"], "telegram");
+                assert_eq!(payload["chat_id"], "123");
+                assert_eq!(payload["content"], "park until developer registers");
+                assert_eq!(payload["delivery_hotel"], "local-hotel");
+                assert_eq!(payload["delivery_node_id"], "local-aiua-01");
+                assert_eq!(payload["delivery_target_role"], "agent");
+                assert_eq!(payload["delivery_target_guest_id"], "agent-jane:developer");
             }
             other => panic!("unexpected developer inbound response: {other:?}"),
         }
@@ -14234,6 +14271,8 @@ mod tests {
                 lease_expires_at: None,
                 summary_json: serde_json::json!({
                     "bindings": {
+                        "effective_toolset": ["echo"],
+                        "effective_rights": ["tool.echo"],
                         "allowed_tool_runner_incarnations": [
                             {
                                 "incarnation_id": "tool-runner-remote",
@@ -14258,6 +14297,12 @@ mod tests {
                                 "selection_hint": "local_live_preferred"
                             }
                         ]
+                    }
+                ,
+                    "reflex_overrides": {
+                        "remote_tool_reflex": "allow",
+                        "remote_component_reflex": "allow",
+                        "credential_scope_reflex": "mesh_scoped"
                     }
                 }),
                 created_at: 1,
@@ -14385,6 +14430,8 @@ mod tests {
                 summary_json: serde_json::json!({
                     "bindings": {
                         "preferred_environment_id": "env://remote",
+                        "effective_toolset": ["echo"],
+                        "effective_rights": ["tool.echo"],
                         "allowed_tool_runner_incarnations": [
                             {
                                 "incarnation_id": "tool-runner-local",
@@ -14409,6 +14456,11 @@ mod tests {
                                 "selection_hint": "remote_fallback"
                             }
                         ]
+                    },
+                    "reflex_overrides": {
+                        "remote_tool_reflex": "allow",
+                        "remote_component_reflex": "allow",
+                        "credential_scope_reflex": "mesh_scoped"
                     }
                 }),
                 created_at: 1,
@@ -14563,7 +14615,13 @@ mod tests {
                 lease_expires_at: None,
                 summary_json: serde_json::json!({
                     "bindings": {
+                        "effective_rights": ["tool.echo"],
                         "effective_toolset": ["echo"]
+                    },
+                    "reflex_overrides": {
+                        "remote_tool_reflex": "allow",
+                        "remote_component_reflex": "allow",
+                        "credential_scope_reflex": "mesh_scoped"
                     }
                 }),
                 created_at: 1,
@@ -19414,7 +19472,25 @@ mod tests {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
         let (dispatcher_tx, _) = mpsc::channel(8);
-        let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+            })
+            .expect("seed local hotel");
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {

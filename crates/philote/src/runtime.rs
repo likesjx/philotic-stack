@@ -1335,6 +1335,15 @@ impl AgentRuntime {
 
                     match serde_json::from_str::<InboundTaskPayload>(&task_json) {
                         Ok(task) if task.is_model_response() => {
+                            info!(
+                                session_id = task.session_id.as_deref().unwrap_or(""),
+                                turn_id = task.turn_id.as_deref().unwrap_or(""),
+                                final_reply_guest_id =
+                                    task.final_reply_guest_id.as_deref().unwrap_or(""),
+                                "Agent [{}] picked up model_response envelope [{}]",
+                                self.agent_id,
+                                task_id
+                            );
                             let task_ref = task.clone();
                             if let Err(err) = self.handle_model_response(task).await {
                                 error!("Failed to handle model response: {}", err);
@@ -1937,6 +1946,13 @@ impl AgentRuntime {
             None => return Ok(()),
         };
         self.ensure_session_loaded(&session_id, "unknown").await?;
+        let _ = self
+            .emit_turn_event(
+                &session_id,
+                "model_response_received",
+                Some(format!("Received model_response for turn {}", turn_id)),
+            )
+            .await;
 
         // If the turn is waiting for voice synthesis, this is the audio response — route it
         // directly to the voice handler regardless of the agent_action kind.
@@ -1948,6 +1964,13 @@ impl AgentRuntime {
             .unwrap_or(false);
 
         if waiting_voice {
+            let _ = self
+                .emit_turn_event(
+                    &session_id,
+                    "voice_response_received",
+                    Some("Received voice synthesis response".into()),
+                )
+                .await;
             if let Some(model_error) = extract_model_error(&task) {
                 warn!(
                     "Session [{}] voice synthesis failed before audio delivery: {}",
@@ -2072,6 +2095,13 @@ impl AgentRuntime {
 
         let action = interpret_model_payload(task.agent_action.as_ref(), task.content.as_deref());
         if awaiting_transcription_reentry {
+            let _ = self
+                .emit_turn_event(
+                    &session_id,
+                    "transcription_reentry_received",
+                    Some("Received transcription response for re-entry".into()),
+                )
+                .await;
             return match action {
                 AgentAction::Respond { content } => {
                     self.reenter_turn_after_transcription(session_id, turn_id, content)
@@ -2122,6 +2152,16 @@ impl AgentRuntime {
 
         match action {
             AgentAction::Respond { content } => {
+                let _ = self
+                    .emit_turn_event(
+                        &session_id,
+                        "model_response_classified_respond",
+                        Some(format!(
+                            "Model response classified as respond ({} chars)",
+                            content.chars().count()
+                        )),
+                    )
+                    .await;
                 for partial in partial_replies {
                     self.emit_partial_reply(&session_id, partial).await?;
                 }
@@ -2137,6 +2177,13 @@ impl AgentRuntime {
                 .await
             }
             AgentAction::ToolCall(tool_call) => {
+                let _ = self
+                    .emit_turn_event(
+                        &session_id,
+                        "model_response_classified_tool_call",
+                        Some(format!("Model requested tool {}", tool_call.tool_name)),
+                    )
+                    .await;
                 if let Some(function_call_id) = extract_native_live_pending_function_call_id(&task)
                 {
                     if let Some(state) = self.sessions.get_mut(&session_id) {
@@ -2146,10 +2193,24 @@ impl AgentRuntime {
                 self.handle_tool_call(session_id, turn_id, tool_call).await
             }
             AgentAction::RequestApproval(approval) => {
+                let _ = self
+                    .emit_turn_event(
+                        &session_id,
+                        "model_response_classified_approval",
+                        Some(format!("Model requested approval: {}", approval.reason)),
+                    )
+                    .await;
                 self.handle_approval_request(session_id, turn_id, approval, false)
                     .await
             }
             AgentAction::Fail { message } => {
+                let _ = self
+                    .emit_turn_event(
+                        &session_id,
+                        "model_response_classified_fail",
+                        Some(message.clone()),
+                    )
+                    .await;
                 self.fail_active_turn(session_id, turn_id, message).await
             }
         }
@@ -3375,6 +3436,38 @@ impl AgentRuntime {
         Ok(())
     }
 
+    async fn emit_turn_event_to(
+        &mut self,
+        session_id: String,
+        turn_id: String,
+        chat_id: String,
+        target_node: String,
+        target_role: String,
+        target_guest_id: Option<String>,
+        event: &str,
+        partial_content: Option<String>,
+    ) -> Result<()> {
+        let event_payload = TurnEventPayload {
+            action: "turn_event",
+            event: event.to_string(),
+            session_id,
+            turn_id,
+            chat_id,
+            partial_content,
+        };
+
+        self.ipc_client
+            .send_request(IpcRequest::EmitTask {
+                target_node,
+                target_role,
+                target_guest_id,
+                task_json: serde_json::to_string(&event_payload)?,
+            })
+            .await?;
+
+        Ok(())
+    }
+
     async fn maybe_auto_recall_turn_memory(&mut self, session_id: &str) -> Result<()> {
         use memory_core::MemoryEngine as _;
 
@@ -3554,8 +3647,28 @@ impl AgentRuntime {
             .map(|t| t.had_voice_input)
             .unwrap_or(false);
 
+        let _ = self
+            .emit_turn_event(
+                &session_id,
+                "agent_response_finalizing",
+                Some(format!(
+                    "Finalizing response voice_input={} audio_artifact={} spoken_text={}",
+                    had_voice_input,
+                    audio_artifact.is_some(),
+                    spoken_text.is_some()
+                )),
+            )
+            .await;
+
         if let Some(audio_artifact) = audio_artifact {
             if voice_policy.is_active(had_voice_input) || had_voice_input {
+                let _ = self
+                    .emit_turn_event(
+                        &session_id,
+                        "reply_delivery_started",
+                        Some("Delivering cognitive audio artifact directly".into()),
+                    )
+                    .await;
                 return self
                     .deliver_text_reply(
                         session_id,
@@ -3576,11 +3689,25 @@ impl AgentRuntime {
         }
 
         if voice_policy.is_active(had_voice_input) {
+            let _ = self
+                .emit_turn_event(
+                    &session_id,
+                    "voice_synthesis_started",
+                    Some("Starting voice synthesis for final reply".into()),
+                )
+                .await;
             return self
                 .start_voice_synthesis(session_id, turn_id, content, spoken_text, voice_policy)
                 .await;
         }
 
+        let _ = self
+            .emit_turn_event(
+                &session_id,
+                "reply_delivery_started",
+                Some("Delivering final text reply".into()),
+            )
+            .await;
         self.deliver_text_reply(
             session_id,
             turn_id,
@@ -3788,14 +3915,17 @@ impl AgentRuntime {
     ) -> Result<()> {
         let (completed_turn, checkpoint_memory_type, checkpoint_json, index_state) = {
             let Some(state) = self.sessions.get_mut(&session_id) else {
-                warn!("deliver_text_reply: unknown session {}", session_id);
+                warn!(
+                    "deliver_text_reply: unknown session {} while delivering turn {}",
+                    session_id, turn_id
+                );
                 return Ok(());
             };
 
             let Some(completed_turn) = state.complete_active_turn(content.clone()) else {
                 warn!(
-                    "deliver_text_reply: no active turn for session {}",
-                    session_id
+                    "deliver_text_reply: no active turn for session {} while delivering response turn {}",
+                    session_id, turn_id
                 );
                 return Ok(());
             };
@@ -3848,15 +3978,35 @@ impl AgentRuntime {
             audio_artifact,
             send_text_caption,
         };
+        let final_reply_to = completed_turn.final_reply_to.clone();
+        let final_reply_role = completed_turn.final_reply_role.clone();
+        let final_reply_guest_id = completed_turn.final_reply_guest_id.clone();
 
         self.ipc_client
             .send_request(IpcRequest::EmitTask {
-                target_node: completed_turn.final_reply_to,
-                target_role: completed_turn.final_reply_role,
-                target_guest_id: completed_turn.final_reply_guest_id,
+                target_node: final_reply_to.clone(),
+                target_role: final_reply_role.clone(),
+                target_guest_id: final_reply_guest_id.clone(),
                 task_json: serde_json::to_string(&reply_payload)?,
             })
             .await?;
+
+        let _ = self
+            .emit_turn_event_to(
+                reply_payload.session_id.clone(),
+                reply_payload.turn_id.clone(),
+                reply_payload.chat_id.clone(),
+                final_reply_to,
+                final_reply_role,
+                final_reply_guest_id,
+                "reply_delivery_emitted",
+                Some(format!(
+                    "Reply emitted to membrane audio_artifact={} text_caption={}",
+                    reply_payload.audio_artifact.is_some(),
+                    reply_payload.send_text_caption
+                )),
+            )
+            .await;
 
         // Attend hook (Slice E): fire-and-forget autobiographical memory write.
         if let Some(engine) = self.memory_engine_for(&self.agent_id, &self.agent_id) {
