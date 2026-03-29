@@ -59,12 +59,10 @@ use tokio::sync::{broadcast, watch, Mutex};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use philotic_client::{
-    CronJob, CronJobSource,
-    DesktopMembraneAgentView, DesktopMembraneGuestView, DesktopMembraneStatusView,
-    GuestIdentity, IpcRequest, IpcResponse, LeaseEnvelope,
-    OperatorTargetAgentInventoryView, OperatorTargetGuestInventoryView,
-    OperatorTargetStatusView, OperatorTargetView, PhiloticClient,
-    OPERATOR_CHAT_REPLY_ROLE,
+    CronJob, CronJobSource, DesktopMembraneAgentView, DesktopMembraneGuestView,
+    DesktopMembraneStatusView, GuestIdentity, IpcRequest, IpcResponse, LeaseEnvelope,
+    OperatorTargetAgentInventoryView, OperatorTargetGuestInventoryView, OperatorTargetStatusView,
+    OperatorTargetView, PhiloticClient, OPERATOR_CHAT_REPLY_ROLE,
 };
 
 // ── Embedded UI assets ────────────────────────────────────────────────────────
@@ -162,7 +160,10 @@ pub async fn run(
         .route("/api/status", get(handle_status))
         .route("/api/guests", get(handle_guests))
         .route("/api/agents", get(handle_agents))
-        .route("/api/agents/:agent_id", axum::routing::patch(handle_agent_patch))
+        .route(
+            "/api/agents/:agent_id",
+            axum::routing::patch(handle_agent_patch),
+        )
         .route("/api/agents/:agent_id/roles", get(handle_agent_roles))
         .route("/api/agents/:agent_id/rules", get(handle_agent_rules))
         .route("/api/skills", get(handle_skills))
@@ -172,14 +173,23 @@ pub async fn run(
         .route("/api/config/gemini", get(handle_config_gemini))
         .route("/api/components", get(handle_components))
         .route("/api/components/:guest_id", get(handle_component_detail))
-        .route("/api/components/:guest_id/enable", post(handle_component_enable))
-        .route("/api/components/:guest_id/disable", post(handle_component_disable))
-        .route("/api/components/:guest_id/restart", post(handle_component_restart))
+        .route(
+            "/api/components/:guest_id/enable",
+            post(handle_component_enable),
+        )
+        .route(
+            "/api/components/:guest_id/disable",
+            post(handle_component_disable),
+        )
+        .route(
+            "/api/components/:guest_id/restart",
+            post(handle_component_restart),
+        )
         .route("/api/graphs", get(handle_graphs))
         .route("/api/graphs/:graph_id", get(handle_graph_detail))
         .route("/api/cron", get(handle_cron_list).post(handle_cron_create))
         .route("/api/cron/:job_id", delete(handle_cron_delete))
-        .route("/api/cron/:job_id/enable",  post(handle_cron_enable))
+        .route("/api/cron/:job_id/enable", post(handle_cron_enable))
         .route("/api/cron/:job_id/disable", post(handle_cron_disable))
         .route("/api/secrets", get(handle_secrets))
         .route("/api/secrets/rotate", post(handle_secret_rotate))
@@ -837,11 +847,14 @@ async fn stream_operator_chat_turn(
     content: String,
 ) -> Result<()> {
     let reply_guest_id = new_operator_chat_id("operator-chat");
-    let mut client = connect_client_with_identity(&socket, GuestIdentity {
-        guest_id: reply_guest_id.clone(),
-        role: OPERATOR_CHAT_REPLY_ROLE.into(),
-        supported_tools: vec![],
-    })
+    let mut client = connect_client_with_identity(
+        &socket,
+        GuestIdentity {
+            guest_id: reply_guest_id.clone(),
+            role: OPERATOR_CHAT_REPLY_ROLE.into(),
+            supported_tools: vec![],
+        },
+    )
     .await?;
 
     match client
@@ -1117,17 +1130,30 @@ async fn handle_agent_roles(
     // Load role incarnations, then enrich each with its toolset profile data.
     let role_data = match ipc_list_role_incarnations(&state.socket, &agent_id).await {
         Ok(d) => d,
-        Err(e) => return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        ).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
     };
-    let roles_arr = role_data.get("roles").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let roles_arr = role_data
+        .get("roles")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
     let mut enriched_roles = Vec::new();
     for role in roles_arr {
-        let profile_name = role.get("toolset_profile").and_then(|v| v.as_str()).unwrap_or("");
+        let profile_name = role
+            .get("toolset_profile")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let profile = if !profile_name.is_empty() {
-            ipc_get_toolset_profile(&state.socket, profile_name).await.ok().flatten()
+            ipc_get_toolset_profile(&state.socket, profile_name)
+                .await
+                .ok()
+                .flatten()
         } else {
             None
         };
@@ -1195,10 +1221,16 @@ async fn handle_toolsets(headers: HeaderMap, State(state): State<AppState>) -> R
 // ── Cron endpoints ────────────────────────────────────────────────────────────
 
 async fn handle_cron_list(headers: HeaderMap, State(state): State<AppState>) -> Response {
-    if !check_auth(&headers, &state) { return unauthorized(); }
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
     match ipc_list_cron_jobs(&state.socket).await {
         Ok(jobs) => Json(jobs).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -1220,7 +1252,9 @@ async fn handle_cron_create(
     State(state): State<AppState>,
     Json(body): Json<CreateCronBody>,
 ) -> Response {
-    if !check_auth(&headers, &state) { return unauthorized(); }
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1244,7 +1278,11 @@ async fn handle_cron_create(
             let _ = state.tx.send(event.to_string());
             Json(json!({"ok": true, "job_id": job.id})).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -1253,14 +1291,20 @@ async fn handle_cron_delete(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
 ) -> Response {
-    if !check_auth(&headers, &state) { return unauthorized(); }
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
     match ipc_remove_cron_job(&state.socket, &job_id).await {
         Ok(()) => {
             let event = json!({ "type": "cron:deleted", "payload": { "job_id": job_id } });
             let _ = state.tx.send(event.to_string());
             Json(json!({"ok": true})).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -1269,14 +1313,21 @@ async fn handle_cron_enable(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
 ) -> Response {
-    if !check_auth(&headers, &state) { return unauthorized(); }
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
     match ipc_set_cron_enabled(&state.socket, &job_id, true).await {
         Ok(()) => {
-            let event = json!({ "type": "cron:updated", "payload": { "job_id": job_id, "enabled": true } });
+            let event =
+                json!({ "type": "cron:updated", "payload": { "job_id": job_id, "enabled": true } });
             let _ = state.tx.send(event.to_string());
             Json(json!({"ok": true})).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -1285,14 +1336,20 @@ async fn handle_cron_disable(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
 ) -> Response {
-    if !check_auth(&headers, &state) { return unauthorized(); }
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
     match ipc_set_cron_enabled(&state.socket, &job_id, false).await {
         Ok(()) => {
             let event = json!({ "type": "cron:updated", "payload": { "job_id": job_id, "enabled": false } });
             let _ = state.tx.send(event.to_string());
             Json(json!({"ok": true})).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -1304,16 +1361,16 @@ async fn handle_config(headers: HeaderMap, State(state): State<AppState>) -> Res
     }
     // Read well-known operator-facing config keys. Values are returned as-is
     // (already JSON-encoded strings in the context graph).
-    let keys = &[
-        "execution_host",
-        "vault_registry",
-        "tool_runner_registry",
-    ];
+    let keys = &["execution_host", "vault_registry", "tool_runner_registry"];
     let mut out = serde_json::Map::new();
     for key in keys {
         match ipc_get_config(&state.socket, key).await {
-            Ok(Some(val)) => { out.insert(key.to_string(), val); }
-            Ok(None) => { out.insert(key.to_string(), Value::Null); }
+            Ok(Some(val)) => {
+                out.insert(key.to_string(), val);
+            }
+            Ok(None) => {
+                out.insert(key.to_string(), Value::Null);
+            }
             Err(e) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1378,7 +1435,9 @@ async fn handle_config_gemini(headers: HeaderMap, State(state): State<AppState>)
     let mut meta = serde_json::Map::new();
     for key in meta_keys {
         match ipc_get_config(&state.socket, key).await {
-            Ok(Some(val)) => { meta.insert(key.to_string(), val); }
+            Ok(Some(val)) => {
+                meta.insert(key.to_string(), val);
+            }
             Ok(None) => {}
             Err(e) => {
                 return (
@@ -1443,7 +1502,11 @@ async fn handle_graph_detail(
                 .find(|g| g.get("graph_id").and_then(|v| v.as_str()) == Some(graph_id.as_str()));
             match found {
                 Some(g) => Json(g).into_response(),
-                None => (StatusCode::NOT_FOUND, Json(json!({"error": "graph instance not found"}))).into_response(),
+                None => (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "graph instance not found"})),
+                )
+                    .into_response(),
             }
         }
         Err(e) => (
@@ -1473,10 +1536,15 @@ async fn handle_secrets(headers: HeaderMap, State(state): State<AppState>) -> Re
     let vault_entries: Vec<Value> = vault_registry
         .into_iter()
         .filter_map(|entry| {
-            let name = entry.get("vault_name").or_else(|| entry.get("name"))
-                .and_then(|v| v.as_str())?.to_string();
-            let secret_ref = entry.get("secret_ref")
-                .and_then(|v| v.as_str())?.to_string();
+            let name = entry
+                .get("vault_name")
+                .or_else(|| entry.get("name"))
+                .and_then(|v| v.as_str())?
+                .to_string();
+            let secret_ref = entry
+                .get("secret_ref")
+                .and_then(|v| v.as_str())?
+                .to_string();
             Some(json!({ "kind": "vault_token", "name": name, "secret_ref": secret_ref }))
         })
         .collect();
@@ -1484,7 +1552,10 @@ async fn handle_secrets(headers: HeaderMap, State(state): State<AppState>) -> Re
     // Named config-key secret refs
     let named_refs = [
         ("gemini_oauth_access_token", "gemini_oauth_access_token_ref"),
-        ("gemini_oauth_refresh_token", "gemini_oauth_refresh_token_ref"),
+        (
+            "gemini_oauth_refresh_token",
+            "gemini_oauth_refresh_token_ref",
+        ),
         ("telegram_bot_token", "telegram_bot_token"),
     ];
     let mut named_entries: Vec<Value> = Vec::new();
@@ -1493,7 +1564,9 @@ async fn handle_secrets(headers: HeaderMap, State(state): State<AppState>) -> Re
             Ok(Some(_)) => true,
             _ => false,
         };
-        named_entries.push(json!({ "kind": "config_ref", "name": label, "key": key, "configured": configured }));
+        named_entries.push(
+            json!({ "kind": "config_ref", "name": label, "key": key, "configured": configured }),
+        );
     }
 
     Json(json!({
@@ -1506,11 +1579,7 @@ async fn handle_secrets(headers: HeaderMap, State(state): State<AppState>) -> Re
 // ── PUT /api/config/:key ──────────────────────────────────────────────────────
 //
 // Allowed keys for operator mutation (prevents arbitrary config overwrites).
-const MUTABLE_CONFIG_KEYS: &[&str] = &[
-    "telegram_bot_token",
-    "execution_host",
-    "vault_registry",
-];
+const MUTABLE_CONFIG_KEYS: &[&str] = &["telegram_bot_token", "execution_host", "vault_registry"];
 
 #[derive(serde::Deserialize)]
 struct SetConfigBody {
@@ -1535,10 +1604,13 @@ async fn handle_config_put(
     }
     let value_json = match serde_json::to_string(&body.value) {
         Ok(s) => s,
-        Err(e) => return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("invalid value: {e}")})),
-        ).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("invalid value: {e}")})),
+            )
+                .into_response()
+        }
     };
     match ipc_set_config(&state.socket, &key, &value_json).await {
         Ok(()) => {
@@ -1598,7 +1670,14 @@ async fn handle_vault_add(
     if !check_auth(&headers, &state) {
         return unauthorized();
     }
-    match ipc_add_vault_entry(&state.socket, &body.vault_name, &body.plaintext, body.allowed_roles).await {
+    match ipc_add_vault_entry(
+        &state.socket,
+        &body.vault_name,
+        &body.plaintext,
+        body.allowed_roles,
+    )
+    .await
+    {
         Ok(secret_ref) => {
             let event = json!({ "type": "vault:entry-added", "payload": { "vault_name": body.vault_name, "secret_ref": secret_ref } });
             let _ = state.tx.send(event.to_string());
@@ -1687,7 +1766,15 @@ async fn handle_agent_patch(
     if !check_auth(&headers, &state) {
         return unauthorized();
     }
-    match ipc_patch_agent_bundle(&state.socket, &agent_id, body.persona_name, body.default_toolset, body.default_skillset).await {
+    match ipc_patch_agent_bundle(
+        &state.socket,
+        &agent_id,
+        body.persona_name,
+        body.default_toolset,
+        body.default_skillset,
+    )
+    .await
+    {
         Ok(agent) => {
             let event = json!({ "type": "agent:updated", "payload": { "agent_id": agent_id } });
             let _ = state.tx.send(event.to_string());
@@ -1757,7 +1844,11 @@ async fn handle_component_detail(
                 .find(|c| c.get("guest_id").and_then(|v| v.as_str()) == Some(guest_id.as_str()));
             match found {
                 Some(c) => Json(c).into_response(),
-                None => (StatusCode::NOT_FOUND, Json(json!({"error": "component not found"}))).into_response(),
+                None => (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "component not found"})),
+                )
+                    .into_response(),
             }
         }
         Err(e) => (
@@ -1804,7 +1895,8 @@ async fn handle_component_disable(
     }
     match ipc_set_component_active(&state.socket, &guest_id, false).await {
         Ok(_) => {
-            let event = json!({ "type": "component:disabled", "payload": { "guest_id": guest_id } });
+            let event =
+                json!({ "type": "component:disabled", "payload": { "guest_id": guest_id } });
             let _ = state.tx.send(event.to_string());
             Json(json!({"ok": true, "guest_id": guest_id, "active": false})).into_response()
         }
@@ -1828,7 +1920,8 @@ async fn handle_component_restart(
     }
     match ipc_restart_component(&state.socket, &guest_id).await {
         Ok(_) => {
-            let event = json!({ "type": "component:restarted", "payload": { "guest_id": guest_id } });
+            let event =
+                json!({ "type": "component:restarted", "payload": { "guest_id": guest_id } });
             let _ = state.tx.send(event.to_string());
             Json(json!({"ok": true, "guest_id": guest_id})).into_response()
         }
@@ -1904,7 +1997,10 @@ async fn ipc_desktop_membrane_agents(socket: &str) -> Result<Vec<DesktopMembrane
 
 async fn ipc_desktop_membrane_targets(socket: &str) -> Result<Vec<OperatorTargetView>> {
     let mut client = connect_management_client(socket, "philotic-web-mesh-targets").await?;
-    match client.send_request(IpcRequest::QueryOperatorTargets).await? {
+    match client
+        .send_request(IpcRequest::QueryOperatorTargets)
+        .await?
+    {
         IpcResponse::OperatorTargetsView { operator_targets } => Ok(operator_targets),
         IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
         other => Err(anyhow!(
@@ -2020,11 +2116,15 @@ async fn ipc_list_skills(socket: &str) -> Result<Vec<Value>> {
 async fn ipc_get_toolset_profile(socket: &str, profile_name: &str) -> Result<Option<Value>> {
     let mut client = connect_management_client(socket, "philotic-web-toolsets").await?;
     match client
-        .send_request(IpcRequest::GetToolsetProfile { profile_name: profile_name.to_string() })
+        .send_request(IpcRequest::GetToolsetProfile {
+            profile_name: profile_name.to_string(),
+        })
         .await?
     {
         IpcResponse::Standard { ok: true, data, .. } => Ok(data),
-        IpcResponse::Standard { ok: false, message, .. } => Err(anyhow!(message)),
+        IpcResponse::Standard {
+            ok: false, message, ..
+        } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected toolset_profile response: {other:?}")),
     }
 }
@@ -2035,9 +2135,11 @@ async fn ipc_list_toolset_profiles(socket: &str) -> Result<Vec<Value>> {
         .send_request(IpcRequest::ListToolsetProfiles {})
         .await?
     {
-        IpcResponse::Standard { ok: true, data: Some(d), .. } => {
-            Ok(d.as_array().cloned().unwrap_or_default())
-        }
+        IpcResponse::Standard {
+            ok: true,
+            data: Some(d),
+            ..
+        } => Ok(d.as_array().cloned().unwrap_or_default()),
         IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected toolset_profiles response: {other:?}")),
     }
@@ -2057,7 +2159,10 @@ async fn ipc_list_cron_jobs(socket: &str) -> Result<Vec<Value>> {
 
 async fn ipc_register_cron_job(socket: &str, job: CronJob) -> Result<()> {
     let mut client = connect_management_client(socket, "philotic-web-cron").await?;
-    match client.send_request(IpcRequest::RegisterCronJob { job }).await? {
+    match client
+        .send_request(IpcRequest::RegisterCronJob { job })
+        .await?
+    {
         IpcResponse::Standard { ok: true, .. } => Ok(()),
         IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
         IpcResponse::Error(msg) => Err(anyhow!(msg)),
@@ -2068,7 +2173,9 @@ async fn ipc_register_cron_job(socket: &str, job: CronJob) -> Result<()> {
 async fn ipc_remove_cron_job(socket: &str, job_id: &str) -> Result<()> {
     let mut client = connect_management_client(socket, "philotic-web-cron").await?;
     match client
-        .send_request(IpcRequest::RemoveCronJob { job_id: job_id.to_string() })
+        .send_request(IpcRequest::RemoveCronJob {
+            job_id: job_id.to_string(),
+        })
         .await?
     {
         IpcResponse::Standard { ok: true, .. } => Ok(()),
@@ -2080,16 +2187,22 @@ async fn ipc_remove_cron_job(socket: &str, job_id: &str) -> Result<()> {
 
 async fn ipc_set_cron_enabled(socket: &str, job_id: &str, enabled: bool) -> Result<()> {
     let req = if enabled {
-        IpcRequest::EnableCronJob { job_id: job_id.to_string() }
+        IpcRequest::EnableCronJob {
+            job_id: job_id.to_string(),
+        }
     } else {
-        IpcRequest::DisableCronJob { job_id: job_id.to_string() }
+        IpcRequest::DisableCronJob {
+            job_id: job_id.to_string(),
+        }
     };
     let mut client = connect_management_client(socket, "philotic-web-cron").await?;
     match client.send_request(req).await? {
         IpcResponse::Standard { ok: true, .. } => Ok(()),
         IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
         IpcResponse::Error(msg) => Err(anyhow!(msg)),
-        other => Err(anyhow!("unexpected cron enable/disable response: {other:?}")),
+        other => Err(anyhow!(
+            "unexpected cron enable/disable response: {other:?}"
+        )),
     }
 }
 
@@ -2101,12 +2214,16 @@ async fn ipc_get_config(socket: &str, key: &str) -> Result<Option<Value>> {
         })
         .await?
     {
-        IpcResponse::ConfigData { value_json: Some(raw), .. } => {
-            let parsed: Value = serde_json::from_str(&raw)
-                .unwrap_or_else(|_| Value::String(raw));
+        IpcResponse::ConfigData {
+            value_json: Some(raw),
+            ..
+        } => {
+            let parsed: Value = serde_json::from_str(&raw).unwrap_or_else(|_| Value::String(raw));
             Ok(Some(parsed))
         }
-        IpcResponse::ConfigData { value_json: None, .. } => Ok(None),
+        IpcResponse::ConfigData {
+            value_json: None, ..
+        } => Ok(None),
         IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected config data response: {other:?}")),
     }
@@ -2122,7 +2239,9 @@ async fn ipc_set_config(socket: &str, key: &str, value_json: &str) -> Result<()>
         .await?
     {
         IpcResponse::Standard { ok: true, .. } => Ok(()),
-        IpcResponse::Standard { ok: false, message, .. } => Err(anyhow!(message)),
+        IpcResponse::Standard {
+            ok: false, message, ..
+        } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected set_config response: {other:?}")),
     }
 }
@@ -2137,7 +2256,9 @@ async fn ipc_rotate_secret(socket: &str, secret_ref: &str, plaintext: &str) -> R
         .await?
     {
         IpcResponse::Standard { ok: true, .. } => Ok(()),
-        IpcResponse::Standard { ok: false, message, .. } => Err(anyhow!(message)),
+        IpcResponse::Standard {
+            ok: false, message, ..
+        } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected rotate_secret response: {other:?}")),
     }
 }
@@ -2166,21 +2287,35 @@ async fn ipc_add_vault_entry(
                 .to_string();
             Ok(secret_ref)
         }
-        IpcResponse::Standard { ok: false, message, .. } => Err(anyhow!(message)),
+        IpcResponse::Standard {
+            ok: false, message, ..
+        } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected add_vault_entry response: {other:?}")),
     }
 }
 
 async fn ipc_list_graph_instances(socket: &str) -> Result<Vec<Value>> {
     let mut client = connect_management_client(socket, "philotic-web-graphs").await?;
-    match client.send_request(IpcRequest::ListGraphInstances {}).await? {
+    match client
+        .send_request(IpcRequest::ListGraphInstances {})
+        .await?
+    {
         IpcResponse::GraphInstanceList { instances } => Ok(instances),
-        IpcResponse::Standard { ok: false, message, .. } => Err(anyhow!(message)),
-        other => Err(anyhow!("unexpected list_graph_instances response: {other:?}")),
+        IpcResponse::Standard {
+            ok: false, message, ..
+        } => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected list_graph_instances response: {other:?}"
+        )),
     }
 }
 
-async fn ipc_assign_skill(socket: &str, agent_id: &str, role_name: &str, skill_name: &str) -> Result<Value> {
+async fn ipc_assign_skill(
+    socket: &str,
+    agent_id: &str,
+    role_name: &str,
+    skill_name: &str,
+) -> Result<Value> {
     let mut client = connect_management_client(socket, "philotic-web-skills-mgmt").await?;
     match client
         .send_request(IpcRequest::AssignSkill {
@@ -2190,15 +2325,26 @@ async fn ipc_assign_skill(socket: &str, agent_id: &str, role_name: &str, skill_n
         })
         .await?
     {
-        IpcResponse::SkillAssigned { role_name, skill_name, operation } => {
-            Ok(json!({"ok": true, "role_name": role_name, "skill_name": skill_name, "operation": operation}))
-        }
-        IpcResponse::Standard { ok: false, message, .. } => Err(anyhow!(message)),
+        IpcResponse::SkillAssigned {
+            role_name,
+            skill_name,
+            operation,
+        } => Ok(
+            json!({"ok": true, "role_name": role_name, "skill_name": skill_name, "operation": operation}),
+        ),
+        IpcResponse::Standard {
+            ok: false, message, ..
+        } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected assign_skill response: {other:?}")),
     }
 }
 
-async fn ipc_revoke_skill(socket: &str, agent_id: &str, role_name: &str, skill_name: &str) -> Result<Value> {
+async fn ipc_revoke_skill(
+    socket: &str,
+    agent_id: &str,
+    role_name: &str,
+    skill_name: &str,
+) -> Result<Value> {
     let mut client = connect_management_client(socket, "philotic-web-skills-mgmt").await?;
     match client
         .send_request(IpcRequest::RevokeSkill {
@@ -2208,10 +2354,16 @@ async fn ipc_revoke_skill(socket: &str, agent_id: &str, role_name: &str, skill_n
         })
         .await?
     {
-        IpcResponse::SkillAssigned { role_name, skill_name, operation } => {
-            Ok(json!({"ok": true, "role_name": role_name, "skill_name": skill_name, "operation": operation}))
-        }
-        IpcResponse::Standard { ok: false, message, .. } => Err(anyhow!(message)),
+        IpcResponse::SkillAssigned {
+            role_name,
+            skill_name,
+            operation,
+        } => Ok(
+            json!({"ok": true, "role_name": role_name, "skill_name": skill_name, "operation": operation}),
+        ),
+        IpcResponse::Standard {
+            ok: false, message, ..
+        } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected revoke_skill response: {other:?}")),
     }
 }
@@ -2220,7 +2372,9 @@ async fn ipc_list_components(socket: &str) -> Result<Vec<Value>> {
     let mut client = connect_management_client(socket, "philotic-web-components").await?;
     match client.send_request(IpcRequest::ListComponents {}).await? {
         IpcResponse::ComponentInventory { components } => Ok(components),
-        IpcResponse::Standard { ok: false, message, .. } => Err(anyhow!(message)),
+        IpcResponse::Standard {
+            ok: false, message, ..
+        } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected list_components response: {other:?}")),
     }
 }
@@ -2236,7 +2390,9 @@ async fn ipc_set_component_active(socket: &str, guest_id: &str, active: bool) ->
     {
         IpcResponse::Standard { ok: true, .. } => Ok(()),
         IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
-        other => Err(anyhow!("unexpected set_component_active response: {other:?}")),
+        other => Err(anyhow!(
+            "unexpected set_component_active response: {other:?}"
+        )),
     }
 }
 
@@ -2261,15 +2417,21 @@ fn new_operator_chat_id(prefix: &str) -> String {
 }
 
 async fn connect_management_client(socket: &str, guest_id: &str) -> Result<PhiloticClient> {
-    connect_client_with_identity(socket, GuestIdentity {
-        guest_id: guest_id.into(),
-        role: "management".into(),
-        supported_tools: vec![],
-    })
+    connect_client_with_identity(
+        socket,
+        GuestIdentity {
+            guest_id: guest_id.into(),
+            role: "management".into(),
+            supported_tools: vec![],
+        },
+    )
     .await
 }
 
-async fn connect_client_with_identity(socket: &str, identity: GuestIdentity) -> Result<PhiloticClient> {
+async fn connect_client_with_identity(
+    socket: &str,
+    identity: GuestIdentity,
+) -> Result<PhiloticClient> {
     PhiloticClient::connect_at(socket, identity)
         .await
         .map_err(Into::into)

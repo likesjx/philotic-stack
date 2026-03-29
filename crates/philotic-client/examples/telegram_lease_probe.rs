@@ -5,8 +5,8 @@ use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
 async fn main() -> Result<()> {
     let socket_path = std::env::var("PHILOTIC_HOTEL_SOCKET")
         .context("PHILOTIC_HOTEL_SOCKET must be set for telegram_lease_probe")?;
-    let lease_key =
-        std::env::var("PHILOTIC_TELEGRAM_LEASE_KEY").context("PHILOTIC_TELEGRAM_LEASE_KEY must be set")?;
+    let lease_key = std::env::var("PHILOTIC_TELEGRAM_LEASE_KEY")
+        .context("PHILOTIC_TELEGRAM_LEASE_KEY must be set")?;
 
     let mut client = PhiloticClient::connect(GuestIdentity {
         guest_id: "telegram-lease-probe".into(),

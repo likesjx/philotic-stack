@@ -70,7 +70,10 @@ async fn main() -> Result<()> {
             continue;
         }
 
-        let event = payload.get("event").and_then(Value::as_str).unwrap_or_default();
+        let event = payload
+            .get("event")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         if event == expected_event {
             println!("recall smoke ok: observed turn event {event:?}");
             return Ok(());

@@ -8,7 +8,7 @@ use ansible_mesh_core::agent_graph_storage::{
     AgentExperienceTrace, AgentGraphSnapshot, AgentGraphStorage, AgentToolPreference,
 };
 use ansible_mesh_core::resources::{ResourceDeclaration, ResourceType};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use ulid::Ulid;
 
 /// Dispatch an `agent.graph.*` tool call. Returns a JSON string result.
@@ -37,9 +37,7 @@ pub fn dispatch(
 fn agent_graph_read(storage: &dyn AgentGraphStorage, args: &Value) -> String {
     let entity = match args.get("entity").and_then(Value::as_str) {
         Some(e) => e,
-        None => {
-            return json!({"ok": false, "error": "missing 'entity' field"}).to_string()
-        }
+        None => return json!({"ok": false, "error": "missing 'entity' field"}).to_string(),
     };
 
     match entity {
@@ -55,7 +53,9 @@ fn agent_graph_read(storage: &dyn AgentGraphStorage, args: &Value) -> String {
             Ok(decls) => json!({"ok": true, "resource_declarations": decls}).to_string(),
             Err(e) => json!({"ok": false, "error": e.to_string()}).to_string(),
         },
-        other => json!({"ok": false, "error": format!("unknown entity type '{other}'")}).to_string(),
+        other => {
+            json!({"ok": false, "error": format!("unknown entity type '{other}'")}).to_string()
+        }
     }
 }
 
@@ -75,18 +75,13 @@ fn agent_graph_write(storage: &dyn AgentGraphStorage, args: &Value, agent_id: &s
         "tool_preference" => {
             let tool_name = match args.get("tool_name").and_then(Value::as_str) {
                 Some(t) => t,
-                None => {
-                    return json!({"ok": false, "error": "missing 'tool_name'"}).to_string()
-                }
+                None => return json!({"ok": false, "error": "missing 'tool_name'"}).to_string(),
             };
             let preference_level = args
                 .get("preference_level")
                 .and_then(Value::as_i64)
                 .unwrap_or(0) as i32;
-            let config_json = args
-                .get("config")
-                .cloned()
-                .unwrap_or_else(|| json!({}));
+            let config_json = args.get("config").cloned().unwrap_or_else(|| json!({}));
             let pref = AgentToolPreference {
                 agent_id: agent_id.to_string(),
                 tool_name: tool_name.to_string(),
@@ -99,10 +94,8 @@ fn agent_graph_write(storage: &dyn AgentGraphStorage, args: &Value, agent_id: &s
                 Err(e) => json!({"ok": false, "error": e.to_string()}).to_string(),
             }
         }
-        other => {
-            json!({"ok": false, "error": format!("write not supported for entity '{other}'")})
-                .to_string()
-        }
+        other => json!({"ok": false, "error": format!("write not supported for entity '{other}'")})
+            .to_string(),
     }
 }
 
@@ -145,10 +138,7 @@ fn agent_graph_declare(storage: &dyn AgentGraphStorage, args: &Value, _agent_id:
 ///
 /// Args: `{ "limit": N, "event_type": "tool_call" }` (both optional)
 fn agent_graph_recall(storage: &dyn AgentGraphStorage, args: &Value) -> String {
-    let limit = args
-        .get("limit")
-        .and_then(Value::as_u64)
-        .unwrap_or(20) as usize;
+    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20) as usize;
     let result = if let Some(et) = args.get("event_type").and_then(Value::as_str) {
         storage.list_traces_by_event_type(et, limit)
     } else {

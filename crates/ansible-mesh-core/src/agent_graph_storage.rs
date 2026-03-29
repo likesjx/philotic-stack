@@ -22,7 +22,7 @@
 
 use crate::resources::{ResourceDeclaration, ResourceType};
 use anyhow::Result;
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -341,8 +341,13 @@ impl AgentGraphStorage for SqliteAgentGraphStorage {
         let mut grants = Vec::new();
         for row in rows {
             let (instance_id, agent_id, rt_str, granted_at) = row?;
-            let resource_type: ResourceType = serde_json::from_str(&rt_str)
-                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e)))?;
+            let resource_type: ResourceType = serde_json::from_str(&rt_str).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
             grants.push(AgentResourceGrant {
                 instance_id,
                 agent_id,
@@ -461,8 +466,13 @@ impl AgentGraphStorage for SqliteAgentGraphStorage {
         let mut decls = Vec::new();
         for row in rows {
             let (rt_str, config_hint) = row?;
-            let resource_type: ResourceType = serde_json::from_str(&rt_str)
-                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+            let resource_type: ResourceType = serde_json::from_str(&rt_str).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
             decls.push(ResourceDeclaration {
                 resource_type,
                 config_hint,
@@ -573,8 +583,13 @@ impl AgentGraphStorage for SqliteAgentGraphStorage {
         let mut declarations = Vec::new();
         for row in decl_rows {
             let (rt_str, config_hint, updated_at) = row?;
-            let resource_type: ResourceType = serde_json::from_str(&rt_str)
-                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+            let resource_type: ResourceType = serde_json::from_str(&rt_str).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
             declarations.push(SnapshotDeclaration {
                 resource_type,
                 config_hint,
@@ -600,8 +615,8 @@ impl AgentGraphStorage for SqliteAgentGraphStorage {
 
         for pref in &snapshot.preferences {
             // LWW: only apply if incoming updated_at is strictly greater than stored.
-            let config_str = serde_json::to_string(&pref.config_json)
-                .unwrap_or_else(|_| "{}".to_string());
+            let config_str =
+                serde_json::to_string(&pref.config_json).unwrap_or_else(|_| "{}".to_string());
             let rows_changed = conn.execute(
                 "INSERT INTO tool_preferences (agent_id, tool_name, preference_level, config_json, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)
@@ -907,7 +922,10 @@ mod tests {
         assert_eq!(snap.preferences.len(), 1);
         assert_eq!(snap.preferences[0].tool_name, "bash.exec");
         assert_eq!(snap.declarations.len(), 1);
-        assert_eq!(snap.declarations[0].resource_type, ResourceType::ModelRouter);
+        assert_eq!(
+            snap.declarations[0].resource_type,
+            ResourceType::ModelRouter
+        );
     }
 
     #[test]

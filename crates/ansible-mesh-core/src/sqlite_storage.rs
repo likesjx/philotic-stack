@@ -10,8 +10,8 @@ use crate::graph::{
     RuleRecord, ToolsetProfileRecord,
 };
 use crate::storage::{
-    CursorStorage, EventStorage, GraphAdapter, GuestRecord, HotelRecord,
-    SecretRecord, SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,
+    CursorStorage, EventStorage, GraphAdapter, GuestRecord, HotelRecord, SecretRecord,
+    SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,
 };
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
@@ -697,4 +697,3 @@ impl SqliteGraphStorage {
         format!("edge:session:{session_id}:turn:{turn_id}:has_event:{event_id}")
     }
 }
-

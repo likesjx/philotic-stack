@@ -98,16 +98,15 @@ pub fn log_mel_spectrogram(samples: &[f32]) -> Vec<f32> {
 
         // Apply mel filterbank → log mel energy.
         for m in 0..N_MELS {
-            let energy: f32 = (0..n_freqs).map(|k| filters[m * n_freqs + k] * power[k]).sum();
+            let energy: f32 = (0..n_freqs)
+                .map(|k| filters[m * n_freqs + k] * power[k])
+                .sum();
             mel_spec[m * N_FRAMES + frame] = energy.max(1e-10).log10();
         }
     }
 
     // Whisper normalisation: global max − 8 dB floor, then (val + 4) / 4.
-    let global_max = mel_spec
-        .iter()
-        .cloned()
-        .fold(f32::NEG_INFINITY, f32::max);
+    let global_max = mel_spec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let floor = global_max - 8.0;
     for v in mel_spec.iter_mut() {
         *v = ((*v).max(floor) + 4.0) / 4.0;

@@ -12,6 +12,8 @@ tags:
   - active-seam
 related_docs:
   - ARCHITECTURE_STATUS.md
+  - MODEL_GRAPH_CATALOG_PROPOSAL.md
+  - TURN_ROUTING_PLAN_PROPOSAL.md
   - TASK_RUNNER_PROPOSAL.md
   - VOICE_MACHINE_PROPOSAL.md
   - KEY_VAULT_PROPOSAL.md
@@ -26,6 +28,8 @@ implemented_by:
 active_seams:
   - structured-model-envelope
   - hotel-gemini-oauth-flow
+  - model-graph-catalog
+  - turn-routing-plan
   - openai-provider-contract
   - hotel-openai-oauth-flow
   - provider-capability-overrides
@@ -85,6 +89,14 @@ Pin and prove the first design contract for:
 - a structured model response envelope with explicit response channels for optimization-oriented outputs
 - a first `request_class` split so cognitive calls can carry agent context and affordances without forcing every model call to pretend it is part of the reasoning loop
 - a proposal-backed OpenAI provider slice covering standard text/tool/structured-output support, hotel-owned OAuth, and model-specific capability overrides
+- a provider-neutral shared model graph/catalog so endpoint stems, capability families, and model/variant weights stop living as scattered provider folklore
+
+The current controller/runtime reality still matters:
+
+- `model.manager.list@1` is currently node-advertisement driven
+- provider capability truth mostly lives in provider-local `supports()` logic
+
+That makes the model graph a missing canonical metadata layer, not a justification to blur routing and catalog authority.
 
 Current confidence for the implemented structured-envelope slice:
 

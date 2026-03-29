@@ -323,6 +323,9 @@ pub struct WorkingTurn {
     /// Stashed text content while waiting for voice synthesis to complete.
     pub pending_text_reply: Option<String>,
     pub had_voice_input: bool,
+    /// Compiled staged routing plan for this turn. This is observability and
+    /// continuity state for the turn owner, not a second execution authority.
+    pub turn_routing_plan: Option<TurnRoutingPlan>,
     /// True when a voice transcription result should be routed back into the
     /// normal reasoning loop instead of finalized as the assistant reply.
     pub awaiting_transcription_reentry: bool,
@@ -476,6 +479,64 @@ impl Default for VoiceResponsePolicy {
             fallback_to_text: true,
         }
     }
+}
+
+/// High-level phase within a compiled turn routing plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TurnRoutingStageKind {
+    Ingress,
+    Cognition,
+    Egress,
+}
+
+/// Stage-specific context envelope budget.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TurnContextEnvelopeKind {
+    MediaIngress,
+    AgentTurn,
+    VoiceEgress,
+}
+
+/// One compiled stage inside a per-turn routing plan.
+///
+/// This is the agent's planned execution path, not a claim that every stage is
+/// already implemented with live streaming delivery today.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnRoutingStagePlan {
+    pub stage: TurnRoutingStageKind,
+    pub capability: String,
+    pub request_class: String,
+    pub target_node: String,
+    pub target_role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_guest_id: Option<String>,
+    pub context_envelope: TurnContextEnvelopeKind,
+    /// Desired streaming posture for this stage. This is a planning hint, not
+    /// necessarily proof that the selected provider path already streams live.
+    #[serde(default)]
+    pub streaming_preferred: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_id: Option<String>,
+}
+
+/// Compiled multi-stage plan for an inbound turn.
+///
+/// The session and agent remain the owners of continuity; the routing plan
+/// only chooses the best execution path for each stage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnRoutingPlan {
+    pub trigger: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress: Option<TurnRoutingStagePlan>,
+    pub cognition: TurnRoutingStagePlan,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<TurnRoutingStagePlan>,
 }
 
 /// Configures how the rolling `dialogue_window` is assembled and bounded.
@@ -954,6 +1015,18 @@ impl SessionState {
         }
     }
 
+    pub fn set_active_turn_routing_plan(&mut self, plan: TurnRoutingPlan) {
+        if let Some(turn) = self.active_turn.as_mut() {
+            turn.turn_routing_plan = Some(plan);
+        }
+    }
+
+    pub fn active_turn_routing_plan(&self) -> Option<&TurnRoutingPlan> {
+        self.active_turn
+            .as_ref()
+            .and_then(|turn| turn.turn_routing_plan.as_ref())
+    }
+
     pub fn active_turn_awaiting_transcription_reentry(&self) -> bool {
         self.active_turn
             .as_ref()
@@ -972,9 +1045,7 @@ impl SessionState {
         }
     }
 
-    pub fn scripted_executor_advance(
-        &self,
-    ) -> Option<crate::scripted_loop::ScriptedLoopDecision> {
+    pub fn scripted_executor_advance(&self) -> Option<crate::scripted_loop::ScriptedLoopDecision> {
         self.active_turn
             .as_ref()
             .and_then(|t| t.scripted_loop_context.as_ref())
@@ -1550,7 +1621,11 @@ impl SessionState {
         let mut prompt = self.build_prompt_with_tools(&turn.user_content, &tools);
 
         if !turn.working_tool_history.is_empty() {
-            let max_result_chars = self.settings.context_window.max_tool_result_chars.max(1_000);
+            let max_result_chars = self
+                .settings
+                .context_window
+                .max_tool_result_chars
+                .max(1_000);
             prompt.push_str("\n\n[Tool call history]\n");
             for (i, (call, result)) in turn.working_tool_history.iter().enumerate() {
                 let args = serde_json::to_string(&call.arguments).unwrap_or_default();
@@ -1960,7 +2035,10 @@ impl SessionState {
 
     fn render_prompt_from_projection(&self, projection: &ContextProjection) -> String {
         let mut prompt = String::new();
-        prompt.push_str(&format!("[System]\nCurrent date and time (UTC): {}\n", utc_datetime_string()));
+        prompt.push_str(&format!(
+            "[System]\nCurrent date and time (UTC): {}\n",
+            utc_datetime_string()
+        ));
         for layer in &projection.layers {
             let title = match layer.layer_id {
                 ContextLayerId::Identity => "Agent self projection",
@@ -2087,7 +2165,11 @@ impl SessionState {
         // tool_history: accumulated (call, result) pairs from the active turn.
         // Always present in the envelope — empty on initial turn, populated on re-entry.
         // Results are truncated to max_tool_result_chars to prevent context overflow.
-        let max_result_chars = self.settings.context_window.max_tool_result_chars.max(1_000);
+        let max_result_chars = self
+            .settings
+            .context_window
+            .max_tool_result_chars
+            .max(1_000);
         let tool_history: Vec<Value> = self
             .active_turn
             .as_ref()
@@ -2363,7 +2445,12 @@ impl SessionState {
 
         let mut out = String::from("[Recalled memory]\n");
         for (i, memory) in turn.recalled_memories.iter().enumerate() {
-            out.push_str(&format!("{}. [{}] {}", i + 1, memory.concept, memory.content));
+            out.push_str(&format!(
+                "{}. [{}] {}",
+                i + 1,
+                memory.concept,
+                memory.content
+            ));
             if !memory.tags.is_empty() {
                 out.push_str(&format!(" ({})", memory.tags.join(", ")));
             }
@@ -2701,6 +2788,7 @@ impl SessionState {
                 "provider_repair_attempts": turn.provider_repair_attempts,
                 "pending_text_reply": turn.pending_text_reply,
                 "had_voice_input": turn.had_voice_input,
+                "turn_routing_plan": turn.turn_routing_plan,
                 "awaiting_transcription_reentry": turn.awaiting_transcription_reentry,
                 "scripted_loop_context": turn.scripted_loop_context,
             })
@@ -2941,6 +3029,10 @@ impl SessionState {
                     .get("had_voice_input")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
+                turn_routing_plan: turn
+                    .get("turn_routing_plan")
+                    .cloned()
+                    .and_then(|v| serde_json::from_value::<TurnRoutingPlan>(v).ok()),
                 awaiting_transcription_reentry: turn
                     .get("awaiting_transcription_reentry")
                     .and_then(serde_json::Value::as_bool)
@@ -3480,7 +3572,10 @@ fn utc_datetime_string() -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
 
-    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC", y, m, d, hh, mm, ss)
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+        y, m, d, hh, mm, ss
+    )
 }
 
 /// Apply a set / append / remove operation to a `Vec<String>` field.
@@ -3513,7 +3608,8 @@ mod tests {
         ContextAuthority, ContextLayerId, ContextMutability, HookRequest, HookResult,
         PromotionAction, RecalledMemoryRecord, RefreshRequest, RoleActivation, SessionBindings,
         SessionState, TaskRunnerBaseConfig, ToolRunnerIncarnationBinding,
-        TransportReplyTargetBinding, TtsMode, VoiceResponsePolicy, WorkingTurn,
+        TransportReplyTargetBinding, TtsMode, TurnContextEnvelopeKind, TurnRoutingPlan,
+        TurnRoutingStageKind, TurnRoutingStagePlan, VoiceResponsePolicy, WorkingTurn,
         default_tool_assembly_for_bindings, merge_session_index, session_checkpoint_memory_type,
     };
     use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
@@ -3543,6 +3639,48 @@ mod tests {
             provider_repair_attempts: 0,
             pending_text_reply: Some("hello back".into()),
             had_voice_input: true,
+            turn_routing_plan: Some(TurnRoutingPlan {
+                trigger: "voice-turn".into(),
+                ingress: Some(TurnRoutingStagePlan {
+                    stage: TurnRoutingStageKind::Ingress,
+                    capability: "voice.transcribe".into(),
+                    request_class: "transform".into(),
+                    target_node: "audio-node".into(),
+                    target_role: "model.elevenlabs".into(),
+                    target_guest_id: Some("audio-hotel:model-controller-elevenlabs".into()),
+                    context_envelope: TurnContextEnvelopeKind::MediaIngress,
+                    streaming_preferred: true,
+                    provider_hint: Some("elevenlabs".into()),
+                    model_hint: Some("scribe_v1".into()),
+                    voice_id: None,
+                }),
+                cognition: TurnRoutingStagePlan {
+                    stage: TurnRoutingStageKind::Cognition,
+                    capability: "text.generate".into(),
+                    request_class: "cognitive".into(),
+                    target_node: "cognition-node".into(),
+                    target_role: "model".into(),
+                    target_guest_id: Some("cognition-hotel:model-controller-gemini".into()),
+                    context_envelope: TurnContextEnvelopeKind::AgentTurn,
+                    streaming_preferred: true,
+                    provider_hint: Some("gemini".into()),
+                    model_hint: Some("gemini-flash-latest".into()),
+                    voice_id: None,
+                },
+                egress: Some(TurnRoutingStagePlan {
+                    stage: TurnRoutingStageKind::Egress,
+                    capability: "voice.synthesize".into(),
+                    request_class: "synthesis".into(),
+                    target_node: "audio-node".into(),
+                    target_role: "model.elevenlabs".into(),
+                    target_guest_id: Some("audio-hotel:model-controller-elevenlabs".into()),
+                    context_envelope: TurnContextEnvelopeKind::VoiceEgress,
+                    streaming_preferred: true,
+                    provider_hint: Some("elevenlabs".into()),
+                    model_hint: Some("eleven_multilingual_v2".into()),
+                    voice_id: Some("voice-123".into()),
+                }),
+            }),
             awaiting_transcription_reentry: true,
             scripted_loop_context: None,
         });
@@ -3552,6 +3690,10 @@ mod tests {
         assert_eq!(checkpoint["active_turn"]["turn_id"], "turn-1");
         assert_eq!(checkpoint["active_turn"]["phase"], "queued");
         assert_eq!(checkpoint["active_turn"]["provider_repair_attempts"], 0);
+        assert_eq!(
+            checkpoint["active_turn"]["turn_routing_plan"]["trigger"],
+            "voice-turn"
+        );
         assert_eq!(
             checkpoint["active_turn"]["pending_text_reply"],
             "hello back"
@@ -3564,6 +3706,16 @@ mod tests {
         assert_eq!(
             checkpoint["active_turn"]["final_reply_guest_id"],
             "membrane-telegram-01"
+        );
+        let restored =
+            SessionState::from_checkpoint(&checkpoint).expect("checkpoint should restore");
+        assert_eq!(
+            restored
+                .active_turn
+                .as_ref()
+                .and_then(|turn| turn.turn_routing_plan.as_ref())
+                .map(|plan| plan.trigger.as_str()),
+            Some("voice-turn")
         );
         // component_route_assembly and tool_assembly are hotel-computed and intentionally
         // excluded from the checkpoint to prevent circular growth. They are re-injected
@@ -3620,9 +3772,11 @@ mod tests {
         let restored =
             SessionState::from_checkpoint(&checkpoint).expect("checkpoint should restore");
         // After restore, routes are gone — the hotel re-injects them on the next turn.
-        assert!(restored
-            .resolve_component_execution_route("text.generate")
-            .is_none());
+        assert!(
+            restored
+                .resolve_component_execution_route("text.generate")
+                .is_none()
+        );
     }
 
     #[test]
@@ -3649,6 +3803,7 @@ mod tests {
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
+            turn_routing_plan: None,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
         });
@@ -3687,6 +3842,7 @@ mod tests {
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
+            turn_routing_plan: None,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
         });
@@ -3703,10 +3859,7 @@ mod tests {
     fn stale_audio_in_checkpoint_is_stripped_from_knowledge_projection() {
         // Regression: old checkpoints on disk may still have raw audio base64 in
         // recent_turns[].user_content. Ensure project_knowledge() never leaks it.
-        let audio_payload = format!(
-            r#"{{"audio_base64":"{}"}}"#,
-            "B".repeat(1_900_000)
-        );
+        let audio_payload = format!(r#"{{"audio_base64":"{}"}}"#, "B".repeat(1_900_000));
         let checkpoint = serde_json::json!({
             "session_id": "sess-1",
             "agent_id": "agent-jane-01",
@@ -3723,8 +3876,14 @@ mod tests {
         let state =
             SessionState::from_checkpoint(&checkpoint).expect("from_checkpoint must succeed");
         let knowledge = state.project_knowledge("", &[]);
-        assert!(!knowledge.contains("audio_base64"), "audio base64 must not appear in context");
-        assert!(knowledge.contains("[voice message]"), "placeholder must appear in context");
+        assert!(
+            !knowledge.contains("audio_base64"),
+            "audio base64 must not appear in context"
+        );
+        assert!(
+            knowledge.contains("[voice message]"),
+            "placeholder must appear in context"
+        );
     }
 
     #[test]
@@ -4202,6 +4361,7 @@ mod tests {
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
+            turn_routing_plan: None,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
         });
@@ -4283,6 +4443,7 @@ mod tests {
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
+            turn_routing_plan: None,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
         });
@@ -4358,6 +4519,7 @@ mod tests {
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
+            turn_routing_plan: None,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
         });
@@ -4430,6 +4592,7 @@ mod tests {
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
+            turn_routing_plan: None,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
         });
@@ -4825,8 +4988,9 @@ mod tests {
         state.add_tool_binding("subagent.spawn");
         state.add_tool_binding("echo");
 
-        let projected =
-            state.project_tools_for_turn("Thanks Bjork, I really appreciate it. Looks like you're working pretty well now.");
+        let projected = state.project_tools_for_turn(
+            "Thanks Bjork, I really appreciate it. Looks like you're working pretty well now.",
+        );
         assert!(projected.is_empty());
     }
 
@@ -4905,6 +5069,7 @@ mod tests {
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
+            turn_routing_plan: None,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
         });
@@ -4950,6 +5115,7 @@ mod tests {
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
+            turn_routing_plan: None,
             awaiting_transcription_reentry: true,
             scripted_loop_context: None,
         });
@@ -5010,6 +5176,7 @@ mod tests {
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
+            turn_routing_plan: None,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
         });
@@ -5071,6 +5238,7 @@ mod tests {
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: true,
+            turn_routing_plan: None,
             awaiting_transcription_reentry: true,
             scripted_loop_context: None,
         });
@@ -5340,6 +5508,7 @@ mod tests {
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
+            turn_routing_plan: None,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
         });

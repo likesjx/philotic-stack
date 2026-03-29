@@ -160,13 +160,17 @@ fn process_lines() -> Vec<String> {
     std::process::Command::new("ps")
         .args(["aux"])
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).lines().map(str::to_owned).collect())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        })
         .unwrap_or_default()
 }
 
 fn extract_pid(line: &str) -> Option<u32> {
-    line.split_whitespace()
-        .find_map(|t| t.parse::<u32>().ok())
+    line.split_whitespace().find_map(|t| t.parse::<u32>().ok())
 }
 
 /// Show all processes and socket counts — used by `phil footprint` for the
@@ -194,7 +198,9 @@ pub fn fd_pressure_report() -> String {
     for (pid, name) in &procs {
         // Count open FDs for this PID
         let fd_count = fd_count_for(*pid);
-        out.push_str(&format!("    pid {pid:<6}  {name:<35}  {fd_count} open FDs\n"));
+        out.push_str(&format!(
+            "    pid {pid:<6}  {name:<35}  {fd_count} open FDs\n"
+        ));
     }
     out
 }

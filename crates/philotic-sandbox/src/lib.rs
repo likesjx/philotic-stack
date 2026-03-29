@@ -111,9 +111,9 @@ impl ShellExecutor for DirectShellExecutor {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
-        let mut child = cmd.spawn().map_err(|e| {
-            anyhow::anyhow!("failed to spawn command '{}': {}", request.command, e)
-        })?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("failed to spawn command '{}': {}", request.command, e))?;
 
         if let Some(ref stdin_data) = request.stdin {
             use std::io::Write;

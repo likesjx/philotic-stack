@@ -771,6 +771,30 @@ Seam IDs: `structured-model-envelope`, `hotel-gemini-oauth-flow`
   - background mode
   - built-in tools gated behind explicit provider options
   - realtime/audio kept as a follow-on slice, not part of the first parity path
+- [x] Pin a provider-neutral model graph/catalog as the canonical static metadata layer for model-controller supported models.
+- [ ] Define the first shared model graph schema for:
+  - capability tree
+  - provider records
+  - endpoint stems / API families
+  - model families and variants
+  - coarse score vectors (`capability`, `speed`, `thinking`, `cost_efficiency`, `tool_use`, `audio_native`)
+- [ ] Seed the first shared catalog snapshot for current supported providers and defaults:
+  - Gemini
+  - ElevenLabs
+  - ONNX
+  - MLX
+- [ ] Decide how `model.manager.list@1` should project catalog metadata without confusing static model facts with live node availability.
+- [ ] Reduce provider-local capability folklore over time by threading catalog metadata into controller/provider selection where it actually clarifies behavior.
+- [x] Define the first staged `TurnRoutingPlan` shape so inbound turns can compile explicit ingress, cognition, and egress routes.
+- [ ] Thread the compiled turn routing plan into current voice turns:
+  - ingress `voice.transcribe`
+  - cognition `text.generate`
+  - egress `voice.synthesize`
+- [ ] Make turn-routing-plan context envelopes explicit for:
+  - media ingress
+  - agent cognition
+  - voice egress
+- [ ] Decide when `voice.transcribe` should be normalized to broader catalog vocabulary such as `speech.transcribe` without breaking current runtime truth.
 
 ## New Project: Key Vault
 

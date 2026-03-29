@@ -1,5 +1,5 @@
 use crate::client::{ChatMessage, ChatRequest, MlxClient};
-use crate::config::{MlxModelClass, MlxModelConfig, MlxMode};
+use crate::config::{MlxMode, MlxModelClass, MlxModelConfig};
 use crate::server::MlxServerHandle;
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -12,11 +12,18 @@ use tracing::{info, warn};
 #[derive(Debug, Clone)]
 pub enum HealthState {
     Starting,
-    Healthy { checked_at: Instant },
+    Healthy {
+        checked_at: Instant,
+    },
     /// Degraded after a request failure or transient health-check failure.
-    Degraded { since: Instant, failures: u32 },
+    Degraded {
+        since: Instant,
+        failures: u32,
+    },
     /// Confirmed down after repeated health-check failures.
-    Down { since: Instant },
+    Down {
+        since: Instant,
+    },
 }
 
 impl HealthState {
@@ -50,17 +57,23 @@ impl MlxModelInstance {
 
         let server = match config.mode {
             MlxMode::Managed => {
-                let python_path = python_path
-                    .ok_or_else(|| anyhow::anyhow!(
+                let python_path = python_path.ok_or_else(|| {
+                    anyhow::anyhow!(
                         "model {} requires managed mode but fleet config has no python_path",
                         config.repo_id
-                    ))?;
-                let handle = MlxServerHandle::spawn(python_path, &config.repo_id, port, &config.extra_args)
-                    .with_context(|| format!("failed to spawn server for {}", config.repo_id))?;
+                    )
+                })?;
+                let handle =
+                    MlxServerHandle::spawn(python_path, &config.repo_id, port, &config.extra_args)
+                        .with_context(|| {
+                            format!("failed to spawn server for {}", config.repo_id)
+                        })?;
                 handle
                     .wait_ready(Duration::from_secs(120))
                     .await
-                    .with_context(|| format!("server for {} did not start in time", config.repo_id))?;
+                    .with_context(|| {
+                        format!("server for {} did not start in time", config.repo_id)
+                    })?;
                 Some(handle)
             }
             MlxMode::Attached => None,
@@ -90,9 +103,14 @@ impl MlxModelInstance {
         };
 
         let health = if discovered_model_id.is_some() {
-            HealthState::Healthy { checked_at: Instant::now() }
+            HealthState::Healthy {
+                checked_at: Instant::now(),
+            }
         } else {
-            HealthState::Degraded { since: Instant::now(), failures: 1 }
+            HealthState::Degraded {
+                since: Instant::now(),
+                failures: 1,
+            }
         };
 
         Ok(Self {
@@ -125,7 +143,9 @@ impl MlxModelInstance {
         match self.client.health_check().await {
             Ok(()) => {
                 let mut h = self.health.lock().await;
-                *h = HealthState::Healthy { checked_at: Instant::now() };
+                *h = HealthState::Healthy {
+                    checked_at: Instant::now(),
+                };
             }
             Err(e) => {
                 let mut h = self.health.lock().await;
