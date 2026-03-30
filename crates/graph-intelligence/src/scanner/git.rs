@@ -63,6 +63,11 @@ fn scan_commits(
             worktree: String::new(),
             created_at: *now,
             updated_at: *now,
+            embedding: None,
+            embedding_model: None,
+            embedding_dims: None,
+            embedding_updated: None,
+            embedding_hash: None,
         })?;
     }
 
@@ -169,6 +174,11 @@ fn scan_branches(
             worktree: String::new(),
             created_at: *now,
             updated_at: *now,
+            embedding: None,
+            embedding_model: None,
+            embedding_dims: None,
+            embedding_updated: None,
+            embedding_hash: None,
         })?;
     }
 
@@ -217,6 +227,11 @@ fn scan_worktrees(
                 worktree: String::new(),
                 created_at: *now,
                 updated_at: *now,
+                embedding: None,
+                embedding_model: None,
+                embedding_dims: None,
+                embedding_updated: None,
+                embedding_hash: None,
             })?;
             current_path.clear();
             current_branch.clear();
@@ -243,6 +258,11 @@ fn scan_worktrees(
             worktree: String::new(),
             created_at: *now,
             updated_at: *now,
+            embedding: None,
+            embedding_model: None,
+            embedding_dims: None,
+            embedding_updated: None,
+            embedding_hash: None,
         })?;
     }
 

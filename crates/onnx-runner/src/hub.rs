@@ -42,15 +42,18 @@ impl ModelCache {
     /// Download (or serve from cache) the ONNX model and tokenizer for `repo_id`.
     ///
     /// Expects the repo to contain:
-    /// - `onnx/model.onnx` or `onnx/model_quantized.onnx`
+    /// - `onnx/model.onnx` (fp32, ~1.2GB)
+    /// - `onnx/model_q4.onnx` (q4 quant, ~197MB) - recommended for M1
+    /// - `onnx/model_quantized.onnx` (legacy quantized)
     /// - `tokenizer.json`
     ///
     /// Returns a [`ModelHandle`] with local paths and a `model_gen` token.
     pub fn pull(&self, repo_id: &str, prefer_quantized: bool) -> Result<ModelHandle> {
         let repo = self.api.model(repo_id.to_string());
 
+        // Priority: model_q4 (best for M1) > model_quantized > model_fp32
         let model_filename = if prefer_quantized {
-            "onnx/model_quantized.onnx"
+            "onnx/model_q4.onnx"
         } else {
             "onnx/model.onnx"
         };
@@ -58,15 +61,30 @@ impl ModelCache {
         let model_path = repo
             .get(model_filename)
             .or_else(|_| {
-                // Fall back to the other variant if the preferred one is missing.
-                let fallback = if prefer_quantized {
-                    "onnx/model.onnx"
+                // Try fallback variants in order of preference
+                let fallbacks = if prefer_quantized {
+                    vec!["onnx/model_quantized.onnx", "onnx/model.onnx"]
                 } else {
-                    "onnx/model_quantized.onnx"
+                    vec!["onnx/model_q4.onnx", "onnx/model_quantized.onnx"]
                 };
-                repo.get(fallback)
+                for fallback in fallbacks {
+                    if let Ok(path) = repo.get(fallback) {
+                        return Ok(path);
+                    }
+                }
+                Err(anyhow::anyhow!("no suitable model found"))
             })
             .with_context(|| format!("could not download ONNX model from {}", repo_id))?;
+
+        // Also fetch the .onnx_data file if present (for split models like q4)
+        let model_data_filename = model_path.file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| format!("onnx/{}_data", s))
+            .unwrap_or_else(|| "onnx/model.onnx_data".to_string());
+        
+        if let Ok(data_path) = repo.get(&model_data_filename) {
+            tracing::info!(?data_path, "downloaded companion weights file");
+        }
 
         let tokenizer_path = repo
             .get("tokenizer.json")

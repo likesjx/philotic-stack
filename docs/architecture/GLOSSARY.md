@@ -90,6 +90,48 @@ It has no formal standing in proposals, task tracking, or the seam registry.
 Prefer naming the slices themselves. If Muninn notes use block labels, treat them as
 internal working shorthand only.
 
+### graph (intelligence graph)
+The SQLite-based graph representation of the entire development surface — code,
+documentation, git history, process state, and agent decisions.
+
+The graph is the **canonical source of truth** for:
+- Proposal status and disposition
+- Seam ownership and state
+- Task assignments
+- Agent decisions and traceability
+- Architecture relationships
+
+Agents mutate the graph via MCP tools (`graph_update_node`, `graph_create_edge`,
+`graph_decide`). Markdown files are human-readable projections, not authorities.
+
+See `GRAPH_AS_SOURCE_OF_TRUTH.md` for the full architecture.
+
+### node
+An entity in the intelligence graph. Kinds include: `proposal`, `seam`, `task`,
+`slice`, `domain`, `crate`, `module`, `type`, `function`, `test`, `commit`,
+`branch`, `decision`, `agent`, `session`.
+
+Each node has a unique ID (e.g., `doc:runtime-authority-leases`), kind, name,
+and JSON properties.
+
+### edge
+A relationship between two nodes in the intelligence graph. Relations include:
+`implements`, `implemented_by`, `depends_on`, `contains`, `governs`,
+`references`, `tests`, `blocks`, `applies_to`, `imports`.
+
+### mcp (model context protocol)
+The protocol by which agents interact with the graph intelligence server.
+MCP tools provide both query (`graph_status`, `graph_query`) and mutation
+(`graph_create_node`, `graph_update_node`, `graph_writeback`) capabilities.
+
+### writeback
+The process of serializing graph state back to markdown frontmatter. Graph is
+canonical; files are projections. Optional and explicit via `graph_writeback` tool.
+
+### mutation
+An audit log entry recording every graph change: agent, timestamp, action,
+target node, from/to values, and reason. Stored in the `mutations` table.
+
 ---
 
 ## How These Relate

@@ -164,13 +164,20 @@ Voice/transcription re-entry is a first-class policy boundary, not just “text 
 
 Use repo-local skills for process execution:
 
-- `muninn-memory-habit`
-- `runtime-debugger`
-- `runtime-rollout-watch`
-- `verification-ladder`
-- `philotic-slice-closeout`
-- `check-engine`
-- `retrospective-workflow`
+- `graph-intelligence` — graph as primary context source, MCP tool reference, agent workflow
+- `check-engine` — end-of-session review
+- `philotic-slice-closeout` — closing implementation slices
+- `verification-ladder` — deciding validation depth and SVER state
+- `proposal-maintainer` — proposal and spec hygiene
+- `architecture-docs-maintainer` — architecture truth, domains, frontmatter, cross-links
+- `muninn-memory-habit` — retrieval/write-back habits
+- `muninn-memory-protocol` — client adapter contract for memory integration
+- `subagent-delegation` — splitting tasks into bounded sub-tasks
+- `runtime-debugger` — diagnosing live multi-process failures
+- `runtime-materialization` — startup/wake/sleep and placement policy
+- `runtime-rollout-watch` — proving installed/runtime rollout truth
+- `retrospective-workflow` — seam-based retrospectives
+- `role-authoring` — creating or updating agent roles
 
 Use code-local docs, tests, and types for correctness rules.
 

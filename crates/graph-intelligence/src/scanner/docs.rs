@@ -35,6 +35,9 @@ pub fn scan_docs(root: &Path, engine: &GraphEngine) -> Result<usize> {
     let now = Utc::now();
     let mut count = 0;
 
+    // Clear stale doc nodes before rescan (prevents ghosts from renamed/deleted files)
+    engine.clear_scanned_doc_nodes()?;
+
     // Collect all .md files from multiple scan roots
     let scan_dirs = ["docs", "skills", "workflows"];
     let mut md_files: Vec<std::path::PathBuf> = Vec::new();

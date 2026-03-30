@@ -101,6 +101,11 @@ fn test_engine_in_memory() {
         worktree: "test".into(),
         created_at: now,
         updated_at: now,
+        embedding: None,
+        embedding_model: None,
+        embedding_dims: None,
+        embedding_updated: None,
+        embedding_hash: None,
     };
 
     engine.upsert_node(&node).unwrap();
@@ -118,6 +123,11 @@ fn test_engine_in_memory() {
         worktree: "test".into(),
         created_at: now,
         updated_at: now,
+        embedding: None,
+        embedding_model: None,
+        embedding_dims: None,
+        embedding_updated: None,
+        embedding_hash: None,
     };
     engine.upsert_node(&updated).unwrap();
     let fetched2 = engine.get_node("test:1").unwrap().unwrap();

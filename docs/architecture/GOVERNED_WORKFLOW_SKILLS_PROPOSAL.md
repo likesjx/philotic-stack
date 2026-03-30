@@ -2,7 +2,7 @@
 title: "Governed Workflow Skills Proposal"
 doc_type: proposal
 domain: runtime-sessions
-status: accepted — current slice
+status: accepted-current-slice
 last_updated: 2026-03-13
 tags:
   - workflows

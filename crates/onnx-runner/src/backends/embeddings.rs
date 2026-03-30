@@ -104,6 +104,13 @@ impl EmbeddingsBackend {
         let mask_tensor = Tensor::<i64>::from_array(mask_array)
             .map_err(|e| anyhow::anyhow!("failed to create attention_mask tensor: {}", e))?;
 
+        // token_type_ids: all zeros for single-segment embeddings
+        let token_type_data: Vec<i64> = vec![0i64; seq_len];
+        let token_type_array = Array2::from_shape_vec((1, seq_len), token_type_data)
+            .context("failed to build token_type_ids array")?;
+        let token_type_tensor = Tensor::<i64>::from_array(token_type_array)
+            .map_err(|e| anyhow::anyhow!("failed to create token_type_ids tensor: {}", e))?;
+
         let mut session = self
             .session
             .lock()
@@ -113,6 +120,7 @@ impl EmbeddingsBackend {
             .run(ort::inputs![
                 "input_ids" => ids_tensor,
                 "attention_mask" => mask_tensor,
+                "token_type_ids" => token_type_tensor,
             ])
             .map_err(|e| anyhow::anyhow!("ONNX session run failed: {}", e))?;
 

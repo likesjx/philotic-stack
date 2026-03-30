@@ -1,6 +1,64 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// C4 Model architecture levels for drill-down navigation
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum C4Level {
+    Context,    // C1: Systems and external actors
+    Container,  // C2: Crates/runtimes/processes
+    Component,  // C3: Modules/layers within crates
+    Code,       // C4: Types, functions, traits
+}
+
+impl C4Level {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Context => "c1_context",
+            Self::Container => "c2_container",
+            Self::Component => "c3_component",
+            Self::Code => "c4_code",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "c1_context" | "context" => Some(Self::Context),
+            "c2_container" | "container" => Some(Self::Container),
+            "c3_component" | "component" => Some(Self::Component),
+            "c4_code" | "code" => Some(Self::Code),
+            _ => None,
+        }
+    }
+
+    /// Map NodeKind to default C4 level
+    pub fn from_node_kind(kind: NodeKind) -> Option<Self> {
+        match kind {
+            // C1: Context level
+            NodeKind::Domain | NodeKind::Agent | NodeKind::Skill => Some(Self::Context),
+            
+            // C2: Container level
+            NodeKind::Crate | NodeKind::Worktree | NodeKind::Workstream | NodeKind::Component => Some(Self::Container),
+            
+            // C3: Component level
+            NodeKind::Module | NodeKind::Proposal | NodeKind::Seam | NodeKind::Slice => Some(Self::Component),
+            
+            // C4: Code level
+            NodeKind::Type | NodeKind::Function | NodeKind::ImplBlock | NodeKind::Test | NodeKind::Commit => Some(Self::Code),
+            
+            // Process/metadata
+            NodeKind::Task | NodeKind::Decision => Some(Self::Component),
+            NodeKind::Branch => Some(Self::Container),
+            NodeKind::Session => Some(Self::Context),
+            NodeKind::Document => Some(Self::Context),
+            // Verification tracking - these are process nodes, not code
+            NodeKind::TestRun | NodeKind::SmokeRun | NodeKind::UatRun => None,
+            // SVER - process documentation
+            NodeKind::Sver => Some(Self::Context),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
     pub id: String,
@@ -11,6 +69,17 @@ pub struct Node {
     pub worktree: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    // Embedding fields
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub embedding: Option<Vec<f32>>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub embedding_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub embedding_dims: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub embedding_updated: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub embedding_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,6 +105,14 @@ pub enum NodeKind {
     Agent,
     Session,
     Decision,
+    // Process documents (AGENTS.md, guides, lifecycle docs)
+    Document,
+    // Verification tracking nodes
+    TestRun,
+    SmokeRun,
+    UatRun,
+    // SVER (Software Versioning and Evaluation Record)
+    Sver,
 }
 
 impl NodeKind {
@@ -61,6 +138,13 @@ impl NodeKind {
             Self::Agent => "agent",
             Self::Session => "session",
             Self::Decision => "decision",
+            Self::Document => "document",
+            // Verification tracking
+            Self::TestRun => "test_run",
+            Self::SmokeRun => "smoke_run",
+            Self::UatRun => "uat_run",
+            // SVER
+            Self::Sver => "sver",
         }
     }
 
@@ -86,6 +170,13 @@ impl NodeKind {
             "agent" => Some(Self::Agent),
             "session" => Some(Self::Session),
             "decision" => Some(Self::Decision),
+            "document" => Some(Self::Document),
+            // Verification tracking
+            "test_run" => Some(Self::TestRun),
+            "smoke_run" => Some(Self::SmokeRun),
+            "uat_run" => Some(Self::UatRun),
+            // SVER
+            "sver" => Some(Self::Sver),
             _ => None,
         }
     }
@@ -116,6 +207,18 @@ pub enum EdgeRelation {
     Imports,
     TraitImpl,
     Overlaps,
+    // Verification tracking
+    TestedBy,
+    SmokedBy,
+    UatBy,
+    Validates,
+    RequiresVerification,
+    // SVER relationships
+    UsesSver,
+    // Session tracking
+    WorkingOn,
+    Created,
+    PartOf,
 }
 
 impl EdgeRelation {
@@ -134,6 +237,18 @@ impl EdgeRelation {
             Self::Imports => "imports",
             Self::TraitImpl => "trait_impl",
             Self::Overlaps => "overlaps",
+            // Verification tracking
+            Self::TestedBy => "tested_by",
+            Self::SmokedBy => "smoked_by",
+            Self::UatBy => "uat_by",
+            Self::Validates => "validates",
+            Self::RequiresVerification => "requires_verification",
+            // SVER
+            Self::UsesSver => "uses_sver",
+            // Session tracking
+            Self::WorkingOn => "working_on",
+            Self::Created => "created",
+            Self::PartOf => "part_of",
         }
     }
 
@@ -152,6 +267,18 @@ impl EdgeRelation {
             "imports" => Some(Self::Imports),
             "trait_impl" => Some(Self::TraitImpl),
             "overlaps" => Some(Self::Overlaps),
+            // Verification tracking
+            "tested_by" => Some(Self::TestedBy),
+            "smoked_by" => Some(Self::SmokedBy),
+            "uat_by" => Some(Self::UatBy),
+            "validates" => Some(Self::Validates),
+            "requires_verification" => Some(Self::RequiresVerification),
+            // SVER
+            "uses_sver" => Some(Self::UsesSver),
+            // Session tracking
+            "working_on" => Some(Self::WorkingOn),
+            "created" => Some(Self::Created),
+            "part_of" => Some(Self::PartOf),
             _ => None,
         }
     }
@@ -241,4 +368,60 @@ pub struct ScanSnapshot {
     pub commit_sha: Option<String>,
     pub worktree: Option<String>,
     pub metrics: serde_json::Value,
+}
+
+// ── Embedding Utilities ──
+
+/// Serialize a Vec<f32> to bytes for SQLite BLOB storage
+pub fn serialize_embedding(vec: &[f32]) -> Vec<u8> {
+    vec.iter()
+        .flat_map(|f| f.to_le_bytes())
+        .collect()
+}
+
+/// Deserialize bytes to Vec<f32>
+pub fn deserialize_embedding(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect()
+}
+
+/// Compute cosine similarity between two vectors
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 0.0;
+    }
+    
+    dot / (norm_a * norm_b)
+}
+
+/// Compute dot product similarity (faster, not normalized)
+pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() {
+        return 0.0;
+    }
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+/// Check if a node kind should have embeddings generated
+pub fn should_embed(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Proposal
+            | NodeKind::Seam
+            | NodeKind::Task
+            | NodeKind::Function
+            | NodeKind::Type
+            | NodeKind::Module
+            | NodeKind::Test
+    )
 }

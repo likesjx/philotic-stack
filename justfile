@@ -476,3 +476,101 @@ ansible-check:
 # Deploy the mesh node playbook to configured hosts
 ansible-deploy:
     cd ansible && ansible-playbook deploy_mesh_node.yml
+
+# ── Intel Graph (Semantic Intelligence) ─────────────────────────────────────────
+
+# Install and build intel-graph components
+intel-graph-install:
+    ./scripts/setup-intel-graph.sh install
+
+# Start the intel-graph stack (ONNX sidecar + graph intelligence)
+intel-graph-start:
+    ./scripts/setup-intel-graph.sh start
+
+# Stop the intel-graph stack
+intel-graph-stop:
+    ./scripts/setup-intel-graph.sh stop
+
+# Restart the intel-graph stack
+intel-graph-restart:
+    ./scripts/setup-intel-graph.sh restart
+
+# Check intel-graph stack status
+intel-graph-status:
+    ./scripts/setup-intel-graph.sh status
+
+# Start intel-graph only if not already running (idempotent, for scripts/agents)
+intel-graph-ensure:
+    ./scripts/setup-intel-graph.sh ensure
+
+# Start intel-graph with agent timeout (auto-shutdown after N minutes)
+intel-graph-agent timeout_minutes="60":
+    ./scripts/setup-intel-graph.sh agent-start {{timeout_minutes}}
+
+# Tail intel-graph logs
+intel-graph-logs:
+    ./scripts/setup-intel-graph.sh logs
+
+# Health check both services
+intel-graph-health:
+    @echo "ONNX Sidecar: $(curl -s http://127.0.0.1:11435/api/health 2>/dev/null && echo '✓' || echo '✗')"
+    @echo "Graph Intel:  $(curl -s http://127.0.0.1:8900/api/nodes 2>/dev/null | head -1 && echo '✓' || echo '✗')"
+
+# Quick embed a proposal node
+intel-graph-embed node_id:
+    curl -s -X POST http://127.0.0.1:8901/mcp -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"graph_embed","arguments":{"node_id":"{{node_id}}"}},"id":1}' | jq .result.content[0].text
+
+# Batch embed all proposals
+intel-graph-embed-proposals:
+    curl -s -X POST http://127.0.0.1:8901/mcp -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"graph_embed_batch","arguments":{"kind":"proposal"}},"id":1}' | jq '.result | {processed, embedded}'
+
+# Run the full agent workflow smoke (scan → next_task → context → session → decide → close → dashboard)
+smoke-agent-workflow:
+    bash scripts/smoke-agent-workflow.sh
+
+# Run tests and record results to the graph (Option C foundation)
+# Works even with partial compilation failures - records what tests did run
+test-and-record target_id:
+    #!/bin/bash
+    set +e  # Don't fail on test errors
+    echo "Running tests for {{target_id}}..."
+    START_TIME=$(date +%s%N)
+    cargo test --workspace 2>&1 | tee /tmp/test-output.txt
+    EXIT_CODE=$?
+    END_TIME=$(date +%s%N)
+    DURATION_MS=$(( (END_TIME - START_TIME) / 1000000 ))
+    
+    # Parse test results from output
+    # Handle both "running N tests" and "test result: X passed Y failed"
+    TEST_COUNT=$(grep -oE "running [0-9]+ tests" /tmp/test-output.txt | awk '{sum+=$2} END {print sum+0}')
+    RESULT_LINE=$(grep "^test result:" /tmp/test-output.txt | tail -1)
+    
+    if [ -n "$RESULT_LINE" ]; then
+        PASS_COUNT=$(echo "$RESULT_LINE" | grep -oE "[0-9]+ passed" | grep -oE "[0-9]+")
+        FAIL_COUNT=$(echo "$RESULT_LINE" | grep -oE "[0-9]+ failed" | grep -oE "[0-9]+")
+    else
+        PASS_COUNT=$(grep -c "^test .* ... ok$" /tmp/test-output.txt || echo "0")
+        FAIL_COUNT=$(grep -c "^test .* ... FAILED$" /tmp/test-output.txt || echo "0")
+    fi
+    
+    # Ensure values are set
+    TEST_COUNT=${TEST_COUNT:-0}
+    PASS_COUNT=${PASS_COUNT:-0}
+    FAIL_COUNT=${FAIL_COUNT:-0}
+    
+    echo "Results: $PASS_COUNT/$TEST_COUNT passed, $FAIL_COUNT failed"
+    echo "Recording to graph..."
+    
+    curl -s -X POST http://127.0.0.1:8900/api/test-run \
+      -H "Content-Type: application/json" \
+      -d "{\"target_id\":\"{{target_id}}\",\"test_count\":$TEST_COUNT,\"pass_count\":$PASS_COUNT,\"fail_count\":$FAIL_COUNT,\"duration_ms\":$DURATION_MS}" | jq .
+    
+    exit $EXIT_CODE
+
+# Semantic search
+intel-graph-search query limit="10":
+    curl -s -X POST http://127.0.0.1:8901/mcp -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"graph_semantic_search","arguments":{"query":"{{query}}","limit":{{limit}}}},"id":1}' | jq '.result.results | map({name, kind, similarity})'
+
+# Open Web UI in browser (macOS)
+intel-graph-ui:
+    open http://127.0.0.1:8900

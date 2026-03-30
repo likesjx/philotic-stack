@@ -406,6 +406,25 @@ impl GraphEngine {
         Ok(())
     }
 
+    /// Clear all scanner-created doc nodes (worktree='', doc-like kinds).
+    /// Called before doc rescan to prevent ghost nodes from renamed/deleted files.
+    /// Preserves agent-created nodes (decisions, sessions, workstreams, test runs).
+    pub fn clear_scanned_doc_nodes(&self) -> Result<()> {
+        let doc_kinds = "'proposal','domain','seam','task','document','skill','sver'";
+        self.conn.execute(
+            &format!(
+                "DELETE FROM edges WHERE source_id IN (SELECT id FROM nodes WHERE worktree = '' AND kind IN ({doc_kinds})) \
+                 OR target_id IN (SELECT id FROM nodes WHERE worktree = '' AND kind IN ({doc_kinds}))"
+            ),
+            [],
+        )?;
+        self.conn.execute(
+            &format!("DELETE FROM nodes WHERE worktree = '' AND kind IN ({doc_kinds})"),
+            [],
+        )?;
+        Ok(())
+    }
+
     pub fn transaction<F, T>(&mut self, f: F) -> Result<T>
     where
         F: FnOnce(&Transaction) -> Result<T>,

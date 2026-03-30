@@ -2,8 +2,8 @@
 title: "Graph Intelligence — Project Context Engine"
 doc_type: proposal
 domain: product-management-plane
-status: proposed
-last_updated: 2026-03-28
+status: accepted-current-slice
+last_updated: 2026-03-29
 tags:
   - graph
   - intelligence

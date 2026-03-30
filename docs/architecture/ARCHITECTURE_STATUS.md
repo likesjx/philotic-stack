@@ -3,7 +3,7 @@ title: "Philotic Architecture Status"
 doc_type: status
 domain: runtime-sessions
 status: active
-last_updated: 2026-03-23
+last_updated: 2026-03-29
 tags:
   - source-of-truth
   - current-state
@@ -12,6 +12,9 @@ tags:
 related_docs:
   - README.md
   - ARCHITECTURE.md
+  - GRAPH_AS_SOURCE_OF_TRUTH.md
+  - GRAPH_INTELLIGENCE_PROPOSAL.md
+  - GRAPH_INTELLIGENCE_STATUS.md
   - SESSION_LOOP_PROPOSAL.md
   - TELEGRAM_POLL_LEASE_PROPOSAL.md
   - DESKTOP_MEMBRANE_PROPOSAL.md
@@ -134,6 +137,20 @@ Primary references:
 - [RH_ANSIBLE_VPS_DEPLOYMENT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RH_ANSIBLE_VPS_DEPLOYMENT_PROPOSAL.md)
 - [MUNINN_MEMORY_PROTOCOL_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MUNINN_MEMORY_PROTOCOL_PROPOSAL.md)
 - [AGENT_WORKFLOW_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/AGENT_WORKFLOW_PROPOSAL.md)
+
+### Graph Intelligence and Context
+
+- the SQLite context graph is now the canonical source of truth for proposals, seams, tasks, and architectural state
+- agents mutate state via MCP tools (`graph_create_node`, `graph_update_node`, `graph_create_edge`) rather than editing files directly
+- optional writeback (`graph_writeback`) synchronizes graph state to markdown for human readability
+- web UI provides real-time visibility into proposals, seams, tasks with drill-down architecture diagrams
+- full-text search, code snippets, and PlantUML generation available via MCP and REST API
+- scanner indexes Rust code, markdown frontmatter, git state into queryable graph
+
+Primary references:
+- [GRAPH_AS_SOURCE_OF_TRUTH.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_AS_SOURCE_OF_TRUTH.md)
+- [GRAPH_INTELLIGENCE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_INTELLIGENCE_PROPOSAL.md)
+- [DOC_TAGGING_FRONTMATTER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DOC_TAGGING_FRONTMATTER_PROPOSAL.md)
 
 ## Transitional Architecture
 

@@ -6,6 +6,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::Result;
+use chrono::Utc;
 
 use crate::engine::GraphEngine;
 
@@ -80,6 +81,83 @@ pub fn full_scan(
         .len();
 
     let duration = start.elapsed();
+
+    // 4. Create top-level system node for C4 context diagrams
+    {
+        use crate::schema::*;
+        let now = Utc::now();
+        let system_name = root
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "PhiloticStack".to_string());
+        let system_id = format!("system:{}", system_name);
+
+        engine.upsert_node(&Node {
+            id: system_id.clone(),
+            kind: NodeKind::Component,
+            name: system_name.clone(),
+            properties: serde_json::json!({
+                "system": true,
+                "crates": total_crates,
+                "modules": total_modules,
+                "types": total_types,
+                "functions": total_functions,
+                "tests": total_tests,
+                "docs": docs_count,
+            }),
+            file_path: Some(root.display().to_string()),
+            worktree: config.worktree.clone(),
+            created_at: now,
+            updated_at: now,
+            embedding: None,
+            embedding_model: None,
+            embedding_dims: None,
+            embedding_updated: None,
+            embedding_hash: None,
+        })?;
+
+        // Link system to all crates
+        let crates = engine.query_nodes(Some(NodeKind::Crate), None)?;
+        for c in &crates {
+            engine.upsert_edge(&Edge {
+                source_id: system_id.clone(),
+                target_id: c.id.clone(),
+                relation: EdgeRelation::Contains,
+                properties: serde_json::json!({}),
+                worktree: config.worktree.clone(),
+            })?;
+        }
+
+        // Link system to all domains
+        let domains = engine.query_nodes(Some(NodeKind::Domain), None)?;
+        for d in &domains {
+            engine.upsert_edge(&Edge {
+                source_id: system_id.clone(),
+                target_id: d.id.clone(),
+                relation: EdgeRelation::Governs,
+                properties: serde_json::json!({}),
+                worktree: String::new(),
+            })?;
+        }
+    }
+
+    // 5. Auto-embed proposals (best effort, don't fail scan if this errors)
+    // This runs synchronously for simplicity; could be made async in future
+    if let Ok(proposals) = engine.query_nodes(Some(crate::schema::NodeKind::Proposal), None) {
+        let unembedded: Vec<_> = proposals
+            .into_iter()
+            .filter(|n| n.embedding.is_none())
+            .collect();
+        if !unembedded.is_empty() {
+            // Note: We can't actually do the embedding here without async runtime
+            // and the ONNX client. For now, we log that there are unembedded nodes.
+            // A background task or manual batch embed should be used.
+            eprintln!(
+                "[scan] Found {} unembedded proposals. Run: graph_embed_batch with kind=proposal",
+                unembedded.len()
+            );
+        }
+    }
 
     Ok(ScanResult {
         crates: total_crates,

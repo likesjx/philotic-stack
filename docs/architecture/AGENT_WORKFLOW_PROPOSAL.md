@@ -47,12 +47,17 @@ Implemented so far:
 - executable workflow commands in [justfile](/Users/jaredlikes/code/philotic-stack/justfile):
   - `verify-vertical-slice`
   - `operator-checklist`
+- **NEW**: Agent session tracking via graph-intelligence MCP tools
+  - `session_start` / `session_activity` / `session_close`
+  - Workstream auto-creation with proposal linkage
+  - Status Board ("The Pitt" style) for live work visibility
 
 Still pending in [task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md):
 
 - proposal disposition rollout across remaining active docs
 - lightweight skill/rules optimization loop
 - watched-live recipe for supervised guest/runtime validation
+- **NEW**: Bulk graph update — audit all proposals for missing seams/tasks
 
 ## Core Recommendation
 
@@ -187,6 +192,7 @@ The close-out should also capture:
 
 - assumption/reality gaps exposed during the slice
 - whether any standing instructions, skills, or rules now need tuning
+- **session_close**: Call `session_close` with verification level (`test-green`, `smoke-green`, `watched-live-green`) and summary
 
 ## Slice Contract
 

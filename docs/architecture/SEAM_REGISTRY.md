@@ -3,7 +3,7 @@ title: "Philotic Seam Registry"
 doc_type: workflow
 domain: workflow-docs
 status: active
-last_updated: 2026-03-24
+last_updated: 2026-03-29
 tags:
   - seams
   - ids
@@ -14,8 +14,8 @@ related_docs:
   - DOMAIN_MAP.md
   - ARCHITECTURE_STATUS.md
   - DOC_TAGGING_FRONTMATTER_PROPOSAL.md
+  - GRAPH_AS_SOURCE_OF_TRUTH.md
   - GLOSSARY.md
-task_refs:
   - docs/task.md
 ---
 
@@ -39,11 +39,11 @@ This registry makes the seam layer explicit without forcing every task bullet to
 
 ## Active Seams
 
-| Seam ID | Domain | Primary proposal | Current task surface |
-| --- | --- | --- | --- |
-| `session-leases` | `runtime-sessions` | [SESSION_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SESSION_LOOP_PROPOSAL.md) | `docs/task.md` → `WI 1: Session Management` |
-| `runtime-authority-leases` | `runtime-sessions` | [RUNTIME_AUTHORITY_LEASES_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RUNTIME_AUTHORITY_LEASES_PROPOSAL.md) | `docs/task.md` → `New Project: Runtime Authority Leases` |
-| `session-compaction` | `runtime-sessions` | [SESSION_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SESSION_LOOP_PROPOSAL.md) | `docs/task.md` → `WI 2: Agent Logic` |
+| Seam ID | Domain | Primary proposal | Verification | Current task surface |
+| --- | --- | --- | --- | --- |
+| `session-leases` | `runtime-sessions` | [SESSION_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SESSION_LOOP_PROPOSAL.md) | proposed | `docs/task.md` → `WI 1: Session Management` |
+| `runtime-authority-leases` | `runtime-sessions` | [RUNTIME_AUTHORITY_LEASES_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RUNTIME_AUTHORITY_LEASES_PROPOSAL.md) | uat-green | `docs/task.md` → `New Project: Runtime Authority Leases` |
+| `session-compaction` | `runtime-sessions` | [SESSION_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SESSION_LOOP_PROPOSAL.md) | proposed | `docs/task.md` → `WI 2: Agent Logic` |
 | `structured-context-layers` | `memory-context` | [PERSONALITY_AND_CONTEXT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PERSONALITY_AND_CONTEXT_PROPOSAL.md) | `docs/task.md` → `Next Project: Personality and Context` |
 | `legacy-workspace-import` | `memory-context` | [PERSONALITY_AND_CONTEXT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PERSONALITY_AND_CONTEXT_PROPOSAL.md) | `docs/task.md` → `Next Project: Personality and Context` |
 | `role-incarnation-records` | `runtime-sessions` | [AGENT_INCARNATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/AGENT_INCARNATION_PROPOSAL.md) | `docs/task.md` → `New Project: Agent Incarnation Model / Role Incarnation Records` |
@@ -53,7 +53,7 @@ This registry makes the seam layer explicit without forcing every task bullet to
 | `peer-delegation-workflows` | `runtime-sessions` | [GOVERNED_WORKFLOW_SKILLS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GOVERNED_WORKFLOW_SKILLS_PROPOSAL.md) | `docs/task.md` → `Governed workflow skills` |
 | `approval-card-ux` | `runtime-sessions` | [APPROVAL_UX_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/APPROVAL_UX_PROPOSAL.md) | `docs/task.md` → `Telegram approval card UX` |
 | `session-preapproval-ux` | `runtime-sessions` | [APPROVAL_UX_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/APPROVAL_UX_PROPOSAL.md) | `docs/task.md` → `Approval UX evolution` |
-| `telegram-poll-lease` | `membrane-transport` | [TELEGRAM_POLL_LEASE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_POLL_LEASE_PROPOSAL.md) | `docs/task.md` → Telegram poll ownership slices |
+| `telegram-poll-lease` | `membrane-transport` | [TELEGRAM_POLL_LEASE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_POLL_LEASE_PROPOSAL.md) | smoke-green | `docs/task.md` → Telegram poll ownership slices |
 | `delegated-telegram-polling` | `membrane-transport` | [TELEGRAM_POLL_LEASE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_POLL_LEASE_PROPOSAL.md) | `docs/task.md` → `Telegram poll lease mesh authority` |
 | `webhook-security-contract` | `membrane-transport` | [TELEGRAM_INTEGRATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_INTEGRATION_PROPOSAL.md) | `docs/task.md` → Telegram integration follow-on work |
 | `watched-live-telegram-validation` | `membrane-transport` | [TELEGRAM_INTEGRATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_INTEGRATION_PROPOSAL.md) | `docs/task.md` → Telegram watched-live follow-ons |

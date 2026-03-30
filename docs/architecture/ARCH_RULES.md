@@ -3,7 +3,7 @@ title: "Architectural Rule Registry"
 doc_type: reference
 domain: governance
 status: active
-last_updated: 2026-03-26
+last_updated: 2026-03-29
 tags:
   - rules
   - governance
@@ -40,6 +40,10 @@ See [ARCH_RULES_AND_ROADMAP_PROPOSAL.md](ARCH_RULES_AND_ROADMAP_PROPOSAL.md) for
 | `transitional-architecture-must-be-named` | `workflow-docs` | `AGENTS.md §2.3` | Transitional architecture choices must be explicitly labeled as transitional in docs and close-out notes; scaffolding must not quietly become implied final architecture. | guidance | any slice that introduces a known-temporary pattern |
 | `proven-inferred-intended-are-distinct` | `workflow-docs` | `AGENTS.md §2.4` | Keep a clear distinction between proven behavior, inferred behavior, and intended future design; do not collapse those categories in explanations, docs, or validation claims. | guidance | doc updates, PR descriptions, session notes |
 | `tool-projection-is-policy` | `tooling-execution` | `AGENTS.md §5.3.2` | Tool availability is not the same as tool appropriateness; suppress high-agency tools on low-intent turns rather than passively mirroring all bindings. | guidance | any change to the tool projection surface in `philote` |
+| `graph-is-canonical-source-of-truth` | `workflow-docs` | `GRAPH_INTELLIGENCE_PROPOSAL` | The SQLite graph is the canonical source of truth for process state; markdown files are human-readable projections, not authorities. | hard | any code that reads or writes proposal status, seam state, or task assignments |
+| `agents-mutate-via-graph-tools` | `workflow-docs` | `GRAPH_INTELLIGENCE_PROPOSAL` | Agents must mutate architecture state via graph MCP tools (`graph_update_node`, `graph_create_edge`, `graph_decide`); direct file editing of frontmatter status fields is prohibited. | hard | agent implementations, automation scripts |
+| `graph-writeback-is-optional` | `workflow-docs` | `GRAPH_INTELLIGENCE_PROPOSAL` | Synchronization from graph to markdown (`graph_writeback`) is explicit and optional; the graph state is authoritative even if writeback has not occurred. | guidance | agent workflows, documentation processes |
+| `shared-fields-only-mutated` | `workflow-docs` | `GRAPH_INTELLIGENCE_PROPOSAL` | Only `status`, `last_updated`, `active_seams`, and `implemented_by` frontmatter fields may be mutated by the graph; all other fields remain under human editorial control. | hard | graph writeback implementation, agent tools |
 
 ---
 

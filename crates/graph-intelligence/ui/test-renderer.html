@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>PlantUML Renderer Test</title>
+  <style>
+    body { font-family: sans-serif; padding: 20px; }
+    .test { margin: 20px 0; padding: 10px; border: 1px solid #ccc; }
+    .pass { background: #d4edda; }
+    .fail { background: #f8d7da; }
+    svg { max-width: 100%; border: 1px solid #ddd; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <h1>PlantUML Renderer Test</h1>
+  <div id="results"></div>
+  <script src="plantuml-renderer.js"></script>
+  <script>
+    const results = document.getElementById('results');
+    function test(name, fn) {
+      try {
+        const result = fn();
+        const div = document.createElement('div');
+        div.className = 'test pass';
+        div.innerHTML = `<strong>✓ ${name}</strong>`;
+        if (result) div.appendChild(result);
+        results.appendChild(div);
+      } catch (e) {
+        const div = document.createElement('div');
+        div.className = 'test fail';
+        div.innerHTML = `<strong>✗ ${name}</strong><br>${e.message}`;
+        results.appendChild(div);
+      }
+    }
+
+    test('PlantUMLRenderer loaded', () => {
+      if (!window.PlantUMLRenderer) throw new Error('Not found');
+      return document.createTextNode(' - renderToSvg: ' + (typeof PlantUMLRenderer.renderToSvg));
+    });
+
+    test('C4 Context diagram', () => {
+      const uml = `@startuml
+!include <C4_Context>
+Person(user, "User")
+System(app, "Application")
+Rel(user, app, "uses")
+@enduml`;
+      const svg = PlantUMLRenderer.renderToSvg(uml);
+      const div = document.createElement('div');
+      div.innerHTML = svg;
+      return div;
+    });
+
+    test('Sequence diagram', () => {
+      const uml = `@startuml
+actor User
+User -> App: Request
+App --> User: Response
+@enduml`;
+      const svg = PlantUMLRenderer.renderToSvg(uml);
+      const div = document.createElement('div');
+      div.innerHTML = svg;
+      return div;
+    });
+  </script>
+</body>
+</html>

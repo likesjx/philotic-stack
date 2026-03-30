@@ -48,13 +48,14 @@ fn tool_definitions() -> serde_json::Value {
             },
             {
                 "name": "graph_query",
-                "description": "Query nodes by kind and optional filters. Returns nodes with their properties.",
+                "description": "Query nodes by kind and optional filters. Use compact=true for token-efficient summaries (id, name, kind, status only).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "kind": { "type": "string", "description": "Node kind filter (proposal, seam, crate, module, type, function, etc.)" },
+                        "kind": { "type": "string", "description": "Node kind filter (proposal, seam, crate, module, type, function, skill, sver, domain, etc.)" },
                         "worktree": { "type": "string", "description": "Worktree filter" },
-                        "status": { "type": "string", "description": "Status filter (for proposals)" }
+                        "status": { "type": "string", "description": "Status filter (for proposals)" },
+                        "compact": { "type": "boolean", "description": "If true, return only id/name/kind/status/disposition (saves tokens). Default: false" }
                     }
                 }
             },
@@ -182,19 +183,20 @@ fn tool_definitions() -> serde_json::Value {
             },
             {
                 "name": "graph_record_test_run",
-                "description": "Record a test run for a seam or proposal. Creates test_run node and links it via tested_by edge.",
+                "description": "Record a test run outcome for one or more seams/proposals. Creates a TestRun node linked to all targets. Use target_ids array to test a group of seams together — all get the same pass/fail status. Falls back to target_id for single-target runs.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "target_id": { "type": "string", "description": "Seam or proposal ID being tested" },
-                        "test_count": { "type": "integer", "description": "Total tests run" },
-                        "pass_count": { "type": "integer", "description": "Tests passed" },
-                        "fail_count": { "type": "integer", "description": "Tests failed" },
-                        "coverage_pct": { "type": "number", "description": "Coverage percentage" },
-                        "commit_sha": { "type": "string", "description": "Commit SHA tested" },
-                        "duration_ms": { "type": "integer", "description": "Test duration" }
+                        "target_id": { "type": "string", "description": "Single target proposal or seam ID (use target_ids for groups)" },
+                        "target_ids": { "type": "array", "items": { "type": "string" }, "description": "Array of seam/proposal IDs tested as a group. All get linked to the same TestRun." },
+                        "test_count": { "type": "integer", "description": "Total number of tests executed" },
+                        "pass_count": { "type": "integer", "description": "Number of tests that passed" },
+                        "fail_count": { "type": "integer", "description": "Number of tests that failed (default: 0)" },
+                        "coverage_pct": { "type": "number", "description": "Code coverage percentage (default: 0)" },
+                        "commit_sha": { "type": "string", "description": "Git commit SHA (optional)" },
+                        "duration_ms": { "type": "integer", "description": "Test run duration in milliseconds (default: 0)" }
                     },
-                    "required": ["target_id", "test_count", "pass_count"]
+                    "required": ["test_count", "pass_count"]
                 }
             },
             {
@@ -230,28 +232,32 @@ fn tool_definitions() -> serde_json::Value {
             },
             {
                 "name": "session_activity",
-                "description": "Record activity in an active session. Use this to track file edits, test runs, commits.",
+                "description": "Record activity in an active session. Use this to track file edits, test runs, commits, and token usage. Report tokens_input and tokens_output from each API call to track cost per seam.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "session_id": { "type": "string", "description": "Session ID" },
-                        "activity_type": { "type": "string", "description": "Type: file_edit, test_run, commit, phase_change" },
-                        "details": { "type": "object", "description": "Activity details (files, lines changed, test results)" },
-                        "phase": { "type": "string", "description": "New phase if changed (started, coding, testing, green)" }
+                        "activity_type": { "type": "string", "description": "Type: file_edit, test_run, commit, phase_change, token_report" },
+                        "details": { "type": "object", "description": "Activity details (files, lines changed, test results, tokens)" },
+                        "phase": { "type": "string", "description": "New phase if changed (started, coding, testing, green)" },
+                        "tokens_input": { "type": "integer", "description": "Input tokens consumed in this activity (from API usage response)" },
+                        "tokens_output": { "type": "integer", "description": "Output tokens consumed in this activity (from API usage response)" }
                     },
                     "required": ["session_id", "activity_type"]
                 }
             },
             {
                 "name": "session_close",
-                "description": "Close an agent session. Call this at the end of the workstream with final status.",
+                "description": "Close an agent session. Call this at the end of the workstream with final status. Include tokens_total if you tracked usage, or it will be auto-calculated from session_activity reports.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "session_id": { "type": "string", "description": "Session ID to close" },
-                        "status": { "type": "string", "description": "Final status: completed, cancelled, blocked" },
+                        "status": { "type": "string", "description": "Final status: completed, cancelled, blocked, quota_exhausted" },
                         "verified": { "type": "string", "description": "Verification level: test-green, smoke-green, watched-live-green" },
-                        "summary": { "type": "string", "description": "Brief summary of work completed" }
+                        "summary": { "type": "string", "description": "Brief summary of work completed" },
+                        "tokens_total": { "type": "integer", "description": "Override total tokens if self-tracked (otherwise uses accumulated session_activity totals)" },
+                        "quota_remaining": { "type": "integer", "description": "Approximate remaining quota tokens if known" }
                     },
                     "required": ["session_id", "status"]
                 }
@@ -309,6 +315,68 @@ fn tool_definitions() -> serde_json::Value {
                     },
                     "required": ["proposal_id"]
                 }
+            },
+            {
+                "name": "graph_digest",
+                "description": "Compressed architecture overview: domain→proposal→seam→verification chain for the entire project. One call to orient any agent. Use this first.",
+                "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
+                "name": "graph_export_docs",
+                "description": "Sync graph state back to documentation files on disk. Writes status, disposition, domain, tags, active_seams, verification_level, and last_updated into each doc node's frontmatter. Dry-run supported.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "dry_run": { "type": "boolean", "description": "If true, report what would be written without touching files (default: false)" }
+                    }
+                }
+            },
+            {
+                "name": "graph_export_sver",
+                "description": "Generate canonical SVER document from graph verification state and write to docs/architecture/SVER_STATE.md. Returns the markdown. Pass write=true to persist to disk.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "write": { "type": "boolean", "description": "If true, write the file to disk at docs/architecture/SVER_STATE.md (default: false)" }
+                    }
+                }
+            },
+            {
+                "name": "graph_context_for",
+                "description": "Assemble complete work context for a proposal or seam in ONE call. Returns: proposal body, related seams, code signatures, verification state, decisions, active sessions, and a PlantUML diagram. Use this when starting work on a task.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "target_id": { "type": "string", "description": "Proposal or seam ID (e.g., 'doc:GRAPH_INTELLIGENCE_PROPOSAL', 'seam:telegram-poll-lease')" }
+                    },
+                    "required": ["target_id"]
+                }
+            },
+            {
+                "name": "graph_next_task",
+                "description": "Find the highest-priority unclaimed work item. Considers disposition, verification level, blocking edges, and active sessions to avoid conflicts. Returns scored recommendation with rationale.",
+                "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
+                "name": "graph_impact",
+                "description": "Analyze blast radius of a change. Given a file path or node ID, walks edges to find all affected proposals, seams, and tests. Use after making code changes to understand what needs re-verification.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "target": { "type": "string", "description": "File path or node ID to analyze (e.g., 'crates/aiua/src/hotel.rs' or 'type:GraphEngine')" }
+                    },
+                    "required": ["target"]
+                }
+            },
+            {
+                "name": "graph_agent_dashboard",
+                "description": "Dashboard of all agent activity: active sessions, recent work, per-agent summaries, and verification progress across all proposals.",
+                "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
+                "name": "graph_persist_diagrams",
+                "description": "Auto-generate and persist canonical PlantUML diagrams to docs/architecture/generated/. Writes C4 container, per-proposal architecture, and active seam diagrams.",
+                "inputSchema": { "type": "object", "properties": {} }
             },
             {
                 "name": "graph_diagram",
@@ -426,6 +494,14 @@ async fn execute_tool(
         "graph_semantic_search" => tool_graph_semantic_search(state, arguments).await,
         "graph_embed_batch" => tool_graph_embed_batch(state, arguments).await,
         "graph_verify_semantic" => tool_graph_verify_semantic(state, arguments).await,
+        "graph_digest" => tool_graph_digest(state).await,
+        "graph_export_docs" => tool_graph_export_docs(state, arguments).await,
+        "graph_export_sver" => tool_graph_export_sver(state, arguments).await,
+        "graph_context_for" => tool_graph_context_for(state, arguments).await,
+        "graph_next_task" => tool_graph_next_task(state).await,
+        "graph_impact" => tool_graph_impact(state, arguments).await,
+        "graph_agent_dashboard" => tool_graph_agent_dashboard(state).await,
+        "graph_persist_diagrams" => tool_graph_persist_diagrams(state).await,
         "graph_diagram" => tool_graph_diagram(state, arguments).await,
         "session_start" => tool_session_start(state, arguments).await,
         "session_activity" => tool_session_activity(state, arguments).await,
@@ -526,7 +602,23 @@ async fn tool_graph_query(
         });
     }
 
-    let text = serde_json::to_string_pretty(&nodes).unwrap_or_default();
+    let compact = args.get("compact").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    let text = if compact {
+        let summaries: Vec<serde_json::Value> = nodes.iter().map(|n| {
+            serde_json::json!({
+                "id": n.id,
+                "name": n.name,
+                "kind": n.kind.as_str(),
+                "status": n.properties.get("status"),
+                "disposition": n.properties.get("disposition"),
+            })
+        }).collect();
+        serde_json::to_string_pretty(&summaries).unwrap_or_default()
+    } else {
+        serde_json::to_string_pretty(&nodes).unwrap_or_default()
+    };
+
     Ok(serde_json::json!({
         "content": [{ "type": "text", "text": text }]
     }))
@@ -806,6 +898,18 @@ async fn tool_graph_scan(state: &AppState) -> Result<serde_json::Value, JsonRpcE
         }),
     });
 
+    // Auto-persist PlantUML diagrams after scan
+    let diagram_count = match crate::egress::auto_persist_diagrams(&engine, root) {
+        Ok(written) => {
+            let _ = state.change_tx.send(ChangeEvent {
+                event_type: "diagrams_persisted".to_string(),
+                payload: serde_json::json!({ "count": written.len() }),
+            });
+            written.len()
+        }
+        Err(_) => 0,
+    };
+
     let text = serde_json::to_string_pretty(&serde_json::json!({
         "crates": result.crates,
         "modules": result.modules,
@@ -816,6 +920,7 @@ async fn tool_graph_scan(state: &AppState) -> Result<serde_json::Value, JsonRpcE
         "docs": result.docs,
         "commits": result.commits,
         "branches": result.branches,
+        "diagrams_persisted": diagram_count,
     }))
     .unwrap_or_default();
 
@@ -1083,10 +1188,24 @@ async fn tool_graph_record_test_run(
     state: &AppState,
     args: &serde_json::Value,
 ) -> Result<serde_json::Value, JsonRpcError> {
-    let target_id = args
-        .get("target_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| mcp_err("Missing required parameter: target_id"))?;
+    // Support both single target_id and target_ids array (test groups)
+    let mut targets: Vec<String> = Vec::new();
+    if let Some(ids) = args.get("target_ids").and_then(|v| v.as_array()) {
+        for id in ids {
+            if let Some(s) = id.as_str() {
+                targets.push(s.to_string());
+            }
+        }
+    }
+    if let Some(single) = args.get("target_id").and_then(|v| v.as_str()) {
+        if !targets.contains(&single.to_string()) {
+            targets.push(single.to_string());
+        }
+    }
+    if targets.is_empty() {
+        return Err(mcp_err("Missing required parameter: target_id or target_ids"));
+    }
+
     let test_count = args
         .get("test_count")
         .and_then(|v| v.as_u64())
@@ -1112,6 +1231,13 @@ async fn tool_graph_record_test_run(
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as i64;
 
+    let is_green = fail_count == 0 && test_count > 0;
+    let target_label = if targets.len() == 1 {
+        targets[0].clone()
+    } else {
+        format!("{} seams (group)", targets.len())
+    };
+
     let engine = state.engine.lock().await;
 
     // Create test_run node
@@ -1119,7 +1245,7 @@ async fn tool_graph_record_test_run(
     let test_run = crate::schema::Node {
         id: test_run_id.clone(),
         kind: crate::schema::NodeKind::TestRun,
-        name: format!("Test run for {}", target_id),
+        name: format!("Test run for {}", target_label),
         properties: serde_json::json!({
             "test_count": test_count,
             "pass_count": pass_count,
@@ -1127,7 +1253,10 @@ async fn tool_graph_record_test_run(
             "coverage_pct": coverage_pct,
             "commit_sha": commit_sha,
             "duration_ms": duration_ms,
-            "target_id": target_id,
+            "target_id": targets[0],
+            "target_ids": targets,
+            "is_group": targets.len() > 1,
+            "status": if is_green { "green" } else { "red" },
         }),
         file_path: None,
         worktree: String::new(),
@@ -1144,40 +1273,54 @@ async fn tool_graph_record_test_run(
         .upsert_node(&test_run)
         .map_err(|e| mcp_err(&e.to_string()))?;
 
-    // Create edge: target -> test_run (tested_by)
-    let edge = crate::schema::Edge {
-        source_id: target_id.to_string(),
-        target_id: test_run_id.clone(),
-        relation: crate::schema::EdgeRelation::TestedBy,
-        properties: serde_json::json!({}),
-        worktree: String::new(),
-    };
+    // Create edges for ALL targets in the group
+    for tid in &targets {
+        // target -> test_run (tested_by)
+        let edge = crate::schema::Edge {
+            source_id: tid.clone(),
+            target_id: test_run_id.clone(),
+            relation: crate::schema::EdgeRelation::TestedBy,
+            properties: serde_json::json!({}),
+            worktree: String::new(),
+        };
+        engine.upsert_edge(&edge).map_err(|e| mcp_err(&e.to_string()))?;
 
-    engine
-        .upsert_edge(&edge)
-        .map_err(|e| mcp_err(&e.to_string()))?;
+        // test_run -> target (validates)
+        let edge2 = crate::schema::Edge {
+            source_id: test_run_id.clone(),
+            target_id: tid.clone(),
+            relation: crate::schema::EdgeRelation::Validates,
+            properties: serde_json::json!({}),
+            worktree: String::new(),
+        };
+        engine.upsert_edge(&edge2).map_err(|e| mcp_err(&e.to_string()))?;
 
-    // Also create inverse edge: test_run -> target (validates)
-    let edge2 = crate::schema::Edge {
-        source_id: test_run_id.clone(),
-        target_id: target_id.to_string(),
-        relation: crate::schema::EdgeRelation::Validates,
-        properties: serde_json::json!({}),
-        worktree: String::new(),
-    };
-
-    engine
-        .upsert_edge(&edge2)
-        .map_err(|e| mcp_err(&e.to_string()))?;
+        // Update each target seam's test status
+        if let Ok(Some(mut seam)) = engine.get_node(tid) {
+            let mut seam_props = seam.properties.as_object().cloned().unwrap_or_default();
+            let status_key = if is_green { "test-green" } else { "test-red" };
+            seam_props.insert("last_test_status".to_string(), serde_json::json!(status_key));
+            seam_props.insert("last_test_run".to_string(), serde_json::json!(test_run_id));
+            seam_props.insert("last_test_at".to_string(), serde_json::json!(chrono::Utc::now().to_rfc3339()));
+            if is_green {
+                seam_props.insert("last_green_at".to_string(), serde_json::json!(chrono::Utc::now().to_rfc3339()));
+            }
+            seam.properties = serde_json::Value::Object(seam_props);
+            seam.updated_at = chrono::Utc::now();
+            let _ = engine.upsert_node(&seam);
+        }
+    }
 
     // Broadcast
     let _ = state.change_tx.send(ChangeEvent {
         event_type: "test_run_recorded".to_string(),
         payload: serde_json::json!({
             "test_run_id": test_run_id,
-            "target_id": target_id,
+            "target_ids": targets,
+            "target_id": targets[0],
             "test_count": test_count,
             "pass_count": pass_count,
+            "is_green": is_green,
         }),
     });
 
@@ -1185,8 +1328,9 @@ async fn tool_graph_record_test_run(
         "content": [{
             "type": "text",
             "text": format!(
-                "Recorded test run for {}: {}/{} passed ({}% coverage)",
-                target_id, pass_count, test_count, coverage_pct
+                "Recorded test run for {}: {}/{} passed ({}% coverage) — {}",
+                target_label, pass_count, test_count, coverage_pct,
+                if is_green { "GREEN" } else { "RED" }
             )
         }]
     }))
@@ -1536,7 +1680,7 @@ async fn tool_graph_embed_batch(
     let mut skipped = 0;
     let mut errors = Vec::new();
 
-    for mut node in nodes {
+    for node in nodes {
         processed += 1;
 
         // Build text to embed
@@ -1741,6 +1885,508 @@ async fn tool_graph_verify_semantic(
         "avg_similarity": avg_similarity,
         "top_similarity": top_similarity,
         "top_results": top_results,
+    }))
+}
+
+async fn tool_graph_digest(
+    state: &AppState,
+) -> Result<serde_json::Value, JsonRpcError> {
+    let engine = state.engine.lock().await;
+    let report = crate::egress::generate_digest(&engine)
+        .map_err(|e| mcp_err(&e.to_string()))?;
+
+    // Build compact text representation
+    let mut text = String::new();
+    text.push_str(&format!(
+        "# Architecture Digest\n\nnodes: {}  edges: {}  proposals: {}  seams: {}  skills: {}\n\n",
+        report.total_nodes, report.total_edges,
+        report.proposal_count, report.seam_count, report.skill_count
+    ));
+
+    for domain in &report.domains {
+        text.push_str(&format!("## {}\n", domain.name));
+        for p in &domain.proposals {
+            let seams_str = if p.active_seams.is_empty() {
+                "—".to_string()
+            } else {
+                p.active_seams.join(", ")
+            };
+            text.push_str(&format!(
+                "  - [{}] {} | {} | verified:{} | seams:{}\n",
+                p.disposition, p.name, p.status, p.verification, seams_str
+            ));
+        }
+        text.push('\n');
+    }
+
+    if !report.active_seams.is_empty() {
+        text.push_str("## Active Seams\n");
+        for s in &report.active_seams {
+            text.push_str(&format!("  - {} [{}]\n", s.id, s.status));
+        }
+        text.push('\n');
+    }
+
+    if !report.active_sessions.is_empty() {
+        text.push_str("## Active Sessions\n");
+        for s in &report.active_sessions {
+            text.push_str(&format!(
+                "  - {} ({}) on {} phase:{}\n",
+                s.id, s.agent, s.seam_id, s.phase
+            ));
+        }
+        text.push('\n');
+    }
+
+    if !report.recent_decisions.is_empty() {
+        text.push_str("## Recent Decisions\n");
+        for d in &report.recent_decisions {
+            text.push_str(&format!("  - {} — {}\n", d.id, d.name));
+        }
+    }
+
+    // Also return structured JSON for programmatic use
+    let structured = serde_json::json!({
+        "total_nodes": report.total_nodes,
+        "total_edges": report.total_edges,
+        "proposal_count": report.proposal_count,
+        "seam_count": report.seam_count,
+        "skill_count": report.skill_count,
+        "domains": report.domains.iter().map(|d| {
+            serde_json::json!({
+                "name": d.name,
+                "proposals": d.proposals.iter().map(|p| {
+                    serde_json::json!({
+                        "id": p.id,
+                        "name": p.name,
+                        "disposition": p.disposition,
+                        "status": p.status,
+                        "verification": p.verification,
+                        "active_seams": p.active_seams,
+                    })
+                }).collect::<Vec<_>>(),
+            })
+        }).collect::<Vec<_>>(),
+        "active_seams": report.active_seams.iter().map(|s| {
+            serde_json::json!({ "id": s.id, "name": s.name, "status": s.status })
+        }).collect::<Vec<_>>(),
+        "active_sessions": report.active_sessions.iter().map(|s| {
+            serde_json::json!({ "id": s.id, "agent": s.agent, "seam_id": s.seam_id, "phase": s.phase })
+        }).collect::<Vec<_>>(),
+    });
+
+    Ok(serde_json::json!({
+        "content": [{ "type": "text", "text": text }],
+        "digest": structured,
+    }))
+}
+
+async fn tool_graph_export_docs(
+    state: &AppState,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, JsonRpcError> {
+    let dry_run = args.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+    let repo_root = std::path::Path::new(&state.repo_root);
+
+    let engine = state.engine.lock().await;
+
+    if dry_run {
+        // Collect what would be written without touching files
+        let doc_kinds = [
+            NodeKind::Proposal,
+            NodeKind::Seam,
+            NodeKind::Task,
+            NodeKind::Domain,
+            NodeKind::Document,
+            NodeKind::Skill,
+            NodeKind::Sver,
+        ];
+        let mut would_update = Vec::new();
+        let mut would_skip = Vec::new();
+        for kind in &doc_kinds {
+            let nodes = engine.query_nodes(Some(*kind), None)
+                .map_err(|e| mcp_err(&e.to_string()))?;
+            for node in nodes {
+                match node.file_path.as_deref() {
+                    Some(p) if !p.is_empty() => {
+                        let path = if std::path::Path::new(p).is_absolute() {
+                            std::path::PathBuf::from(p)
+                        } else {
+                            repo_root.join(p)
+                        };
+                        if path.exists() {
+                            would_update.push(format!("{} → {}", node.id, path.display()));
+                        } else {
+                            would_skip.push(format!("{} (not on disk)", node.id));
+                        }
+                    }
+                    _ => would_skip.push(format!("{} (no file_path)", node.id)),
+                }
+            }
+        }
+        let text = format!(
+            "DRY RUN: {} files would be updated, {} skipped\n\nWould update:\n{}\n\nWould skip:\n{}",
+            would_update.len(),
+            would_skip.len(),
+            would_update.join("\n"),
+            would_skip.join("\n"),
+        );
+        return Ok(serde_json::json!({
+            "content": [{ "type": "text", "text": text }],
+            "dry_run": true,
+            "would_update": would_update.len(),
+            "would_skip": would_skip.len(),
+        }));
+    }
+
+    let report = crate::egress::export_docs(&engine, repo_root)
+        .map_err(|e| mcp_err(&e.to_string()))?;
+
+    let text = format!(
+        "export_docs: {} updated, {} skipped, {} errors\n\nUpdated:\n{}\n\nErrors:\n{}",
+        report.updated.len(),
+        report.skipped.len(),
+        report.errors.len(),
+        report.updated.join("\n"),
+        report.errors.join("\n"),
+    );
+
+    // Broadcast
+    let _ = state.change_tx.send(crate::server::ws::ChangeEvent {
+        event_type: "docs_exported".to_string(),
+        payload: serde_json::json!({
+            "updated": report.updated.len(),
+            "errors": report.errors.len(),
+        }),
+    });
+
+    Ok(serde_json::json!({
+        "content": [{ "type": "text", "text": text }],
+        "updated": report.updated.len(),
+        "skipped": report.skipped.len(),
+        "errors": report.errors,
+    }))
+}
+
+async fn tool_graph_export_sver(
+    state: &AppState,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, JsonRpcError> {
+    let write = args.get("write").and_then(|v| v.as_bool()).unwrap_or(false);
+    let engine = state.engine.lock().await;
+
+    let markdown = crate::egress::export_sver_doc(&engine)
+        .map_err(|e| mcp_err(&e.to_string()))?;
+
+    let mut written_path: Option<String> = None;
+
+    if write {
+        let out_path = std::path::Path::new(&state.repo_root)
+            .join("docs/architecture/SVER_STATE.md");
+
+        // Ensure directory exists
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| mcp_err(&format!("Failed to create directory: {}", e)))?;
+        }
+
+        std::fs::write(&out_path, &markdown)
+            .map_err(|e| mcp_err(&format!("Failed to write SVER_STATE.md: {}", e)))?;
+
+        written_path = Some(out_path.display().to_string());
+
+        // Broadcast
+        let _ = state.change_tx.send(crate::server::ws::ChangeEvent {
+            event_type: "sver_exported".to_string(),
+            payload: serde_json::json!({ "path": written_path }),
+        });
+    }
+
+    Ok(serde_json::json!({
+        "content": [{ "type": "text", "text": markdown }],
+        "written": write,
+        "path": written_path,
+        "format": "markdown",
+    }))
+}
+
+async fn tool_graph_context_for(
+    state: &AppState,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, JsonRpcError> {
+    let target_id = args.get("target_id").and_then(|v| v.as_str())
+        .ok_or_else(|| mcp_err("Missing required parameter: target_id"))?;
+
+    let engine = state.engine.lock().await;
+    let ctx = crate::egress::context_for(&engine, target_id)
+        .map_err(|e| mcp_err(&e.to_string()))?;
+
+    // Build compact text representation
+    let mut text = String::new();
+    text.push_str(&format!("# Context: {} ({})\n\n", ctx.target_name, ctx.target_kind));
+    text.push_str(&format!("domain: {}  status: {}  disposition: {}  verification: {}\n\n",
+        ctx.domain, ctx.status, ctx.disposition, ctx.verification_level));
+
+    if let Some(ref body) = ctx.proposal_body {
+        // Truncate body to first 2000 chars to save tokens
+        let truncated = if body.len() > 2000 { &body[..2000] } else { body.as_str() };
+        text.push_str("## Proposal Body\n\n");
+        text.push_str(truncated);
+        if body.len() > 2000 { text.push_str("\n\n...(truncated, use graph_snippet for full text)"); }
+        text.push_str("\n\n");
+    }
+
+    if !ctx.related_seams.is_empty() {
+        text.push_str("## Related Seams\n");
+        for s in &ctx.related_seams {
+            text.push_str(&format!("  - {} [{}] {}\n", s.id, s.status, s.name));
+        }
+        text.push('\n');
+    }
+
+    if !ctx.related_proposals.is_empty() {
+        text.push_str("## Related Proposals\n");
+        for p in &ctx.related_proposals {
+            text.push_str(&format!("  - {} [{}] {}\n", p.id, p.status, p.name));
+        }
+        text.push('\n');
+    }
+
+    if !ctx.implementing_code.is_empty() {
+        text.push_str("## Implementing Code\n");
+        for c in &ctx.implementing_code {
+            text.push_str(&format!("  - {}:{}-{} `{}`\n", c.file_path, c.line_start, c.line_end, c.signature));
+        }
+        text.push('\n');
+    }
+
+    if !ctx.blocking.is_empty() {
+        text.push_str(&format!("## Blocking: {}\n\n", ctx.blocking.join(", ")));
+    }
+
+    if !ctx.decisions.is_empty() {
+        text.push_str("## Recent Decisions\n");
+        for d in &ctx.decisions {
+            text.push_str(&format!("  - {} — {}\n", d.id, d.name));
+        }
+        text.push('\n');
+    }
+
+    if !ctx.active_sessions.is_empty() {
+        text.push_str("## ⚠ Active Sessions (conflict check)\n");
+        for s in &ctx.active_sessions {
+            text.push_str(&format!("  - {} [{}]\n", s.id, s.status));
+        }
+        text.push('\n');
+    }
+
+    if !ctx.recent_runs.is_empty() {
+        text.push_str("## Recent Verification Runs\n");
+        for r in &ctx.recent_runs {
+            text.push_str(&format!("  - {} [{}]\n", r.id, r.kind));
+        }
+        text.push('\n');
+    }
+
+    if let Some(ref diagram) = ctx.diagram {
+        text.push_str("## PlantUML Diagram\n\n```plantuml\n");
+        text.push_str(diagram);
+        text.push_str("\n```\n");
+    }
+
+    Ok(serde_json::json!({
+        "content": [{ "type": "text", "text": text }],
+    }))
+}
+
+async fn tool_graph_next_task(
+    state: &AppState,
+) -> Result<serde_json::Value, JsonRpcError> {
+    let engine = state.engine.lock().await;
+    let result = crate::egress::next_task(&engine)
+        .map_err(|e| mcp_err(&e.to_string()))?;
+
+    match result {
+        Some(task) => {
+            let mut text = format!(
+                "# Recommended Next Task\n\n**{}** — {}\n\nscore: {}  disposition: {}  reason: {}\n",
+                task.id, task.name, task.score, task.disposition, task.reason
+            );
+            if let Some(ref runner) = task.runner_up {
+                text.push_str(&format!("\nRunner-up: {}\n", runner));
+            }
+            text.push_str(&format!("\nTotal candidates: {}\n", task.total_candidates));
+            text.push_str(&format!(
+                "\nTo start working: call `graph_context_for` with target_id=\"{}\"\n",
+                task.id
+            ));
+
+            Ok(serde_json::json!({
+                "content": [{ "type": "text", "text": text }],
+                "task": {
+                    "id": task.id,
+                    "name": task.name,
+                    "score": task.score,
+                    "disposition": task.disposition,
+                    "reason": task.reason,
+                    "runner_up": task.runner_up,
+                    "total_candidates": task.total_candidates,
+                },
+            }))
+        }
+        None => {
+            Ok(serde_json::json!({
+                "content": [{ "type": "text", "text": "No unclaimed work items found. All proposals are either completed, deferred, or actively being worked on." }],
+                "task": null,
+            }))
+        }
+    }
+}
+
+async fn tool_graph_impact(
+    state: &AppState,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, JsonRpcError> {
+    let target = args.get("target").and_then(|v| v.as_str())
+        .ok_or_else(|| mcp_err("Missing required parameter: target"))?;
+
+    let engine = state.engine.lock().await;
+    let report = crate::egress::impact_analysis(&engine, target)
+        .map_err(|e| mcp_err(&e.to_string()))?;
+
+    let mut text = format!(
+        "# Impact Analysis: {}\n\nSeed nodes: {}  Total reached: {}\n\n",
+        report.target, report.seed_nodes, report.total_reached
+    );
+
+    if report.affected_proposals.is_empty() && report.affected_seams.is_empty() && report.affected_tests.is_empty() {
+        text.push_str("No proposals, seams, or tests affected by this change.\n");
+    } else {
+        if !report.affected_proposals.is_empty() {
+            text.push_str(&format!("## Affected Proposals ({})\n", report.affected_proposals.len()));
+            for p in &report.affected_proposals {
+                text.push_str(&format!("  - {}\n", p));
+            }
+            text.push('\n');
+        }
+        if !report.affected_seams.is_empty() {
+            text.push_str(&format!("## Affected Seams ({})\n", report.affected_seams.len()));
+            for s in &report.affected_seams {
+                text.push_str(&format!("  - {}\n", s));
+            }
+            text.push('\n');
+        }
+        if !report.affected_tests.is_empty() {
+            text.push_str(&format!("## Affected Tests ({})\n", report.affected_tests.len()));
+            for t in &report.affected_tests {
+                text.push_str(&format!("  - {}\n", t));
+            }
+            text.push('\n');
+        }
+    }
+
+    Ok(serde_json::json!({
+        "content": [{ "type": "text", "text": text }],
+        "affected_proposals": report.affected_proposals,
+        "affected_seams": report.affected_seams,
+        "affected_tests": report.affected_tests,
+        "total_reached": report.total_reached,
+    }))
+}
+
+async fn tool_graph_agent_dashboard(
+    state: &AppState,
+) -> Result<serde_json::Value, JsonRpcError> {
+    let engine = state.engine.lock().await;
+    let report = crate::egress::agent_dashboard(&engine)
+        .map_err(|e| mcp_err(&e.to_string()))?;
+
+    let mut text = String::new();
+    text.push_str(&format!(
+        "# Agent Dashboard\n\nproposals: {}  sessions: {}  decisions: {}\n\n",
+        report.total_proposals, report.total_sessions, report.total_decisions
+    ));
+
+    // Verification progress
+    text.push_str("## Verification Progress\n");
+    let mut levels: Vec<_> = report.verification_progress.iter().collect();
+    levels.sort_by_key(|(_, count)| std::cmp::Reverse(**count));
+    for (level, count) in &levels {
+        text.push_str(&format!("  - {}: {}\n", level, count));
+    }
+    text.push('\n');
+
+    // Active sessions
+    if report.active_sessions.is_empty() {
+        text.push_str("## Active Sessions: none\n\n");
+    } else {
+        text.push_str(&format!("## Active Sessions ({})\n", report.active_sessions.len()));
+        for s in &report.active_sessions {
+            text.push_str(&format!(
+                "  - {} ({}) on {} phase:{}\n",
+                s.id, s.agent, s.seam_id, s.phase
+            ));
+        }
+        text.push('\n');
+    }
+
+    // Per-agent summary
+    if !report.agents.is_empty() {
+        text.push_str("## Agents\n");
+        for a in &report.agents {
+            text.push_str(&format!(
+                "  - **{}**: {} sessions ({} active), {} decisions, last active {}\n",
+                a.agent, a.total_sessions, a.active_sessions, a.decisions_made,
+                a.last_active.format("%Y-%m-%d %H:%M")
+            ));
+        }
+        text.push('\n');
+    }
+
+    // Recent closed sessions
+    if !report.recent_closed.is_empty() {
+        text.push_str("## Recent Closed Sessions\n");
+        for s in report.recent_closed.iter().take(10) {
+            text.push_str(&format!(
+                "  - {} ({}) on {} — {}\n",
+                s.id, s.agent, s.seam_id, s.phase
+            ));
+        }
+    }
+
+    Ok(serde_json::json!({
+        "content": [{ "type": "text", "text": text }],
+    }))
+}
+
+async fn tool_graph_persist_diagrams(
+    state: &AppState,
+) -> Result<serde_json::Value, JsonRpcError> {
+    let repo_root = std::path::Path::new(&state.repo_root);
+    let engine = state.engine.lock().await;
+
+    let written = crate::egress::auto_persist_diagrams(&engine, repo_root)
+        .map_err(|e| mcp_err(&e.to_string()))?;
+
+    let text = format!(
+        "Persisted {} diagrams to docs/architecture/generated/\n\n{}",
+        written.len(),
+        written.iter().map(|p| {
+            let name = std::path::Path::new(p).file_name().unwrap_or_default().to_string_lossy();
+            format!("  - {}", name)
+        }).collect::<Vec<_>>().join("\n"),
+    );
+
+    // Broadcast
+    let _ = state.change_tx.send(crate::server::ws::ChangeEvent {
+        event_type: "diagrams_persisted".to_string(),
+        payload: serde_json::json!({ "count": written.len() }),
+    });
+
+    Ok(serde_json::json!({
+        "content": [{ "type": "text", "text": text }],
+        "written": written.len(),
+        "files": written,
     }))
 }
 
@@ -2048,6 +2694,24 @@ async fn tool_session_activity(
         props.insert("test_runs".to_string(), serde_json::json!(existing_tests + 1));
     }
 
+    // Track token usage (accumulate from each activity report)
+    let tokens_in = args.get("tokens_input").and_then(|v| v.as_i64())
+        .or_else(|| details.get("tokens_input").and_then(|v| v.as_i64()))
+        .unwrap_or(0);
+    let tokens_out = args.get("tokens_output").and_then(|v| v.as_i64())
+        .or_else(|| details.get("tokens_output").and_then(|v| v.as_i64()))
+        .unwrap_or(0);
+    
+    if tokens_in > 0 || tokens_out > 0 {
+        let existing_in = props.get("tokens_input").and_then(|v| v.as_i64()).unwrap_or(0);
+        let existing_out = props.get("tokens_output").and_then(|v| v.as_i64()).unwrap_or(0);
+        let new_in = existing_in + tokens_in;
+        let new_out = existing_out + tokens_out;
+        props.insert("tokens_input".to_string(), serde_json::json!(new_in));
+        props.insert("tokens_output".to_string(), serde_json::json!(new_out));
+        props.insert("tokens_total".to_string(), serde_json::json!(new_in + new_out));
+    }
+
     session.properties = serde_json::Value::Object(props);
     session.updated_at = chrono::Utc::now();
 
@@ -2135,10 +2799,44 @@ async fn tool_session_close(
         props.insert("summary".to_string(), serde_json::json!(summary));
     }
 
+    // Token totals: use override if provided, otherwise keep accumulated values
+    if let Some(total_override) = args.get("tokens_total").and_then(|v| v.as_i64()) {
+        props.insert("tokens_total".to_string(), serde_json::json!(total_override));
+    }
+    if let Some(quota_rem) = args.get("quota_remaining").and_then(|v| v.as_i64()) {
+        props.insert("quota_remaining".to_string(), serde_json::json!(quota_rem));
+    }
+
+    let session_tokens_total = props.get("tokens_total").and_then(|v| v.as_i64()).unwrap_or(0);
+    let session_tokens_in = props.get("tokens_input").and_then(|v| v.as_i64()).unwrap_or(0);
+    let session_tokens_out = props.get("tokens_output").and_then(|v| v.as_i64()).unwrap_or(0);
+
     session.properties = serde_json::Value::Object(props);
     session.updated_at = chrono::Utc::now();
 
     engine.upsert_node(&session).map_err(|e| mcp_err(&e.to_string()))?;
+
+    // Propagate token usage to linked seam(s)
+    if session_tokens_total > 0 {
+        if let Ok(edges) = engine.get_edges_from(session_id) {
+            for edge in &edges {
+                if edge.relation == crate::schema::EdgeRelation::WorkingOn || edge.relation == crate::schema::EdgeRelation::Implements {
+                    if let Ok(Some(mut seam)) = engine.get_node(&edge.target_id) {
+                        let mut seam_props = seam.properties.as_object().cloned().unwrap_or_default();
+                        let existing = seam_props.get("tokens_total").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let existing_in = seam_props.get("tokens_input").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let existing_out = seam_props.get("tokens_output").and_then(|v| v.as_i64()).unwrap_or(0);
+                        seam_props.insert("tokens_total".to_string(), serde_json::json!(existing + session_tokens_total));
+                        seam_props.insert("tokens_input".to_string(), serde_json::json!(existing_in + session_tokens_in));
+                        seam_props.insert("tokens_output".to_string(), serde_json::json!(existing_out + session_tokens_out));
+                        seam.properties = serde_json::Value::Object(seam_props);
+                        seam.updated_at = chrono::Utc::now();
+                        let _ = engine.upsert_node(&seam);
+                    }
+                }
+            }
+        }
+    }
 
     // Record mutation
     let mutation = crate::schema::Mutation {

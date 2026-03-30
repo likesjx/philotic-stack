@@ -451,6 +451,403 @@ pre.code-block {
 
 .btn:hover { background: rgba(0,229,255,0.2); }
 
+.btn.secondary { background: transparent; border-color: var(--border); color: var(--text-secondary); }
+.btn.secondary:hover { border-color: var(--accent); color: var(--text); }
+
+/* ── Toolbar ── */
+.toolbar {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 20px;
+  align-items: center;
+}
+
+.toolbar-btn {
+  padding: 6px 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  transition: all 0.15s;
+}
+
+.toolbar-btn:hover { background: var(--surface-hover); border-color: var(--accent); }
+
+.toolbar-btn.refreshing { animation: spin 1s linear infinite; }
+@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
+.live-indicator {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--success);
+  margin-left: auto;
+}
+
+.live-dot {
+  width: 8px;
+  height: 8px;
+  background: var(--success);
+  border-radius: 50%;
+  animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+/* ── Tasks Panel ── */
+.tasks-panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  margin-bottom: 20px;
+}
+
+.task-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.task-item:last-child { border-bottom: none; }
+
+.task-status {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.task-status.pending { background: var(--muted); }
+.task-status.in_progress { background: var(--amber); }
+.task-status.completed { background: var(--success); }
+
+.task-content { flex: 1; }
+.task-title { font-size: 13px; font-weight: 500; }
+.task-meta { font-size: 11px; color: var(--text-secondary); margin-top: 2px; }
+
+/* ── Diagram View ── */
+.diagram-tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 8px;
+}
+
+.diagram-tab {
+  padding: 6px 14px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.diagram-tab:hover { color: var(--text); background: var(--surface-hover); }
+.diagram-tab.active { color: var(--accent); border-color: var(--accent); background: rgba(0,229,255,0.1); }
+
+.diagram-container {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  min-height: 300px;
+}
+
+.diagram-source {
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-x: auto;
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+/* ── PlantUML Renderer ── */
+.plantuml-rendered {
+  text-align: center;
+  padding: 20px;
+}
+
+.plantuml-rendered img {
+  max-width: 100%;
+  border-radius: 6px;
+  box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+}
+
+/* ── Ladder Badge ── */
+.ladder-badges {
+  display: flex;
+  gap: 4px;
+}
+
+.ladder-badge {
+  width: 18px;
+  height: 18px;
+  border-radius: 3px;
+  font-size: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+}
+
+.ladder-badge.empty { background: var(--surface); border: 1px solid var(--border); color: var(--muted); }
+.ladder-badge.green { background: rgba(0,230,118,0.2); border: 1px solid var(--success); color: var(--success); }
+.ladder-badge.amber { background: rgba(255,193,7,0.2); border: 1px solid var(--amber); color: var(--amber); }
+
+/* ── Entity Links ── */
+.entity-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  background: rgba(0,229,255,0.1);
+  border-radius: 4px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.entity-link:hover { background: rgba(0,229,255,0.2); }
+
+/* ── Page Navigation ── */
+.page-nav {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 20px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.page-nav-link {
+  color: var(--text-secondary);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.page-nav-link:hover { color: var(--accent); }
+
+.page-nav-separator {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.page-nav-current {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+/* ── WebSocket Status ── */
+.ws-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  padding: 4px 8px;
+  border-radius: 4px;
+}
+
+.ws-status.connected {
+  color: var(--success);
+  background: rgba(0,230,118,0.1);
+}
+
+.ws-status.disconnected {
+  color: var(--orange);
+  background: rgba(255,109,0,0.1);
+}
+
+/* ── Workstream Dashboard Styles ── */
+.workstreams-container { display: flex; flex-direction: column; gap: 24px; }
+.workstream-section { margin-bottom: 16px; }
+.workstream-section h3 { margin-bottom: 12px; color: var(--text-secondary); font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; }
+
+.workstream-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; }
+.workstream-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; cursor: pointer; transition: border-color 0.15s, transform 0.1s; }
+.workstream-card:hover { border-color: var(--accent); transform: translateY(-2px); }
+.workstream-card .workstream-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.workstream-card .workstream-title { font-size: 15px; font-weight: 600; margin-bottom: 8px; color: var(--text); }
+.workstream-card .workstream-meta { display: flex; gap: 16px; font-size: 12px; color: var(--text-secondary); margin-bottom: 12px; }
+.workstream-card .progress-bar { height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; margin-bottom: 12px; }
+.workstream-card .progress-fill { height: 100%; background: var(--success); transition: width 0.3s; }
+.workstream-card .workstream-actions { display: flex; justify-content: flex-end; }
+
+.workstream-list { display: flex; flex-direction: column; gap: 8px; }
+.workstream-row { display: flex; justify-content: space-between; align-items: center; padding: 10px 12px; background: var(--surface); border-radius: var(--radius); border: 1px solid var(--border); }
+.workstream-row .workstream-name { font-size: 13px; }
+.workstream-row .workstream-status.completed { color: var(--success); font-size: 12px; }
+
+.verified-badge { font-size: 10px; padding: 2px 6px; border-radius: 4px; text-transform: uppercase; }
+.verified-badge.test-green { background: rgba(0,230,118,0.1); color: var(--success); }
+.verified-badge.smoke-green { background: rgba(0,229,255,0.1); color: var(--accent); }
+.verified-badge.watched-live-green { background: rgba(255,193,7,0.1); color: var(--amber); }
+.verified-badge.unverified { background: var(--border); color: var(--text-secondary); }
+
+.status-badge { font-size: 11px; padding: 2px 8px; border-radius: 12px; text-transform: uppercase; }
+.status-badge.proposed { background: rgba(255,193,7,0.1); color: var(--amber); }
+.status-badge.accepted { background: rgba(0,229,255,0.1); color: var(--accent); }
+.status-badge.in-progress { background: rgba(0,230,118,0.1); color: var(--success); }
+.status-badge.completed { background: rgba(0,230,118,0.2); color: var(--success); }
+.status-badge.unknown { background: var(--border); color: var(--text-secondary); }
+
+/* Workstream Detail */
+.workstream-detail-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 24px; padding: 20px; background: var(--surface); border-radius: var(--radius); border: 1px solid var(--border); }
+.workstream-title-section { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.workstream-title-section h2 { margin: 0; font-size: 20px; }
+.workstream-meta-section { text-align: right; font-size: 13px; color: var(--text-secondary); }
+.workstream-meta-section div { margin-bottom: 4px; }
+
+.workstream-tasks-section { margin-bottom: 24px; }
+.workstream-tasks-section h3 { margin-bottom: 16px; }
+.task-list { display: flex; flex-direction: column; gap: 12px; }
+.task-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; }
+.task-card.completed { border-color: rgba(0,230,118,0.3); }
+.task-card .task-header { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.task-card .task-status { font-size: 11px; padding: 2px 8px; border-radius: 12px; text-transform: uppercase; }
+.task-card .task-status.completed { background: rgba(0,230,118,0.1); color: var(--success); }
+.task-card .task-status.in-progress { background: rgba(0,229,255,0.1); color: var(--accent); }
+.task-card .task-status.pending { background: var(--border); color: var(--text-secondary); }
+.task-card .task-title { font-size: 14px; font-weight: 500; margin-bottom: 10px; }
+.task-card .task-actions { display: flex; gap: 8px; }
+
+.workstream-lifecycle { margin-top: 24px; }
+.workstream-lifecycle h3 { margin-bottom: 16px; }
+
+.lifecycle-timeline { background: var(--surface); border-radius: var(--radius); padding: 20px; border: 1px solid var(--border); }
+.lifecycle-timeline .stages { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
+.lifecycle-timeline .stage { display: flex; flex-direction: column; align-items: center; flex: 1; position: relative; }
+.lifecycle-timeline .stage.has-arrow::after { content: '→'; position: absolute; right: -10px; top: 10px; color: var(--text-secondary); }
+.lifecycle-timeline .stage-dot { width: 24px; height: 24px; border-radius: 50%; background: var(--border); margin-bottom: 8px; transition: background 0.3s; }
+.lifecycle-timeline .stage.complete .stage-dot { background: var(--success); }
+.lifecycle-timeline .stage-label { font-size: 12px; color: var(--text-secondary); }
+.lifecycle-timeline .stage.complete .stage-label { color: var(--success); }
+.lifecycle-timeline .task-progress-summary { text-align: center; padding-top: 16px; border-top: 1px solid var(--border); }
+.lifecycle-timeline .mini-progress { height: 4px; background: var(--border); border-radius: 2px; margin-top: 8px; }
+.lifecycle-timeline .mini-progress-fill { height: 100%; background: var(--success); border-radius: 2px; }
+
+.empty-state { text-align: center; padding: 40px; color: var(--text-secondary); font-style: italic; }
+
+.btn-small { padding: 6px 12px; font-size: 12px; border: 1px solid var(--border); background: var(--bg); color: var(--text); border-radius: var(--radius); cursor: pointer; }
+.btn-small:hover { border-color: var(--accent); color: var(--accent); }
+
+/* ── Live Sessions Styles ── */
+.live-sessions-container { margin-bottom: 24px; }
+.live-sessions-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }
+.live-session-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; border-left: 4px solid var(--accent); }
+.live-session-card:hover { border-color: var(--accent); }
+.live-session-header { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+.live-pulse { color: var(--error); animation: pulse 2s infinite; font-size: 12px; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+.live-session-agent { font-weight: 600; color: var(--text); }
+.live-session-phase { font-size: 11px; padding: 2px 8px; border-radius: 12px; text-transform: uppercase; margin-left: auto; }
+.live-session-phase.phase-started { background: rgba(255,193,7,0.1); color: var(--amber); }
+.live-session-phase.phase-coding { background: rgba(0,229,255,0.1); color: var(--accent); }
+.live-session-phase.phase-testing { background: rgba(156,39,176,0.1); color: #ce93d8; }
+.live-session-phase.phase-green { background: rgba(0,230,118,0.1); color: var(--success); }
+.live-session-seam { font-family: var(--mono); font-size: 12px; color: var(--text-secondary); margin-bottom: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.live-session-meta { display: flex; gap: 16px; font-size: 12px; color: var(--text-secondary); margin-bottom: 8px; }
+.live-session-time { font-size: 11px; color: var(--text-secondary); }
+.live-indicator { display: flex; align-items: center; gap: 8px; margin-left: auto; font-size: 12px; color: var(--text-secondary); }
+.live-dot { width: 8px; height: 8px; background: var(--success); border-radius: 50%; animation: pulse 2s infinite; }
+
+/* ── Hospital Board Styles (The Pitt Style) ── */
+.hospital-board-container { overflow-x: auto; }
+.hospital-board-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.hospital-board-table th { background: var(--surface); padding: 10px 12px; text-align: left; font-weight: 600; color: var(--text-secondary); border-bottom: 2px solid var(--border); white-space: nowrap; }
+.hospital-board-table td { padding: 12px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+.hospital-board-row { cursor: pointer; transition: background 0.15s; }
+.hospital-board-row:hover { background: rgba(0,229,255,0.05); }
+.hospital-board-row.critical { background: rgba(255,82,82,0.1); }
+.hospital-board-row.attention { background: rgba(255,193,7,0.1); }
+.hospital-board-name { font-weight: 500; }
+.hospital-board-id { font-family: var(--mono); font-size: 11px; color: var(--text-secondary); }
+.hospital-board-proposal { max-width: 200px; }
+.hospital-board-proposal div:first-child { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* ── Hierarchy Modal Styles ── */
+.hierarchy-modal { position: fixed; top: 0; left: 0; right: 0; bottom: 0; z-index: 1000; display: flex; align-items: center; justify-content: center; }
+.hierarchy-overlay { position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.8); }
+.hierarchy-content { position: relative; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); width: 90%; max-width: 800px; max-height: 80vh; overflow-y: auto; padding: 24px; }
+.hierarchy-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }
+.hierarchy-header h2 { margin: 0; font-size: 18px; }
+.btn-close { padding: 4px 8px; font-size: 18px; background: transparent; border: none; color: var(--text-secondary); cursor: pointer; }
+.btn-close:hover { color: var(--accent); }
+
+.hierarchy-tree { padding: 12px 0; }
+.tree-node { margin: 8px 0; }
+.tree-node-header { display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); }
+.tree-node-name { font-weight: 500; }
+.tree-node-id { font-family: var(--mono); font-size: 11px; color: var(--text-secondary); margin-left: auto; }
+.tree-status { font-size: 10px; padding: 2px 6px; border-radius: 4px; text-transform: uppercase; margin-left: 8px; }
+.tree-children { border-left: 2px solid var(--border); margin-left: 12px; padding-left: 12px; }
+
+.tree-parents-section, .tree-related-section { margin: 16px 0; padding: 12px; background: rgba(0,229,255,0.05); border-radius: var(--radius); }
+.tree-parents-section h4, .tree-related-section h4 { margin-bottom: 12px; font-size: 13px; color: var(--text-secondary); }
+.tree-parent-item, .tree-related-item { display: flex; align-items: center; gap: 8px; padding: 6px 0; }
+
+/* ── Responsive ── */
+.tree-item { margin-bottom: 8px; }
+
+.tree-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  cursor: pointer;
+  font-weight: 500;
+  transition: border-color 0.15s;
+}
+
+.tree-header:hover { border-color: var(--accent); }
+
+.tree-chevron {
+  font-size: 10px;
+  color: var(--text-secondary);
+  transition: transform 0.15s;
+  display: inline-block;
+}
+
+.tree-chevron.open { transform: rotate(90deg); }
+
+.tree-children {
+  display: none;
+  margin-left: 16px;
+  margin-top: 4px;
+}
+
+.tree-children.open { display: block; }
+
+.tree-child {
+  padding: 6px 10px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  border-left: 2px solid var(--border);
+  margin-left: 6px;
+}
+
+.tree-child:hover { color: var(--text); border-left-color: var(--accent); }
+
 /* ── Responsive ── */
 @media (max-width: 900px) {
   .sidebar { width: 56px; min-width: 56px; }
@@ -460,6 +857,108 @@ pre.code-block {
   .kanban { grid-template-columns: 1fr; }
   .stats-row { grid-template-columns: repeat(3, 1fr); }
   .activity-item { grid-template-columns: 1fr; gap: 2px; }
+}
+
+/* ── Markdown Content ── */
+.markdown-content {
+  max-width: 100%;
+  line-height: 1.7;
+  font-size: 15px;
+}
+
+.markdown-content h1,
+.markdown-content h2,
+.markdown-content h3,
+.markdown-content h4 {
+  margin-top: 24px;
+  margin-bottom: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.markdown-content h1 { font-size: 28px; border-bottom: 1px solid var(--border); padding-bottom: 8px; }
+.markdown-content h2 { font-size: 22px; }
+.markdown-content h3 { font-size: 18px; }
+.markdown-content h4 { font-size: 16px; }
+
+.markdown-content p {
+  margin-bottom: 14px;
+  color: var(--text);
+}
+
+.markdown-content ul,
+.markdown-content ol {
+  margin-bottom: 14px;
+  padding-left: 24px;
+}
+
+.markdown-content li {
+  margin-bottom: 6px;
+}
+
+.markdown-content code {
+  background: var(--surface);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 13px;
+}
+
+.markdown-content pre {
+  background: var(--surface);
+  padding: 16px;
+  border-radius: var(--radius);
+  overflow-x: auto;
+  margin-bottom: 14px;
+  border: 1px solid var(--border);
+}
+
+.markdown-content pre code {
+  background: none;
+  padding: 0;
+}
+
+.markdown-content blockquote {
+  border-left: 3px solid var(--accent);
+  padding-left: 16px;
+  margin-left: 0;
+  margin-bottom: 14px;
+  color: var(--text-secondary);
+}
+
+.markdown-content a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.markdown-content a:hover {
+  text-decoration: underline;
+}
+
+.markdown-content table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: 14px;
+}
+
+.markdown-content th,
+.markdown-content td {
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  text-align: left;
+}
+
+.markdown-content th {
+  background: var(--surface);
+  font-weight: 600;
+}
+
+.frontmatter-header {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 24px;
 }
 </style>
 </head>
@@ -472,21 +971,29 @@ pre.code-block {
       <div class="subtitle">Philotic Stack</div>
     </div>
     <nav>
-      <div class="nav-item active" data-view="dashboard">
+      <div class="nav-item active" data-view="workstreams">
         <span class="nav-icon">◈</span>
-        <span class="nav-label">Dashboard</span>
+        <span class="nav-label">Workstreams</span>
+      </div>
+      <div class="nav-item" data-view="hospital-board">
+        <span class="nav-icon">🏥</span>
+        <span class="nav-label">Status Board</span>
+      </div>
+      <div class="nav-item" data-view="dashboard">
+        <span class="nav-icon">▣</span>
+        <span class="nav-label">Graph Overview</span>
       </div>
       <div class="nav-item" data-view="proposals">
-        <span class="nav-icon">◆</span>
+        <span class="nav-icon">◉</span>
         <span class="nav-label">Proposals</span>
       </div>
       <div class="nav-item" data-view="seams">
         <span class="nav-icon">⬡</span>
         <span class="nav-label">Seams</span>
       </div>
-      <div class="nav-item" data-view="crates">
-        <span class="nav-icon">⧉</span>
-        <span class="nav-label">Crates</span>
+      <div class="nav-item" data-view="tasks">
+        <span class="nav-icon">☰</span>
+        <span class="nav-label">Tasks</span>
       </div>
       <div class="nav-item" data-view="search">
         <span class="nav-icon">⌕</span>
@@ -496,20 +1003,112 @@ pre.code-block {
         <span class="nav-icon">◷</span>
         <span class="nav-label">Timeline</span>
       </div>
+      <div class="nav-section" style="margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border);">
+        <div class="nav-item" data-view="crates">
+          <span class="nav-icon">⧉</span>
+          <span class="nav-label">Crates (Ref)</span>
+        </div>
+      </div>
     </nav>
+    <div style="padding: 12px 16px; border-top: 1px solid var(--border);">
+      <div id="ws-status" class="ws-status connected">
+        <span style="width: 6px; height: 6px; background: currentColor; border-radius: 50%;"></span>
+        <span>Live Updates</span>
+      </div>
+    </div>
   </div>
 
   <!-- Main Content -->
   <div class="main">
 
-    <!-- Dashboard View -->
-    <div id="view-dashboard" class="view active">
+    <!-- Workstreams View (NEW MAIN DASHBOARD) -->
+    <div id="view-workstreams" class="view active">
+      <div class="toolbar">
+        <button class="toolbar-btn" onclick="loadWorkstreams()">
+          <span>↻</span> Refresh
+        </button>
+        <button class="toolbar-btn" onclick="startNewWorkstream()">
+          <span>+</span> New Workstream
+        </button>
+        <div class="live-indicator">
+          <span class="live-dot"></span>
+          <span>Live workstream tracking</span>
+        </div>
+      </div>
+      
+      <!-- LIVE AGENT SESSIONS -->
+      <h2 style="color: var(--accent);">🔴 Live Agent Sessions</h2>
+      <div id="live-sessions-container" class="live-sessions-container">
+        <div class="loading">Loading active sessions…</div>
+      </div>
+      
+      <h2>Active Workstreams</h2>
+      <div id="workstreams-container" class="workstreams-container">
+        <div class="loading">Loading workstreams…</div>
+      </div>
+      <h3>Orphan Tasks (need seam assignment)</h3>
+      <div id="orphan-tasks" class="table-wrap">
+        <div class="loading" style="padding:16px">Checking for orphan tasks…</div>
+      </div>
+    </div>
+
+    <!-- Hospital Board View (Status Board like The Pitt) -->
+    <div id="view-hospital-board" class="view">
+      <div class="toolbar">
+        <button class="toolbar-btn" onclick="loadHospitalBoard()">
+          <span>↻</span> Refresh
+        </button>
+        <div style="margin-left: auto; font-size: 12px; color: var(--text-secondary);">
+          <span style="color: var(--success);">●</span> Stable 
+          <span style="color: var(--amber); margin-left: 8px;">●</span> Attention
+          <span style="color: var(--error); margin-left: 8px;">●</span> Critical
+        </div>
+      </div>
+      <h2>Workstream Status Board</h2>
+      <div id="hospital-board-container" class="hospital-board-container">
+        <div class="loading">Loading status board…</div>
+      </div>
+    </div>
+
+    <!-- Workstream Detail View -->
+    <div id="view-workstream-detail" class="view">
+      <div class="toolbar">
+        <button class="toolbar-btn secondary" onclick="backToWorkstreams()">
+          <span>←</span> Back to Workstreams
+        </button>
+        <button class="toolbar-btn" onclick="refreshWorkstreamDetail()">
+          <span>↻</span> Refresh
+        </button>
+        <button class="toolbar-btn secondary" onclick="closeWorkstream()">
+          <span>✓</span> Close Workstream
+        </button>
+      </div>
+      <div id="workstream-detail-content">
+        <div class="loading">Loading workstream detail…</div>
+      </div>
+    </div>
+
+    <!-- Dashboard View (renamed to Graph Overview) -->
+    <div id="view-dashboard" class="view">
+      <div class="toolbar">
+        <button class="toolbar-btn" onclick="refreshDashboard()">
+          <span>↻</span> Refresh
+        </button>
+        <div class="live-indicator">
+          <span class="live-dot"></span>
+          <span>Auto-sync enabled</span>
+        </div>
+      </div>
       <h2>Dashboard</h2>
       <div id="stats-row" class="stats-row">
         <div class="loading">Loading stats…</div>
       </div>
       <h3>Proposal Pipeline</h3>
       <div id="pipeline-bar" class="pipeline-bar"></div>
+      <h3>Active Tasks</h3>
+      <div id="dashboard-tasks" class="tasks-panel">
+        <div class="loading">Loading tasks…</div>
+      </div>
       <h3>Recent Activity</h3>
       <div id="activity-feed" class="table-wrap" style="margin-bottom:24px">
         <div class="loading" style="padding:16px">Loading activity…</div>
@@ -522,37 +1121,150 @@ pre.code-block {
 
     <!-- Proposals View -->
     <div id="view-proposals" class="view">
+      <div class="toolbar">
+        <button class="toolbar-btn" onclick="loadProposals()">
+          <span>↻</span> Refresh
+        </button>
+      </div>
       <h2>Proposals</h2>
       <div id="kanban" class="kanban">
         <div class="loading">Loading proposals…</div>
       </div>
-      <div id="proposal-detail"></div>
+    </div>
+
+    <!-- Proposal Detail View -->
+    <div id="view-proposal-detail" class="view">
+      <div class="toolbar">
+        <button class="toolbar-btn secondary" onclick="backToProposals()">
+          <span>←</span> Back to Proposals
+        </button>
+        <button class="toolbar-btn" onclick="refreshProposalDetail()">
+          <span>↻</span> Refresh
+        </button>
+      </div>
+      <div id="proposal-detail-content">
+        <div class="loading">Loading proposal detail…</div>
+      </div>
     </div>
 
     <!-- Seams View -->
     <div id="view-seams" class="view">
+      <div class="toolbar">
+        <button class="toolbar-btn" onclick="loadSeams()">
+          <span>↻</span> Refresh
+        </button>
+      </div>
       <h2>Seams</h2>
       <div id="seams-table" class="table-wrap">
         <div class="loading" style="padding:16px">Loading seams…</div>
       </div>
-      <div id="seam-detail"></div>
+    </div>
+
+    <!-- Seam Detail View -->
+    <div id="view-seam-detail" class="view">
+      <div class="toolbar">
+        <button class="toolbar-btn secondary" onclick="backToSeams()">
+          <span>←</span> Back to Seams
+        </button>
+        <button class="toolbar-btn" onclick="refreshSeamDetail()">
+          <span>↻</span> Refresh
+        </button>
+      </div>
+      <div id="seam-detail-content">
+        <div class="loading">Loading seam detail…</div>
+      </div>
+    </div>
+
+    <!-- Tasks View -->
+    <div id="view-tasks" class="view">
+      <div class="toolbar">
+        <button class="toolbar-btn" onclick="loadTasks()">
+          <span>↻</span> Refresh
+        </button>
+      </div>
+      <h2>Tasks</h2>
+      <div id="tasks-table" class="table-wrap">
+        <div class="loading" style="padding:16px">Loading tasks…</div>
+      </div>
+    </div>
+
+    <!-- Task Detail View -->
+    <div id="view-task-detail" class="view">
+      <div class="toolbar">
+        <button class="toolbar-btn secondary" onclick="backToTasks()">
+          <span>←</span> Back to Tasks
+        </button>
+        <button class="toolbar-btn" onclick="refreshTaskDetail()">
+          <span>↻</span> Refresh
+        </button>
+      </div>
+      <div id="task-detail-content">
+        <div class="loading">Loading task detail…</div>
+      </div>
     </div>
 
     <!-- Crates View -->
     <div id="view-crates" class="view">
+      <div class="toolbar">
+        <button class="toolbar-btn" onclick="triggerScan()">
+          <span>⟳</span> Rescan Codebase
+        </button>
+        <button class="toolbar-btn" onclick="loadCrates()">
+          <span>↻</span> Refresh
+        </button>
+      </div>
       <h2>Crates</h2>
       <div id="crate-tree">
         <div class="loading">Loading crates…</div>
       </div>
     </div>
 
+    <!-- Crate Detail View -->
+    <div id="view-crate-detail" class="view">
+      <div class="toolbar">
+        <button class="toolbar-btn secondary" onclick="backToCrates()">
+          <span>←</span> Back to Crates
+        </button>
+      </div>
+      <div id="crate-detail-content">
+        <div class="loading">Loading crate detail…</div>
+      </div>
+    </div>
+
     <!-- Search View -->
     <div id="view-search" class="view">
-      <h2>Search</h2>
-      <div class="search-input-wrap">
-        <input id="search-input" type="text" placeholder="Search nodes, types, functions, snippets…" />
+      <h2>Semantic Search</h2>
+      <div class="toolbar">
+        <div class="search-input-wrap" style="flex: 1; margin-right: 12px;">
+          <input id="semantic-search-input" type="text" placeholder="Describe what you're looking for... (e.g., 'lease management ownership')" style="width: 100%;" />
+        </div>
+        <select id="semantic-search-kind" class="toolbar-btn secondary">
+          <option value="">All types</option>
+          <option value="proposal">Proposals</option>
+          <option value="function">Functions</option>
+          <option value="type">Types</option>
+          <option value="module">Modules</option>
+        </select>
+        <button class="toolbar-btn" onclick="runSemanticSearch()">
+          <span>⌕</span> Search
+        </button>
       </div>
-      <div id="search-results" class="search-results"></div>
+      <div class="toolbar" style="margin-top: 8px;">
+        <label style="font-size: 12px; color: var(--text-secondary);">
+          Threshold: <input id="semantic-threshold" type="range" min="0.3" max="0.95" step="0.05" value="0.7" style="vertical-align: middle;" />
+          <span id="threshold-value">0.7</span>
+        </label>
+        <span style="flex: 1;"></span>
+        <label style="font-size: 12px; color: var(--text-secondary);">
+          Limit: <input id="semantic-limit" type="number" min="1" max="50" value="10" style="width: 50px; background: var(--surface); border: 1px solid var(--border); color: var(--text); border-radius: 4px; padding: 2px 6px;" />
+        </label>
+      </div>
+      <div id="semantic-search-status" style="margin: 12px 0; font-size: 12px; color: var(--text-secondary);"></div>
+      <div id="search-results" class="search-results">
+        <div style="padding: 40px; text-align: center; color: var(--text-secondary);">
+          Enter a query above to search by semantic meaning
+        </div>
+      </div>
     </div>
 
     <!-- Timeline View -->
@@ -571,8 +1283,8 @@ pre.code-block {
 
 const API = '';
 
-async function api(path) {
-  const res = await fetch(API + path);
+async function api(path, options = {}) {
+  const res = await fetch(API + path, options);
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }));
     throw new Error(err.error || res.statusText);
@@ -606,7 +1318,14 @@ function showError(container, msg) {
 function getStatus(props) {
   if (!props) return 'unknown';
   const p = typeof props === 'string' ? JSON.parse(props) : props;
-  return (p.status || p.disposition || 'unknown').toLowerCase().replace(/\s+/g, '-');
+  const raw = (p.status || p.disposition || 'unknown').toLowerCase();
+  // Normalize status variants to kanban columns
+  if (raw.includes('accepted')) return 'accepted';
+  if (raw.includes('in-progress') || raw.includes('in progress')) return 'in-progress';
+  if (raw.includes('implemented')) return 'implemented';
+  if (raw.includes('deferred')) return 'deferred';
+  if (raw.includes('proposed')) return 'proposed';
+  return 'proposed'; // default bucket
 }
 
 function getProp(props, key) {
@@ -624,21 +1343,184 @@ function formatTime(ts) {
 
 // ── Navigation ──
 
-const views = ['dashboard', 'proposals', 'seams', 'crates', 'search', 'timeline'];
+const views = ['dashboard', 'workstreams', 'workstream-detail', 'hospital-board', 'proposals', 'proposal-detail', 'seams', 'seam-detail', 'tasks', 'task-detail', 'crates', 'crate-detail', 'search', 'timeline'];
 let currentView = 'dashboard';
+let currentProposalId = null;
+let currentSeamId = null;
+let currentTaskId = null;
+let currentCrateName = null;
+let wsConnection = null;
 
 document.querySelectorAll('.nav-item').forEach(item => {
   item.addEventListener('click', () => {
     const view = item.dataset.view;
-    switchView(view);
+    if (view === 'workstreams') backToWorkstreams();
+    else if (view === 'proposals') backToProposals();
+    else if (view === 'seams') backToSeams();
+    else if (view === 'tasks') backToTasks();
+    else if (view === 'crates') backToCrates();
+    else switchView(view);
   });
 });
 
-function switchView(view) {
+function switchView(view, skipLoad = false) {
   currentView = view;
-  document.querySelectorAll('.nav-item').forEach(n => n.classList.toggle('active', n.dataset.view === view));
+  document.querySelectorAll('.nav-item').forEach(n => {
+    const navView = n.dataset.view;
+    // Handle detail views highlighting their parent nav
+    let active = navView === view;
+    if (!active) {
+      if (view === 'workstream-detail' && navView === 'workstreams') active = true;
+      if (view === 'proposal-detail' && navView === 'proposals') active = true;
+      if (view === 'seam-detail' && navView === 'seams') active = true;
+      if (view === 'task-detail' && navView === 'tasks') active = true;
+      if (view === 'crate-detail' && navView === 'crates') active = true;
+    }
+    n.classList.toggle('active', active);
+  });
   document.querySelectorAll('.view').forEach(v => v.classList.toggle('active', v.id === 'view-' + view));
-  loadView(view);
+  if (!skipLoad) loadView(view);
+}
+
+function backToWorkstreams() {
+  currentWorkstreamId = null;
+  switchView('workstreams');
+}
+
+function backToProposals() {
+  currentProposalId = null;
+  switchView('proposals');
+}
+
+function backToSeams() {
+  currentSeamId = null;
+  switchView('seams');
+}
+
+function backToTasks() {
+  currentTaskId = null;
+  switchView('tasks');
+}
+
+// Status & Tag Update Functions
+async function updateNodeStatus(nodeId, newStatus, kind) {
+  const propName = kind === 'proposal' ? 'disposition' : 'status';
+  try {
+    const response = await fetch('http://localhost:8901/mcp', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'tools/call',
+        params: {
+          name: 'graph_update_node',
+          arguments: {
+            id: nodeId,
+            properties: { [propName]: newStatus, last_updated: new Date().toISOString().split('T')[0] },
+            reason: `Status changed to ${newStatus} via UI`
+          }
+        },
+        id: Date.now()
+      })
+    });
+    const result = await response.json();
+    if (result.result) {
+      showToast(`Updated ${nodeId} status to ${newStatus}`);
+      // Update badge immediately without full refresh
+      const badge = document.getElementById('proposal-status-badge');
+      if (badge) {
+        const normalizedStatus = getStatus({ [propName]: newStatus });
+        badge.className = 'badge badge-' + normalizedStatus;
+        badge.textContent = normalizedStatus;
+      }
+    } else {
+      showToast('Error: ' + (result.error?.message || 'Update failed'), 'error');
+    }
+  } catch (err) {
+    showToast('Error: ' + err.message, 'error');
+  }
+}
+
+async function updateNodeTags(nodeId, tags) {
+  try {
+    const response = await fetch('http://localhost:8901/mcp', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'tools/call',
+        params: {
+          name: 'graph_update_node',
+          arguments: {
+            id: nodeId,
+            properties: { tags: tags, last_updated: new Date().toISOString().split('T')[0] },
+            reason: 'Tags updated via UI'
+          }
+        },
+        id: Date.now()
+      })
+    });
+    const result = await response.json();
+    if (result.result) {
+      showToast(`Updated tags for ${nodeId}`);
+    } else {
+      showToast('Error: ' + (result.error?.message || 'Update failed'), 'error');
+    }
+  } catch (err) {
+    showToast('Error: ' + err.message, 'error');
+  }
+}
+
+async function addTag(nodeId, newTag, currentTags) {
+  if (!newTag || !newTag.trim()) {
+    showToast('Please enter a tag name', 'error');
+    return;
+  }
+  const tag = newTag.trim().toLowerCase().replace(/\s+/g, '-');
+  if (currentTags.includes(tag)) {
+    showToast('Tag already exists', 'error');
+    return;
+  }
+  const updatedTags = [...currentTags, tag];
+  await updateNodeTags(nodeId, updatedTags);
+  refreshProposalDetail();
+}
+
+async function removeTag(nodeId, tagToRemove, currentTags) {
+  const updatedTags = currentTags.filter(t => t !== tagToRemove);
+  await updateNodeTags(nodeId, updatedTags);
+  refreshProposalDetail();
+}
+
+function showToast(message, type = 'success') {
+  const toast = document.createElement('div');
+  toast.className = 'toast ' + type;
+  toast.textContent = message;
+  toast.style.cssText = 'position: fixed; bottom: 20px; right: 20px; padding: 12px 20px; background: ' + (type === 'error' ? 'var(--error)' : 'var(--success)') + '; color: white; border-radius: 4px; z-index: 10000; font-size: 14px;';
+  document.body.appendChild(toast);
+  setTimeout(() => toast.remove(), 3000);
+}
+
+function backToCrates() {
+  currentCrateName = null;
+  switchView('crates');
+}
+
+function refreshProposalDetail() {
+  if (currentProposalId) loadProposalDetail(currentProposalId);
+}
+
+function refreshSeamDetail() {
+  if (currentSeamId) loadSeamDetail(currentSeamId);
+}
+
+function refreshTaskDetail() {
+  if (currentTaskId) loadTaskDetail(currentTaskId);
+}
+
+function refreshDashboard() {
+  loaded.dashboard = false;
+  loadDashboard();
 }
 
 const loaded = {};
@@ -647,9 +1529,17 @@ function loadView(view) {
   loaded[view] = true;
   switch (view) {
     case 'dashboard': loadDashboard(); break;
+    case 'workstreams': loadWorkstreams(); break;
+    case 'workstream-detail': if (currentWorkstreamId) refreshWorkstreamDetail(); break;
+    case 'hospital-board': loadHospitalBoard(); break;
     case 'proposals': loadProposals(); break;
+    case 'proposal-detail': if (currentProposalId) loadProposalDetail(currentProposalId); break;
     case 'seams': loadSeams(); break;
+    case 'seam-detail': if (currentSeamId) loadSeamDetail(currentSeamId); break;
+    case 'tasks': loadTasks(); break;
+    case 'task-detail': if (currentTaskId) loadTaskDetail(currentTaskId); break;
     case 'crates': loadCrates(); break;
+    case 'crate-detail': if (currentCrateName) loadCrateDetail(currentCrateName); break;
     case 'search': initSearch(); break;
     case 'timeline': loadTimeline(); break;
   }
@@ -770,6 +1660,51 @@ function renderCrateTable(crates) {
   container.appendChild(table);
 }
 
+// ── Timeline ──
+
+async function loadTimeline() {
+  const container = document.getElementById('timeline-feed');
+  try {
+    const mutations = await api('/api/mutations?limit=50');
+    renderTimeline(mutations);
+  } catch (err) {
+    showError(container, 'Failed to load timeline: ' + err.message);
+  }
+}
+
+function renderTimeline(mutations) {
+  const container = document.getElementById('timeline-feed');
+  if (!mutations || mutations.length === 0) {
+    container.innerHTML = '<div style="padding:16px;color:var(--text-secondary)">No mutations recorded</div>';
+    return;
+  }
+  
+  container.innerHTML = '';
+  const table = el('table');
+  const thead = el('thead', null, el('tr', null,
+    el('th', { textContent: 'Time' }),
+    el('th', { textContent: 'Action' }),
+    el('th', { textContent: 'Target' }),
+    el('th', { textContent: 'Agent' }),
+    el('th', { textContent: 'Reason' })
+  ));
+  table.appendChild(thead);
+  
+  const tbody = el('tbody');
+  mutations.forEach(m => {
+    const row = el('tr', null,
+      el('td', { textContent: formatTime(m.timestamp), style: 'font-family:var(--mono);font-size:12px;white-space:nowrap;' }),
+      el('td', null, el('span', { className: 'badge badge-kind', textContent: m.action })),
+      el('td', { textContent: m.target_node || '—', style: 'font-family:var(--mono);font-size:12px;max-width:200px;overflow:hidden;text-overflow:ellipsis;' }),
+      el('td', { textContent: m.agent || '—' }),
+      el('td', { textContent: m.reason || '—', style: 'font-size:12px;color:var(--text-secondary);max-width:300px;overflow:hidden;text-overflow:ellipsis;' })
+    );
+    tbody.appendChild(row);
+  });
+  table.appendChild(tbody);
+  container.appendChild(table);
+}
+
 // ── Proposals (Kanban) ──
 
 let proposalsCache = [];
@@ -846,156 +1781,8 @@ function renderKanban(proposals) {
   }
 }
 
-async function showProposalDetail(id) {
-  const container = document.getElementById('proposal-detail');
-  container.innerHTML = '<div class="loading">Loading proposal detail…</div>';
-  try {
-    const data = await api('/api/nodes/' + encodeURIComponent(id));
-    const node = data;
-    const props = typeof node.properties === 'string' ? JSON.parse(node.properties) : (node.properties || {});
-    const edges = node._edges || { outgoing: [], incoming: [] };
-
-    const panel = el('div', { className: 'detail-panel' });
-    panel.appendChild(el('h3', null, node.name));
-
-    // Properties
-    const propsSection = el('div', { className: 'detail-section' });
-    propsSection.appendChild(el('h4', { textContent: 'Properties' }));
-    const propsGrid = el('div', { className: 'detail-props' });
-    for (const [k, v] of Object.entries(props)) {
-      propsGrid.appendChild(el('span', { className: 'prop-key', textContent: k }));
-      const val = Array.isArray(v) ? v.join(', ') : String(v);
-      propsGrid.appendChild(el('span', { className: 'prop-val', textContent: val }));
-    }
-    propsSection.appendChild(propsGrid);
-    panel.appendChild(propsSection);
-
-    // Related seams (outgoing implements edges)
-    const seamsEdges = edges.outgoing.filter(e => e.relation === 'implements');
-    if (seamsEdges.length > 0) {
-      const seamsSection = el('div', { className: 'detail-section' });
-      seamsSection.appendChild(el('h4', { textContent: 'Seams (' + seamsEdges.length + ')' }));
-      const list = el('ul', { className: 'detail-list' });
-      seamsEdges.forEach(e => list.appendChild(el('li', { textContent: e.target_id })));
-      seamsSection.appendChild(list);
-      panel.appendChild(seamsSection);
-    }
-
-    // Implementing code
-    const implEdges = edges.outgoing.filter(e => e.relation === 'implemented_by');
-    if (implEdges.length > 0) {
-      const implSection = el('div', { className: 'detail-section' });
-      implSection.appendChild(el('h4', { textContent: 'Implementing Code (' + implEdges.length + ')' }));
-      const list = el('ul', { className: 'detail-list' });
-      implEdges.forEach(e => list.appendChild(el('li', { textContent: e.target_id })));
-      implSection.appendChild(list);
-      panel.appendChild(implSection);
-    }
-
-    // Incoming edges
-    if (edges.incoming.length > 0) {
-      const inSection = el('div', { className: 'detail-section' });
-      inSection.appendChild(el('h4', { textContent: 'Incoming Edges (' + edges.incoming.length + ')' }));
-      const list = el('ul', { className: 'detail-list' });
-      edges.incoming.forEach(e => list.appendChild(el('li', { textContent: e.relation + ' ← ' + e.source_id })));
-      inSection.appendChild(list);
-      panel.appendChild(inSection);
-    }
-
-    container.innerHTML = '';
-    container.appendChild(panel);
-  } catch (err) {
-    showError(container, 'Failed to load proposal: ' + err.message);
-  }
-}
-
-// ── Seams ──
-
-async function loadSeams() {
-  const container = document.getElementById('seams-table');
-  try {
-    const seams = await api('/api/seams');
-    container.innerHTML = '';
-    const table = el('table');
-    const thead = el('thead', null, el('tr', null,
-      el('th', { textContent: 'Name' }),
-      el('th', { textContent: 'Status' }),
-      el('th', { textContent: 'Dependencies' })
-    ));
-    table.appendChild(thead);
-    const tbody = el('tbody');
-    seams.forEach(s => {
-      const node = s.node;
-      const status = getStatus(node.properties);
-      const deps = (s.dependencies || []).join(', ') || '—';
-      const row = el('tr', {
-        style: 'cursor:pointer',
-        onclick: () => showSeamDetail(node.id),
-      },
-        el('td', { textContent: node.name }),
-        el('td', null, el('span', { className: 'badge badge-' + status, textContent: status })),
-        el('td', { textContent: deps, style: 'font-size:12px;color:var(--text-secondary)' })
-      );
-      tbody.appendChild(row);
-    });
-    table.appendChild(tbody);
-    container.appendChild(table);
-  } catch (err) {
-    showError(container, 'Failed to load seams: ' + err.message);
-  }
-}
-
-async function showSeamDetail(id) {
-  const container = document.getElementById('seam-detail');
-  container.innerHTML = '<div class="loading">Loading seam detail…</div>';
-  try {
-    const data = await api('/api/nodes/' + encodeURIComponent(id));
-    const props = typeof data.properties === 'string' ? JSON.parse(data.properties) : (data.properties || {});
-    const edges = data._edges || { outgoing: [], incoming: [] };
-
-    const panel = el('div', { className: 'detail-panel' });
-    panel.appendChild(el('h3', null, data.name));
-
-    // Properties
-    const propsSection = el('div', { className: 'detail-section' });
-    propsSection.appendChild(el('h4', { textContent: 'Properties' }));
-    const propsGrid = el('div', { className: 'detail-props' });
-    for (const [k, v] of Object.entries(props)) {
-      propsGrid.appendChild(el('span', { className: 'prop-key', textContent: k }));
-      const val = Array.isArray(v) ? v.join(', ') : String(v);
-      propsGrid.appendChild(el('span', { className: 'prop-val', textContent: val }));
-    }
-    propsSection.appendChild(propsGrid);
-    panel.appendChild(propsSection);
-
-    // Proposal (incoming implements)
-    const proposalEdges = edges.incoming.filter(e => e.relation === 'implements');
-    if (proposalEdges.length > 0) {
-      const sec = el('div', { className: 'detail-section' });
-      sec.appendChild(el('h4', { textContent: 'Belongs to Proposal' }));
-      const list = el('ul', { className: 'detail-list' });
-      proposalEdges.forEach(e => list.appendChild(el('li', { textContent: e.source_id })));
-      sec.appendChild(list);
-      panel.appendChild(sec);
-    }
-
-    // Implementing code (outgoing implemented_by)
-    const implEdges = edges.outgoing.filter(e => e.relation === 'implemented_by');
-    if (implEdges.length > 0) {
-      const sec = el('div', { className: 'detail-section' });
-      sec.appendChild(el('h4', { textContent: 'Implementing Code' }));
-      const list = el('ul', { className: 'detail-list' });
-      implEdges.forEach(e => list.appendChild(el('li', { textContent: e.target_id })));
-      sec.appendChild(list);
-      panel.appendChild(sec);
-    }
-
-    container.innerHTML = '';
-    container.appendChild(panel);
-  } catch (err) {
-    showError(container, 'Failed to load seam detail: ' + err.message);
-  }
-}
+// (Old showProposalDetail, loadSeams, getVerificationBadge, showSeamDetail removed — 
+//  superseded by enhanced versions below)
 
 // ── Crates (Tree) ──
 
@@ -1233,23 +2020,7 @@ async function doSearch(query) {
   }
 }
 
-function navigateToNode(node) {
-  const kind = node.kind;
-  if (kind === 'proposal') {
-    switchView('proposals');
-    loaded.proposals = false;
-    loadProposals().then(() => showProposalDetail(node.id));
-  } else if (kind === 'seam') {
-    switchView('seams');
-    loaded.seams = false;
-    loadSeams().then(() => showSeamDetail(node.id));
-  } else if (kind === 'crate') {
-    switchView('crates');
-  } else {
-    // Show node detail inline
-    showNodeDetail(node);
-  }
-}
+// (Old navigateToNode removed — superseded by enhanced version below)
 
 async function showNodeDetail(node) {
   const container = document.getElementById('search-results');
@@ -1269,6 +2040,18 @@ async function showNodeDetail(node) {
       propsGrid.appendChild(el('span', { className: 'prop-key', textContent: 'file' }));
       propsGrid.appendChild(el('span', { className: 'prop-val', textContent: data.file_path, style: 'font-family:var(--mono);font-size:12px' }));
     }
+    
+    // Embedding status indicator
+    const hasEmbedding = data.embedding_dims && data.embedding_dims > 0;
+    propsGrid.appendChild(el('span', { className: 'prop-key', textContent: 'embedding' }));
+    propsGrid.appendChild(el('span', { 
+      className: 'prop-val', 
+      style: `font-family:var(--mono);font-size:12px;color:${hasEmbedding ? 'var(--success)' : 'var(--text-secondary)'}`,
+      textContent: hasEmbedding 
+        ? `✓ ${data.embedding_dims} dims (${data.embedding_model || 'unknown model'})` 
+        : '✗ not embedded'
+    }));
+    
     for (const [k, v] of Object.entries(props)) {
       propsGrid.appendChild(el('span', { className: 'prop-key', textContent: k }));
       const val = Array.isArray(v) ? v.join(', ') : String(v);
@@ -1311,45 +2094,2557 @@ async function showNodeDetail(node) {
   }
 }
 
-// ── Timeline ──
+// ── WebSocket for Live Updates ──
 
-async function loadTimeline() {
-  const container = document.getElementById('timeline-feed');
-  try {
-    const mutations = await api('/api/mutations?limit=50');
-    container.innerHTML = '';
-    if (mutations.length === 0) {
-      container.innerHTML = '<div style="padding:16px;color:var(--text-secondary)">No mutations recorded</div>';
-      return;
+function initWebSocket() {
+  const ws = new WebSocket('ws://localhost:8900/ws/changes');
+  ws.onopen = () => {
+    console.log('WebSocket connected');
+    document.getElementById('ws-status').className = 'ws-status connected';
+    document.getElementById('ws-status').innerHTML = '<span style="width: 6px; height: 6px; background: currentColor; border-radius: 50%;"></span><span>Live Updates</span>';
+  };
+  ws.onclose = () => {
+    console.log('WebSocket disconnected');
+    document.getElementById('ws-status').className = 'ws-status disconnected';
+    document.getElementById('ws-status').innerHTML = '<span style="width: 6px; height: 6px; background: currentColor; border-radius: 50%;"></span><span>Offline</span>';
+    setTimeout(initWebSocket, 5000);
+  };
+  ws.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+    handleLiveUpdate(data);
+  };
+  wsConnection = ws;
+}
+
+function handleLiveUpdate(data) {
+  const et = data.event_type || '';
+  console.log('[WS] Event:', et, data.payload);
+  
+  // Events that affect workstreams/sessions views
+  const sessionEvents = ['session_started', 'session_closed', 'session_activity'];
+  const nodeEvents = ['node_updated', 'node_created', 'edge_created', 'scan_complete'];
+  const testEvents = ['test_run_recorded', 'verification_advanced'];
+  const allRefreshEvents = [...sessionEvents, ...nodeEvents, ...testEvents, 
+    'decision_recorded', 'mutation_recorded', 'diagrams_persisted'];
+  
+  if (allRefreshEvents.includes(et)) {
+    // Invalidate all cached views so they reload on next visit
+    Object.keys(loaded).forEach(k => loaded[k] = false);
+    // Reload current view immediately
+    loadView(currentView);
+    
+    // If we're on workstreams and a session event came in, also refresh live sessions
+    if (sessionEvents.includes(et) && currentView === 'workstreams') {
+      loadLiveSessions();
     }
-    const table = el('table');
-    const thead = el('thead', null, el('tr', null,
-      el('th', { textContent: 'Time' }),
-      el('th', { textContent: 'Agent' }),
-      el('th', { textContent: 'Action' }),
-      el('th', { textContent: 'Target' }),
-      el('th', { textContent: 'Reason' })
-    ));
-    table.appendChild(thead);
-    const tbody = el('tbody');
-    mutations.forEach(m => {
-      tbody.appendChild(el('tr', null,
-        el('td', { textContent: formatTime(m.timestamp), style: 'font-family:var(--mono);font-size:12px;color:var(--text-secondary);white-space:nowrap' }),
-        el('td', { textContent: m.agent || '—', style: 'color:var(--accent);font-weight:500' }),
-        el('td', { textContent: m.action || '—' }),
-        el('td', { textContent: m.target_node || '—', style: 'font-family:var(--mono);font-size:12px' }),
-        el('td', { textContent: m.reason || '—', style: 'color:var(--text-secondary);font-style:italic' })
-      ));
-    });
-    table.appendChild(tbody);
-    container.appendChild(table);
-  } catch (err) {
-    showError(container, 'Failed to load timeline: ' + err.message);
   }
 }
 
+// ── Enhanced Dashboard Functions ──
+
+function renderDashboardTasks(tasks) {
+  const container = document.getElementById('dashboard-tasks');
+  if (!tasks || tasks.length === 0) {
+    container.innerHTML = '<div style="color:var(--text-secondary)">No active tasks</div>';
+    return;
+  }
+  container.innerHTML = '';
+  const activeTasks = tasks.filter(t => {
+    const status = getProp(t.properties, 'status');
+    return status === 'pending' || status === 'in_progress';
+  }).slice(0, 5);
+  
+  if (activeTasks.length === 0) {
+    container.innerHTML = '<div style="color:var(--text-secondary)">No active tasks</div>';
+    return;
+  }
+  
+  activeTasks.forEach(t => {
+    const status = getProp(t.properties, 'status');
+    const priority = getProp(t.properties, 'priority');
+    container.appendChild(el('div', { className: 'task-item' },
+      el('span', { className: 'task-status ' + status }),
+      el('div', { className: 'task-content' },
+        el('div', { className: 'task-title', textContent: t.name }),
+        el('div', { className: 'task-meta', textContent: priority + ' priority' })
+      ),
+      el('button', { 
+        className: 'btn', 
+        textContent: 'View',
+        onclick: () => showTaskDetail(t.id)
+      })
+    ));
+  });
+}
+
+// ── Proposal Detail ──
+
+async function showProposalDetail(id) {
+  currentProposalId = id;
+  switchView('proposal-detail', true);
+  await loadProposalDetail(id);
+}
+
+async function loadProposalDetail(id) {
+  const container = document.getElementById('proposal-detail-content');
+  container.innerHTML = '<div class="loading">Loading proposal detail…</div>';
+  try {
+    const [node, seams, tasks, mutations] = await Promise.all([
+      api('/api/nodes/' + encodeURIComponent(id)),
+      api('/api/seams'),
+      api('/api/nodes?kind=task'),
+      api('/api/mutations?limit=20'),
+    ]);
+    
+    const props = typeof node.properties === 'string' ? JSON.parse(node.properties) : (node.properties || {});
+    const edges = node._edges || { outgoing: [], incoming: [] };
+
+    const page = el('div', null);
+    
+    // Breadcrumbs
+    page.appendChild(el('div', { className: 'page-nav' },
+      el('span', { className: 'page-nav-link', onclick: backToProposals, textContent: 'Proposals' }),
+      el('span', { className: 'page-nav-separator', textContent: '/' }),
+      el('span', { className: 'page-nav-current', textContent: node.name })
+    ));
+
+    // Title and status
+    const header = el('div', { style: 'margin-bottom: 24px;' });
+    header.appendChild(el('h2', null,
+      node.name,
+      el('span', { 
+        id: 'proposal-status-badge',
+        className: 'badge badge-' + getStatus(props), 
+        style: 'margin-left: 12px; font-size: 12px;',
+        textContent: getStatus(props) 
+      })
+    ));
+    page.appendChild(header);
+
+    // Stacked layout (single column)
+    const mainStack = el('div', { style: 'display: flex; flex-direction: column; gap: 20px;' });
+    
+    // Combined Properties & Frontmatter Section
+    const combinedPropsSection = el('div', { className: 'detail-section' });
+    combinedPropsSection.appendChild(el('h4', { textContent: 'Document Info' }));
+    
+    const combinedGrid = el('div', { 
+      className: 'detail-props',
+      style: 'display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px;'
+    });
+    
+    // Core properties from node
+    const coreProps = {
+      'Domain': props.domain,
+      'Doc Type': props.doc_type || node.kind,
+      'Last Updated': props.last_updated,
+      'Proposal ID': props.proposal_id,
+      'Current Slice': props.current_slice,
+      'Assigned Agent': props.assigned_agent,
+      'Status': props.disposition || props.status,
+      'Tags': props.tags?.join(', ')
+    };
+    
+    Object.entries(coreProps).forEach(([key, value]) => {
+      if (value) {
+        const item = el('div', { style: 'background: var(--surface); padding: 8px 12px; border-radius: 4px;' },
+          el('div', { style: 'color: var(--muted); font-size: 11px; text-transform: uppercase; margin-bottom: 2px;', textContent: key }),
+          el('div', { style: 'color: var(--text); font-size: 13px;', textContent: Array.isArray(value) ? value.join(', ') : String(value) })
+        );
+        combinedGrid.appendChild(item);
+      }
+    });
+    
+    combinedPropsSection.appendChild(combinedGrid);
+    mainStack.appendChild(combinedPropsSection);
+
+    // Status & Tags Management Section
+    const statusTagsSection = el('div', { className: 'detail-section' });
+    statusTagsSection.appendChild(el('h4', { textContent: 'Status & Tags Management' }));
+    
+    // Status row
+    const statusRow = el('div', { style: 'display: flex; align-items: center; gap: 12px; margin-bottom: 16px;' });
+    statusRow.appendChild(el('span', { textContent: 'Status:', style: 'font-weight: 500; min-width: 60px;' }));
+    
+    const statusOptions = ['proposed', 'accepted', 'accepted-current-slice', 'in-progress', 'implemented', 'verified', 'archived', 'superseded', 'deferred'];
+    const currentStatus = props.disposition || props.status || 'unknown';
+    
+    const statusSelect = el('select', { 
+      className: 'status-dropdown',
+      style: 'padding: 6px 12px; border-radius: 4px; background: var(--bg); border: 1px solid var(--border); color: var(--text); min-width: 180px;',
+      onchange: (e) => updateNodeStatus(id, e.target.value, 'proposal')
+    });
+    statusOptions.forEach(opt => {
+      const option = el('option', { value: opt, textContent: opt, selected: opt === currentStatus });
+      statusSelect.appendChild(option);
+    });
+    statusRow.appendChild(statusSelect);
+    statusTagsSection.appendChild(statusRow);
+    
+    // Tags management
+    const tagsRow = el('div', { style: 'display: flex; align-items: flex-start; gap: 12px;' });
+    tagsRow.appendChild(el('span', { textContent: 'Tags:', style: 'font-weight: 500; min-width: 60px; margin-top: 8px;' }));
+    
+    const tagsContainer = el('div', { style: 'flex: 1;' });
+    
+    // Current tags display with remove buttons
+    const currentTagsDiv = el('div', { 
+      id: 'current-tags-display',
+      style: 'display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px;' 
+    });
+    
+    const currentTags = props.tags || [];
+    currentTags.forEach(tag => {
+      const tagEl = el('span', { 
+        className: 'badge badge-kind',
+        style: 'display: inline-flex; align-items: center; gap: 4px; padding: 4px 8px; cursor: pointer;',
+        textContent: tag + ' ×',
+        title: 'Click to remove',
+        onclick: () => removeTag(id, tag, currentTags)
+      });
+      currentTagsDiv.appendChild(tagEl);
+    });
+    
+    if (currentTags.length === 0) {
+      currentTagsDiv.appendChild(el('span', { 
+        style: 'color: var(--muted); font-size: 13px; font-style: italic;',
+        textContent: 'No tags yet'
+      }));
+    }
+    
+    tagsContainer.appendChild(currentTagsDiv);
+    
+    // Add tag input
+    const addTagRow = el('div', { style: 'display: flex; gap: 8px;' });
+    const tagInput = el('input', {
+      id: 'new-tag-input',
+      type: 'text',
+      placeholder: 'Add new tag...',
+      style: 'padding: 6px 10px; border-radius: 4px; background: var(--bg); border: 1px solid var(--border); color: var(--text); font-size: 13px; flex: 1; max-width: 200px;'
+    });
+    const addBtn = el('button', {
+      className: 'btn btn-sm',
+      textContent: '+ Add',
+      style: 'padding: 6px 12px;',
+      onclick: () => addTag(id, tagInput.value, currentTags)
+    });
+    addTagRow.appendChild(tagInput);
+    addTagRow.appendChild(addBtn);
+    tagsContainer.appendChild(addTagRow);
+    
+    tagsRow.appendChild(tagsContainer);
+    statusTagsSection.appendChild(tagsRow);
+    mainStack.appendChild(statusTagsSection);
+
+    // Active seams
+    const activeSeams = props.active_seams || [];
+    if (activeSeams.length > 0) {
+      const seamsSection = el('div', { className: 'detail-section' });
+      seamsSection.appendChild(el('h4', { textContent: 'Active Seams (' + activeSeams.length + ')' }));
+      const list = el('ul', { className: 'detail-list' });
+      activeSeams.forEach(seamId => {
+        const seamNode = seams.find(s => s.node.id === seamId || s.node.id === 'seam:' + seamId);
+        const seamName = seamNode ? seamNode.node.name : seamId;
+        list.appendChild(el('li', null,
+          el('span', { 
+            className: 'entity-link',
+            onclick: () => showSeamDetail(seamNode ? seamNode.node.id : seamId),
+            textContent: seamName
+          })
+        ));
+      });
+      seamsSection.appendChild(list);
+      mainStack.appendChild(seamsSection);
+    }
+
+    // Architecture section with tabs
+    const archSection = el('div', { className: 'detail-section' });
+    archSection.appendChild(el('h4', { textContent: 'Architecture' }));
+    
+    const tabs = el('div', { className: 'diagram-tabs' });
+    const tabTypes = [
+      { id: 'diagram', label: 'Diagram' },
+      { id: 'source', label: 'Source' },
+      { id: 'markdown', label: 'Markdown' }
+    ];
+    let currentTab = 'diagram';
+    
+    tabTypes.forEach(t => {
+      const tab = el('button', {
+        className: 'diagram-tab' + (t.id === currentTab ? ' active' : ''),
+        textContent: t.label,
+        onclick: () => switchDiagramTab(t.id, diagramContainer, id, node)
+      });
+      tabs.appendChild(tab);
+    });
+    archSection.appendChild(tabs);
+    
+    const diagramContainer = el('div', { className: 'diagram-container' });
+    archSection.appendChild(diagramContainer);
+    mainStack.appendChild(archSection);
+    
+    loadProposalDiagram('diagram', diagramContainer, id);
+
+    // Related tasks
+    const relatedTasks = tasks.filter(t => {
+      const taskProps = typeof t.properties === 'string' ? JSON.parse(t.properties) : (t.properties || {});
+      return taskProps.proposal_id === id || taskProps.proposal === node.name;
+    });
+    if (relatedTasks.length > 0) {
+      const tasksSection = el('div', { className: 'detail-section' });
+      tasksSection.appendChild(el('h4', { textContent: 'Related Tasks (' + relatedTasks.length + ')' }));
+      const list = el('ul', { className: 'detail-list' });
+      relatedTasks.forEach(t => {
+        const tstatus = getProp(t.properties, 'status');
+        list.appendChild(el('li', null,
+          el('span', {
+            className: 'entity-link',
+            onclick: () => showTaskDetail(t.id),
+            textContent: t.name
+          }),
+          el('span', { 
+            className: 'badge badge-' + tstatus, 
+            style: 'margin-left: 8px;',
+            textContent: tstatus 
+          })
+        ));
+      });
+      tasksSection.appendChild(list);
+      mainStack.appendChild(tasksSection);
+    }
+
+    // Test Runs targeting this proposal or its seams
+    let allTestRuns = [];
+    try { allTestRuns = await api('/api/nodes?kind=test_run'); } catch(_) {}
+    const activeSeamIds = new Set((props.active_seams || []).flatMap(sid => [sid, 'seam:' + sid]));
+    const proposalTestRuns = allTestRuns.filter(tr => {
+      const tid = tr.properties?.target_id || '';
+      return tid === id || activeSeamIds.has(tid);
+    }).sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+    
+    if (proposalTestRuns.length > 0) {
+      const trSection = el('div', { className: 'detail-section' });
+      trSection.appendChild(el('h4', { textContent: 'Test Runs (' + proposalTestRuns.length + ')' }));
+      proposalTestRuns.slice(0, 10).forEach(tr => {
+        const trp = tr.properties || {};
+        const passRate = trp.test_count > 0 ? Math.round(trp.pass_count / trp.test_count * 100) : 0;
+        const allPassed = trp.fail_count === 0 && trp.test_count > 0;
+        const statusColor = allPassed ? 'var(--success)' : trp.fail_count > 0 ? 'var(--error)' : 'var(--text-secondary)';
+        trSection.appendChild(el('div', { style: 'background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:10px 12px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;' },
+          el('div', null,
+            el('span', { style: `color:${statusColor};font-weight:600;`, textContent: `${trp.pass_count || 0}/${trp.test_count || 0} passed (${passRate}%)` }),
+            trp.target_id ? el('span', { style: 'font-size:11px;color:var(--text-secondary);margin-left:12px;font-family:var(--mono);', textContent: trp.target_id }) : null
+          ),
+          el('div', { style: 'text-align:right;' },
+            trp.duration_ms ? el('div', { style: 'font-size:11px;color:var(--text-secondary);', textContent: `${trp.duration_ms}ms` }) : null,
+            el('div', { style: 'font-size:11px;color:var(--text-secondary);', textContent: formatTime(tr.created_at) }),
+            trp.commit_sha ? el('div', { style: 'font-size:10px;color:var(--text-secondary);font-family:var(--mono);', textContent: trp.commit_sha.slice(0, 8) }) : null
+          )
+        ));
+      });
+      mainStack.appendChild(trSection);
+    }
+
+    // Parent/Children edges
+    if (edges.incoming.length > 0 || edges.outgoing.length > 0) {
+      const edgeSection = el('div', { className: 'detail-section' });
+      
+      if (edges.incoming.length > 0) {
+        edgeSection.appendChild(el('h4', { textContent: 'Parents / Incoming (' + edges.incoming.length + ')' }));
+        const plist = el('ul', { className: 'detail-list' });
+        edges.incoming.forEach(e => {
+          const src = e.source || {};
+          plist.appendChild(el('li', null,
+            el('span', { className: 'badge badge-kind', textContent: src.kind || '?', style: 'margin-right:6px;font-size:10px;' }),
+            el('span', { className: 'entity-link', onclick: () => navigateToNode(src.id ? src : { id: e.source_id, kind: 'unknown' }), textContent: src.name || e.source_id }),
+            el('span', { style: 'color:var(--muted);font-size:11px;margin-left:6px;', textContent: e.relation })
+          ));
+        });
+        edgeSection.appendChild(plist);
+      }
+      
+      if (edges.outgoing.length > 0) {
+        edgeSection.appendChild(el('h4', { textContent: 'Children / Outgoing (' + edges.outgoing.length + ')', style: 'margin-top:12px;' }));
+        const clist = el('ul', { className: 'detail-list' });
+        edges.outgoing.forEach(e => {
+          const tgt = e.target || {};
+          clist.appendChild(el('li', null,
+            el('span', { className: 'badge badge-kind', textContent: tgt.kind || '?', style: 'margin-right:6px;font-size:10px;' }),
+            el('span', { className: 'entity-link', onclick: () => navigateToNode(tgt.id ? tgt : { id: e.target_id, kind: 'unknown' }), textContent: tgt.name || e.target_id }),
+            el('span', { style: 'color:var(--muted);font-size:11px;margin-left:6px;', textContent: e.relation })
+          ));
+        });
+        edgeSection.appendChild(clist);
+      }
+      
+      mainStack.appendChild(edgeSection);
+    }
+
+    // Recent activity
+    const proposalMutations = mutations.filter(m => 
+      m.target_node === id || (m.reason && m.reason.includes(node.name))
+    ).slice(0, 5);
+    if (proposalMutations.length > 0) {
+      const actSection = el('div', { className: 'detail-section' });
+      actSection.appendChild(el('h4', { textContent: 'Recent Activity' }));
+      proposalMutations.forEach(m => {
+        actSection.appendChild(el('div', { 
+          style: 'font-size: 12px; padding: 6px 0; border-bottom: 1px solid var(--border);'
+        },
+          el('span', { style: 'color: var(--accent);', textContent: m.agent || '—' }),
+          ' ',
+          el('span', { textContent: m.action }),
+          ' — ',
+          el('span', { style: 'color: var(--text-secondary);', textContent: formatTime(m.timestamp) })
+        ));
+      });
+      mainStack.appendChild(actSection);
+    }
+
+    page.appendChild(mainStack);
+
+    container.innerHTML = '';
+    container.appendChild(page);
+  } catch (err) {
+    showError(container, 'Failed to load proposal: ' + err.message);
+  }
+}
+
+async function switchDiagramTab(tabId, container, proposalId, node) {
+  const tabs = container.parentElement.querySelectorAll('.diagram-tab');
+  const types = ['diagram', 'source', 'markdown'];
+  tabs.forEach((t, i) => {
+    t.classList.toggle('active', types[i] === tabId);
+  });
+  
+  if (tabId === 'markdown') {
+    await loadMarkdownContent(container, node);
+  } else if (tabId === 'source') {
+    await loadDiagramSource(container, proposalId);
+  } else {
+    await loadProposalDiagram(tabId, container, proposalId);
+  }
+}
+
+async function loadProposalDiagram(type, container, proposalId) {
+  container.innerHTML = '<div class="loading">Rendering diagram…</div>';
+  try {
+    const uml = await api('/api/c4/proposal/' + encodeURIComponent(proposalId.replace('proposal:', '').replace('doc:', '')));
+    
+    container.innerHTML = '';
+    // Auto-render the diagram
+    renderPlantUMLExternal(uml, container);
+  } catch (err) {
+    showError(container, 'Failed to load diagram: ' + err.message);
+  }
+}
+
+async function loadDiagramSource(container, proposalId) {
+  container.innerHTML = '<div class="loading">Loading source…</div>';
+  try {
+    const uml = await api('/api/c4/proposal/' + encodeURIComponent(proposalId.replace('proposal:', '').replace('doc:', '')));
+    
+    container.innerHTML = '';
+    const toolbar = el('div', { style: 'display: flex; gap: 8px; margin-bottom: 12px;' },
+      el('button', { 
+        className: 'btn',
+        textContent: '📋 Copy',
+        onclick: () => navigator.clipboard.writeText(uml)
+      })
+    );
+    container.appendChild(toolbar);
+    container.appendChild(el('pre', { className: 'diagram-source code-block', textContent: uml }));
+  } catch (err) {
+    showError(container, 'Failed to load source: ' + err.message);
+  }
+}
+
+async function loadMarkdownContent(container, node) {
+  container.innerHTML = '<div class="loading">Loading markdown…</div>';
+  try {
+    const proposalId = node.id;
+    const response = await api('/api/proposals/' + encodeURIComponent(proposalId) + '/content');
+    let content = response.content || 'No content available';
+    
+    // Parse frontmatter
+    const frontmatterMatch = content.match(/^---\s*\n([\s\S]*?)\n---\s*\n/);
+    let frontmatter = {};
+    let bodyContent = content;
+    
+    if (frontmatterMatch) {
+      const frontmatterText = frontmatterMatch[1];
+      bodyContent = content.slice(frontmatterMatch[0].length);
+      
+      // Simple YAML-like parsing
+      frontmatterText.split('\n').forEach(line => {
+        const match = line.match(/^(\w+):\s*(.+)$/);
+        if (match) {
+          let value = match[2].trim();
+          // Remove quotes if present
+          if ((value.startsWith('"') && value.endsWith('"')) || 
+              (value.startsWith("'") && value.endsWith("'"))) {
+            value = value.slice(1, -1);
+          }
+          frontmatter[match[1]] = value;
+        }
+      });
+    }
+    
+    container.innerHTML = '';
+    
+    // Full width container
+    const wrapper = el('div', { style: 'max-width: 100%; padding: 0;' });
+    
+    // Frontmatter display at top (if any)
+    if (Object.keys(frontmatter).length > 0) {
+      const fmSection = el('div', { 
+        className: 'frontmatter-header',
+        style: 'background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 24px; font-size: 13px;' 
+      });
+      
+      const fmGrid = el('div', { style: 'display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px;' });
+      
+      Object.entries(frontmatter).forEach(([key, value]) => {
+        const item = el('div', null,
+          el('div', { style: 'color: var(--muted); font-size: 11px; text-transform: uppercase; margin-bottom: 2px;', textContent: key }),
+          el('div', { style: 'color: var(--text);', textContent: value })
+        );
+        fmGrid.appendChild(item);
+      });
+      
+      fmSection.appendChild(fmGrid);
+      wrapper.appendChild(fmSection);
+    }
+    
+    // Rendered markdown content
+    const contentDiv = el('div', { 
+      className: 'markdown-content',
+      style: 'max-width: 100%; line-height: 1.6;'
+    });
+    
+    // Use marked.js if available, otherwise show plain text
+    if (typeof marked !== 'undefined') {
+      // Configure marked for safe rendering
+      marked.setOptions({
+        headerIds: false,
+        mangle: false,
+        sanitize: false // We trust the content
+      });
+      contentDiv.innerHTML = marked.parse(bodyContent);
+    } else {
+      contentDiv.appendChild(el('pre', { 
+        style: 'white-space: pre-wrap; word-break: break-word;',
+        textContent: bodyContent 
+      }));
+    }
+    
+    wrapper.appendChild(contentDiv);
+    container.appendChild(wrapper);
+    
+  } catch (err) {
+    showError(container, 'Failed to load markdown: ' + err.message);
+  }
+}
+
+function renderPlantUMLExternal(uml, container) {
+  // Use local TypeScript renderer if available, fallback to external
+  if (typeof renderPlantUML === 'function') {
+    renderPlantUML(uml, container);
+  } else {
+    // Fallback to plantuml.com
+    const encoded = plantumlEncode(uml);
+    const url = 'https://www.plantuml.com/plantuml/png/' + encoded;
+    const imgContainer = el('div', { className: 'plantuml-rendered' });
+    imgContainer.appendChild(el('img', { src: url, alt: 'PlantUML Diagram' }));
+    container.appendChild(imgContainer);
+  }
+}
+
+// Local PlantUML renderer using TypeScript source
+function renderPlantUML(uml, container) {
+  // Clear previous renders
+  const existing = container.querySelector('.plantuml-rendered');
+  if (existing) existing.remove();
+  
+  // Show loading
+  const loading = el('div', { className: 'loading' }, 'Rendering diagram…');
+  container.appendChild(loading);
+  
+  // Use the TypeScript renderer if loaded
+  if (window.PlantUMLRenderer) {
+    try {
+      const svg = window.PlantUMLRenderer.renderToSvg(uml);
+      loading.remove();
+      const svgContainer = el('div', { className: 'plantuml-rendered', style: 'background: white; padding: 12px; border-radius: 4px;' });
+      svgContainer.innerHTML = svg;
+      container.appendChild(svgContainer);
+    } catch (err) {
+      loading.remove();
+      container.appendChild(el('div', { className: 'error' }, 'Render error: ' + err.message));
+    }
+  } else {
+    loading.remove();
+    // TS not loaded yet, queue for retry
+    setTimeout(() => renderPlantUML(uml, container), 500);
+  }
+}
+
+function plantumlEncode(text) {
+  return btoa(unescape(encodeURIComponent(text)));
+}
+
+// ── Seam Detail with Full Drill-down ──
+
+async function showSeamDetail(id) {
+  currentSeamId = id;
+  switchView('seam-detail', true);
+  await loadSeamDetail(id);
+}
+
+async function loadSeamDetail(id) {
+  const container = document.getElementById('seam-detail-content');
+  container.innerHTML = '<div class="loading">Loading seam detail…</div>';
+  try {
+    const [data, proposals, tasks, tests, mutations] = await Promise.all([
+      api('/api/nodes/' + encodeURIComponent(id)),
+      api('/api/proposals'),
+      api('/api/nodes?kind=task'),
+      api('/api/nodes?kind=test'),
+      api('/api/mutations?limit=20'),
+    ]);
+    
+    const props = typeof data.properties === 'string' ? JSON.parse(data.properties) : (data.properties || {});
+    const edges = data._edges || { outgoing: [], incoming: [] };
+
+    // Find parent proposal
+    const parentProposal = proposals.find(p => {
+      const pprops = typeof p.properties === 'string' ? JSON.parse(p.properties) : (p.properties || {});
+      const activeSeams = pprops.active_seams || [];
+      return activeSeams.some(sid => id.includes(sid) || sid.includes(id.replace('seam:', '')));
+    });
+
+    const relatedTasks = tasks.filter(t => {
+      const tprops = typeof t.properties === 'string' ? JSON.parse(t.properties) : (t.properties || {});
+      return tprops.seam_id === id || t.name.includes(data.name);
+    });
+
+    const relatedTests = tests.filter(t => {
+      return t.name.includes(data.name) || (t.file_path && t.file_path.includes(data.name.replace(/-/g, '_')));
+    });
+
+    const seamMutations = mutations.filter(m => 
+      m.target_node === id || (m.reason && m.reason.includes(data.name))
+    );
+
+    const page = el('div', null);
+    
+    // Breadcrumbs
+    page.appendChild(el('div', { className: 'page-nav' },
+      el('span', { className: 'page-nav-link', onclick: backToSeams, textContent: 'Seams' }),
+      el('span', { className: 'page-nav-separator', textContent: '/' }),
+      parentProposal ? el('span', { 
+        className: 'page-nav-link', 
+        onclick: () => showProposalDetail(parentProposal.id),
+        textContent: parentProposal.name 
+      }) : null,
+      parentProposal ? el('span', { className: 'page-nav-separator', textContent: '/' }) : null,
+      el('span', { className: 'page-nav-current', textContent: data.name })
+    ));
+
+    // Title with lifecycle controls
+    const seamStatus = props.status || props.disposition || (parentProposal ? getStatus(parentProposal.properties) : 'orphaned');
+    const titleRow = el('div', { style: 'display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:20px;' });
+    titleRow.appendChild(el('h2', { style: 'margin:0;' },
+      data.name,
+      el('span', { 
+        className: 'badge badge-' + seamStatus, 
+        style: 'margin-left: 12px; font-size: 12px;',
+        textContent: seamStatus 
+      })
+    ));
+    
+    // Lifecycle controls
+    const seamControls = el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;' });
+    const seamStatuses = ['proposed', 'accepted', 'in-progress', 'implemented', 'deferred', 'completed'];
+    seamStatuses.forEach(s => {
+      seamControls.appendChild(el('button', {
+        className: 'btn' + (seamStatus === s ? '' : ' secondary'),
+        style: 'padding:4px 10px;font-size:11px;',
+        textContent: s,
+        onclick: () => updateNodeStatus(id, s, 'seam').then(() => loadSeamDetail(id))
+      }));
+    });
+    titleRow.appendChild(seamControls);
+    page.appendChild(titleRow);
+
+    if (props.description) {
+      page.appendChild(el('p', { 
+        style: 'color: var(--text-secondary); margin-bottom: 20px; line-height: 1.5;'
+      }, props.description));
+    }
+
+    // Parent/Children edges (always show)
+    const parentEdges = edges.incoming || [];
+    const childEdges = edges.outgoing || [];
+    
+    if (parentEdges.length > 0) {
+      const parSection = el('div', { className: 'detail-section', style: 'margin-bottom:16px;background:rgba(0,229,255,0.03);padding:12px;border-radius:var(--radius);' });
+      parSection.appendChild(el('h4', { textContent: 'Parents (' + parentEdges.length + ')' }));
+      const plist = el('ul', { className: 'detail-list' });
+      parentEdges.forEach(e => {
+        const src = e.source || {};
+        plist.appendChild(el('li', null,
+          el('span', { className: 'badge badge-kind', textContent: src.kind || '?', style: 'margin-right:6px;font-size:10px;' }),
+          el('span', { className: 'entity-link', onclick: () => navigateToNode(src.id ? src : { id: e.source_id, kind: 'unknown' }), textContent: src.name || e.source_id }),
+          el('span', { style: 'color:var(--muted);font-size:11px;margin-left:6px;', textContent: e.relation })
+        ));
+      });
+      parSection.appendChild(plist);
+      page.appendChild(parSection);
+    }
+
+    // Token usage + test status summary bar
+    const tokensTotal = props.tokens_total || 0;
+    const tokensIn = props.tokens_input || 0;
+    const tokensOut = props.tokens_output || 0;
+    const lastTestStatus = props.last_test_status || 'untested';
+    const lastTestAt = props.last_test_at;
+    const lastGreenAt = props.last_green_at;
+    
+    if (tokensTotal > 0 || lastTestStatus !== 'untested') {
+      const summaryBar = el('div', { style: 'display:flex;gap:20px;padding:12px 16px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);margin-bottom:16px;' });
+      
+      // Test status
+      const testDot = lastTestStatus === 'test-green' ? '🟢' : lastTestStatus === 'test-red' ? '🔴' : '⚪';
+      const testLabel = lastTestStatus === 'test-green' ? 'GREEN' : lastTestStatus === 'test-red' ? 'RED' : 'Untested';
+      summaryBar.appendChild(el('div', null,
+        el('div', { style: 'font-size:11px;color:var(--text-secondary);', textContent: 'Test Status' }),
+        el('div', { style: 'font-size:16px;font-weight:600;', textContent: testDot + ' ' + testLabel }),
+        lastTestAt ? el('div', { style: 'font-size:10px;color:var(--muted);', textContent: formatTime(lastTestAt) }) : null
+      ));
+      
+      // Token usage
+      if (tokensTotal > 0) {
+        summaryBar.appendChild(el('div', { style: 'border-left:1px solid var(--border);padding-left:20px;' },
+          el('div', { style: 'font-size:11px;color:var(--text-secondary);', textContent: 'Token Usage' }),
+          el('div', { style: 'font-size:16px;font-weight:600;color:var(--amber);font-family:var(--mono);', textContent: formatTokens(tokensTotal) }),
+          el('div', { style: 'font-size:10px;color:var(--muted);', textContent: `In: ${formatTokens(tokensIn)} / Out: ${formatTokens(tokensOut)}` })
+        ));
+      }
+      
+      // Last green
+      if (lastGreenAt) {
+        summaryBar.appendChild(el('div', { style: 'border-left:1px solid var(--border);padding-left:20px;' },
+          el('div', { style: 'font-size:11px;color:var(--text-secondary);', textContent: 'Last Green' }),
+          el('div', { style: 'font-size:14px;color:var(--success);', textContent: formatTime(lastGreenAt) })
+        ));
+      }
+      
+      page.appendChild(summaryBar);
+    }
+
+    // Two column layout
+    const grid = el('div', { style: 'display: grid; grid-template-columns: 1fr 1fr; gap: 20px;' });
+    
+    const leftCol = el('div', null);
+
+    // Properties
+    const propsSection = el('div', { className: 'detail-section' });
+    propsSection.appendChild(el('h4', { textContent: 'Properties' }));
+    const propsGrid = el('div', { className: 'detail-props' });
+    Object.entries(props).forEach(([k, v]) => {
+      if (k === 'description') return;
+      propsGrid.appendChild(el('span', { className: 'prop-key', textContent: k }));
+      const val = Array.isArray(v) ? v.join(', ') : String(v);
+      propsGrid.appendChild(el('span', { className: 'prop-val', textContent: val }));
+    });
+    propsSection.appendChild(propsGrid);
+    leftCol.appendChild(propsSection);
+
+    // Architecture diagram
+    const archSection = el('div', { className: 'detail-section' });
+    archSection.appendChild(el('h4', { textContent: 'Architecture' }));
+    const diagramContainer = el('div', { className: 'diagram-container' },
+      el('div', { className: 'loading' }, 'Loading diagram…')
+    );
+    archSection.appendChild(diagramContainer);
+    leftCol.appendChild(archSection);
+
+    loadSeamDiagram(id, diagramContainer);
+
+    grid.appendChild(leftCol);
+
+    // Right column
+    const rightCol = el('div', null);
+
+    // Tasks
+    if (relatedTasks.length > 0) {
+      const tasksSection = el('div', { className: 'detail-section' });
+      tasksSection.appendChild(el('h4', { textContent: 'Related Tasks (' + relatedTasks.length + ')' }));
+      const list = el('ul', { className: 'detail-list' });
+      relatedTasks.forEach(t => {
+        const tstatus = getProp(t.properties, 'status');
+        list.appendChild(el('li', null,
+          el('span', {
+            className: 'entity-link',
+            onclick: () => showTaskDetail(t.id),
+            textContent: t.name
+          }),
+          el('span', { 
+            className: 'badge badge-' + tstatus, 
+            style: 'margin-left: 8px;',
+            textContent: tstatus 
+          })
+        ));
+      });
+      tasksSection.appendChild(list);
+      rightCol.appendChild(tasksSection);
+    }
+
+    // Test Runs (from TestedBy edges)
+    const testRunEdges = [...(edges.incoming || []), ...(edges.outgoing || [])].filter(e => e.relation === 'tested_by' || e.relation === 'TestedBy');
+    // Also find test runs targeting this seam by ID
+    let testRuns = [];
+    try { testRuns = await api('/api/nodes?kind=test_run'); } catch(_) {}
+    const seamTestRuns = testRuns.filter(tr => tr.properties?.target_id === id);
+    
+    if (seamTestRuns.length > 0 || testRunEdges.length > 0) {
+      const trSection = el('div', { className: 'detail-section' });
+      trSection.appendChild(el('h4', { textContent: 'Test Runs (' + seamTestRuns.length + ')' }));
+      seamTestRuns.forEach(tr => {
+        const trp = tr.properties || {};
+        const passRate = trp.test_count > 0 ? Math.round(trp.pass_count / trp.test_count * 100) : 0;
+        const statusColor = trp.fail_count === 0 ? 'var(--success)' : 'var(--orange)';
+        trSection.appendChild(el('div', { style: 'background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:10px 12px;margin-bottom:8px;' },
+          el('div', { style: 'display:flex;justify-content:space-between;align-items:center;' },
+            el('span', { style: `color:${statusColor};font-weight:600;`, textContent: `${trp.pass_count}/${trp.test_count} passed (${passRate}%)` }),
+            el('span', { style: 'font-size:11px;color:var(--text-secondary);', textContent: formatTime(tr.created_at) })
+          ),
+          trp.duration_ms ? el('div', { style: 'font-size:11px;color:var(--text-secondary);margin-top:4px;', textContent: `Duration: ${trp.duration_ms}ms` }) : null,
+          trp.commit_sha ? el('div', { style: 'font-size:11px;color:var(--text-secondary);font-family:var(--mono);', textContent: `SHA: ${trp.commit_sha}` }) : null
+        ));
+      });
+      rightCol.appendChild(trSection);
+    }
+
+    // Tests
+    if (relatedTests.length > 0) {
+      const testsSection = el('div', { className: 'detail-section' });
+      testsSection.appendChild(el('h4', { textContent: 'Related Tests (' + relatedTests.length + ')' }));
+      const list = el('ul', { className: 'detail-list' });
+      relatedTests.forEach(t => {
+        list.appendChild(el('li', { textContent: t.name }));
+      });
+      testsSection.appendChild(list);
+      rightCol.appendChild(testsSection);
+    }
+
+    // Children / outgoing edges
+    if (childEdges.length > 0) {
+      const childSection = el('div', { className: 'detail-section' });
+      childSection.appendChild(el('h4', { textContent: 'Children / Links (' + childEdges.length + ')' }));
+      const clist = el('ul', { className: 'detail-list' });
+      childEdges.forEach(e => {
+        const tgt = e.target || {};
+        clist.appendChild(el('li', null,
+          el('span', { className: 'badge badge-kind', textContent: tgt.kind || '?', style: 'margin-right:6px;font-size:10px;' }),
+          el('span', { className: 'entity-link', onclick: () => navigateToNode(tgt.id ? tgt : { id: e.target_id, kind: 'unknown' }), textContent: tgt.name || e.target_id }),
+          el('span', { style: 'color:var(--muted);font-size:11px;margin-left:6px;', textContent: e.relation })
+        ));
+      });
+      childSection.appendChild(clist);
+      rightCol.appendChild(childSection);
+    }
+
+    // Verification ladder
+    const ladderSection = el('div', { className: 'detail-section' });
+    ladderSection.appendChild(el('h4', { textContent: 'Verification Ladder' }));
+    const parentProps = parentProposal ? (typeof parentProposal.properties === 'string' ? JSON.parse(parentProposal.properties) : parentProposal.properties) : {};
+    ladderSection.appendChild(getVerificationBadge(parentProps));
+    rightCol.appendChild(ladderSection);
+
+    // Activity
+    if (seamMutations.length > 0) {
+      const actSection = el('div', { className: 'detail-section' });
+      actSection.appendChild(el('h4', { textContent: 'Recent Activity' }));
+      seamMutations.forEach(m => {
+        actSection.appendChild(el('div', { 
+          style: 'font-size: 12px; padding: 6px 0; border-bottom: 1px solid var(--border);'
+        },
+          el('span', { style: 'color: var(--accent);', textContent: m.agent || '—' }),
+          ' ',
+          el('span', { textContent: m.action }),
+          ' — ',
+          el('span', { style: 'color: var(--text-secondary);', textContent: formatTime(m.timestamp) })
+        ));
+      });
+      rightCol.appendChild(actSection);
+    }
+
+    grid.appendChild(rightCol);
+    page.appendChild(grid);
+
+    container.innerHTML = '';
+    container.appendChild(page);
+  } catch (err) {
+    showError(container, 'Failed to load seam: ' + err.message);
+  }
+}
+
+async function loadSeamDiagram(seamId, container) {
+  try {
+    const uml = await api('/api/c4/seam/' + encodeURIComponent(seamId.replace('seam:', '')));
+    container.innerHTML = '';
+    const toolbar = el('div', { style: 'display: flex; gap: 8px; margin-bottom: 12px;' },
+      el('button', { 
+        className: 'btn',
+        textContent: '📋 Copy',
+        onclick: () => navigator.clipboard.writeText(uml)
+      }),
+      el('button', {
+        className: 'btn',
+        textContent: '🖼️ Render',
+        onclick: () => renderPlantUMLExternal(uml, container)
+      })
+    );
+    container.appendChild(toolbar);
+    container.appendChild(el('pre', { className: 'diagram-source code-block', textContent: uml }));
+  } catch (err) {
+    container.innerHTML = '<div class="error">Failed to load diagram: ' + err.message + '</div>';
+  }
+}
+
+// ── Tasks View ──
+
+async function loadTasks() {
+  const container = document.getElementById('tasks-table');
+  try {
+    const tasks = await api('/api/nodes?kind=task');
+    container.innerHTML = '';
+    
+    if (tasks.length === 0) {
+      container.innerHTML = '<div style="padding: 16px; color: var(--text-secondary);">No tasks found</div>';
+      return;
+    }
+    
+    const table = el('table');
+    const thead = el('thead', null, el('tr', null,
+      el('th', { textContent: 'Name' }),
+      el('th', { textContent: 'Status' }),
+      el('th', { textContent: 'Priority' }),
+      el('th', { textContent: 'Proposal' }),
+      el('th', { textContent: 'Seam' }),
+      el('th', { textContent: 'Agent' })
+    ));
+    table.appendChild(thead);
+    const tbody = el('tbody');
+    
+    tasks.forEach(t => {
+      const props = typeof t.properties === 'string' ? JSON.parse(t.properties) : (t.properties || {});
+      const status = props.status || 'pending';
+      const priority = props.priority || 'medium';
+      const proposal = props.proposal || props.proposal_id || '—';
+      const seam = props.seam || props.seam_id || '—';
+      const agent = props.assigned_agent || '—';
+      
+      tbody.appendChild(el('tr', {
+        className: 'clickable',
+        onclick: () => showTaskDetail(t.id),
+      },
+        el('td', { textContent: t.name }),
+        el('td', null, el('span', { className: 'badge badge-' + status, textContent: status })),
+        el('td', null, el('span', { className: 'badge badge-task', textContent: priority })),
+        el('td', { textContent: proposal, style: 'font-size: 12px; color: var(--text-secondary);' }),
+        el('td', { textContent: seam, style: 'font-size: 12px; color: var(--text-secondary);' }),
+        el('td', { textContent: agent, style: 'font-size: 12px; color: var(--accent);' })
+      ));
+    });
+    
+    table.appendChild(tbody);
+    container.appendChild(table);
+  } catch (err) {
+    showError(container, 'Failed to load tasks: ' + err.message);
+  }
+}
+
+async function showTaskDetail(id) {
+  currentTaskId = id;
+  switchView('task-detail', true);
+  await loadTaskDetail(id);
+}
+
+async function loadTaskDetail(id) {
+  const container = document.getElementById('task-detail-content');
+  container.innerHTML = '<div class="loading">Loading task detail…</div>';
+  try {
+    const data = await api('/api/nodes/' + encodeURIComponent(id));
+    const props = typeof data.properties === 'string' ? JSON.parse(data.properties) : (data.properties || {});
+    
+    const page = el('div', null);
+    
+    // Breadcrumbs
+    page.appendChild(el('div', { className: 'page-nav' },
+      el('span', { className: 'page-nav-link', onclick: backToTasks, textContent: 'Tasks' }),
+      el('span', { className: 'page-nav-separator', textContent: '/' }),
+      el('span', { className: 'page-nav-current', textContent: data.name })
+    ));
+    
+    // Title with lifecycle controls
+    const status = props.status || 'pending';
+    const taskTitleRow = el('div', { style: 'display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:20px;' });
+    taskTitleRow.appendChild(el('h2', { style: 'margin:0;' },
+      data.name,
+      el('span', { 
+        className: 'badge badge-' + status, 
+        style: 'margin-left: 12px; font-size: 12px;',
+        textContent: status 
+      })
+    ));
+    
+    // Task lifecycle controls
+    const taskControls = el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;' });
+    const taskStatuses = ['pending', 'in-progress', 'completed', 'deferred', 'blocked'];
+    taskStatuses.forEach(s => {
+      taskControls.appendChild(el('button', {
+        className: 'btn' + (status === s ? '' : ' secondary'),
+        style: 'padding:4px 10px;font-size:11px;',
+        textContent: s,
+        onclick: () => updateNodeStatus(id, s, 'task').then(() => loadTaskDetail(id))
+      }));
+    });
+    taskTitleRow.appendChild(taskControls);
+    page.appendChild(taskTitleRow);
+
+    // Parent/Children section
+    const edges = data._edges || { outgoing: [], incoming: [] };
+    if (edges.incoming.length > 0 || edges.outgoing.length > 0) {
+      const relSection = el('div', { className: 'detail-section', style: 'margin-bottom:20px;' });
+      
+      if (edges.incoming.length > 0) {
+        relSection.appendChild(el('h4', { textContent: 'Parents (' + edges.incoming.length + ')' }));
+        const parentList = el('ul', { className: 'detail-list' });
+        edges.incoming.forEach(e => {
+          const source = e.source || {};
+          parentList.appendChild(el('li', null,
+            el('span', { className: 'badge badge-kind', textContent: source.kind || '?', style: 'margin-right:6px;font-size:10px;' }),
+            el('span', { 
+              className: 'entity-link',
+              onclick: () => navigateToNode(source.id ? source : { id: e.source_id, kind: 'unknown' }),
+              textContent: source.name || e.source_id
+            }),
+            el('span', { style: 'color:var(--muted);font-size:11px;margin-left:6px;', textContent: e.relation })
+          ));
+        });
+        relSection.appendChild(parentList);
+      }
+      
+      if (edges.outgoing.length > 0) {
+        relSection.appendChild(el('h4', { textContent: 'Children / Links (' + edges.outgoing.length + ')', style: 'margin-top:12px;' }));
+        const childList = el('ul', { className: 'detail-list' });
+        edges.outgoing.forEach(e => {
+          const target = e.target || {};
+          childList.appendChild(el('li', null,
+            el('span', { className: 'badge badge-kind', textContent: target.kind || '?', style: 'margin-right:6px;font-size:10px;' }),
+            el('span', { 
+              className: 'entity-link',
+              onclick: () => navigateToNode(target.id ? target : { id: e.target_id, kind: 'unknown' }),
+              textContent: target.name || e.target_id
+            }),
+            el('span', { style: 'color:var(--muted);font-size:11px;margin-left:6px;', textContent: e.relation })
+          ));
+        });
+        relSection.appendChild(childList);
+      }
+      
+      page.appendChild(relSection);
+    }
+    
+    // Properties
+    const propsSection = el('div', { className: 'detail-section' });
+    propsSection.appendChild(el('h4', { textContent: 'Properties' }));
+    const propsGrid = el('div', { className: 'detail-props' });
+    Object.entries(props).forEach(([k, v]) => {
+      propsGrid.appendChild(el('span', { className: 'prop-key', textContent: k }));
+      const val = Array.isArray(v) ? v.join(', ') : String(v);
+      propsGrid.appendChild(el('span', { className: 'prop-val', textContent: val }));
+    });
+    propsSection.appendChild(propsGrid);
+    page.appendChild(propsSection);
+    
+    // Navigation links
+    const links = el('div', { style: 'display: flex; gap: 12px; margin-top: 20px;' });
+    if (props.proposal_id || props.proposal) {
+      links.appendChild(el('button', {
+        className: 'btn',
+        textContent: 'View Proposal',
+        onclick: () => showProposalDetail(props.proposal_id || 'doc:' + props.proposal)
+      }));
+    }
+    if (props.seam_id || props.seam) {
+      links.appendChild(el('button', {
+        className: 'btn',
+        textContent: 'View Seam',
+        onclick: () => showSeamDetail(props.seam_id || 'seam:' + props.seam)
+      }));
+    }
+    page.appendChild(links);
+    
+    container.innerHTML = '';
+    container.appendChild(page);
+  } catch (err) {
+    showError(container, 'Failed to load task: ' + err.message);
+  }
+}
+
+// ── Crate Detail ──
+
+async function showCrateDetail(crateName) {
+  currentCrateName = crateName;
+  switchView('crate-detail', true);
+  await loadCrateDetail(crateName);
+}
+
+async function loadCrateDetail(crateName) {
+  const container = document.getElementById('crate-detail-content');
+  container.innerHTML = '<div class="loading">Loading crate detail…</div>';
+  try {
+    const [crate, proposals, seams] = await Promise.all([
+      api('/api/nodes/' + encodeURIComponent('crate:' + crateName)),
+      api('/api/proposals'),
+      api('/api/seams'),
+    ]);
+    
+    const edges = crate._edges || { outgoing: [], incoming: [] };
+    const moduleIds = edges.outgoing.filter(e => e.relation === 'contains').map(e => e.target_id);
+    
+    // Find related proposals
+    const relatedProposals = proposals.filter(p => {
+      const pprops = typeof p.properties === 'string' ? JSON.parse(p.properties) : (p.properties || {});
+      return p.name.toLowerCase().includes(crateName.toLowerCase()) ||
+        (pprops.active_seams || []).some(sid => {
+          return seams.some(seam => 
+            seam.node.id === sid && 
+            seam.node.name.toLowerCase().includes(crateName.toLowerCase())
+          );
+        });
+    });
+    
+    const page = el('div', null);
+    
+    // Breadcrumbs
+    page.appendChild(el('div', { className: 'page-nav' },
+      el('span', { className: 'page-nav-link', onclick: backToCrates, textContent: 'Crates' }),
+      el('span', { className: 'page-nav-separator', textContent: '/' }),
+      el('span', { className: 'page-nav-current', textContent: crateName })
+    ));
+    
+    page.appendChild(el('h2', null, crateName));
+    
+    // Architecture tabs
+    const archSection = el('div', { className: 'detail-section' });
+    archSection.appendChild(el('h4', { textContent: 'Architecture' }));
+    
+    const tabs = el('div', { className: 'diagram-tabs' });
+    const tabTypes = [
+      { id: 'skeleton', label: 'Class Diagram' },
+      { id: 'component', label: 'C4 Component' },
+      { id: 'interactions', label: 'Interactions' },
+    ];
+    const diagramContainer = el('div', { className: 'diagram-container' });
+    
+    tabTypes.forEach(t => {
+      const tab = el('button', {
+        className: 'diagram-tab' + (t.id === 'skeleton' ? ' active' : ''),
+        textContent: t.label,
+        onclick: async () => {
+          tabTypes.forEach(tt => {
+            const btn = tabs.children[tabTypes.indexOf(tt)];
+            btn.classList.toggle('active', tt.id === t.id);
+          });
+          await loadCrateDiagram(t.id, diagramContainer, crateName);
+        }
+      });
+      tabs.appendChild(tab);
+    });
+    archSection.appendChild(tabs);
+    archSection.appendChild(diagramContainer);
+    page.appendChild(archSection);
+    
+    // Load initial diagram
+    await loadCrateDiagram('skeleton', diagramContainer, crateName);
+    
+    // Modules
+    if (moduleIds.length > 0) {
+      const modsSection = el('div', { className: 'detail-section' });
+      modsSection.appendChild(el('h4', { textContent: 'Modules (' + moduleIds.length + ')' }));
+      const list = el('ul', { className: 'detail-list' });
+      for (const mid of moduleIds.slice(0, 10)) {
+        try {
+          const mod = await api('/api/nodes/' + encodeURIComponent(mid));
+          list.appendChild(el('li', { textContent: mod.name }));
+        } catch (_) {
+          list.appendChild(el('li', { textContent: mid }));
+        }
+      }
+      if (moduleIds.length > 10) {
+        list.appendChild(el('li', { style: 'color: var(--text-secondary);', textContent: '... and ' + (moduleIds.length - 10) + ' more' }));
+      }
+      modsSection.appendChild(list);
+      page.appendChild(modsSection);
+    }
+    
+    // Related proposals
+    if (relatedProposals.length > 0) {
+      const propsSection = el('div', { className: 'detail-section' });
+      propsSection.appendChild(el('h4', { textContent: 'Related Proposals (' + relatedProposals.length + ')' }));
+      const list = el('ul', { className: 'detail-list' });
+      relatedProposals.forEach(p => {
+        list.appendChild(el('li', null,
+          el('span', {
+            className: 'entity-link',
+            onclick: () => showProposalDetail(p.id),
+            textContent: p.name
+          })
+        ));
+      });
+      propsSection.appendChild(list);
+      page.appendChild(propsSection);
+    }
+    
+    container.innerHTML = '';
+    container.appendChild(page);
+  } catch (err) {
+    showError(container, 'Failed to load crate: ' + err.message);
+  }
+}
+
+async function loadCrateDiagram(type, container, crateName) {
+  container.innerHTML = '<div class="loading">Loading diagram…</div>';
+  try {
+    let uml = '';
+    if (type === 'skeleton') {
+      uml = await api('/api/skeleton/' + encodeURIComponent(crateName));
+    } else if (type === 'component') {
+      uml = await api('/api/c4/component/' + encodeURIComponent(crateName));
+    } else if (type === 'interactions') {
+      uml = await api('/api/diagram/interactions/' + encodeURIComponent(crateName));
+    }
+    
+    container.innerHTML = '';
+    const toolbar = el('div', { style: 'display: flex; gap: 8px; margin-bottom: 12px;' },
+      el('button', { 
+        className: 'btn',
+        textContent: '📋 Copy',
+        onclick: () => navigator.clipboard.writeText(uml)
+      }),
+      el('button', {
+        className: 'btn',
+        textContent: '🖼️ Render',
+        onclick: () => renderPlantUMLExternal(uml, container)
+      })
+    );
+    container.appendChild(toolbar);
+    container.appendChild(el('pre', { className: 'diagram-source code-block', textContent: uml }));
+  } catch (err) {
+    showError(container, 'Failed to load diagram: ' + err.message);
+  }
+}
+
+// ── Enhanced Seams List with Ladder ──
+
+async function loadSeams() {
+  const container = document.getElementById('seams-table');
+  try {
+    const [seams, proposals, tasks, tests] = await Promise.all([
+      api('/api/seams'),
+      api('/api/proposals'),
+      api('/api/nodes?kind=task'),
+      api('/api/nodes?kind=test'),
+    ]);
+    
+    // Build proposal map from both directions:
+    // 1. proposal.active_seams → seam (forward)
+    // 2. seam.proposal_ref or edges → proposal (reverse)
+    const proposalMap = {};
+    
+    // Forward: from proposals
+    proposals.forEach(p => {
+      const pprops = typeof p.properties === 'string' ? JSON.parse(p.properties) : (p.properties || {});
+      const status = getStatus(pprops);
+      const activeSeams = pprops.active_seams || [];
+      activeSeams.forEach(seamId => {
+        const cleanId = seamId.replace('seam:', '');
+        proposalMap[cleanId] = { proposal: p, status, props: pprops };
+        proposalMap[seamId] = { proposal: p, status, props: pprops };
+        proposalMap['seam:' + cleanId] = { proposal: p, status, props: pprops };
+      });
+    });
+    
+    // Reverse: from seams (since active_seams isn't always populated)
+    seams.forEach(s => {
+      const node = s.node;
+      const sprops = typeof node.properties === 'string' ? JSON.parse(node.properties) : (node.properties || {});
+      
+      // Check if we already have a mapping
+      if (proposalMap[node.id]) return;
+      
+      // Try to find parent via proposal_ref property
+      const proposalRef = sprops.proposal_ref || '';
+      if (proposalRef) {
+        // Extract proposal filename from markdown link [NAME.md](path) or plain text
+        const match = proposalRef.match(/\[([^\]]+\.md)\]/);
+        let filename;
+        if (match) {
+          filename = match[1].toLowerCase().replace('_proposal.md', '').replace('.md', '');
+        } else {
+          // Fallback: use the whole ref
+          filename = proposalRef.toLowerCase().replace('_proposal.md', '').replace('.md', '');
+        }
+        
+        // Find matching proposal by name
+        const parentProposal = proposals.find(p => {
+          const pname = p.name.toLowerCase().replace(/\s+/g, '-');
+          const pfile = (p.file_path || '').toLowerCase();
+          return pname.includes(filename) || filename.includes(pname) || pfile.includes(filename);
+        });
+        
+        if (parentProposal) {
+          const pprops = typeof parentProposal.properties === 'string' ? 
+            JSON.parse(parentProposal.properties) : (parentProposal.properties || {});
+          const status = getStatus(pprops);
+          proposalMap[node.id] = { proposal: parentProposal, status, props: pprops };
+        }
+      }
+    });
+
+    // Map relations
+    const seamRelations = {};
+    seams.forEach(s => {
+      const sid = s.node.id;
+      seamRelations[sid] = { tasks: [], tests: [] };
+      
+      tasks.forEach(t => {
+        const tprops = typeof t.properties === 'string' ? JSON.parse(t.properties) : (t.properties || {});
+        if (tprops.seam_id === sid || tprops.seam === s.node.name) {
+          seamRelations[sid].tasks.push(t);
+        }
+      });
+      
+      tests.forEach(t => {
+        if (t.name.includes(s.node.name)) {
+          seamRelations[sid].tests.push(t);
+        }
+      });
+    });
+    
+    container.innerHTML = '';
+    const table = el('table');
+    const thead = el('thead', null, el('tr', null,
+      el('th', { textContent: '' }),
+      el('th', { textContent: 'Name' }),
+      el('th', { textContent: 'Status' }),
+      el('th', { textContent: 'Owning Proposal' }),
+      el('th', { textContent: 'Tasks' }),
+      el('th', { textContent: 'Tests' }),
+      el('th', { textContent: 'Tokens' }),
+      el('th', { textContent: 'Ladder' })
+    ));
+    table.appendChild(thead);
+    const tbody = el('tbody');
+    
+    seams.forEach(s => {
+      const node = s.node;
+      const nprops = typeof node.properties === 'string' ? JSON.parse(node.properties) : (node.properties || {});
+      const parentInfo = proposalMap[node.id] || proposalMap[node.name];
+      const derivedStatus = parentInfo ? parentInfo.status : 'orphaned';
+      const proposalName = parentInfo ? parentInfo.proposal.name : '—';
+      const rels = seamRelations[node.id] || { tasks: [], tests: [] };
+      const verification = getVerificationBadge(parentInfo ? parentInfo.props : {});
+      
+      // Test status dot
+      const testStatus = nprops.last_test_status || 'untested';
+      const dot = testStatus === 'test-green' ? '🟢' : testStatus === 'test-red' ? '🔴' : '⚪';
+      
+      // Token usage
+      const tokens = nprops.tokens_total || 0;
+      const tokenStr = tokens > 0 ? formatTokens(tokens) : '—';
+      
+      const row = el('tr', {
+        className: 'clickable',
+        onclick: () => showSeamDetail(node.id),
+      },
+        el('td', { textContent: dot, style: 'text-align:center;font-size:12px;' }),
+        el('td', { textContent: node.name }),
+        el('td', null, el('span', { className: 'badge badge-' + derivedStatus, textContent: derivedStatus })),
+        el('td', { 
+          textContent: proposalName, 
+          style: 'font-size:12px;color:var(--text-secondary); max-width: 200px; overflow: hidden; text-overflow: ellipsis;'
+        }),
+        el('td', { textContent: rels.tasks.length }),
+        el('td', { textContent: rels.tests.length }),
+        el('td', { textContent: tokenStr, style: 'font-family:var(--mono);font-size:11px;color:var(--amber);' }),
+        el('td', null, verification)
+      );
+      tbody.appendChild(row);
+    });
+    
+    table.appendChild(tbody);
+    container.appendChild(table);
+  } catch (err) {
+    showError(container, 'Failed to load seams: ' + err.message);
+  }
+}
+
+function getVerificationBadge(props) {
+  const verified = (props && props.verified) || '';
+  
+  const badges = [];
+  
+  if (verified.includes('test') || verified.includes('unit')) {
+    badges.push({ color: 'green', label: 'T' });
+  } else {
+    badges.push({ color: 'empty', label: 'T' });
+  }
+  
+  if (verified.includes('smoke')) {
+    badges.push({ color: 'amber', label: 'S' });
+  } else {
+    badges.push({ color: 'empty', label: 'S' });
+  }
+  
+  if (verified.includes('live') || verified.includes('watched')) {
+    badges.push({ color: 'green', label: 'L' });
+  } else {
+    badges.push({ color: 'empty', label: 'L' });
+  }
+  
+  const container = el('div', { className: 'ladder-badges' });
+  badges.forEach(b => {
+    container.appendChild(el('span', { 
+      className: 'ladder-badge ' + b.color,
+      textContent: b.label,
+      title: b.label === 'T' ? 'Test' : b.label === 'S' ? 'Smoke' : 'Live'
+    }));
+  });
+  return container;
+}
+
+async function triggerScan() {
+  try {
+    await api('/api/scan', { method: 'POST' });
+    alert('Scan triggered successfully');
+    loaded.crates = false;
+    if (currentView === 'crates') loadCrates();
+  } catch (err) {
+    alert('Failed to trigger scan: ' + err.message);
+  }
+}
+
+// ── Updated Search Navigation ──
+
+function navigateToNode(node) {
+  const kind = node.kind;
+  if (kind === 'proposal') {
+    showProposalDetail(node.id);
+  } else if (kind === 'seam') {
+    showSeamDetail(node.id);
+  } else if (kind === 'task') {
+    showTaskDetail(node.id);
+  } else if (kind === 'crate') {
+    showCrateDetail(node.name);
+  } else {
+    showNodeDetail(node);
+  }
+}
+
+// ── Semantic Search ──
+
+// Update threshold display
+const thresholdInput = document.getElementById('semantic-threshold');
+if (thresholdInput) {
+  thresholdInput.addEventListener('input', (e) => {
+    document.getElementById('threshold-value').textContent = e.target.value;
+  });
+}
+
+async function runSemanticSearch() {
+  const query = document.getElementById('semantic-search-input').value.trim();
+  if (!query) {
+    alert('Please enter a search query');
+    return;
+  }
+
+  const kind = document.getElementById('semantic-search-kind').value;
+  const threshold = parseFloat(document.getElementById('semantic-threshold').value);
+  const limit = parseInt(document.getElementById('semantic-limit').value);
+
+  const statusDiv = document.getElementById('semantic-search-status');
+  const resultsDiv = document.getElementById('search-results');
+
+  statusDiv.textContent = 'Generating embedding and searching...';
+  resultsDiv.innerHTML = '<div class="loading">Searching...</div>';
+
+  try {
+    const response = await fetch('http://localhost:8901/mcp', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'tools/call',
+        params: {
+          name: 'graph_semantic_search',
+          arguments: { query, kind: kind || undefined, threshold, limit }
+        },
+        id: 1
+      })
+    });
+
+    const data = await response.json();
+
+    if (data.error) {
+      throw new Error(data.error.message);
+    }
+
+    const results = data.result.results || [];
+
+    if (results.length === 0) {
+      resultsDiv.innerHTML = '<div style="padding: 40px; text-align: center; color: var(--text-secondary);">No results found. Try lowering the threshold or broadening your query.</div>';
+      statusDiv.textContent = `No results for "${query}"`;
+      return;
+    }
+
+    statusDiv.textContent = `Found ${results.length} results for "${query}"`;
+
+    resultsDiv.innerHTML = '';
+    results.forEach((r, i) => {
+      const row = el('div', {
+        className: 'search-result-item',
+        style: 'padding: 12px; border-bottom: 1px solid var(--border); cursor: pointer;',
+        onclick: () => navigateToNode({ id: r.id, kind: r.kind })
+      });
+
+      const scoreColor = r.similarity > 0.8 ? 'var(--success)' : r.similarity > 0.6 ? 'var(--amber)' : 'var(--text-secondary)';
+
+      row.appendChild(el('div', { style: 'display:flex;align-items:center;gap:8px;margin-bottom:4px;' },
+        el('span', { className: 'badge badge-kind', textContent: r.kind }),
+        el('span', { style: `font-weight:600;flex:1;`, textContent: r.name }),
+        el('span', { style: `color:${scoreColor};font-family:var(--mono);font-size:12px;`, textContent: (r.similarity * 100).toFixed(1) + '%' })
+      ));
+
+      row.appendChild(el('div', { style: 'font-size:12px;color:var(--text-secondary);font-family:var(--mono);', textContent: r.id }));
+
+      resultsDiv.appendChild(row);
+    });
+
+  } catch (err) {
+    resultsDiv.innerHTML = `<div class="error">Search failed: ${err.message}</div>`;
+    statusDiv.textContent = 'Search failed';
+  }
+}
+
+// Allow Enter key to trigger search
+document.addEventListener('DOMContentLoaded', () => {
+  const searchInput = document.getElementById('semantic-search-input');
+  if (searchInput) {
+    searchInput.addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') runSemanticSearch();
+    });
+  }
+});
+
+// ── Steering Controls ──
+
+async function updateProposalStatus(nodeId, newStatus) {
+  try {
+    const response = await fetch('http://localhost:8901/mcp', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'tools/call',
+        params: {
+          name: 'graph_update_node',
+          arguments: {
+            node_id: nodeId,
+            updates: { status: newStatus },
+            agent: 'user-ui',
+            reason: 'Status updated via web UI'
+          }
+        },
+        id: 1
+      })
+    });
+    
+    const data = await response.json();
+    if (data.error) {
+      throw new Error(data.error.message);
+    }
+    
+    // Refresh the proposal detail view
+    showProposalDetail(nodeId);
+  } catch (err) {
+    alert('Failed to update status: ' + err.message);
+  }
+}
+
+// ── Workstream Dashboard Functions ──
+
+let currentWorkstreamId = null;
+
+async function loadLiveSessions() {
+  const container = document.getElementById('live-sessions-container');
+  container.innerHTML = '<div class="loading">Loading active sessions…</div>';
+  
+  try {
+    // Get active sessions
+    const sessions = await api('/api/nodes?kind=session');
+    const activeSessions = sessions.filter(s => s.properties?.status === 'active');
+    
+    if (activeSessions.length === 0) {
+      container.innerHTML = '<div class="empty-state">No active agent sessions</div>';
+      return;
+    }
+    
+    container.innerHTML = '';
+    const grid = el('div', { className: 'live-sessions-grid' });
+    
+    for (const session of activeSessions) {
+      const props = session.properties || {};
+      const seamId = props.seam_id;
+      const card = el('div', { 
+        className: 'live-session-card',
+        onclick: () => seamId ? showWorkstreamDetail(seamId) : null,
+        style: seamId ? 'cursor: pointer;' : ''
+      },
+        el('div', { className: 'live-session-header' },
+          el('span', { className: 'live-pulse', textContent: '●' }),
+          el('span', { className: 'live-session-agent', textContent: props.agent || 'unknown' }),
+          el('span', { className: 'live-session-phase phase-' + (props.phase || 'started'), textContent: props.phase || 'started' })
+        ),
+        el('div', { className: 'live-session-seam', textContent: seamId || 'no seam' }),
+        el('div', { className: 'live-session-meta' },
+          el('span', { textContent: `Files: ${(props.files_touched || []).length}` }),
+          el('span', { textContent: `Lines: ${props.lines_changed || 0}` }),
+          el('span', { textContent: `Tests: ${props.test_runs || 0}` })
+        ),
+        el('div', { className: 'live-session-time', textContent: 'Started: ' + formatTime(props.start_time) })
+      );
+      grid.appendChild(card);
+    }
+    
+    container.appendChild(grid);
+  } catch (err) {
+    showError(container, 'Failed to load sessions: ' + err.message);
+  }
+}
+
+async function loadWorkstreams() {
+  const container = document.getElementById('workstreams-container');
+  container.innerHTML = '<div class="loading">Loading workstreams…</div>';
+  
+  // Load live sessions first
+  await loadLiveSessions();
+  
+  try {
+    // Load workstream nodes, proposals, and seams in parallel
+    const [workstreams, proposals, seams] = await Promise.all([
+      api('/api/nodes?kind=workstream'),
+      api('/api/proposals'),
+      api('/api/nodes?kind=seam'),
+    ]);
+    
+    // Build seam map for quick lookup
+    const seamMap = {};
+    seams.forEach(s => { seamMap[s.id] = s; });
+    
+    // Build workstream cards from explicit workstream nodes
+    const wsCards = [];
+    for (const ws of workstreams) {
+      const wsEdges = ws._edges || { outgoing: [], incoming: [] };
+      const childSeams = wsEdges.outgoing
+        .filter(e => e.relation === 'contains' || e.relation === 'implements')
+        .map(e => seamMap[e.target_id] || e.target)
+        .filter(Boolean);
+      wsCards.push({ node: ws, seams: childSeams, source: 'workstream' });
+    }
+    
+    // Also show proposals with active_seams as implicit workstreams (if no explicit workstream covers them)
+    const coveredSeamIds = new Set(wsCards.flatMap(wc => wc.seams.map(s => s.id)));
+    for (const p of proposals) {
+      const pprops = typeof p.properties === 'string' ? JSON.parse(p.properties) : (p.properties || {});
+      const status = getStatus(pprops);
+      if (status === 'deferred' || status === 'implemented') continue;
+      
+      const activeSeamIds = (pprops.active_seams || []);
+      if (activeSeamIds.length === 0) continue;
+      
+      // Check if any of this proposal's seams are already in an explicit workstream
+      const uncoveredSeams = activeSeamIds
+        .map(sid => seamMap[sid] || seamMap['seam:' + sid])
+        .filter(s => s && !coveredSeamIds.has(s.id));
+      
+      if (uncoveredSeams.length > 0) {
+        wsCards.push({ node: p, seams: uncoveredSeams, source: 'proposal' });
+      }
+    }
+    
+    // Also show orphan seams (seams not in any workstream or proposal)
+    const allCoveredSeamIds = new Set(wsCards.flatMap(wc => wc.seams.map(s => s.id)));
+    const orphanSeams = seams.filter(s => !allCoveredSeamIds.has(s.id) && s.properties?.status !== 'completed');
+    
+    container.innerHTML = '';
+    
+    // Active workstreams
+    const activeCards = wsCards.filter(wc => {
+      const props = wc.node.properties || {};
+      return (props.status || props.disposition || 'proposed') !== 'completed';
+    });
+    const completedCards = wsCards.filter(wc => {
+      const props = wc.node.properties || {};
+      return (props.status || props.disposition) === 'completed';
+    });
+    
+    if (activeCards.length > 0) {
+      const activeSection = el('div', { className: 'workstream-section' },
+        el('h3', { textContent: `Active Workstreams (${activeCards.length})` })
+      );
+      const grid = el('div', { className: 'workstream-grid' });
+      for (const wc of activeCards) {
+        grid.appendChild(renderWorkstreamCard2(wc));
+      }
+      activeSection.appendChild(grid);
+      container.appendChild(activeSection);
+    }
+    
+    // Orphan seams (need workstream assignment)
+    if (orphanSeams.length > 0) {
+      const orphanSection = el('div', { className: 'workstream-section' },
+        el('h3', { style: 'color:var(--amber);', textContent: `Orphan Seams (${orphanSeams.length}) — need workstream assignment` })
+      );
+      const grid = el('div', { className: 'workstream-grid' });
+      for (const s of orphanSeams) {
+        grid.appendChild(el('div', { className: 'workstream-card', style: 'border-left:3px solid var(--amber);', onclick: () => showSeamDetail(s.id) },
+          el('div', { className: 'workstream-header' },
+            el('span', { className: 'badge badge-kind', textContent: 'seam' }),
+            el('span', { className: 'badge', style: 'background:rgba(255,193,7,0.2);color:var(--amber);', textContent: 'orphan' })
+          ),
+          el('h4', { className: 'workstream-title', textContent: s.name }),
+          el('div', { style: 'font-size:12px;color:var(--text-secondary);font-family:var(--mono);', textContent: s.id })
+        ));
+      }
+      orphanSection.appendChild(grid);
+      container.appendChild(orphanSection);
+    }
+    
+    // Completed
+    if (completedCards.length > 0) {
+      const doneSection = el('div', { className: 'workstream-section' },
+        el('h3', { textContent: `Recently Completed (${completedCards.length})` })
+      );
+      const list = el('div', { className: 'workstream-list' });
+      completedCards.slice(0, 5).forEach(wc => {
+        list.appendChild(renderWorkstreamRow(wc.node));
+      });
+      doneSection.appendChild(list);
+      container.appendChild(doneSection);
+    }
+    
+    if (wsCards.length === 0 && orphanSeams.length === 0) {
+      container.innerHTML = '<div class="empty-state">No workstreams yet. Click "New Workstream" to start one.</div>';
+    }
+    
+    // Load orphan tasks
+    await loadOrphanTasks();
+    
+  } catch (err) {
+    showError(container, 'Failed to load workstreams: ' + err.message);
+  }
+}
+
+function renderWorkstreamCard2(wc) {
+  const node = wc.node;
+  const props = node.properties || {};
+  const seamCount = wc.seams.length;
+  const source = wc.source;
+  const status = props.status || props.disposition || 'proposed';
+  const verified = props.verified || 'unverified';
+  
+  // Aggregate token usage across all child seams
+  let totalTokens = 0;
+  const seamRows = wc.seams.slice(0, 5).map(s => {
+    const sp = s.properties || {};
+    const testStatus = sp.last_test_status || 'untested';
+    const tokens = sp.tokens_total || 0;
+    totalTokens += tokens;
+    const dot = testStatus === 'test-green' ? '🟢' : testStatus === 'test-red' ? '🔴' : '⚪';
+    const tokenStr = tokens > 0 ? ` (${formatTokens(tokens)})` : '';
+    return el('div', { style: 'padding:2px 0;display:flex;align-items:center;gap:6px;' },
+      el('span', { textContent: dot, style: 'font-size:10px;' }),
+      el('span', { textContent: s.name, style: 'flex:1;' }),
+      tokens > 0 ? el('span', { style: 'font-size:10px;color:var(--muted);font-family:var(--mono);', textContent: tokenStr }) : null
+    );
+  });
+  const moreSeams = seamCount > 5 ? el('div', { style: 'color:var(--muted);padding:2px 0;', textContent: `+${seamCount - 5} more` }) : null;
+  
+  // Count green/red/untested
+  const greenCount = wc.seams.filter(s => (s.properties || {}).last_test_status === 'test-green').length;
+  const redCount = wc.seams.filter(s => (s.properties || {}).last_test_status === 'test-red').length;
+  const untestedCount = seamCount - greenCount - redCount;
+  
+  return el('div', { 
+    className: 'workstream-card',
+    style: source === 'proposal' ? 'border-left:3px solid var(--accent);' : '',
+    onclick: () => source === 'workstream' ? showWorkstreamDetail(node.id) : showProposalDetail(node.id)
+  },
+    el('div', { className: 'workstream-header' },
+      el('span', { className: 'badge badge-kind', textContent: source }),
+      el('span', { className: 'badge badge-' + status, style: 'font-size:10px;', textContent: status })
+    ),
+    el('h4', { className: 'workstream-title', textContent: node.name }),
+    el('div', { className: 'workstream-meta', style: 'display:flex;gap:12px;align-items:center;' },
+      el('span', { textContent: `${seamCount} seam${seamCount !== 1 ? 's' : ''}` }),
+      greenCount > 0 ? el('span', { style: 'color:var(--success);font-size:11px;', textContent: `${greenCount} green` }) : null,
+      redCount > 0 ? el('span', { style: 'color:var(--error);font-size:11px;', textContent: `${redCount} red` }) : null,
+      untestedCount > 0 ? el('span', { style: 'color:var(--muted);font-size:11px;', textContent: `${untestedCount} untested` }) : null
+    ),
+    // Token usage summary
+    totalTokens > 0 ? el('div', { style: 'font-size:11px;color:var(--amber);margin-top:4px;font-family:var(--mono);' },
+      el('span', { textContent: `⚡ ${formatTokens(totalTokens)} tokens` })
+    ) : null,
+    el('div', { style: 'font-size:12px;color:var(--text-secondary);margin-top:8px;' },
+      ...seamRows,
+      moreSeams
+    ),
+    el('div', { className: 'workstream-actions', style: 'margin-top:12px;' },
+      el('button', { 
+        className: 'btn-small',
+        textContent: 'View',
+        onclick: (e) => { e.stopPropagation(); source === 'workstream' ? showWorkstreamDetail(node.id) : showProposalDetail(node.id); }
+      }),
+      el('button', { 
+        className: 'btn-small',
+        textContent: 'Hierarchy',
+        onclick: (e) => { e.stopPropagation(); showHierarchyView(node.id); }
+      })
+    )
+  );
+}
+
+function formatTokens(n) {
+  if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+  if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+  return String(n);
+}
+
+// ── Hospital Board (The Pitt Style Status Board) ──
+
+async function loadHospitalBoard() {
+  const container = document.getElementById('hospital-board-container');
+  container.innerHTML = '<div class="loading">Loading status board…</div>';
+  
+  try {
+    // Get seams and sessions in parallel
+    const [seams, sessions] = await Promise.all([
+      api('/api/nodes?kind=seam'),
+      api('/api/nodes?kind=session')
+    ]);
+    
+    const activeSessions = sessions.filter(s => s.properties?.status === 'active');
+    
+    // Build session map by seam
+    const sessionBySeam = {};
+    activeSessions.forEach(s => {
+      const seamId = s.properties?.seam_id;
+      if (seamId) sessionBySeam[seamId] = s;
+    });
+    
+    // Filter to active workstreams
+    const activeWorkstreams = seams.filter(s => s.properties?.status !== 'completed');
+    
+    if (activeWorkstreams.length === 0) {
+      container.innerHTML = '<div class="empty-state">No active workstreams</div>';
+      return;
+    }
+    
+    // Sort by alert level: critical (no session) > attention (idle) > stable (active)
+    const sorted = activeWorkstreams.sort((a, b) => {
+      const aSession = sessionBySeam[a.id];
+      const bSession = sessionBySeam[b.id];
+      const aScore = !aSession ? 3 : (aSession.properties?.phase === 'started' ? 2 : 1);
+      const bScore = !bSession ? 3 : (bSession.properties?.phase === 'started' ? 2 : 1);
+      return bScore - aScore;
+    });
+    
+    container.innerHTML = '';
+    
+    // Create hospital board table
+    const table = el('table', { className: 'hospital-board-table' },
+      el('thead', null,
+        el('tr', null,
+          el('th', { textContent: 'Alert' }),
+          el('th', { textContent: 'Proposal' }),
+          el('th', { textContent: 'Seam' }),
+          el('th', { textContent: 'Agent' }),
+          el('th', { textContent: 'Phase' }),
+          el('th', { textContent: 'Files' }),
+          el('th', { textContent: 'Lines' }),
+          el('th', { textContent: 'Tests' }),
+          el('th', { textContent: 'Started' }),
+          el('th', { textContent: 'Activity' })
+        )
+      ),
+      el('tbody', null)
+    );
+    
+    sorted.forEach(seam => {
+      const props = seam.properties || {};
+      const session = sessionBySeam[seam.id];
+      const seshProps = session?.properties || {};
+      const proposalId = seshProps.proposal_id;
+      
+      // Determine alert level
+      let alertLevel = 'stable';
+      let alertColor = 'var(--success)';
+      if (!session) {
+        alertLevel = 'critical';
+        alertColor = 'var(--error)';
+      } else if (seshProps.phase === 'started') {
+        alertLevel = 'attention';
+        alertColor = 'var(--amber)';
+      }
+      
+      const row = el('tr', { className: 'hospital-board-row', onclick: () => showWorkstreamDetail(seam.id) },
+        el('td', null, el('span', { style: `color: ${alertColor}; font-size: 16px;`, textContent: '●' })),
+        el('td', { className: 'hospital-board-proposal' }, 
+          el('div', { style: 'font-weight: 500;', textContent: proposalId ? proposalId.replace('doc:', '').replace(/-proposal$/, '').replace(/-/g, ' ').toUpperCase() : 'NO PROPOSAL' }),
+          el('div', { className: 'hospital-board-id', textContent: proposalId || '—' })
+        ),
+        el('td', { className: 'hospital-board-name' }, 
+          el('div', { textContent: seam.name }),
+          el('div', { className: 'hospital-board-id', textContent: seam.id })
+        ),
+        el('td', { textContent: seshProps.agent || '—' }),
+        el('td', null, el('span', { className: 'live-session-phase phase-' + (seshProps.phase || 'unknown'), textContent: seshProps.phase || '—' })),
+        el('td', { textContent: (seshProps.files_touched || []).length }),
+        el('td', { textContent: seshProps.lines_changed || 0 }),
+        el('td', { textContent: seshProps.test_runs || 0 }),
+        el('td', { textContent: formatTime(seshProps.start_time) }),
+        el('td', { textContent: formatTime(seshProps.last_activity) })
+      );
+      
+      table.querySelector('tbody').appendChild(row);
+    });
+    
+    container.appendChild(table);
+    
+  } catch (err) {
+    showError(container, 'Failed to load status board: ' + err.message);
+  }
+}
+
+async function renderWorkstreamCard(seam) {
+  const props = seam.properties || {};
+  const agent = props.agent || props.last_agent || 'unknown';
+  const verified = props.verified || 'unverified';
+  
+  // Use edge data from the list response (much faster than individual API calls)
+  const edges = seam._edges || { incoming: [], outgoing: [] };
+  const implementingTasks = edges.incoming?.filter(e => e.relation === 'implements') || [];
+  const taskCount = implementingTasks.length;
+  
+  const completedTasks = implementingTasks.filter(e => 
+    e.target && e.target.properties?.status === 'completed'
+  ).length;
+  
+  return el('div', { 
+    className: 'workstream-card',
+    onclick: () => showWorkstreamDetail(seam.id)
+  },
+    el('div', { className: 'workstream-header' },
+      el('span', { className: 'badge badge-kind', textContent: 'seam' }),
+      el('span', { className: 'verified-badge ' + verified, textContent: verified })
+    ),
+    el('h4', { className: 'workstream-title', textContent: seam.name }),
+    el('div', { className: 'workstream-meta' },
+      el('span', { textContent: `Agent: ${agent}` }),
+      el('span', { textContent: `${completedTasks}/${taskCount} tasks` })
+    ),
+    el('div', { className: 'progress-bar' },
+      el('div', { 
+        className: 'progress-fill',
+        style: `width: ${taskCount > 0 ? (completedTasks/taskCount*100) : 0}%`
+      })
+    ),
+    el('div', { className: 'workstream-actions' },
+      el('button', { 
+        className: 'btn-small',
+        textContent: 'View',
+        onclick: (e) => { e.stopPropagation(); showWorkstreamDetail(seam.id); }
+      }),
+      el('button', { 
+        className: 'btn-small',
+        textContent: 'Hierarchy',
+        onclick: (e) => { e.stopPropagation(); showHierarchyView(seam.id); }
+      })
+    )
+  );
+}
+
+function renderWorkstreamRow(seam) {
+  return el('div', { className: 'workstream-row' },
+    el('span', { className: 'workstream-name', textContent: seam.name }),
+    el('span', { className: 'workstream-status completed', textContent: '✓ completed' })
+  );
+}
+
+async function loadOrphanTasks() {
+  const container = document.getElementById('orphan-tasks');
+  container.innerHTML = '<div class="loading" style="padding:16px">Checking for orphan tasks…</div>';
+  
+  try {
+    // Get tasks with their edges in a single batch (limit to recent 50 for performance)
+    const tasksResponse = await api('/api/nodes?kind=task&limit=50');
+    const tasks = tasksResponse || [];
+    
+    // Check each task for seam parent (with rate limiting)
+    const orphanTasks = [];
+    const batchSize = 5; // Process in small batches to avoid overwhelming the server
+    
+    for (let i = 0; i < tasks.length; i += batchSize) {
+      const batch = tasks.slice(i, i + batchSize);
+      const batchResults = await Promise.all(
+        batch.map(async (task) => {
+          try {
+            const detail = await api('/api/nodes/' + encodeURIComponent(task.id));
+            const edges = detail._edges || { incoming: [], outgoing: [] };
+            const hasSeamParent = edges.outgoing?.some(e => e.target?.kind === 'seam');
+            
+            if (!hasSeamParent && task.properties?.status !== 'completed') {
+              return task;
+            }
+          } catch (e) {
+            // Skip tasks that fail to load
+          }
+          return null;
+        })
+      );
+      
+      orphanTasks.push(...batchResults.filter(t => t));
+      
+      // If we found orphans, stop checking (we only need to show some)
+      if (orphanTasks.length >= 10) break;
+    }
+    
+    if (orphanTasks.length === 0) {
+      container.innerHTML = '<div class="empty-state" style="padding:16px">✓ All tasks linked to seams (checked recent 50)</div>';
+      return;
+    }
+    
+    container.innerHTML = `<div style="padding: 8px 16px; color: var(--amber); font-size: 12px;">${orphanTasks.length}+ orphan tasks found (showing first ${Math.min(orphanTasks.length, 10)})</div>`;
+    const table = el('table', { className: 'data-table' },
+      el('thead', null,
+        el('tr', null,
+          el('th', { textContent: 'Task' }),
+          el('th', { textContent: 'Status' }),
+          el('th', { textContent: 'Agent' }),
+          el('th', { textContent: 'Action' })
+        )
+      ),
+      el('tbody', null)
+    );
+    
+    orphanTasks.slice(0, 10).forEach(task => {
+      const tr = el('tr', null,
+        el('td', null, el('a', { href: '#', onclick: () => showTaskDetail(task.id) }, task.name)),
+        el('td', null, el('span', { className: 'badge', textContent: task.properties?.status || 'unknown' })),
+        el('td', { textContent: task.properties?.agent || 'unassigned' }),
+        el('td', null, 
+          el('button', { 
+            className: 'btn-small',
+            textContent: 'Assign to Seam',
+            onclick: () => assignTaskToSeam(task.id)
+          })
+        )
+      );
+      table.querySelector('tbody').appendChild(tr);
+    });
+    
+    container.appendChild(table);
+    
+  } catch (err) {
+    showError(container, 'Failed to load orphan tasks: ' + err.message);
+  }
+}
+
+async function showWorkstreamDetail(seamId) {
+  currentWorkstreamId = seamId;
+  switchView('workstream-detail');
+  await refreshWorkstreamDetail();
+}
+
+async function refreshWorkstreamDetail() {
+  const container = document.getElementById('workstream-detail-content');
+  if (!currentWorkstreamId) return;
+  
+  try {
+    let nodeData;
+    try {
+      nodeData = await api('/api/nodes/' + encodeURIComponent(currentWorkstreamId));
+    } catch (e) {
+      // Node not found — show helpful error with back button
+      container.innerHTML = '';
+      container.appendChild(el('div', { style: 'padding:24px;text-align:center;' },
+        el('div', { style: 'font-size:48px;margin-bottom:12px;', textContent: '🔍' }),
+        el('h3', { textContent: 'Node not found' }),
+        el('p', { style: 'color:var(--text-secondary);', textContent: `"${currentWorkstreamId}" does not exist in the graph.` }),
+        el('p', { style: 'color:var(--muted);font-size:12px;margin-bottom:16px;', textContent: 'This can happen when a session referenced a seam that was never scanned, or a workstream was deleted.' }),
+        el('button', { className: 'toolbar-btn', textContent: '← Back to Workstreams', onclick: () => switchView('workstreams') })
+      ));
+      return;
+    }
+
+    // If the node is actually a proposal, redirect to proposal detail
+    if (nodeData.kind === 'proposal') {
+      showProposalDetail(nodeData.id);
+      return;
+    }
+    // If it's a seam, redirect to seam detail 
+    if (nodeData.kind === 'seam') {
+      showSeamDetail(nodeData.id);
+      return;
+    }
+
+    const props = nodeData.properties || {};
+    const edges = nodeData._edges || { incoming: [], outgoing: [] };
+    
+    // For workstream nodes: find child seams via outgoing contains/implements edges
+    const childEdges = edges.outgoing.filter(e => 
+      e.relation === 'contains' || e.relation === 'implements' || e.relation === 'working_on'
+    );
+    // Also check incoming edges (seams that belong to this workstream)
+    const incomingChildEdges = edges.incoming.filter(e =>
+      e.relation === 'part_of' || e.relation === 'working_on'
+    );
+    
+    // Collect all child seam IDs and fetch them
+    const childIds = [...new Set([
+      ...childEdges.map(e => e.target_id),
+      ...incomingChildEdges.map(e => e.source_id)
+    ])];
+    
+    let childSeams = [];
+    for (const cid of childIds) {
+      try {
+        const child = await api('/api/nodes/' + encodeURIComponent(cid));
+        childSeams.push(child);
+      } catch (e) { /* skip missing */ }
+    }
+    
+    // Get implementing tasks from incoming edges
+    const implementingEdges = edges.incoming.filter(e => e.relation === 'implements');
+    const tasks = implementingEdges.map(e => e.target).filter(Boolean);
+    
+    container.innerHTML = '';
+    
+    // Header section
+    const status = props.status || props.disposition || 'unknown';
+    const header = el('div', { className: 'workstream-detail-header' },
+      el('div', { className: 'workstream-title-section' },
+        el('span', { className: 'badge badge-kind', textContent: nodeData.kind || 'workstream' }),
+        el('h2', { textContent: nodeData.name }),
+        el('span', { 
+          className: 'status-badge badge-' + status,
+          textContent: status
+        })
+      ),
+      el('div', { className: 'workstream-meta-section' },
+        el('div', null, el('strong', { textContent: 'Agent: ' }), props.agent || props.last_agent || 'unassigned'),
+        el('div', null, el('strong', { textContent: 'Verified: ' }), props.verified || 'unverified'),
+        props.tokens_total ? el('div', null, el('strong', { textContent: 'Tokens: ' }), formatTokens(props.tokens_total)) : null
+      )
+    );
+    container.appendChild(header);
+    
+    // Child seams section (the core of a workstream)
+    if (childSeams.length > 0) {
+      const seamsSection = el('div', { className: 'detail-section', style: 'margin-top:16px;' });
+      seamsSection.appendChild(el('h3', { textContent: `Seams (${childSeams.length})` }));
+      
+      let totalTokens = 0;
+      const seamList = el('div', { style: 'display:flex;flex-direction:column;gap:8px;' });
+      childSeams.forEach(cs => {
+        const sp = cs.properties || {};
+        const testStatus = sp.last_test_status || 'untested';
+        const dot = testStatus === 'test-green' ? '🟢' : testStatus === 'test-red' ? '🔴' : '⚪';
+        const tokens = sp.tokens_total || 0;
+        totalTokens += tokens;
+        
+        const seamRow = el('div', { 
+          style: 'display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);cursor:pointer;',
+          onclick: () => showSeamDetail(cs.id)
+        },
+          el('span', { textContent: dot }),
+          el('span', { style: 'flex:1;font-weight:500;', textContent: cs.name }),
+          el('span', { className: 'badge badge-' + (sp.status || 'unknown'), style: 'font-size:10px;', textContent: sp.status || 'unknown' }),
+          tokens > 0 ? el('span', { style: 'font-family:var(--mono);font-size:11px;color:var(--amber);', textContent: formatTokens(tokens) }) : null
+        );
+        seamList.appendChild(seamRow);
+      });
+      seamsSection.appendChild(seamList);
+      
+      if (totalTokens > 0) {
+        seamsSection.appendChild(el('div', { style: 'margin-top:8px;font-size:12px;color:var(--amber);font-family:var(--mono);' },
+          el('span', { textContent: `⚡ Total: ${formatTokens(totalTokens)} tokens across ${childSeams.length} seams` })
+        ));
+      }
+      container.appendChild(seamsSection);
+    }
+    
+    // Task list
+    const taskSection = el('div', { className: 'workstream-tasks-section' },
+      el('h3', { textContent: `Implementing Tasks (${tasks.length})` })
+    );
+    
+    if (tasks.length === 0) {
+      taskSection.appendChild(el('div', { className: 'empty-state' }, 'No tasks linked to this workstream'));
+    } else {
+      const taskList = el('div', { className: 'task-list' });
+      tasks.forEach(task => {
+        const taskProps = task.properties || {};
+        const taskCard = el('div', { className: 'task-card ' + (taskProps.status || '') },
+          el('div', { className: 'task-header' },
+            el('span', { className: 'badge badge-kind', textContent: 'task' }),
+            el('span', { className: 'task-status ' + (taskProps.status || ''), textContent: taskProps.status || 'unknown' }),
+            el('span', { className: 'verified-badge ' + (taskProps.verified || ''), textContent: taskProps.verified || 'unverified' })
+          ),
+          el('h4', { className: 'task-title', textContent: task.name }),
+          el('div', { className: 'task-actions' },
+            el('button', { 
+              className: 'btn-small',
+              textContent: 'View',
+              onclick: () => showTaskDetail(task.id)
+            }),
+            el('button', { 
+              className: 'btn-small',
+              textContent: 'Hierarchy',
+              onclick: (e) => { e.stopPropagation(); showHierarchyView(task.id); }
+            })
+          )
+        );
+        taskList.appendChild(taskCard);
+      });
+      taskSection.appendChild(taskList);
+    }
+    container.appendChild(taskSection);
+    
+    // Lifecycle timeline
+    const lifecycleSection = el('div', { className: 'workstream-lifecycle' },
+      el('h3', { textContent: 'Workstream Lifecycle' }),
+      renderLifecycleTimeline(nodeData, tasks)
+    );
+    container.appendChild(lifecycleSection);
+    
+  } catch (err) {
+    showError(container, 'Failed to load workstream detail: ' + err.message);
+  }
+}
+
+function renderLifecycleTimeline(seam, tasks) {
+  const status = seam.properties?.status || 'unknown';
+  const stages = [
+    { key: 'proposed', label: 'Proposed', complete: true },
+    { key: 'accepted', label: 'Accepted', complete: status !== 'proposed' },
+    { key: 'in-progress', label: 'In Progress', complete: ['in-progress', 'completed'].includes(status) },
+    { key: 'completed', label: 'Completed', complete: status === 'completed' }
+  ];
+  
+  const completedTasks = tasks.filter(t => t.properties?.status === 'completed').length;
+  const totalTasks = tasks.length;
+  
+  return el('div', { className: 'lifecycle-timeline' },
+    el('div', { className: 'stages' },
+      ...stages.map((stage, i) => el('div', { 
+        className: 'stage ' + (stage.complete ? 'complete' : '') + (i < stages.length - 1 ? ' has-arrow' : '')
+      },
+        el('div', { className: 'stage-dot' }),
+        el('div', { className: 'stage-label', textContent: stage.label })
+      ))
+    ),
+    el('div', { className: 'task-progress-summary' },
+      el('span', { textContent: `${completedTasks}/${totalTasks} tasks completed` }),
+      totalTasks > 0 ? el('div', { className: 'mini-progress' },
+        el('div', { className: 'mini-progress-fill', style: `width: ${completedTasks/totalTasks*100}%` })
+      ) : null
+    )
+  );
+}
+
+function backToWorkstreams() {
+  currentWorkstreamId = null;
+  switchView('workstreams');
+  loadWorkstreams();
+}
+
+async function closeWorkstream() {
+  if (!currentWorkstreamId) return;
+  
+  if (!confirm('Close this workstream? All tasks should be completed first.')) return;
+  
+  try {
+    await api('/api/nodes/' + encodeURIComponent(currentWorkstreamId), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        properties: { status: 'completed', closed_at: new Date().toISOString() }
+      })
+    });
+    
+    await refreshWorkstreamDetail();
+    alert('Workstream closed successfully');
+  } catch (err) {
+    alert('Failed to close workstream: ' + err.message);
+  }
+}
+
+function startNewWorkstream() {
+  const name = prompt('Workstream name:');
+  if (!name) return;
+  
+  const wsId = 'workstream:' + name.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+  
+  // Create a proper workstream node
+  fetch('http://localhost:8901/mcp', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'tools/call',
+      params: {
+        name: 'graph_create_node',
+        arguments: {
+          id: wsId,
+          kind: 'workstream',
+          name: name,
+          properties: { status: 'proposed', created_by: 'user-ui', created_at: new Date().toISOString() }
+        }
+      },
+      id: Date.now()
+    })
+  })
+  .then(r => r.json())
+  .then(() => {
+    showToast('Workstream created: ' + name);
+    loadWorkstreams();
+    showWorkstreamDetail(wsId);
+  })
+  .catch(err => alert('Failed to create workstream: ' + err.message));
+}
+
+async function assignTaskToSeam(taskId) {
+  // Fetch available seams for the dropdown
+  let seams = [];
+  try { seams = await api('/api/nodes?kind=seam'); } catch(_) {}
+  
+  if (seams.length === 0) {
+    alert('No seams available. Create a workstream first.');
+    return;
+  }
+  
+  // Build modal with seam picker
+  const modal = el('div', { className: 'hierarchy-modal' });
+  const overlay = el('div', { className: 'hierarchy-overlay', onclick: () => modal.remove() });
+  const content = el('div', { className: 'hierarchy-content', style: 'max-width:500px;' });
+  
+  content.appendChild(el('div', { className: 'hierarchy-header' },
+    el('h2', { textContent: 'Assign Task to Seam' }),
+    el('button', { className: 'btn-close', textContent: '✕', onclick: () => modal.remove() })
+  ));
+  
+  const listDiv = el('div', { style: 'max-height:400px;overflow-y:auto;' });
+  seams.forEach(s => {
+    const seamStatus = s.properties?.status || 'unknown';
+    const row = el('div', { 
+      style: 'display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-bottom:1px solid var(--border);cursor:pointer;',
+      onclick: () => {
+        doAssignTaskToSeam(taskId, s.id);
+        modal.remove();
+      }
+    },
+      el('div', null,
+        el('div', { style: 'font-weight:500;', textContent: s.name }),
+        el('div', { style: 'font-size:11px;color:var(--text-secondary);font-family:var(--mono);', textContent: s.id })
+      ),
+      el('span', { className: 'badge badge-' + seamStatus, textContent: seamStatus })
+    );
+    row.addEventListener('mouseenter', () => row.style.background = 'rgba(0,229,255,0.05)');
+    row.addEventListener('mouseleave', () => row.style.background = '');
+    listDiv.appendChild(row);
+  });
+  content.appendChild(listDiv);
+  
+  modal.appendChild(overlay);
+  modal.appendChild(content);
+  document.body.appendChild(modal);
+}
+
+function doAssignTaskToSeam(taskId, seamId) {
+  fetch('http://localhost:8901/mcp', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'tools/call',
+      params: {
+        name: 'graph_create_edge',
+        arguments: {
+          source_id: taskId,
+          target_id: seamId,
+          relation: 'implements'
+        }
+      },
+      id: Date.now()
+    })
+  })
+  .then(() => { showToast('Task assigned to seam'); loadOrphanTasks(); })
+  .catch(err => showToast('Failed to assign: ' + err.message, 'error'));
+}
+
+// ── Hierarchical Drill-Down View Functions ──
+
+async function renderHierarchyTree(nodeId, container, level = 0) {
+  if (level > 5) return; // Prevent infinite recursion
+  
+  try {
+    const node = await api('/api/nodes/' + encodeURIComponent(nodeId));
+    const edges = node._edges || { incoming: [], outgoing: [] };
+    
+    // Group edges by relation type
+    const children = [];
+    const parents = [];
+    const related = [];
+    
+    // Outgoing edges: node -> target (children/implements)
+    edges.outgoing.forEach(edge => {
+      if (edge.relation === 'implements' || edge.relation === 'part_of' || edge.relation === 'child_of') {
+        children.push(edge.target);
+      } else {
+        related.push({ ...edge, direction: 'to' });
+      }
+    });
+    
+    // Incoming edges: source -> node (parents/contained by)
+    edges.incoming.forEach(edge => {
+      if (edge.relation === 'implements' || edge.relation === 'part_of' || edge.relation === 'child_of') {
+        parents.push(edge.source);
+      } else {
+        related.push({ ...edge, direction: 'from' });
+      }
+    });
+    
+    // Render the tree item
+    const treeItem = el('div', { className: 'tree-node', style: `margin-left: ${level * 24}px` },
+      el('div', { className: 'tree-node-header' },
+        el('span', { className: 'badge badge-kind', textContent: node.kind }),
+        el('span', { className: 'tree-node-name', textContent: node.name }),
+        el('span', { className: 'tree-node-id', textContent: node.id })
+      ),
+      node.properties?.status ? el('span', { 
+        className: `tree-status ${node.properties.status}`, 
+        textContent: node.properties.status 
+      }) : null
+    );
+    
+    container.appendChild(treeItem);
+    
+    // Render children recursively
+    if (children.length > 0) {
+      const childrenContainer = el('div', { className: 'tree-children' });
+      for (const child of children.filter(c => c)) {
+        await renderHierarchyTree(child.id, childrenContainer, level + 1);
+      }
+      container.appendChild(childrenContainer);
+    }
+    
+    // Show parent info at top level
+    if (level === 0 && parents.length > 0) {
+      const parentSection = el('div', { className: 'tree-parents-section' },
+        el('h4', { textContent: `Parents (${parents.length})` })
+      );
+      parents.filter(p => p).forEach(parent => {
+        parentSection.appendChild(
+          el('div', { className: 'tree-parent-item' },
+            el('span', { className: 'badge badge-kind', textContent: parent.kind }),
+            el('span', { textContent: parent.name }),
+            el('button', { 
+              className: 'btn-small',
+              textContent: 'View',
+              onclick: () => navigateToNode(parent)
+            })
+          )
+        );
+      });
+      container.insertBefore(parentSection, treeItem.nextSibling);
+    }
+    
+    // Show related nodes at top level
+    if (level === 0 && related.length > 0) {
+      const relatedSection = el('div', { className: 'tree-related-section' },
+        el('h4', { textContent: `Related (${related.length})` })
+      );
+      related.forEach(edge => {
+        const otherNode = edge.direction === 'to' ? edge.target : edge.source;
+        if (!otherNode) return;
+        relatedSection.appendChild(
+          el('div', { className: 'tree-related-item' },
+            el('span', { className: 'badge', textContent: edge.relation }),
+            el('span', { className: 'badge badge-kind', textContent: otherNode.kind }),
+            el('span', { textContent: otherNode.name }),
+            el('button', { 
+              className: 'btn-small',
+              textContent: 'View',
+              onclick: () => navigateToNode(otherNode)
+            })
+          )
+        );
+      });
+      container.appendChild(relatedSection);
+    }
+    
+  } catch (err) {
+    console.error('Failed to render hierarchy for', nodeId, err);
+  }
+}
+
+async function showHierarchyView(nodeId) {
+  const modal = el('div', { className: 'hierarchy-modal' },
+    el('div', { className: 'hierarchy-overlay', onclick: closeHierarchyView }),
+    el('div', { className: 'hierarchy-content' },
+      el('div', { className: 'hierarchy-header' },
+        el('h2', { textContent: 'Hierarchy View' }),
+        el('button', { className: 'btn-close', onclick: closeHierarchyView, textContent: '✕' })
+      ),
+      el('div', { className: 'hierarchy-tree', id: 'hierarchy-tree-root' })
+    )
+  );
+  
+  document.body.appendChild(modal);
+  
+  const treeRoot = document.getElementById('hierarchy-tree-root');
+  await renderHierarchyTree(nodeId, treeRoot);
+}
+
+function closeHierarchyView() {
+  const modal = document.querySelector('.hierarchy-modal');
+  if (modal) modal.remove();
+}
+
 // ── Init ──
-loadView('dashboard');
+loadView('workstreams');
+initWebSocket();
+
+// PlantUML renderer loaded via IIFE in <head>
 </script>
+<script src="plantuml-renderer.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
 </body>
 </html>

@@ -58,6 +58,46 @@ pub struct ScanBody {
     pub worktree: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub struct SessionStartBody {
+    pub session_id: String,
+    pub agent: String,
+    pub agent_model: Option<String>,
+    pub seam_id: String,
+    pub proposal_id: Option<String>,
+    pub task_id: Option<String>,
+    pub phase: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct SessionCloseBody {
+    pub session_id: String,
+    pub summary: Option<String>,
+    pub files_touched: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+pub struct DecideBody {
+    pub target_node: String,
+    pub action: String,
+    pub from_value: Option<String>,
+    pub to_value: Option<String>,
+    pub reason: String,
+    pub agent: String,
+    pub session: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct TestRunBody {
+    pub target_id: String,
+    pub test_count: usize,
+    pub pass_count: usize,
+    pub fail_count: usize,
+    pub coverage_pct: Option<f64>,
+    pub commit_sha: Option<String>,
+    pub duration_ms: Option<u64>,
+}
+
 // ── Response types ──
 
 #[derive(Serialize)]
@@ -105,18 +145,35 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/status", get(get_status))
         .route("/api/nodes", get(list_nodes))
-        .route("/api/nodes/{id}", get(get_node))
-        .route("/api/nodes/{id}/edges", get(get_node_edges))
-        .route("/api/nodes/{id}/update", post(update_node))
+        .route("/api/nodes/:id", get(get_node))
+        .route("/api/nodes/:id/edges", get(get_node_edges))
+        .route("/api/nodes/:id/update", post(update_node))
         .route("/api/search", get(search))
-        .route("/api/snippets/{node_id}", get(get_snippets))
-        .route("/api/snippets/{node_id}/full", get(get_snippets_full))
-        .route("/api/skeleton/{crate_name}", get(get_skeleton))
+        .route("/api/snippets/:node_id", get(get_snippets))
+        .route("/api/snippets/:node_id/full", get(get_snippets_full))
+        .route("/api/skeleton/:crate_name", get(get_skeleton))
+        .route("/api/c4/context/:system_name", get(get_c4_context))
+        .route("/api/c4/container/:system_name", get(get_c4_container))
+        .route("/api/c4/component/:crate_name", get(get_c4_component))
+        .route("/api/c4/proposal/:proposal_id", get(get_c4_proposal))
+        .route("/api/c4/seam/:seam_id", get(get_c4_seam))
+        .route("/api/diagram/sequence/:function_id", get(get_sequence_diagram))
+        .route("/api/diagram/state/:enum_id", get(get_state_diagram))
+        .route("/api/diagram/interactions/:crate_name", get(get_module_interactions))
         .route("/api/proposals", get(list_proposals))
-        .route("/api/proposals/{id}", get(get_proposal))
+        .route("/api/proposals/:id", get(get_proposal))
+        .route("/api/proposals/:id/content", get(get_proposal_content))
         .route("/api/seams", get(list_seams))
         .route("/api/worktrees", get(list_worktrees))
         .route("/api/mutations", get(list_mutations))
+        .route("/api/dashboard", get(get_dashboard))
+        .route("/api/impact/:target", get(get_impact))
+        .route("/api/next_task", get(get_next_task))
+        .route("/api/context/:target_id", get(get_context_for))
+        .route("/api/session/start", post(post_session_start))
+        .route("/api/session/close", post(post_session_close))
+        .route("/api/decide", post(post_decide))
+        .route("/api/test-run", post(post_test_run))
         .route("/api/scan", post(trigger_scan))
         .layer(CorsLayer::permissive())
         .fallback(get(handle_ui_static))
@@ -370,6 +427,38 @@ async fn get_proposal(
     })))
 }
 
+async fn get_proposal_content(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let engine = state.engine.lock().await;
+
+    // Try both raw id and prefixed
+    let proposal_id = if id.contains(':') {
+        id.clone()
+    } else {
+        format!("proposal:{}", id)
+    };
+
+    let node = engine
+        .get_node(&proposal_id)
+        .map_err(internal_error)?
+        .ok_or_else(|| not_found(&format!("Proposal '{}' not found", id)))?;
+
+    // Read the file content
+    let content = if let Some(ref path) = node.file_path {
+        std::fs::read_to_string(path).unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    Ok(Json(serde_json::json!({
+        "id": proposal_id,
+        "name": node.name,
+        "content": content,
+    })))
+}
+
 async fn list_seams(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<serde_json::Value>>, (StatusCode, Json<ErrorResponse>)> {
@@ -533,6 +622,479 @@ async fn update_node(
         "updated": true,
         "node": node,
         "mutation_id": mutation.id,
+    })))
+}
+
+// ── C4 Architecture Diagram Handlers ──
+
+async fn get_c4_context(
+    State(state): State<Arc<AppState>>,
+    AxumPath(system_name): AxumPath<String>,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let engine = state.engine.lock().await;
+    let uml = crate::c4::generate_c4_context(&engine, &system_name)
+        .map_err(internal_error)?;
+    Ok(uml)
+}
+
+async fn get_c4_container(
+    State(state): State<Arc<AppState>>,
+    AxumPath(system_name): AxumPath<String>,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let engine = state.engine.lock().await;
+    let uml = crate::c4::generate_c4_container(&engine, &system_name)
+        .map_err(internal_error)?;
+    Ok(uml)
+}
+
+async fn get_c4_component(
+    State(state): State<Arc<AppState>>,
+    AxumPath(crate_name): AxumPath<String>,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let engine = state.engine.lock().await;
+    let uml = crate::c4::generate_c4_component(&engine, &crate_name)
+        .map_err(internal_error)?;
+    Ok(uml)
+}
+
+async fn get_c4_proposal(
+    State(state): State<Arc<AppState>>,
+    AxumPath(proposal_id): AxumPath<String>,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let engine = state.engine.lock().await;
+    let uml = crate::c4::generate_proposal_architecture(&engine, &proposal_id)
+        .map_err(internal_error)?;
+    Ok(uml)
+}
+
+async fn get_c4_seam(
+    State(state): State<Arc<AppState>>,
+    AxumPath(seam_id): AxumPath<String>,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let engine = state.engine.lock().await;
+    let uml = crate::c4::generate_seam_detail(&engine, &seam_id)
+        .map_err(internal_error)?;
+    Ok(uml)
+}
+
+// ── Sequence/State Diagram Handlers ──
+
+async fn get_sequence_diagram(
+    State(state): State<Arc<AppState>>,
+    AxumPath(function_id): AxumPath<String>,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let engine = state.engine.lock().await;
+    let uml = crate::diagrams::generate_sequence_diagram(&engine, &function_id, 3)
+        .map_err(internal_error)?;
+    Ok(uml)
+}
+
+async fn get_state_diagram(
+    State(state): State<Arc<AppState>>,
+    AxumPath(enum_id): AxumPath<String>,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let engine = state.engine.lock().await;
+    let uml = crate::diagrams::generate_state_diagram(&engine, &enum_id)
+        .map_err(internal_error)?;
+    Ok(uml)
+}
+
+async fn get_module_interactions(
+    State(state): State<Arc<AppState>>,
+    AxumPath(crate_name): AxumPath<String>,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let engine = state.engine.lock().await;
+    let uml = crate::diagrams::generate_module_interaction(&engine, &crate_name)
+        .map_err(internal_error)?;
+    Ok(uml)
+}
+
+// ── Dashboard, Impact, Next Task handlers ──
+
+async fn get_dashboard(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let engine = state.engine.lock().await;
+    let report = crate::egress::agent_dashboard(&engine).map_err(internal_error)?;
+
+    Ok(Json(serde_json::json!({
+        "active_sessions": report.active_sessions.iter().map(|s| serde_json::json!({
+            "id": s.id, "agent": s.agent, "seam_id": s.seam_id,
+            "proposal_id": s.proposal_id, "phase": s.phase,
+            "started": s.started.to_rfc3339(),
+        })).collect::<Vec<_>>(),
+        "recent_closed": report.recent_closed.iter().map(|s| serde_json::json!({
+            "id": s.id, "agent": s.agent, "seam_id": s.seam_id,
+            "proposal_id": s.proposal_id, "phase": s.phase,
+            "started": s.started.to_rfc3339(),
+        })).collect::<Vec<_>>(),
+        "agents": report.agents.iter().map(|a| serde_json::json!({
+            "agent": a.agent, "total_sessions": a.total_sessions,
+            "active_sessions": a.active_sessions, "decisions_made": a.decisions_made,
+            "last_active": a.last_active.to_rfc3339(),
+        })).collect::<Vec<_>>(),
+        "verification_progress": report.verification_progress,
+        "total_proposals": report.total_proposals,
+        "total_sessions": report.total_sessions,
+        "total_decisions": report.total_decisions,
+    })))
+}
+
+async fn get_impact(
+    State(state): State<Arc<AppState>>,
+    AxumPath(target): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let engine = state.engine.lock().await;
+    let report = crate::egress::impact_analysis(&engine, &target).map_err(internal_error)?;
+
+    Ok(Json(serde_json::json!({
+        "target": report.target,
+        "seed_nodes": report.seed_nodes,
+        "affected_proposals": report.affected_proposals,
+        "affected_seams": report.affected_seams,
+        "affected_tests": report.affected_tests,
+        "total_reached": report.total_reached,
+    })))
+}
+
+async fn get_next_task(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let engine = state.engine.lock().await;
+    let result = crate::egress::next_task(&engine).map_err(internal_error)?;
+
+    match result {
+        Some(task) => Ok(Json(serde_json::json!({
+            "id": task.id,
+            "name": task.name,
+            "score": task.score,
+            "disposition": task.disposition,
+            "reason": task.reason,
+            "runner_up": task.runner_up,
+            "total_candidates": task.total_candidates,
+        }))),
+        None => Ok(Json(serde_json::json!({
+            "id": null,
+            "message": "No unclaimed work items",
+        }))),
+    }
+}
+
+// ── Session Lifecycle, Context, Decide handlers ──
+
+async fn get_context_for(
+    State(state): State<Arc<AppState>>,
+    AxumPath(target_id): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let engine = state.engine.lock().await;
+    let ctx = crate::egress::context_for(&engine, &target_id).map_err(internal_error)?;
+
+    Ok(Json(serde_json::json!({
+        "target_id": ctx.target_id,
+        "target_name": ctx.target_name,
+        "target_kind": ctx.target_kind,
+        "domain": ctx.domain,
+        "status": ctx.status,
+        "disposition": ctx.disposition,
+        "verification_level": ctx.verification_level,
+        "proposal_body": ctx.proposal_body,
+        "related_seams": ctx.related_seams.iter().map(|s| serde_json::json!({
+            "id": s.id, "name": s.name, "kind": s.kind, "status": s.status,
+        })).collect::<Vec<_>>(),
+        "related_proposals": ctx.related_proposals.iter().map(|p| serde_json::json!({
+            "id": p.id, "name": p.name, "kind": p.kind, "status": p.status,
+        })).collect::<Vec<_>>(),
+        "implementing_code": ctx.implementing_code.iter().map(|c| serde_json::json!({
+            "file_path": c.file_path, "line_start": c.line_start,
+            "line_end": c.line_end, "signature": c.signature,
+        })).collect::<Vec<_>>(),
+        "blocking": ctx.blocking,
+        "decisions": ctx.decisions.iter().map(|d| serde_json::json!({
+            "id": d.id, "name": d.name, "kind": d.kind, "status": d.status,
+        })).collect::<Vec<_>>(),
+        "active_sessions": ctx.active_sessions.iter().map(|s| serde_json::json!({
+            "id": s.id, "name": s.name, "kind": s.kind, "status": s.status,
+        })).collect::<Vec<_>>(),
+        "diagram": ctx.diagram,
+    })))
+}
+
+async fn post_session_start(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<SessionStartBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let engine = state.engine.lock().await;
+    let phase = body.phase.as_deref().unwrap_or("started");
+    let agent_model = body.agent_model.as_deref().unwrap_or("unknown");
+
+    // Create workstream node
+    let workstream_id = format!("workstream:{}", body.seam_id.replace("seam:", ""));
+    let workstream = Node {
+        id: workstream_id.clone(),
+        kind: NodeKind::Workstream,
+        name: format!("Work on {}", body.seam_id),
+        properties: serde_json::json!({
+            "seam_id": body.seam_id,
+            "proposal_id": body.proposal_id,
+            "task_id": body.task_id,
+            "agent": body.agent,
+            "status": "active",
+            "phase": phase,
+            "started_at": chrono::Utc::now().to_rfc3339(),
+        }),
+        file_path: None,
+        worktree: String::new(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        embedding: None, embedding_model: None, embedding_dims: None,
+        embedding_updated: None, embedding_hash: None,
+    };
+    engine.upsert_node(&workstream).map_err(internal_error)?;
+
+    // Link to seam
+    let edge = Edge {
+        source_id: workstream_id.clone(),
+        target_id: body.seam_id.clone(),
+        relation: EdgeRelation::PartOf,
+        properties: serde_json::json!({"role": "active_work"}),
+        worktree: String::new(),
+    };
+    engine.upsert_edge(&edge).map_err(internal_error)?;
+
+    // Create session node
+    let session = Node {
+        id: body.session_id.clone(),
+        kind: NodeKind::Session,
+        name: format!("Session {} - {}", body.agent, chrono::Utc::now().format("%Y-%m-%d %H:%M")),
+        properties: serde_json::json!({
+            "agent": body.agent,
+            "agent_model": agent_model,
+            "seam_id": body.seam_id,
+            "proposal_id": body.proposal_id,
+            "task_id": body.task_id,
+            "status": "active",
+            "phase": phase,
+            "start_time": chrono::Utc::now().to_rfc3339(),
+        }),
+        file_path: None,
+        worktree: String::new(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        embedding: None, embedding_model: None, embedding_dims: None,
+        embedding_updated: None, embedding_hash: None,
+    };
+    engine.upsert_node(&session).map_err(internal_error)?;
+
+    // Link session to workstream
+    let sess_edge = Edge {
+        source_id: body.session_id.clone(),
+        target_id: workstream_id.clone(),
+        relation: EdgeRelation::WorkingOn,
+        properties: serde_json::json!({}),
+        worktree: String::new(),
+    };
+    engine.upsert_edge(&sess_edge).map_err(internal_error)?;
+
+    let _ = state.change_tx.send(ChangeEvent {
+        event_type: "session_started".to_string(),
+        payload: serde_json::json!({
+            "session_id": body.session_id,
+            "agent": body.agent,
+            "seam_id": body.seam_id,
+        }),
+    });
+
+    Ok(Json(serde_json::json!({
+        "session_id": body.session_id,
+        "workstream_id": workstream_id,
+        "status": "active",
+    })))
+}
+
+async fn post_session_close(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<SessionCloseBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let engine = state.engine.lock().await;
+
+    let session = engine.get_node(&body.session_id)
+        .map_err(internal_error)?
+        .ok_or_else(|| not_found(&format!("Session not found: {}", body.session_id)))?;
+
+    let mut props = session.properties.clone();
+    props["status"] = serde_json::json!("closed");
+    props["end_time"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
+    if let Some(ref summary) = body.summary {
+        props["summary"] = serde_json::json!(summary);
+    }
+    if let Some(ref files) = body.files_touched {
+        props["files_touched"] = serde_json::json!(files);
+    }
+
+    let mut updated = session.clone();
+    updated.properties = props;
+    updated.updated_at = chrono::Utc::now();
+    engine.upsert_node(&updated).map_err(internal_error)?;
+
+    let _ = state.change_tx.send(ChangeEvent {
+        event_type: "session_closed".to_string(),
+        payload: serde_json::json!({
+            "session_id": body.session_id,
+        }),
+    });
+
+    Ok(Json(serde_json::json!({
+        "session_id": body.session_id,
+        "status": "closed",
+    })))
+}
+
+async fn post_decide(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<DecideBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let engine = state.engine.lock().await;
+
+    let decision_id = format!("decision:{}", uuid::Uuid::new_v4());
+    let decision = Node {
+        id: decision_id.clone(),
+        kind: NodeKind::Decision,
+        name: format!("{}: {} on {}", body.action, body.agent, body.target_node),
+        properties: serde_json::json!({
+            "action": body.action,
+            "from_value": body.from_value,
+            "to_value": body.to_value,
+            "reason": body.reason,
+            "agent": body.agent,
+            "session": body.session,
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        }),
+        file_path: None,
+        worktree: String::new(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        embedding: None, embedding_model: None, embedding_dims: None,
+        embedding_updated: None, embedding_hash: None,
+    };
+    engine.upsert_node(&decision).map_err(internal_error)?;
+
+    // Link decision to target node
+    let edge = Edge {
+        source_id: decision_id.clone(),
+        target_id: body.target_node.clone(),
+        relation: EdgeRelation::DecidedBy,
+        properties: serde_json::json!({}),
+        worktree: String::new(),
+    };
+    engine.upsert_edge(&edge).map_err(internal_error)?;
+
+    // Record mutation
+    let mutation = crate::schema::Mutation {
+        id: format!("mut:{}", uuid::Uuid::new_v4()),
+        timestamp: chrono::Utc::now(),
+        agent: Some(body.agent.clone()),
+        session: body.session.clone(),
+        action: body.action.clone(),
+        target_node: Some(body.target_node.clone()),
+        from_value: body.from_value.clone(),
+        to_value: body.to_value.clone(),
+        reason: Some(body.reason.clone()),
+        details: serde_json::json!({}),
+    };
+    engine.record_mutation(&mutation).map_err(internal_error)?;
+
+    let _ = state.change_tx.send(ChangeEvent {
+        event_type: "decision_recorded".to_string(),
+        payload: serde_json::json!({
+            "decision_id": decision_id,
+            "target": body.target_node,
+            "action": body.action,
+        }),
+    });
+
+    Ok(Json(serde_json::json!({
+        "decision_id": decision_id,
+        "target_node": body.target_node,
+        "action": body.action,
+        "status": "recorded",
+    })))
+}
+
+async fn post_test_run(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<TestRunBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let engine = state.engine.lock().await;
+
+    let testrun_id = format!("testrun:{}", uuid::Uuid::new_v4());
+    let coverage = body.coverage_pct.unwrap_or(0.0);
+    let commit = body.commit_sha.clone().unwrap_or_default();
+    let duration = body.duration_ms.unwrap_or(0);
+
+    let testrun = Node {
+        id: testrun_id.clone(),
+        kind: NodeKind::TestRun,
+        name: format!("Test run: {}/{}", body.pass_count, body.test_count),
+        properties: serde_json::json!({
+            "target_id": body.target_id,
+            "test_count": body.test_count,
+            "pass_count": body.pass_count,
+            "fail_count": body.fail_count,
+            "coverage_pct": coverage,
+            "commit_sha": commit,
+            "duration_ms": duration,
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        }),
+        file_path: None,
+        worktree: String::new(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        embedding: None, embedding_model: None, embedding_dims: None,
+        embedding_updated: None, embedding_hash: None,
+    };
+    engine.upsert_node(&testrun).map_err(internal_error)?;
+
+    // Link test run to target node
+    let edge = Edge {
+        source_id: testrun_id.clone(),
+        target_id: body.target_id.clone(),
+        relation: EdgeRelation::TestedBy,
+        properties: serde_json::json!({"status": if body.fail_count == 0 { "pass" } else { "fail" }}),
+        worktree: String::new(),
+    };
+    engine.upsert_edge(&edge).map_err(internal_error)?;
+
+    // Record mutation for audit trail
+    let mutation = crate::schema::Mutation {
+        id: format!("mut:{}", uuid::Uuid::new_v4()),
+        timestamp: chrono::Utc::now(),
+        agent: None,
+        session: None,
+        action: "test_run".to_string(),
+        target_node: Some(body.target_id.clone()),
+        from_value: None,
+        to_value: Some(format!("{}/{} passed", body.pass_count, body.test_count)),
+        reason: Some(format!("Test run recorded: {}/{} pass", body.pass_count, body.test_count)),
+        details: serde_json::json!({"testrun_id": testrun_id}),
+    };
+    engine.record_mutation(&mutation).map_err(internal_error)?;
+
+    let _ = state.change_tx.send(ChangeEvent {
+        event_type: "test_run_recorded".to_string(),
+        payload: serde_json::json!({
+            "testrun_id": testrun_id,
+            "target": body.target_id,
+            "passed": body.pass_count,
+            "failed": body.fail_count,
+        }),
+    });
+
+    Ok(Json(serde_json::json!({
+        "testrun_id": testrun_id,
+        "target_id": body.target_id,
+        "status": if body.fail_count == 0 { "pass" } else { "fail" },
+        "passed": body.pass_count,
+        "failed": body.fail_count,
     })))
 }
 

@@ -215,3 +215,314 @@ async fn test_api_not_found() {
 
     assert_eq!(resp.status(), 404);
 }
+
+// ── New endpoint tests: context, session lifecycle, decide, dashboard, next_task, impact ──
+
+/// Helper: spin up a test server, return (port, client)
+async fn start_test_server() -> (u16, reqwest::Client) {
+    let state = test_state();
+    let port = available_port();
+    let app = api::router(state);
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
+        .await
+        .expect("Failed to bind");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    (port, reqwest::Client::new())
+}
+
+#[tokio::test]
+async fn test_api_next_task() {
+    let (port, client) = start_test_server().await;
+
+    let resp = client
+        .get(format!("http://127.0.0.1:{}/api/next_task", port))
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.expect("Failed to parse JSON");
+    // Should return either a task with an id or a "no work" message
+    assert!(
+        body.get("id").is_some() || body.get("message").is_some(),
+        "Expected id or message in next_task response, got: {:?}",
+        body
+    );
+}
+
+#[tokio::test]
+async fn test_api_dashboard() {
+    let (port, client) = start_test_server().await;
+
+    let resp = client
+        .get(format!("http://127.0.0.1:{}/api/dashboard", port))
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.expect("Failed to parse JSON");
+    assert!(body.get("active_sessions").is_some(), "Missing active_sessions");
+    assert!(body.get("agents").is_some(), "Missing agents");
+    assert!(body.get("total_proposals").is_some(), "Missing total_proposals");
+    assert!(body.get("total_sessions").is_some(), "Missing total_sessions");
+    assert!(body.get("total_decisions").is_some(), "Missing total_decisions");
+    assert!(body.get("verification_progress").is_some(), "Missing verification_progress");
+}
+
+#[tokio::test]
+async fn test_api_context_for_proposal() {
+    let (port, client) = start_test_server().await;
+
+    // First, find a real proposal ID from the scanned graph
+    let resp = client
+        .get(format!("http://127.0.0.1:{}/api/proposals", port))
+        .send()
+        .await
+        .expect("Failed to send request");
+    assert_eq!(resp.status(), 200);
+    let proposals: Vec<serde_json::Value> = resp.json().await.expect("Failed to parse JSON");
+    assert!(!proposals.is_empty(), "Need at least one proposal for context test");
+
+    let proposal_id = proposals[0]["id"].as_str().unwrap();
+
+    // GET /api/context/:target_id
+    let resp = client
+        .get(format!("http://127.0.0.1:{}/api/context/{}", port, proposal_id))
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(resp.status(), 200, "context_for should return 200 for a known proposal");
+    let body: serde_json::Value = resp.json().await.expect("Failed to parse JSON");
+    assert_eq!(body["target_id"].as_str().unwrap(), proposal_id);
+    assert!(body.get("target_name").is_some(), "Missing target_name");
+    assert!(body.get("target_kind").is_some(), "Missing target_kind");
+    assert!(body.get("related_seams").is_some(), "Missing related_seams");
+    assert!(body.get("implementing_code").is_some(), "Missing implementing_code");
+    assert!(body.get("decisions").is_some(), "Missing decisions");
+    assert!(body.get("active_sessions").is_some(), "Missing active_sessions");
+}
+
+#[tokio::test]
+async fn test_api_context_for_nonexistent() {
+    let (port, client) = start_test_server().await;
+
+    let resp = client
+        .get(format!("http://127.0.0.1:{}/api/context/nonexistent:fake:id", port))
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(resp.status(), 500, "context_for should error for nonexistent node");
+}
+
+#[tokio::test]
+async fn test_api_impact() {
+    let (port, client) = start_test_server().await;
+
+    // Find a real proposal to test impact on
+    let resp = client
+        .get(format!("http://127.0.0.1:{}/api/proposals", port))
+        .send()
+        .await
+        .expect("Failed to send request");
+    let proposals: Vec<serde_json::Value> = resp.json().await.unwrap();
+    assert!(!proposals.is_empty(), "Need at least one proposal for impact test");
+
+    let proposal_id = proposals[0]["id"].as_str().unwrap();
+
+    let resp = client
+        .get(format!("http://127.0.0.1:{}/api/impact/{}", port, proposal_id))
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.expect("Failed to parse JSON");
+    assert!(body.get("target").is_some(), "Missing target in impact response");
+    assert!(body.get("affected_proposals").is_some(), "Missing affected_proposals");
+    assert!(body.get("affected_seams").is_some(), "Missing affected_seams");
+    assert!(body.get("affected_tests").is_some(), "Missing affected_tests");
+    assert!(body.get("total_reached").is_some(), "Missing total_reached");
+}
+
+#[tokio::test]
+async fn test_api_session_start() {
+    let (port, client) = start_test_server().await;
+
+    let resp = client
+        .post(format!("http://127.0.0.1:{}/api/session/start", port))
+        .json(&serde_json::json!({
+            "session_id": "test-session-001",
+            "agent": "test-agent",
+            "agent_model": "test-model",
+            "seam_id": "seam:test-seam",
+            "proposal_id": "proposal:test-proposal",
+            "phase": "testing"
+        }))
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(resp.status(), 200, "session/start should return 200");
+    let body: serde_json::Value = resp.json().await.expect("Failed to parse JSON");
+    assert_eq!(body["session_id"].as_str().unwrap(), "test-session-001");
+    assert_eq!(body["status"].as_str().unwrap(), "active");
+    assert!(body.get("workstream_id").is_some(), "Missing workstream_id");
+}
+
+#[tokio::test]
+async fn test_api_session_close() {
+    let (port, client) = start_test_server().await;
+
+    // First start a session
+    let resp = client
+        .post(format!("http://127.0.0.1:{}/api/session/start", port))
+        .json(&serde_json::json!({
+            "session_id": "test-session-close-001",
+            "agent": "test-agent",
+            "seam_id": "seam:test-seam",
+        }))
+        .send()
+        .await
+        .expect("Failed to send request");
+    assert_eq!(resp.status(), 200);
+
+    // Now close it
+    let resp = client
+        .post(format!("http://127.0.0.1:{}/api/session/close", port))
+        .json(&serde_json::json!({
+            "session_id": "test-session-close-001",
+            "summary": "Test session completed successfully",
+            "files_touched": ["test_file.rs"]
+        }))
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(resp.status(), 200, "session/close should return 200");
+    let body: serde_json::Value = resp.json().await.expect("Failed to parse JSON");
+    assert_eq!(body["session_id"].as_str().unwrap(), "test-session-close-001");
+    assert_eq!(body["status"].as_str().unwrap(), "closed");
+}
+
+#[tokio::test]
+async fn test_api_session_close_nonexistent() {
+    let (port, client) = start_test_server().await;
+
+    let resp = client
+        .post(format!("http://127.0.0.1:{}/api/session/close", port))
+        .json(&serde_json::json!({
+            "session_id": "nonexistent-session-999",
+        }))
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    // Should fail because the session doesn't exist
+    assert_ne!(resp.status(), 200, "Closing a nonexistent session should fail");
+}
+
+#[tokio::test]
+async fn test_api_decide() {
+    let (port, client) = start_test_server().await;
+
+    let resp = client
+        .post(format!("http://127.0.0.1:{}/api/decide", port))
+        .json(&serde_json::json!({
+            "target_node": "proposal:test-proposal",
+            "action": "status_change",
+            "from_value": "proposed",
+            "to_value": "accepted for current slice",
+            "reason": "Test decision for verification",
+            "agent": "test-agent",
+            "session": "test-session-decide-001"
+        }))
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(resp.status(), 200, "decide should return 200");
+    let body: serde_json::Value = resp.json().await.expect("Failed to parse JSON");
+    assert!(body["decision_id"].as_str().unwrap().starts_with("decision:"), "decision_id should start with 'decision:'");
+    assert_eq!(body["target_node"].as_str().unwrap(), "proposal:test-proposal");
+    assert_eq!(body["action"].as_str().unwrap(), "status_change");
+    assert_eq!(body["status"].as_str().unwrap(), "recorded");
+}
+
+#[tokio::test]
+async fn test_api_full_agent_lifecycle() {
+    let (port, client) = start_test_server().await;
+
+    // 1. Start a session
+    let resp = client
+        .post(format!("http://127.0.0.1:{}/api/session/start", port))
+        .json(&serde_json::json!({
+            "session_id": "lifecycle-session-001",
+            "agent": "lifecycle-agent",
+            "seam_id": "seam:lifecycle-seam",
+            "phase": "implementation"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // 2. Dashboard should show the active session
+    let resp = client
+        .get(format!("http://127.0.0.1:{}/api/dashboard", port))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let dashboard: serde_json::Value = resp.json().await.unwrap();
+    let active = dashboard["active_sessions"].as_array().unwrap();
+    let found = active.iter().any(|s| s["id"].as_str() == Some("lifecycle-session-001"));
+    assert!(found, "Dashboard should show our active session. Active sessions: {:?}", active);
+
+    // 3. Record a decision
+    let resp = client
+        .post(format!("http://127.0.0.1:{}/api/decide", port))
+        .json(&serde_json::json!({
+            "target_node": "seam:lifecycle-seam",
+            "action": "implementation_complete",
+            "reason": "Lifecycle test: marking seam as complete",
+            "agent": "lifecycle-agent",
+            "session": "lifecycle-session-001"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let decide_body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(decide_body["status"].as_str().unwrap(), "recorded");
+
+    // 4. Close the session
+    let resp = client
+        .post(format!("http://127.0.0.1:{}/api/session/close", port))
+        .json(&serde_json::json!({
+            "session_id": "lifecycle-session-001",
+            "summary": "Lifecycle test completed",
+            "files_touched": ["api.rs", "egress.rs"]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // 5. Dashboard should show session as recently closed, not active
+    let resp = client
+        .get(format!("http://127.0.0.1:{}/api/dashboard", port))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let dashboard: serde_json::Value = resp.json().await.unwrap();
+    let active = dashboard["active_sessions"].as_array().unwrap();
+    let still_active = active.iter().any(|s| s["id"].as_str() == Some("lifecycle-session-001"));
+    assert!(!still_active, "Closed session should not appear in active_sessions");
+}

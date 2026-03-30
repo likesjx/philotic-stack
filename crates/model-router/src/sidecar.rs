@@ -57,6 +57,8 @@ pub struct EmbedRequest {
 pub struct EmbedResponse {
     pub embedding: Vec<f32>,
     /// Non-standard extension: model generation provenance token.
+    /// Serialized as "model" for Ollama API compatibility.
+    #[serde(rename = "model")]
     pub model_gen: String,
 }
 

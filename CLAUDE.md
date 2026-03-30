@@ -6,10 +6,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Every session MUST begin with these steps in order:
 1.  **Read [AGENTS.md](file:///Users/jaredlikes/code/philotic-stack/AGENTS.md)**: Adopt the standing protocol.
-2.  **Query the Project Graph**: Run `phil graph status` to orient. If the graph server is running, use MCP tools (`graph_status`, `graph_proposals`) for a complete picture of what's in flight. The graph is faster and more complete than reading raw files. See `$graph-intelligence` skill.
+2.  **Query the Project Graph**: If the graph server is running (`just intel-graph-ensure`), use MCP tools (`graph_status`, `graph_digest`) for a complete picture of what's in flight. The graph is faster and more complete than reading raw files but is NOT required — agents can work effectively without it. See `$graph-intelligence` skill.
 3.  **Orient and Recall**: Run `just session-start` to bootstrap Muninn. Use `$muninn-memory-habit` for cognitive context. The graph gives you structural facts; Muninn gives you learned context.
 4.  **Verify Green Status**: Run `just check` and `just test` (or the relevant smoke) to confirm the baseline is stable before editing.
 5.  **Record Decisions**: After completing work, use `graph_decide` (MCP) or `phil graph decide` to record what you did and why. This creates the audit trail.
+
+When starting work on a specific proposal or seam, use the graph workflow:
+- `graph_next_task` → find the highest-priority unclaimed work
+- `graph_context_for` → load proposal + seams + code + verification + diagram in one call
+- `session_start` → claim the work so other agents see it on the dashboard
+- `graph_impact` → check blast radius before committing
+- `session_close` → release the claim when done
 
 If `just session-start` cannot recover Muninn, stop and alert the user/operator immediately. Do not continue with meaningful work until explicit approval is given to proceed without Muninn.
 
@@ -45,6 +52,14 @@ phil graph proposals           # all proposals with current status
 phil graph seams               # all registered seams
 phil graph skeleton <crate>    # PlantUML diagram for a crate
 phil graph search "<text>"     # full-text search across code and docs
+
+# Intel Graph (managed lifecycle)
+just intel-graph-start         # start ONNX sidecar + graph intelligence server
+just intel-graph-stop          # stop the intel-graph stack
+just intel-graph-status        # check if running
+just intel-graph-health        # health check both services
+just intel-graph-ui            # open the web UI (http://127.0.0.1:8900)
+just intel-graph-agent 60      # start with auto-shutdown after N minutes
 ```
 
 The hotel daemon requires `mesh-config.json` in root — copy from `mesh-config.example.json`.
@@ -120,3 +135,5 @@ All consumers hold `Arc<dyn XxxStorage>`:
 - `docs/architecture/PORT_BLUEPRINT.md` — migration blueprint
 - `README.md` — status overview & diagram gallery
 - `AGENTS.md` — standing protocol for coding agents
+- `skills/graph-intelligence/SKILL.md` — full MCP tool reference and agent workflow
+- `docs/process/WORKFLOW.md` — SVE operating loop
