@@ -50,6 +50,11 @@ pub fn scan_rust_workspace(
             file_path: Some(crate_path.join("Cargo.toml").display().to_string()),
             worktree: worktree.to_string(),
             created_at: now,
+                embedding: None,
+                embedding_model: None,
+                embedding_dims: None,
+                embedding_updated: None,
+                embedding_hash: None,
             updated_at: now,
         };
         engine.upsert_node(&crate_node)?;
@@ -86,6 +91,11 @@ pub fn scan_rust_workspace(
                 file_path: Some(rel_path.clone()),
                 worktree: worktree.to_string(),
                 created_at: now,
+                embedding: None,
+                embedding_model: None,
+                embedding_dims: None,
+                embedding_updated: None,
+                embedding_hash: None,
                 updated_at: now,
             };
             engine.upsert_node(&module_node)?;
@@ -136,6 +146,11 @@ pub fn scan_rust_workspace(
                 file_path: Some(rel_path.clone()),
                 worktree: worktree.to_string(),
                 created_at: now,
+                embedding: None,
+                embedding_model: None,
+                embedding_dims: None,
+                embedding_updated: None,
+                embedding_hash: None,
                 updated_at: now,
             };
             engine.upsert_node(&module_with_metrics)?;
@@ -187,6 +202,11 @@ fn scan_items(
                     file_path: Some(file_path.to_string()),
                     worktree: worktree.to_string(),
                     created_at: now,
+                embedding: None,
+                embedding_model: None,
+                embedding_dims: None,
+                embedding_updated: None,
+                embedding_hash: None,
                     updated_at: now,
                 })?;
                 metrics.types_found += 1;
@@ -232,6 +252,11 @@ fn scan_items(
                     file_path: Some(file_path.to_string()),
                     worktree: worktree.to_string(),
                     created_at: now,
+                embedding: None,
+                embedding_model: None,
+                embedding_dims: None,
+                embedding_updated: None,
+                embedding_hash: None,
                     updated_at: now,
                 })?;
                 metrics.types_found += 1;
@@ -277,6 +302,11 @@ fn scan_items(
                     file_path: Some(file_path.to_string()),
                     worktree: worktree.to_string(),
                     created_at: now,
+                embedding: None,
+                embedding_model: None,
+                embedding_dims: None,
+                embedding_updated: None,
+                embedding_hash: None,
                     updated_at: now,
                 })?;
                 metrics.types_found += 1;
@@ -336,6 +366,11 @@ fn scan_items(
                     file_path: Some(file_path.to_string()),
                     worktree: worktree.to_string(),
                     created_at: now,
+                embedding: None,
+                embedding_model: None,
+                embedding_dims: None,
+                embedding_updated: None,
+                embedding_hash: None,
                     updated_at: now,
                 })?;
                 if is_test {
@@ -397,6 +432,11 @@ fn scan_items(
                     file_path: Some(file_path.to_string()),
                     worktree: worktree.to_string(),
                     created_at: now,
+                embedding: None,
+                embedding_model: None,
+                embedding_dims: None,
+                embedding_updated: None,
+                embedding_hash: None,
                     updated_at: now,
                 })?;
                 metrics.impl_blocks += 1;
@@ -452,6 +492,11 @@ fn scan_items(
                             file_path: Some(file_path.to_string()),
                             worktree: worktree.to_string(),
                             created_at: now,
+                embedding: None,
+                embedding_model: None,
+                embedding_dims: None,
+                embedding_updated: None,
+                embedding_hash: None,
                             updated_at: now,
                         })?;
                         if is_test {
@@ -568,6 +613,11 @@ fn scan_items(
                     file_path: Some(file_path.to_string()),
                     worktree: worktree.to_string(),
                     created_at: now,
+                embedding: None,
+                embedding_model: None,
+                embedding_dims: None,
+                embedding_updated: None,
+                embedding_hash: None,
                     updated_at: now,
                 })?;
                 metrics.types_found += 1;
@@ -625,6 +675,11 @@ fn scan_items(
                         file_path: Some(file_path.to_string()),
                         worktree: worktree.to_string(),
                         created_at: now,
+                embedding: None,
+                embedding_model: None,
+                embedding_dims: None,
+                embedding_updated: None,
+                embedding_hash: None,
                         updated_at: now,
                     };
                     engine.upsert_node(&sub_mod_node)?;
@@ -730,11 +785,22 @@ fn hash_string(s: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn span_lines(_span: proc_macro2::Span, source: &str) -> (u32, u32) {
-    // proc_macro2 span locations require the "span-locations" feature
-    // which has caveats. Use line count of the source as a fallback.
-    let lines = source.lines().count() as u32;
-    (1, lines)
+fn span_lines(span: proc_macro2::Span, source: &str) -> (u32, u32) {
+    let start = span.start().line as u32;
+    let end = span.end().line as u32;
+    // span-locations gives the span of the identifier only — estimate the
+    // block end by scanning forward for a reasonable range. If start==end
+    // (single-line item like a field), just return that line.
+    if start == 0 {
+        // Fallback if span locations aren't available
+        let lines = source.lines().count() as u32;
+        return (1, lines);
+    }
+    if end > start {
+        (start, end)
+    } else {
+        (start, start)
+    }
 }
 
 fn format_struct_signature(s: &syn::ItemStruct) -> String {

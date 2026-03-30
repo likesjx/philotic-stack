@@ -1542,6 +1542,7 @@ dependencies = [
  "anyhow",
  "axum 0.7.9",
  "chrono",
+ "clap",
  "glob",
  "hex",
  "proc-macro2",

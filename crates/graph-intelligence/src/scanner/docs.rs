@@ -16,34 +16,54 @@ struct DocFrontmatter {
     doc_type: Option<String>,
     domain: Option<String>,
     status: Option<String>,
+    disposition: Option<String>,
     proposal_id: Option<String>,
     related_docs: Option<Vec<String>>,
+    task_refs: Option<Vec<String>>,
     implements: Option<Vec<String>>,
     implemented_by: Option<Vec<String>>,
     active_seams: Option<Vec<String>>,
-    tags: Option<Vec<String>>,
+    source_of_truth_targets: Option<Vec<String>>,
+    tags: Option<String>,
     last_updated: Option<String>,
+    sver: Option<String>,
 }
 
-/// Scan all `.md` files under the given root directories.
+/// Scan all `.md` files under docs/, skills/, workflows/, and root.
 /// Returns the number of document nodes created.
 pub fn scan_docs(root: &Path, engine: &GraphEngine) -> Result<usize> {
     let now = Utc::now();
     let mut count = 0;
 
-    let docs_dir = root.join("docs");
-    if !docs_dir.exists() {
-        return Ok(0);
+    // Collect all .md files from multiple scan roots
+    let scan_dirs = ["docs", "skills", "workflows"];
+    let mut md_files: Vec<std::path::PathBuf> = Vec::new();
+
+    for dir_name in &scan_dirs {
+        let dir = root.join(dir_name);
+        if dir.exists() {
+            for entry in WalkDir::new(&dir)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().map_or(false, |ext| ext == "md"))
+            {
+                md_files.push(entry.path().to_path_buf());
+            }
+        }
     }
 
-    for entry in WalkDir::new(&docs_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path().extension().map_or(false, |ext| ext == "md")
-        })
+    // Also scan root-level .md files (AGENTS.md, CLAUDE.md, README.md)
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().map_or(false, |ext| ext == "md") && path.is_file() {
+                md_files.push(path);
+            }
+        }
+    }
+
+    for file_path in &md_files
     {
-        let file_path = entry.path();
         let rel_path = file_path
             .strip_prefix(root)
             .unwrap_or(file_path)
@@ -67,12 +87,24 @@ pub fn scan_docs(root: &Path, engine: &GraphEngine) -> Result<usize> {
             .clone()
             .unwrap_or_else(|| file_name.clone());
 
+        let is_skill = rel_path.starts_with("skills/");
+        let is_workflow = rel_path.starts_with("workflows/");
+
         let node_kind = match frontmatter.doc_type.as_deref() {
             Some("proposal") => NodeKind::Proposal,
-            Some("reference") | Some("workflow") | Some("status") => NodeKind::Domain,
+            Some("reference") | Some("status") | Some("historical") | Some("architecture") => NodeKind::Domain,
+            Some("workflow") => NodeKind::Document,
+            Some("seam") => NodeKind::Seam,
+            Some("task-surface") | Some("task") => NodeKind::Task,
+            Some("sver") => NodeKind::Sver,
+            Some("skill") => NodeKind::Skill,
             _ => {
-                // Infer from filename
-                if rel_path.contains("PROPOSAL") {
+                // Infer from path and filename
+                if is_skill {
+                    NodeKind::Skill
+                } else if is_workflow {
+                    NodeKind::Document
+                } else if rel_path.contains("PROPOSAL") {
                     NodeKind::Proposal
                 } else if rel_path.contains("task") {
                     NodeKind::Task
@@ -82,8 +114,17 @@ pub fn scan_docs(root: &Path, engine: &GraphEngine) -> Result<usize> {
             }
         };
 
+        let id_prefix = match node_kind {
+            NodeKind::Skill => "skill",
+            NodeKind::Sver => "sver",
+            NodeKind::Proposal => "doc",
+            NodeKind::Seam => "seam",
+            NodeKind::Task => "task",
+            _ => "doc",
+        };
         let node_id = format!(
-            "doc:{}",
+            "{}:{}",
+            id_prefix,
             frontmatter
                 .proposal_id
                 .clone()
@@ -92,9 +133,11 @@ pub fn scan_docs(root: &Path, engine: &GraphEngine) -> Result<usize> {
 
         let properties = serde_json::json!({
             "status": frontmatter.status,
+            "disposition": frontmatter.disposition,
             "domain": frontmatter.domain,
             "doc_type": frontmatter.doc_type,
             "tags": frontmatter.tags,
+            "source_of_truth_targets": frontmatter.source_of_truth_targets,
             "last_updated": frontmatter.last_updated,
         });
 
@@ -106,6 +149,11 @@ pub fn scan_docs(root: &Path, engine: &GraphEngine) -> Result<usize> {
             file_path: Some(rel_path.clone()),
             worktree: String::new(),
             created_at: now,
+                embedding: None,
+                embedding_model: None,
+                embedding_dims: None,
+                embedding_updated: None,
+                embedding_hash: None,
             updated_at: now,
         })?;
         count += 1;
@@ -150,6 +198,11 @@ pub fn scan_docs(root: &Path, engine: &GraphEngine) -> Result<usize> {
                     file_path: None,
                     worktree: String::new(),
                     created_at: now,
+                embedding: None,
+                embedding_model: None,
+                embedding_dims: None,
+                embedding_updated: None,
+                embedding_hash: None,
                     updated_at: now,
                 })?;
                 engine.upsert_edge(&Edge {
@@ -175,6 +228,11 @@ pub fn scan_docs(root: &Path, engine: &GraphEngine) -> Result<usize> {
                     file_path: None,
                     worktree: String::new(),
                     created_at: now,
+                embedding: None,
+                embedding_model: None,
+                embedding_dims: None,
+                embedding_updated: None,
+                embedding_hash: None,
                     updated_at: now,
                 })?;
                 engine.upsert_edge(&Edge {
@@ -185,6 +243,32 @@ pub fn scan_docs(root: &Path, engine: &GraphEngine) -> Result<usize> {
                     worktree: String::new(),
                 })?;
             }
+        }
+
+        // Create edges for task_refs
+        if let Some(tasks) = &frontmatter.task_refs {
+            for task_ref in tasks {
+                let task_id = format!("task:{}", slugify(&task_ref.replace(".md", "")));
+                engine.upsert_edge(&Edge {
+                    source_id: node_id.clone(),
+                    target_id: task_id,
+                    relation: EdgeRelation::References,
+                    properties: serde_json::json!({}),
+                    worktree: String::new(),
+                })?;
+            }
+        }
+
+        // Create UsesSver edge if sver field is present
+        if let Some(sver_ref) = &frontmatter.sver {
+            let sver_target = format!("doc:{}", slugify(sver_ref));
+            engine.upsert_edge(&Edge {
+                source_id: node_id.clone(),
+                target_id: sver_target,
+                relation: EdgeRelation::UsesSver,
+                properties: serde_json::json!({}),
+                worktree: String::new(),
+            })?;
         }
 
         // If this is the SEAM_REGISTRY, parse seam table rows
@@ -256,6 +340,11 @@ fn parse_seam_registry(body: &str, engine: &GraphEngine) -> Result<()> {
                 file_path: Some("docs/architecture/SEAM_REGISTRY.md".into()),
                 worktree: String::new(),
                 created_at: now,
+                embedding: None,
+                embedding_model: None,
+                embedding_dims: None,
+                embedding_updated: None,
+                embedding_hash: None,
                 updated_at: now,
             })?;
 
@@ -270,6 +359,11 @@ fn parse_seam_registry(body: &str, engine: &GraphEngine) -> Result<()> {
                     file_path: None,
                     worktree: String::new(),
                     created_at: now,
+                embedding: None,
+                embedding_model: None,
+                embedding_dims: None,
+                embedding_updated: None,
+                embedding_hash: None,
                     updated_at: now,
                 })?;
                 engine.upsert_edge(&Edge {
@@ -327,6 +421,11 @@ fn parse_task_items(body: &str, engine: &GraphEngine) -> Result<()> {
                 file_path: Some("docs/task.md".into()),
                 worktree: String::new(),
                 created_at: now,
+                embedding: None,
+                embedding_model: None,
+                embedding_dims: None,
+                embedding_updated: None,
+                embedding_hash: None,
                 updated_at: now,
             })?;
         }

@@ -188,12 +188,40 @@ pub fn generate_module_diagram(
 
 // ── Formatting helpers ──
 
+fn extract_generics(signature: &str) -> String {
+    // Extract <T: Bound, U> from "pub struct Foo<T: Debug, U>"
+    if let Some(start) = signature.find('<') {
+        if let Some(end) = signature.find('>') {
+            if end > start {
+                return signature[start..=end].to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+fn simplify_type_path(ty: &str) -> String {
+    // Simplify std::sync::Arc<foo::Bar> -> Arc<Bar>
+    ty.replace("std::", "")
+        .replace("core::", "")
+        .replace("alloc::", "")
+}
+
 fn format_struct_uml(name: &str, signature: &str) -> String {
+    let generics = extract_generics(signature);
+    let display_name = if generics.is_empty() {
+        sanitize_name(name)
+    } else {
+        format!("{}{}", sanitize_name(name), generics)
+    };
+    
     let mut fields = Vec::new();
     for line in signature.lines() {
         let trimmed = line.trim().trim_end_matches(',');
         if trimmed.contains(':') && !trimmed.starts_with("pub struct") && !trimmed.starts_with("struct") {
-            fields.push(format!("  +{}", trimmed));
+            // Simplify field type paths for readability
+            let simplified = simplify_type_path(trimmed);
+            fields.push(format!("  +{}", simplified));
         }
     }
     let body = if fields.is_empty() {
@@ -201,15 +229,33 @@ fn format_struct_uml(name: &str, signature: &str) -> String {
     } else {
         format!("\n{}\n", fields.join("\n"))
     };
-    format!("class {} {{{}}}\n\n", sanitize_name(name), body)
+    format!("class {} {{{}}}\n\n", display_name, body)
 }
 
 fn format_trait_uml(name: &str, signature: &str) -> String {
+    let generics = extract_generics(signature);
+    let display_name = if generics.is_empty() {
+        sanitize_name(name)
+    } else {
+        format!("{}{}", sanitize_name(name), generics)
+    };
+    
     let mut methods = Vec::new();
     for line in signature.lines() {
         let trimmed = line.trim().trim_end_matches(';');
+        // Capture full method signatures including generics
         if trimmed.starts_with("fn ") || trimmed.starts_with("async fn ") {
-            methods.push(format!("  +{}", trimmed));
+            // Extract the full signature up to where body would start
+            let sig = if let Some(where_pos) = trimmed.find("where") {
+                &trimmed[..where_pos].trim()
+            } else if let Some(brace_pos) = trimmed.find('{') {
+                &trimmed[..brace_pos].trim()
+            } else {
+                trimmed
+            };
+            // Simplify return types
+            let simplified = simplify_type_path(sig);
+            methods.push(format!("  +{}", simplified));
         }
     }
     let body = if methods.is_empty() {
@@ -219,12 +265,19 @@ fn format_trait_uml(name: &str, signature: &str) -> String {
     };
     format!(
         "interface {} <<trait>> {{{}}}\n\n",
-        sanitize_name(name),
+        display_name,
         body
     )
 }
 
 fn format_enum_uml(name: &str, signature: &str) -> String {
+    let generics = extract_generics(signature);
+    let display_name = if generics.is_empty() {
+        sanitize_name(name)
+    } else {
+        format!("{}{}", sanitize_name(name), generics)
+    };
+    
     let mut variants = Vec::new();
     for line in signature.lines() {
         let trimmed = line.trim().trim_end_matches(',');
@@ -242,7 +295,7 @@ fn format_enum_uml(name: &str, signature: &str) -> String {
     } else {
         format!("\n{}\n", variants.join("\n"))
     };
-    format!("enum {} {{{}}}\n\n", sanitize_name(name), body)
+    format!("enum {} {{{}}}\n\n", display_name, body)
 }
 
 fn sanitize_name(name: &str) -> String {

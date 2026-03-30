@@ -29,7 +29,12 @@ impl GraphEngine {
                 file_path TEXT,
                 worktree TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                embedding BLOB,              -- Serialized f32 array
+                embedding_model TEXT,        -- Model name, e.g. nomic_embed
+                embedding_dims INTEGER,      -- Dimensionality
+                embedding_updated TEXT,    -- ISO timestamp
+                embedding_hash TEXT          -- Hash of source text
             );
 
             CREATE TABLE IF NOT EXISTS edges (
@@ -98,16 +103,23 @@ impl GraphEngine {
     // ── Node CRUD ──
 
     pub fn upsert_node(&self, node: &Node) -> Result<()> {
+        let embedding_blob = node.embedding.as_ref().map(|v| crate::schema::serialize_embedding(v));
         self.conn.execute(
-            "INSERT INTO nodes (id, kind, name, properties, file_path, worktree, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO nodes (id, kind, name, properties, file_path, worktree, created_at, updated_at,
+                              embedding, embedding_model, embedding_dims, embedding_updated, embedding_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(id) DO UPDATE SET
                 kind=excluded.kind,
                 name=excluded.name,
                 properties=excluded.properties,
                 file_path=excluded.file_path,
                 worktree=excluded.worktree,
-                updated_at=excluded.updated_at",
+                updated_at=excluded.updated_at,
+                embedding=COALESCE(excluded.embedding, nodes.embedding),
+                embedding_model=COALESCE(excluded.embedding_model, nodes.embedding_model),
+                embedding_dims=COALESCE(excluded.embedding_dims, nodes.embedding_dims),
+                embedding_updated=COALESCE(excluded.embedding_updated, nodes.embedding_updated),
+                embedding_hash=COALESCE(excluded.embedding_hash, nodes.embedding_hash)",
             params![
                 node.id,
                 node.kind.as_str(),
@@ -117,6 +129,11 @@ impl GraphEngine {
                 node.worktree,
                 node.created_at.to_rfc3339(),
                 node.updated_at.to_rfc3339(),
+                embedding_blob,
+                node.embedding_model,
+                node.embedding_dims,
+                node.embedding_updated.map(|dt| dt.to_rfc3339()),
+                node.embedding_hash,
             ],
         )?;
         // Update FTS
@@ -131,7 +148,8 @@ impl GraphEngine {
 
     pub fn get_node(&self, id: &str) -> Result<Option<Node>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, kind, name, properties, file_path, worktree, created_at, updated_at
+            "SELECT id, kind, name, properties, file_path, worktree, created_at, updated_at,
+                    embedding, embedding_model, embedding_dims, embedding_updated, embedding_hash
              FROM nodes WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], |row| {
@@ -151,22 +169,26 @@ impl GraphEngine {
     ) -> Result<Vec<Node>> {
         let (sql, params_vec) = match (kind, worktree) {
             (Some(k), Some(w)) => (
-                "SELECT id, kind, name, properties, file_path, worktree, created_at, updated_at
+                "SELECT id, kind, name, properties, file_path, worktree, created_at, updated_at,
+                        embedding, embedding_model, embedding_dims, embedding_updated, embedding_hash
                  FROM nodes WHERE kind = ?1 AND worktree = ?2",
                 vec![k.as_str().to_string(), w.to_string()],
             ),
             (Some(k), None) => (
-                "SELECT id, kind, name, properties, file_path, worktree, created_at, updated_at
+                "SELECT id, kind, name, properties, file_path, worktree, created_at, updated_at,
+                        embedding, embedding_model, embedding_dims, embedding_updated, embedding_hash
                  FROM nodes WHERE kind = ?1",
                 vec![k.as_str().to_string()],
             ),
             (None, Some(w)) => (
-                "SELECT id, kind, name, properties, file_path, worktree, created_at, updated_at
+                "SELECT id, kind, name, properties, file_path, worktree, created_at, updated_at,
+                        embedding, embedding_model, embedding_dims, embedding_updated, embedding_hash
                  FROM nodes WHERE worktree = ?1",
                 vec![w.to_string()],
             ),
             (None, None) => (
-                "SELECT id, kind, name, properties, file_path, worktree, created_at, updated_at
+                "SELECT id, kind, name, properties, file_path, worktree, created_at, updated_at,
+                        embedding, embedding_model, embedding_dims, embedding_updated, embedding_hash
                  FROM nodes",
                 vec![],
             ),
@@ -422,7 +444,8 @@ impl GraphEngine {
     /// Full-text search over nodes by name.
     pub fn search_nodes(&self, query: &str) -> Result<Vec<Node>> {
         let mut stmt = self.conn.prepare(
-            "SELECT n.id, n.kind, n.name, n.properties, n.file_path, n.worktree, n.created_at, n.updated_at
+            "SELECT n.id, n.kind, n.name, n.properties, n.file_path, n.worktree, n.created_at, n.updated_at,
+                    n.embedding, n.embedding_model, n.embedding_dims, n.embedding_updated, n.embedding_hash
              FROM nodes n
              JOIN nodes_fts fts ON n.rowid = fts.rowid
              WHERE nodes_fts MATCH ?1
@@ -452,6 +475,9 @@ fn row_to_node(row: &rusqlite::Row) -> Result<Node> {
     let props_str: String = row.get(3)?;
     let created_str: String = row.get(6)?;
     let updated_str: String = row.get(7)?;
+    let embedding_blob: Option<Vec<u8>> = row.get(8)?;
+    let embedding_updated: Option<String> = row.get(11)?;
+    
     Ok(Node {
         id: row.get(0)?,
         kind: NodeKind::from_str(&kind_str).unwrap_or(NodeKind::Component),
@@ -465,6 +491,13 @@ fn row_to_node(row: &rusqlite::Row) -> Result<Node> {
         updated_at: chrono::DateTime::parse_from_rfc3339(&updated_str)
             .map(|dt| dt.with_timezone(&chrono::Utc))
             .unwrap_or_else(|_| chrono::Utc::now()),
+        embedding: embedding_blob.map(|b| crate::schema::deserialize_embedding(&b)),
+        embedding_model: row.get(9)?,
+        embedding_dims: row.get(10)?,
+        embedding_updated: embedding_updated.and_then(|s| 
+            chrono::DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&chrono::Utc))
+        ),
+        embedding_hash: row.get(12)?,
     })
 }
 
@@ -534,6 +567,11 @@ mod tests {
             worktree: "main".into(),
             created_at: now,
             updated_at: now,
+            embedding: None,
+            embedding_model: None,
+            embedding_dims: None,
+            embedding_updated: None,
+            embedding_hash: None,
         };
 
         engine.upsert_node(&node).unwrap();
