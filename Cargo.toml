@@ -2,6 +2,7 @@
 members = [
     "crates/aiua",
     "crates/membrane",
+    "crates/membrane-discord",
     "crates/philote",
     "crates/model-router",
     "crates/onnx-runner",

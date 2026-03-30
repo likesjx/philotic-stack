@@ -81,6 +81,11 @@ const DESKTOP_MEMBRANE_LEASE_TTL_SECS: u64 = 45;
 #[cfg(test)]
 const DESKTOP_MEMBRANE_LEASE_TTL_SECS: u64 = 1;
 
+#[cfg(not(test))]
+const DISCORD_GATEWAY_LEASE_TTL_SECS: u64 = 45;
+#[cfg(test)]
+const DISCORD_GATEWAY_LEASE_TTL_SECS: u64 = 1;
+
 #[derive(Default)]
 struct SessionEnvelope {
     session_id: Option<String>,
@@ -145,6 +150,7 @@ pub struct IpcServer {
     materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
     telegram_poll_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
     desktop_membrane_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
+    discord_gateway_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
     subagent_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
     subagent_hooks: SubagentHookRegistry,
     registry: Arc<RwLock<NodeRegistry>>,
@@ -269,6 +275,33 @@ impl IpcServer {
             owner_guest_id: owner_guest_id.to_string(),
             owner_hotel: Some(authority_hotel.to_string()),
             owner_component_type: Some("membrane".into()),
+            lease_epoch: 0,
+            lease_expires_at: 0,
+            last_heartbeat_at: 0,
+            status: LeaseStatus::Active,
+            delegated_from: None,
+            metadata: serde_json::json!({
+                "agent_id": agent_id,
+                "authority_node_id": local_node_id,
+            }),
+        }
+    }
+
+    fn discord_gateway_lease(
+        lease_key: &str,
+        authority_hotel: &str,
+        local_node_id: &str,
+        owner_guest_id: &str,
+        agent_id: &str,
+    ) -> LeaseEnvelope {
+        LeaseEnvelope {
+            lease_type: "discord_gateway".into(),
+            lease_scope: lease_key.to_string(),
+            authority_hotel: authority_hotel.to_string(),
+            authority_component: Some("aiua".into()),
+            owner_guest_id: owner_guest_id.to_string(),
+            owner_hotel: Some(authority_hotel.to_string()),
+            owner_component_type: Some("membrane.discord".into()),
             lease_epoch: 0,
             lease_expires_at: 0,
             last_heartbeat_at: 0,
@@ -1283,6 +1316,39 @@ impl IpcServer {
         );
     }
 
+    fn drop_stale_discord_gateway_lease_if_needed(
+        guard: &mut RuntimeLeaseRegistry,
+        graph: &GraphDomain,
+        local_node_id: &str,
+        lease_key: &str,
+    ) {
+        let mut observer = LoggingLeaseObserver;
+        let _ = guard.drop_if_stale(
+            lease_key,
+            |existing| {
+                Self::discord_gateway_lease_is_expired(existing)
+                    || !Self::discord_gateway_lease_owner_is_live(
+                        graph,
+                        local_node_id,
+                        &existing.owner_guest_id,
+                    )
+            },
+            &mut observer,
+        );
+    }
+
+    fn discord_gateway_lease_is_expired(lease: &LeaseEnvelope) -> bool {
+        lease.lease_expires_at > 0 && unix_ts() > lease.lease_expires_at
+    }
+
+    fn discord_gateway_lease_owner_is_live(
+        graph: &GraphDomain,
+        local_node_id: &str,
+        owner_guest_id: &str,
+    ) -> bool {
+        Self::telegram_poll_lease_owner_is_live(graph, local_node_id, owner_guest_id)
+    }
+
     async fn write_frame<W: AsyncWriteExt + Unpin>(
         writer: &mut W,
         payload: &[u8],
@@ -1326,6 +1392,7 @@ impl IpcServer {
             materialization_requester: None,
             telegram_poll_leases: Arc::new(Mutex::new(RuntimeLeaseRegistry::default())),
             desktop_membrane_leases: Arc::new(Mutex::new(RuntimeLeaseRegistry::default())),
+            discord_gateway_leases: Arc::new(Mutex::new(RuntimeLeaseRegistry::default())),
             subagent_leases: Arc::new(Mutex::new(RuntimeLeaseRegistry::default())),
             subagent_hooks: Arc::new(Mutex::new(HashMap::new())),
             registry: Arc::new(RwLock::new(NodeRegistry::new())),
@@ -1377,6 +1444,7 @@ impl IpcServer {
                     let materialization_requester = self.materialization_requester.clone();
                     let telegram_poll_leases = self.telegram_poll_leases.clone();
                     let desktop_membrane_leases = self.desktop_membrane_leases.clone();
+                    let discord_gateway_leases = self.discord_gateway_leases.clone();
                     let subagent_leases = self.subagent_leases.clone();
                     let subagent_hooks = self.subagent_hooks.clone();
                     let registry = self.registry.clone();
@@ -1393,6 +1461,7 @@ impl IpcServer {
                             materialization_requester,
                             telegram_poll_leases,
                             desktop_membrane_leases,
+                            discord_gateway_leases,
                             subagent_leases,
                             subagent_hooks,
                             registry,
@@ -1422,6 +1491,7 @@ impl IpcServer {
         materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
         telegram_poll_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
         desktop_membrane_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
+        discord_gateway_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
         subagent_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
         subagent_hooks: SubagentHookRegistry,
         registry: Arc<RwLock<NodeRegistry>>,
@@ -1455,6 +1525,7 @@ impl IpcServer {
                     Self::remove_subscriptions(&inboxes, conn_id, &subscribed_roles).await;
                     Self::remove_telegram_poll_leases(&telegram_poll_leases, conn_id).await;
                     Self::remove_desktop_membrane_leases(&desktop_membrane_leases, conn_id).await;
+                    Self::remove_discord_gateway_leases(&discord_gateway_leases, conn_id).await;
                     let _ = write_task.await;
                     return Ok(());
                 }
@@ -1481,6 +1552,7 @@ impl IpcServer {
                             materialization_requester.as_deref(),
                             &telegram_poll_leases,
                             &desktop_membrane_leases,
+                            &discord_gateway_leases,
                             &subagent_leases,
                             &subagent_hooks,
                             &registry,
@@ -1582,6 +1654,22 @@ impl IpcServer {
             .map(|lease| lease.lease_scope)
             .collect();
         let mut observer = LoggingDesktopMembraneLeaseObserver;
+        for scope in scopes {
+            let _ = guard.release(&scope, conn_id, &mut observer);
+        }
+    }
+
+    async fn remove_discord_gateway_leases(
+        discord_gateway_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
+        conn_id: Uuid,
+    ) {
+        let mut guard = discord_gateway_leases.lock().await;
+        let scopes: Vec<String> = guard
+            .active_leases_for_connection(conn_id)
+            .into_iter()
+            .map(|lease| lease.lease_scope)
+            .collect();
+        let mut observer = LoggingLeaseObserver;
         for scope in scopes {
             let _ = guard.release(&scope, conn_id, &mut observer);
         }
@@ -2139,6 +2227,7 @@ impl IpcServer {
         materialization_requester: Option<&dyn GuestMaterializationRequester>,
         telegram_poll_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
         desktop_membrane_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
+        discord_gateway_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
         subagent_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
         subagent_hooks: &SubagentHookRegistry,
         registry: &Arc<RwLock<NodeRegistry>>,
@@ -3087,6 +3176,215 @@ impl IpcServer {
                         ),
                     ),
                     None => IpcResponse::success("desktop_membrane_lease_release", None),
+                }
+            }
+            IpcRequest::AcquireDiscordGatewayLease { lease_key, agent_id } => {
+                let Some(identity) = current_identity.as_ref() else {
+                    return IpcResponse::error(
+                        "discord_gateway_lease",
+                        "LEASE_UNREGISTERED",
+                        "guest must register before acquiring a Discord gateway lease",
+                    );
+                };
+                let Some(agent_identity) = graph.get_agent_identity(&agent_id).ok().flatten()
+                else {
+                    return IpcResponse::error(
+                        "discord_gateway_lease",
+                        "LEASE_AGENT_UNKNOWN",
+                        format!("no agent identity found for [{}]", agent_id),
+                    );
+                };
+                let Some(local_hotel_name) = Self::local_hotel_name(graph, local_node_id) else {
+                    return IpcResponse::error(
+                        "discord_gateway_lease",
+                        "LEASE_AUTHORITY_UNKNOWN",
+                        format!(
+                            "current hotel authority could not be resolved for node [{}]",
+                            local_node_id
+                        ),
+                    );
+                };
+                if !Self::hotel_may_poll_for_agent(&agent_identity, &local_hotel_name) {
+                    return IpcResponse::error(
+                        "discord_gateway_lease",
+                        "LEASE_FOREIGN_AUTHORITY",
+                        format!(
+                            "agent [{}] is owned by hotel [{}] and hotel [{}] is not authorized",
+                            agent_id, agent_identity.authority_hotel, local_hotel_name
+                        ),
+                    );
+                }
+
+                let mut guard = discord_gateway_leases.lock().await;
+                Self::drop_stale_discord_gateway_lease_if_needed(
+                    &mut guard,
+                    graph,
+                    local_node_id,
+                    &lease_key,
+                );
+                let candidate = Self::discord_gateway_lease(
+                    &lease_key,
+                    &local_hotel_name,
+                    local_node_id,
+                    &identity.guest_id,
+                    &agent_id,
+                );
+                let mut observer = LoggingLeaseObserver;
+                match guard.acquire(
+                    conn_id,
+                    candidate,
+                    DISCORD_GATEWAY_LEASE_TTL_SECS,
+                    unix_ts(),
+                    &mut observer,
+                ) {
+                    LeaseAcquireOutcome::Granted(lease) => IpcResponse::DiscordGatewayLease {
+                        granted: true,
+                        lease: Some(lease),
+                    },
+                    LeaseAcquireOutcome::Denied(lease) => {
+                        info!(
+                            "Discord gateway lease [{}] denied for guest [{}]; held by [{}] epoch {}.",
+                            lease.lease_scope,
+                            identity.guest_id,
+                            lease.owner_guest_id,
+                            lease.lease_epoch
+                        );
+                        IpcResponse::DiscordGatewayLease {
+                            granted: false,
+                            lease: Some(lease),
+                        }
+                    }
+                }
+            }
+            IpcRequest::GetDiscordGatewayLeaseOwner { lease_key } => {
+                let mut guard = discord_gateway_leases.lock().await;
+                Self::drop_stale_discord_gateway_lease_if_needed(
+                    &mut guard,
+                    graph,
+                    local_node_id,
+                    &lease_key,
+                );
+                if let Some(existing) = guard.inspect(&lease_key) {
+                    IpcResponse::DiscordGatewayLeaseStatus {
+                        active: true,
+                        lease: Some(existing),
+                    }
+                } else {
+                    IpcResponse::DiscordGatewayLeaseStatus {
+                        active: false,
+                        lease: None,
+                    }
+                }
+            }
+            IpcRequest::RenewDiscordGatewayLease { lease_key, agent_id, lease_epoch } => {
+                let Some(identity) = current_identity.as_ref() else {
+                    return IpcResponse::error(
+                        "discord_gateway_lease",
+                        "LEASE_UNREGISTERED",
+                        "guest must register before renewing a Discord gateway lease",
+                    );
+                };
+                let Some(agent_identity) = graph.get_agent_identity(&agent_id).ok().flatten()
+                else {
+                    return IpcResponse::error(
+                        "discord_gateway_lease",
+                        "LEASE_AGENT_UNKNOWN",
+                        format!("no agent identity found for [{}]", agent_id),
+                    );
+                };
+                let Some(local_hotel_name) = Self::local_hotel_name(graph, local_node_id) else {
+                    return IpcResponse::error(
+                        "discord_gateway_lease",
+                        "LEASE_AUTHORITY_UNKNOWN",
+                        format!(
+                            "current hotel authority could not be resolved for node [{}]",
+                            local_node_id
+                        ),
+                    );
+                };
+                if !Self::hotel_may_poll_for_agent(&agent_identity, &local_hotel_name) {
+                    return IpcResponse::error(
+                        "discord_gateway_lease",
+                        "LEASE_FOREIGN_AUTHORITY",
+                        format!(
+                            "agent [{}] is owned by hotel [{}] and hotel [{}] is not authorized",
+                            agent_id, agent_identity.authority_hotel, local_hotel_name
+                        ),
+                    );
+                }
+
+                let mut guard = discord_gateway_leases.lock().await;
+                Self::drop_stale_discord_gateway_lease_if_needed(
+                    &mut guard,
+                    graph,
+                    local_node_id,
+                    &lease_key,
+                );
+                let mut observer = LoggingLeaseObserver;
+                match guard.renew(
+                    &lease_key,
+                    conn_id,
+                    lease_epoch,
+                    DISCORD_GATEWAY_LEASE_TTL_SECS,
+                    unix_ts(),
+                    &mut observer,
+                ) {
+                    LeaseRenewOutcome::Renewed(lease) => IpcResponse::DiscordGatewayLease {
+                        granted: true,
+                        lease: Some(lease),
+                    },
+                    LeaseRenewOutcome::Lost(lease) => {
+                        if let Some(ref lease) = lease {
+                            info!(
+                                "Discord gateway lease [{}] renew denied for guest [{}]; held by [{}] epoch {}.",
+                                lease.lease_scope,
+                                identity.guest_id,
+                                lease.owner_guest_id,
+                                lease.lease_epoch
+                            );
+                        }
+                        IpcResponse::DiscordGatewayLease {
+                            granted: false,
+                            lease,
+                        }
+                    }
+                }
+            }
+            IpcRequest::ReleaseDiscordGatewayLease { lease_key } => {
+                let Some(identity) = current_identity.as_ref() else {
+                    return IpcResponse::error(
+                        "discord_gateway_lease",
+                        "LEASE_UNREGISTERED",
+                        "guest must register before releasing a Discord gateway lease",
+                    );
+                };
+
+                let mut guard = discord_gateway_leases.lock().await;
+                let mut observer = LoggingLeaseObserver;
+                match guard.inspect(&lease_key) {
+                    Some(existing) if existing.owner_guest_id == identity.guest_id => {
+                        if guard.release(&lease_key, conn_id, &mut observer).is_some() {
+                            IpcResponse::success("discord_gateway_lease_release", None)
+                        } else {
+                            IpcResponse::error(
+                                "discord_gateway_lease_release",
+                                "LEASE_NOT_OWNER",
+                                format!(
+                                    "guest [{}] does not hold the active connection for lease [{}]",
+                                    identity.guest_id, lease_key
+                                ),
+                            )
+                        }
+                    }
+                    Some(existing) => IpcResponse::error(
+                        "discord_gateway_lease_release",
+                        "LEASE_NOT_OWNER",
+                        format!(
+                            "guest [{}] cannot release lease [{}] owned by [{}]",
+                            identity.guest_id, lease_key, existing.owner_guest_id
+                        ),
+                    ),
+                    None => IpcResponse::success("discord_gateway_lease_release", None),
                 }
             }
             IpcRequest::ReleaseTelegramPollLease { lease_key } => {
