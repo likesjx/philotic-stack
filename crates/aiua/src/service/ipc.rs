@@ -812,6 +812,14 @@ fn project_effective_rights(bindings: &serde_json::Value) -> Vec<String> {
         })
         .unwrap_or_default();
 
+    // Only project rights when there is an explicit toolset or skillset configured.
+    // When both are empty the session has no profile yet; returning empty lets
+    // downstream consumers (philote's default_visible_toolset) use their own
+    // defaults without the rights filter stripping them out.
+    if toolset.is_empty() && skillset.is_empty() {
+        return Vec::new();
+    }
+
     let mut rights = Vec::new();
     rights.extend(toolset.iter().map(|tool_name| tool_right(tool_name)));
     rights.extend(skillset.iter().map(|skill_name| skill_right(skill_name)));
