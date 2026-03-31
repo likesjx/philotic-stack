@@ -16,7 +16,7 @@ use aes_gcm::{
     Aes256Gcm, Key, Nonce as AesNonce,
 };
 use chacha20poly1305::{
-    aead::{Aead as ChachaAead, KeyInit as ChachaKeyInit},
+    aead::{Aead as _, KeyInit as _},
     XChaCha20Poly1305,
     XNonce,
 };
@@ -68,6 +68,10 @@ impl VoiceEncryptionState {
             secret_key,
             nonce_counter: 0,
         }
+    }
+
+    pub fn secret_key(&self) -> &[u8] {
+        &self.secret_key
     }
 
     /// Encrypt an Opus payload for outbound RTP.
