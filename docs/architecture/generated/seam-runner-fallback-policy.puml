@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - runner-fallback-policy
+
+rectangle "runner-fallback-policy" as runner_fallback_policy #Orange {
+}
+
+
+@enduml

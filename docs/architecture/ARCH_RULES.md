@@ -1,15 +1,15 @@
 ---
-title: "Architectural Rule Registry"
+title: Architectural Rule Registry
 doc_type: reference
 domain: governance
 status: active
-last_updated: 2026-03-29
+last_updated: 2026-03-31
 tags:
-  - rules
-  - governance
-  - architecture
+- rules
+- governance
+- architecture
 related_docs:
-  - ARCH_RULES_AND_ROADMAP_PROPOSAL.md
+- ARCH_RULES_AND_ROADMAP_PROPOSAL.md
 ---
 
 # Architectural Rule Registry

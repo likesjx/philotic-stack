@@ -1,31 +1,31 @@
 ---
-title: "Pluggable Context Engine Proposal"
+title: Pluggable Context Engine Proposal
 doc_type: proposal
 domain: memory-context
 status: accepted-current-slice
-last_updated: 2026-03-12
+last_updated: 2026-03-31
 tags:
-  - context
-  - engine
-  - assembly
-  - memory
-  - active-seam
+- context
+- engine
+- assembly
+- memory
+- active-seam
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - ARCHITECTURE.md
-  - MEMORY_ENGINE_ABSTRACTION_PROPOSAL.md
-  - AGENT_PLUGIN_HOOKS_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
+- MEMORY_ENGINE_ABSTRACTION_PROPOSAL.md
+- AGENT_PLUGIN_HOOKS_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: pluggable-context-engine
 implements: []
 implemented_by: []
 active_seams:
-  - context-engine-contract
-  - deterministic-context-assembly
+- context-engine-contract
+- deterministic-context-assembly
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
-  - ARCHITECTURE.md
+- ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
 ---
 
 # Pluggable Context Engine Proposal

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - artifact-distribution-rollout
+
+rectangle "artifact-distribution-rollout" as artifact_distribution_rollout #Orange {
+}
+
+
+@enduml

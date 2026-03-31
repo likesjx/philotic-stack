@@ -1,25 +1,25 @@
 ---
-title: "Embeddings Training Data from Graph Intelligence"
+title: Embeddings Training Data from Graph Intelligence
 doc_type: proposal
 domain: memory-context
 status: proposed
-last_updated: 2026-03-29
+last_updated: 2026-03-31
 tags:
-  - embeddings
-  - rl-training
-  - graph-intelligence
-  - feedback-loop
-  - model-router
+- embeddings
+- rl-training
+- graph-intelligence
+- feedback-loop
+- model-router
 related_docs:
-  - EMBEDDINGS_IN_GRAPH_PROPOSAL.md
-  - LOCAL_ONNX_INFERENCE_PROPOSAL.md
-  - GRAPH_INTELLIGENCE_PROPOSAL.md
-  - AGENT_RESOURCE_MODEL_PROPOSAL.md
+- EMBEDDINGS_IN_GRAPH_PROPOSAL.md
+- LOCAL_ONNX_INFERENCE_PROPOSAL.md
+- GRAPH_INTELLIGENCE_PROPOSAL.md
+- AGENT_RESOURCE_MODEL_PROPOSAL.md
 proposal_id: embeddings-training-data
 active_seams:
-  - training-signal-capture
-  - embedding-drift-detection
-  - semantic-feedback-loop
+- training-signal-capture
+- embedding-drift-detection
+- semantic-feedback-loop
 ---
 
 # Embeddings Training Data from Graph Intelligence

@@ -2,18 +2,18 @@
 doc_type: architecture
 domain: operator-control-plane
 status: draft
-last_updated: 2026-03-29
+last_updated: 2026-03-31
 tags:
-  - operator
-  - control
-  - admin
-  - ui
-  - workstream
+- operator
+- control
+- admin
+- ui
+- workstream
 refs:
-  - CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL
-  - ROLE_POSTURE_AND_ADMIN_PROPOSAL
-  - APPROVAL_UX_PROPOSAL
-  - AGENT_WORKSTREAM_TRACKING_PROPOSAL
+- CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL
+- ROLE_POSTURE_AND_ADMIN_PROPOSAL
+- APPROVAL_UX_PROPOSAL
+- AGENT_WORKSTREAM_TRACKING_PROPOSAL
 ---
 
 # Operator Control Plane Architecture

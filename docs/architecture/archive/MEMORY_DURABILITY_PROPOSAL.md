@@ -1,23 +1,23 @@
 ---
-title: "Memory Durability Proposal"
+title: Memory Durability Proposal
 doc_type: proposal
 domain: memory-context
 status: proposed
-last_updated: 2026-03-15
+last_updated: 2026-03-31
 tags:
-  - memory
-  - durability
-  - replication
-  - mesh
-  - muninn
-  - write-ahead-log
+- memory
+- durability
+- replication
+- mesh
+- muninn
+- write-ahead-log
 related_docs:
-  - PHILOTE_MEMORY_CORE_PROPOSAL.md
-  - ARCHITECTURE.md
-  - MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md
+- PHILOTE_MEMORY_CORE_PROPOSAL.md
+- ARCHITECTURE.md
+- MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md
 proposal_id: memory-durability
 implements:
-  - philote-memory-core
+- philote-memory-core
 ---
 
 # Memory Durability Proposal

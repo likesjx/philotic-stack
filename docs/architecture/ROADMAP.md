@@ -1,16 +1,16 @@
 ---
-title: "Seam Roadmap"
+title: Seam Roadmap
 doc_type: reference
 domain: governance
 status: active
-last_updated: 2026-03-26
+last_updated: 2026-03-31
 tags:
-  - roadmap
-  - seams
-  - dependencies
+- roadmap
+- seams
+- dependencies
 related_docs:
-  - SEAM_REGISTRY.md
-  - ARCH_RULES_AND_ROADMAP_PROPOSAL.md
+- SEAM_REGISTRY.md
+- ARCH_RULES_AND_ROADMAP_PROPOSAL.md
 ---
 
 # Seam Roadmap

@@ -2,11 +2,11 @@
 domain: memory-context
 status: in-progress
 disposition: accepted for current slice
-last_updated: 2026-03-29
+last_updated: 2026-03-31
 active_seams:
-  - onnx-runner-embed-surface
-  - model-router-embed-kind
-  - graph-intel-embed-mcp
+- onnx-runner-embed-surface
+- model-router-embed-kind
+- graph-intel-embed-mcp
 ---
 
 # Embeddings in Graph Proposal

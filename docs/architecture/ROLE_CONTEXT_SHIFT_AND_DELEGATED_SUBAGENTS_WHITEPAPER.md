@@ -1,35 +1,35 @@
 ---
-title: "Role Context Shift And Delegated Subagents Whitepaper"
+title: Role Context Shift And Delegated Subagents Whitepaper
 doc_type: proposal
 domain: runtime-sessions
 status: proposed
-last_updated: 2026-03-13
+last_updated: 2026-03-31
 tags:
-  - roles
-  - subagents
-  - context
-  - delegation
-  - active-seam
+- roles
+- subagents
+- context
+- delegation
+- active-seam
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - AGENT_INCARNATION_PROPOSAL.md
-  - GOVERNED_WORKFLOW_SKILLS_PROPOSAL.md
-  - ROLE_ACTIVATION_AND_SUBAGENT_CONTRACTS_PROPOSAL.md
-  - ROLE_POSTURE_AND_ADMIN_PROPOSAL.md
-  - PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md
-  - MEMORY_RELATION_LIFECYCLE_WHITEPAPER.md
+- ARCHITECTURE_STATUS.md
+- AGENT_INCARNATION_PROPOSAL.md
+- GOVERNED_WORKFLOW_SKILLS_PROPOSAL.md
+- ROLE_ACTIVATION_AND_SUBAGENT_CONTRACTS_PROPOSAL.md
+- ROLE_POSTURE_AND_ADMIN_PROPOSAL.md
+- PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md
+- MEMORY_RELATION_LIFECYCLE_WHITEPAPER.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: role-context-shift-subagents
 implements: []
 implemented_by: []
 active_seams:
-  - role-context-shift
-  - delegated-subagent-contract
-  - concurrent-role-materialization
+- role-context-shift
+- delegated-subagent-contract
+- concurrent-role-materialization
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
-  - ARCHITECTURE.md
+- ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
 ---
 
 # Role Context Shift And Delegated Subagents Whitepaper

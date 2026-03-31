@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - wider-client-adoption
+
+rectangle "wider-client-adoption" as wider_client_adoption #Orange {
+}
+
+
+@enduml

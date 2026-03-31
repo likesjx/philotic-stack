@@ -3,6 +3,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use chrono::Utc;
+use regex::Regex;
 use serde::Deserialize;
 use walkdir::WalkDir;
 
@@ -312,6 +313,9 @@ fn parse_frontmatter(content: &str) -> (DocFrontmatter, String) {
 fn parse_seam_registry(body: &str, engine: &GraphEngine) -> Result<()> {
     let now = Utc::now();
 
+    // Regex to extract [Name.md](path) or just Name.md
+    let proposal_ref_regex = Regex::new(r"\[([^\]]+\.md)\]\([^)]*\)|([^\s]+\.md)").unwrap();
+
     for line in body.lines() {
         let line = line.trim();
         if !line.starts_with('|') || line.starts_with("| ---") || line.starts_with("| Seam") {
@@ -350,6 +354,25 @@ fn parse_seam_registry(body: &str, engine: &GraphEngine) -> Result<()> {
                 embedding_hash: None,
                 updated_at: now,
             })?;
+
+            // Create edge to proposal if proposal_ref contains a markdown link
+            if !proposal_ref.is_empty() {
+                // Extract proposal ID from markdown link [Name.md](path) or just Name.md
+                let proposal_id = if let Some(caps) = proposal_ref_regex.captures(proposal_ref) {
+                    caps.get(1).map(|m| m.as_str()).unwrap_or(proposal_ref)
+                } else {
+                    proposal_ref
+                };
+                let proposal_slug = slugify(&proposal_id.replace(".md", ""));
+                let proposal_node_id = format!("doc:{}", proposal_slug);
+                engine.upsert_edge(&Edge {
+                    source_id: node_id.clone(),
+                    target_id: proposal_node_id,
+                    relation: EdgeRelation::References,
+                    properties: serde_json::json!({"ref_type": "proposal"}),
+                    worktree: String::new(),
+                })?;
+            }
 
             // Create domain node and edge
             if !domain.is_empty() {

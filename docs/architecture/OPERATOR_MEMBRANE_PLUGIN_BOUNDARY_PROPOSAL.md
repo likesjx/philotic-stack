@@ -1,33 +1,33 @@
 ---
-title: "Operator Membrane Plugin Boundary Proposal"
+title: Operator Membrane Plugin Boundary Proposal
 doc_type: proposal
 domain: membrane-transport
 status: proposed
-last_updated: 2026-03-20
+last_updated: 2026-03-31
 tags:
-  - membrane
-  - operator-surface
-  - desktop
-  - plugin-boundary
-  - control-plane
+- membrane
+- operator-surface
+- desktop
+- plugin-boundary
+- control-plane
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - DESKTOP_MEMBRANE_PROPOSAL.md
-  - MEMBRANE_COMPONENT_PROPOSAL.md
-  - CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md
-  - PHILOTIC_WEB_PROPOSAL.md
-  - ROUTED_OPERATOR_CHAT_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- DESKTOP_MEMBRANE_PROPOSAL.md
+- MEMBRANE_COMPONENT_PROPOSAL.md
+- CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md
+- PHILOTIC_WEB_PROPOSAL.md
+- ROUTED_OPERATOR_CHAT_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: operator-membrane-plugin-boundary
 implements:
-  - membrane-component
+- membrane-component
 implemented_by: []
 active_seams:
-  - desktop-membrane-boundary
-  - operator-membrane-plugin-boundary
+- desktop-membrane-boundary
+- operator-membrane-plugin-boundary
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
+- ARCHITECTURE_STATUS.md
 ---
 
 # Operator Membrane Plugin Boundary Proposal

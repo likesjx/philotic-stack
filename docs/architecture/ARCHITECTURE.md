@@ -1,27 +1,27 @@
 ---
-title: "Philotic Stack Architecture Reference"
+title: Philotic Stack Architecture Reference
 doc_type: reference
 domain: runtime-sessions
 status: active
-last_updated: 2026-03-12
+last_updated: 2026-03-31
 tags:
-  - runtime
-  - reference
-  - hotel
-  - ipc
-  - mesh
+- runtime
+- reference
+- hotel
+- ipc
+- mesh
 related_docs:
-  - README.md
-  - ARCHITECTURE_STATUS.md
-  - PORT_BLUEPRINT.md
+- README.md
+- ARCHITECTURE_STATUS.md
+- PORT_BLUEPRINT.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 tracks_domains:
-  - runtime-sessions
-  - membrane-transport
-  - mesh-placement
-  - tooling-execution
-  - deployment-distribution
+- runtime-sessions
+- membrane-transport
+- mesh-placement
+- tooling-execution
+- deployment-distribution
 ---
 
 # Philotic Stack — Architecture Reference

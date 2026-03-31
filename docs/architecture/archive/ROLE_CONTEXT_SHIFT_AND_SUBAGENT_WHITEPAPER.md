@@ -1,35 +1,35 @@
 ---
-title: "Role Context Shift And Subagent Whitepaper"
+title: Role Context Shift And Subagent Whitepaper
 doc_type: proposal
 domain: runtime-sessions
 status: proposed
-last_updated: 2026-03-13
+last_updated: 2026-03-31
 tags:
-  - roles
-  - incarnations
-  - subagents
-  - delegation
-  - context
-  - active-seam
+- roles
+- incarnations
+- subagents
+- delegation
+- context
+- active-seam
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - AGENT_INCARNATION_PROPOSAL.md
-  - GOVERNED_WORKFLOW_SKILLS_PROPOSAL.md
-  - ROLE_POSTURE_AND_ADMIN_PROPOSAL.md
-  - PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md
-  - MODEL_CONTROLLER_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- AGENT_INCARNATION_PROPOSAL.md
+- GOVERNED_WORKFLOW_SKILLS_PROPOSAL.md
+- ROLE_POSTURE_AND_ADMIN_PROPOSAL.md
+- PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md
+- MODEL_CONTROLLER_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: role-context-shift-subagent-whitepaper
 implements: []
 implemented_by: []
 active_seams:
-  - context-swapped-roles
-  - delegated-subagent-execution
-  - role-vs-subagent-boundary
+- context-swapped-roles
+- delegated-subagent-execution
+- role-vs-subagent-boundary
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
-  - ARCHITECTURE.md
+- ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
 ---
 
 # Role Context Shift And Subagent Whitepaper

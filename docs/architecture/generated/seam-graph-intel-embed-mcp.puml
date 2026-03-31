@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - graph-intel-embed-mcp
+
+rectangle "graph-intel-embed-mcp" as graph_intel_embed_mcp #Orange {
+}
+
+
+@enduml

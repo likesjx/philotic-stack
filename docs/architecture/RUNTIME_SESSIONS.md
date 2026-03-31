@@ -2,17 +2,17 @@
 doc_type: architecture
 domain: runtime-sessions
 status: draft
-last_updated: 2026-03-29
+last_updated: 2026-03-31
 tags:
-  - runtime
-  - sessions
-  - aiua
-  - philote
-  - leases
+- runtime
+- sessions
+- aiua
+- philote
+- leases
 refs:
-  - RUNTIME_AUTHORITY_LEASES_PROPOSAL
-  - AGENT_WORKFLOW_PROPOSAL
-  - AGENT_WORKSTREAM_TRACKING_PROPOSAL
+- RUNTIME_AUTHORITY_LEASES_PROPOSAL
+- AGENT_WORKFLOW_PROPOSAL
+- AGENT_WORKSTREAM_TRACKING_PROPOSAL
 ---
 
 # Runtime Sessions Architecture

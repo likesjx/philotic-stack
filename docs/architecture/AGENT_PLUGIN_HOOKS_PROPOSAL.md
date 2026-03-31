@@ -1,31 +1,31 @@
 ---
-title: "Agent Plugin Hooks Proposal"
+title: Agent Plugin Hooks Proposal
 doc_type: proposal
 domain: tooling-execution
 status: accepted-current-slice
-last_updated: 2026-03-12
+last_updated: 2026-03-31
 tags:
-  - hooks
-  - plugins
-  - agent-core
-  - extensibility
-  - active-seam
+- hooks
+- plugins
+- agent-core
+- extensibility
+- active-seam
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md
-  - MEMORY_ENGINE_ABSTRACTION_PROPOSAL.md
-  - TASK_RUNNER_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md
+- MEMORY_ENGINE_ABSTRACTION_PROPOSAL.md
+- TASK_RUNNER_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: agent-plugin-hooks
 implements: []
 implemented_by: []
 active_seams:
-  - agent-hook-registry
-  - transcription-hook-extraction
+- agent-hook-registry
+- transcription-hook-extraction
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
-  - ARCHITECTURE.md
+- ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
 ---
 
 # Agent Plugin Hooks Proposal

@@ -1,32 +1,32 @@
 ---
-title: "Philotic Tool Assembly and Execution Proposal"
+title: Philotic Tool Assembly and Execution Proposal
 doc_type: proposal
 domain: tooling-execution
 status: accepted-current-slice
-last_updated: 2026-03-12
+last_updated: 2026-03-31
 tags:
-  - tools
-  - execution
-  - routing
-  - runners
-  - active-seam
+- tools
+- execution
+- routing
+- runners
+- active-seam
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - TASK_RUNNER_PROPOSAL.md
-  - TOOL_MANAGEMENT_PLANE_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- TASK_RUNNER_PROPOSAL.md
+- TOOL_MANAGEMENT_PLANE_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: tool-assembly-execution
 implements: []
 implemented_by:
-  - tool-assembly-routing-slice
-  - allowed-runner-incarnations-slice
+- tool-assembly-routing-slice
+- allowed-runner-incarnations-slice
 active_seams:
-  - route-readiness-checks
-  - runner-fallback-policy
+- route-readiness-checks
+- runner-fallback-policy
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
-  - ARCHITECTURE.md
+- ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
 ---
 
 # Philotic Tool Assembly and Execution Proposal

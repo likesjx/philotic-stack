@@ -1,32 +1,32 @@
 ---
-title: "Philotic Telegram Integration Proposal"
+title: Philotic Telegram Integration Proposal
 doc_type: proposal
 domain: membrane-transport
 status: accepted-current-slice
-last_updated: 2026-03-12
+last_updated: 2026-03-31
 tags:
-  - telegram
-  - membrane
-  - transport
-  - multimodal
-  - current-slice
+- telegram
+- membrane
+- transport
+- multimodal
+- current-slice
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - TELEGRAM_POLL_LEASE_PROPOSAL.md
-  - MEMBRANE_COMPONENT_PROPOSAL.md
-  - SLASH_COMMANDS_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- TELEGRAM_POLL_LEASE_PROPOSAL.md
+- MEMBRANE_COMPONENT_PROPOSAL.md
+- SLASH_COMMANDS_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: telegram-integration
 implements: []
 implemented_by:
-  - telegram-normalized-ingress-slice
-  - telegram-media-startup-smoke-slice
+- telegram-normalized-ingress-slice
+- telegram-media-startup-smoke-slice
 active_seams:
-  - webhook-security-contract
-  - watched-live-telegram-validation
+- webhook-security-contract
+- watched-live-telegram-validation
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
+- ARCHITECTURE_STATUS.md
 ---
 
 # Philotic Telegram Integration Proposal

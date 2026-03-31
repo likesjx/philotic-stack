@@ -1,30 +1,30 @@
 ---
-title: "Muninn Memory Protocol Proposal"
+title: Muninn Memory Protocol Proposal
 doc_type: proposal
 domain: memory-context
 status: accepted-current-slice
-last_updated: 2026-03-15
+last_updated: 2026-03-31
 tags:
-  - muninn
-  - memory
-  - protocol
-  - continuity
-  - active-seam
+- muninn
+- memory
+- protocol
+- continuity
+- active-seam
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - MUNINN_CLIENT_MEMORY_PROTOCOL.md
-  - AGENT_WORKFLOW_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- MUNINN_CLIENT_MEMORY_PROTOCOL.md
+- AGENT_WORKFLOW_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: muninn-memory-protocol
 implements: []
 implemented_by:
-  - muninn-helper-and-skill-slice
+- muninn-helper-and-skill-slice
 active_seams:
-  - wider-client-adoption
-  - philotic-native-memory-integration
+- wider-client-adoption
+- philotic-native-memory-integration
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
+- ARCHITECTURE_STATUS.md
 ---
 
 # Muninn Memory Protocol Proposal

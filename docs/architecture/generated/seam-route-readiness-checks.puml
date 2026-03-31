@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - route-readiness-checks
+
+rectangle "route-readiness-checks" as route_readiness_checks #Orange {
+}
+
+
+@enduml

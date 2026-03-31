@@ -1,22 +1,22 @@
 ---
-title: "Philotic Seam Registry"
+title: Philotic Seam Registry
 doc_type: workflow
-domain: workflow-docs
+domain: '`tooling-execution`'
 status: active
-last_updated: 2026-03-29
+last_updated: 2026-03-31
 tags:
-  - seams
-  - ids
-  - docs
-  - planning
+- seams
+- ids
+- docs
+- planning
 related_docs:
-  - README.md
-  - DOMAIN_MAP.md
-  - ARCHITECTURE_STATUS.md
-  - DOC_TAGGING_FRONTMATTER_PROPOSAL.md
-  - GRAPH_AS_SOURCE_OF_TRUTH.md
-  - GLOSSARY.md
-  - docs/task.md
+- README.md
+- DOMAIN_MAP.md
+- ARCHITECTURE_STATUS.md
+- DOC_TAGGING_FRONTMATTER_PROPOSAL.md
+- GRAPH_AS_SOURCE_OF_TRUTH.md
+- GLOSSARY.md
+- docs/task.md
 ---
 
 # Philotic Seam Registry

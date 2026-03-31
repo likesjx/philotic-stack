@@ -1,43 +1,43 @@
 ---
-title: "Graph Intelligence — Project Context Engine"
+title: Graph Intelligence — Project Context Engine
 doc_type: proposal
 domain: product-management-plane
 status: accepted-current-slice
-last_updated: 2026-03-29
+last_updated: 2026-03-31
 tags:
-  - graph
-  - intelligence
-  - context
-  - mcp
-  - scanners
-  - sver
-  - agent-substrate
+- graph
+- intelligence
+- context
+- mcp
+- scanners
+- sver
+- agent-substrate
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - SEAM_REGISTRY.md
-  - DOMAIN_MAP.md
-  - INTERACTIVE_ONBOARDING_PROPOSAL.md
-  - COGNITIVE_LOOP_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- SEAM_REGISTRY.md
+- DOMAIN_MAP.md
+- INTERACTIVE_ONBOARDING_PROPOSAL.md
+- COGNITIVE_LOOP_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: graph-intelligence
 implements: []
 implemented_by: []
 active_seams:
-  - graph-engine-schema
-  - code-scanner
-  - doc-scanner
-  - git-scanner
-  - snippet-store
-  - graph-query-api
-  - graph-mcp-server
-  - graph-writeback
-  - sver-process-model
-  - muninn-bridge
-  - graph-web-ui
-  - agent-self-model
+- graph-engine-schema
+- code-scanner
+- doc-scanner
+- git-scanner
+- snippet-store
+- graph-query-api
+- graph-mcp-server
+- graph-writeback
+- sver-process-model
+- muninn-bridge
+- graph-web-ui
+- agent-self-model
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
+- ARCHITECTURE_STATUS.md
 ---
 
 # Graph Intelligence — Project Context Engine

@@ -1,18 +1,18 @@
 ---
-title: "Philotic Working Vocabulary"
+title: Philotic Working Vocabulary
 doc_type: reference
 domain: workflow-docs
 status: active
-last_updated: 2026-03-14
+last_updated: 2026-03-31
 tags:
-  - glossary
-  - vocabulary
-  - process
+- glossary
+- vocabulary
+- process
 related_docs:
-  - AGENTS.md
-  - SEAM_REGISTRY.md
-  - DOC_TAGGING_FRONTMATTER_PROPOSAL.md
-  - ARCHITECTURE_STATUS.md
+- AGENTS.md
+- SEAM_REGISTRY.md
+- DOC_TAGGING_FRONTMATTER_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
 ---
 
 # Philotic Working Vocabulary

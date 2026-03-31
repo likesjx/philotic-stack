@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - dedicated-voice-machine-component
+
+rectangle "dedicated-voice-machine-component" as dedicated_voice_machine_component #Orange {
+}
+
+
+@enduml

@@ -2,10 +2,17 @@
 doc_type: proposal
 domain: operator-control-plane
 status: in-progress
-last_updated: 2026-03-29
+last_updated: 2026-03-31
 disposition: accepted for current slice
-tags: [workstream, session, agent, dashboard, visibility]
-refs: [EMBEDDINGS_IN_GRAPH_PROPOSAL, CONTEXT_GRAPH_RUNNER_PROPOSAL]
+tags:
+- workstream
+- session
+- agent
+- dashboard
+- visibility
+refs:
+- EMBEDDINGS_IN_GRAPH_PROPOSAL
+- CONTEXT_GRAPH_RUNNER_PROPOSAL
 ---
 
 # AGENT_WORKSTREAM_TRACKING_PROPOSAL

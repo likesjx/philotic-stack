@@ -1,33 +1,33 @@
 ---
-title: "Agent Loop Proposal"
+title: Agent Loop Proposal
 doc_type: proposal
 domain: runtime-sessions
 status: implemented
-last_updated: 2026-03-12
+last_updated: 2026-03-31
 tags:
-  - agent-loop
-  - approvals
-  - tools
-  - media
+- agent-loop
+- approvals
+- tools
+- media
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - ARCHITECTURE.md
-  - SESSION_LOOP_PROPOSAL.md
-  - APPROVAL_UX_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
+- SESSION_LOOP_PROPOSAL.md
+- APPROVAL_UX_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: agent-loop-gap-closure
 implements:
-  - session-loop
+- session-loop
 implemented_by:
-  - multi-turn-tool-reentry-slice
-  - media-routing-policy-slice
-  - tool-catalog-slice
-  - approval-granularity-slice
+- multi-turn-tool-reentry-slice
+- media-routing-policy-slice
+- tool-catalog-slice
+- approval-granularity-slice
 active_seams: []
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
-  - ARCHITECTURE.md
+- ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
 ---
 
 # Agent Loop Proposal

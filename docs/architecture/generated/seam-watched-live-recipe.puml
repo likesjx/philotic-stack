@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - watched-live-recipe
+
+rectangle "watched-live-recipe" as watched_live_recipe #Orange {
+}
+
+
+@enduml

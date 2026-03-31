@@ -1,33 +1,33 @@
 ---
-title: "Cognitive Loop Architecture"
+title: Cognitive Loop Architecture
 doc_type: proposal
 domain: runtime-sessions
 status: accepted-current-slice
-last_updated: 2026-03-18
+last_updated: 2026-03-31
 tags:
-  - agent-loop
-  - context-envelope
-  - memory
-  - plan-execute-evaluate
-  - streaming
-  - rules
-  - settings
+- agent-loop
+- context-envelope
+- memory
+- plan-execute-evaluate
+- streaming
+- rules
+- settings
 related_docs:
-  - AGENT_LOOP_PROPOSAL.md
-  - PHILOTIC_AGENT_LOOP_SPEC.md
-  - PERSISTENCE_TIERS_PROPOSAL.md
-  - MUNINN_MEMORY_PROTOCOL_PROPOSAL.md
-  - PHILOTE_MEMORY_CORE_PROPOSAL.md
-  - GOVERNED_WORKFLOW_SKILLS_PROPOSAL.md
-  - ARCHITECTURE_STATUS.md
+- AGENT_LOOP_PROPOSAL.md
+- PHILOTIC_AGENT_LOOP_SPEC.md
+- PERSISTENCE_TIERS_PROPOSAL.md
+- MUNINN_MEMORY_PROTOCOL_PROPOSAL.md
+- PHILOTE_MEMORY_CORE_PROPOSAL.md
+- GOVERNED_WORKFLOW_SKILLS_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: cognitive-loop-architecture
 active_seams:
-  - context-envelope-contract
-  - memory-local-tools
-  - active-plan-streaming
-  - rules-tier
+- context-envelope-contract
+- memory-local-tools
+- active-plan-streaming
+- rules-tier
 ---
 
 # Cognitive Loop Architecture

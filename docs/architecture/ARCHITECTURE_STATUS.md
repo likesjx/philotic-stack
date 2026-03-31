@@ -1,38 +1,38 @@
 ---
-title: "Philotic Architecture Status"
+title: Philotic Architecture Status
 doc_type: status
 domain: runtime-sessions
 status: active
-last_updated: 2026-03-29
+last_updated: 2026-03-31
 tags:
-  - source-of-truth
-  - current-state
-  - active-seam
-  - transitional
+- source-of-truth
+- current-state
+- active-seam
+- transitional
 related_docs:
-  - README.md
-  - ARCHITECTURE.md
-  - GRAPH_AS_SOURCE_OF_TRUTH.md
-  - GRAPH_INTELLIGENCE_PROPOSAL.md
-  - GRAPH_INTELLIGENCE_STATUS.md
-  - SESSION_LOOP_PROPOSAL.md
-  - TELEGRAM_POLL_LEASE_PROPOSAL.md
-  - DESKTOP_MEMBRANE_PROPOSAL.md
-  - OPERATOR_MEMBRANE_PLUGIN_BOUNDARY_PROPOSAL.md
-  - RUNTIME_AUTHORITY_LEASES_PROPOSAL.md
-  - MESH_VISIBILITY_AND_STATE_PLACEMENT_PROPOSAL.md
-  - DOC_TAGGING_FRONTMATTER_PROPOSAL.md
+- README.md
+- ARCHITECTURE.md
+- GRAPH_AS_SOURCE_OF_TRUTH.md
+- GRAPH_INTELLIGENCE_PROPOSAL.md
+- GRAPH_INTELLIGENCE_STATUS.md
+- SESSION_LOOP_PROPOSAL.md
+- TELEGRAM_POLL_LEASE_PROPOSAL.md
+- DESKTOP_MEMBRANE_PROPOSAL.md
+- OPERATOR_MEMBRANE_PLUGIN_BOUNDARY_PROPOSAL.md
+- RUNTIME_AUTHORITY_LEASES_PROPOSAL.md
+- MESH_VISIBILITY_AND_STATE_PLACEMENT_PROPOSAL.md
+- DOC_TAGGING_FRONTMATTER_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 tracks_domains:
-  - runtime-sessions
-  - membrane-transport
-  - mesh-placement
-  - memory-context
-  - tooling-execution
-  - operator-control-plane
-  - deployment-distribution
-  - migration-parity
+- runtime-sessions
+- membrane-transport
+- mesh-placement
+- memory-context
+- tooling-execution
+- operator-control-plane
+- deployment-distribution
+- migration-parity
 ---
 
 # Philotic Architecture Status

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - architecture-doc-metadata-rollout
+
+rectangle "architecture-doc-metadata-rollout" as architecture_doc_metadata_rollout #Orange {
+}
+
+
+@enduml

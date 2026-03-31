@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - action-grant-contract
+
+rectangle "action-grant-contract" as action_grant_contract #Orange {
+}
+
+
+@enduml

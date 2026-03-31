@@ -1,20 +1,20 @@
 ---
-title: "Philotic Architecture Domain Map"
+title: Philotic Architecture Domain Map
 doc_type: workflow
 domain: workflow-docs
 status: active
-last_updated: 2026-03-12
+last_updated: 2026-03-31
 tags:
-  - docs
-  - domains
-  - architecture
-  - navigation
+- docs
+- domains
+- architecture
+- navigation
 related_docs:
-  - README.md
-  - ARCHITECTURE_STATUS.md
-  - ARCHITECTURE.md
+- README.md
+- ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 ---
 
 # Philotic Architecture Domain Map

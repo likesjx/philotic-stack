@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - structured-model-envelope
+
+rectangle "structured-model-envelope" as structured_model_envelope #Orange {
+}
+
+
+@enduml

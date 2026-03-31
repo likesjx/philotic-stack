@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - onnx-runner-embed-surface
+
+rectangle "onnx-runner-embed-surface" as onnx_runner_embed_surface #Orange {
+}
+
+
+@enduml

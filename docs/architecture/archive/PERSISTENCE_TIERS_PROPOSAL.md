@@ -1,31 +1,31 @@
 ---
-title: "Philotic Persistence Tiers"
+title: Philotic Persistence Tiers
 doc_type: proposal
 domain: memory-context
 status: proposed
-last_updated: 2026-03-17
+last_updated: 2026-03-31
 tags:
-  - ods
-  - graph
-  - muninn
-  - data-adapter
-  - agent-graph
-  - persistence
-  - architecture
+- ods
+- graph
+- muninn
+- data-adapter
+- agent-graph
+- persistence
+- architecture
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - ARCHITECTURE.md
-  - CONTEXT_GRAPH_RUNNER_PROPOSAL.md
-  - TOOL_MANAGEMENT_PLANE_PROPOSAL.md
-  - MUNINN_MEMORY_PROTOCOL_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
+- CONTEXT_GRAPH_RUNNER_PROPOSAL.md
+- TOOL_MANAGEMENT_PLANE_PROPOSAL.md
+- MUNINN_MEMORY_PROTOCOL_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: persistence-tiers
 active_seams:
-  - ods-rename
-  - agent-graph-materialization
-  - graph-adapter-table-surface
-  - mesh-graph-distribution
+- ods-rename
+- agent-graph-materialization
+- graph-adapter-table-surface
+- mesh-graph-distribution
 ---
 
 # Philotic Persistence Tiers

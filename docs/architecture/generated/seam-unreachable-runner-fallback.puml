@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - unreachable-runner-fallback
+
+rectangle "unreachable-runner-fallback" as unreachable_runner_fallback #Orange {
+}
+
+
+@enduml

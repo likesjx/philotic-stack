@@ -1,46 +1,46 @@
 ---
-title: "Philote Memory Core Proposal"
+title: Philote Memory Core Proposal
 doc_type: proposal
 domain: memory-context
 status: proposed
-last_updated: 2026-03-15
+last_updated: 2026-03-31
 tags:
-  - memory
-  - muninn
-  - cognitive
-  - vaults
-  - propagation
-  - introspection
-  - consolidation
-  - embedding
-  - multi-tenant
+- memory
+- muninn
+- cognitive
+- vaults
+- propagation
+- introspection
+- consolidation
+- embedding
+- multi-tenant
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - ARCHITECTURE.md
-  - MEMORY_ENGINE_ABSTRACTION_PROPOSAL.md
-  - MEMORY_DURABILITY_PROPOSAL.md
-  - MUNINN_MEMORY_PROTOCOL_PROPOSAL.md
-  - PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md
-  - PERSONALITY_AND_CONTEXT_PROPOSAL.md
-  - ROLE_ACTIVATION_AND_SUBAGENT_CONTRACTS_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
+- MEMORY_ENGINE_ABSTRACTION_PROPOSAL.md
+- MEMORY_DURABILITY_PROPOSAL.md
+- MUNINN_MEMORY_PROTOCOL_PROPOSAL.md
+- PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md
+- PERSONALITY_AND_CONTEXT_PROPOSAL.md
+- ROLE_ACTIVATION_AND_SUBAGENT_CONTRACTS_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: philote-memory-core
 implements:
-  - memory-engine-abstraction
+- memory-engine-abstraction
 supersedes:
-  - memory-engine-abstraction
+- memory-engine-abstraction
 active_seams:
-  - memory-core-sdk
-  - memory-vault-topology
-  - role-lens-activation
-  - introspection-skill
-  - memory-propagation-mesh
-  - consolidation-subsystem
-  - embedding-integration
+- memory-core-sdk
+- memory-vault-topology
+- role-lens-activation
+- introspection-skill
+- memory-propagation-mesh
+- consolidation-subsystem
+- embedding-integration
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
-  - ARCHITECTURE.md
+- ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
 ---
 
 # Philote Memory Core Proposal

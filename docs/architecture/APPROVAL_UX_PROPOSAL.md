@@ -1,32 +1,32 @@
 ---
-title: "Philotic Approval UX Proposal"
+title: Philotic Approval UX Proposal
 doc_type: proposal
 domain: runtime-sessions
 status: accepted-current-slice
-last_updated: 2026-03-12
+last_updated: 2026-03-31
 tags:
-  - approval
-  - ux
-  - sessions
-  - telegram
-  - active-seam
+- approval
+- ux
+- sessions
+- telegram
+- active-seam
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - SESSION_LOOP_PROPOSAL.md
-  - AGENT_LOOP_PROPOSAL.md
-  - TELEGRAM_INTEGRATION_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- SESSION_LOOP_PROPOSAL.md
+- AGENT_LOOP_PROPOSAL.md
+- TELEGRAM_INTEGRATION_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: approval-ux
 implements:
-  - session-loop
+- session-loop
 implemented_by:
-  - approval-interrupt-history-slice
+- approval-interrupt-history-slice
 active_seams:
-  - approval-card-ux
-  - session-preapproval-ux
+- approval-card-ux
+- session-preapproval-ux
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
+- ARCHITECTURE_STATUS.md
 ---
 
 # Philotic Approval UX Proposal

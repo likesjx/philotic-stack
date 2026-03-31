@@ -1,16 +1,16 @@
 ---
-title: "Sandbox Architecture"
+title: Sandbox Architecture
 doc_type: architecture
 domain: philotic-sandbox
 status: active
-last_updated: 2026-03-23
+last_updated: 2026-03-31
 tags:
-  - sandbox
-  - security
-  - architecture
+- sandbox
+- security
+- architecture
 related_docs:
-  - ARCHITECTURE.md
-  - ../guides/SANDBOX_POLICIES.md
+- ARCHITECTURE.md
+- ../guides/SANDBOX_POLICIES.md
 ---
 
 # Sandbox Architecture

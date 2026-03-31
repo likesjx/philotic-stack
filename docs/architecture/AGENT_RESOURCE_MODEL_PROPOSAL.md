@@ -1,36 +1,36 @@
 ---
-title: "Agent-Centric Resource Model"
+title: Agent-Centric Resource Model
 doc_type: proposal
 domain: runtime-sessions
 status: proposed
-last_updated: 2026-03-22
+last_updated: 2026-03-31
 tags:
-  - resource-broker
-  - demand-driven-materialization
-  - agent-graph
-  - graph-storage-trait
-  - mesh-sync
-  - training-data
-  - onnx
-  - rl-flywheel
-  - active-seam
+- resource-broker
+- demand-driven-materialization
+- agent-graph
+- graph-storage-trait
+- mesh-sync
+- training-data
+- onnx
+- rl-flywheel
+- active-seam
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - ARCHITECTURE.md
-  - TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md
-  - TASK_RUNNER_PROPOSAL.md
-  - LOCAL_ONNX_INFERENCE_PROPOSAL.md
-  - MESH_VISIBILITY_AND_STATE_PLACEMENT_PROPOSAL.md
-  - CONTEXT_GRAPH_RUNNER_PROPOSAL.md
-  - AGENT_LOOP_PROPOSAL.md
-  - GOVERNED_WORKFLOW_SKILLS_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
+- TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md
+- TASK_RUNNER_PROPOSAL.md
+- LOCAL_ONNX_INFERENCE_PROPOSAL.md
+- MESH_VISIBILITY_AND_STATE_PLACEMENT_PROPOSAL.md
+- CONTEXT_GRAPH_RUNNER_PROPOSAL.md
+- AGENT_LOOP_PROPOSAL.md
+- GOVERNED_WORKFLOW_SKILLS_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: agent-resource-model
 active_seams:
-  - agent-resource-broker
-  - agent-graph-toolrunner
-  - router-training-tap
+- agent-resource-broker
+- agent-graph-toolrunner
+- router-training-tap
 ---
 
 # Agent-Centric Resource Model

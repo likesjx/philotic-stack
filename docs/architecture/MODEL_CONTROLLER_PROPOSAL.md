@@ -1,37 +1,37 @@
 ---
-title: "Model Controller Proposal"
+title: Model Controller Proposal
 doc_type: proposal
 domain: tooling-execution
 status: accepted-current-slice
-last_updated: 2026-03-19
+last_updated: 2026-03-31
 tags:
-  - model-controller
-  - models
-  - oauth
-  - voice
-  - active-seam
+- model-controller
+- models
+- oauth
+- voice
+- active-seam
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - TASK_RUNNER_PROPOSAL.md
-  - VOICE_MACHINE_PROPOSAL.md
-  - KEY_VAULT_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- TASK_RUNNER_PROPOSAL.md
+- VOICE_MACHINE_PROPOSAL.md
+- KEY_VAULT_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: model-controller
 implements: []
 implemented_by:
-  - structured-model-envelope-slice
-  - gemini-oauth-guest-path-slice
-  - voice-synthesize-envelope-slice
+- structured-model-envelope-slice
+- gemini-oauth-guest-path-slice
+- voice-synthesize-envelope-slice
 active_seams:
-  - structured-model-envelope
-  - hotel-gemini-oauth-flow
-  - openai-provider-contract
-  - hotel-openai-oauth-flow
-  - provider-capability-overrides
+- structured-model-envelope
+- hotel-gemini-oauth-flow
+- openai-provider-contract
+- hotel-openai-oauth-flow
+- provider-capability-overrides
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
-  - ARCHITECTURE.md
+- ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
 ---
 
 # Model Controller Proposal

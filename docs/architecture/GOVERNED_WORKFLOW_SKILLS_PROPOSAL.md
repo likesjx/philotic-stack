@@ -1,32 +1,32 @@
 ---
-title: "Governed Workflow Skills Proposal"
+title: Governed Workflow Skills Proposal
 doc_type: proposal
 domain: runtime-sessions
 status: accepted-current-slice
-last_updated: 2026-03-13
+last_updated: 2026-03-31
 tags:
-  - workflows
-  - roles
-  - delegation
-  - governance
-  - active-seam
+- workflows
+- roles
+- delegation
+- governance
+- active-seam
 related_docs:
-  - AGENT_INCARNATION_PROPOSAL.md
-  - ROLE_ACTIVATION_AND_SUBAGENT_CONTRACTS_PROPOSAL.md
-  - ROLE_CONTEXT_SHIFT_AND_DELEGATED_SUBAGENTS_WHITEPAPER.md
-  - RUNTIME_AUTHORITY_LEASES_PROPOSAL.md
-  - MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md
-  - CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md
-  - ARCHITECTURE_STATUS.md
-  - SKILL_LIFECYCLE_PROPOSAL.md
+- AGENT_INCARNATION_PROPOSAL.md
+- ROLE_ACTIVATION_AND_SUBAGENT_CONTRACTS_PROPOSAL.md
+- ROLE_CONTEXT_SHIFT_AND_DELEGATED_SUBAGENTS_WHITEPAPER.md
+- RUNTIME_AUTHORITY_LEASES_PROPOSAL.md
+- MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md
+- CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- SKILL_LIFECYCLE_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: governed-workflow-skills
 active_seams:
-  - governed-workflow-skills
-  - peer-delegation-workflows
+- governed-workflow-skills
+- peer-delegation-workflows
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
+- ARCHITECTURE_STATUS.md
 ---
 
 # Governed Workflow Skills Proposal

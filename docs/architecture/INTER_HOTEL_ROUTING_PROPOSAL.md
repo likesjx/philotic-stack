@@ -1,32 +1,32 @@
 ---
-title: "Inter-Hotel Routing Proposal"
+title: Inter-Hotel Routing Proposal
 doc_type: proposal
 domain: mesh-placement
 status: implemented
-last_updated: 2026-03-12
+last_updated: 2026-03-31
 tags:
-  - routing
-  - mesh
-  - execution-plane
-  - placement
-  - source-of-truth
+- routing
+- mesh
+- execution-plane
+- placement
+- source-of-truth
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - ARCHITECTURE.md
-  - NATIVE_OVERLAY_VPN_PROPOSAL.md
-  - MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
+- NATIVE_OVERLAY_VPN_PROPOSAL.md
+- MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: inter-hotel-routing
 implements: []
 implemented_by:
-  - execution-plane-routing-slice
+- execution-plane-routing-slice
 active_seams:
-  - placement-policy-broadening
-  - multi-host-watched-validation
+- placement-policy-broadening
+- multi-host-watched-validation
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
-  - ARCHITECTURE.md
+- ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
 ---
 
 # Inter-Hotel Routing Proposal

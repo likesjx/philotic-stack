@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - active-membrane-routing
+
+rectangle "active-membrane-routing" as active_membrane_routing #Orange {
+}
+
+
+@enduml

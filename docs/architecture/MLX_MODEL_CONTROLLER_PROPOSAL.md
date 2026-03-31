@@ -1,27 +1,27 @@
 ---
-title: "MLX Model Controller"
+title: MLX Model Controller
 doc_type: proposal
 domain: tooling-execution
 status: proposed
-last_updated: 2026-03-24
+last_updated: 2026-03-31
 tags:
-  - mlx
-  - local-inference
-  - model-controller
-  - model-router
-  - apple-silicon
+- mlx
+- local-inference
+- model-controller
+- model-router
+- apple-silicon
 related_docs:
-  - MODEL_CONTROLLER_PROPOSAL.md
-  - LOCAL_ONNX_INFERENCE_PROPOSAL.md
-  - ARCHITECTURE_STATUS.md
-  - SEAM_REGISTRY.md
+- MODEL_CONTROLLER_PROPOSAL.md
+- LOCAL_ONNX_INFERENCE_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- SEAM_REGISTRY.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: mlx-model-controller
 active_seams:
-  - mlx-runner-fleet
-  - mlx-provider-dispatch
-  - model-role-naming-migration
+- mlx-runner-fleet
+- mlx-provider-dispatch
+- model-role-naming-migration
 ---
 
 # MLX Model Controller

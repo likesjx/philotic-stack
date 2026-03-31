@@ -2,10 +2,14 @@
 doc_type: proposal
 status: proposed
 domain: runtime-sessions
-last_updated: 2026-03-21
-tags: [ipc, naming, guest-identity, role-disambiguation]
+last_updated: 2026-03-31
+tags:
+- ipc
+- naming
+- guest-identity
+- role-disambiguation
 refs:
-  - AGENT_INCARNATION_PROPOSAL.md
+- AGENT_INCARNATION_PROPOSAL.md
 ---
 
 # GuestIdentity.role → GuestIdentity.component_type Rename Proposal

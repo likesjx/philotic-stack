@@ -1,15 +1,15 @@
 ---
-title: "Codebase Health Assessment"
+title: Codebase Health Assessment
 doc_type: reference
 domain: governance
 status: active
-last_updated: 2026-03-26
+last_updated: 2026-03-31
 tags:
-  - health
-  - metrics
-  - automation
+- health
+- metrics
+- automation
 related_docs:
-  - ARCHITECTURE_STATUS.md
+- ARCHITECTURE_STATUS.md
 ---
 
 # Philotic Stack — Codebase Health Assessment

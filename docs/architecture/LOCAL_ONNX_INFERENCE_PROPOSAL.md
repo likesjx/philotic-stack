@@ -1,28 +1,28 @@
 ---
-title: "Local ONNX Inference Runner"
+title: Local ONNX Inference Runner
 doc_type: proposal
 domain: memory-context
 status: proposed
-last_updated: 2026-03-17
+last_updated: 2026-03-31
 tags:
-  - onnx
-  - embeddings
-  - local-inference
-  - model-router
-  - muninn
-  - rl-training
+- onnx
+- embeddings
+- local-inference
+- model-router
+- muninn
+- rl-training
 related_docs:
-  - MODEL_CONTROLLER_PROPOSAL.md
-  - VOICE_MACHINE_PROPOSAL.md
-  - MUNINN_MEMORY_PROTOCOL_PROPOSAL.md
-  - ARCHITECTURE_STATUS.md
+- MODEL_CONTROLLER_PROPOSAL.md
+- VOICE_MACHINE_PROPOSAL.md
+- MUNINN_MEMORY_PROTOCOL_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: local-onnx-inference
 active_seams:
-  - onnx-runner-embed-surface
-  - model-router-embed-kind
-  - muninn-embed-integration
+- onnx-runner-embed-surface
+- model-router-embed-kind
+- muninn-embed-integration
 ---
 
 # Local ONNX Inference Runner

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - artifact-trust-contract
+
+rectangle "artifact-trust-contract" as artifact_trust_contract #Orange {
+}
+
+
+@enduml

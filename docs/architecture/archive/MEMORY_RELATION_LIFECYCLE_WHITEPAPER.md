@@ -1,35 +1,35 @@
 ---
-title: "Memory Relation Lifecycle Whitepaper"
+title: Memory Relation Lifecycle Whitepaper
 doc_type: proposal
 domain: memory-context
 status: proposed
-last_updated: 2026-03-13
+last_updated: 2026-03-31
 tags:
-  - memory
-  - relations
-  - sleep
-  - muninn
-  - context
-  - active-seam
+- memory
+- relations
+- sleep
+- muninn
+- context
+- active-seam
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - MEMORY_ENGINE_ABSTRACTION_PROPOSAL.md
-  - MUNINN_MEMORY_PROTOCOL_PROPOSAL.md
-  - PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md
-  - MODEL_CONTROLLER_PROPOSAL.md
-  - HEURISTIC_MIND_AND_CONTEXT_PAPER.md
+- ARCHITECTURE_STATUS.md
+- MEMORY_ENGINE_ABSTRACTION_PROPOSAL.md
+- MUNINN_MEMORY_PROTOCOL_PROPOSAL.md
+- PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md
+- MODEL_CONTROLLER_PROPOSAL.md
+- HEURISTIC_MIND_AND_CONTEXT_PAPER.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: memory-relation-lifecycle-whitepaper
 implements: []
 implemented_by: []
 active_seams:
-  - memory-formation-lifecycle
-  - provisional-relation-layer
-  - sleep-consolidation-heuristics
+- memory-formation-lifecycle
+- provisional-relation-layer
+- sleep-consolidation-heuristics
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
-  - ARCHITECTURE.md
+- ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
 ---
 
 # Memory Relation Lifecycle Whitepaper

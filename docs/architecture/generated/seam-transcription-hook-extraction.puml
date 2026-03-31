@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - transcription-hook-extraction
+
+rectangle "transcription-hook-extraction" as transcription_hook_extraction #Orange {
+}
+
+
+@enduml

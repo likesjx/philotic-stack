@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - capacity-relief-placement
+
+rectangle "capacity-relief-placement" as capacity_relief_placement #Orange {
+}
+
+
+@enduml

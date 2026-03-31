@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - midi-output-artifact
+
+rectangle "midi-output-artifact" as midi_output_artifact #Orange {
+}
+
+
+@enduml

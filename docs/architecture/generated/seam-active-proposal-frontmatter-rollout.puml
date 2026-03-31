@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - active-proposal-frontmatter-rollout
+
+rectangle "active-proposal-frontmatter-rollout" as active_frontmatter_rollout #Orange {
+}
+
+
+@enduml

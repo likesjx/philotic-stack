@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - delegated-telegram-polling
+
+rectangle "delegated-telegram-polling" as delegated_telegram_polling #Orange {
+}
+
+
+@enduml

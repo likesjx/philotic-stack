@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - elevenlabs-streaming-tts
+
+rectangle "elevenlabs-streaming-tts" as elevenlabs_streaming_tts #Orange {
+}
+
+
+@enduml

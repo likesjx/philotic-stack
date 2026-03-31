@@ -1,48 +1,48 @@
 ---
-title: "Philotic Web: The Mesh, Management Plane, and Distribution"
+title: 'Philotic Web: The Mesh, Management Plane, and Distribution'
 doc_type: proposal
 domain: product-management-plane
 status: proposed
-last_updated: 2026-03-16
+last_updated: 2026-03-31
 tags:
-  - philotic-web
-  - aiua
-  - management-plane
-  - distribution
-  - homebrew
-  - security
-  - naming
-  - cli
-  - pki
-  - vpn
-  - nat-traversal
-  - mesh
+- philotic-web
+- aiua
+- management-plane
+- distribution
+- homebrew
+- security
+- naming
+- cli
+- pki
+- vpn
+- nat-traversal
+- mesh
 related_docs:
-  - ARCHITECTURE.md
-  - ARCHITECTURE_STATUS.md
-  - CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md
-  - HOMEBREW_DISTRIBUTION_PROPOSAL.md
-  - RUNTIME_AUTHORITY_LEASES_PROPOSAL.md
-  - PERIMETER_EGRESS_CONTROL_PROPOSAL.md
-  - PHILOTE_MEMORY_CORE_PROPOSAL.md
-  - PORT_BLUEPRINT.md
+- ARCHITECTURE.md
+- ARCHITECTURE_STATUS.md
+- CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md
+- HOMEBREW_DISTRIBUTION_PROPOSAL.md
+- RUNTIME_AUTHORITY_LEASES_PROPOSAL.md
+- PERIMETER_EGRESS_CONTROL_PROPOSAL.md
+- PHILOTE_MEMORY_CORE_PROPOSAL.md
+- PORT_BLUEPRINT.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: philotic-web
 implements:
-  - homebrew-distribution
-  - control-plane-admin-surface
+- homebrew-distribution
+- control-plane-admin-surface
 supersedes:
-  - homebrew-distribution
+- homebrew-distribution
 active_seams:
-  - binary-rename-ansible-to-aiua
-  - philotic-web-crate
-  - management-plane-security
-  - distribution-pipeline
-  - repo-identity
+- binary-rename-ansible-to-aiua
+- philotic-web-crate
+- management-plane-security
+- distribution-pipeline
+- repo-identity
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
-  - ARCHITECTURE.md
+- ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
 ---
 
 # Philotic Web: The Mesh, Management Plane, and Distribution

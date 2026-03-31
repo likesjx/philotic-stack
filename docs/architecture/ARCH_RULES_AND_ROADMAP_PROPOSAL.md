@@ -1,12 +1,20 @@
 ---
-title: "Architectural Rules Registry and Roadmap"
+title: Architectural Rules Registry and Roadmap
 doc_type: proposal
 domain: workflow-docs
 status: proposed
-last_updated: 2026-03-22
-tags: [arch-rules, roadmap, enforcement, process]
-related_docs: [ARCHITECTURE_STATUS.md, AGENTS.md, SEAM_REGISTRY.md]
-task_refs: [docs/task.md]
+last_updated: 2026-03-31
+tags:
+- arch-rules
+- roadmap
+- enforcement
+- process
+related_docs:
+- ARCHITECTURE_STATUS.md
+- AGENTS.md
+- SEAM_REGISTRY.md
+task_refs:
+- docs/task.md
 proposal_id: arch-rules-and-roadmap
 ---
 

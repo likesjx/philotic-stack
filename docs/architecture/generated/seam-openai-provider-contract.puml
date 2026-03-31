@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - openai-provider-contract
+
+rectangle "openai-provider-contract" as openai_provider_contract #Orange {
+}
+
+
+@enduml

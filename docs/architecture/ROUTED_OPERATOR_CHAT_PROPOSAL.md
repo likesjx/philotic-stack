@@ -1,31 +1,31 @@
 ---
-title: "Routed Operator Chat Proposal"
+title: Routed Operator Chat Proposal
 doc_type: proposal
 domain: operator-control-plane
 status: proposed
-last_updated: 2026-03-20
+last_updated: 2026-03-31
 tags:
-  - operator-chat
-  - router
-  - membrane
-  - telegram-parity
-  - graph-runner
+- operator-chat
+- router
+- membrane
+- telegram-parity
+- graph-runner
 related_docs:
-  - OPERATOR_MEMBRANE_PLUGIN_BOUNDARY_PROPOSAL.md
-  - DESKTOP_MEMBRANE_PROPOSAL.md
-  - TELEGRAM_INTEGRATION_PROPOSAL.md
-  - INTER_HOTEL_ROUTING_PROPOSAL.md
-  - ARCHITECTURE_STATUS.md
+- OPERATOR_MEMBRANE_PLUGIN_BOUNDARY_PROPOSAL.md
+- DESKTOP_MEMBRANE_PROPOSAL.md
+- TELEGRAM_INTEGRATION_PROPOSAL.md
+- INTER_HOTEL_ROUTING_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: routed-operator-chat
 implements: []
 implemented_by: []
 active_seams:
-  - operator-membrane-plugin-boundary
-  - desktop-membrane-boundary
+- operator-membrane-plugin-boundary
+- desktop-membrane-boundary
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
+- ARCHITECTURE_STATUS.md
 ---
 
 # Routed Operator Chat Proposal

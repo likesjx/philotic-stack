@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - onnx-music-analysis-surface
+
+rectangle "onnx-music-analysis-surface" as onnx_music_analysis_surface #Orange {
+}
+
+
+@enduml

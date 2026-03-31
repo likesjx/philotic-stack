@@ -1,35 +1,35 @@
 ---
-title: "Role Activation And Subagent Contracts Proposal"
+title: Role Activation And Subagent Contracts Proposal
 doc_type: proposal
 domain: runtime-sessions
 status: accepted-current-slice
-last_updated: 2026-03-13
+last_updated: 2026-03-31
 tags:
-  - roles
-  - subagents
-  - contracts
-  - handoff
-  - active-seam
+- roles
+- subagents
+- contracts
+- handoff
+- active-seam
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - AGENT_INCARNATION_PROPOSAL.md
-  - GOVERNED_WORKFLOW_SKILLS_PROPOSAL.md
-  - ROLE_CONTEXT_SHIFT_AND_DELEGATED_SUBAGENTS_WHITEPAPER.md
-  - PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- AGENT_INCARNATION_PROPOSAL.md
+- GOVERNED_WORKFLOW_SKILLS_PROPOSAL.md
+- ROLE_CONTEXT_SHIFT_AND_DELEGATED_SUBAGENTS_WHITEPAPER.md
+- PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: role-activation-subagent-contracts
 implements: []
 implemented_by:
-  - ../../crates/philote/src/session.rs
-  - ../../crates/aiua/src/service/ipc.rs
+- ../../crates/philote/src/session.rs
+- ../../crates/aiua/src/service/ipc.rs
 active_seams:
-  - role-activation-contract
-  - same-identity-handoff-packet
-  - delegated-subagent-contract
-  - role-materialization-rubric
+- role-activation-contract
+- same-identity-handoff-packet
+- delegated-subagent-contract
+- role-materialization-rubric
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
+- ARCHITECTURE_STATUS.md
 ---
 
 # Role Activation And Subagent Contracts Proposal

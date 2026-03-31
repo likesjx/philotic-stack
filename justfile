@@ -380,9 +380,9 @@ local-push:
     set -euo pipefail
     AIUA_CELLAR=/opt/homebrew/Cellar/aiua/0.1.0-alpha/bin
     PHIL_CELLAR=/opt/homebrew/Cellar/philotic-web/0.1.0-alpha/bin
-    AIUA_BINS="aiua philote membrane model-router model-controller-gemini model-controller-elevenlabs model-controller-mlx philote-worker tool-runner graph-runner"
+    AIUA_BINS="aiua philote membrane model-router model-controller-gemini model-controller-elevenlabs model-controller-mlx model-controller-onnx philote-worker tool-runner graph-runner graph-intelligence"
     echo "▶ Building release binaries..."
-    cargo build --release -p aiua -p philote -p membrane -p model-router -p tool-runner -p graph-runner -p philotic-web
+    cargo build --release -p aiua -p philote -p membrane -p model-router -p tool-runner -p graph-runner -p graph-intelligence -p philotic-web
     echo "▶ Installing aiua stack to ${AIUA_CELLAR}..."
     for bin in $AIUA_BINS; do
         if [ ! -f "target/release/$bin" ]; then

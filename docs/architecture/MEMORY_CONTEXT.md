@@ -2,18 +2,18 @@
 doc_type: architecture
 domain: memory-context
 status: draft
-last_updated: 2026-03-29
+last_updated: 2026-03-31
 tags:
-  - memory
-  - muninn
-  - context
-  - embeddings
-  - graph
+- memory
+- muninn
+- context
+- embeddings
+- graph
 refs:
-  - MUNINN_MEMORY_PROTOCOL_PROPOSAL
-  - EMBEDDINGS_IN_GRAPH_PROPOSAL
-  - MEMORY_DURABILITY_PROPOSAL
-  - MEMORY_ENGINE_ABSTRACTION_PROPOSAL
+- MUNINN_MEMORY_PROTOCOL_PROPOSAL
+- EMBEDDINGS_IN_GRAPH_PROPOSAL
+- MEMORY_DURABILITY_PROPOSAL
+- MEMORY_ENGINE_ABSTRACTION_PROPOSAL
 ---
 
 # Memory Context Architecture

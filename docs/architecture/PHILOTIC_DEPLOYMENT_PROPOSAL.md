@@ -1,31 +1,31 @@
 ---
-title: "Philotic Deployment and Environment Model"
+title: Philotic Deployment and Environment Model
 doc_type: proposal
 domain: deployment-distribution
 status: proposed
-last_updated: 2026-03-17
+last_updated: 2026-03-31
 tags:
-  - deployment
-  - environments
-  - launchd
-  - profile
-  - mbp-jane
-  - active-seam
+- deployment
+- environments
+- launchd
+- profile
+- mbp-jane
+- active-seam
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - HOMEBREW_DISTRIBUTION_PROPOSAL.md
-  - RH_ANSIBLE_VPS_DEPLOYMENT_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- HOMEBREW_DISTRIBUTION_PROPOSAL.md
+- RH_ANSIBLE_VPS_DEPLOYMENT_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: philotic-deployment
 implements: []
 implemented_by: []
 active_seams:
-  - philotic-profile-namespacing
-  - mbp-jane-launchd-hardening
-  - phil-service-subcommands
+- philotic-profile-namespacing
+- mbp-jane-launchd-hardening
+- phil-service-subcommands
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
+- ARCHITECTURE_STATUS.md
 ---
 
 # PROPOSAL: Philotic Deployment and Environment Model

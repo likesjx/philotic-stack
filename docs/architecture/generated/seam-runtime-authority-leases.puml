@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - runtime-authority-leases
+
+rectangle "runtime-authority-leases" as runtime_authority_leases #Orange {
+}
+
+
+@enduml

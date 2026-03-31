@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - hotel-gemini-oauth-flow
+
+rectangle "hotel-gemini-oauth-flow" as hotel_gemini_oauth_flow #Orange {
+}
+
+
+@enduml
