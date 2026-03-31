@@ -15,6 +15,6 @@ members = [
     "crates/philotic-sandbox",
     "crates/mlx-runner",
     "crates/graph-intelligence",
-    "crates/philotic-graph",
+    "crates/philotic-graph", "crates/datasource", "crates/graph-datasource",
 ]
 resolver = "2"
