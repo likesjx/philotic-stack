@@ -1,10 +1,13 @@
 mod commands;
+mod crypto;
 mod egress;
 mod envelope;
 mod gateway;
 mod lease;
 mod markdown;
 mod session;
+mod voice_gateway;
+mod voice_udp;
 
 use anyhow::{bail, Result};
 use clap::Parser;
