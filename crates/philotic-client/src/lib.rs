@@ -979,6 +979,11 @@ pub enum IpcRequest {
     DisableCronJob {
         job_id: CronJobId,
     },
+    /// Hotel-to-guest graceful shutdown signal. Guests do not send this to the hotel;
+    /// the no-op handler in ipc.rs covers the case where one arrives unexpectedly.
+    GracefulShutdown {
+        drain_timeout_secs: u64,
+    },
 }
 
 /// Represents the canonical response from the local Ansible back to the Guest via IPC.
@@ -1185,6 +1190,11 @@ pub enum IpcResponse {
     /// Response to [`IpcRequest::ListCronJobs`].
     CronJobList {
         jobs: Vec<CronJob>,
+    },
+    /// Sent from hotel to guests during graceful shutdown. Guests should drain
+    /// in-flight work and exit within `drain_timeout_secs`.
+    GracefulShutdown {
+        drain_timeout_secs: u64,
     },
     /// Response to [`IpcRequest::FetchMemoryConfig`].
     /// `config_json` is `None` if MuninnDB is not configured on this hotel.
