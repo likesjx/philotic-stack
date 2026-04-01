@@ -618,6 +618,21 @@ pub enum IpcRequest {
     ReleaseDesktopMembraneLease {
         lease_key: String,
     },
+    AcquireDiscordGatewayLease {
+        lease_key: String,
+        agent_id: String,
+    },
+    GetDiscordGatewayLeaseOwner {
+        lease_key: String,
+    },
+    RenewDiscordGatewayLease {
+        lease_key: String,
+        agent_id: String,
+        lease_epoch: u64,
+    },
+    ReleaseDiscordGatewayLease {
+        lease_key: String,
+    },
     HandoffToRole {
         session_id: String,
         role_name: String,
@@ -950,6 +965,14 @@ pub enum IpcResponse {
     DesktopMembraneLeaseStatus {
         desktop_active: bool,
         desktop_lease: Option<LeaseEnvelope>,
+    },
+    DiscordGatewayLease {
+        granted: bool,
+        lease: Option<LeaseEnvelope>,
+    },
+    DiscordGatewayLeaseStatus {
+        active: bool,
+        lease: Option<LeaseEnvelope>,
     },
     DesktopMembraneStatusView {
         membrane_status: DesktopMembraneStatusView,

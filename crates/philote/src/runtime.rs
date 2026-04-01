@@ -21,7 +21,7 @@ use philotic_client::{
 use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Duration;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 pub const DEFAULT_AGENT_ID: &str = "agent-jane-01";
@@ -221,20 +221,22 @@ fn media_analysis_attachments(task: &InboundTaskPayload) -> Vec<TransportAttachm
     task.attachments
         .iter()
         .filter(|attachment| {
-            attachment
+            let has_url = attachment
                 .blob_download_url
                 .as_deref()
                 .map(|url| !url.is_empty())
-                .unwrap_or(false)
-                && attachment
-                    .transport_error
-                    .as_deref()
-                    .map(|error| error.is_empty())
-                    .unwrap_or(true)
-                && matches!(
-                    attachment.kind.as_str(),
-                    "photo" | "image" | "voice" | "audio" | "document"
-                )
+                .unwrap_or(false);
+            let has_inline = attachment.inline_audio_b64.is_some();
+            let no_error = attachment
+                .transport_error
+                .as_deref()
+                .map(|error| error.is_empty())
+                .unwrap_or(true);
+            let right_kind = matches!(
+                attachment.kind.as_str(),
+                "photo" | "image" | "voice" | "audio" | "document"
+            );
+            (has_url || has_inline) && no_error && right_kind
         })
         .cloned()
         .collect()
@@ -674,6 +676,13 @@ impl AgentRuntime {
                             let task_ref = task.clone();
                             if let Err(err) = self.handle_user_message(task, task_id).await {
                                 error!("Failed to handle peer delegation as user message: {}", err);
+                                let _ = self.emit_error_reply(&task_ref, task_id, err).await;
+                            }
+                        }
+                        Ok(task) if task.action.as_deref() == Some("voice.dialogue") => {
+                            let task_ref = task.clone();
+                            if let Err(err) = self.handle_voice_dialogue(task, task_id).await {
+                                error!("Failed to handle voice.dialogue: {}", err);
                                 let _ = self.emit_error_reply(&task_ref, task_id, err).await;
                             }
                         }
@@ -2776,6 +2785,54 @@ impl AgentRuntime {
         .await
     }
 
+    /// Handle a `voice.dialogue` task from the Discord membrane.
+    ///
+    /// Converts the inline PCM payload into a synthetic voice-attachment message and routes it
+    /// through the normal media-routing path (typically → `voice.transcribe` → Claude → reply).
+    async fn handle_voice_dialogue(
+        &mut self,
+        task: InboundTaskPayload,
+        task_id: Uuid,
+    ) -> Result<()> {
+        use crate::protocol::TransportAttachment;
+
+        let pcm_b64 = match task.pcm_b64.as_deref() {
+            Some(b) if !b.is_empty() => b.to_string(),
+            _ => {
+                debug!("voice.dialogue task has no pcm_b64, skipping");
+                return Ok(());
+            }
+        };
+
+        let sample_rate = task.sample_rate.unwrap_or(48_000);
+        let speaker_ssrc = task.speaker_ssrc.unwrap_or(0);
+
+        // Build a synthetic inbound task that looks like a voice-note message.
+        // The action is cleared so the normal handle_user_message dispatch applies.
+        let mut synthetic = task.clone();
+        synthetic.action = None;
+        synthetic.message_kind = Some("voice".into());
+        synthetic.pcm_b64 = None;
+        synthetic.sample_rate = None;
+        synthetic.speaker_ssrc = None;
+        synthetic.attachments = vec![TransportAttachment {
+            kind: "voice".into(),
+            file_id: format!("discord-voice-{}", speaker_ssrc),
+            mime_type: Some("audio/wav".into()),
+            inline_audio_b64: Some(pcm_b64),
+            inline_audio_sample_rate: Some(sample_rate),
+            inline_audio_channels: Some(2),
+            ..Default::default()
+        }];
+        // If the task had no content, provide a minimal placeholder so
+        // normalized_user_content doesn't skip the message.
+        if synthetic.content.as_deref().map(str::trim).unwrap_or("").is_empty() {
+            synthetic.content = Some(String::new());
+        }
+
+        self.handle_user_message(synthetic, task_id).await
+    }
+
     /// Final step: complete the turn, sync state, and emit `FinalReplyPayload` to membrane.
     async fn deliver_text_reply(
         &mut self,
@@ -4731,6 +4788,7 @@ impl AgentRuntime {
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
                 })
                 .await
             }
@@ -4826,6 +4884,7 @@ impl AgentRuntime {
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
                 })
                 .await
             }
@@ -5014,6 +5073,7 @@ impl AgentRuntime {
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
                 })
                 .await
             }
@@ -5151,6 +5211,7 @@ impl AgentRuntime {
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
                 })
                 .await
             }
@@ -5238,6 +5299,7 @@ impl AgentRuntime {
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
                 })
                 .await
             }
@@ -5345,6 +5407,7 @@ impl AgentRuntime {
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
                 })
                 .await
             }
@@ -5491,6 +5554,7 @@ impl AgentRuntime {
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
                 })
                 .await
             }
@@ -5652,6 +5716,7 @@ impl AgentRuntime {
                         final_reply_to: Some(payload.final_reply_to),
                         final_reply_role: Some(payload.final_reply_role),
                         final_reply_guest_id: payload.final_reply_guest_id,
+                        ..Default::default()
                     })
                     .await
                 } else {
@@ -5749,6 +5814,7 @@ impl AgentRuntime {
                         final_reply_to: Some(payload.final_reply_to),
                         final_reply_role: Some(payload.final_reply_role),
                         final_reply_guest_id: payload.final_reply_guest_id,
+                        ..Default::default()
                     })
                     .await
                 } else {
@@ -5889,6 +5955,7 @@ impl AgentRuntime {
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
                 })
                 .await
             }
@@ -6012,6 +6079,7 @@ impl AgentRuntime {
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
                 })
                 .await
             }
@@ -6089,6 +6157,7 @@ impl AgentRuntime {
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
                 })
                 .await
             }
@@ -6165,6 +6234,7 @@ impl AgentRuntime {
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
                 })
                 .await
             }
@@ -6232,6 +6302,7 @@ impl AgentRuntime {
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
                 })
                 .await
             }
@@ -6320,6 +6391,7 @@ impl AgentRuntime {
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
                 })
                 .await
             }
@@ -6844,6 +6916,7 @@ mod tests {
                 capability: Some("voice.synthesize".into()),
                 retryable: Some(false),
             }),
+            ..Default::default()
         };
 
         let error = extract_model_error(&payload).expect("structured error should be extracted");
@@ -6891,6 +6964,7 @@ mod tests {
                 capability: Some("text.generate".into()),
                 retryable: Some(true),
             }),
+            ..Default::default()
         };
 
         let error =
@@ -7081,12 +7155,9 @@ mod tests {
                 kind: "photo".into(),
                 file_id: "photo-1".into(),
                 mime_type: None,
-                file_name: None,
-                file_size: None,
-                telegram_file_path: None,
-                blob_id: None,
                 blob_download_url: None,
                 transport_error: None,
+                ..Default::default()
             }],
             command: None,
             callback_data: None,
@@ -7097,6 +7168,7 @@ mod tests {
             final_reply_role: None,
             final_reply_guest_id: None,
             error: None,
+            ..Default::default()
         };
 
         assert_eq!(normalized_user_content(&task), Some("caption text".into()));
@@ -7122,12 +7194,9 @@ mod tests {
                 kind: "voice".into(),
                 file_id: "voice-1".into(),
                 mime_type: Some("audio/ogg".into()),
-                file_name: None,
-                file_size: None,
-                telegram_file_path: None,
-                blob_id: None,
                 blob_download_url: None,
                 transport_error: None,
+                ..Default::default()
             }],
             command: None,
             callback_data: None,
@@ -7138,6 +7207,7 @@ mod tests {
             final_reply_role: None,
             final_reply_guest_id: None,
             error: None,
+            ..Default::default()
         };
 
         assert_eq!(
@@ -7175,6 +7245,7 @@ mod tests {
             final_reply_role: None,
             final_reply_guest_id: None,
             error: None,
+            ..Default::default()
         };
 
         assert_eq!(
@@ -7204,34 +7275,28 @@ mod tests {
                     kind: "photo".into(),
                     file_id: "photo-1".into(),
                     mime_type: Some("image/jpeg".into()),
-                    file_name: None,
-                    file_size: None,
-                    telegram_file_path: None,
                     blob_id: Some("sha256-1".into()),
                     blob_download_url: Some("http://127.0.0.1:9001/download/sha256-1".into()),
                     transport_error: None,
+                    ..Default::default()
                 },
                 TransportAttachment {
                     kind: "sticker".into(),
                     file_id: "sticker-1".into(),
                     mime_type: Some("image/webp".into()),
-                    file_name: None,
-                    file_size: None,
-                    telegram_file_path: None,
                     blob_id: Some("sha256-2".into()),
                     blob_download_url: Some("http://127.0.0.1:9001/download/sha256-2".into()),
                     transport_error: None,
+                    ..Default::default()
                 },
                 TransportAttachment {
                     kind: "voice".into(),
                     file_id: "voice-1".into(),
                     mime_type: Some("audio/ogg".into()),
-                    file_name: None,
-                    file_size: None,
-                    telegram_file_path: None,
                     blob_id: Some("sha256-3".into()),
                     blob_download_url: None,
                     transport_error: None,
+                    ..Default::default()
                 },
             ],
             command: None,
@@ -7243,6 +7308,7 @@ mod tests {
             final_reply_role: None,
             final_reply_guest_id: None,
             error: None,
+            ..Default::default()
         };
 
         let attachments = media_analysis_attachments(&task);
@@ -7259,12 +7325,10 @@ mod tests {
             } else {
                 "image/jpeg".into()
             }),
-            file_name: None,
-            file_size: None,
-            telegram_file_path: None,
             blob_id: Some(format!("sha256-{kind}-1")),
             blob_download_url: Some(format!("http://127.0.0.1:9001/download/sha256-{kind}-1")),
             transport_error: None,
+            ..Default::default()
         }
     }
 
