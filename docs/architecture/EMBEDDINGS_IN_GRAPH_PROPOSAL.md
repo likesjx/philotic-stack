@@ -7,6 +7,7 @@ active_seams:
 - onnx-runner-embed-surface
 - model-router-embed-kind
 - graph-intel-embed-mcp
+- embeddinggemma-swap-validation
 ---
 
 # Embeddings in Graph Proposal

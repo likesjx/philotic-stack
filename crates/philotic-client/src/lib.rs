@@ -933,6 +933,13 @@ pub enum IpcRequest {
     DisableCronJob {
         job_id: CronJobId,
     },
+    /// Sent by the hotel to all registered guests when it is preparing to shut down.
+    /// The guest should finish any in-flight work, release held leases, and exit.
+    /// The hotel waits for all guest PIDs to stop before exiting itself.
+    GracefulShutdown {
+        /// Maximum seconds the guest should take to drain before the hotel force-kills it.
+        drain_timeout_secs: u64,
+    },
 }
 
 /// Represents the canonical response from the local Ansible back to the Guest via IPC.
@@ -1133,6 +1140,11 @@ pub enum IpcResponse {
     /// Response to [`IpcRequest::FetchMemoryConfig`].
     /// `config_json` is `None` if MuninnDB is not configured on this hotel.
     ///
+    /// Sent by the hotel to a guest asking it to drain in-flight work and exit cleanly.
+    /// The guest should finish any active turn within `drain_timeout_secs`, then exit.
+    GracefulShutdown {
+        drain_timeout_secs: u64,
+    },
     /// NOTE: This variant MUST remain at the end of the enum. It has an all-optional
     /// field (`config_json: Option<String>`), which with `#[serde(untagged)]` means it
     /// will match ANY JSON object that serde hasn't already matched to an earlier variant.

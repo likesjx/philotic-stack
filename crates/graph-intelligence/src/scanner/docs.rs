@@ -66,6 +66,19 @@ pub fn scan_docs(root: &Path, engine: &GraphEngine) -> Result<usize> {
         }
     }
 
+    // Prime the graph with authoritative domain nodes before linking proposals/seams.
+    if let Some(domain_map_path) = md_files.iter().find(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name == "DOMAIN_MAP.md")
+            .unwrap_or(false)
+    }) {
+        if let Ok(content) = fs::read_to_string(domain_map_path) {
+            let (_, body) = parse_frontmatter(&content);
+            parse_domain_map(&body, engine)?;
+        }
+    }
+
     for file_path in &md_files
     {
         let rel_path = file_path
@@ -96,7 +109,7 @@ pub fn scan_docs(root: &Path, engine: &GraphEngine) -> Result<usize> {
 
         let node_kind = match frontmatter.doc_type.as_deref() {
             Some("proposal") => NodeKind::Proposal,
-            Some("reference") | Some("status") | Some("historical") | Some("architecture") => NodeKind::Domain,
+            Some("reference") | Some("status") | Some("historical") | Some("architecture") => NodeKind::Document,
             Some("workflow") => NodeKind::Document,
             Some("seam") => NodeKind::Seam,
             Some("task-surface") | Some("task") => NodeKind::Task,
@@ -113,7 +126,7 @@ pub fn scan_docs(root: &Path, engine: &GraphEngine) -> Result<usize> {
                 } else if rel_path.contains("task") {
                     NodeKind::Task
                 } else {
-                    NodeKind::Domain
+                    NodeKind::Document
                 }
             }
         };
@@ -124,6 +137,7 @@ pub fn scan_docs(root: &Path, engine: &GraphEngine) -> Result<usize> {
             NodeKind::Proposal => "doc",
             NodeKind::Seam => "seam",
             NodeKind::Task => "task",
+            NodeKind::Document => "doc",
             _ => "doc",
         };
         let node_id = format!(
@@ -161,6 +175,24 @@ pub fn scan_docs(root: &Path, engine: &GraphEngine) -> Result<usize> {
             updated_at: now,
         })?;
         count += 1;
+
+        if let Some(domain) = frontmatter.domain.as_deref() {
+            let domain_id = format!("domain:{}", domain);
+            if engine.get_node(&domain_id)?.is_some() {
+                engine.upsert_edge(&Edge {
+                    source_id: domain_id,
+                    target_id: node_id.clone(),
+                    relation: EdgeRelation::Governs,
+                    properties: serde_json::json!({"source": "proposal_frontmatter"}),
+                    worktree: String::new(),
+                })?;
+            } else {
+                eprintln!(
+                    "[scan] Proposal {} references unknown domain '{}'. Add it to DOMAIN_MAP.md before treating it as canonical.",
+                    node_id, domain
+                );
+            }
+        }
 
         // Create edges for related_docs
         if let Some(refs) = &frontmatter.related_docs {
@@ -374,34 +406,133 @@ fn parse_seam_registry(body: &str, engine: &GraphEngine) -> Result<()> {
                 })?;
             }
 
-            // Create domain node and edge
+            // Link seam to a known domain node if the domain exists in DOMAIN_MAP.
             if !domain.is_empty() {
                 let domain_id = format!("domain:{}", domain);
-                engine.upsert_node(&Node {
-                    id: domain_id.clone(),
-                    kind: NodeKind::Domain,
-                    name: domain.to_string(),
-                    properties: serde_json::json!({}),
-                    file_path: None,
-                    worktree: String::new(),
-                    created_at: now,
-                embedding: None,
-                embedding_model: None,
-                embedding_dims: None,
-                embedding_updated: None,
-                embedding_hash: None,
-                    updated_at: now,
-                })?;
-                engine.upsert_edge(&Edge {
-                    source_id: domain_id,
-                    target_id: node_id.clone(),
-                    relation: EdgeRelation::Contains,
-                    properties: serde_json::json!({}),
-                    worktree: String::new(),
-                })?;
+                if engine.get_node(&domain_id)?.is_some() {
+                    engine.upsert_edge(&Edge {
+                        source_id: domain_id,
+                        target_id: node_id.clone(),
+                        relation: EdgeRelation::Contains,
+                        properties: serde_json::json!({"source": "seam_registry"}),
+                        worktree: String::new(),
+                    })?;
+                } else {
+                    eprintln!(
+                        "[scan] Seam {} references unknown domain '{}'. Add the domain to DOMAIN_MAP.md first.",
+                        seam_id, domain
+                    );
+                }
             }
         }
     }
+    Ok(())
+}
+
+/// Parse the authoritative domain catalog from DOMAIN_MAP.md and create first-class domain nodes.
+fn parse_domain_map(body: &str, engine: &GraphEngine) -> Result<()> {
+    let now = Utc::now();
+
+    let mut current_title = String::new();
+    let mut current_domain_id = String::new();
+    let mut current_truth: Vec<String> = Vec::new();
+    let mut active_proposals: Vec<String> = Vec::new();
+    let mut supporting_docs: Vec<String> = Vec::new();
+    let mut current_bucket = "";
+
+    let commit_section = |engine: &GraphEngine,
+                          title: &str,
+                          domain_id: &str,
+                          current_truth: &[String],
+                          active_proposals: &[String],
+                          supporting_docs: &[String]|
+     -> Result<()> {
+        if domain_id.is_empty() {
+            return Ok(());
+        }
+
+        let node_id = format!("domain:{}", domain_id);
+        engine.upsert_node(&Node {
+            id: node_id,
+            kind: NodeKind::Domain,
+            name: title.to_string(),
+            properties: serde_json::json!({
+                "scope": title,
+                "current_truth": current_truth,
+                "active_proposals": active_proposals,
+                "supporting_docs": supporting_docs,
+                "source": "docs/architecture/DOMAIN_MAP.md",
+            }),
+            file_path: Some("docs/architecture/DOMAIN_MAP.md".into()),
+            worktree: String::new(),
+            created_at: now,
+            embedding: None,
+            embedding_model: None,
+            embedding_dims: None,
+            embedding_updated: None,
+            embedding_hash: None,
+            updated_at: now,
+        })?;
+
+        Ok(())
+    };
+
+    for line in body.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.starts_with("## ") {
+            commit_section(
+                engine,
+                &current_title,
+                &current_domain_id,
+                &current_truth,
+                &active_proposals,
+                &supporting_docs,
+            )?;
+            current_title = trimmed.trim_start_matches("## ").trim().to_string();
+            current_domain_id.clear();
+            current_truth.clear();
+            active_proposals.clear();
+            supporting_docs.clear();
+            current_bucket = "";
+            continue;
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("Primary domain id:") {
+            current_domain_id = rest.trim().trim_matches('`').to_string();
+            continue;
+        }
+
+        current_bucket = match trimmed {
+            "Current truth:" => "truth",
+            "Active proposals:" => "proposals",
+            "Supporting docs:" => "supporting",
+            _ => current_bucket,
+        };
+
+        if trimmed.starts_with("-") {
+            let item = trimmed.trim_start_matches('-').trim();
+            if item.is_empty() {
+                continue;
+            }
+            match current_bucket {
+                "truth" => current_truth.push(item.to_string()),
+                "proposals" => active_proposals.push(item.to_string()),
+                "supporting" => supporting_docs.push(item.to_string()),
+                _ => {}
+            }
+        }
+    }
+
+    commit_section(
+        engine,
+        &current_title,
+        &current_domain_id,
+        &current_truth,
+        &active_proposals,
+        &supporting_docs,
+    )?;
+
     Ok(())
 }
 

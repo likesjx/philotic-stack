@@ -66,9 +66,9 @@ type SubagentHookRegistry = Arc<Mutex<HashMap<String, SubagentHookRecord>>>;
 #[derive(Clone)]
 pub(crate) struct RoleSubscriber {
     conn_id: Uuid,
-    guest_id: String,
+    pub(crate) guest_id: String,
     supported_tools: Vec<String>,
-    tx: mpsc::UnboundedSender<IpcResponse>,
+    pub(crate) tx: mpsc::UnboundedSender<IpcResponse>,
 }
 
 #[cfg(not(test))]
@@ -2088,6 +2088,12 @@ impl IpcServer {
                     return Some(role_record.guest_id);
                 }
             }
+            // Single-process philote registers as the base agent_id and handles all roles
+            // internally. If the specific incarnation guest is not live but the base agent is,
+            // treat the base agent as the orchestrator.
+            if is_registered(agent_id) {
+                return Some(agent_id.to_string());
+            }
         }
 
         live_agent_guests
@@ -2305,13 +2311,19 @@ impl IpcServer {
                         value_json: Some(snapshot.to_string()),
                     };
                 }
-                if let Some(session_id) = key.strip_prefix("__session_snapshot__:") {
+                if let Some(rest) = key.strip_prefix("__session_snapshot__:") {
+                    // Format: `{session_id}` (orchestrator) or `{session_id}@{role_name}` (role process)
+                    let (session_id, role_name) = match rest.split_once('@') {
+                        Some((sess, role)) => (sess, Some(role)),
+                        None => (rest, None),
+                    };
                     match Self::compose_session_snapshot(
                         graph,
                         inboxes,
                         registry,
                         local_node_id,
                         session_id,
+                        role_name,
                     )
                     .await
                     {
@@ -3597,8 +3609,8 @@ impl IpcServer {
                     );
                 }
 
-                let target_guest_id =
-                    match Self::resolve_role_guest_id(graph, &session_id, &role_name) {
+                let target_guest_id = {
+                    let resolved = match Self::resolve_role_guest_id(graph, &session_id, &role_name) {
                         Ok(guest_id) => guest_id,
                         Err(err) => {
                             return IpcResponse::error(
@@ -3608,6 +3620,40 @@ impl IpcServer {
                             );
                         }
                     };
+                    // Single-process philote registers as the base agent_id. If the specific
+                    // role guest is not live but the base agent is, deliver the handoff bundle
+                    // to the base agent directly rather than parking it forever.
+                    let is_live = {
+                        let guard = inboxes.lock().await;
+                        guard
+                            .get("agent")
+                            .into_iter()
+                            .flatten()
+                            .any(|s| s.guest_id == resolved)
+                    };
+                    if !is_live {
+                        let base_id = resolved.split(':').next().unwrap_or(&resolved).to_string();
+                        let base_is_live = {
+                            let guard = inboxes.lock().await;
+                            guard
+                                .get("agent")
+                                .into_iter()
+                                .flatten()
+                                .any(|s| s.guest_id == base_id)
+                        };
+                        if base_is_live {
+                            warn!(
+                                "Role guest [{}] is not registered; delivering handoff bundle to base agent [{}].",
+                                resolved, base_id
+                            );
+                            base_id
+                        } else {
+                            resolved
+                        }
+                    } else {
+                        resolved
+                    }
+                };
                 let task_id = Uuid::new_v4();
                 
                 // Construct the SessionControl envelope for durable mesh ledger tracking
@@ -4828,6 +4874,12 @@ impl IpcServer {
                     Err(e) => IpcResponse::Error(format!("DisableCronJob failed: {e}")),
                 }
             }
+            // GracefulShutdown is hotel→guest only; a guest sending it is a no-op.
+            IpcRequest::GracefulShutdown { .. } => IpcResponse::error(
+                "graceful_shutdown",
+                "NOT_APPLICABLE",
+                "GracefulShutdown is a hotel-to-guest signal; guests do not send it.",
+            ),
         }
     }
 
@@ -5609,6 +5661,9 @@ impl IpcServer {
         registry: &Arc<RwLock<NodeRegistry>>,
         local_node_id: &str,
         session_id: &str,
+        // When a role process requests its snapshot, it passes its role name so we
+        // return the role-scoped checkpoint instead of the orchestrator's base one.
+        role_name: Option<&str>,
     ) -> anyhow::Result<Option<serde_json::Value>> {
         let Some(session) = graph.get_session(session_id)? else {
             return Ok(None);
@@ -5616,7 +5671,10 @@ impl IpcServer {
 
         let turns = graph.list_session_turns(session_id, 8)?;
         let apartment_checkpoint = session.primary_agent_id.as_deref().and_then(|agent_id| {
-            let memory_type = format!("short_session:{session_id}");
+            let memory_type = match role_name {
+                Some(role) => format!("short_session:{session_id}:{role}"),
+                None => format!("short_session:{session_id}"),
+            };
             graph.get_apartment(agent_id, &memory_type).ok().flatten()
         });
 

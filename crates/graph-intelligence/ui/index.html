@@ -1492,6 +1492,47 @@ async function removeTag(nodeId, tagToRemove, currentTags) {
   refreshProposalDetail();
 }
 
+// Priority Update Function
+async function updateNodePriority(nodeId, newPriority) {
+  try {
+    const response = await fetch('http://localhost:8900/api/nodes/' + encodeURIComponent(nodeId) + '/update', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        properties: { priority: newPriority, last_updated: new Date().toISOString().split('T')[0] },
+        agent: 'user-ui'
+      })
+    });
+    
+    const result = await response.json();
+    if (result.updated) {
+      showToast(`Updated priority to ${newPriority}`);
+      
+      // Update priority indicator immediately
+      const indicator = document.getElementById('priority-indicator');
+      if (indicator) {
+        const priorityOptions = [
+          { value: 1, label: '1 - Minimal', color: '#666' },
+          { value: 2, label: '2 - Low', color: '#888' },
+          { value: 3, label: '3 - Medium', color: '#ffa500' },
+          { value: 4, label: '4 - High', color: '#ff6b35' },
+          { value: 5, label: '5 - Critical', color: '#dc3545' }
+        ];
+        const opt = priorityOptions.find(p => p.value === newPriority);
+        indicator.style.background = opt?.color || '#ffa500';
+        indicator.textContent = `Priority ${newPriority}`;
+      }
+      
+      // Refresh the detail view to show updated priority
+      refreshProposalDetail();
+    } else {
+      showToast('Error: ' + (result.error?.message || 'Priority update failed'), 'error');
+    }
+  } catch (err) {
+    showToast('Error: ' + err.message, 'error');
+  }
+}
+
 function showToast(message, type = 'success') {
   const toast = document.createElement('div');
   toast.className = 'toast ' + type;
@@ -2281,6 +2322,45 @@ async function loadProposalDetail(id) {
     statusRow.appendChild(statusSelect);
     statusTagsSection.appendChild(statusRow);
     
+    // Priority row
+    const priorityRow = el('div', { style: 'display: flex; align-items: center; gap: 12px; margin-bottom: 16px;' });
+    priorityRow.appendChild(el('span', { textContent: 'Priority:', style: 'font-weight: 500; min-width: 60px;' }));
+    
+    const priorityOptions = [
+      { value: 1, label: '1 - Minimal', color: '#666' },
+      { value: 2, label: '2 - Low', color: '#888' },
+      { value: 3, label: '3 - Medium', color: '#ffa500' },
+      { value: 4, label: '4 - High', color: '#ff6b35' },
+      { value: 5, label: '5 - Critical', color: '#dc3545' }
+    ];
+    const currentPriority = props.priority || 3;
+    
+    const prioritySelect = el('select', { 
+      className: 'priority-dropdown',
+      style: 'padding: 6px 12px; border-radius: 4px; background: var(--bg); border: 1px solid var(--border); color: var(--text); min-width: 180px;',
+      onchange: (e) => updateNodePriority(id, parseInt(e.target.value))
+    });
+    priorityOptions.forEach(opt => {
+      const option = el('option', { 
+        value: opt.value, 
+        textContent: opt.label, 
+        selected: opt.value === currentPriority 
+      });
+      prioritySelect.appendChild(option);
+    });
+    priorityRow.appendChild(prioritySelect);
+    
+    // Priority indicator
+    const priorityIndicator = el('span', {
+      id: 'priority-indicator',
+      className: 'badge',
+      style: `background: ${priorityOptions.find(p => p.value === currentPriority)?.color || '#ffa500'}; color: white; padding: 4px 8px; font-size: 11px; margin-left: 8px;`,
+      textContent: `Priority ${currentPriority}`
+    });
+    priorityRow.appendChild(priorityIndicator);
+    
+    statusTagsSection.appendChild(priorityRow);
+    
     // Tags management
     const tagsRow = el('div', { style: 'display: flex; align-items: flex-start; gap: 12px;' });
     tagsRow.appendChild(el('span', { textContent: 'Tags:', style: 'font-weight: 500; min-width: 60px; margin-top: 8px;' }));
@@ -2751,10 +2831,36 @@ async function loadSeamDetail(id) {
       el('span', { className: 'page-nav-current', textContent: data.name })
     ));
 
-    // Title with lifecycle controls
+    // Title row with status and verification ladder
     const seamStatus = props.status || props.disposition || (parentProposal ? getStatus(parentProposal.properties) : 'orphaned');
-    const titleRow = el('div', { style: 'display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:20px;' });
-    titleRow.appendChild(el('h2', { style: 'margin:0;' },
+    
+    // Status pills with active state highlighting
+    const seamStatuses = ['proposed', 'accepted', 'in-progress', 'implemented', 'deferred', 'completed'];
+    const statusPills = el('div', { style: 'display:flex;gap:6px;flex-wrap:wrap;align-items:center;' });
+    seamStatuses.forEach(s => {
+      const isActive = seamStatus === s;
+      statusPills.appendChild(el('button', {
+        className: 'btn' + (isActive ? '' : ' secondary'),
+        style: `padding:4px 10px;font-size:11px;${isActive ? 'background:var(--accent);color:var(--bg);border-color:var(--accent);font-weight:600;' : ''}`,
+        textContent: s,
+        onclick: () => updateNodeStatus(id, s, 'seam').then(() => loadSeamDetail(id))
+      }));
+    });
+    
+    // Verification ladder - inline right-justified with square pill badges
+    const parentProps = parentProposal ? (typeof parentProposal.properties === 'string' ? JSON.parse(parentProposal.properties) : parentProposal.properties) : {};
+    const ladderBadges = getVerificationBadge(parentProps);
+    const ladderRow = el('div', { style: 'display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;padding:12px 0;border-bottom:1px solid var(--border);' },
+      statusPills,
+      el('div', { style: 'display:flex;align-items:center;gap:8px;' },
+        el('span', { style: 'font-size:11px;color:var(--muted);text-transform:uppercase;', textContent: 'Verification' }),
+        ladderBadges
+      )
+    );
+    page.appendChild(ladderRow);
+
+    // Title
+    page.appendChild(el('h2', { style: 'margin:0 0 12px 0;' },
       data.name,
       el('span', { 
         className: 'badge badge-' + seamStatus, 
@@ -2762,20 +2868,6 @@ async function loadSeamDetail(id) {
         textContent: seamStatus 
       })
     ));
-    
-    // Lifecycle controls
-    const seamControls = el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;' });
-    const seamStatuses = ['proposed', 'accepted', 'in-progress', 'implemented', 'deferred', 'completed'];
-    seamStatuses.forEach(s => {
-      seamControls.appendChild(el('button', {
-        className: 'btn' + (seamStatus === s ? '' : ' secondary'),
-        style: 'padding:4px 10px;font-size:11px;',
-        textContent: s,
-        onclick: () => updateNodeStatus(id, s, 'seam').then(() => loadSeamDetail(id))
-      }));
-    });
-    titleRow.appendChild(seamControls);
-    page.appendChild(titleRow);
 
     if (props.description) {
       page.appendChild(el('p', { 
@@ -2783,24 +2875,55 @@ async function loadSeamDetail(id) {
       }, props.description));
     }
 
-    // Parent/Children edges (always show)
+    // Parent edges (show first, stacked)
     const parentEdges = edges.incoming || [];
     const childEdges = edges.outgoing || [];
     
-    if (parentEdges.length > 0) {
-      const parSection = el('div', { className: 'detail-section', style: 'margin-bottom:16px;background:rgba(0,229,255,0.03);padding:12px;border-radius:var(--radius);' });
-      parSection.appendChild(el('h4', { textContent: 'Parents (' + parentEdges.length + ')' }));
-      const plist = el('ul', { className: 'detail-list' });
-      parentEdges.forEach(e => {
-        const src = e.source || {};
-        plist.appendChild(el('li', null,
-          el('span', { className: 'badge badge-kind', textContent: src.kind || '?', style: 'margin-right:6px;font-size:10px;' }),
-          el('span', { className: 'entity-link', onclick: () => navigateToNode(src.id ? src : { id: e.source_id, kind: 'unknown' }), textContent: src.name || e.source_id }),
-          el('span', { style: 'color:var(--muted);font-size:11px;margin-left:6px;', textContent: e.relation })
-        ));
-      });
-      parSection.appendChild(plist);
-      page.appendChild(parSection);
+    if (parentEdges.length > 0 || childEdges.length > 0) {
+      const relSection = el('div', { className: 'detail-section', style: 'margin-bottom:20px;' });
+      
+      // Parents first
+      if (parentEdges.length > 0) {
+        relSection.appendChild(el('h4', { textContent: 'Parents (' + parentEdges.length + ')', style: 'margin-bottom:8px;' }));
+        parentEdges.forEach(e => {
+          const src = e.source || {};
+          const kindBadge = src.kind 
+            ? el('span', { className: 'badge badge-kind', textContent: src.kind, style: 'margin-right:6px;font-size:10px;' })
+            : el('span', { className: 'badge badge-kind', textContent: 'node', style: 'margin-right:6px;font-size:10px;' });
+          relSection.appendChild(el('div', { style: 'display:flex;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);' },
+            kindBadge,
+            el('span', { className: 'entity-link', style: 'flex:1;', onclick: () => navigateToNode(src.id ? src : { id: e.source_id, kind: 'unknown' }), textContent: src.name || e.source_id }),
+            el('span', { style: 'color:var(--muted);font-size:11px;margin-left:6px;', textContent: e.relation })
+          ));
+        });
+      }
+      
+      // Children separate section
+      if (childEdges.length > 0) {
+        const childKinds = {};
+        childEdges.forEach(e => {
+          const tgt = e.target || {};
+          const kind = tgt.kind || 'link';
+          if (!childKinds[kind]) childKinds[kind] = [];
+          childKinds[kind].push(e);
+        });
+        
+        Object.entries(childKinds).forEach(([kind, edges]) => {
+          relSection.appendChild(el('h4', { textContent: kind.charAt(0).toUpperCase() + kind.slice(1) + ' (' + edges.length + ')', style: 'margin-top:16px;margin-bottom:8px;' }));
+          edges.forEach(e => {
+            const tgt = e.target || {};
+            relSection.appendChild(el('div', { style: 'display:flex;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);' },
+              tgt.kind 
+                ? el('span', { className: 'badge badge-kind', textContent: tgt.kind, style: 'margin-right:6px;font-size:10px;' })
+                : el('span', { className: 'badge badge-kind', textContent: 'node', style: 'margin-right:6px;font-size:10px;' }),
+              el('span', { className: 'entity-link', style: 'flex:1;', onclick: () => navigateToNode(tgt.id ? tgt : { id: e.target_id, kind: 'unknown' }), textContent: tgt.name || e.target_id }),
+              el('span', { style: 'color:var(--muted);font-size:11px;margin-left:6px;', textContent: e.relation })
+            ));
+          });
+        });
+      }
+      
+      page.appendChild(relSection);
     }
 
     // Token usage + test status summary bar
@@ -2848,29 +2971,71 @@ async function loadSeamDetail(id) {
     
     const leftCol = el('div', null);
 
-    // Properties
+    // Properties - filter out legacy and internal fields
     const propsSection = el('div', { className: 'detail-section' });
     propsSection.appendChild(el('h4', { textContent: 'Properties' }));
     const propsGrid = el('div', { className: 'detail-props' });
     Object.entries(props).forEach(([k, v]) => {
-      if (k === 'description') return;
+      if (k === 'description' || k === 'proposal_ref') return; // Skip legacy proposal_ref
       propsGrid.appendChild(el('span', { className: 'prop-key', textContent: k }));
-      const val = Array.isArray(v) ? v.join(', ') : String(v);
+      let val = Array.isArray(v) ? v.join(', ') : String(v);
+      // Make markdown links clickable
+      if (typeof val === 'string' && val.includes('.md')) {
+        const linkMatch = val.match(/\[([^\]]+)\]\(([^)]+)\)/);
+        if (linkMatch) {
+          const linkText = linkMatch[1];
+          const linkUrl = linkMatch[2];
+          const docId = linkText.replace('.md', '').toLowerCase().replace(/[_-]/g, '-');
+          propsGrid.appendChild(el('span', { className: 'prop-val' },
+            el('a', { 
+              href: '#', 
+              style: 'color:var(--accent);text-decoration:underline;',
+              onclick: (e) => { e.preventDefault(); showProposalDetail('doc:' + docId); }
+            }, linkText)
+          ));
+          return;
+        }
+      }
       propsGrid.appendChild(el('span', { className: 'prop-val', textContent: val }));
     });
     propsSection.appendChild(propsGrid);
     leftCol.appendChild(propsSection);
 
-    // Architecture diagram
+    // Architecture notes - free markdown for agents to write (replaces auto-generated UML)
+    const archNotes = props.architecture_notes || props.notes || '';
     const archSection = el('div', { className: 'detail-section' });
-    archSection.appendChild(el('h4', { textContent: 'Architecture' }));
-    const diagramContainer = el('div', { className: 'diagram-container' },
-      el('div', { className: 'loading' }, 'Loading diagram…')
-    );
-    archSection.appendChild(diagramContainer);
+    archSection.appendChild(el('h4', { textContent: 'Architecture Notes' }));
+    
+    if (archNotes) {
+      // Check if content has PlantUML
+      const plantumlMatch = archNotes.match(/@startuml([\s\S]*?)@enduml/);
+      if (plantumlMatch) {
+        const diagramContainer = el('div', { className: 'diagram-container' });
+        archSection.appendChild(diagramContainer);
+        // Auto-render the PlantUML
+        const fullUml = '@startuml' + plantumlMatch[1] + '@enduml';
+        renderPlantUML(fullUml, diagramContainer);
+        // Also show the notes text (minus the UML) as markdown
+        const textWithoutUml = archNotes.replace(/@startuml[\s\S]*?@enduml/, '').trim();
+        if (textWithoutUml) {
+          archSection.appendChild(el('div', { 
+            className: 'markdown-content',
+            style: 'margin-top:12px;line-height:1.6;'
+          }, textWithoutUml));
+        }
+      } else {
+        // Just show the notes as text
+        archSection.appendChild(el('div', { 
+          className: 'markdown-content',
+          style: 'line-height:1.6;white-space:pre-wrap;'
+        }, archNotes));
+      }
+    } else {
+      archSection.appendChild(el('div', { 
+        style: 'color:var(--muted);font-style:italic;padding:12px;background:var(--bg);border-radius:var(--radius);'
+      }, 'No architecture notes yet. Add notes via properties.architecture_notes.'));
+    }
     leftCol.appendChild(archSection);
-
-    loadSeamDiagram(id, diagramContainer);
 
     grid.appendChild(leftCol);
 
@@ -2938,30 +3103,6 @@ async function loadSeamDetail(id) {
       testsSection.appendChild(list);
       rightCol.appendChild(testsSection);
     }
-
-    // Children / outgoing edges
-    if (childEdges.length > 0) {
-      const childSection = el('div', { className: 'detail-section' });
-      childSection.appendChild(el('h4', { textContent: 'Children / Links (' + childEdges.length + ')' }));
-      const clist = el('ul', { className: 'detail-list' });
-      childEdges.forEach(e => {
-        const tgt = e.target || {};
-        clist.appendChild(el('li', null,
-          el('span', { className: 'badge badge-kind', textContent: tgt.kind || '?', style: 'margin-right:6px;font-size:10px;' }),
-          el('span', { className: 'entity-link', onclick: () => navigateToNode(tgt.id ? tgt : { id: e.target_id, kind: 'unknown' }), textContent: tgt.name || e.target_id }),
-          el('span', { style: 'color:var(--muted);font-size:11px;margin-left:6px;', textContent: e.relation })
-        ));
-      });
-      childSection.appendChild(clist);
-      rightCol.appendChild(childSection);
-    }
-
-    // Verification ladder
-    const ladderSection = el('div', { className: 'detail-section' });
-    ladderSection.appendChild(el('h4', { textContent: 'Verification Ladder' }));
-    const parentProps = parentProposal ? (typeof parentProposal.properties === 'string' ? JSON.parse(parentProposal.properties) : parentProposal.properties) : {};
-    ladderSection.appendChild(getVerificationBadge(parentProps));
-    rightCol.appendChild(ladderSection);
 
     // Activity
     if (seamMutations.length > 0) {

@@ -104,25 +104,42 @@ impl EmbeddingsBackend {
         let mask_tensor = Tensor::<i64>::from_array(mask_array)
             .map_err(|e| anyhow::anyhow!("failed to create attention_mask tensor: {}", e))?;
 
-        // token_type_ids: all zeros for single-segment embeddings
-        let token_type_data: Vec<i64> = vec![0i64; seq_len];
-        let token_type_array = Array2::from_shape_vec((1, seq_len), token_type_data)
-            .context("failed to build token_type_ids array")?;
-        let token_type_tensor = Tensor::<i64>::from_array(token_type_array)
-            .map_err(|e| anyhow::anyhow!("failed to create token_type_ids tensor: {}", e))?;
-
         let mut session = self
             .session
             .lock()
             .map_err(|_| anyhow::anyhow!("session mutex poisoned"))?;
 
-        let outputs = session
-            .run(ort::inputs![
-                "input_ids" => ids_tensor,
-                "attention_mask" => mask_tensor,
-                "token_type_ids" => token_type_tensor,
-            ])
-            .map_err(|e| anyhow::anyhow!("ONNX session run failed: {}", e))?;
+        // Check if model expects token_type_ids by inspecting input names
+        let input_names: Vec<String> = session
+            .inputs()
+            .iter()
+            .map(|input| input.name().to_string())
+            .collect();
+        let needs_token_type_ids = input_names.iter().any(|name| name == "token_type_ids");
+
+        let outputs = if needs_token_type_ids {
+            // token_type_ids: all zeros for single-segment embeddings
+            let token_type_data: Vec<i64> = vec![0i64; seq_len];
+            let token_type_array = Array2::from_shape_vec((1, seq_len), token_type_data)
+                .context("failed to build token_type_ids array")?;
+            let token_type_tensor = Tensor::<i64>::from_array(token_type_array)
+                .map_err(|e| anyhow::anyhow!("failed to create token_type_ids tensor: {}", e))?;
+
+            session
+                .run(ort::inputs![
+                    "input_ids" => ids_tensor,
+                    "attention_mask" => mask_tensor,
+                    "token_type_ids" => token_type_tensor,
+                ])
+                .map_err(|e| anyhow::anyhow!("ONNX session run failed: {}", e))?
+        } else {
+            session
+                .run(ort::inputs![
+                    "input_ids" => ids_tensor,
+                    "attention_mask" => mask_tensor,
+                ])
+                .map_err(|e| anyhow::anyhow!("ONNX session run failed: {}", e))?
+        };
 
         // Output is `last_hidden_state`: [batch=1, seq_len, hidden_dim].
         // Use try_extract_tensor which returns (&Shape, &[T]) in ort v2.

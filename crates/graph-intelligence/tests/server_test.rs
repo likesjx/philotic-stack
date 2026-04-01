@@ -408,6 +408,31 @@ async fn test_api_session_close() {
     let body: serde_json::Value = resp.json().await.expect("Failed to parse JSON");
     assert_eq!(body["session_id"].as_str().unwrap(), "test-session-close-001");
     assert_eq!(body["status"].as_str().unwrap(), "closed");
+    assert_eq!(body["workstream_ids"][0].as_str().unwrap(), "workstream:test-seam");
+
+    let resp = client
+        .get(format!("http://127.0.0.1:{}/api/nodes?kind=workstream", port))
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.expect("Failed to parse JSON");
+    let workstreams = body.as_array().unwrap();
+    let workstream = workstreams
+        .iter()
+        .find(|node| node["id"].as_str() == Some("workstream:test-seam"))
+        .expect("Expected linked workstream node");
+
+    assert_eq!(workstream["properties"]["status"].as_str().unwrap(), "closed");
+    assert_eq!(
+        workstream["properties"]["closed_by_session"].as_str().unwrap(),
+        "test-session-close-001"
+    );
+    assert_eq!(
+        workstream["properties"]["summary"].as_str().unwrap(),
+        "Test session completed successfully"
+    );
 }
 
 #[tokio::test]
@@ -425,6 +450,124 @@ async fn test_api_session_close_nonexistent() {
 
     // Should fail because the session doesn't exist
     assert_ne!(resp.status(), 200, "Closing a nonexistent session should fail");
+}
+
+#[tokio::test]
+async fn test_api_session_cleanup_closes_workstream() {
+    let (port, client) = start_test_server().await;
+
+    let resp = client
+        .post(format!("http://127.0.0.1:{}/api/session/start", port))
+        .json(&serde_json::json!({
+            "session_id": "test-session-cleanup-001",
+            "agent": "test-agent",
+            "seam_id": "seam:test-cleanup-seam"
+        }))
+        .send()
+        .await
+        .expect("Failed to send request");
+    assert_eq!(resp.status(), 200);
+
+    let resp = client
+        .post(format!("http://127.0.0.1:{}/api/session/cleanup", port))
+        .json(&serde_json::json!({
+            "max_age_hours": 0
+        }))
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(resp.status(), 200, "session/cleanup should return 200");
+    let body: serde_json::Value = resp.json().await.expect("Failed to parse JSON");
+    assert_eq!(body["cleaned"].as_u64().unwrap(), 1);
+
+    let resp = client
+        .get(format!("http://127.0.0.1:{}/api/nodes?kind=workstream", port))
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.expect("Failed to parse JSON");
+    let workstreams = body.as_array().unwrap();
+    let workstream = workstreams
+        .iter()
+        .find(|node| node["id"].as_str() == Some("workstream:test-cleanup-seam"))
+        .expect("Expected linked workstream node");
+
+    assert_eq!(workstream["properties"]["status"].as_str().unwrap(), "timed_out");
+    assert_eq!(
+        workstream["properties"]["closed_by_session"].as_str().unwrap(),
+        "test-session-cleanup-001"
+    );
+}
+
+#[tokio::test]
+async fn test_api_session_cleanup_reconciles_orphaned_workstream() {
+    let (port, client) = start_test_server().await;
+
+    let resp = client
+        .post(format!("http://127.0.0.1:{}/api/session/start", port))
+        .json(&serde_json::json!({
+            "session_id": "orphan-session-001",
+            "agent": "test-agent",
+            "seam_id": "seam:orphan-seam"
+        }))
+        .send()
+        .await
+        .expect("Failed to send request");
+    assert_eq!(resp.status(), 200);
+
+    let resp = client
+        .post(format!("http://127.0.0.1:{}/api/nodes/orphan-session-001/update", port))
+        .json(&serde_json::json!({
+            "properties": {
+                "status": "closed"
+            },
+            "agent": "test-agent",
+            "reason": "Create orphaned workstream fixture"
+        }))
+        .send()
+        .await
+        .expect("Failed to send request");
+    assert_eq!(resp.status(), 200);
+
+    let resp = client
+        .post(format!("http://127.0.0.1:{}/api/session/cleanup", port))
+        .json(&serde_json::json!({
+            "max_age_hours": 24
+        }))
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(resp.status(), 200, "session/cleanup should return 200");
+    let body: serde_json::Value = resp.json().await.expect("Failed to parse JSON");
+    assert_eq!(body["orphaned_workstreams_cleaned"].as_u64().unwrap(), 1);
+    assert_eq!(
+        body["orphaned_workstream_ids"][0].as_str().unwrap(),
+        "workstream:orphan-seam"
+    );
+
+    let resp = client
+        .get(format!("http://127.0.0.1:{}/api/nodes?kind=workstream", port))
+        .send()
+        .await
+        .expect("Failed to send request");
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.expect("Failed to parse JSON");
+    let workstreams = body.as_array().unwrap();
+    let workstream = workstreams
+        .iter()
+        .find(|node| node["id"].as_str() == Some("workstream:orphan-seam"))
+        .expect("Expected orphaned workstream node");
+
+    assert_eq!(workstream["properties"]["status"].as_str().unwrap(), "orphaned");
+    assert_eq!(
+        workstream["properties"]["close_reason"].as_str().unwrap(),
+        "auto_cleanup: no active session"
+    );
 }
 
 #[tokio::test]

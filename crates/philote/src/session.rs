@@ -3136,6 +3136,14 @@ fn tool_name_matches_goal(tool_name: &str, normalized: &str) -> bool {
 }
 
 pub fn session_checkpoint_memory_type(session_id: &str) -> String {
+    // Role processes (PHILOTIC_ROLE_NAME set) write to a role-scoped key so that
+    // the orchestrator completing its handoff turn (active_turn → null) cannot
+    // clobber an in-flight role turn via last-writer-wins on the shared key.
+    if let Ok(role_name) = std::env::var("PHILOTIC_ROLE_NAME") {
+        if !role_name.is_empty() {
+            return format!("short_session:{session_id}:{role_name}");
+        }
+    }
     format!("short_session:{session_id}")
 }
 

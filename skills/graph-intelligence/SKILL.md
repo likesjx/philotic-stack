@@ -30,6 +30,8 @@ This is the standard flow for an agent picking up and completing work:
 9. graph_scan                → update the graph with your changes (auto-persists PlantUML diagrams)
 ```
 
+⚠️ **CRITICAL**: Before calling `session_start`, you MUST verify the seam exists and follow the full session protocol. See the `session-hygiene` skill for the complete agent session protocol. Failure to follow this protocol creates orphaned workstreams and breaks the coordination system.
+
 Use `graph_agent_dashboard` at any time to see who else is working and on what.
 
 ## Available Tools (MCP)
@@ -132,8 +134,15 @@ GET  /api/dashboard           # agent activity dashboard (sessions, verification
 GET  /api/impact/:target      # blast-radius analysis for a node or file
 POST /api/session/start       # start a session (body: session_id, agent, seam_id, ...)
 POST /api/session/close       # close a session (body: session_id, summary, files_touched)
+POST /api/session/cleanup     # auto-close stale sessions (body: max_age_hours)
 POST /api/decide              # record a decision (body: target_node, action, reason, agent, ...)
+POST /api/test-run            # record test results (body: target_id, test_count, pass_count, ...)
 POST /api/scan                # trigger a full rescan
+
+# Health monitoring
+GET  /api/health              # combined system health (sessions + proposals + graph)
+GET  /api/health/sessions     # session hygiene: stale, orphaned, overloaded
+GET  /api/health/proposals    # proposal pipeline: dispositions, verification, embeddings
 ```
 
 ## Session Protocol
@@ -191,3 +200,23 @@ just intel-graph-ui          # open the web UI
 
 The MCP endpoint is `http://127.0.0.1:8901/mcp`. The REST API is `http://127.0.0.1:8900`.
 The web UI provides a visual dashboard at `http://127.0.0.1:8900`.
+
+## Maintenance & Hygiene
+
+Use these justfile recipes for ongoing graph health:
+
+```bash
+just intel-graph-health-check       # combined health: sessions + proposals + graph
+just intel-graph-session-health     # session hygiene report
+just intel-graph-session-cleanup    # auto-close stale sessions (default 4h)
+just intel-graph-session-cleanup 8  # custom max age in hours
+just intel-graph-proposal-health    # proposal pipeline health
+just intel-graph-embed-proposals    # batch embed all proposals
+just intel-graph-embed-all          # batch embed all embeddable node kinds
+just intel-graph-maintain           # full maintenance: scan + cleanup + health + embed
+```
+
+Related skills:
+- [$session-hygiene](../session-hygiene/SKILL.md) — session lifecycle monitoring and cleanup
+- [$verification-orchestrator](../verification-orchestrator/SKILL.md) — SVER state and test-run pipeline
+- [$proposal-pipeline](../proposal-pipeline/SKILL.md) — proposal lifecycle and metadata hygiene

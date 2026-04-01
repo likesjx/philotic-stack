@@ -12,6 +12,8 @@ last_updated: 2026-03-31
 
 Close the loop between code, tests, and architecture. Every seam completion requires verification evidence tracked in the graph. Architecture updates flow through the graph, not around it.
 
+Current reality: the graph already stores verification evidence nodes such as `TestRun`, `SmokeRun`, and `UatRun`. The empty ladder problem is therefore a presentation/state-assembly gap, not a lack of evidence.
+
 ---
 
 ## The Verification Ladder

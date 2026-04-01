@@ -24,7 +24,7 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-pub const DEFAULT_AGENT_ID: &str = "agent-jane-01";
+pub const DEFAULT_AGENT_ID: &str = "agent-bjork-01";
 const DEFAULT_REPLY_ROLE: &str = "membrane";
 const DEFAULT_TEXT_MODEL_ROLE: &str = "model";
 const DEFAULT_VOICE_MODEL_ROLE: &str = "model.elevenlabs";
@@ -695,6 +695,29 @@ impl AgentRuntime {
                         }
                         Err(err) => warn!("Could not parse inbound task payload: {}", err),
                     }
+                }
+                Ok(Ok(IpcResponse::GracefulShutdown { drain_timeout_secs })) => {
+                    info!(
+                        "Hotel requested graceful shutdown (drain window: {}s). \
+                         Finishing in-flight work then exiting.",
+                        drain_timeout_secs
+                    );
+                    // Wait up to drain_timeout_secs for any active turns to complete,
+                    // then exit. We poll once per second.
+                    let deadline = std::time::Instant::now()
+                        + std::time::Duration::from_secs(drain_timeout_secs);
+                    loop {
+                        let has_active = self
+                            .sessions
+                            .values()
+                            .any(|s| s.active_turn.is_some());
+                        if !has_active || std::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                    info!("Graceful shutdown drain complete; philote exiting.");
+                    return Ok(());
                 }
                 Ok(Ok(other)) => {
                     info!("Jane received non-task IPC message: {:?}", other);
@@ -1403,6 +1426,8 @@ impl AgentRuntime {
             checkpoint_memory_type,
             checkpoint_json,
             index_state,
+            approval_active_plan,
+            approval_pending_tool_call,
         ) = {
             let Some(state) = self.sessions.get_mut(&session_id) else {
                 warn!(
@@ -1423,6 +1448,8 @@ impl AgentRuntime {
             let final_reply_to = active_turn.final_reply_to.clone();
             let final_reply_role = active_turn.final_reply_role.clone();
             let final_reply_guest_id = active_turn.final_reply_guest_id.clone();
+            let approval_active_plan = active_turn.active_plan.clone();
+            let approval_pending_tool_call = active_turn.pending_tool_call.clone();
             if preapproved {
                 state.clear_pending_approval();
                 state.set_active_turn_phase(TurnPhase::Thinking);
@@ -1439,6 +1466,8 @@ impl AgentRuntime {
                 state.checkpoint_memory_type(),
                 state.checkpoint_json(),
                 state.clone(),
+                approval_active_plan,
+                approval_pending_tool_call,
             )
         };
 
@@ -1546,9 +1575,10 @@ impl AgentRuntime {
             session_id,
             turn_id,
             chat_id,
-            content: format!(
-                "Approval required: {}. Reply /approve or /deny.",
-                approval.reason
+            content: Self::format_approval_message(
+                &approval,
+                approval_active_plan.as_ref(),
+                approval_pending_tool_call.as_ref(),
             ),
             audio_artifact: None,
             send_text_caption: false,
@@ -4743,6 +4773,76 @@ impl AgentRuntime {
             })
     }
 
+    /// Build the Telegram-facing approval message from the approval request plus any
+    /// available plan and tool-call context, so the operator can make an informed decision.
+    fn format_approval_message(
+        approval: &ApprovalRequest,
+        active_plan: Option<&ActivePlan>,
+        pending_tool_call: Option<&ToolCall>,
+    ) -> String {
+        let mut lines: Vec<String> = Vec::new();
+
+        if let Some(plan) = active_plan {
+            lines.push(format!("Goal: {}", plan.goal));
+            if let Some(step) = plan.steps.iter().find(|s| s.status == "in_progress") {
+                let tool_hint = step
+                    .tool_name
+                    .as_deref()
+                    .map(|t| format!(" ({})", t))
+                    .unwrap_or_default();
+                lines.push(format!(
+                    "Step {}: {}{}",
+                    step.id, step.description, tool_hint
+                ));
+            }
+        }
+
+        if let Some(tool) = pending_tool_call {
+            lines.push(format!("Tool: {}", tool.tool_name));
+            let args_summary = Self::summarize_tool_args(&tool.tool_name, &tool.arguments);
+            if !args_summary.is_empty() {
+                lines.push(args_summary);
+            }
+        }
+
+        lines.push(approval.reason.clone());
+        lines.push("Reply /approve or /deny.".to_string());
+        lines.join("\n")
+    }
+
+    /// Produce a short, human-readable summary of the most relevant tool arguments.
+    fn summarize_tool_args(tool_name: &str, args: &serde_json::Value) -> String {
+        match tool_name {
+            "bash.exec" => {
+                if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
+                    let s = if cmd.len() > 300 { &cmd[..300] } else { cmd };
+                    return format!("$ {}", s);
+                }
+            }
+            "role.configure" | "role.handoff" => {
+                if let Some(role) = args.get("role_name").and_then(|v| v.as_str()) {
+                    return format!("role: {}", role);
+                }
+            }
+            "rule.propose" => {
+                if let Some(rule) = args.get("rule").and_then(|v| v.as_str()) {
+                    let s = if rule.len() > 300 { &rule[..300] } else { rule };
+                    return format!("rule: {}", s);
+                }
+            }
+            _ => {}
+        }
+        let json = args.to_string();
+        if json == "{}" || json == "null" {
+            return String::new();
+        }
+        if json.len() > 300 {
+            format!("{}…", &json[..300])
+        } else {
+            json
+        }
+    }
+
     fn normalize_approval_request(mut approval: ApprovalRequest) -> ApprovalRequest {
         if approval
             .approval_id
@@ -6563,11 +6663,18 @@ impl AgentRuntime {
             return Ok(());
         }
 
+        // Role processes request a role-scoped snapshot so the hotel returns the
+        // role-specific checkpoint rather than the orchestrator's base checkpoint.
+        let snapshot_key = {
+            let role = std::env::var("PHILOTIC_ROLE_NAME").ok().filter(|r| !r.is_empty());
+            match role {
+                Some(r) => format!("__session_snapshot__:{session_id}@{r}"),
+                None => format!("__session_snapshot__:{session_id}"),
+            }
+        };
         let response = self
             .ipc_client
-            .send_request(IpcRequest::GetConfig {
-                key: format!("__session_snapshot__:{session_id}"),
-            })
+            .send_request(IpcRequest::GetConfig { key: snapshot_key })
             .await?;
 
         if let IpcResponse::ConfigData {

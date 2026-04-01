@@ -4,6 +4,8 @@
 
 **The SQLite graph is the canonical source of truth.** Markdown files are human-readable projections, not authorities. Agents mutate state via MCP tools; the graph owns the state; optional writeback keeps markdown files synchronized for human consumption.
 
+`ARCHITECTURE_STATUS.md` is now a legacy/transitional projection of that graph state, while `DOMAIN_MAP.md` is the human-readable catalog for graph domain nodes.
+
 ---
 
 ## Architecture Overview
@@ -176,7 +178,8 @@ Certain architecture files are **derived** from the graph:
 
 | File | Derivation |
 |------|-----------|
-| `ARCHITECTURE_STATUS.md` | Aggregate of all proposal statuses, active seams, current slices |
+| `ARCHITECTURE_STATUS.md` | Legacy/transitional aggregate of graph state for humans |
+| `DOMAIN_MAP.md` | Catalog of graph domain nodes, scopes, and active proposal areas |
 | `SEAM_REGISTRY.md` | Union of all `active_seams` from proposals |
 | `ROADMAP.md` | Dependency-ordered view of seams across proposals |
 | `ARCH_RULES.md` | Rules from `accepted`/`implemented` proposals |

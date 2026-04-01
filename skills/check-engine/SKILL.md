@@ -76,6 +76,28 @@ If any code was written or committed this session, confirm:
 - relevant tests pass
 - no stale zombie processes on either machine
 
+### 6. Graph Health Check
+
+If the Intel Graph is running (`just intel-graph-status`), run the combined health check:
+
+```bash
+curl -s http://127.0.0.1:8900/api/health | jq .
+```
+
+Check for:
+- **Stale sessions**: Active sessions older than 4 hours → auto-cleanup via `just intel-graph-session-cleanup`
+- **Orphaned workstreams**: Workstreams with no active session → investigate and close
+- **Missing dispositions**: Proposals without a disposition → flag for next session
+- **Verification gaps**: High count of `verification_level: none` → prioritize in next slice
+- **Embedding gaps**: Proposals without embeddings → run `just intel-graph-embed-proposals`
+
+If the graph is not running, skip this check and note it in the output.
+
+Also check:
+- Was a `session_start` called at the beginning of this session? If not, note the gap.
+- Was `session_close` called? If not, close it now.
+- Were any test runs recorded? If code was tested, record results via `just test-and-record`.
+
 ## Output Format
 
 ```
@@ -97,6 +119,12 @@ If any code was written or committed this session, confirm:
 
 ### Green Status
 - <check result or skipped if no code changed>
+
+### Graph Health
+- Sessions: <active>/<total>, stale: <count>, cleaned: <count>
+- Proposals: <total>, missing disposition: <count>, no verification: <count>
+- Embeddings: <count> unembedded proposals
+- Session protocol: <started/closed/gap noted>
 ```
 
 ## Relationship To Retrospectives

@@ -14,6 +14,24 @@ GRAPH_DB="${DATA_DIR}/graph.db"
 ONNX_PORT=11435
 GRAPH_PORT=8900
 
+# Embedding model configuration
+# Options: 384 (default, fast), 768 (higher quality)
+# Or set PHILOTIC_EMBED_MODEL to a custom HuggingFace repo
+EMBED_DIM="${PHILOTIC_EMBED_DIM:-384}"
+
+case "$EMBED_DIM" in
+    384)
+        EMBED_MODEL="${PHILOTIC_EMBED_MODEL:-sentence-transformers/all-MiniLM-L6-v2}"
+        ;;
+    768)
+        EMBED_MODEL="${PHILOTIC_EMBED_MODEL:-Xenova/all-mpnet-base-v2}"
+        ;;
+    *)
+        EMBED_MODEL="${PHILOTIC_EMBED_MODEL:-sentence-transformers/all-MiniLM-L6-v2}"
+        warn "Unknown PHILOTIC_EMBED_DIM=$EMBED_DIM, using default 384-dim model"
+        ;;
+esac
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -108,11 +126,12 @@ start_onnx() {
     fi
     
     log "Starting ONNX model controller on port $ONNX_PORT..."
+    log "Embedding model: $EMBED_MODEL (${EMBED_DIM}-dim)"
     
     cd "$PHILOTIC_ROOT"
     nohup cargo run --release -p model-router --bin model-controller-onnx -- \
         --sidecar-only \
-        --embed-repo sentence-transformers/all-MiniLM-L6-v2 \
+        --embed-repo "$EMBED_MODEL" \
         > "$LOG_DIR/onnx.log" 2>&1 &
     
     local pid=$!
@@ -233,7 +252,8 @@ status() {
     echo -e "Graph Intel:  $graph_status"
     echo ""
     echo "Data directory: $DATA_DIR"
-    echo "Logs:         $LOG_DIR"
+    echo "Logs:           $LOG_DIR"
+    echo "Embed model:    $EMBED_MODEL (${EMBED_DIM}-dim)"
     echo ""
     
     if is_running "$PID_DIR/graph.pid"; then
@@ -342,10 +362,19 @@ case "${1:-}" in
         echo "  health        - Quick health check"
         echo "  logs          - Tail all logs"
         echo ""
+        echo "Environment Variables:"
+        echo "  PHILOTIC_EMBED_DIM    - Embedding dimensions: 384 (default, fast) or 768 (higher quality)"
+        echo "  PHILOTIC_EMBED_MODEL  - Custom HuggingFace model repo (overrides preset)"
+        echo ""
         echo "Examples:"
-        echo "  $0 install                    # First-time setup"
-        echo "  $0 start                      # Start for development"
-        echo "  $0 agent-start 30             # Start with 30-min timeout"
+        echo "  $0 install                              # First-time setup with 384-dim"
+        echo "  $0 start                                # Start with default 384-dim model"
+        echo "  PHILOTIC_EMBED_DIM=768 $0 start         # Start with 768-dim model"
+        echo "  $0 agent-start 30                       # Start with 30-min timeout"
+        echo ""
+        echo "Model Presets:"
+        echo "  384-dim: sentence-transformers/all-MiniLM-L6-v2 (fast, ~80MB)"
+        echo "  768-dim: Xenova/all-mpnet-base-v2 (quality, ~420MB, ONNX-optimized)"
         echo ""
         exit 1
         ;;

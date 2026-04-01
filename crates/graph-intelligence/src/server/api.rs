@@ -172,6 +172,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/context/:target_id", get(get_context_for))
         .route("/api/session/start", post(post_session_start))
         .route("/api/session/close", post(post_session_close))
+        .route("/api/session/cleanup", post(post_session_cleanup))
+        .route("/api/health/sessions", get(get_session_health))
+        .route("/api/health/proposals", get(get_proposal_health))
+        .route("/api/health", get(get_system_health))
         .route("/api/decide", post(post_decide))
         .route("/api/test-run", post(post_test_run))
         .route("/api/scan", post(trigger_scan))
@@ -935,17 +939,22 @@ async fn post_session_close(
     updated.properties = props;
     updated.updated_at = chrono::Utc::now();
     engine.upsert_node(&updated).map_err(internal_error)?;
+    let closed_workstreams = engine
+        .close_linked_workstreams(&updated, "closed", body.summary.as_deref())
+        .map_err(internal_error)?;
 
     let _ = state.change_tx.send(ChangeEvent {
         event_type: "session_closed".to_string(),
         payload: serde_json::json!({
             "session_id": body.session_id,
+            "workstream_ids": closed_workstreams,
         }),
     });
 
     Ok(Json(serde_json::json!({
         "session_id": body.session_id,
         "status": "closed",
+        "workstream_ids": closed_workstreams,
     })))
 }
 
@@ -1095,6 +1104,125 @@ async fn post_test_run(
         "status": if body.fail_count == 0 { "pass" } else { "fail" },
         "passed": body.pass_count,
         "failed": body.fail_count,
+    })))
+}
+
+// ── Health & Cleanup handlers ──
+
+#[derive(Deserialize)]
+pub struct SessionCleanupBody {
+    pub max_age_hours: Option<u64>,
+}
+
+async fn post_session_cleanup(
+    State(state): State<Arc<AppState>>,
+    body: Option<Json<SessionCleanupBody>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let engine = state.engine.lock().await;
+    let max_age_hours = body
+        .map(|Json(b)| b.max_age_hours.unwrap_or(4))
+        .unwrap_or(4);
+    let max_age = chrono::Duration::hours(max_age_hours as i64);
+
+    let cleaned = engine.cleanup_stale_sessions(max_age).map_err(internal_error)?;
+    let orphaned_workstreams = engine.cleanup_orphaned_workstreams().map_err(internal_error)?;
+
+    let _ = state.change_tx.send(super::ws::ChangeEvent {
+        event_type: "sessions_cleaned".to_string(),
+        payload: serde_json::json!({
+            "cleaned_count": cleaned.len(),
+            "session_ids": cleaned,
+            "orphaned_workstream_ids": orphaned_workstreams,
+        }),
+    });
+
+    Ok(Json(serde_json::json!({
+        "cleaned": cleaned.len(),
+        "session_ids": cleaned,
+        "orphaned_workstreams_cleaned": orphaned_workstreams.len(),
+        "orphaned_workstream_ids": orphaned_workstreams,
+        "max_age_hours": max_age_hours,
+    })))
+}
+
+async fn get_session_health(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let engine = state.engine.lock().await;
+    let report = crate::egress::session_health_check(&engine).map_err(internal_error)?;
+
+    Ok(Json(serde_json::json!({
+        "healthy": report.healthy,
+        "active_sessions": report.active_sessions,
+        "total_sessions": report.total_sessions,
+        "stale_sessions": report.stale_sessions.iter().map(|s| serde_json::json!({
+            "id": s.id,
+            "agent": s.agent,
+            "seam_id": s.seam_id,
+            "age_hours": s.age_hours,
+            "phase": s.phase,
+        })).collect::<Vec<_>>(),
+        "overloaded_agents": report.overloaded_agents.iter().map(|a| serde_json::json!({
+            "agent": a.agent,
+            "session_count": a.session_count,
+            "session_ids": a.session_ids,
+        })).collect::<Vec<_>>(),
+        "orphaned_workstreams": report.orphaned_workstreams,
+    })))
+}
+
+async fn get_proposal_health(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let engine = state.engine.lock().await;
+    let report = crate::egress::proposal_health_check(&engine).map_err(internal_error)?;
+
+    Ok(Json(serde_json::json!({
+        "healthy": report.healthy,
+        "total_proposals": report.total_proposals,
+        "missing_disposition": report.missing_disposition.len(),
+        "missing_disposition_ids": report.missing_disposition,
+        "missing_domain": report.missing_domain.len(),
+        "missing_domain_ids": report.missing_domain,
+        "no_verification": report.no_verification.len(),
+        "no_seams": report.no_seams.len(),
+        "no_embedding": report.no_embedding.len(),
+        "disposition_counts": report.disposition_counts,
+        "verification_counts": report.verification_counts,
+    })))
+}
+
+async fn get_system_health(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let engine = state.engine.lock().await;
+
+    let session_health = crate::egress::session_health_check(&engine).map_err(internal_error)?;
+    let proposal_health = crate::egress::proposal_health_check(&engine).map_err(internal_error)?;
+    let total_nodes = engine.count_nodes(None).map_err(internal_error)?;
+    let total_edges = engine.count_edges().map_err(internal_error)?;
+
+    let overall_healthy = session_health.healthy && proposal_health.healthy;
+
+    Ok(Json(serde_json::json!({
+        "healthy": overall_healthy,
+        "graph": {
+            "total_nodes": total_nodes,
+            "total_edges": total_edges,
+        },
+        "sessions": {
+            "healthy": session_health.healthy,
+            "active": session_health.active_sessions,
+            "stale": session_health.stale_sessions.len(),
+            "orphaned_workstreams": session_health.orphaned_workstreams.len(),
+        },
+        "proposals": {
+            "healthy": proposal_health.healthy,
+            "total": proposal_health.total_proposals,
+            "missing_disposition": proposal_health.missing_disposition.len(),
+            "no_verification": proposal_health.no_verification.len(),
+            "no_embedding": proposal_health.no_embedding.len(),
+        },
     })))
 }
 

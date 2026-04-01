@@ -160,12 +160,61 @@ When the turn is conversational, social, gratitude-oriented, or acknowledgment-o
 
 Voice/transcription re-entry is a first-class policy boundary, not just “text with extra steps.”
 
+## Graph Hygiene
+
+The Intel Graph requires periodic maintenance to stay healthy. Without it, stale sessions block `graph_next_task` scoring, unembedded proposals degrade semantic search, and missing dispositions leave the pipeline ambiguous.
+
+### Automated Maintenance
+
+Run `just intel-graph-maintain` for a full sweep: scan → session cleanup → health check → embed proposals. This is safe to run at any time and is idempotent.
+
+### Session Hygiene
+
+Sessions are the coordination primitive for multi-agent work. Stale sessions (active but abandoned) pollute the dashboard and cause conflict-avoidance false positives.
+
+- **Detection**: `GET /api/health/sessions` reports stale sessions (>4h), overloaded agents (>2 concurrent), and orphaned workstreams
+- **Cleanup**: `POST /api/session/cleanup` auto-closes stale sessions with `timed_out` status
+- **Prevention**: Always call `session_close` at session end, even for incomplete work
+- **Justfile**: `just intel-graph-session-cleanup` (default 4h), `just intel-graph-session-cleanup 8` (custom)
+
+See `$session-hygiene` skill for full protocol.
+
+### Proposal Pipeline Hygiene
+
+Every proposal should have a disposition, domain, and verification state.
+
+- **Detection**: `GET /api/health/proposals` reports missing dispositions, verification gaps, and embedding coverage
+- **Embedding**: `just intel-graph-embed-proposals` batch-embeds all proposals
+- **Health criteria**: No missing dispositions, <50% proposals at `verification_level: none`
+
+See `$proposal-pipeline` skill for lifecycle and metadata requirements.
+
+### Verification Pipeline
+
+Test results must be recorded in the graph to advance verification state.
+
+- **Recording**: `just test-and-record <proposal_id>` runs tests and records results
+- **Health**: `GET /api/health/proposals` shows verification distribution
+- **Advancement**: Use `graph_advance_verification` only when evidence supports the new level
+
+See `$verification-orchestrator` skill for the full ladder and evidence rules.
+
+### Integration with SVE Loop
+
+- **S (Start)**: Run `GET /api/health` to check system state before work
+- **V (Verify)**: Record test runs via `POST /api/test-run`, advance verification via `graph_advance_verification`
+- **E (End)**: `check-engine` includes Graph Health Check (Check 6) — stale sessions, proposal gaps, embedding coverage
+- **R (Retrospective)**: Review `GET /api/dashboard` for agent coordination patterns
+
 ## Skills Map
 
 Use repo-local skills for process execution:
 
 - `graph-intelligence` — graph as primary context source, MCP tool reference, agent workflow
-- `check-engine` — end-of-session review
+- `session-hygiene` — session lifecycle monitoring, stale cleanup, coordination health
+- `verification-orchestrator` — SVER state, test-run pipeline, verification evidence
+- `proposal-pipeline` — proposal lifecycle, disposition management, metadata hygiene
+- `check-engine` — end-of-session review (now includes graph health check)
 - `philotic-slice-closeout` — closing implementation slices
 - `verification-ladder` — deciding validation depth and SVER state
 - `proposal-maintainer` — proposal and spec hygiene
