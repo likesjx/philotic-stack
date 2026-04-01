@@ -5865,8 +5865,49 @@ async fn main() -> Result<()> {
             error!("Blob HTTP Server failed: {}", e);
         }
     });
-    tokio::signal::ctrl_c().await?;
-    warn!("Ctrl-C received! Initiating shutdown of all Materialized Guests...");
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm = signal(SignalKind::terminate())?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => { warn!("Ctrl-C received — initiating graceful drain."); }
+            _ = sigterm.recv() => { warn!("SIGTERM received — initiating graceful drain."); }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+        warn!("Ctrl-C received — initiating graceful drain.");
+    }
+
+    const DRAIN_TIMEOUT_SECS: u64 = 30;
+    {
+        let guard = ipc_inboxes.lock().await;
+        let mut count = 0usize;
+        for subscribers in guard.values() {
+            for sub in subscribers {
+                let _ = sub.tx.send(philotic_client::IpcResponse::GracefulShutdown {
+                    drain_timeout_secs: DRAIN_TIMEOUT_SECS,
+                });
+                count += 1;
+            }
+        }
+        info!("Graceful drain signal sent to {} guest subscriber(s).", count);
+    }
+    let drain_deadline =
+        tokio::time::Instant::now() + tokio::time::Duration::from_secs(DRAIN_TIMEOUT_SECS);
+    loop {
+        let all_gone = {
+            let guard = ipc_inboxes.lock().await;
+            guard.values().all(|subs| subs.is_empty())
+        };
+        if all_gone || tokio::time::Instant::now() >= drain_deadline {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    }
+    info!("All guest subscribers drained (or drain window elapsed). Shutting down hotel.");
+
     let _ = shutdown_tx.send(());
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     let _ = graph_domain_arc.set_hotel_pid(&hotel_name, None);

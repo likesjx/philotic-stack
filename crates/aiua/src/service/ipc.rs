@@ -72,9 +72,9 @@ type SubagentHookRegistry = Arc<Mutex<HashMap<String, SubagentHookRecord>>>;
 #[derive(Clone)]
 pub(crate) struct RoleSubscriber {
     conn_id: Uuid,
-    guest_id: String,
+    pub(crate) guest_id: String,
     supported_tools: Vec<String>,
-    tx: mpsc::UnboundedSender<IpcResponse>,
+    pub(crate) tx: mpsc::UnboundedSender<IpcResponse>,
 }
 
 #[cfg(not(test))]
@@ -2838,6 +2838,12 @@ impl IpcServer {
                     return Some(role_record.guest_id);
                 }
             }
+            // Single-process philote registers as the base agent_id and handles all roles
+            // internally. If the specific incarnation guest is not live but the base agent is,
+            // treat the base agent as the orchestrator.
+            if is_registered(agent_id) {
+                return Some(agent_id.to_string());
+            }
         }
 
         live_agent_guests
@@ -3132,6 +3138,26 @@ impl IpcServer {
             .ok()
             .flatten();
         let is_new_role = previous.is_none();
+        // For a new role, check if the base agent is currently live. Single-process philote
+        // registers as the base agent_id and handles all roles internally, so any new role
+        // it creates is immediately routable via the base guest.
+        let initial_readiness = if let Some(prev) = previous.as_ref() {
+            prev.readiness_state.clone()
+        } else {
+            let base_guest_live = {
+                let guard = inboxes.lock().await;
+                guard
+                    .get("agent")
+                    .into_iter()
+                    .flatten()
+                    .any(|s| s.guest_id == agent_id)
+            };
+            if base_guest_live {
+                ansible_mesh_core::graph::RoleReadinessState::Routable
+            } else {
+                ansible_mesh_core::graph::RoleReadinessState::Configured
+            }
+        };
         let record = ansible_mesh_core::graph::RoleIncarnationRecord {
             agent_id: agent_id.clone(),
             role_name: role_name.clone(),
@@ -3140,12 +3166,7 @@ impl IpcServer {
             role_identity_addendum,
             role_manifest,
             is_admin,
-            readiness_state: graph
-                .get_role_incarnation(&agent_id, &role_name)
-                .ok()
-                .flatten()
-                .map(|record| record.readiness_state)
-                .unwrap_or_default(),
+            readiness_state: initial_readiness,
             inactive_ttl_seconds,
             turn_loop_config: ansible_mesh_core::graph::TurnLoopConfig {
                 iteration_cap,
@@ -3444,13 +3465,20 @@ impl IpcServer {
                         value_json: Some(snapshot.to_string()),
                     };
                 }
-                if let Some(session_id) = key.strip_prefix("__session_snapshot__:") {
+                if let Some(rest) = key.strip_prefix("__session_snapshot__:") {
+                    // Key format: __session_snapshot__:{session_id} (orchestrator)
+                    //          or __session_snapshot__:{session_id}@{role_name} (role process)
+                    let (session_id, role_name) = match rest.split_once('@') {
+                        Some((sess, role)) => (sess, Some(role)),
+                        None => (rest, None),
+                    };
                     match Self::compose_session_snapshot(
                         graph,
                         inboxes,
                         registry,
                         local_node_id,
                         session_id,
+                        role_name,
                     )
                     .await
                     {
@@ -6360,6 +6388,11 @@ impl IpcServer {
                 Ok(None) => IpcResponse::Error(format!("cron job not found: {job_id}")),
                 Err(e) => IpcResponse::Error(format!("DisableCronJob failed: {e}")),
             },
+            IpcRequest::GracefulShutdown { .. } => IpcResponse::error(
+                "graceful_shutdown",
+                "NOT_APPLICABLE",
+                "GracefulShutdown is a hotel-to-guest signal; guests do not send it.",
+            ),
         }
     }
 
@@ -7373,6 +7406,8 @@ impl IpcServer {
         registry: &Arc<RwLock<NodeRegistry>>,
         local_node_id: &str,
         session_id: &str,
+        // Role-scoped key suffix: Some("virtuosa") → reads short_session:{id}:virtuosa
+        role_name: Option<&str>,
     ) -> anyhow::Result<Option<serde_json::Value>> {
         let Some(session) = graph.get_session(session_id)? else {
             return Ok(None);
@@ -7380,7 +7415,10 @@ impl IpcServer {
 
         let turns = graph.list_session_turns(session_id, 8)?;
         let apartment_checkpoint = session.primary_agent_id.as_deref().and_then(|agent_id| {
-            let memory_type = format!("short_session:{session_id}");
+            let memory_type = match role_name {
+                Some(role) => format!("short_session:{session_id}:{role}"),
+                None => format!("short_session:{session_id}"),
+            };
             graph.get_apartment(agent_id, &memory_type).ok().flatten()
         });
 
