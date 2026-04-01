@@ -72,6 +72,8 @@ pub struct VoiceBridge {
     pub guild_id: String,
     pub channel_id: String,
     pub session_id: String,
+    /// Text channel where /join was invoked — replies from the agent go here.
+    pub text_channel_id: String,
     /// Send PCM i16 samples here to have them encoded as Opus and transmitted to Discord.
     pub audio_tx: mpsc::Sender<Vec<i16>>,
     _shutdown_tx: oneshot::Sender<()>,
@@ -86,6 +88,7 @@ impl VoiceBridge {
         session: VoiceSession,
         utterance_tx: mpsc::Sender<VoiceUtteranceEvent>,
         hotel_session_id: String,
+        text_channel_id: String,
     ) -> Result<Self> {
         let guild_id = session.guild_id.clone();
         let channel_id = session.channel_id.clone();
@@ -131,6 +134,7 @@ impl VoiceBridge {
             guild_id,
             channel_id,
             session_id: hotel_session_id,
+            text_channel_id,
             audio_tx,
             _shutdown_tx: shutdown_tx,
         })

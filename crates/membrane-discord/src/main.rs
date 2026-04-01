@@ -173,15 +173,41 @@ async fn main() -> Result<()> {
             utterance = utterance_rx.recv() => {
                 if let Some(ev) = utterance {
                     let session_id = ev.session_id.clone();
+
+                    // Look up the text channel for this voice session so the reply lands
+                    // in the right Discord text channel.
+                    let text_channel_id = active_bridges
+                        .get(&ev.guild_id)
+                        .map(|b| b.text_channel_id.clone())
+                        .unwrap_or_else(|| ev.channel_id.clone());
+
+                    // Register an ActiveTurn so handle_agent_reply can route the reply.
+                    active_turns.insert(
+                        session_id.clone(),
+                        session::ActiveTurn {
+                            session_id: session_id.clone(),
+                            channel_id: ev.channel_id.clone(),
+                            guild_id: ev.guild_id.clone(),
+                            draft_message_id: None,
+                            trigger_message_id: None,
+                            reply_channel_id: text_channel_id.clone(),
+                        },
+                    );
+
                     let task_json = json!({
                         "action": "voice.dialogue",
                         "session_id": &session_id,
+                        "chat_id": &text_channel_id,
                         "guild_id": &ev.guild_id,
                         "channel_id": &ev.channel_id,
                         "speaker_ssrc": ev.speaker_ssrc,
                         "pcm_b64": ev.pcm_b64,
                         "sample_rate": voice_bridge::SAMPLE_RATE,
                         "source": "discord",
+                        "transport": "discord",
+                        "final_reply_to": &args.node_id,
+                        "final_reply_role": "membrane",
+                        "final_reply_guest_id": &args.guest_id,
                     });
 
                     if let Err(e) = ipc.send_request(IpcRequest::EmitTask {
@@ -552,7 +578,7 @@ async fn attempt_voice_connect(
     .await
     {
         Ok((session, _event_rx)) => {
-            match VoiceBridge::start(session, utterance_tx, hotel_session_id) {
+            match VoiceBridge::start(session, utterance_tx, hotel_session_id, pending.text_channel_id.clone()) {
                 Ok(bridge) => {
                     info!(
                         "VoiceBridge: active for guild={} channel={}",

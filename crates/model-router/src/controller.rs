@@ -138,6 +138,10 @@ pub struct AttachmentInput {
     pub url: Option<String>,
     pub blob_ref: Option<String>,
     pub transport_error: Option<String>,
+    /// Inline PCM audio — base64 i16 LE; bypasses blob store (Discord voice bridge).
+    pub inline_audio_b64: Option<String>,
+    pub inline_audio_sample_rate: Option<u32>,
+    pub inline_audio_channels: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -548,19 +552,22 @@ impl ControllerTask {
                 if self.context.attachments.is_empty() {
                     bail!("{kind_label} task requires at least one attachment");
                 }
-                if !self.context.attachments.iter().any(|attachment| {
-                    attachment
+                let has_usable_attachment = self.context.attachments.iter().any(|attachment| {
+                    let no_error = attachment
+                        .transport_error
+                        .as_deref()
+                        .map(|error| error.trim().is_empty())
+                        .unwrap_or(true);
+                    let has_url = attachment
                         .url
                         .as_deref()
                         .map(|url| !url.trim().is_empty())
-                        .unwrap_or(false)
-                        && attachment
-                            .transport_error
-                            .as_deref()
-                            .map(|error| error.trim().is_empty())
-                            .unwrap_or(true)
-                }) {
-                    bail!("{kind_label} task requires at least one blob-backed attachment url");
+                        .unwrap_or(false);
+                    let has_inline = attachment.inline_audio_b64.is_some();
+                    no_error && (has_url || has_inline)
+                });
+                if !has_usable_attachment {
+                    bail!("{kind_label} task requires at least one blob-backed or inline attachment");
                 }
             }
             TaskKind::VoiceSynthesize => {
@@ -782,6 +789,18 @@ fn parse_attachments(value: Option<&Value>) -> Vec<AttachmentInput> {
                             .and_then(|obj| obj.get("transport_error"))
                             .and_then(Value::as_str)
                             .map(str::to_string),
+                        inline_audio_b64: object
+                            .and_then(|obj| obj.get("inline_audio_b64"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        inline_audio_sample_rate: object
+                            .and_then(|obj| obj.get("inline_audio_sample_rate"))
+                            .and_then(Value::as_u64)
+                            .map(|v| v as u32),
+                        inline_audio_channels: object
+                            .and_then(|obj| obj.get("inline_audio_channels"))
+                            .and_then(Value::as_u64)
+                            .map(|v| v as u16),
                     }
                 })
                 .collect()

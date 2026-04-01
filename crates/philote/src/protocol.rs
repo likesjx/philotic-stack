@@ -20,6 +20,14 @@ pub struct TransportAttachment {
     pub blob_download_url: Option<String>,
     #[serde(default)]
     pub transport_error: Option<String>,
+    /// Inline audio payload — base64-encoded i16 LE PCM samples.
+    /// Set by Discord voice bridge (voice.dialogue) to bypass blob store.
+    #[serde(default)]
+    pub inline_audio_b64: Option<String>,
+    #[serde(default)]
+    pub inline_audio_sample_rate: Option<u32>,
+    #[serde(default)]
+    pub inline_audio_channels: Option<u16>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -71,6 +79,13 @@ pub struct InboundTaskPayload {
     pub final_reply_guest_id: Option<String>,
     #[serde(default)]
     pub error: Option<TaskErrorPayload>,
+    /// Inline PCM audio from Discord voice bridge (voice.dialogue tasks).
+    #[serde(default)]
+    pub pcm_b64: Option<String>,
+    #[serde(default)]
+    pub sample_rate: Option<u32>,
+    #[serde(default)]
+    pub speaker_ssrc: Option<u32>,
 }
 
 // Transitional note: older emitters may still carry failures in
@@ -254,6 +269,7 @@ mod tests {
             final_reply_guest_id: None,
             handoff_bundle: None,
             error: None,
+            ..Default::default()
         };
 
         assert_eq!(
@@ -288,6 +304,7 @@ mod tests {
             final_reply_guest_id: None,
             handoff_bundle: None,
             error: None,
+            ..Default::default()
         };
 
         assert!(payload.is_model_response());
@@ -319,6 +336,7 @@ mod tests {
             final_reply_guest_id: None,
             handoff_bundle: None,
             error: None,
+            ..Default::default()
         };
 
         assert!(payload.is_tool_result());
@@ -369,6 +387,7 @@ mod tests {
                 blob_id: None,
                 blob_download_url: None,
                 transport_error: None,
+                ..Default::default()
             }]
         );
         assert_eq!(
@@ -403,6 +422,7 @@ mod tests {
             final_reply_guest_id: None,
             handoff_bundle: None,
             error: None,
+            ..Default::default()
         };
 
         assert_eq!(
