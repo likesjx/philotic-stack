@@ -380,9 +380,9 @@ local-push:
     set -euo pipefail
     AIUA_CELLAR=/opt/homebrew/Cellar/aiua/0.1.0-alpha/bin
     PHIL_CELLAR=/opt/homebrew/Cellar/philotic-web/0.1.0-alpha/bin
-    AIUA_BINS="aiua philote membrane model-router model-controller-gemini model-controller-elevenlabs model-controller-mlx model-controller-onnx philote-worker tool-runner graph-runner graph-intelligence"
+    AIUA_BINS="aiua philote membrane membrane-telegram model-router model-controller-gemini model-controller-elevenlabs model-controller-mlx model-controller-onnx philote-worker tool-runner graph-runner graph-intelligence"
     echo "▶ Building release binaries..."
-    cargo build --release -p aiua -p philote -p membrane -p model-router -p tool-runner -p graph-runner -p graph-intelligence -p philotic-web
+    cargo build --release -p aiua -p philote -p membrane -p membrane-telegram -p model-router -p tool-runner -p graph-runner -p graph-intelligence -p philotic-web
     echo "▶ Installing aiua stack to ${AIUA_CELLAR}..."
     for bin in $AIUA_BINS; do
         if [ ! -f "target/release/$bin" ]; then
@@ -414,7 +414,7 @@ jane-push:
     set -euo pipefail
     REMOTE=mbp-jane
     REMOTE_CELLAR=/opt/homebrew/Cellar/aiua/0.1.0-alpha/bin
-    BINS="aiua philote membrane model-router model-controller-gemini model-controller-elevenlabs model-controller-mlx philote-worker tool-runner graph-runner philotic-web"
+    BINS="aiua philote membrane membrane-telegram model-router model-controller-gemini model-controller-elevenlabs model-controller-mlx philote-worker tool-runner graph-runner philotic-web"
     # Safety guard: verify we are actually talking to mbp-jane before touching anything.
     # mbp-jane's system hostname is "MacBookPro" — the SSH alias is just our local label.
     ACTUAL_HOST="$(ssh "${REMOTE}" hostname -s 2>/dev/null)"
@@ -423,7 +423,7 @@ jane-push:
         exit 1
     fi
     echo "▶ Building release binaries (local)..."
-    cargo build --release -p aiua -p philote -p membrane -p model-router -p tool-runner -p graph-runner -p philotic-web
+    cargo build --release -p aiua -p philote -p membrane -p membrane-telegram -p model-router -p tool-runner -p graph-runner -p philotic-web
     echo "▶ Stopping Jane on ${REMOTE}..."
     ssh "${REMOTE}" "pkill -f '/opt/homebrew/bin/aiua' 2>/dev/null || true; sleep 2"
     echo "▶ Pushing binaries to ${REMOTE}:${REMOTE_CELLAR}..."
@@ -486,6 +486,14 @@ intel-graph-install:
 # Start the intel-graph stack (ONNX sidecar + graph intelligence)
 intel-graph-start:
     ./scripts/setup-intel-graph.sh start
+
+# Start with 768-dim embedding model (higher quality, slower)
+intel-graph-start-768:
+    PHILOTIC_EMBED_DIM=768 ./scripts/setup-intel-graph.sh start
+
+# Start with custom embedding model
+intel-graph-start-custom model:
+    PHILOTIC_EMBED_MODEL={{model}} ./scripts/setup-intel-graph.sh start
 
 # Stop the intel-graph stack
 intel-graph-stop:
@@ -567,6 +575,57 @@ test-and-record target_id:
     
     exit $EXIT_CODE
 
+# Combined system health check (sessions + proposals + graph stats)
+intel-graph-health-check:
+    @echo "── Intel Graph System Health ──"
+    @curl -s http://127.0.0.1:8900/api/health 2>/dev/null | jq . || echo "Graph server not running"
+
+# Session health report
+intel-graph-session-health:
+    @curl -s http://127.0.0.1:8900/api/health/sessions 2>/dev/null | jq . || echo "Graph server not running"
+
+# Auto-close stale sessions (default: older than 4 hours)
+intel-graph-session-cleanup max_age_hours="4":
+    @echo "Cleaning stale sessions (max age: {{max_age_hours}}h)..."
+    @curl -s -X POST http://127.0.0.1:8900/api/session/cleanup \
+      -H "Content-Type: application/json" \
+      -d '{"max_age_hours": {{max_age_hours}}}' 2>/dev/null | jq . || echo "Graph server not running"
+
+# Proposal pipeline health report
+intel-graph-proposal-health:
+    @curl -s http://127.0.0.1:8900/api/health/proposals 2>/dev/null | jq . || echo "Graph server not running"
+
+# Embed all embeddable node kinds (proposals, seams, tasks, functions, types, modules, tests)
+intel-graph-embed-all:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for kind in proposal seam task function type module test; do
+        echo "Embedding ${kind}s..."
+        curl -s -X POST http://127.0.0.1:8901/mcp \
+          -H "Content-Type: application/json" \
+          -d "{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"graph_embed_batch\",\"arguments\":{\"kind\":\"${kind}\"}},\"id\":1}" | jq -r '.result.content[0].text' 2>/dev/null || echo "  failed for ${kind}"
+    done
+
+# Full graph maintenance: scan + cleanup + health check
+intel-graph-maintain:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "── Step 1: Scan ──"
+    curl -s -X POST http://127.0.0.1:8900/api/scan | jq '{crates, modules, types, functions, tests, docs, duration_ms}' 2>/dev/null || echo "Scan failed"
+    echo ""
+    echo "── Step 2: Session Cleanup ──"
+    curl -s -X POST http://127.0.0.1:8900/api/session/cleanup | jq . 2>/dev/null || echo "Cleanup failed"
+    echo ""
+    echo "── Step 3: Health Check ──"
+    curl -s http://127.0.0.1:8900/api/health | jq . 2>/dev/null || echo "Health check failed"
+    echo ""
+    echo "── Step 4: Embed Proposals ──"
+    curl -s -X POST http://127.0.0.1:8901/mcp \
+      -H "Content-Type: application/json" \
+      -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"graph_embed_batch","arguments":{"kind":"proposal"}},"id":1}' | jq -r '.result.content[0].text' 2>/dev/null || echo "Embedding failed"
+    echo ""
+    echo "✅ Maintenance complete."
+
 # Semantic search
 intel-graph-search query limit="10":
     curl -s -X POST http://127.0.0.1:8901/mcp -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"graph_semantic_search","arguments":{"query":"{{query}}","limit":{{limit}}}},"id":1}' | jq '.result.results | map({name, kind, similarity})'
@@ -574,3 +633,46 @@ intel-graph-search query limit="10":
 # Open Web UI in browser (macOS)
 intel-graph-ui:
     open http://127.0.0.1:8900
+
+# Close active workstream with summary and disposition
+close-workstream:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    
+    # Get active workstream
+    WORKSTREAM=$(curl -s "http://127.0.0.1:8900/api/nodes?kind=workstream" | jq -r '.[] | select(.properties.status == "active") | .id' | head -1)
+    if [ -z "$WORKSTREAM" ]; then
+        echo "No active workstream found"
+        exit 1
+    fi
+    
+    # Get session
+    SESSION=$(curl -s "http://127.0.0.1:8900/api/nodes?kind=session" | jq -r '.[] | select(.properties.status == "active") | .id' | head -1)
+    
+    echo "Closing workstream: $WORKSTREAM"
+    echo "Session: ${SESSION:-none}"
+    echo ""
+    
+    # Prompt for details
+    read -p "Disposition (completed/partial/blocked/superseded/cancelled): " DISPOSITION
+    DISPOSITION=${DISPOSITION:-completed}
+    
+    read -p "Verification level (none/test-green/smoke-green/watched-live-green): " VERIFIED
+    VERIFIED=${VERIFIED:-test-green}
+    
+    read -p "Summary of work: " SUMMARY
+    
+    # Close workstream
+    curl -s -X POST "http://127.0.0.1:8900/api/nodes/${WORKSTREAM}/update" \
+      -H "Content-Type: application/json" \
+      -d "{\"properties\":{\"status\":\"closed\",\"disposition\":\"${DISPOSITION}\",\"verified\":\"${VERIFIED}\",\"summary\":\"${SUMMARY}\",\"end_time\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}}" | jq '.updated'
+    
+    # Close session if exists
+    if [ -n "$SESSION" ]; then
+        curl -s -X POST http://127.0.0.1:8901/mcp \
+          -H "Content-Type: application/json" \
+          -d "{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"session_close\",\"arguments\":{\"session_id\":\"${SESSION}\",\"status\":\"${DISPOSITION}\",\"verified\":\"${VERIFIED}\",\"summary\":\"${SUMMARY}\"}},\"id\":1}" | jq -r '.result.content[0].text'
+    fi
+    
+    echo ""
+    echo "✅ Workstream closed"

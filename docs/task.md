@@ -376,6 +376,39 @@ Seam IDs: `local-admin-capability-envelope`, `onnx-admin-fallback-path`
 - [ ] Decide how ONNX fits for embeddings, tool-calling support, and local degraded-mode admin workflows.
 - [ ] Prove one local fallback path without external models.
 
+## New Project: EmbeddingGemma Swap
+
+Seam IDs: `embeddinggemma-swap-validation`
+
+- [x] Add [EMBEDDINGGEMMA_SWAP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/EMBEDDINGGEMMA_SWAP_PROPOSAL.md) and register seam.
+- [x] Start graph workstream for this session and claim the seam.
+- [ ] Switch graph embedding default from MiniLM to EmbeddingGemma in the active sidecar path.
+- [ ] Run embedding smoke validation: `graph_embed`, `graph_embed_batch(kind=proposal)`, `graph_semantic_search`.
+- [ ] Record session decision and verification status in graph before close-out.
+
+## New Project: Multi-Agent Coding Fleet
+
+Proposal: [MULTI_AGENT_CODING_FLEET_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MULTI_AGENT_CODING_FLEET_PROPOSAL.md)
+Seam IDs: `cross-agent-seam-ownership`, `role-charter-contract`, `verification-custody`, `handoff-packet-shape`
+
+- [x] Open proposal for multi-agent parallel coding topology across Codex, Claude Code, Gemini/Antigravity, and Copilot.
+- [ ] Define first role charters with explicit authority boundaries:
+  - orchestrator
+  - implementer
+  - explorer/reviewer
+  - verifier
+  - docs/state maintainer
+- [ ] Define and enforce first delegation packet schema:
+  - `seam_id`
+  - `truth_level`
+  - `in_scope`
+  - `out_of_scope`
+  - `success_condition`
+  - `output_contract`
+  - `verification_expectation`
+- [ ] Run first pilot with two parallel implementation lanes plus independent verifier lane.
+- [ ] Capture at least one observed coordination failure and codify it into a standing workflow rule.
+
 ## New Project: OpenClaw Parity And Migration
 
 - [ ] Review [OPENCLAW_PARITY_MIGRATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OPENCLAW_PARITY_MIGRATION_PROPOSAL.md).
@@ -1187,6 +1220,7 @@ Seam IDs: `wider-client-adoption`, `philotic-native-memory-integration`
 - [x] Telegram slash-command elevation (first slice): `/ping` handled in `membrane` before agent-core — `handle_membrane_command` short-circuits the `EmitTask` dispatch and replies directly.
 - [ ] Telegram slash-command elevation (next): `/new` resets session_id in membrane (start fresh conversation without round-trip); `/help` lists available commands from membrane directly.
 - [x] Telegram bot command registration/UI: call Telegram `setMyCommands` from `membrane` startup so supported slash commands show up in the Telegram client command UI instead of existing only as hidden transport behavior.
+- [ ] Telegram provider binary (`telegram-provider-binary`): materialize Telegram hotels with `membrane-telegram` instead of the compatibility `membrane` wrapper, and keep rollout/install recipes aware of the provider binary.
 - [x] Telegram poll ownership (first slice): add a hotel-owned poll lease per bot token fingerprint so only one local membrane long-polls `getUpdates` for a token at a time, and fail closed when lease acquisition is denied.
 - [x] Telegram poll ownership (authority slice): anchor agent identity to `authority_hotel` and deny poll-lease acquisition when the current hotel is not that agent's home authority.
 - [x] Telegram poll delegated authority (transitional slice): allow a non-home hotel to acquire the poll lease only when the agent identity bundle explicitly lists that hotel in `telegram_poll_delegate_hotels`.

@@ -1421,7 +1421,7 @@ fn hotel_shared_guests(hotel_name: &str, profiles: &[AgentProfile]) -> Vec<Guest
             guest_id: format!("{hotel_name}:membrane-gateway"),
             role: "membrane".into(),
             config_json: serde_json::json!({
-                "command": "membrane",
+                "command": "membrane-telegram",
                 "args": [],
                 "env": {
                     "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
@@ -2373,7 +2373,7 @@ fn enable_guest_test_overrides(
                     guest_id: standby_guest_id.clone(),
                     role: "membrane".into(),
                     config_json: serde_json::json!({
-                        "command": "membrane",
+                        "command": "membrane-telegram",
                         "args": [],
                         "env": {
                             "PHILOTIC_HOTEL_SOCKET": hotel.ipc_socket_path.clone(),
