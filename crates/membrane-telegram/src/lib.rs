@@ -16,6 +16,17 @@ use tracing::{error, info, warn};
 
 const TELEGRAM_POLL_TIMEOUT_SECS: u64 = 10;
 const TELEGRAM_POLL_LEASE_RENEW_INTERVAL_SECS: u64 = 20;
+const MEMBRANE_ERROR_BACKOFF_INITIAL_SECS: u64 = 1;
+const MEMBRANE_ERROR_BACKOFF_MAX_SECS: u64 = 600;
+
+fn next_error_backoff_secs(current_secs: u64) -> u64 {
+    current_secs
+        .saturating_mul(2)
+        .clamp(
+            MEMBRANE_ERROR_BACKOFF_INITIAL_SECS,
+            MEMBRANE_ERROR_BACKOFF_MAX_SECS,
+        )
+}
 
 fn local_node_id() -> String {
     std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string())
@@ -2015,6 +2026,42 @@ async fn run_seat_impl(
     }
 }
 
+async fn run_seat_with_backoff(
+    seat_guest_id: String,
+    telegram_token_key: String,
+    target_agent_id: String,
+    http_client: reqwest::Client,
+    telegram_api_base: String,
+    telegram_file_api_base: String,
+    blob_base: String,
+) -> Result<()> {
+    let mut backoff_secs = MEMBRANE_ERROR_BACKOFF_INITIAL_SECS;
+
+    loop {
+        match run_seat_impl(
+            seat_guest_id.clone(),
+            telegram_token_key.clone(),
+            target_agent_id.clone(),
+            http_client.clone(),
+            telegram_api_base.clone(),
+            telegram_file_api_base.clone(),
+            blob_base.clone(),
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                warn!(
+                    "Telegram membrane seat [{}] failed: {}. Retrying in {}s.",
+                    seat_guest_id, err, backoff_secs
+                );
+                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                backoff_secs = next_error_backoff_secs(backoff_secs);
+            }
+        }
+    }
+}
+
 pub async fn run() -> Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
@@ -2074,7 +2121,7 @@ pub async fn run() -> Result<()> {
                 let blob = blob_base.clone();
 
                 tasks.push(tokio::spawn(async move {
-                    if let Err(e) = run_seat_impl(
+                    if let Err(e) = run_seat_with_backoff(
                         seat_guest_id.clone(),
                         token_key,
                         agent_id,
@@ -2108,7 +2155,7 @@ pub async fn run() -> Result<()> {
     let target_agent_id = configured_target_agent_id();
     let telegram_token_key = configured_telegram_token_key();
 
-    run_seat_impl(
+    run_seat_with_backoff(
         guest_id,
         telegram_token_key,
         target_agent_id,
@@ -2125,8 +2172,9 @@ mod tests {
     use super::{
         TELEGRAM_MAX_COMMANDS, TELEGRAM_MENU_COMMANDS, TelegramBotCommand, TelegramFileRef,
         build_combined_telegram_commands, build_telegram_menu_commands, default_attachment_name,
-        enrich_attachment_with_transport, normalize_telegram_menu_command_name, telegram_command,
-        telegram_format_text, telegram_help_text, telegram_inbound_envelope,
+        enrich_attachment_with_transport, next_error_backoff_secs,
+        normalize_telegram_menu_command_name, telegram_command, telegram_format_text,
+        telegram_help_text, telegram_inbound_envelope,
     };
     use philotic_client::CommandManifestEntry;
     use serde_json::json;
@@ -2501,5 +2549,14 @@ mod tests {
         assert!(names.contains(&"ping"));
         assert!(names.contains(&"new"));
         assert!(names.contains(&"status"));
+    }
+
+    #[test]
+    fn error_backoff_doubles_and_caps_at_ten_minutes() {
+        assert_eq!(next_error_backoff_secs(1), 2);
+        assert_eq!(next_error_backoff_secs(2), 4);
+        assert_eq!(next_error_backoff_secs(300), 600);
+        assert_eq!(next_error_backoff_secs(600), 600);
+        assert_eq!(next_error_backoff_secs(900), 600);
     }
 }

@@ -10,7 +10,7 @@ mod voice_bridge;
 mod voice_gateway;
 mod voice_udp;
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use clap::Parser;
 use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
 use serde_json::{json, Value};
@@ -21,8 +21,20 @@ use tokio::time::{interval, Duration};
 use tracing::{debug, error, info, warn};
 use voice_bridge::{VoiceBridge, VoiceUtteranceEvent};
 
+const MEMBRANE_ERROR_BACKOFF_INITIAL_SECS: u64 = 1;
+const MEMBRANE_ERROR_BACKOFF_MAX_SECS: u64 = 600;
+
+fn next_error_backoff_secs(current_secs: u64) -> u64 {
+    current_secs
+        .saturating_mul(2)
+        .clamp(
+            MEMBRANE_ERROR_BACKOFF_INITIAL_SECS,
+            MEMBRANE_ERROR_BACKOFF_MAX_SECS,
+        )
+}
+
 /// Discord Membrane — bridges Discord text/voice into the Philotic hotel.
-#[derive(Debug, Parser)]
+#[derive(Clone, Debug, Parser)]
 #[command(name = "membrane-discord", version)]
 struct Args {
     /// Agent ID this membrane instance serves.
@@ -85,13 +97,11 @@ impl PendingVoiceConnect {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+async fn run_once(args: Args) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
-
-    let args = Args::parse();
+        .try_init()
+        .ok();
     info!("membrane-discord starting for agent [{}]", args.agent_id);
 
     // Connect to hotel IPC
@@ -164,8 +174,7 @@ async fn main() -> Result<()> {
             // Periodic lease renewal
             _ = lease_renew_tick.tick() => {
                 if let Err(e) = gateway_lease.renew(&mut ipc).await {
-                    error!("Discord gateway lease lost: {} — shutting down", e);
-                    break;
+                    return Err(anyhow!("Discord gateway lease lost: {}", e));
                 }
             }
 
@@ -224,8 +233,7 @@ async fn main() -> Result<()> {
             // Inbound gateway event
             event = event_rx.recv() => {
                 let Some(event) = event else {
-                    warn!("Gateway event channel closed — exiting");
-                    break;
+                    return Err(anyhow!("Gateway event channel closed"));
                 };
 
                 match event {
@@ -511,8 +519,7 @@ async fn main() -> Result<()> {
                         warn!("Unexpected IPC response in recv_task: {:?}", other);
                     }
                     Err(e) => {
-                        error!("IPC recv_task error: {} — connection may be closed", e);
-                        break;
+                        return Err(anyhow!("IPC recv_task error: {}", e));
                     }
                 }
             }
@@ -533,6 +540,30 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn run_with_backoff(args: Args) -> Result<()> {
+    let mut backoff_secs = MEMBRANE_ERROR_BACKOFF_INITIAL_SECS;
+
+    loop {
+        match run_once(args.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                warn!(
+                    "membrane-discord runtime failed for agent [{}]: {}. Retrying in {}s.",
+                    args.agent_id, err, backoff_secs
+                );
+                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                backoff_secs = next_error_backoff_secs(backoff_secs);
+            }
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = Args::parse();
+    run_with_backoff(args).await
 }
 
 /// Attempt to connect the voice gateway once both VoiceStateUpdate and
@@ -733,4 +764,18 @@ async fn handle_agent_reply(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_error_backoff_secs;
+
+    #[test]
+    fn error_backoff_doubles_and_caps_at_ten_minutes() {
+        assert_eq!(next_error_backoff_secs(1), 2);
+        assert_eq!(next_error_backoff_secs(2), 4);
+        assert_eq!(next_error_backoff_secs(300), 600);
+        assert_eq!(next_error_backoff_secs(600), 600);
+        assert_eq!(next_error_backoff_secs(900), 600);
+    }
 }
