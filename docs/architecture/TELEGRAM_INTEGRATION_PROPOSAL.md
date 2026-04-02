@@ -3,7 +3,7 @@ title: Philotic Telegram Integration Proposal
 doc_type: proposal
 domain: membrane-transport
 status: accepted-current-slice
-last_updated: 2026-03-31
+last_updated: 2026-04-01
 tags:
 - telegram
 - membrane
@@ -25,6 +25,7 @@ implemented_by:
 active_seams:
 - webhook-security-contract
 - watched-live-telegram-validation
+- telegram-provider-binary
 source_of_truth_targets:
 - ARCHITECTURE_STATUS.md
 ---
@@ -50,25 +51,26 @@ Telegram poller ownership is defined separately in [TELEGRAM_POLL_LEASE_PROPOSAL
 
 ## Core Recommendation
 
-Keep `membrane` as the canonical Telegram transport boundary.
+Keep Telegram as a membrane implementation, not as the definition of `membrane`.
 
-More precisely for long-term architecture:
+More precisely for the current extraction path:
 
 - `membrane` is the component type
 - Telegram is one membrane implementation
-- the current `crates/membrane` binary is a transitional Telegram-oriented implementation of that type
+- `membrane-telegram` is the runtime binary that should be materialized for Telegram hotels
+- the existing `membrane` binary is a transitional compatibility wrapper over the same implementation during migration
 
 For the first coherent slice:
 
 - keep polling as the default production ingress
 - design webhook ingress now, but gate it behind a stricter security contract than polling
-- raise Telegram-native control behavior into `membrane`
+- raise Telegram-native control behavior into the Telegram membrane provider
 - normalize Telegram updates into a transport-neutral envelope before handing them to `philote`
 - keep `philote` transport-agnostic and focused on cognition
 
 In other words:
 
-- `membrane` owns Telegram semantics
+- `membrane-telegram` owns Telegram semantics
 - `philote` owns the conversational/agent loop
 - the context graph owns durable session truth
 
@@ -86,7 +88,8 @@ Accepted here means:
 
 Current repo truth:
 
-- `crates/membrane` is a long-polling Telegram guest
+- `crates/membrane-telegram` is the intended long-polling Telegram guest binary
+- `crates/membrane` currently remains as a compatibility wrapper package over `membrane-telegram`
 - it now normalizes one canonical inbound path for:
   - `message.text`
   - captioned media messages
@@ -118,6 +121,12 @@ That is a useful membrane slice, but it is not yet a richer Telegram controller:
 - membrane/agent identity is now guest-configurable, so separate hotels can materialize separate Telegram pollers and separate agent identities without hardcoding Jane everywhere
 - specialized voice transcription, richer vision workflows, and watched live validation of the blob-backed media path are still follow-on work
 - polling still does not cover the full Telegram update surface beyond `message` and `callback_query`
+
+This slice is intentionally transitional:
+
+- Telegram runtime code now lives in `crates/membrane-telegram`
+- the bare `membrane` package still exists as a compatibility wrapper for older runtime references
+- follow-on work should keep converging provider crates toward the same side-by-side pattern already used by Discord
 
 ## Current Reality
 

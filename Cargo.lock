@@ -2305,16 +2305,8 @@ name = "membrane"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
- "clap",
- "philotic-client",
- "pulldown-cmark",
- "reqwest",
- "serde_json",
- "sha2",
+ "membrane-telegram",
  "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -2337,6 +2329,23 @@ dependencies = [
  "sha2",
  "tokio",
  "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "membrane-telegram"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "clap",
+ "philotic-client",
+ "pulldown-cmark",
+ "reqwest",
+ "serde_json",
+ "sha2",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]

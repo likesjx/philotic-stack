@@ -3,7 +3,7 @@ title: Philotic Architecture Status
 doc_type: status
 domain: runtime-sessions
 status: active
-last_updated: 2026-03-31
+last_updated: 2026-04-01
 tags:
 - source-of-truth
 - current-state
@@ -37,9 +37,11 @@ tracks_domains:
 
 # Philotic Architecture Status
 
-> **Status:** Living Snapshot | **Last Updated:** 2026-03-23
+> **Status:** Transitional Snapshot | **Last Updated:** 2026-03-23
 
-This document is the single source of truth for Philotic's current architecture status.
+This document is a legacy human-readable projection of current architecture state.
+The SQLite graph is the canonical source of truth; this file exists for review,
+orientation, and writeback compatibility while the graph-centric workflow matures.
 
 Use it to answer three questions fast:
 
@@ -47,13 +49,14 @@ Use it to answer three questions fast:
 2. What is intentionally transitional?
 3. What is actively being worked right now?
 
-This is not the place for full design arguments. For those, follow the linked proposal docs.
+This is not the place for full design arguments. For those, follow the linked proposal docs and the graph-backed domain/seam records.
 
 ## How To Read This
 
 - `Implemented` means there is code and test evidence in the repo today.
 - `Transitional` means the shape is real enough to rely on for the current slice, but it is not presented as final architecture.
 - `Active` means the seam is currently hot based on [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md), active proposals, and the observed worktree on 2026-03-12.
+- `Graph canonical` means the authoritative state now lives in the SQLite graph; update the graph first and let writeback refresh this file.
 - when convenience docs disagree on concrete transport details, current code and [docs/README.md](/Users/jaredlikes/code/philotic-stack/docs/README.md) win over stale crate-level prose.
 
 ## Current Architecture Summary
@@ -61,10 +64,10 @@ This is not the place for full design arguments. For those, follow the linked pr
 Philotic currently operates as a hotel-centered runtime:
 
 - `aiua` is the runtime authority for hotel orchestration, guest materialization, context-graph persistence, IPC handling, and inter-hotel coordination.
-- `membrane`, `philote`, `model-router`, and `tool-runner` are separate guest-facing binaries with explicit runtime boundaries.
+- `membrane-telegram`, `philote`, `model-router`, and `tool-runner` are separate guest-facing binaries with explicit runtime boundaries.
 - local guest-to-hotel IPC currently runs over Unix domain sockets, driven by `PHILOTIC_HOTEL_SOCKET`; default paths include `/tmp/philotic-aiua.sock` for generic local clients and hotel-specific socket paths such as `/tmp/philotic-<hotel>.sock` when `aiua` materializes a named hotel.
 - canonical session state now lives in the context graph, while apartment-style checkpoints remain derived recovery projections rather than a competing source of truth.
-- Telegram ingress is session-aware and guarded by hotel-owned poll-lease authority, with explicit delegated remote polling available as a transitional exception.
+- Telegram ingress is session-aware and guarded by hotel-owned poll-lease authority, with explicit delegated remote polling available as a transitional exception; Telegram hotels should now materialize `membrane-telegram` directly while the bare `membrane` binary remains a transitional compatibility wrapper.
 - local and remote execution routing both exist, but several placement, delegation, and admin/control-plane seams are still under active development.
 
 ## Implemented Foundations
@@ -99,6 +102,7 @@ Primary references:
 - slash commands are short-circuited before the normal model path
 - Telegram poll leases are hotel-owned, renewed, fenced, explicitly released on graceful shutdown, and can be delegated to named remote hotels as a transitional contract
 - poll authority is anchored to the agent's home hotel rather than the current routed role
+- `membrane-telegram` is now the intended Telegram provider binary, while `crates/membrane` remains a compatibility wrapper package during extraction
 
 Primary references:
 - [TELEGRAM_INTEGRATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TELEGRAM_INTEGRATION_PROPOSAL.md)
@@ -207,9 +211,10 @@ These are the most clearly active seams as of 2026-03-13:
 
 When a slice lands:
 
-1. Update this file if the answer to "what is implemented" or "what is active right now" changed.
-2. Update the relevant proposal disposition/current-slice text.
-3. Update [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md) if sequencing or work ownership changed.
+1. Update the graph first.
+2. Let writeback or a follow-on doc sync update this file.
+3. Update the relevant proposal disposition/current-slice text.
+4. Update [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md) if sequencing or work ownership changed.
 
 ## Related Entry Points
 
