@@ -697,6 +697,35 @@ fn spawn_typing_heartbeat(
     (tx, handle)
 }
 
+/// Strip the `@agent:<role_name>` attribution tag from the end of outbound
+/// content. Returns (clean_content, Option<role_name>).
+/// Format contract: tag is on its own line at the very end, e.g.
+///   "Some answer.\n\n@agent:theoretician"
+fn strip_attribution_tag(content: &str) -> (String, Option<String>) {
+    let trimmed = content.trim_end();
+    if let Some(tag_start) = trimmed.rfind("\n@agent:") {
+        let role = trimmed[tag_start + "\n@agent:".len()..].trim().to_string();
+        if !role.is_empty() && role.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+            let clean = trimmed[..tag_start].trim_end().to_string();
+            return (clean, Some(role));
+        }
+    }
+    (content.to_string(), None)
+}
+
+/// Build a Telegram `reply_markup` with a single inline button to switch to
+/// the named specialist role.
+fn role_switch_button(role_name: &str) -> Value {
+    let label = format!("🎭 {}", role_name);
+    let callback = format!("/role {}", role_name);
+    json!({
+        "inline_keyboard": [[{
+            "text": label,
+            "callback_data": callback
+        }]]
+    })
+}
+
 /// Send a plain text reply to a Telegram chat, formatted as HTML.
 /// Returns the Telegram `message_id` if the send succeeded.
 async fn send_telegram_text(
@@ -705,6 +734,7 @@ async fn send_telegram_text(
     chat_id: &str,
     thread_id: Option<&str>,
     text: &str,
+    reply_markup: Option<Value>,
 ) -> Option<i64> {
     let formatted = telegram_format_text(text);
     let send_url = format!("{tg_base}sendMessage");
@@ -716,6 +746,9 @@ async fn send_telegram_text(
     });
     if let Some(tid) = thread_id {
         payload["message_thread_id"] = Value::String(tid.to_string());
+    }
+    if let Some(markup) = reply_markup {
+        payload["reply_markup"] = markup;
     }
     match http_client.post(&send_url).json(&payload).send().await {
         Ok(res) => {
@@ -792,11 +825,13 @@ async fn upsert_formatted_text(
     thread_id: Option<&str>,
     existing_message_id: Option<i64>,
     text: &str,
+    reply_markup: Option<Value>,
 ) -> Option<i64> {
     let chunks = split_at_paragraph_boundary(text, 4096);
     let Some(first_chunk) = chunks.first() else {
         return existing_message_id;
     };
+    let last_idx = chunks.len() - 1;
 
     let first_message_id = match existing_message_id {
         Some(message_id)
@@ -804,11 +839,15 @@ async fn upsert_formatted_text(
         {
             Some(message_id)
         }
-        _ => send_telegram_text(http_client, tg_base, chat_id, thread_id, first_chunk).await,
+        _ => {
+            let markup = if last_idx == 0 { reply_markup.clone() } else { None };
+            send_telegram_text(http_client, tg_base, chat_id, thread_id, first_chunk, markup).await
+        }
     };
 
-    for chunk in chunks.iter().skip(1) {
-        send_telegram_text(http_client, tg_base, chat_id, thread_id, chunk).await;
+    for (i, chunk) in chunks.iter().enumerate().skip(1) {
+        let markup = if i == last_idx { reply_markup.clone() } else { None };
+        send_telegram_text(http_client, tg_base, chat_id, thread_id, chunk, markup).await;
     }
 
     first_message_id
@@ -839,6 +878,7 @@ async fn handle_membrane_command(
                 &envelope.chat_id,
                 envelope.thread_id.as_deref(),
                 &telegram_help_text(agent_cmds),
+                None,
             )
             .await;
             true
@@ -851,6 +891,7 @@ async fn handle_membrane_command(
                 &envelope.chat_id,
                 envelope.thread_id.as_deref(),
                 "pong",
+                None,
             )
             .await;
             true
@@ -880,6 +921,7 @@ async fn handle_membrane_command(
                 &envelope.chat_id,
                 envelope.thread_id.as_deref(),
                 "Started a new conversation.",
+                None,
             )
             .await;
             true
@@ -1891,6 +1933,7 @@ async fn run_seat_impl(
                                         thread_id.as_deref(),
                                         draft_message_id,
                                         &content,
+                                        None, // no button on partial/draft messages
                                     ).await {
                                         if let Some(active) = active_turns.get_mut(&session_id) {
                                             active.draft_message_id = Some(message_id);
@@ -1909,7 +1952,14 @@ async fn run_seat_impl(
                                     (None, None)
                                 };
 
-                                let content = task.get("content").and_then(|c| c.as_str()).unwrap_or_default().to_string();
+                                let raw_content = task.get("content").and_then(|c| c.as_str()).unwrap_or_default().to_string();
+                                // Interceptor: strip @agent:<role> attribution tag and
+                                // build an inline button so the user can switch to that role.
+                                let (content, role_button) = {
+                                    let (clean, role) = strip_attribution_tag(&raw_content);
+                                    let markup = role.as_deref().map(role_switch_button);
+                                    (clean, markup)
+                                };
                                 let thread_id = task.get("thread_id").and_then(|v| v.as_str()).map(str::to_string).or(active_thread_id);
                                 let audio_artifact_json = task.get("audio_artifact").and_then(|a| a.as_str()).map(str::to_string);
                                 let send_text_caption = task.get("send_text_caption").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -1965,6 +2015,7 @@ async fn run_seat_impl(
                                                     thread_id_clone.as_deref(),
                                                     draft_message_id,
                                                     &content,
+                                                    role_button.clone(),
                                                 ).await;
                                             }
                                         } else if !content.is_empty() {
@@ -1977,6 +2028,7 @@ async fn run_seat_impl(
                                                 thread_id_clone.as_deref(),
                                                 draft_message_id,
                                                 &content,
+                                                role_button.clone(),
                                             ).await;
                                         }
                                     });

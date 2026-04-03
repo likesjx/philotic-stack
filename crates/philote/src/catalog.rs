@@ -553,6 +553,45 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
     );
 
     m.insert(
+        "delegate.whisper".into(),
+        ToolDefinition {
+            tool_name: "delegate.whisper".into(),
+            description: "Fire-and-forget paracrine dispatch — silently consults a specialist \
+                          role without interrupting the current turn. The specialist's response \
+                          arrives back asynchronously as a paracrine_response. Use for quiet \
+                          delegation, mid-turn enrichment, or specialist consultation where the \
+                          user does not need to see the handoff. \
+                          Set reply_to='membrane' to route the specialist's response directly \
+                          to the user with an inline role-switch button."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "role": {
+                        "type": "string",
+                        "description": "The target specialist role name to dispatch the exosome to."
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "The prompt or question for the specialist."
+                    },
+                    "reply_to": {
+                        "type": "string",
+                        "description": "Where the specialist's response should go. 'self' = back to this philote as paracrine_response (default). 'membrane' = directly to the user with a role-switch button. '<node>/<role>' = explicit routing."
+                    },
+                    "routing": {
+                        "type": "string",
+                        "enum": ["cognitive_re_entry", "enriched_tool_result", "datasource_injection", "memory_enrichment", "progress_update", "heartbeat", "raw_forward"],
+                        "description": "How to handle the specialist's response when it arrives. Defaults to cognitive_re_entry."
+                    }
+                },
+                "required": ["role", "prompt"]
+            }),
+            class: Some("delegate".into()),
+        },
+    );
+
+    m.insert(
         "role.configure".into(),
         ToolDefinition {
             tool_name: "role.configure".into(),

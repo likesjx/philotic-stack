@@ -4880,6 +4880,38 @@ impl IpcServer {
                 "NOT_APPLICABLE",
                 "GracefulShutdown is a hotel-to-guest signal; guests do not send it.",
             ),
+
+            // Fire-and-forget paracrine dispatch.
+            // The caller does NOT wait for the specialist's response — it arrives later
+            // as a paracrine_response inbound task at reply_to_node/reply_to_role.
+            IpcRequest::ParacrineEmit {
+                role,
+                exosome,
+                reply_to_node,
+                reply_to_role,
+                ..
+            } => {
+                let paracrine_task = serde_json::json!({
+                    "action": "paracrine_request",
+                    "content": exosome.prompt,
+                    "exosome": exosome,
+                    "final_reply_to": reply_to_node,
+                    "final_reply_role": reply_to_role,
+                });
+
+                // Deliver to the target role's inbox; parking lot materialises if needed.
+                Self::deliver_inbound_task(
+                    inboxes,
+                    local_node_id,
+                    &role,
+                    None,
+                    Uuid::new_v4(),
+                    paracrine_task.to_string(),
+                )
+                .await;
+
+                IpcResponse::success("paracrine_emit", None)
+            }
         }
     }
 

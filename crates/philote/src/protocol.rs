@@ -86,6 +86,10 @@ pub struct InboundTaskPayload {
     pub sample_rate: Option<u32>,
     #[serde(default)]
     pub speaker_ssrc: Option<u32>,
+    /// The [`Exosome`] envelope present on `paracrine_request` and
+    /// `paracrine_response` tasks. Carries the paracrine_id and routing hint.
+    #[serde(default)]
+    pub exosome: Option<serde_json::Value>,
 }
 
 // Transitional note: older emitters may still carry failures in

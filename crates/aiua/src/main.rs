@@ -2056,6 +2056,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "workspace.list".into(),
                 "workspace.read".into(),
                 "bash.exec".into(),
+                "delegate.whisper".into(),
             ],
             allowed_classes: vec!["session".into(), "utility".into(), "config".into()],
             allowed_skills: vec![
@@ -2109,6 +2110,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "workspace.list".into(),
                 "workspace.read".into(),
                 "bash.exec".into(),
+                "delegate.whisper".into(),
             ],
             allowed_classes: vec![
                 "session".into(),

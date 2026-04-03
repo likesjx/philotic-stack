@@ -16,7 +16,8 @@ use memory_core::{
     MemoryScope, MuninnConfig, MuninnRestEngine, RecallContext, RecallTrigger, VaultResolver,
 };
 use philotic_client::{
-    HandoffBundle, IpcRequest, IpcResponse, PhiloticClient, TaskErrorPayload, is_ipc_disconnect,
+    Exosome, HandoffBundle, IpcRequest, IpcResponse, ParacrineRouting, PhiloticClient,
+    TaskErrorPayload, is_ipc_disconnect,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -683,6 +684,25 @@ impl AgentRuntime {
                             let task_ref = task.clone();
                             if let Err(err) = self.handle_voice_dialogue(task, task_id).await {
                                 error!("Failed to handle voice.dialogue: {}", err);
+                        }
+                    }
+                                            Ok(task) if task.action.as_deref() == Some("paracrine_request") => {
+                            // Paracrine sub-call — this philote is the specialist receiving
+                            // an Exosome from a peer or Orchestrator. final_reply_to/role
+                            // are set by the ParacrineEmit caller to route the response.
+                            let task_ref = task.clone();
+                            if let Err(err) = self.handle_user_message(task, task_id).await {
+                                error!("Failed to handle paracrine_request: {}", err);
+                                let _ = self.emit_error_reply(&task_ref, task_id, err).await;
+                            }
+                        }
+                        Ok(task) if task.action.as_deref() == Some("paracrine_response") => {
+                            // Exosome response arriving back from a prior paracrine
+                            // dispatch. Route through the lookaside reflex — not the
+                            // main user-message path.
+                            let task_ref = task.clone();
+                            if let Err(err) = self.handle_paracrine_response(task, task_id).await {
+                                error!("Failed to handle paracrine_response: {}", err);
                                 let _ = self.emit_error_reply(&task_ref, task_id, err).await;
                             }
                         }
@@ -732,6 +752,149 @@ impl AgentRuntime {
                 Err(_) => {}
             }
         }
+    }
+
+    /// Lookaside routing reflex — dispatches an incoming `paracrine_response`
+    /// based on the [`ParacrineRouting`] hint carried in the exosome.
+    ///
+    /// This is a separate path from [`handle_user_message`]: the main cognitive
+    /// loop is not re-entered unless the routing explicitly calls for it. The
+    /// `paracrine_id` threads through every branch for cross-mesh provenance.
+    async fn handle_paracrine_response(
+        &mut self,
+        task: InboundTaskPayload,
+        task_id: Uuid,
+    ) -> Result<()> {
+        // Extract the exosome envelope from the task payload so we can read the
+        // paracrine_id and response_routing hint set at dispatch time.
+        let exosome: Option<Exosome> = task
+            .exosome
+            .as_ref()
+            .and_then(|v| serde_json::from_value::<Exosome>(v.clone()).ok());
+
+        let paracrine_id = exosome
+            .as_ref()
+            .and_then(|e| e.paracrine_id.clone());
+
+        let routing = exosome
+            .as_ref()
+            .and_then(|e| e.response_routing.clone())
+            .unwrap_or(ParacrineRouting::CognitiveReEntry);
+
+        // Locate the owning session by matching paracrine_id against turn logs,
+        // falling back to the task's session_id field.
+        let session_id = task
+            .session_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                if let Some(pid) = &paracrine_id {
+                    self.sessions.iter().find_map(|(sid, state)| {
+                        state
+                            .active_turn
+                            .as_ref()
+                            .filter(|t| t.associated_paracrine_ids.contains(pid))
+                            .map(|_| sid.as_str())
+                    })
+                } else {
+                    None
+                }
+            })
+            .map(str::to_string);
+
+        match routing {
+            ParacrineRouting::RawForward => {
+                // Emit content directly to membrane — no model loop.
+                let content = task.content.clone().unwrap_or_default();
+                let node_id = local_node_id();
+                let _ = self
+                    .ipc_client
+                    .send_request(IpcRequest::EmitTask {
+                        target_node: node_id,
+                        target_role: "membrane".into(),
+                        target_guest_id: None,
+                        task_json: serde_json::json!({
+                            "action": "send_message",
+                            "content": content,
+                            "paracrine_id": paracrine_id,
+                        })
+                        .to_string(),
+                    })
+                    .await;
+            }
+
+            ParacrineRouting::ProgressUpdate => {
+                // Emit a partial/ephemeral update to membrane without closing
+                // or interrupting the active turn.
+                let content = task.content.clone().unwrap_or_default();
+                if let Some(sid) = &session_id {
+                    let _ = self.emit_partial_reply(sid, content).await;
+                }
+            }
+
+            ParacrineRouting::Heartbeat => {
+                // No model involvement — just log and acknowledge.
+                info!(
+                    paracrine_id = paracrine_id.as_deref().unwrap_or("?"),
+                    "paracrine heartbeat received"
+                );
+            }
+
+            ParacrineRouting::MemoryEnrichment => {
+                // Push specialist content into the session memory window.
+                // Falls through to CognitiveReEntry if no session found.
+                if session_id.is_none() {
+                    warn!(
+                        paracrine_id = paracrine_id.as_deref().unwrap_or("?"),
+                        "MemoryEnrichment: no session found, dropping"
+                    );
+                    return Ok(());
+                }
+                // Memory injection handled by model re-entry with enriched context.
+                self.handle_user_message(task, task_id).await?;
+            }
+
+            ParacrineRouting::DatasourceInjection => {
+                // Structured retrieval — inject into session context and re-enter
+                // the model so it can reason over the data.
+                if session_id.is_none() {
+                    warn!(
+                        paracrine_id = paracrine_id.as_deref().unwrap_or("?"),
+                        "DatasourceInjection: no session found, dropping"
+                    );
+                    return Ok(());
+                }
+                self.handle_user_message(task, task_id).await?;
+            }
+
+            ParacrineRouting::EnrichedToolResult => {
+                // Replace the "paracrine dispatched" placeholder with the real
+                // specialist response and re-enter the model as if the tool call
+                // completed normally.
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    tool_name: Some("delegate.whisper".into()),
+                    content: task.content.clone(),
+                    session_id: session_id.clone().or(task.session_id.clone()),
+                    turn_id: task.turn_id.clone(),
+                    chat_id: task.chat_id.clone(),
+                    source: Some("paracrine".into()),
+                    final_reply_to: task.final_reply_to.clone(),
+                    final_reply_role: task.final_reply_role.clone(),
+                    ..task
+                })
+                .await?;
+            }
+
+            ParacrineRouting::CognitiveReEntry => {
+                // Standard path: feed into cognitive re-entry.
+                // If there is an active turn, the re-entry will merge this
+                // response into its context. If not, a new synthesis turn begins.
+                self.handle_user_message(task, task_id).await?;
+            }
+        }
+
+        Ok(())
     }
 
     async fn handle_user_message(&mut self, task: InboundTaskPayload, task_id: Uuid) -> Result<()> {
@@ -866,6 +1029,15 @@ impl AgentRuntime {
                 .sessions
                 .get_mut(&session_id)
                 .expect("session should exist after ensuring and binding transport target");
+            // If this turn was triggered by a paracrine_request, capture the
+            // originating paracrine_id so deliver_text_reply can echo it back
+            // as a `paracrine_response` rather than a `send_reply`.
+            let paracrine_origin = task
+                .exosome
+                .as_ref()
+                .and_then(|v| serde_json::from_value::<Exosome>(v.clone()).ok())
+                .and_then(|e| e.paracrine_id);
+
             state.start_turn(WorkingTurn {
                 task_id,
                 turn_id: turn_id.clone(),
@@ -888,6 +1060,8 @@ impl AgentRuntime {
                 had_voice_input,
                 awaiting_transcription_reentry: false,
                 scripted_loop_context: None,
+                associated_paracrine_ids: Vec::new(),
+                paracrine_origin,
             });
             state.set_active_turn_phase(TurnPhase::LoadingContext);
 
@@ -2927,14 +3101,47 @@ impl AgentRuntime {
         let attend_content = content.clone();
         let attend_session_id = session_id.clone();
 
-        let reply_payload = FinalReplyPayload {
-            action: "send_reply",
-            session_id,
-            turn_id,
-            chat_id: completed_turn.chat_id,
-            content,
-            audio_artifact,
-            send_text_caption,
+        // Named specialist philotes always append an @agent attribution tag so the
+        // membrane (or receiving philote) knows which role secreted this Exosome.
+        // Format: `@agent:<role_name>` on its own line at the end of content.
+        // Membrane strips the tag before transport delivery and attaches an affordance.
+        let content = if let Ok(role_name) = std::env::var("PHILOTIC_ROLE_NAME") {
+            if !role_name.is_empty() {
+                format!("{}\n\n@agent:{}", content, role_name)
+            } else {
+                content
+            }
+        } else {
+            content
+        };
+
+        // If this turn was triggered by a paracrine_request, reply as a
+        // `paracrine_response` so A's routing reflex handles it correctly.
+        // Otherwise use the normal `send_reply` path.
+        let task_json = if let Some(ref pid) = completed_turn.paracrine_origin {
+            serde_json::json!({
+                "action": "paracrine_response",
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "chat_id": completed_turn.chat_id,
+                "content": content,
+                "exosome": {
+                    "prompt": "",
+                    "paracrine_id": pid,
+                },
+            })
+            .to_string()
+        } else {
+            let reply_payload = FinalReplyPayload {
+                action: "send_reply",
+                session_id,
+                turn_id,
+                chat_id: completed_turn.chat_id,
+                content,
+                audio_artifact,
+                send_text_caption,
+            };
+            serde_json::to_string(&reply_payload)?
         };
 
         self.ipc_client
@@ -2942,7 +3149,7 @@ impl AgentRuntime {
                 target_node: completed_turn.final_reply_to,
                 target_role: completed_turn.final_reply_role,
                 target_guest_id: completed_turn.final_reply_guest_id,
-                task_json: serde_json::to_string(&reply_payload)?,
+                task_json,
             })
             .await?;
 
@@ -5816,7 +6023,7 @@ impl AgentRuntime {
                         final_reply_to: Some(payload.final_reply_to),
                         final_reply_role: Some(payload.final_reply_role),
                         final_reply_guest_id: payload.final_reply_guest_id,
-                        ..Default::default()
+                    ..Default::default()
                     })
                     .await
                 } else {
@@ -5914,7 +6121,7 @@ impl AgentRuntime {
                         final_reply_to: Some(payload.final_reply_to),
                         final_reply_role: Some(payload.final_reply_role),
                         final_reply_guest_id: payload.final_reply_guest_id,
-                        ..Default::default()
+                    ..Default::default()
                     })
                     .await
                 } else {
@@ -6492,6 +6699,135 @@ impl AgentRuntime {
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
                     ..Default::default()
+
+                })
+                .await
+            }
+
+            "delegate.whisper" => {
+                let args = &payload.arguments;
+                let role = match args.get("role").and_then(|v| v.as_str()) {
+                    Some(r) => r.to_string(),
+                    None => {
+                        return self
+                            .fail_active_turn(
+                                payload.session_id,
+                                payload.turn_id,
+                                "delegate.whisper: missing required argument 'role'".into(),
+                            )
+                            .await;
+                    }
+                };
+                let prompt = match args.get("prompt").and_then(|v| v.as_str()) {
+                    Some(p) => p.to_string(),
+                    None => {
+                        return self
+                            .fail_active_turn(
+                                payload.session_id,
+                                payload.turn_id,
+                                "delegate.whisper: missing required argument 'prompt'".into(),
+                            )
+                            .await;
+                    }
+                };
+
+                // `reply_to` controls where the specialist's response goes.
+                // "self"     → back to this philote as paracrine_response
+                // "membrane" → directly to the membrane role
+                // "<node>/<role>" → explicit routing
+                // default    → "self"
+                let reply_to_str = args
+                    .get("reply_to")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("self");
+
+                let node_id = local_node_id();
+                let (reply_to_node, reply_to_role) = match reply_to_str {
+                    "membrane" => (node_id.clone(), "membrane".to_string()),
+                    "self" | "" => (node_id.clone(), "agent".to_string()),
+                    other => {
+                        if let Some((node, role_part)) = other.split_once('/') {
+                            (node.to_string(), role_part.to_string())
+                        } else {
+                            (node_id.clone(), other.to_string())
+                        }
+                    }
+                };
+
+                // Parse optional response_routing hint from arguments.
+                // Defaults to CognitiveReEntry if absent or unrecognised.
+                let response_routing = args
+                    .get("routing")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| serde_json::from_value::<ParacrineRouting>(
+                        serde_json::Value::String(s.to_string())
+                    ).ok());
+
+                // Always generate a paracrine_id — it threads through the full
+                // thought graph and ties the response back to this turn.
+                let paracrine_id = Uuid::new_v4().to_string();
+
+                // Log the outbound exosome ID on the active turn so the routing
+                // reflex can correlate the response when it arrives.
+                if let Some(state) = self.sessions.get_mut(&payload.session_id) {
+                    if let Some(turn) = state.active_turn.as_mut() {
+                        turn.associated_paracrine_ids.push(paracrine_id.clone());
+                    }
+                }
+
+                let exosome = Exosome {
+                    prompt,
+                    context: None,
+                    paracrine_id: Some(paracrine_id.clone()),
+                    response_routing,
+                };
+
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::ParacrineEmit {
+                        role,
+                        exosome,
+                        reply_to_node,
+                        reply_to_role,
+                        timeout_secs: None,
+                    })
+                    .await
+                {
+                    Ok(_) => (format!("paracrine dispatched (id: {paracrine_id})"), None),
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("delegate.whisper: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    handoff_bundle: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(content),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
                 })
                 .await
             }
@@ -7023,7 +7359,7 @@ mod tests {
                 capability: Some("voice.synthesize".into()),
                 retryable: Some(false),
             }),
-            ..Default::default()
+                    ..Default::default()
         };
 
         let error = extract_model_error(&payload).expect("structured error should be extracted");
@@ -7071,7 +7407,7 @@ mod tests {
                 capability: Some("text.generate".into()),
                 retryable: Some(true),
             }),
-            ..Default::default()
+                    ..Default::default()
         };
 
         let error =
@@ -7117,6 +7453,8 @@ mod tests {
             had_voice_input: false,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
         });
 
         assert!(should_attempt_provider_repair(&error, Some(&state)));
@@ -7275,7 +7613,7 @@ mod tests {
             final_reply_role: None,
             final_reply_guest_id: None,
             error: None,
-            ..Default::default()
+                    ..Default::default()
         };
 
         assert_eq!(normalized_user_content(&task), Some("caption text".into()));
@@ -7314,7 +7652,7 @@ mod tests {
             final_reply_role: None,
             final_reply_guest_id: None,
             error: None,
-            ..Default::default()
+                    ..Default::default()
         };
 
         assert_eq!(
@@ -7352,7 +7690,7 @@ mod tests {
             final_reply_role: None,
             final_reply_guest_id: None,
             error: None,
-            ..Default::default()
+                    ..Default::default()
         };
 
         assert_eq!(
@@ -7415,7 +7753,7 @@ mod tests {
             final_reply_role: None,
             final_reply_guest_id: None,
             error: None,
-            ..Default::default()
+                    ..Default::default()
         };
 
         let attachments = media_analysis_attachments(&task);

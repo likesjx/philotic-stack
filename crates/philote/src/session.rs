@@ -330,6 +330,15 @@ pub struct WorkingTurn {
     /// the standard tool re-entry loop. Persisted through approval-gate
     /// re-entry via checkpoint_json.
     pub scripted_loop_context: Option<crate::scripted_loop::ScriptedLoopExecutor>,
+    /// IDs of every [`Exosome`] dispatched from this turn via `delegate.whisper`.
+    /// Used to correlate incoming `paracrine_response` tasks back to this turn
+    /// and to reconstruct the full thought graph across the mesh.
+    pub associated_paracrine_ids: Vec<String>,
+    /// Set when this turn was started by an incoming `paracrine_request`.
+    /// Holds the `paracrine_id` from the originating exosome.
+    /// When present, `deliver_text_reply` emits `action: "paracrine_response"`
+    /// (instead of `"send_reply"`) so A's routing reflex can handle it correctly.
+    pub paracrine_origin: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -3044,6 +3053,19 @@ impl SessionState {
                     .get("scripted_loop_context")
                     .cloned()
                     .and_then(|v| serde_json::from_value(v).ok()),
+                associated_paracrine_ids: turn
+                    .get("associated_paracrine_ids")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                paracrine_origin: turn
+                    .get("paracrine_origin")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
             })
         });
 
@@ -3309,6 +3331,7 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
             | "role.configure"
             | "handoff.to_role"
             | "handoff.back"
+            | "delegate.whisper"
     )
 }
 
@@ -3648,6 +3671,8 @@ mod tests {
             had_voice_input: true,
             awaiting_transcription_reentry: true,
             scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
         });
 
         let checkpoint = state.checkpoint_json();
@@ -3754,6 +3779,8 @@ mod tests {
             had_voice_input: false,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
         });
 
         state.complete_active_turn("hi".into());
@@ -3792,6 +3819,8 @@ mod tests {
             had_voice_input: false,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
         });
 
         state.complete_active_turn("transcription reply".into());
@@ -4430,6 +4459,8 @@ mod tests {
             had_voice_input: false,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
         });
 
         let projection = state.build_context_projection("status");
@@ -4511,6 +4542,8 @@ mod tests {
             had_voice_input: false,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
         });
 
         let prompt = state.build_prompt("status");
@@ -4586,6 +4619,8 @@ mod tests {
             had_voice_input: false,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
         });
 
         let bundle = state.build_same_identity_handoff_bundle(
@@ -4658,6 +4693,8 @@ mod tests {
             had_voice_input: false,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
         });
 
         let delegation = state.build_subagent_delegation(
@@ -5133,6 +5170,8 @@ mod tests {
             had_voice_input: false,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
         });
         let index = merge_session_index(None, &first);
         assert_eq!(index["active_sessions"].as_array().unwrap().len(), 1);
@@ -5178,6 +5217,8 @@ mod tests {
             had_voice_input: false,
             awaiting_transcription_reentry: true,
             scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
         });
 
         state.push_tool_history(
@@ -5238,6 +5279,8 @@ mod tests {
             had_voice_input: false,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
         });
 
         state.push_tool_history(
@@ -5299,6 +5342,8 @@ mod tests {
             had_voice_input: true,
             awaiting_transcription_reentry: true,
             scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
         });
 
         let reentry = state
@@ -5568,6 +5613,8 @@ mod tests {
             had_voice_input: false,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
         });
 
         let projection = state.build_context_projection("continue the memory work");
