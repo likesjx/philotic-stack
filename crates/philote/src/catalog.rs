@@ -349,7 +349,8 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         ToolDefinition {
             tool_name: "agent.configure".into(),
             description: "Update an agent configuration field. Supports approval_policy, \
-                          profile, and bindings sections. Changes to sensitive fields \
+                          profile, bindings, settings, media_routing_policy, and \
+                          voice_response_policy sections. Changes to sensitive fields \
                           (soul, identity, approval policy) require operator approval unless \
                           preapproved. Use operation 'set' to replace, 'append' to add to \
                           arrays, or 'remove' to delete from arrays."
@@ -368,7 +369,17 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                                         'profile.user_context_text', \
                                         'profile.memory_summary', \
                                         'bindings.effective_toolset', \
-                                        'bindings.effective_skillset'"
+                                        'bindings.effective_skillset', \
+                                        'media_routing_policy.voice_action', \
+                                        'media_routing_policy.image_action', \
+                                        'media_routing_policy.document_action', \
+                                        'media_routing_policy.forward_media_to_model', \
+                                        'media_routing_policy.strip_tools_on_media', \
+                                        'voice_response_policy.mode', \
+                                        'voice_response_policy.provider', \
+                                        'voice_response_policy.voice_id', \
+                                        'voice_response_policy.send_text_caption', \
+                                        'voice_response_policy.fallback_to_text'"
                     },
                     "value": {
                         "description": "The new value. For array fields with 'append'/'remove', \
