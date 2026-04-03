@@ -219,6 +219,8 @@ pub enum EdgeRelation {
     WorkingOn,
     Created,
     PartOf,
+    // Workstream tracking
+    Drives,
 }
 
 impl EdgeRelation {
@@ -249,6 +251,7 @@ impl EdgeRelation {
             Self::WorkingOn => "working_on",
             Self::Created => "created",
             Self::PartOf => "part_of",
+            Self::Drives => "drives",
         }
     }
 
@@ -279,6 +282,7 @@ impl EdgeRelation {
             "working_on" => Some(Self::WorkingOn),
             "created" => Some(Self::Created),
             "part_of" => Some(Self::PartOf),
+            "drives" => Some(Self::Drives),
             _ => None,
         }
     }

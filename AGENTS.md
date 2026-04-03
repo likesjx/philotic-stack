@@ -212,6 +212,7 @@ Controlled domain vocabulary:
 - `membrane-transport`
 - `mesh-placement`
 - `memory-context`
+- `product-management-plane`
 - `tooling-execution`
 - `operator-control-plane`
 - `deployment-distribution`

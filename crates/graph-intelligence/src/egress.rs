@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::Result;
@@ -747,12 +747,29 @@ pub fn next_task(engine: &GraphEngine) -> Result<Option<NextTaskResult>> {
 
         let mut score: i32 = 0;
 
+        // Priority modifier (1-5 scale, default 3)
+        // Higher priority = higher score multiplier
+        let priority = p.properties.get("priority")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(3) as i32;
+        let priority_multiplier = match priority {
+            5 => 25,  // Critical
+            4 => 15,  // High
+            3 => 10,  // Medium (default)
+            2 => 5,   // Low
+            1 => 2,   // Minimal
+            _ => 10,  // Default fallback
+        };
+
         // Disposition priority
         score += match disposition {
             "accepted for current slice" => 100,
             "proposed" => 50,
             _ => 25,
         };
+
+        // Apply priority multiplier to base score
+        score = (score * priority_multiplier) / 10;
 
         // Lower verification = more work needed = higher priority
         score += match verification {
@@ -784,12 +801,27 @@ pub fn next_task(engine: &GraphEngine) -> Result<Option<NextTaskResult>> {
             continue;
         }
 
+        // Priority modifier (1-5 scale, default 3)
+        let priority = s.properties.get("priority")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(3) as i32;
+        let priority_multiplier = match priority {
+            5 => 25,  // Critical
+            4 => 15,  // High
+            3 => 10,  // Medium (default)
+            2 => 5,   // Low
+            1 => 2,   // Minimal
+            _ => 10,  // Default fallback
+        };
+
         let edges = engine.get_edges_from(&s.id).unwrap_or_default();
         let blocks_count = edges.iter()
             .filter(|e| e.relation == EdgeRelation::Blocks)
             .count();
 
-        let score = 60 + (blocks_count as i32) * 15; // Seams are generally high-priority
+        let mut score = 60 + (blocks_count as i32) * 15; // Seams are generally high-priority
+        // Apply priority multiplier to base score
+        score = (score * priority_multiplier) / 10;
         candidates.push((score, s.id.clone(), s.name.clone(), status.to_string()));
     }
 
@@ -1060,6 +1092,224 @@ pub struct AgentSummary {
     pub active_sessions: usize,
     pub decisions_made: usize,
     pub last_active: chrono::DateTime<chrono::Utc>,
+}
+
+// ── session_health_check ──────────────────────────────────────────────────────
+
+/// Analyze session hygiene: stale sessions, orphaned workstreams, and
+/// agent coordination issues. Returns a structured health report.
+pub fn session_health_check(engine: &GraphEngine) -> Result<SessionHealthReport> {
+    let sessions = engine.query_nodes(Some(NodeKind::Session), None)?;
+    let now = Utc::now();
+
+    let mut active_count = 0usize;
+    let mut stale_sessions: Vec<StaleSessionEntry> = Vec::new();
+    let mut agents_with_multiple: HashMap<String, Vec<String>> = HashMap::new();
+
+    for s in &sessions {
+        let status = s.properties.get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        if status != "active" {
+            continue;
+        }
+        active_count += 1;
+
+        let agent = s.properties.get("agent")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        agents_with_multiple.entry(agent.clone()).or_default().push(s.id.clone());
+
+        // Check staleness: active sessions with no activity for > 4 hours
+        let age = now - s.updated_at;
+        let last_activity = s.properties.get("last_activity")
+            .and_then(|v| v.as_str())
+            .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+            .map(|dt| now - dt.with_timezone(&Utc));
+
+        let effective_age = last_activity.unwrap_or(age);
+        let stale_threshold = chrono::Duration::hours(4);
+
+        if effective_age > stale_threshold {
+            stale_sessions.push(StaleSessionEntry {
+                id: s.id.clone(),
+                agent,
+                seam_id: s.properties.get("seam_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .to_string(),
+                age_hours: effective_age.num_hours(),
+                phase: s.properties.get("phase")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .to_string(),
+            });
+        }
+    }
+
+    // Agents with > 2 concurrent sessions = coordination risk
+    let overloaded_agents: Vec<OverloadedAgent> = agents_with_multiple.iter()
+        .filter(|(_, sessions)| sessions.len() > 2)
+        .map(|(agent, sessions)| OverloadedAgent {
+            agent: agent.clone(),
+            session_count: sessions.len(),
+            session_ids: sessions.clone(),
+        })
+        .collect();
+
+    // Check for orphaned workstreams (workstream nodes with no active session)
+    let workstreams = engine.query_nodes(Some(NodeKind::Workstream), None)?;
+    let active_session_seam_ids: std::collections::HashSet<String> = sessions.iter()
+        .filter(|s| s.properties.get("status").and_then(|v| v.as_str()) == Some("active"))
+        .filter_map(|s| s.properties.get("seam_id").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .collect();
+
+    let orphaned_workstreams: Vec<String> = workstreams.iter()
+        .filter(|w| {
+            let ws_status = w.properties.get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let ws_seam = w.properties.get("seam_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            ws_status == "active" && !active_session_seam_ids.contains(ws_seam)
+        })
+        .map(|w| w.id.clone())
+        .collect();
+
+    let healthy = stale_sessions.is_empty()
+        && overloaded_agents.is_empty()
+        && orphaned_workstreams.is_empty();
+
+    Ok(SessionHealthReport {
+        healthy,
+        active_sessions: active_count,
+        total_sessions: sessions.len(),
+        stale_sessions,
+        overloaded_agents,
+        orphaned_workstreams,
+    })
+}
+
+pub struct SessionHealthReport {
+    pub healthy: bool,
+    pub active_sessions: usize,
+    pub total_sessions: usize,
+    pub stale_sessions: Vec<StaleSessionEntry>,
+    pub overloaded_agents: Vec<OverloadedAgent>,
+    pub orphaned_workstreams: Vec<String>,
+}
+
+pub struct StaleSessionEntry {
+    pub id: String,
+    pub agent: String,
+    pub seam_id: String,
+    pub age_hours: i64,
+    pub phase: String,
+}
+
+pub struct OverloadedAgent {
+    pub agent: String,
+    pub session_count: usize,
+    pub session_ids: Vec<String>,
+}
+
+// ── proposal_health_check ─────────────────────────────────────────────────────
+
+/// Analyze proposal pipeline health: stuck proposals, missing dispositions,
+/// verification gaps, and embedding coverage.
+pub fn proposal_health_check(engine: &GraphEngine) -> Result<ProposalHealthReport> {
+    let proposals = engine.query_nodes(Some(NodeKind::Proposal), None)?;
+    let domain_ids: HashSet<String> = engine
+        .query_nodes(Some(NodeKind::Domain), None)?
+        .into_iter()
+        .map(|domain| domain.id)
+        .collect();
+
+    let mut missing_disposition = Vec::new();
+    let mut missing_domain = Vec::new();
+    let mut missing_domain_node = Vec::new();
+    let mut no_verification = Vec::new();
+    let mut no_seams = Vec::new();
+    let mut no_embedding = Vec::new();
+    let mut disposition_counts: HashMap<String, usize> = HashMap::new();
+    let mut verification_counts: HashMap<String, usize> = HashMap::new();
+
+    for p in &proposals {
+        let disposition = p.properties.get("disposition")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let domain = p.properties.get("domain")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let verification = p.properties.get("verification_level")
+            .and_then(|v| v.as_str())
+            .unwrap_or("none");
+
+        // Track disposition distribution
+        let disp_key = if disposition.is_empty() { "missing" } else { disposition };
+        *disposition_counts.entry(disp_key.to_string()).or_insert(0) += 1;
+        *verification_counts.entry(verification.to_string()).or_insert(0) += 1;
+
+        if disposition.is_empty() {
+            missing_disposition.push(p.id.clone());
+        }
+        if domain.is_empty() {
+            missing_domain.push(p.id.clone());
+        } else if !domain_ids.contains(&format!("domain:{}", domain)) {
+            missing_domain_node.push(p.id.clone());
+        }
+        if verification == "none" {
+            no_verification.push(p.id.clone());
+        }
+        if p.embedding.is_none() {
+            no_embedding.push(p.id.clone());
+        }
+
+        // Check for proposals with no linked seams
+        let edges = engine.get_edges_from(&p.id)?;
+        let has_seam = edges.iter().any(|e| {
+            e.target_id.starts_with("seam:") && matches!(
+                e.relation,
+                EdgeRelation::Implements | EdgeRelation::References | EdgeRelation::Governs
+            )
+        });
+        if !has_seam {
+            no_seams.push(p.id.clone());
+        }
+    }
+
+    let healthy = missing_disposition.is_empty()
+        && missing_domain_node.is_empty()
+        && no_verification.len() < proposals.len() / 2;
+
+    Ok(ProposalHealthReport {
+        healthy,
+        total_proposals: proposals.len(),
+        missing_disposition,
+        missing_domain,
+        missing_domain_node,
+        no_verification,
+        no_seams,
+        no_embedding,
+        disposition_counts,
+        verification_counts,
+    })
+}
+
+pub struct ProposalHealthReport {
+    pub healthy: bool,
+    pub total_proposals: usize,
+    pub missing_disposition: Vec<String>,
+    pub missing_domain: Vec<String>,
+    pub missing_domain_node: Vec<String>,
+    pub no_verification: Vec<String>,
+    pub no_seams: Vec<String>,
+    pub no_embedding: Vec<String>,
+    pub disposition_counts: HashMap<String, usize>,
+    pub verification_counts: HashMap<String, usize>,
 }
 
 // ── auto_persist_diagrams ─────────────────────────────────────────────────────

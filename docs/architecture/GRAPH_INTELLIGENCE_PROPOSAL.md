@@ -14,6 +14,8 @@ tags:
 - agent-substrate
 related_docs:
 - ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
+- GRAPH_AS_SOURCE_OF_TRUTH.md
 - SEAM_REGISTRY.md
 - DOMAIN_MAP.md
 - INTERACTIVE_ONBOARDING_PROPOSAL.md
@@ -38,6 +40,9 @@ active_seams:
 - agent-self-model
 source_of_truth_targets:
 - ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
+- DOMAIN_MAP.md
+- SEAM_REGISTRY.md
 ---
 
 # Graph Intelligence — Project Context Engine
@@ -61,6 +66,17 @@ Two crates:
 ## Disposition
 
 `proposed`
+
+## Current Slice
+
+- Make `DOMAIN_MAP.md` the authoritative catalog of first-class domain nodes.
+- Link proposals to domains through graph edges, and link seams to their domain nodes from the seam registry.
+- Treat `ARCHITECTURE_STATUS.md` as a legacy/transitional projection of graph state rather than the owner of truth.
+- Keep `ARCHITECTURE.md` as the durable hierarchy reference, with generated UML/PlantUML diagrams for the graph-visible layers.
+- Define orphan semantics in the graph health model:
+  - **workstream orphan**: an active workstream with no active backing session
+  - **seam orphan**: a seam with no adopted domain/proposal path or no live workstream adoption path
+  - **resolution**: adopt by linking the seam to a proposal/domain and starting or reattaching a session; otherwise mark the seam closed/superseded/deferred and remove it from the active surface
 
 ---
 

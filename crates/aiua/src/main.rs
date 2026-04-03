@@ -469,6 +469,43 @@ fn hotel_execution_port(hotel_name: &str) -> u16 {
     hotel_base_port(hotel_name) + 2
 }
 
+/// Detect the current git worktree branch by matching the working directory against
+/// `git worktree list --porcelain`. Returns `None` if not in a worktree, on the
+/// main checkout, or if git is unavailable.
+fn detect_git_worktree_branch() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let output = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut current_path = String::new();
+    let mut current_branch = String::new();
+    for line in stdout.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            current_path = path.to_string();
+            current_branch.clear();
+        } else if let Some(branch) = line.strip_prefix("branch refs/heads/") {
+            current_branch = branch.to_string();
+        } else if line.is_empty() && !current_path.is_empty() {
+            if std::path::Path::new(&current_path) == cwd {
+                // Only return if it's a codex/* branch — main checkout is not a workstream.
+                return if current_branch.starts_with("codex/") {
+                    Some(current_branch.clone())
+                } else {
+                    None
+                };
+            }
+            current_path.clear();
+            current_branch.clear();
+        }
+    }
+    None
+}
+
 fn is_udp_port_available(port: u16) -> bool {
     StdUdpSocket::bind(("0.0.0.0", port)).is_ok()
 }
@@ -2019,6 +2056,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "workspace.list".into(),
                 "workspace.read".into(),
                 "bash.exec".into(),
+                "delegate.whisper".into(),
             ],
             allowed_classes: vec!["session".into(), "utility".into(), "config".into()],
             allowed_skills: vec![
@@ -2072,6 +2110,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "workspace.list".into(),
                 "workspace.read".into(),
                 "bash.exec".into(),
+                "delegate.whisper".into(),
             ],
             allowed_classes: vec![
                 "session".into(),
@@ -4351,6 +4390,19 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Detect which git worktree the hotel is running from and expose it to all
+    // spawned guests via PHILOTIC_WORKTREE. Guests (philote, membrane, etc.) can
+    // use this to tag sessions and let the intel-graph link live sessions to
+    // their workstream branch. No-op if not inside a git worktree or if already set.
+    if std::env::var_os("PHILOTIC_WORKTREE").is_none() {
+        if let Some(worktree_branch) = detect_git_worktree_branch() {
+            unsafe {
+                std::env::set_var("PHILOTIC_WORKTREE", &worktree_branch);
+            }
+            info!("Detected git worktree branch: {}", worktree_branch);
+        }
+    }
+
     if let Some(Command::Auth { provider }) = args.command {
         return auth::run_auth_command(provider).await;
     }
@@ -4869,8 +4921,54 @@ async fn main() -> Result<()> {
             error!("Blob HTTP Server failed: {}", e);
         }
     });
+    // Wait for either Ctrl-C or SIGTERM.
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm = signal(SignalKind::terminate())?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                warn!("Ctrl-C received — initiating graceful drain.");
+            }
+            _ = sigterm.recv() => {
+                warn!("SIGTERM received — initiating graceful drain.");
+            }
+        }
+    }
+    #[cfg(not(unix))]
     tokio::signal::ctrl_c().await?;
-    warn!("Ctrl-C received! Initiating shutdown of all Materialized Guests...");
+
+    // Phase 1: signal every registered guest to drain in-flight work and exit.
+    const DRAIN_TIMEOUT_SECS: u64 = 30;
+    {
+        let guard = ipc_inboxes.lock().await;
+        let mut count = 0usize;
+        for subscribers in guard.values() {
+            for sub in subscribers {
+                let _ = sub.tx.send(philotic_client::IpcResponse::GracefulShutdown {
+                    drain_timeout_secs: DRAIN_TIMEOUT_SECS,
+                });
+                count += 1;
+            }
+        }
+        info!("Graceful drain signal sent to {} guest subscriber(s).", count);
+    }
+
+    // Phase 2: wait for guest PIDs to exit (poll every 500ms, up to DRAIN_TIMEOUT_SECS).
+    let drain_deadline = tokio::time::Instant::now()
+        + tokio::time::Duration::from_secs(DRAIN_TIMEOUT_SECS);
+    loop {
+        let all_gone = {
+            let guard = ipc_inboxes.lock().await;
+            guard.values().all(|subs| subs.is_empty())
+        };
+        if all_gone || tokio::time::Instant::now() >= drain_deadline {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    }
+    info!("All guest subscribers drained (or drain window elapsed). Shutting down hotel.");
+
     let _ = shutdown_tx.send(());
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     let _ = graph_domain_arc.set_hotel_pid(&hotel_name, None);

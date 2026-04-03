@@ -2815,6 +2815,9 @@ async fn tool_session_close(
     session.updated_at = chrono::Utc::now();
 
     engine.upsert_node(&session).map_err(|e| mcp_err(&e.to_string()))?;
+    let closed_workstreams = engine
+        .close_linked_workstreams(&session, status, Some(summary))
+        .map_err(|e| mcp_err(&e.to_string()))?;
 
     // Propagate token usage to linked seam(s)
     if session_tokens_total > 0 {
@@ -2861,6 +2864,7 @@ async fn tool_session_close(
             "agent": agent,
             "status": status,
             "verified": verified,
+            "workstream_ids": closed_workstreams,
         }),
     });
 
@@ -2872,5 +2876,6 @@ async fn tool_session_close(
         "session_id": session_id,
         "status": status,
         "verified": verified,
+        "workstream_ids": closed_workstreams,
     }))
 }

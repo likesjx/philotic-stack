@@ -21,6 +21,11 @@ task_refs:
 
 This is the scope-first navigation view for `docs/architecture/`.
 
+It is also the authoritative catalog of domain nodes for the graph. When a
+new domain is needed, inspect the existing catalog first, then add a new
+section here and let the graph scanner materialize the domain node from this
+document.
+
 Use it when you know the concern area first and need to find:
 
 - current truth
@@ -154,6 +159,26 @@ Active proposals:
 - [RUNNER_ARTIFACT_BUILD_DISTRIBUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RUNNER_ARTIFACT_BUILD_DISTRIBUTION_PROPOSAL.md)
 - [HOMEBREW_DISTRIBUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/HOMEBREW_DISTRIBUTION_PROPOSAL.md)
 - [RUST_FORGE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RUST_FORGE_PROPOSAL.md)
+
+## Product Management Plane
+
+Primary domain id: `product-management-plane`
+
+Current truth:
+
+- [GRAPH_AS_SOURCE_OF_TRUTH.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_AS_SOURCE_OF_TRUTH.md)
+- [ARCHITECTURE_STATUS.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE_STATUS.md)
+- [ARCHITECTURE.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE.md)
+
+Active proposals:
+
+- [GRAPH_INTELLIGENCE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_INTELLIGENCE_PROPOSAL.md)
+- [PHILOTIC_WEB_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PHILOTIC_WEB_PROPOSAL.md)
+
+Supporting docs:
+
+- [DOC_TAGGING_FRONTMATTER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DOC_TAGGING_FRONTMATTER_PROPOSAL.md)
+- [VERIFICATION_LADDER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/VERIFICATION_LADDER_PROPOSAL.md)
 
 ## Migration And Parity
 

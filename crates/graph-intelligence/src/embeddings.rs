@@ -21,6 +21,8 @@ pub struct EmbedRequest {
 pub struct EmbedResponse {
     pub embedding: Vec<f32>,
     /// Model generation provenance token.
+    /// The sidecar returns this as "model" for Ollama API compatibility.
+    #[serde(rename = "model")]
     pub model_gen: String,
 }
 

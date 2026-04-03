@@ -406,6 +406,22 @@ impl GraphEngine {
         Ok(())
     }
 
+    /// Clear all worktree/branch nodes before a git rescan so pruned checkouts
+    /// don't persist as ghost nodes across scans.
+    pub fn clear_git_topology_nodes(&self) -> Result<()> {
+        let kinds = "'worktree','branch'";
+        self.conn.execute(
+            &format!(
+                "DELETE FROM edges WHERE source_id IN (SELECT id FROM nodes WHERE kind IN ({kinds})) \
+                 OR target_id IN (SELECT id FROM nodes WHERE kind IN ({kinds}))"
+            ),
+            [],
+        )?;
+        self.conn
+            .execute(&format!("DELETE FROM nodes WHERE kind IN ({kinds})"), [])?;
+        Ok(())
+    }
+
     /// Clear all scanner-created doc nodes (worktree='', doc-like kinds).
     /// Called before doc rescan to prevent ghost nodes from renamed/deleted files.
     /// Preserves agent-created nodes (decisions, sessions, workstreams, test runs).
@@ -484,6 +500,179 @@ impl GraphEngine {
             .conn
             .query_row("SELECT COUNT(*) FROM snippets", [], |row| row.get(0))?;
         Ok(count as usize)
+    }
+
+    /// Find active sessions older than `max_age` and close them as timed-out.
+    /// Returns the list of session IDs that were cleaned up.
+    pub fn cleanup_stale_sessions(&self, max_age: chrono::Duration) -> Result<Vec<String>> {
+        let cutoff = (chrono::Utc::now() - max_age).to_rfc3339();
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, name, properties, file_path, worktree, created_at, updated_at,
+                    embedding, embedding_model, embedding_dims, embedding_updated, embedding_hash
+             FROM nodes
+             WHERE kind = 'session'
+               AND json_extract(properties, '$.status') = 'active'
+               AND updated_at < ?1",
+        )?;
+        let rows = stmt.query_map(params![cutoff], |row| Ok(row_to_node(row)))?;
+        let mut cleaned = Vec::new();
+        let mut stale_sessions = Vec::new();
+        for row in rows {
+            stale_sessions.push(row??);
+        }
+        for mut session in stale_sessions {
+            let mut props = session.properties.as_object().cloned().unwrap_or_default();
+            props.insert("status".to_string(), serde_json::json!("timed_out"));
+            props.insert("end_time".to_string(), serde_json::json!(chrono::Utc::now().to_rfc3339()));
+            props.insert("close_reason".to_string(), serde_json::json!("auto_cleanup: exceeded max session age"));
+            session.properties = serde_json::Value::Object(props);
+            session.updated_at = chrono::Utc::now();
+            self.upsert_node(&session)?;
+            self.close_linked_workstreams(
+                &session,
+                "timed_out",
+                Some("auto_cleanup: exceeded max session age"),
+            )?;
+            cleaned.push(session.id.clone());
+        }
+        Ok(cleaned)
+    }
+
+    /// Find workstreams associated with a session via explicit edges or seam fallback.
+    pub fn linked_workstream_ids(&self, session: &Node) -> Result<Vec<String>> {
+        let mut workstream_ids: Vec<String> = self
+            .get_edges_from(&session.id)?
+            .into_iter()
+            .filter(|edge| edge.relation == EdgeRelation::WorkingOn)
+            .map(|edge| edge.target_id)
+            .collect();
+
+        if workstream_ids.is_empty() {
+            if let Some(seam_id) = session.properties.get("seam_id").and_then(|value| value.as_str()) {
+                workstream_ids.push(format!("workstream:{}", seam_id.replace("seam:", "")));
+            }
+        }
+
+        workstream_ids.sort();
+        workstream_ids.dedup();
+        Ok(workstream_ids)
+    }
+
+    /// Close linked workstreams when the owning session leaves the active state.
+    pub fn close_linked_workstreams(
+        &self,
+        session: &Node,
+        status: &str,
+        summary: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let now = chrono::Utc::now();
+        let mut updated_ids = Vec::new();
+
+        for workstream_id in self.linked_workstream_ids(session)? {
+            let Some(mut workstream) = self.get_node(&workstream_id)? else {
+                continue;
+            };
+
+            let mut props = workstream.properties.as_object().cloned().unwrap_or_default();
+            props.insert("status".to_string(), serde_json::json!(status));
+            props.insert("end_time".to_string(), serde_json::json!(now.to_rfc3339()));
+            props.insert("closed_by_session".to_string(), serde_json::json!(session.id.clone()));
+            if let Some(phase) = session.properties.get("phase").and_then(|value| value.as_str()) {
+                props.insert("phase".to_string(), serde_json::json!(phase));
+            }
+            if let Some(summary) = summary.filter(|value| !value.is_empty()) {
+                props.insert("summary".to_string(), serde_json::json!(summary));
+            }
+
+            workstream.properties = serde_json::Value::Object(props);
+            workstream.updated_at = now;
+            self.upsert_node(&workstream)?;
+            updated_ids.push(workstream_id);
+        }
+
+        Ok(updated_ids)
+    }
+
+    /// Reconcile active workstreams that no longer have an active backing session.
+    pub fn cleanup_orphaned_workstreams(&self) -> Result<Vec<String>> {
+        let active_session_seam_ids: std::collections::HashSet<String> = self
+            .query_nodes(Some(NodeKind::Session), None)?
+            .into_iter()
+            .filter(|session| {
+                session
+                    .properties
+                    .get("status")
+                    .and_then(|value| value.as_str())
+                    == Some("active")
+            })
+            .filter_map(|session| {
+                session
+                    .properties
+                    .get("seam_id")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.to_string())
+            })
+            .collect();
+
+        let now = chrono::Utc::now();
+        let mut cleaned = Vec::new();
+        for mut workstream in self.query_nodes(Some(NodeKind::Workstream), None)? {
+            let status = workstream
+                .properties
+                .get("status")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown");
+            let seam_id = workstream
+                .properties
+                .get("seam_id")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+
+            if status != "active" || active_session_seam_ids.contains(seam_id) {
+                continue;
+            }
+
+            let mut props = workstream.properties.as_object().cloned().unwrap_or_default();
+            props.insert("status".to_string(), serde_json::json!("orphaned"));
+            props.insert("end_time".to_string(), serde_json::json!(now.to_rfc3339()));
+            props.insert(
+                "close_reason".to_string(),
+                serde_json::json!("auto_cleanup: no active session"),
+            );
+
+            workstream.properties = serde_json::Value::Object(props);
+            workstream.updated_at = now;
+            self.upsert_node(&workstream)?;
+            cleaned.push(workstream.id);
+        }
+
+        Ok(cleaned)
+    }
+
+    /// Query all nodes of a given kind with a specific property value.
+    pub fn query_nodes_by_property(
+        &self,
+        kind: NodeKind,
+        property_key: &str,
+        property_value: &str,
+    ) -> Result<Vec<Node>> {
+        let json_path = format!("$.{}", property_key);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, name, properties, file_path, worktree, created_at, updated_at,
+                    embedding, embedding_model, embedding_dims, embedding_updated, embedding_hash
+             FROM nodes
+             WHERE kind = ?1
+               AND json_extract(properties, ?2) = ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![kind.as_str(), json_path, property_value],
+            |row| Ok(row_to_node(row)),
+        )?;
+        let mut nodes = Vec::new();
+        for row in rows {
+            nodes.push(row??);
+        }
+        Ok(nodes)
     }
 }
 
