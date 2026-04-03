@@ -1331,6 +1331,91 @@ impl SessionState {
                 self.settings.execution.stream_tool_events = v;
                 Ok(format!("Set settings.execution.stream_tool_events = {v}."))
             }
+            // ── Media routing policy ─────────────────────────────────────────────
+            "media_routing_policy.forward_media_to_model" => {
+                let v = value
+                    .as_bool()
+                    .ok_or("media_routing_policy.forward_media_to_model requires a boolean")?;
+                self.agent_profile.media_routing_policy.forward_media_to_model = v;
+                Ok(format!("Set media_routing_policy.forward_media_to_model = {v}."))
+            }
+            "media_routing_policy.voice_action" => {
+                let v = value
+                    .as_str()
+                    .ok_or("media_routing_policy.voice_action requires a string (e.g. 'transcribe', 'analyze_media')")?
+                    .to_string();
+                self.agent_profile.media_routing_policy.voice_action = Some(v.clone());
+                Ok(format!("Set media_routing_policy.voice_action = '{v}'."))
+            }
+            "media_routing_policy.image_action" => {
+                let v = value
+                    .as_str()
+                    .ok_or("media_routing_policy.image_action requires a string")?
+                    .to_string();
+                self.agent_profile.media_routing_policy.image_action = Some(v.clone());
+                Ok(format!("Set media_routing_policy.image_action = '{v}'."))
+            }
+            "media_routing_policy.document_action" => {
+                let v = value
+                    .as_str()
+                    .ok_or("media_routing_policy.document_action requires a string")?
+                    .to_string();
+                self.agent_profile.media_routing_policy.document_action = Some(v.clone());
+                Ok(format!("Set media_routing_policy.document_action = '{v}'."))
+            }
+            "media_routing_policy.strip_tools_on_media" => {
+                let v = value
+                    .as_bool()
+                    .ok_or("media_routing_policy.strip_tools_on_media requires a boolean")?;
+                self.agent_profile.media_routing_policy.strip_tools_on_media = v;
+                Ok(format!("Set media_routing_policy.strip_tools_on_media = {v}."))
+            }
+            // ── Voice response policy ────────────────────────────────────────────
+            "voice_response_policy.mode" => {
+                let s = value
+                    .as_str()
+                    .ok_or("voice_response_policy.mode requires a string: 'off', 'auto', or 'on'")?;
+                let mode = match s {
+                    "off" => TtsMode::Off,
+                    "auto" => TtsMode::Auto,
+                    "on" => TtsMode::On,
+                    other => return Err(format!(
+                        "Invalid voice_response_policy.mode '{other}'. Valid values: off, auto, on"
+                    )),
+                };
+                self.agent_profile.voice_response_policy.mode = mode;
+                Ok(format!("Set voice_response_policy.mode = '{s}'."))
+            }
+            "voice_response_policy.provider" => {
+                let v = value
+                    .as_str()
+                    .ok_or("voice_response_policy.provider requires a string (e.g. 'elevenlabs')")?
+                    .to_string();
+                self.agent_profile.voice_response_policy.provider = Some(v.clone());
+                Ok(format!("Set voice_response_policy.provider = '{v}'."))
+            }
+            "voice_response_policy.voice_id" => {
+                let v = value
+                    .as_str()
+                    .ok_or("voice_response_policy.voice_id requires a string")?
+                    .to_string();
+                self.agent_profile.voice_response_policy.voice_id = Some(v.clone());
+                Ok(format!("Set voice_response_policy.voice_id = '{v}'."))
+            }
+            "voice_response_policy.send_text_caption" => {
+                let v = value
+                    .as_bool()
+                    .ok_or("voice_response_policy.send_text_caption requires a boolean")?;
+                self.agent_profile.voice_response_policy.send_text_caption = v;
+                Ok(format!("Set voice_response_policy.send_text_caption = {v}."))
+            }
+            "voice_response_policy.fallback_to_text" => {
+                let v = value
+                    .as_bool()
+                    .ok_or("voice_response_policy.fallback_to_text requires a boolean")?;
+                self.agent_profile.voice_response_policy.fallback_to_text = v;
+                Ok(format!("Set voice_response_policy.fallback_to_text = {v}."))
+            }
             other => Err(format!(
                 "Unknown config path: '{other}'. Supported paths: \
                 approval_policy.auto_approve_all, approval_policy.preapproved_tools, \
@@ -1345,7 +1430,17 @@ impl SessionState {
                 settings.memory.recall_limit, \
                 settings.execution.iteration_cap, \
                 settings.execution.stall_detection_threshold, \
-                settings.execution.stream_tool_events"
+                settings.execution.stream_tool_events, \
+                media_routing_policy.forward_media_to_model, \
+                media_routing_policy.voice_action, \
+                media_routing_policy.image_action, \
+                media_routing_policy.document_action, \
+                media_routing_policy.strip_tools_on_media, \
+                voice_response_policy.mode, \
+                voice_response_policy.provider, \
+                voice_response_policy.voice_id, \
+                voice_response_policy.send_text_caption, \
+                voice_response_policy.fallback_to_text"
             )),
         }
     }
@@ -4061,6 +4156,129 @@ mod tests {
             state.agent_profile.soul_text.as_deref(),
             Some("You are a curious and helpful agent.")
         );
+    }
+
+    #[test]
+    fn agent_configure_media_routing_policy() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+
+        // voice_action
+        let r = state.apply_configure(
+            "media_routing_policy.voice_action",
+            &serde_json::json!("transcribe"),
+            "set",
+        );
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(
+            state.agent_profile.media_routing_policy.voice_action.as_deref(),
+            Some("transcribe")
+        );
+
+        // image_action
+        let r = state.apply_configure(
+            "media_routing_policy.image_action",
+            &serde_json::json!("analyze_media"),
+            "set",
+        );
+        assert!(r.is_ok());
+        assert_eq!(
+            state.agent_profile.media_routing_policy.image_action.as_deref(),
+            Some("analyze_media")
+        );
+
+        // forward_media_to_model
+        let r = state.apply_configure(
+            "media_routing_policy.forward_media_to_model",
+            &serde_json::json!(false),
+            "set",
+        );
+        assert!(r.is_ok());
+        assert!(!state.agent_profile.media_routing_policy.forward_media_to_model);
+
+        // strip_tools_on_media
+        let r = state.apply_configure(
+            "media_routing_policy.strip_tools_on_media",
+            &serde_json::json!(false),
+            "set",
+        );
+        assert!(r.is_ok());
+        assert!(!state.agent_profile.media_routing_policy.strip_tools_on_media);
+
+        // wrong type → error
+        let r = state.apply_configure(
+            "media_routing_policy.forward_media_to_model",
+            &serde_json::json!("yes"),
+            "set",
+        );
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn agent_configure_voice_response_policy() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+
+        // mode: valid values
+        for (input, expected) in &[("off", TtsMode::Off), ("auto", TtsMode::Auto), ("on", TtsMode::On)] {
+            let r = state.apply_configure(
+                "voice_response_policy.mode",
+                &serde_json::json!(input),
+                "set",
+            );
+            assert!(r.is_ok(), "mode={input}: {r:?}");
+            assert_eq!(&state.agent_profile.voice_response_policy.mode, expected);
+        }
+
+        // mode: invalid value
+        let r = state.apply_configure(
+            "voice_response_policy.mode",
+            &serde_json::json!("loud"),
+            "set",
+        );
+        assert!(r.is_err());
+
+        // provider
+        let r = state.apply_configure(
+            "voice_response_policy.provider",
+            &serde_json::json!("elevenlabs"),
+            "set",
+        );
+        assert!(r.is_ok());
+        assert_eq!(
+            state.agent_profile.voice_response_policy.provider.as_deref(),
+            Some("elevenlabs")
+        );
+
+        // voice_id
+        let r = state.apply_configure(
+            "voice_response_policy.voice_id",
+            &serde_json::json!("rachel"),
+            "set",
+        );
+        assert!(r.is_ok());
+        assert_eq!(
+            state.agent_profile.voice_response_policy.voice_id.as_deref(),
+            Some("rachel")
+        );
+
+        // send_text_caption
+        let r = state.apply_configure(
+            "voice_response_policy.send_text_caption",
+            &serde_json::json!(false),
+            "set",
+        );
+        assert!(r.is_ok());
+        assert!(!state.agent_profile.voice_response_policy.send_text_caption);
+
+        // fallback_to_text
+        let r = state.apply_configure(
+            "voice_response_policy.fallback_to_text",
+            &serde_json::json!(false),
+            "set",
+        );
+        assert!(r.is_ok());
+        assert!(!state.agent_profile.voice_response_policy.fallback_to_text);
     }
 
     #[test]
