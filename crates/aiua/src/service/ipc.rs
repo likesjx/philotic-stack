@@ -1245,6 +1245,47 @@ impl IpcServer {
             .unwrap_or(false)
     }
 
+    /// Inject a membrane binding into an agent's bundle_json reflex_context.
+    /// Called on successful lease acquisition so the agent's next bundle fetch
+    /// reflects the active membrane without any dynamic query.
+    /// Bindings are never removed on release — the agent owns its membranes until
+    /// it explicitly relinquishes them (operator-pinned by design).
+    fn inject_membrane_binding(
+        graph: &GraphDomain,
+        agent_id: &str,
+        kind: &str,
+        membrane_guest_id: &str,
+    ) {
+        let Ok(Some(mut identity)) = graph.get_agent_identity(agent_id) else {
+            return;
+        };
+        let new_binding = serde_json::json!({
+            "kind": kind,
+            "membrane_guest_id": membrane_guest_id,
+        });
+        let bindings = identity.bundle_json
+            .get_mut("reflex_context")
+            .and_then(|rc| rc.get_mut("membrane_bindings"))
+            .and_then(|b| b.as_array_mut());
+        if let Some(arr) = bindings {
+            arr.retain(|b| {
+                !(b.get("kind").and_then(|k| k.as_str()) == Some(kind)
+                    && b.get("membrane_guest_id").and_then(|g| g.as_str()) == Some(membrane_guest_id))
+            });
+            arr.push(new_binding);
+        } else {
+            if let Some(obj) = identity.bundle_json.as_object_mut() {
+                let rc = obj.entry("reflex_context").or_insert_with(|| serde_json::json!({}));
+                if let Some(rc_obj) = rc.as_object_mut() {
+                    rc_obj.insert("membrane_bindings".to_string(), serde_json::json!([new_binding]));
+                }
+            }
+        }
+        if let Err(e) = graph.upsert_agent_identity(&identity) {
+            warn!("Failed to inject membrane binding [{kind}/{membrane_guest_id}] for agent [{agent_id}]: {e}");
+        }
+    }
+
     fn hotel_may_poll_for_agent(
         agent_identity: &ansible_mesh_core::storage::AgentIdentityRecord,
         local_hotel_name: &str,
@@ -2743,9 +2784,12 @@ impl IpcServer {
                     unix_ts(),
                     &mut observer,
                 ) {
-                    LeaseAcquireOutcome::Granted(lease) => IpcResponse::TelegramPollLease {
-                        granted: true,
-                        lease: Some(lease),
+                    LeaseAcquireOutcome::Granted(lease) => {
+                        Self::inject_membrane_binding(graph, &agent_id, "telegram", &identity.guest_id);
+                        IpcResponse::TelegramPollLease {
+                            granted: true,
+                            lease: Some(lease),
+                        }
                     },
                     LeaseAcquireOutcome::Denied(lease) => {
                         info!(
@@ -3249,9 +3293,12 @@ impl IpcServer {
                     unix_ts(),
                     &mut observer,
                 ) {
-                    LeaseAcquireOutcome::Granted(lease) => IpcResponse::DiscordGatewayLease {
-                        granted: true,
-                        lease: Some(lease),
+                    LeaseAcquireOutcome::Granted(lease) => {
+                        Self::inject_membrane_binding(graph, &agent_id, "discord_text", &identity.guest_id);
+                        IpcResponse::DiscordGatewayLease {
+                            granted: true,
+                            lease: Some(lease),
+                        }
                     },
                     LeaseAcquireOutcome::Denied(lease) => {
                         info!(
