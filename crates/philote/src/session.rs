@@ -1,5 +1,6 @@
 use crate::catalog::{tool_catalog, tool_class, tool_requires_approval};
 use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
+use crate::reflex::{IngressAction, MaterializationContext, PolicyAssertion, ReflexEngine, ReflexEvent};
 use philotic_client::{
     HandoffBundle, SubagentCompletionContract, SubagentContextPacket, SubagentDelegation,
 };
@@ -606,6 +607,13 @@ pub struct AgentProfile {
     /// `/tools add` commands. Falls back to `["echo"]` when empty.
     #[serde(default)]
     pub default_toolset: Vec<String>,
+    /// Materialization context pushed by the hotel at guest spawn time.
+    ///
+    /// Contains the membrane bindings and capabilities known at spawn. The reflex
+    /// engine evaluates this at session open to derive the initial routing policy,
+    /// ensuring turn zero is correct without agent self-discovery.
+    #[serde(default)]
+    pub reflex_context: MaterializationContext,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -827,6 +835,10 @@ pub struct SessionState {
     /// Injected into the `instructions` section of every cognitive call and never
     /// rolled off by the dialogue window.
     pub rules: Vec<Value>,
+    /// Reflex engine — evaluates static rules against materialization context and
+    /// runtime delta events to derive routing policy assertions.
+    /// Not serialized; always initialized fresh and re-applied from `agent_profile`.
+    pub reflex_engine: ReflexEngine,
 }
 
 impl SessionState {
@@ -850,6 +862,7 @@ impl SessionState {
             last_handoff_summary: None,
             active_subagents: Vec::new(),
             rules: Vec::new(),
+            reflex_engine: ReflexEngine::new(),
         }
     }
 
@@ -1443,6 +1456,51 @@ impl SessionState {
                 voice_response_policy.fallback_to_text"
             )),
         }
+    }
+
+    // ── Reflex engine integration ─────────────────────────────────────────────
+
+    /// Apply a list of `PolicyAssertion`s to this session by driving `apply_configure`.
+    ///
+    /// Errors from individual assertions are logged and skipped rather than
+    /// propagating — a partial reflex application is better than none.
+    pub fn apply_reflex_assertions(&mut self, assertions: Vec<PolicyAssertion>) {
+        for assertion in assertions {
+            let (path, value) = assertion.to_configure_args();
+            if let Err(e) = self.apply_configure(path, &value, "set") {
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    path, error = %e,
+                    "Reflex assertion failed (skipping)"
+                );
+            }
+        }
+    }
+
+    /// Evaluate static rules against the materialization context embedded in the
+    /// agent profile and apply all resulting assertions.
+    ///
+    /// Called once at session open (after `agent_profile` is set). Ensures routing
+    /// policy is correct from turn zero without relying on agent self-discovery.
+    pub fn apply_reflex_materialization(&mut self) {
+        let ctx = self.agent_profile.reflex_context.clone();
+        let assertions = self.reflex_engine.apply_materialization(&ctx);
+        self.apply_reflex_assertions(assertions);
+    }
+
+    /// Evaluate ingress-time rules for the given action and apply resulting assertions.
+    ///
+    /// Called at task arrival for typed actions (e.g. `VoiceDialogue`). Belt-and-suspenders
+    /// on top of materialization — catches cases where context wasn't known at spawn.
+    pub fn apply_reflex_ingress(&mut self, action: IngressAction) {
+        let assertions = self.reflex_engine.apply_ingress(&action);
+        self.apply_reflex_assertions(assertions);
+    }
+
+    /// Fire a runtime reflex event (e.g. TTS failure) and apply resulting assertions.
+    pub fn fire_reflex_event(&mut self, event: ReflexEvent) {
+        let assertions = self.reflex_engine.handle_event(&event);
+        self.apply_reflex_assertions(assertions);
     }
 
     pub fn set_status(&mut self, status: impl Into<String>) {
@@ -3069,6 +3127,7 @@ impl SessionState {
                 .and_then(|v| v.as_array())
                 .cloned()
                 .unwrap_or_default(),
+            reflex_engine: ReflexEngine::new(),
         })
     }
 }

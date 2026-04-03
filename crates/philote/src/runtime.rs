@@ -1,4 +1,5 @@
 use crate::commands::{SlashCommand, command_manifest, parse_slash_command};
+use crate::reflex::{IngressAction, ReflexEvent};
 use crate::r#loop::{
     AgentAction, ApprovalRequest, ToolCall, ToolResult, TurnPhase, interpret_model_payload,
 };
@@ -1174,6 +1175,19 @@ impl AgentRuntime {
                     "Session [{}] voice synthesis failed before audio delivery: {}",
                     session_id, model_error
                 );
+                // Fire TTS failure reflex — ensures fallback_to_text is on and
+                // any future turns know synthesis is unreliable.
+                if let Some(state) = self.sessions.get_mut(&session_id) {
+                    state.fire_reflex_event(ReflexEvent::TtsFailure {
+                        provider: state
+                            .agent_profile
+                            .voice_response_policy
+                            .provider
+                            .clone()
+                            .unwrap_or_else(|| "unknown".into()),
+                    });
+                }
+
                 let voice_policy = self
                     .sessions
                     .get(&session_id)
@@ -2795,6 +2809,13 @@ impl AgentRuntime {
         task_id: Uuid,
     ) -> Result<()> {
         use crate::protocol::TransportAttachment;
+
+        // Ingress-time reflex: ensure voice_action == "transcribe" regardless of
+        // what the agent profile defaulted to. Belt-and-suspenders over materialization.
+        let session_id = task.session_id_or_default(&self.agent_id);
+        if let Some(state) = self.sessions.get_mut(&session_id) {
+            state.apply_reflex_ingress(IngressAction::VoiceDialogue);
+        }
 
         let pcm_b64 = match task.pcm_b64.as_deref() {
             Some(b) if !b.is_empty() => b.to_string(),
@@ -6582,6 +6603,8 @@ impl AgentRuntime {
                     == Some(session_id)
                 {
                     if let Some(mut state) = SessionState::from_checkpoint(&checkpoint) {
+                        // Re-apply reflex materialization from the restored profile.
+                        state.apply_reflex_materialization();
                         Self::fetch_and_inject_rules(
                             &mut self.ipc_client,
                             &self.agent_id,
@@ -6601,6 +6624,8 @@ impl AgentRuntime {
             fallback_source.into(),
         );
         state.agent_profile = self.default_agent_profile.clone();
+        // Apply reflex materialization now that the profile (including reflex_context) is set.
+        state.apply_reflex_materialization();
         Self::fetch_and_inject_rules(&mut self.ipc_client, &self.agent_id, &mut state).await;
         self.sessions.insert(session_id.to_string(), state);
         Ok(())
