@@ -63,7 +63,10 @@ fn test_full_workspace_scan() {
     for node in proposal_nodes.iter().take(5) {
         println!("  - {} ({})", node.name, node.id);
     }
-    assert!(!proposal_nodes.is_empty(), "Expected proposal nodes from docs");
+    assert!(
+        !proposal_nodes.is_empty(),
+        "Expected proposal nodes from docs"
+    );
 
     // Verify seam nodes exist from SEAM_REGISTRY
     let seam_nodes = engine
@@ -158,14 +161,68 @@ fn test_plantuml_generation() {
         .expect("Failed to query");
 
     if let Some(crate_node) = crate_nodes.first() {
-        let diagram = graph_intelligence::plantuml::generate_crate_diagram(
-            &engine,
-            &crate_node.name,
-        )
-        .expect("Failed to generate diagram");
+        let diagram =
+            graph_intelligence::plantuml::generate_crate_diagram(&engine, &crate_node.name)
+                .expect("Failed to generate diagram");
 
-        println!("PlantUML for {}:\n{}", crate_node.name, &diagram[..diagram.len().min(500)]);
+        println!(
+            "PlantUML for {}:\n{}",
+            crate_node.name,
+            &diagram[..diagram.len().min(500)]
+        );
         assert!(diagram.contains("@startuml"));
         assert!(diagram.contains("@enduml"));
     }
+}
+
+#[test]
+fn test_graph_authored_doc_content_survives_rescan() {
+    let root = workspace_root();
+    let mut engine = GraphEngine::open(":memory:").expect("Failed to create engine");
+
+    let config = ScanConfig {
+        rust_roots: vec!["crates".to_string()],
+        doc_roots: vec!["docs".to_string()],
+        git_repo: ".".to_string(),
+        worktree: "develop".to_string(),
+    };
+
+    full_scan(&root, &config, &mut engine).expect("Initial scan failed");
+
+    let proposal = engine
+        .query_nodes(Some(NodeKind::Proposal), None)
+        .expect("Failed to query proposals")
+        .into_iter()
+        .next()
+        .expect("Expected at least one proposal");
+
+    let mut updated = proposal.clone();
+    let mut props = updated.properties.as_object().cloned().unwrap_or_default();
+    props.insert(
+        "content".to_string(),
+        serde_json::json!("# Graph-owned content\n\nThis should survive rescan."),
+    );
+    props.insert("content_format".to_string(), serde_json::json!("markdown"));
+    props.insert("content_source".to_string(), serde_json::json!("graph"));
+    updated.properties = serde_json::Value::Object(props);
+    updated.updated_at = chrono::Utc::now();
+    engine
+        .upsert_node(&updated)
+        .expect("Failed to store graph content");
+
+    full_scan(&root, &config, &mut engine).expect("Rescan failed");
+
+    let rescanned = engine
+        .get_node(&proposal.id)
+        .expect("Failed to fetch rescanned proposal")
+        .expect("Proposal should still exist after rescan");
+
+    assert_eq!(
+        rescanned.properties["content_source"],
+        serde_json::json!("graph")
+    );
+    assert!(rescanned.properties["content"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("Graph-owned content"));
 }

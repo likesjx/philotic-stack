@@ -83,9 +83,18 @@ async fn test_api_status_endpoint() {
 
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.expect("Failed to parse JSON");
-    assert!(body.get("node_counts").is_some(), "Missing node_counts in status response");
-    assert!(body.get("edge_count").is_some(), "Missing edge_count in status response");
-    assert!(body.get("snippet_count").is_some(), "Missing snippet_count in status response");
+    assert!(
+        body.get("node_counts").is_some(),
+        "Missing node_counts in status response"
+    );
+    assert!(
+        body.get("edge_count").is_some(),
+        "Missing edge_count in status response"
+    );
+    assert!(
+        body.get("snippet_count").is_some(),
+        "Missing snippet_count in status response"
+    );
 
     // Verify some nodes were found
     let total = body["node_counts"]["total"].as_u64().unwrap_or(0);
@@ -121,13 +130,83 @@ async fn test_api_proposals_endpoint() {
     let body: serde_json::Value = resp.json().await.expect("Failed to parse JSON");
     assert!(body.is_array(), "Expected proposals to be an array");
     let proposals = body.as_array().unwrap();
-    assert!(!proposals.is_empty(), "Expected at least one proposal from docs");
+    assert!(
+        !proposals.is_empty(),
+        "Expected at least one proposal from docs"
+    );
 
     // Each proposal should have basic fields
     let first = &proposals[0];
     assert!(first.get("id").is_some(), "Proposal missing id");
     assert!(first.get("name").is_some(), "Proposal missing name");
     assert!(first.get("kind").is_some(), "Proposal missing kind");
+}
+
+#[tokio::test]
+async fn test_api_proposal_content_prefers_graph_authored_content() {
+    let state = test_state();
+    let port = available_port();
+
+    let app = api::router(state);
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
+        .await
+        .expect("Failed to bind");
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let client = reqwest::Client::new();
+    let proposals: serde_json::Value = client
+        .get(format!("http://127.0.0.1:{}/api/proposals", port))
+        .send()
+        .await
+        .expect("Failed to send request")
+        .json()
+        .await
+        .expect("Failed to parse proposals");
+
+    let proposal_id = proposals[0]["id"]
+        .as_str()
+        .expect("proposal id")
+        .to_string();
+
+    let update_resp = client
+        .post(format!(
+            "http://127.0.0.1:{}/api/nodes/{}/content",
+            port, proposal_id
+        ))
+        .json(&serde_json::json!({
+            "content": "# Graph-owned proposal body\n\nThis content should win over file fallback.",
+            "format": "markdown",
+            "agent": "test",
+            "reason": "test graph-authored content"
+        }))
+        .send()
+        .await
+        .expect("Failed to update content");
+
+    assert_eq!(update_resp.status(), 200);
+
+    let content_resp: serde_json::Value = client
+        .get(format!(
+            "http://127.0.0.1:{}/api/proposals/{}/content",
+            port, proposal_id
+        ))
+        .send()
+        .await
+        .expect("Failed to load proposal content")
+        .json()
+        .await
+        .expect("Failed to parse content response");
+
+    assert_eq!(content_resp["content_source"], "graph");
+    assert!(content_resp["content"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("Graph-owned proposal body"));
 }
 
 #[tokio::test]
@@ -174,7 +253,10 @@ async fn test_api_nodes_endpoint() {
     // Test the edges endpoint — use a simple test node we know exists
     // First try getting edges for a crate node via the list
     let resp = client
-        .get(format!("http://127.0.0.1:{}/api/nodes?kind=crate&worktree=develop", port))
+        .get(format!(
+            "http://127.0.0.1:{}/api/nodes?kind=crate&worktree=develop",
+            port
+        ))
         .send()
         .await
         .expect("Failed to send request");
@@ -182,7 +264,10 @@ async fn test_api_nodes_endpoint() {
     let body: serde_json::Value = resp.json().await.expect("Failed to parse JSON");
     assert!(body.is_array());
     let filtered = body.as_array().unwrap();
-    assert!(!filtered.is_empty(), "Expected crate nodes in develop worktree");
+    assert!(
+        !filtered.is_empty(),
+        "Expected crate nodes in develop worktree"
+    );
 }
 
 #[tokio::test]
@@ -265,12 +350,27 @@ async fn test_api_dashboard() {
 
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.expect("Failed to parse JSON");
-    assert!(body.get("active_sessions").is_some(), "Missing active_sessions");
+    assert!(
+        body.get("active_sessions").is_some(),
+        "Missing active_sessions"
+    );
     assert!(body.get("agents").is_some(), "Missing agents");
-    assert!(body.get("total_proposals").is_some(), "Missing total_proposals");
-    assert!(body.get("total_sessions").is_some(), "Missing total_sessions");
-    assert!(body.get("total_decisions").is_some(), "Missing total_decisions");
-    assert!(body.get("verification_progress").is_some(), "Missing verification_progress");
+    assert!(
+        body.get("total_proposals").is_some(),
+        "Missing total_proposals"
+    );
+    assert!(
+        body.get("total_sessions").is_some(),
+        "Missing total_sessions"
+    );
+    assert!(
+        body.get("total_decisions").is_some(),
+        "Missing total_decisions"
+    );
+    assert!(
+        body.get("verification_progress").is_some(),
+        "Missing verification_progress"
+    );
 }
 
 #[tokio::test]
@@ -285,26 +385,42 @@ async fn test_api_context_for_proposal() {
         .expect("Failed to send request");
     assert_eq!(resp.status(), 200);
     let proposals: Vec<serde_json::Value> = resp.json().await.expect("Failed to parse JSON");
-    assert!(!proposals.is_empty(), "Need at least one proposal for context test");
+    assert!(
+        !proposals.is_empty(),
+        "Need at least one proposal for context test"
+    );
 
     let proposal_id = proposals[0]["id"].as_str().unwrap();
 
     // GET /api/context/:target_id
     let resp = client
-        .get(format!("http://127.0.0.1:{}/api/context/{}", port, proposal_id))
+        .get(format!(
+            "http://127.0.0.1:{}/api/context/{}",
+            port, proposal_id
+        ))
         .send()
         .await
         .expect("Failed to send request");
 
-    assert_eq!(resp.status(), 200, "context_for should return 200 for a known proposal");
+    assert_eq!(
+        resp.status(),
+        200,
+        "context_for should return 200 for a known proposal"
+    );
     let body: serde_json::Value = resp.json().await.expect("Failed to parse JSON");
     assert_eq!(body["target_id"].as_str().unwrap(), proposal_id);
     assert!(body.get("target_name").is_some(), "Missing target_name");
     assert!(body.get("target_kind").is_some(), "Missing target_kind");
     assert!(body.get("related_seams").is_some(), "Missing related_seams");
-    assert!(body.get("implementing_code").is_some(), "Missing implementing_code");
+    assert!(
+        body.get("implementing_code").is_some(),
+        "Missing implementing_code"
+    );
     assert!(body.get("decisions").is_some(), "Missing decisions");
-    assert!(body.get("active_sessions").is_some(), "Missing active_sessions");
+    assert!(
+        body.get("active_sessions").is_some(),
+        "Missing active_sessions"
+    );
 }
 
 #[tokio::test]
@@ -312,12 +428,19 @@ async fn test_api_context_for_nonexistent() {
     let (port, client) = start_test_server().await;
 
     let resp = client
-        .get(format!("http://127.0.0.1:{}/api/context/nonexistent:fake:id", port))
+        .get(format!(
+            "http://127.0.0.1:{}/api/context/nonexistent:fake:id",
+            port
+        ))
         .send()
         .await
         .expect("Failed to send request");
 
-    assert_eq!(resp.status(), 500, "context_for should error for nonexistent node");
+    assert_eq!(
+        resp.status(),
+        500,
+        "context_for should error for nonexistent node"
+    );
 }
 
 #[tokio::test]
@@ -331,22 +454,40 @@ async fn test_api_impact() {
         .await
         .expect("Failed to send request");
     let proposals: Vec<serde_json::Value> = resp.json().await.unwrap();
-    assert!(!proposals.is_empty(), "Need at least one proposal for impact test");
+    assert!(
+        !proposals.is_empty(),
+        "Need at least one proposal for impact test"
+    );
 
     let proposal_id = proposals[0]["id"].as_str().unwrap();
 
     let resp = client
-        .get(format!("http://127.0.0.1:{}/api/impact/{}", port, proposal_id))
+        .get(format!(
+            "http://127.0.0.1:{}/api/impact/{}",
+            port, proposal_id
+        ))
         .send()
         .await
         .expect("Failed to send request");
 
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.expect("Failed to parse JSON");
-    assert!(body.get("target").is_some(), "Missing target in impact response");
-    assert!(body.get("affected_proposals").is_some(), "Missing affected_proposals");
-    assert!(body.get("affected_seams").is_some(), "Missing affected_seams");
-    assert!(body.get("affected_tests").is_some(), "Missing affected_tests");
+    assert!(
+        body.get("target").is_some(),
+        "Missing target in impact response"
+    );
+    assert!(
+        body.get("affected_proposals").is_some(),
+        "Missing affected_proposals"
+    );
+    assert!(
+        body.get("affected_seams").is_some(),
+        "Missing affected_seams"
+    );
+    assert!(
+        body.get("affected_tests").is_some(),
+        "Missing affected_tests"
+    );
     assert!(body.get("total_reached").is_some(), "Missing total_reached");
 }
 
@@ -406,12 +547,21 @@ async fn test_api_session_close() {
 
     assert_eq!(resp.status(), 200, "session/close should return 200");
     let body: serde_json::Value = resp.json().await.expect("Failed to parse JSON");
-    assert_eq!(body["session_id"].as_str().unwrap(), "test-session-close-001");
+    assert_eq!(
+        body["session_id"].as_str().unwrap(),
+        "test-session-close-001"
+    );
     assert_eq!(body["status"].as_str().unwrap(), "closed");
-    assert_eq!(body["workstream_ids"][0].as_str().unwrap(), "workstream:test-seam");
+    assert_eq!(
+        body["workstream_ids"][0].as_str().unwrap(),
+        "workstream:test-seam"
+    );
 
     let resp = client
-        .get(format!("http://127.0.0.1:{}/api/nodes?kind=workstream", port))
+        .get(format!(
+            "http://127.0.0.1:{}/api/nodes?kind=workstream",
+            port
+        ))
         .send()
         .await
         .expect("Failed to send request");
@@ -424,9 +574,14 @@ async fn test_api_session_close() {
         .find(|node| node["id"].as_str() == Some("workstream:test-seam"))
         .expect("Expected linked workstream node");
 
-    assert_eq!(workstream["properties"]["status"].as_str().unwrap(), "closed");
     assert_eq!(
-        workstream["properties"]["closed_by_session"].as_str().unwrap(),
+        workstream["properties"]["status"].as_str().unwrap(),
+        "closed"
+    );
+    assert_eq!(
+        workstream["properties"]["closed_by_session"]
+            .as_str()
+            .unwrap(),
         "test-session-close-001"
     );
     assert_eq!(
@@ -449,7 +604,11 @@ async fn test_api_session_close_nonexistent() {
         .expect("Failed to send request");
 
     // Should fail because the session doesn't exist
-    assert_ne!(resp.status(), 200, "Closing a nonexistent session should fail");
+    assert_ne!(
+        resp.status(),
+        200,
+        "Closing a nonexistent session should fail"
+    );
 }
 
 #[tokio::test]
@@ -482,7 +641,10 @@ async fn test_api_session_cleanup_closes_workstream() {
     assert_eq!(body["cleaned"].as_u64().unwrap(), 1);
 
     let resp = client
-        .get(format!("http://127.0.0.1:{}/api/nodes?kind=workstream", port))
+        .get(format!(
+            "http://127.0.0.1:{}/api/nodes?kind=workstream",
+            port
+        ))
         .send()
         .await
         .expect("Failed to send request");
@@ -495,9 +657,14 @@ async fn test_api_session_cleanup_closes_workstream() {
         .find(|node| node["id"].as_str() == Some("workstream:test-cleanup-seam"))
         .expect("Expected linked workstream node");
 
-    assert_eq!(workstream["properties"]["status"].as_str().unwrap(), "timed_out");
     assert_eq!(
-        workstream["properties"]["closed_by_session"].as_str().unwrap(),
+        workstream["properties"]["status"].as_str().unwrap(),
+        "timed_out"
+    );
+    assert_eq!(
+        workstream["properties"]["closed_by_session"]
+            .as_str()
+            .unwrap(),
         "test-session-cleanup-001"
     );
 }
@@ -519,7 +686,10 @@ async fn test_api_session_cleanup_reconciles_orphaned_workstream() {
     assert_eq!(resp.status(), 200);
 
     let resp = client
-        .post(format!("http://127.0.0.1:{}/api/nodes/orphan-session-001/update", port))
+        .post(format!(
+            "http://127.0.0.1:{}/api/nodes/orphan-session-001/update",
+            port
+        ))
         .json(&serde_json::json!({
             "properties": {
                 "status": "closed"
@@ -550,7 +720,10 @@ async fn test_api_session_cleanup_reconciles_orphaned_workstream() {
     );
 
     let resp = client
-        .get(format!("http://127.0.0.1:{}/api/nodes?kind=workstream", port))
+        .get(format!(
+            "http://127.0.0.1:{}/api/nodes?kind=workstream",
+            port
+        ))
         .send()
         .await
         .expect("Failed to send request");
@@ -563,7 +736,10 @@ async fn test_api_session_cleanup_reconciles_orphaned_workstream() {
         .find(|node| node["id"].as_str() == Some("workstream:orphan-seam"))
         .expect("Expected orphaned workstream node");
 
-    assert_eq!(workstream["properties"]["status"].as_str().unwrap(), "orphaned");
+    assert_eq!(
+        workstream["properties"]["status"].as_str().unwrap(),
+        "orphaned"
+    );
     assert_eq!(
         workstream["properties"]["close_reason"].as_str().unwrap(),
         "auto_cleanup: no active session"
@@ -591,8 +767,17 @@ async fn test_api_decide() {
 
     assert_eq!(resp.status(), 200, "decide should return 200");
     let body: serde_json::Value = resp.json().await.expect("Failed to parse JSON");
-    assert!(body["decision_id"].as_str().unwrap().starts_with("decision:"), "decision_id should start with 'decision:'");
-    assert_eq!(body["target_node"].as_str().unwrap(), "proposal:test-proposal");
+    assert!(
+        body["decision_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("decision:"),
+        "decision_id should start with 'decision:'"
+    );
+    assert_eq!(
+        body["target_node"].as_str().unwrap(),
+        "proposal:test-proposal"
+    );
     assert_eq!(body["action"].as_str().unwrap(), "status_change");
     assert_eq!(body["status"].as_str().unwrap(), "recorded");
 }
@@ -624,8 +809,14 @@ async fn test_api_full_agent_lifecycle() {
     assert_eq!(resp.status(), 200);
     let dashboard: serde_json::Value = resp.json().await.unwrap();
     let active = dashboard["active_sessions"].as_array().unwrap();
-    let found = active.iter().any(|s| s["id"].as_str() == Some("lifecycle-session-001"));
-    assert!(found, "Dashboard should show our active session. Active sessions: {:?}", active);
+    let found = active
+        .iter()
+        .any(|s| s["id"].as_str() == Some("lifecycle-session-001"));
+    assert!(
+        found,
+        "Dashboard should show our active session. Active sessions: {:?}",
+        active
+    );
 
     // 3. Record a decision
     let resp = client
@@ -666,6 +857,11 @@ async fn test_api_full_agent_lifecycle() {
     assert_eq!(resp.status(), 200);
     let dashboard: serde_json::Value = resp.json().await.unwrap();
     let active = dashboard["active_sessions"].as_array().unwrap();
-    let still_active = active.iter().any(|s| s["id"].as_str() == Some("lifecycle-session-001"));
-    assert!(!still_active, "Closed session should not appear in active_sessions");
+    let still_active = active
+        .iter()
+        .any(|s| s["id"].as_str() == Some("lifecycle-session-001"));
+    assert!(
+        !still_active,
+        "Closed session should not appear in active_sessions"
+    );
 }

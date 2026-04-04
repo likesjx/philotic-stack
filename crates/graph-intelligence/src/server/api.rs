@@ -12,8 +12,8 @@ use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 
-use crate::schema::*;
 use crate::scanner::{full_scan, ScanConfig};
+use crate::schema::*;
 
 use super::ws::ChangeEvent;
 use super::AppState;
@@ -46,6 +46,15 @@ pub struct MutationQuery {
 #[derive(Deserialize)]
 pub struct UpdateNodeBody {
     pub properties: serde_json::Value,
+    pub agent: Option<String>,
+    pub session: Option<String>,
+    pub reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateContentBody {
+    pub content: String,
+    pub format: Option<String>,
     pub agent: Option<String>,
     pub session: Option<String>,
     pub reason: Option<String>,
@@ -146,6 +155,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/status", get(get_status))
         .route("/api/nodes", get(list_nodes))
         .route("/api/nodes/:id", get(get_node))
+        .route(
+            "/api/nodes/:id/content",
+            get(get_node_content).post(update_node_content),
+        )
         .route("/api/nodes/:id/edges", get(get_node_edges))
         .route("/api/nodes/:id/update", post(update_node))
         .route("/api/search", get(search))
@@ -157,9 +170,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/c4/component/:crate_name", get(get_c4_component))
         .route("/api/c4/proposal/:proposal_id", get(get_c4_proposal))
         .route("/api/c4/seam/:seam_id", get(get_c4_seam))
-        .route("/api/diagram/sequence/:function_id", get(get_sequence_diagram))
+        .route(
+            "/api/diagram/sequence/:function_id",
+            get(get_sequence_diagram),
+        )
         .route("/api/diagram/state/:enum_id", get(get_state_diagram))
-        .route("/api/diagram/interactions/:crate_name", get(get_module_interactions))
+        .route(
+            "/api/diagram/interactions/:crate_name",
+            get(get_module_interactions),
+        )
         .route("/api/proposals", get(list_proposals))
         .route("/api/proposals/:id", get(get_proposal))
         .route("/api/proposals/:id/content", get(get_proposal_content))
@@ -337,8 +356,8 @@ async fn get_skeleton(
     AxumPath(crate_name): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let engine = state.engine.lock().await;
-    let diagram = crate::plantuml::generate_crate_diagram(&engine, &crate_name)
-        .map_err(internal_error)?;
+    let diagram =
+        crate::plantuml::generate_crate_diagram(&engine, &crate_name).map_err(internal_error)?;
     Ok((
         StatusCode::OK,
         [("content-type", "text/plain; charset=utf-8")],
@@ -374,7 +393,9 @@ async fn get_proposal(
         .map_err(internal_error)?
         .ok_or_else(|| not_found(&format!("Proposal '{}' not found", id)))?;
 
-    let outgoing = engine.get_edges_from(&proposal_id).map_err(internal_error)?;
+    let outgoing = engine
+        .get_edges_from(&proposal_id)
+        .map_err(internal_error)?;
     let incoming = engine.get_edges_to(&proposal_id).map_err(internal_error)?;
 
     // Find related seams
@@ -449,18 +470,151 @@ async fn get_proposal_content(
         .map_err(internal_error)?
         .ok_or_else(|| not_found(&format!("Proposal '{}' not found", id)))?;
 
-    // Read the file content
-    let content = if let Some(ref path) = node.file_path {
-        std::fs::read_to_string(path).unwrap_or_default()
-    } else {
-        String::new()
+    Ok(Json(node_content_response(&node)))
+}
+
+async fn get_node_content(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let engine = state.engine.lock().await;
+
+    let node = engine
+        .get_node(&id)
+        .map_err(internal_error)?
+        .ok_or_else(|| not_found(&format!("Node '{}' not found", id)))?;
+
+    if !is_graph_content_kind(node.kind) {
+        return Err(not_found(&format!(
+            "Node '{}' does not support graph-authored content",
+            id
+        )));
+    }
+
+    Ok(Json(node_content_response(&node)))
+}
+
+async fn update_node_content(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<UpdateContentBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let engine = state.engine.lock().await;
+
+    let mut node = engine
+        .get_node(&id)
+        .map_err(internal_error)?
+        .ok_or_else(|| not_found(&format!("Node '{}' not found", id)))?;
+
+    if !is_graph_content_kind(node.kind) {
+        return Err(not_found(&format!(
+            "Node '{}' does not support graph-authored content",
+            id
+        )));
+    }
+
+    let mut props = node.properties.as_object().cloned().unwrap_or_default();
+    props.insert("content".to_string(), serde_json::json!(body.content));
+    props.insert(
+        "content_format".to_string(),
+        serde_json::json!(body
+            .format
+            .clone()
+            .unwrap_or_else(|| "markdown".to_string())),
+    );
+    props.insert("content_source".to_string(), serde_json::json!("graph"));
+    props.insert(
+        "last_updated".to_string(),
+        serde_json::json!(chrono::Utc::now().format("%Y-%m-%d").to_string()),
+    );
+    node.properties = serde_json::Value::Object(props);
+    node.updated_at = chrono::Utc::now();
+
+    engine.upsert_node(&node).map_err(internal_error)?;
+
+    let mutation = Mutation {
+        id: uuid::Uuid::new_v4().to_string(),
+        timestamp: chrono::Utc::now(),
+        agent: body.agent.clone(),
+        session: body.session.clone(),
+        action: "update_content".to_string(),
+        target_node: Some(id.clone()),
+        from_value: None,
+        to_value: Some(format!(
+            "{} bytes ({})",
+            node_content(&node).len(),
+            node_content_format(&node)
+        )),
+        reason: body.reason.clone(),
+        details: serde_json::json!({}),
     };
+    engine.record_mutation(&mutation).map_err(internal_error)?;
+
+    let _ = state.change_tx.send(ChangeEvent {
+        event_type: "node_content_updated".to_string(),
+        payload: serde_json::json!({
+            "node_id": id,
+            "agent": body.agent,
+        }),
+    });
 
     Ok(Json(serde_json::json!({
-        "id": proposal_id,
-        "name": node.name,
-        "content": content,
+        "updated": true,
+        "node_id": node.id,
+        "content_source": "graph",
+        "content_format": node_content_format(&node),
+        "mutation_id": mutation.id,
     })))
+}
+
+fn is_graph_content_kind(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Proposal | NodeKind::Task | NodeKind::Document | NodeKind::Skill | NodeKind::Sver
+    )
+}
+
+fn node_content(node: &Node) -> String {
+    node.properties
+        .get("content")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            node.file_path
+                .as_ref()
+                .and_then(|path| std::fs::read_to_string(path).ok())
+        })
+        .unwrap_or_default()
+}
+
+fn node_content_format(node: &Node) -> String {
+    node.properties
+        .get("content_format")
+        .and_then(|v| v.as_str())
+        .unwrap_or("markdown")
+        .to_string()
+}
+
+fn node_content_source(node: &Node) -> String {
+    node.properties
+        .get("content_source")
+        .and_then(|v| v.as_str())
+        .unwrap_or(if node.file_path.is_some() {
+            "file_fallback"
+        } else {
+            "graph"
+        })
+        .to_string()
+}
+
+fn node_content_response(node: &Node) -> serde_json::Value {
+    serde_json::json!({
+        "id": node.id,
+        "name": node.name,
+        "content": node_content(node),
+        "content_format": node_content_format(node),
+        "content_source": node_content_source(node),
+    })
 }
 
 async fn list_seams(
@@ -636,8 +790,7 @@ async fn get_c4_context(
     AxumPath(system_name): AxumPath<String>,
 ) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
     let engine = state.engine.lock().await;
-    let uml = crate::c4::generate_c4_context(&engine, &system_name)
-        .map_err(internal_error)?;
+    let uml = crate::c4::generate_c4_context(&engine, &system_name).map_err(internal_error)?;
     Ok(uml)
 }
 
@@ -646,8 +799,7 @@ async fn get_c4_container(
     AxumPath(system_name): AxumPath<String>,
 ) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
     let engine = state.engine.lock().await;
-    let uml = crate::c4::generate_c4_container(&engine, &system_name)
-        .map_err(internal_error)?;
+    let uml = crate::c4::generate_c4_container(&engine, &system_name).map_err(internal_error)?;
     Ok(uml)
 }
 
@@ -656,8 +808,7 @@ async fn get_c4_component(
     AxumPath(crate_name): AxumPath<String>,
 ) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
     let engine = state.engine.lock().await;
-    let uml = crate::c4::generate_c4_component(&engine, &crate_name)
-        .map_err(internal_error)?;
+    let uml = crate::c4::generate_c4_component(&engine, &crate_name).map_err(internal_error)?;
     Ok(uml)
 }
 
@@ -666,8 +817,8 @@ async fn get_c4_proposal(
     AxumPath(proposal_id): AxumPath<String>,
 ) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
     let engine = state.engine.lock().await;
-    let uml = crate::c4::generate_proposal_architecture(&engine, &proposal_id)
-        .map_err(internal_error)?;
+    let uml =
+        crate::c4::generate_proposal_architecture(&engine, &proposal_id).map_err(internal_error)?;
     Ok(uml)
 }
 
@@ -676,8 +827,7 @@ async fn get_c4_seam(
     AxumPath(seam_id): AxumPath<String>,
 ) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
     let engine = state.engine.lock().await;
-    let uml = crate::c4::generate_seam_detail(&engine, &seam_id)
-        .map_err(internal_error)?;
+    let uml = crate::c4::generate_seam_detail(&engine, &seam_id).map_err(internal_error)?;
     Ok(uml)
 }
 
@@ -698,8 +848,7 @@ async fn get_state_diagram(
     AxumPath(enum_id): AxumPath<String>,
 ) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
     let engine = state.engine.lock().await;
-    let uml = crate::diagrams::generate_state_diagram(&engine, &enum_id)
-        .map_err(internal_error)?;
+    let uml = crate::diagrams::generate_state_diagram(&engine, &enum_id).map_err(internal_error)?;
     Ok(uml)
 }
 
@@ -726,11 +875,25 @@ async fn get_dashboard(
             "id": s.id, "agent": s.agent, "seam_id": s.seam_id,
             "proposal_id": s.proposal_id, "phase": s.phase,
             "started": s.started.to_rfc3339(),
+            "last_activity": s.last_activity,
+            "tokens_total": s.tokens_total,
+            "tokens_input": s.tokens_input,
+            "tokens_output": s.tokens_output,
+            "elapsed_ms": s.elapsed_ms,
+            "harness_id": s.harness_id,
+            "workflow_name": s.workflow_name,
         })).collect::<Vec<_>>(),
         "recent_closed": report.recent_closed.iter().map(|s| serde_json::json!({
             "id": s.id, "agent": s.agent, "seam_id": s.seam_id,
             "proposal_id": s.proposal_id, "phase": s.phase,
             "started": s.started.to_rfc3339(),
+            "last_activity": s.last_activity,
+            "tokens_total": s.tokens_total,
+            "tokens_input": s.tokens_input,
+            "tokens_output": s.tokens_output,
+            "elapsed_ms": s.elapsed_ms,
+            "harness_id": s.harness_id,
+            "workflow_name": s.workflow_name,
         })).collect::<Vec<_>>(),
         "agents": report.agents.iter().map(|a| serde_json::json!({
             "agent": a.agent, "total_sessions": a.total_sessions,
@@ -850,8 +1013,11 @@ async fn post_session_start(
         worktree: String::new(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
-        embedding: None, embedding_model: None, embedding_dims: None,
-        embedding_updated: None, embedding_hash: None,
+        embedding: None,
+        embedding_model: None,
+        embedding_dims: None,
+        embedding_updated: None,
+        embedding_hash: None,
     };
     engine.upsert_node(&workstream).map_err(internal_error)?;
 
@@ -869,7 +1035,11 @@ async fn post_session_start(
     let session = Node {
         id: body.session_id.clone(),
         kind: NodeKind::Session,
-        name: format!("Session {} - {}", body.agent, chrono::Utc::now().format("%Y-%m-%d %H:%M")),
+        name: format!(
+            "Session {} - {}",
+            body.agent,
+            chrono::Utc::now().format("%Y-%m-%d %H:%M")
+        ),
         properties: serde_json::json!({
             "agent": body.agent,
             "agent_model": agent_model,
@@ -884,8 +1054,11 @@ async fn post_session_start(
         worktree: String::new(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
-        embedding: None, embedding_model: None, embedding_dims: None,
-        embedding_updated: None, embedding_hash: None,
+        embedding: None,
+        embedding_model: None,
+        embedding_dims: None,
+        embedding_updated: None,
+        embedding_hash: None,
     };
     engine.upsert_node(&session).map_err(internal_error)?;
 
@@ -921,7 +1094,8 @@ async fn post_session_close(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let engine = state.engine.lock().await;
 
-    let session = engine.get_node(&body.session_id)
+    let session = engine
+        .get_node(&body.session_id)
         .map_err(internal_error)?
         .ok_or_else(|| not_found(&format!("Session not found: {}", body.session_id)))?;
 
@@ -982,8 +1156,11 @@ async fn post_decide(
         worktree: String::new(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
-        embedding: None, embedding_model: None, embedding_dims: None,
-        embedding_updated: None, embedding_hash: None,
+        embedding: None,
+        embedding_model: None,
+        embedding_dims: None,
+        embedding_updated: None,
+        embedding_hash: None,
     };
     engine.upsert_node(&decision).map_err(internal_error)?;
 
@@ -1058,8 +1235,11 @@ async fn post_test_run(
         worktree: String::new(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
-        embedding: None, embedding_model: None, embedding_dims: None,
-        embedding_updated: None, embedding_hash: None,
+        embedding: None,
+        embedding_model: None,
+        embedding_dims: None,
+        embedding_updated: None,
+        embedding_hash: None,
     };
     engine.upsert_node(&testrun).map_err(internal_error)?;
 
@@ -1083,7 +1263,10 @@ async fn post_test_run(
         target_node: Some(body.target_id.clone()),
         from_value: None,
         to_value: Some(format!("{}/{} passed", body.pass_count, body.test_count)),
-        reason: Some(format!("Test run recorded: {}/{} pass", body.pass_count, body.test_count)),
+        reason: Some(format!(
+            "Test run recorded: {}/{} pass",
+            body.pass_count, body.test_count
+        )),
         details: serde_json::json!({"testrun_id": testrun_id}),
     };
     engine.record_mutation(&mutation).map_err(internal_error)?;
@@ -1124,8 +1307,12 @@ async fn post_session_cleanup(
         .unwrap_or(4);
     let max_age = chrono::Duration::hours(max_age_hours as i64);
 
-    let cleaned = engine.cleanup_stale_sessions(max_age).map_err(internal_error)?;
-    let orphaned_workstreams = engine.cleanup_orphaned_workstreams().map_err(internal_error)?;
+    let cleaned = engine
+        .cleanup_stale_sessions(max_age)
+        .map_err(internal_error)?;
+    let orphaned_workstreams = engine
+        .cleanup_orphaned_workstreams()
+        .map_err(internal_error)?;
 
     let _ = state.change_tx.send(super::ws::ChangeEvent {
         event_type: "sessions_cleaned".to_string(),

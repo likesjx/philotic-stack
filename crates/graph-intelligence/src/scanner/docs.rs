@@ -36,6 +36,8 @@ pub fn scan_docs(root: &Path, engine: &GraphEngine) -> Result<usize> {
     let now = Utc::now();
     let mut count = 0;
 
+    let existing_doc_nodes = existing_doc_node_map(engine)?;
+
     // Clear stale doc nodes before rescan (prevents ghosts from renamed/deleted files)
     engine.clear_scanned_doc_nodes()?;
 
@@ -79,8 +81,7 @@ pub fn scan_docs(root: &Path, engine: &GraphEngine) -> Result<usize> {
         }
     }
 
-    for file_path in &md_files
-    {
+    for file_path in &md_files {
         let rel_path = file_path
             .strip_prefix(root)
             .unwrap_or(file_path)
@@ -109,7 +110,9 @@ pub fn scan_docs(root: &Path, engine: &GraphEngine) -> Result<usize> {
 
         let node_kind = match frontmatter.doc_type.as_deref() {
             Some("proposal") => NodeKind::Proposal,
-            Some("reference") | Some("status") | Some("historical") | Some("architecture") => NodeKind::Document,
+            Some("reference") | Some("status") | Some("historical") | Some("architecture") => {
+                NodeKind::Document
+            }
             Some("workflow") => NodeKind::Document,
             Some("seam") => NodeKind::Seam,
             Some("task-surface") | Some("task") => NodeKind::Task,
@@ -149,7 +152,7 @@ pub fn scan_docs(root: &Path, engine: &GraphEngine) -> Result<usize> {
                 .unwrap_or_else(|| slugify(&file_name))
         );
 
-        let properties = serde_json::json!({
+        let scanned_properties = serde_json::json!({
             "status": frontmatter.status,
             "disposition": frontmatter.disposition,
             "domain": frontmatter.domain,
@@ -157,7 +160,12 @@ pub fn scan_docs(root: &Path, engine: &GraphEngine) -> Result<usize> {
             "tags": frontmatter.tags,
             "source_of_truth_targets": frontmatter.source_of_truth_targets,
             "last_updated": frontmatter.last_updated,
+            "content": content,
+            "content_format": "markdown",
+            "content_source": "scan:file",
         });
+
+        let properties = merge_doc_properties(existing_doc_nodes.get(&node_id), scanned_properties);
 
         engine.upsert_node(&Node {
             id: node_id.clone(),
@@ -167,11 +175,11 @@ pub fn scan_docs(root: &Path, engine: &GraphEngine) -> Result<usize> {
             file_path: Some(rel_path.clone()),
             worktree: String::new(),
             created_at: now,
-                embedding: None,
-                embedding_model: None,
-                embedding_dims: None,
-                embedding_updated: None,
-                embedding_hash: None,
+            embedding: None,
+            embedding_model: None,
+            embedding_dims: None,
+            embedding_updated: None,
+            embedding_hash: None,
             updated_at: now,
         })?;
         count += 1;
@@ -234,11 +242,11 @@ pub fn scan_docs(root: &Path, engine: &GraphEngine) -> Result<usize> {
                     file_path: None,
                     worktree: String::new(),
                     created_at: now,
-                embedding: None,
-                embedding_model: None,
-                embedding_dims: None,
-                embedding_updated: None,
-                embedding_hash: None,
+                    embedding: None,
+                    embedding_model: None,
+                    embedding_dims: None,
+                    embedding_updated: None,
+                    embedding_hash: None,
                     updated_at: now,
                 })?;
                 engine.upsert_edge(&Edge {
@@ -264,11 +272,11 @@ pub fn scan_docs(root: &Path, engine: &GraphEngine) -> Result<usize> {
                     file_path: None,
                     worktree: String::new(),
                     created_at: now,
-                embedding: None,
-                embedding_model: None,
-                embedding_dims: None,
-                embedding_updated: None,
-                embedding_hash: None,
+                    embedding: None,
+                    embedding_model: None,
+                    embedding_dims: None,
+                    embedding_updated: None,
+                    embedding_hash: None,
                     updated_at: now,
                 })?;
                 engine.upsert_edge(&Edge {
@@ -321,6 +329,64 @@ pub fn scan_docs(root: &Path, engine: &GraphEngine) -> Result<usize> {
     Ok(count)
 }
 
+fn existing_doc_node_map(engine: &GraphEngine) -> Result<std::collections::HashMap<String, Node>> {
+    let mut map = std::collections::HashMap::new();
+    for kind in [
+        NodeKind::Proposal,
+        NodeKind::Domain,
+        NodeKind::Seam,
+        NodeKind::Task,
+        NodeKind::Document,
+        NodeKind::Skill,
+        NodeKind::Sver,
+    ] {
+        for node in engine.query_nodes(Some(kind), None)? {
+            if node.worktree.is_empty() {
+                map.insert(node.id.clone(), node);
+            }
+        }
+    }
+    Ok(map)
+}
+
+fn merge_doc_properties(existing: Option<&Node>, scanned: serde_json::Value) -> serde_json::Value {
+    let mut merged = scanned.as_object().cloned().unwrap_or_default();
+
+    if let Some(existing) = existing {
+        if let Some(existing_props) = existing.properties.as_object() {
+            for (key, value) in existing_props {
+                if key == "content" || key == "content_format" || key == "content_source" {
+                    let is_graph_authored_content = existing_props
+                        .get("content_source")
+                        .and_then(|v| v.as_str())
+                        == Some("graph");
+                    if is_graph_authored_content {
+                        merged.insert(key.clone(), value.clone());
+                    }
+                    continue;
+                }
+
+                let scanned_missing = merged.get(key).map(is_missing_value).unwrap_or(true);
+                if scanned_missing {
+                    merged.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
+
+    serde_json::Value::Object(merged)
+}
+
+fn is_missing_value(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => true,
+        serde_json::Value::String(s) => s.is_empty(),
+        serde_json::Value::Array(items) => items.is_empty(),
+        serde_json::Value::Object(map) => map.is_empty(),
+        _ => false,
+    }
+}
+
 /// Parse YAML frontmatter delimited by `---` lines.
 fn parse_frontmatter(content: &str) -> (DocFrontmatter, String) {
     let trimmed = content.trim_start();
@@ -357,9 +423,7 @@ fn parse_seam_registry(body: &str, engine: &GraphEngine) -> Result<()> {
         let cols: Vec<&str> = line.split('|').map(|s| s.trim()).collect();
         // Expected: ["", seam_id, domain, proposal, task_surface, ""]
         if cols.len() >= 5 {
-            let seam_id = cols[1]
-                .trim_matches('`')
-                .trim();
+            let seam_id = cols[1].trim_matches('`').trim();
             let domain = cols[2].trim();
             let proposal_ref = cols[3].trim();
 
@@ -547,10 +611,7 @@ fn parse_task_items(body: &str, engine: &GraphEngine) -> Result<()> {
 
         // Track section headers
         if trimmed.starts_with('#') {
-            current_section = trimmed
-                .trim_start_matches('#')
-                .trim()
-                .to_string();
+            current_section = trimmed.trim_start_matches('#').trim().to_string();
             continue;
         }
 
@@ -563,7 +624,17 @@ fn parse_task_items(body: &str, engine: &GraphEngine) -> Result<()> {
             task_idx += 1;
             let done = trimmed.contains("[x]") || trimmed.contains("[X]");
             let task_text = trimmed
-                .trim_start_matches(|c: char| c == '-' || c == '*' || c == ' ' || c.is_ascii_digit() || c == '.' || c == '[' || c == ']' || c == 'x' || c == 'X')
+                .trim_start_matches(|c: char| {
+                    c == '-'
+                        || c == '*'
+                        || c == ' '
+                        || c.is_ascii_digit()
+                        || c == '.'
+                        || c == '['
+                        || c == ']'
+                        || c == 'x'
+                        || c == 'X'
+                })
                 .trim();
 
             let task_id = format!("task:task-md-{}", task_idx);
