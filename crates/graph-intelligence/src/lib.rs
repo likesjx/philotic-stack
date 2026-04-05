@@ -9,8 +9,8 @@ pub mod schema;
 pub mod server;
 pub mod writeback;
 
+pub use c4::*;
+pub use diagrams::*;
 pub use engine::GraphEngine;
 pub use scanner::{full_scan, ScanConfig, ScanResult};
 pub use schema::*;
-pub use c4::*;
-pub use diagrams::*;

@@ -33,11 +33,7 @@ pub struct ScanResult {
 }
 
 /// Run all scanners against the workspace.
-pub fn full_scan(
-    root: &Path,
-    config: &ScanConfig,
-    engine: &mut GraphEngine,
-) -> Result<ScanResult> {
+pub fn full_scan(root: &Path, config: &ScanConfig, engine: &mut GraphEngine) -> Result<ScanResult> {
     let start = Instant::now();
 
     // Clear existing data for this worktree before re-scanning
@@ -56,8 +52,7 @@ pub fn full_scan(
         if !scan_path.exists() {
             continue;
         }
-        let metrics =
-            code::scan_rust_workspace(&scan_path, engine, &config.worktree)?;
+        let metrics = code::scan_rust_workspace(&scan_path, engine, &config.worktree)?;
         total_crates += metrics.crates_found;
         total_modules += metrics.modules_found;
         total_types += metrics.types_found;

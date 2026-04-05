@@ -97,13 +97,46 @@ impl GraphEngine {
             );
             ",
         )?;
+        self.migrate_legacy_schema()?;
+        Ok(())
+    }
+
+    fn migrate_legacy_schema(&self) -> Result<()> {
+        self.ensure_column("nodes", "embedding", "BLOB")?;
+        self.ensure_column("nodes", "embedding_model", "TEXT")?;
+        self.ensure_column("nodes", "embedding_dims", "INTEGER")?;
+        self.ensure_column("nodes", "embedding_updated", "TEXT")?;
+        self.ensure_column("nodes", "embedding_hash", "TEXT")?;
+        Ok(())
+    }
+
+    fn ensure_column(&self, table: &str, column: &str, decl: &str) -> Result<()> {
+        let found: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+                params![table, column],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("Failed to inspect schema for table {table}"))?;
+        if found == 0 {
+            self.conn
+                .execute(
+                    &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+                    [],
+                )
+                .with_context(|| format!("Failed to add column {column} to table {table}"))?;
+        }
         Ok(())
     }
 
     // ── Node CRUD ──
 
     pub fn upsert_node(&self, node: &Node) -> Result<()> {
-        let embedding_blob = node.embedding.as_ref().map(|v| crate::schema::serialize_embedding(v));
+        let embedding_blob = node
+            .embedding
+            .as_ref()
+            .map(|v| crate::schema::serialize_embedding(v));
         self.conn.execute(
             "INSERT INTO nodes (id, kind, name, properties, file_path, worktree, created_at, updated_at,
                               embedding, embedding_model, embedding_dims, embedding_updated, embedding_hash)
@@ -137,13 +170,106 @@ impl GraphEngine {
             ],
         )?;
         // Update FTS
-        self.conn.execute(
-            "INSERT INTO nodes_fts(rowid, name)
+        self.conn
+            .execute(
+                "INSERT INTO nodes_fts(rowid, name)
              SELECT rowid, name FROM nodes WHERE id = ?1
              ON CONFLICT DO NOTHING",
-            params![node.id],
-        ).ok(); // FTS sync is best-effort
+                params![node.id],
+            )
+            .ok(); // FTS sync is best-effort
         Ok(())
+    }
+
+    pub fn insert_node_if_absent(&self, node: &Node) -> Result<bool> {
+        let embedding_blob = node
+            .embedding
+            .as_ref()
+            .map(|v| crate::schema::serialize_embedding(v));
+        let changed = self.conn.execute(
+            "INSERT INTO nodes (id, kind, name, properties, file_path, worktree, created_at, updated_at,
+                              embedding, embedding_model, embedding_dims, embedding_updated, embedding_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             ON CONFLICT(id) DO NOTHING",
+            params![
+                node.id,
+                node.kind.as_str(),
+                node.name,
+                node.properties.to_string(),
+                node.file_path,
+                node.worktree,
+                node.created_at.to_rfc3339(),
+                node.updated_at.to_rfc3339(),
+                embedding_blob,
+                node.embedding_model,
+                node.embedding_dims,
+                node.embedding_updated.map(|dt| dt.to_rfc3339()),
+                node.embedding_hash,
+            ],
+        )? > 0;
+        if changed {
+            self.conn
+                .execute(
+                    "INSERT INTO nodes_fts(rowid, name)
+                 SELECT rowid, name FROM nodes WHERE id = ?1
+                 ON CONFLICT DO NOTHING",
+                    params![node.id],
+                )
+                .ok();
+        }
+        Ok(changed)
+    }
+
+    pub fn compare_and_swap_node(
+        &self,
+        node: &Node,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool> {
+        let embedding_blob = node
+            .embedding
+            .as_ref()
+            .map(|v| crate::schema::serialize_embedding(v));
+        let changed = self.conn.execute(
+            "UPDATE nodes
+             SET kind = ?2,
+                 name = ?3,
+                 properties = ?4,
+                 file_path = ?5,
+                 worktree = ?6,
+                 updated_at = ?7,
+                 embedding = COALESCE(?8, embedding),
+                 embedding_model = COALESCE(?9, embedding_model),
+                 embedding_dims = COALESCE(?10, embedding_dims),
+                 embedding_updated = COALESCE(?11, embedding_updated),
+                 embedding_hash = COALESCE(?12, embedding_hash)
+             WHERE id = ?1 AND updated_at = ?13",
+            params![
+                node.id,
+                node.kind.as_str(),
+                node.name,
+                node.properties.to_string(),
+                node.file_path,
+                node.worktree,
+                node.updated_at.to_rfc3339(),
+                embedding_blob,
+                node.embedding_model,
+                node.embedding_dims,
+                node.embedding_updated.map(|dt| dt.to_rfc3339()),
+                node.embedding_hash,
+                expected_updated_at.to_rfc3339(),
+            ],
+        )? > 0;
+        if changed {
+            self.conn
+                .execute(
+                    "INSERT INTO nodes_fts(rowid, name)
+                 SELECT rowid, name FROM nodes WHERE id = ?1
+                 ON CONFLICT DO NOTHING",
+                    params![node.id],
+                )
+                .ok();
+        }
+        Ok(changed)
     }
 
     pub fn get_node(&self, id: &str) -> Result<Option<Node>> {
@@ -152,9 +278,7 @@ impl GraphEngine {
                     embedding, embedding_model, embedding_dims, embedding_updated, embedding_hash
              FROM nodes WHERE id = ?1",
         )?;
-        let mut rows = stmt.query_map(params![id], |row| {
-            Ok(row_to_node(row))
-        })?;
+        let mut rows = stmt.query_map(params![id], |row| Ok(row_to_node(row)))?;
         match rows.next() {
             Some(Ok(node)) => Ok(Some(node?)),
             Some(Err(e)) => Err(e.into()),
@@ -162,11 +286,7 @@ impl GraphEngine {
         }
     }
 
-    pub fn query_nodes(
-        &self,
-        kind: Option<NodeKind>,
-        worktree: Option<&str>,
-    ) -> Result<Vec<Node>> {
+    pub fn query_nodes(&self, kind: Option<NodeKind>, worktree: Option<&str>) -> Result<Vec<Node>> {
         let (sql, params_vec) = match (kind, worktree) {
             (Some(k), Some(w)) => (
                 "SELECT id, kind, name, properties, file_path, worktree, created_at, updated_at,
@@ -194,8 +314,10 @@ impl GraphEngine {
             ),
         };
         let mut stmt = self.conn.prepare(sql)?;
-        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params_vec.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec
+            .iter()
+            .map(|s| s as &dyn rusqlite::types::ToSql)
+            .collect();
         let rows = stmt.query_map(params_refs.as_slice(), |row| Ok(row_to_node(row)))?;
         let mut nodes = Vec::new();
         for row in rows {
@@ -349,11 +471,7 @@ impl GraphEngine {
         Ok(())
     }
 
-    pub fn get_mutations(
-        &self,
-        target_node: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<Mutation>> {
+    pub fn get_mutations(&self, target_node: Option<&str>, limit: usize) -> Result<Vec<Mutation>> {
         let (sql, params_vec): (&str, Vec<String>) = match target_node {
             Some(t) => (
                 "SELECT id, timestamp, agent, session, action, target_node, from_value, to_value, reason, details
@@ -367,8 +485,10 @@ impl GraphEngine {
             ),
         };
         let mut stmt = self.conn.prepare(sql)?;
-        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params_vec.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec
+            .iter()
+            .map(|s| s as &dyn rusqlite::types::ToSql)
+            .collect();
         let rows = stmt.query_map(params_refs.as_slice(), |row| Ok(row_to_mutation(row)))?;
         let mut mutations = Vec::new();
         for row in rows {
@@ -397,8 +517,10 @@ impl GraphEngine {
     // ── Bulk operations ──
 
     pub fn clear_worktree(&self, worktree: &str) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM snippets WHERE node_id IN (SELECT id FROM nodes WHERE worktree = ?1)", params![worktree])?;
+        self.conn.execute(
+            "DELETE FROM snippets WHERE node_id IN (SELECT id FROM nodes WHERE worktree = ?1)",
+            params![worktree],
+        )?;
         self.conn
             .execute("DELETE FROM edges WHERE worktree = ?1", params![worktree])?;
         self.conn
@@ -459,11 +581,9 @@ impl GraphEngine {
                 params![k.as_str()],
                 |row| row.get(0),
             )?,
-            None => self.conn.query_row(
-                "SELECT COUNT(*) FROM nodes",
-                [],
-                |row| row.get(0),
-            )?,
+            None => self
+                .conn
+                .query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0))?,
         };
         Ok(count as usize)
     }
@@ -523,8 +643,14 @@ impl GraphEngine {
         for mut session in stale_sessions {
             let mut props = session.properties.as_object().cloned().unwrap_or_default();
             props.insert("status".to_string(), serde_json::json!("timed_out"));
-            props.insert("end_time".to_string(), serde_json::json!(chrono::Utc::now().to_rfc3339()));
-            props.insert("close_reason".to_string(), serde_json::json!("auto_cleanup: exceeded max session age"));
+            props.insert(
+                "end_time".to_string(),
+                serde_json::json!(chrono::Utc::now().to_rfc3339()),
+            );
+            props.insert(
+                "close_reason".to_string(),
+                serde_json::json!("auto_cleanup: exceeded max session age"),
+            );
             session.properties = serde_json::Value::Object(props);
             session.updated_at = chrono::Utc::now();
             self.upsert_node(&session)?;
@@ -548,7 +674,11 @@ impl GraphEngine {
             .collect();
 
         if workstream_ids.is_empty() {
-            if let Some(seam_id) = session.properties.get("seam_id").and_then(|value| value.as_str()) {
+            if let Some(seam_id) = session
+                .properties
+                .get("seam_id")
+                .and_then(|value| value.as_str())
+            {
                 workstream_ids.push(format!("workstream:{}", seam_id.replace("seam:", "")));
             }
         }
@@ -573,11 +703,22 @@ impl GraphEngine {
                 continue;
             };
 
-            let mut props = workstream.properties.as_object().cloned().unwrap_or_default();
+            let mut props = workstream
+                .properties
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
             props.insert("status".to_string(), serde_json::json!(status));
             props.insert("end_time".to_string(), serde_json::json!(now.to_rfc3339()));
-            props.insert("closed_by_session".to_string(), serde_json::json!(session.id.clone()));
-            if let Some(phase) = session.properties.get("phase").and_then(|value| value.as_str()) {
+            props.insert(
+                "closed_by_session".to_string(),
+                serde_json::json!(session.id.clone()),
+            );
+            if let Some(phase) = session
+                .properties
+                .get("phase")
+                .and_then(|value| value.as_str())
+            {
                 props.insert("phase".to_string(), serde_json::json!(phase));
             }
             if let Some(summary) = summary.filter(|value| !value.is_empty()) {
@@ -632,7 +773,11 @@ impl GraphEngine {
                 continue;
             }
 
-            let mut props = workstream.properties.as_object().cloned().unwrap_or_default();
+            let mut props = workstream
+                .properties
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
             props.insert("status".to_string(), serde_json::json!("orphaned"));
             props.insert("end_time".to_string(), serde_json::json!(now.to_rfc3339()));
             props.insert(
@@ -664,10 +809,9 @@ impl GraphEngine {
              WHERE kind = ?1
                AND json_extract(properties, ?2) = ?3",
         )?;
-        let rows = stmt.query_map(
-            params![kind.as_str(), json_path, property_value],
-            |row| Ok(row_to_node(row)),
-        )?;
+        let rows = stmt.query_map(params![kind.as_str(), json_path, property_value], |row| {
+            Ok(row_to_node(row))
+        })?;
         let mut nodes = Vec::new();
         for row in rows {
             nodes.push(row??);
@@ -685,7 +829,7 @@ fn row_to_node(row: &rusqlite::Row) -> Result<Node> {
     let updated_str: String = row.get(7)?;
     let embedding_blob: Option<Vec<u8>> = row.get(8)?;
     let embedding_updated: Option<String> = row.get(11)?;
-    
+
     Ok(Node {
         id: row.get(0)?,
         kind: NodeKind::from_str(&kind_str).unwrap_or(NodeKind::Component),
@@ -702,9 +846,11 @@ fn row_to_node(row: &rusqlite::Row) -> Result<Node> {
         embedding: embedding_blob.map(|b| crate::schema::deserialize_embedding(&b)),
         embedding_model: row.get(9)?,
         embedding_dims: row.get(10)?,
-        embedding_updated: embedding_updated.and_then(|s| 
-            chrono::DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&chrono::Utc))
-        ),
+        embedding_updated: embedding_updated.and_then(|s| {
+            chrono::DateTime::parse_from_rfc3339(&s)
+                .ok()
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+        }),
         embedding_hash: row.get(12)?,
     })
 }

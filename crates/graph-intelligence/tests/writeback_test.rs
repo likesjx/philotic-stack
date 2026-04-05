@@ -83,7 +83,10 @@ fn test_update_frontmatter_adds_new_field() {
 
     let result = std::fs::read_to_string(&file_path).expect("Failed to read result");
 
-    assert!(result.contains("last_updated: '2026-03-28'") || result.contains("last_updated: 2026-03-28"));
+    assert!(
+        result.contains("last_updated: '2026-03-28'")
+            || result.contains("last_updated: 2026-03-28")
+    );
     assert!(result.contains("title: Test"));
     assert!(result.contains("Body"));
 }

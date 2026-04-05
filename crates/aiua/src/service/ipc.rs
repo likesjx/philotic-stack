@@ -1089,11 +1089,22 @@ impl IpcServer {
                 })
                 .unwrap_or_default()
         };
+        let str_opt = |key: &str| {
+            identity
+                .bundle_json
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
 
         OperatorAgentView {
             agent_id: identity.agent_id,
             persona_name: identity.persona_name,
             authority_hotel: identity.authority_hotel,
+            soul_text: str_opt("soul_text"),
+            identity_text: str_opt("identity_text"),
+            user_context_text: str_opt("user_context_text"),
+            system_prompt: str_opt("system_prompt"),
             toolset_tags: str_vec("toolset_tags"),
             default_toolset: str_vec("default_toolset"),
             default_skillset: str_vec("default_skillset"),
@@ -4271,17 +4282,18 @@ impl IpcServer {
                         "guest must register before configuring roles",
                     );
                 };
+                let is_management = identity.role == "management";
                 // Check the agent's active persona role, not the IPC process type.
                 // The IPC process type is always "agent" for philote — what matters
                 // is the session-level persona role ("orchestrator") passed explicitly.
-                if calling_role != "orchestrator" {
+                if !is_management && calling_role != "orchestrator" {
                     return IpcResponse::error(
                         "configure_role",
                         "CONFIGURE_FORBIDDEN",
-                        "only agents operating in the orchestrator persona may configure role incarnations",
+                        "only agents operating in the orchestrator persona or management guests may configure role incarnations",
                     );
                 }
-                if !identity.guest_id.starts_with(&agent_id) {
+                if !is_management && !identity.guest_id.starts_with(&agent_id) {
                     return IpcResponse::error(
                         "configure_role",
                         "CONFIGURE_FORBIDDEN",
@@ -4290,16 +4302,20 @@ impl IpcServer {
                 }
                 // Determine whether the calling guest has admin authority by looking up their
                 // role incarnation record. Only admin roles may update operator-owned records.
-                let caller_agent_id = identity
-                    .guest_id
-                    .strip_suffix(&format!(":{}", identity.role))
-                    .unwrap_or(&identity.guest_id);
-                let caller_is_admin = graph
-                    .get_role_incarnation(caller_agent_id, &identity.role)
-                    .ok()
-                    .flatten()
-                    .map(|r| r.is_admin)
-                    .unwrap_or(false);
+                let caller_is_admin = if is_management {
+                    true
+                } else {
+                    let caller_agent_id = identity
+                        .guest_id
+                        .strip_suffix(&format!(":{}", identity.role))
+                        .unwrap_or(&identity.guest_id);
+                    graph
+                        .get_role_incarnation(caller_agent_id, &identity.role)
+                        .ok()
+                        .flatten()
+                        .map(|r| r.is_admin)
+                        .unwrap_or(false)
+                };
 
                 // The orchestrator role record is operator-owned. Only admin roles may update it.
                 if role_name == "orchestrator" && !caller_is_admin {
@@ -4433,6 +4449,10 @@ impl IpcServer {
             IpcRequest::PatchAgentBundle {
                 agent_id,
                 persona_name,
+                soul_text,
+                identity_text,
+                user_context_text,
+                system_prompt,
                 default_toolset,
                 default_skillset,
             } => {
@@ -4441,6 +4461,10 @@ impl IpcServer {
                     local_node_id,
                     &agent_id,
                     persona_name,
+                    soul_text,
+                    identity_text,
+                    user_context_text,
+                    system_prompt,
                     default_toolset,
                     default_skillset,
                 ) {
@@ -4818,6 +4842,9 @@ impl IpcServer {
             IpcRequest::RestartComponent { guest_id } => {
                 Self::handle_restart_component(graph, materialization_requester, local_node_id, &guest_id).await
             }
+            IpcRequest::RemoveComponent { guest_id } => {
+                Self::handle_remove_component(graph, local_node_id, &guest_id).await
+            }
             IpcRequest::SeedRemoteIncarnation {
                 node_id,
                 hotel_id,
@@ -5088,6 +5115,10 @@ impl IpcServer {
         local_node_id: &str,
         agent_id: &str,
         persona_name: Option<String>,
+        soul_text: Option<String>,
+        identity_text: Option<String>,
+        user_context_text: Option<String>,
+        system_prompt: Option<String>,
         default_toolset: Option<Vec<String>>,
         default_skillset: Option<Vec<String>>,
     ) -> anyhow::Result<DesktopMembraneAgentView> {
@@ -5104,6 +5135,18 @@ impl IpcServer {
 
         if let Some(name) = persona_name {
             identity.persona_name = name;
+        }
+        if let Some(value) = soul_text {
+            identity.bundle_json["soul_text"] = serde_json::json!(value);
+        }
+        if let Some(value) = identity_text {
+            identity.bundle_json["identity_text"] = serde_json::json!(value);
+        }
+        if let Some(value) = user_context_text {
+            identity.bundle_json["user_context_text"] = serde_json::json!(value);
+        }
+        if let Some(value) = system_prompt {
+            identity.bundle_json["system_prompt"] = serde_json::json!(value);
         }
         if let Some(toolset) = default_toolset {
             identity.bundle_json["default_toolset"] = serde_json::json!(toolset);
@@ -5174,15 +5217,38 @@ impl IpcServer {
 
         let components: Vec<serde_json::Value> = guests
             .into_iter()
-            .filter_map(|g| {
-                // Infer component type from role prefix — only model-controllers and tool-runners
-                // are surfaced here. Agents, membrane, and other guests belong in /api/guests.
+            .map(|g| {
+                let spawn_config = serde_json::from_str::<serde_json::Value>(&g.config_json)
+                    .unwrap_or(serde_json::Value::Null);
+                let command = spawn_config
+                    .get("command")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let args = spawn_config
+                    .get("args")
+                    .and_then(|value| value.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let env = spawn_config
+                    .get("env")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+
+                // Keep the compatibility component_type hint, but stop pretending
+                // only model/tool-ish components exist on the authoring surface.
                 let component_type = if g.role == "model" || g.role.starts_with("model.") || g.role.starts_with("model-controller") {
                     "model-controller"
                 } else if g.role == "tool" || g.role.starts_with("tool.") || g.role.starts_with("tool-runner") {
                     "tool-runner"
+                } else if g.role == "membrane" || g.role.starts_with("membrane.") {
+                    "membrane"
+                } else if g.role == "agent" || g.role.starts_with("agent.") {
+                    "agent"
+                } else if g.role == "graph-runner" || g.role.starts_with("graph.") {
+                    "graph-runner"
                 } else {
-                    return None;
+                    "other"
                 };
 
                 // Read per-component config blob.
@@ -5214,16 +5280,21 @@ impl IpcServer {
                     })
                     .unwrap_or_default();
 
-                Some(serde_json::json!({
+                serde_json::json!({
                     "guest_id": g.guest_id,
                     "role": g.role,
+                    "hotel": g.hotel_name,
+                    "command": command,
+                    "args": args,
+                    "env": env,
                     "component_type": component_type,
                     "is_active": g.is_active,
+                    "auto_start": g.is_active,
                     "active_pid": g.active_pid,
                     "last_active_at": g.last_active_at,
                     "component_config": component_config,
                     "capabilities": capabilities,
-                }))
+                })
             })
             .collect();
 
@@ -5356,6 +5427,53 @@ impl IpcServer {
 
         info!(guest_id = %guest_id, "component restarted");
         IpcResponse::success("restart_component", Some(serde_json::json!({ "guest_id": guest_id })))
+    }
+
+    async fn handle_remove_component(
+        graph: &GraphDomain,
+        local_node_id: &str,
+        guest_id: &str,
+    ) -> IpcResponse {
+        let hotel_name = match Self::local_hotel_name(graph, local_node_id) {
+            Some(h) => h,
+            None => {
+                return IpcResponse::error("remove_component", "HOTEL_NOT_FOUND", "local hotel record not found");
+            }
+        };
+
+        let guest = match graph.get_guest(&hotel_name, guest_id) {
+            Ok(Some(guest)) => guest,
+            Ok(None) => {
+                return IpcResponse::error(
+                    "remove_component",
+                    "GUEST_NOT_FOUND",
+                    format!("No component registered with guest_id={guest_id}"),
+                );
+            }
+            Err(e) => {
+                return IpcResponse::error("remove_component", "STORAGE_ERROR", e.to_string());
+            }
+        };
+
+        if let Some(ref pid_str) = guest.active_pid {
+            if let Ok(pid) = pid_str.parse::<u32>() {
+                let _ = ProcessCommand::new("kill")
+                    .args(["-15", &pid.to_string()])
+                    .status();
+            }
+        }
+
+        if let Err(e) = graph.remove_guest(&hotel_name, guest_id) {
+            return IpcResponse::error("remove_component", "STORAGE_ERROR", e.to_string());
+        }
+
+        let config_key = format!("component:{guest_id}");
+        if let Err(e) = graph.remove_config_value(&config_key) {
+            warn!("RemoveComponent: failed to remove component config for {guest_id}: {e}");
+        }
+
+        info!(guest_id = %guest_id, "component removed");
+        IpcResponse::success("remove_component", Some(serde_json::json!({ "guest_id": guest_id })))
     }
 
     fn record_apartment_checkpoint(
@@ -7018,12 +7136,11 @@ mod tests {
     use ansible_mesh_core::registry::{CapabilityAdvertisement, NodeRegistry};
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
     use ansible_mesh_core::storage::{
-        AgentIdentityRecord, GuestRecord, GraphStorage, HotelRecord, SecretRecord,
-        SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,
+        AgentIdentityRecord, GuestRecord, HotelRecord, SessionRecord, SessionTurnRecord,
     };
     use base64::Engine;
     use philotic_client::{
-        GuestIdentity, HandoffBundle, HookKind, OperatorTargetView, PhiloticClient,
+        GuestIdentity, HandoffBundle, OperatorTargetView, PhiloticClient,
         SubagentCompletionContract, SubagentContextPacket, SubagentDelegation,
     };
     use std::path::Path;
@@ -7154,6 +7271,139 @@ mod tests {
         }
     }
 
+    #[test]
+    fn list_components_returns_manifest_relevant_fields_for_registered_components() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: "/tmp/test.sock".into(),
+                active_pid: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .upsert_guest(&GuestRecord {
+                hotel_name: "local-hotel".into(),
+                guest_id: "membrane-discord-01".into(),
+                role: "membrane.discord".into(),
+                config_json: serde_json::json!({
+                    "command": "membrane-discord",
+                    "args": ["--agent-id", "agent-01"],
+                    "env": {
+                        "DISCORD_BOT_TOKEN": "token"
+                    }
+                })
+                .to_string(),
+                is_active: true,
+                active_pid: Some("4242".into()),
+                last_active_at: Some(123),
+            })
+            .expect("seed component guest");
+        graph
+            .set_config_value(
+                "component:membrane-discord-01",
+                &serde_json::json!({
+                    "guild_id": "1234"
+                })
+                .to_string(),
+            )
+            .expect("seed component config");
+
+        let response = IpcServer::handle_list_components(&graph, "local-aiua-01");
+        let components = match response {
+            IpcResponse::ComponentInventory { components } => components,
+            other => panic!("unexpected list_components response: {other:?}"),
+        };
+
+        assert_eq!(components.len(), 1);
+        assert_eq!(components[0]["guest_id"], "membrane-discord-01");
+        assert_eq!(components[0]["role"], "membrane.discord");
+        assert_eq!(components[0]["hotel"], "local-hotel");
+        assert_eq!(components[0]["command"], "membrane-discord");
+        assert_eq!(components[0]["args"][0], "--agent-id");
+        assert_eq!(components[0]["env"]["DISCORD_BOT_TOKEN"], "token");
+        assert_eq!(components[0]["component_type"], "membrane");
+        assert_eq!(components[0]["auto_start"], true);
+        assert_eq!(components[0]["component_config"]["guild_id"], "1234");
+    }
+
+    #[test]
+    fn remove_component_deletes_guest_and_component_config() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: "/tmp/test.sock".into(),
+                active_pid: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .upsert_guest(&GuestRecord {
+                hotel_name: "local-hotel".into(),
+                guest_id: "tool-echo-01".into(),
+                role: "tool.echo".into(),
+                config_json: serde_json::json!({
+                    "command": "tool-runner",
+                    "args": ["--help"],
+                    "env": {}
+                })
+                .to_string(),
+                is_active: false,
+                active_pid: None,
+                last_active_at: None,
+            })
+            .expect("seed component guest");
+        graph
+            .set_config_value(
+                "component:tool-echo-01",
+                &serde_json::json!({ "description": "temporary" }).to_string(),
+            )
+            .expect("seed component config");
+
+        let runtime = tokio::runtime::Runtime::new().expect("create tokio runtime");
+        let response = runtime.block_on(IpcServer::handle_remove_component(
+            &graph,
+            "local-aiua-01",
+            "tool-echo-01",
+        ));
+
+        match response {
+            IpcResponse::Standard { ok: true, .. } => {}
+            other => panic!("unexpected remove_component response: {other:?}"),
+        }
+
+        assert!(graph
+            .get_guest("local-hotel", "tool-echo-01")
+            .expect("load guest")
+            .is_none());
+        assert!(graph
+            .get_config_value("component:tool-echo-01")
+            .expect("load component config")
+            .is_none());
+    }
+
     fn expect_operator_chat_reply(response: IpcResponse) -> OperatorChatTurnReply {
         match response {
             IpcResponse::OperatorChatTurnReply {
@@ -7219,269 +7469,6 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct TestGraphStorage;
-
-    impl GraphStorage for TestGraphStorage {
-        fn load_node_capabilities(&self) -> anyhow::Result<Option<NodeCapabilities>> {
-            Ok(None)
-        }
-        fn save_node_capabilities(&self, _caps: &NodeCapabilities) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn get_config_value(&self, _key: &str) -> anyhow::Result<Option<String>> {
-            Ok(None)
-        }
-        fn set_config_value(&self, _key: &str, _value_json: &str) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn upsert_secret(&self, _secret: &SecretRecord) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn get_secret(&self, _secret_ref: &str) -> anyhow::Result<Option<SecretRecord>> {
-            Ok(None)
-        }
-        fn get_hotel(&self, _hotel_name: &str) -> anyhow::Result<Option<HotelRecord>> {
-            Ok(None)
-        }
-        fn list_hotels(&self) -> anyhow::Result<Vec<HotelRecord>> {
-            Ok(vec![])
-        }
-        fn upsert_hotel(&self, _hotel: &HotelRecord) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn set_hotel_pid(&self, _hotel_name: &str, _pid: Option<&str>) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn list_guests(
-            &self,
-            _hotel_name: &str,
-            _active_only: bool,
-        ) -> anyhow::Result<Vec<GuestRecord>> {
-            Ok(vec![])
-        }
-        fn set_guest_pid(
-            &self,
-            _hotel_name: &str,
-            _guest_id: &str,
-            _pid: Option<&str>,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn set_guest_active(
-            &self,
-            _hotel_name: &str,
-            _guest_id: &str,
-            _active: bool,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn seed_guests(&self, _hotel_name: &str, _guests: &[GuestRecord]) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn upsert_agent_identity(&self, _identity: &AgentIdentityRecord) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn list_agent_identities(&self) -> anyhow::Result<Vec<AgentIdentityRecord>> {
-            Ok(vec![])
-        }
-        fn get_agent_identity(
-            &self,
-            _agent_id: &str,
-        ) -> anyhow::Result<Option<AgentIdentityRecord>> {
-            Ok(None)
-        }
-        fn sync_apartment(
-            &self,
-            _agent_id: &str,
-            _memory_type: &str,
-            _content_json: &serde_json::Value,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn get_apartment(
-            &self,
-            _agent_id: &str,
-            _memory_type: &str,
-        ) -> anyhow::Result<Option<serde_json::Value>> {
-            Ok(None)
-        }
-        fn upsert_session(&self, _session: &SessionRecord) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn get_session(&self, _session_id: &str) -> anyhow::Result<Option<SessionRecord>> {
-            Ok(None)
-        }
-        fn upsert_role_incarnation(&self, _role: &RoleIncarnationRecord) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn get_role_incarnation(
-            &self,
-            _agent_id: &str,
-            _role_name: &str,
-        ) -> anyhow::Result<Option<RoleIncarnationRecord>> {
-            Ok(None)
-        }
-        fn list_role_incarnations(
-            &self,
-            _agent_id: &str,
-        ) -> anyhow::Result<Vec<RoleIncarnationRecord>> {
-            Ok(vec![])
-        }
-        fn upsert_session_participant(
-            &self,
-            _participant: &SessionParticipantRecord,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn list_session_participants(
-            &self,
-            _session_id: &str,
-        ) -> anyhow::Result<Vec<SessionParticipantRecord>> {
-            Ok(vec![])
-        }
-        fn upsert_session_turn(&self, _turn: &SessionTurnRecord) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn get_session_turn(
-            &self,
-            _session_id: &str,
-            _turn_id: &str,
-        ) -> anyhow::Result<Option<SessionTurnRecord>> {
-            Ok(None)
-        }
-        fn list_session_turns(
-            &self,
-            _session_id: &str,
-            _limit: usize,
-        ) -> anyhow::Result<Vec<SessionTurnRecord>> {
-            Ok(vec![])
-        }
-        fn append_session_event(&self, _event: &SessionEventRecord) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn list_session_events(
-            &self,
-            _session_id: &str,
-            _limit: usize,
-        ) -> anyhow::Result<Vec<SessionEventRecord>> {
-            Ok(vec![])
-        }
-
-        fn upsert_abstract_tool(
-            &self,
-            _tool: &ansible_mesh_core::graph::AbstractToolRecord,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn get_abstract_tool(
-            &self,
-            _tool_name: &str,
-        ) -> anyhow::Result<Option<ansible_mesh_core::graph::AbstractToolRecord>> {
-            Ok(None)
-        }
-
-        fn list_abstract_tools(
-            &self,
-        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::AbstractToolRecord>> {
-            Ok(vec![])
-        }
-
-        fn upsert_abstract_skill(
-            &self,
-            _skill: &ansible_mesh_core::graph::AbstractSkillRecord,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn get_abstract_skill(
-            &self,
-            _skill_name: &str,
-        ) -> anyhow::Result<Option<ansible_mesh_core::graph::AbstractSkillRecord>> {
-            Ok(None)
-        }
-
-        fn list_abstract_skills(
-            &self,
-        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::AbstractSkillRecord>> {
-            Ok(vec![])
-        }
-
-        fn list_role_incarnations_by_guest_id(
-            &self,
-            _guest_id: &str,
-        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::RoleIncarnationRecord>> {
-            Ok(vec![])
-        }
-
-        fn set_guest_last_active(
-            &self,
-            _hotel_name: &str,
-            _guest_id: &str,
-            _epoch: u64,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn upsert_toolset_profile(
-            &self,
-            _profile: &ansible_mesh_core::graph::ToolsetProfileRecord,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn get_toolset_profile(
-            &self,
-            _profile_name: &str,
-        ) -> anyhow::Result<Option<ansible_mesh_core::graph::ToolsetProfileRecord>> {
-            Ok(None)
-        }
-
-        fn list_toolset_profiles(
-            &self,
-        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::ToolsetProfileRecord>> {
-            Ok(vec![])
-        }
-
-        fn upsert_rule(&self, _rule: &ansible_mesh_core::graph::RuleRecord) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn get_rule(
-            &self,
-            _rule_id: &str,
-        ) -> anyhow::Result<Option<ansible_mesh_core::graph::RuleRecord>> {
-            Ok(None)
-        }
-
-        fn list_rules(
-            &self,
-            _agent_id: &str,
-        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::RuleRecord>> {
-            Ok(vec![])
-        }
-
-        fn upsert_workflow_skill(
-            &self,
-            _skill: &ansible_mesh_core::graph::WorkflowSkillRecord,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn get_workflow_skill(
-            &self,
-            _workflow_name: &str,
-        ) -> anyhow::Result<Option<ansible_mesh_core::graph::WorkflowSkillRecord>> {
-            Ok(None)
-        }
-
-        fn list_workflow_skills(
-            &self,
-        ) -> anyhow::Result<Vec<ansible_mesh_core::graph::WorkflowSkillRecord>> {
-            Ok(vec![])
-        }
-    }
     fn test_socket_path() -> String {
         format!("/tmp/ipc-e2e-{}.sock", Uuid::new_v4().simple())
     }

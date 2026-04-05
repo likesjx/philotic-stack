@@ -101,10 +101,7 @@ fn apply_frontmatter_updates(
     // Apply updates to the YAML mapping
     if let serde_yaml::Value::Mapping(ref mut map) = yaml {
         for (key, value) in updates {
-            map.insert(
-                serde_yaml::Value::String(key.clone()),
-                value.clone(),
-            );
+            map.insert(serde_yaml::Value::String(key.clone()), value.clone());
         }
     } else {
         bail!("Frontmatter is not a YAML mapping");
@@ -150,7 +147,8 @@ mod tests {
 
     #[test]
     fn test_preserves_content_below_frontmatter() {
-        let body = "\n\n# Big Section\n\nLots of content here.\n\n## Sub-section\n\nMore content.\n";
+        let body =
+            "\n\n# Big Section\n\nLots of content here.\n\n## Sub-section\n\nMore content.\n";
         let content = format!("---\nkey: value\n---{}", body);
 
         let mut updates = HashMap::new();
@@ -161,7 +159,11 @@ mod tests {
 
         let result = apply_frontmatter_updates(&content, &updates).unwrap();
 
-        assert!(result.ends_with(body), "Body was not preserved. Got: {}", result);
+        assert!(
+            result.ends_with(body),
+            "Body was not preserved. Got: {}",
+            result
+        );
     }
 
     #[test]

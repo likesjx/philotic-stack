@@ -1076,6 +1076,10 @@ Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membra
 - [x] Add graph runner instance inventory (Slice 4): `GET /api/graphs`, `GET /api/graphs/:graph_id` — via new `ListGraphInstances` IPC variant.
 - [x] Add secret refs read-only inventory (Slice 4): `GET /api/secrets` — vault registry entries + known config-key ref presence flags; no values exposed.
 - [x] Add skill assignment mutations (Slice 4): `POST /api/agents/:agent_id/roles/:role_name/skills`, `DELETE /api/agents/:agent_id/roles/:role_name/skills/:skill_name` — management-role bypass added to `AssignSkill`/`RevokeSkill` authority checks.
+- [x] Add desktop component authoring parity (Slice 5): `POST /api/components`, `PATCH /api/components/:guest_id`, backed by the canonical `ComponentManifest` contract and hotel-owned manifest-complete inventory/detail reads instead of partial desktop-only shape guessing.
+- [x] Add schema-driven component templates (Slice 6): `GET /api/component-templates`, backend-owned template metadata for known component families, structured desktop rendering for representative fields, and explicit vault-only guidance for secrets/config refs.
+- [x] Expand desktop agent editing (Slice 7): agent settings now surface editable base persona/identity fields (`identity_text`, `soul_text`, `user_context_text`, `system_prompt`), roles show richer role posture details, and the same agent editor exposes durable rules in a first-class tab instead of making the persona spine disappear behind nickname-only edits.
+- [x] Move graph-owned base agent persona editing into a dedicated desktop window launched from the agent graph/persona object, with labeled fields plus explicit Cancel/Save, instead of burying those edits inline inside the list panel.
 
 ## Next Project: Tool Assembly and Routed Execution
 
@@ -1149,6 +1153,12 @@ Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membra
   - conversational agents
   - workers
   - subagents
+- [ ] Define the four-layer memory split and datasource boundary:
+  - working memory (turn window / role-local)
+  - heuristic memory (relevance-ranked recall)
+  - rote memory (durable references / pointers / dates / standing facts)
+  - work product (datasource truth, shareable polished records)
+- [ ] Define how agent-shared and role-scoped durable references should coexist with heuristics and work-product datasource records.
 - [ ] Keep the first implementation slice personality-first; do not try to solve the full memory backend story in the same change.
 - [ ] Build the first ZeroClaw/OpenClaw bridge slice:
   - [ ] import one agent from `openclaw.json`
@@ -1350,3 +1360,9 @@ Seam IDs: `active-proposal-frontmatter-rollout`, `architecture-doc-metadata-roll
 - [x] Decide that seam docs remain exception-based artifacts and only graduate from proposal + registry + task surfaces when cross-cutting complexity or repeated confusion justifies their own boundary doc.
 - [x] Tighten [docs/architecture/ARCHITECTURE.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE.md) against current execution-transport and current session-authority reality.
 - [x] Audit historical docs and clearly mark any remaining non-authoritative architecture narratives as legacy or historical.
+- [ ] Define reintegration tracking for worktrees and branches in intel-graph/SVER so operators can see:
+  - whether a slice is only on a side branch
+  - whether it is merged to `develop`
+  - whether local `develop` is behind `origin/develop`
+  - whether watched-live verification is about to run from stale local truth
+  - proposal: [docs/architecture/WORKTREE_REINTEGRATION_TRACKING_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/WORKTREE_REINTEGRATION_TRACKING_PROPOSAL.md)

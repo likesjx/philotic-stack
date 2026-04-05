@@ -14,6 +14,9 @@ use std::process::Command;
 fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let ui_dist_dir = manifest_dir.join("ui-dist");
+    let refresh_desktop_ui = std::env::var("PHILOTIC_REFRESH_DESKTOP_UI")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false);
 
     // Locate the desktop repo
     let desktop_dir = resolve_desktop_dir(&manifest_dir);
@@ -30,8 +33,14 @@ fn main() {
             dir.join("vite.config.js").display()
         );
 
-        build_desktop(dir);
-        copy_dist(&dir.join("dist"), &ui_dist_dir);
+        if refresh_desktop_ui || !ui_dist_dir.join("index.html").exists() {
+            build_desktop(dir);
+            copy_dist(&dir.join("dist"), &ui_dist_dir);
+        } else {
+            println!(
+                "cargo:warning=Reusing cached ui-dist/; set PHILOTIC_REFRESH_DESKTOP_UI=1 to rebuild desktop UI"
+            );
+        }
     } else if !ui_dist_dir.join("index.html").exists() {
         // No desktop repo and no cached ui-dist — write a placeholder so
         // rust-embed doesn't fail the compile.
@@ -55,6 +64,7 @@ fn main() {
     // else: ui-dist already populated from a previous build — reuse it.
 
     println!("cargo:rerun-if-env-changed=PHILOTIC_DESKTOP_DIR");
+    println!("cargo:rerun-if-env-changed=PHILOTIC_REFRESH_DESKTOP_UI");
     println!("cargo:rerun-if-changed=ui-dist/index.html");
 }
 

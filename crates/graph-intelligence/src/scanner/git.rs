@@ -28,11 +28,7 @@ pub fn scan_git(repo_root: &Path, engine: &GraphEngine) -> Result<()> {
     Ok(())
 }
 
-fn scan_commits(
-    repo_root: &Path,
-    engine: &GraphEngine,
-    now: &chrono::DateTime<Utc>,
-) -> Result<()> {
+fn scan_commits(repo_root: &Path, engine: &GraphEngine, now: &chrono::DateTime<Utc>) -> Result<()> {
     let output = Command::new("git")
         .args(["log", "--oneline", "-100", "--format=%H %s"])
         .current_dir(repo_root)
@@ -99,13 +95,15 @@ fn scan_commits(
                 // Create a reference to the file path (best effort module mapping)
                 let module_id = rs_file_to_module_id(line);
                 if !module_id.is_empty() {
-                    engine.upsert_edge(&Edge {
-                        source_id: commit_id,
-                        target_id: module_id,
-                        relation: EdgeRelation::References,
-                        properties: serde_json::json!({}),
-                        worktree: String::new(),
-                    }).ok();
+                    engine
+                        .upsert_edge(&Edge {
+                            source_id: commit_id,
+                            target_id: module_id,
+                            relation: EdgeRelation::References,
+                            properties: serde_json::json!({}),
+                            worktree: String::new(),
+                        })
+                        .ok();
                 }
             }
         }
@@ -136,9 +134,7 @@ fn scan_branches(
             continue;
         }
 
-        let branch_name = branch
-            .strip_prefix("origin/")
-            .unwrap_or(branch);
+        let branch_name = branch.strip_prefix("origin/").unwrap_or(branch);
         let node_id = format!("branch:{}", branch_name);
 
         // Get ahead/behind count relative to develop
@@ -205,7 +201,9 @@ fn scan_worktrees(
     }
 
     // Pre-load all proposal nodes so we can do slug matching without repeated queries.
-    let proposals = engine.query_nodes(Some(NodeKind::Proposal), None).unwrap_or_default();
+    let proposals = engine
+        .query_nodes(Some(NodeKind::Proposal), None)
+        .unwrap_or_default();
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut current_path = String::new();
@@ -221,7 +219,14 @@ fn scan_worktrees(
             if !current_branch.is_empty() {
                 active_branches.insert(current_branch.clone());
             }
-            upsert_worktree(engine, now, &proposals, &current_path, &current_branch, repo_root)?;
+            upsert_worktree(
+                engine,
+                now,
+                &proposals,
+                &current_path,
+                &current_branch,
+                repo_root,
+            )?;
             current_path.clear();
             current_branch.clear();
         }
@@ -232,7 +237,14 @@ fn scan_worktrees(
         if !current_branch.is_empty() {
             active_branches.insert(current_branch.clone());
         }
-        upsert_worktree(engine, now, &proposals, &current_path, &current_branch, repo_root)?;
+        upsert_worktree(
+            engine,
+            now,
+            &proposals,
+            &current_path,
+            &current_branch,
+            repo_root,
+        )?;
     }
 
     // Write pruned stubs for codex/* branches that exist but have no active checkout.
@@ -304,7 +316,12 @@ fn list_local_branches(repo_root: &Path) -> Vec<String> {
     out.ok()
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        .map(|s| {
+            s.lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -385,7 +402,11 @@ fn upsert_worktree(
 /// Count commits on `branch` that are ahead of develop.
 fn commit_count_ahead(repo_root: &Path, branch: &str) -> u32 {
     let out = Command::new("git")
-        .args(["rev-list", "--count", &format!("origin/develop..{}", branch)])
+        .args([
+            "rev-list",
+            "--count",
+            &format!("origin/develop..{}", branch),
+        ])
         .current_dir(repo_root)
         .output();
     out.ok()

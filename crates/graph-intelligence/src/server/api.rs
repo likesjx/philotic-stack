@@ -882,6 +882,11 @@ async fn get_dashboard(
             "elapsed_ms": s.elapsed_ms,
             "harness_id": s.harness_id,
             "workflow_name": s.workflow_name,
+            "branch": s.branch,
+            "worktree_path": s.worktree_path,
+            "files_touched": s.files_touched,
+            "lines_changed": s.lines_changed,
+            "test_runs": s.test_runs,
         })).collect::<Vec<_>>(),
         "recent_closed": report.recent_closed.iter().map(|s| serde_json::json!({
             "id": s.id, "agent": s.agent, "seam_id": s.seam_id,
@@ -894,6 +899,11 @@ async fn get_dashboard(
             "elapsed_ms": s.elapsed_ms,
             "harness_id": s.harness_id,
             "workflow_name": s.workflow_name,
+            "branch": s.branch,
+            "worktree_path": s.worktree_path,
+            "files_touched": s.files_touched,
+            "lines_changed": s.lines_changed,
+            "test_runs": s.test_runs,
         })).collect::<Vec<_>>(),
         "agents": report.agents.iter().map(|a| serde_json::json!({
             "agent": a.agent, "total_sessions": a.total_sessions,

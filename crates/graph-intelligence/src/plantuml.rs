@@ -4,10 +4,7 @@ use crate::engine::GraphEngine;
 use crate::schema::*;
 
 /// Generate a PlantUML class diagram for all types in a given crate.
-pub fn generate_crate_diagram(
-    engine: &GraphEngine,
-    crate_name: &str,
-) -> Result<String> {
+pub fn generate_crate_diagram(engine: &GraphEngine, crate_name: &str) -> Result<String> {
     let crate_id = format!("crate:{}", crate_name);
     let mut uml = String::new();
     uml.push_str("@startuml\n");
@@ -76,11 +73,8 @@ pub fn generate_crate_diagram(
                                     .get("self_type")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("Unknown");
-                                let trait_name = ie
-                                    .target_id
-                                    .split("::")
-                                    .last()
-                                    .unwrap_or("Unknown");
+                                let trait_name =
+                                    ie.target_id.split("::").last().unwrap_or("Unknown");
                                 uml.push_str(&format!(
                                     "{} ..|> {} : implements\n",
                                     sanitize_name(self_ty),
@@ -100,10 +94,7 @@ pub fn generate_crate_diagram(
 }
 
 /// Generate a PlantUML diagram for a single module.
-pub fn generate_module_diagram(
-    engine: &GraphEngine,
-    module_id: &str,
-) -> Result<String> {
+pub fn generate_module_diagram(engine: &GraphEngine, module_id: &str) -> Result<String> {
     let module_node = engine.get_node(module_id)?;
     let module_name = module_node
         .as_ref()
@@ -166,11 +157,7 @@ pub fn generate_module_diagram(
                             .get("self_type")
                             .and_then(|v| v.as_str())
                             .unwrap_or("Unknown");
-                        let trait_name = ie
-                            .target_id
-                            .split("::")
-                            .last()
-                            .unwrap_or("Unknown");
+                        let trait_name = ie.target_id.split("::").last().unwrap_or("Unknown");
                         uml.push_str(&format!(
                             "{} ..|> {} : implements\n",
                             sanitize_name(self_ty),
@@ -214,11 +201,14 @@ fn format_struct_uml(name: &str, signature: &str) -> String {
     } else {
         format!("{}{}", sanitize_name(name), generics)
     };
-    
+
     let mut fields = Vec::new();
     for line in signature.lines() {
         let trimmed = line.trim().trim_end_matches(',');
-        if trimmed.contains(':') && !trimmed.starts_with("pub struct") && !trimmed.starts_with("struct") {
+        if trimmed.contains(':')
+            && !trimmed.starts_with("pub struct")
+            && !trimmed.starts_with("struct")
+        {
             // Simplify field type paths for readability
             let simplified = simplify_type_path(trimmed);
             fields.push(format!("  +{}", simplified));
@@ -239,7 +229,7 @@ fn format_trait_uml(name: &str, signature: &str) -> String {
     } else {
         format!("{}{}", sanitize_name(name), generics)
     };
-    
+
     let mut methods = Vec::new();
     for line in signature.lines() {
         let trimmed = line.trim().trim_end_matches(';');
@@ -263,11 +253,7 @@ fn format_trait_uml(name: &str, signature: &str) -> String {
     } else {
         format!("\n{}\n", methods.join("\n"))
     };
-    format!(
-        "interface {} <<trait>> {{{}}}\n\n",
-        display_name,
-        body
-    )
+    format!("interface {} <<trait>> {{{}}}\n\n", display_name, body)
 }
 
 fn format_enum_uml(name: &str, signature: &str) -> String {
@@ -277,7 +263,7 @@ fn format_enum_uml(name: &str, signature: &str) -> String {
     } else {
         format!("{}{}", sanitize_name(name), generics)
     };
-    
+
     let mut variants = Vec::new();
     for line in signature.lines() {
         let trimmed = line.trim().trim_end_matches(',');

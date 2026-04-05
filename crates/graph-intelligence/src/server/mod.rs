@@ -74,8 +74,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     });
 
     // Build the HTTP + WebSocket router
-    let http_router = api::router(state.clone())
-        .merge(ws::router(state.clone()));
+    let http_router = api::router(state.clone()).merge(ws::router(state.clone()));
 
     let http_addr = format!("0.0.0.0:{}", config.http_port);
     let mcp_addr = format!("0.0.0.0:{}", config.mcp_port);

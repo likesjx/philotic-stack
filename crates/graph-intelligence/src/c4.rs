@@ -4,10 +4,7 @@ use crate::engine::GraphEngine;
 use crate::schema::*;
 
 /// Generate C4 Context diagram (C1) - System level
-pub fn generate_c4_context(
-    engine: &GraphEngine,
-    system_name: &str,
-) -> Result<String> {
+pub fn generate_c4_context(engine: &GraphEngine, system_name: &str) -> Result<String> {
     let mut uml = String::new();
     uml.push_str("@startuml\n");
     uml.push_str("!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Context.puml\n\n");
@@ -56,8 +53,7 @@ pub fn generate_c4_context(
                     let agent_id = sanitize_c4_id(&node.name);
                     uml.push_str(&format!(
                         "Person({}, \"{}\", \"AI Agent\")\n",
-                        agent_id,
-                        node.name
+                        agent_id, node.name
                     ));
                     uml.push_str(&format!(
                         "Rel({}, {}, \"uses\")\n",
@@ -74,10 +70,7 @@ pub fn generate_c4_context(
 }
 
 /// Generate C4 Container diagram (C2) - Crate/process level
-pub fn generate_c4_container(
-    engine: &GraphEngine,
-    system_name: &str,
-) -> Result<String> {
+pub fn generate_c4_container(engine: &GraphEngine, system_name: &str) -> Result<String> {
     let mut uml = String::new();
     uml.push_str("@startuml\n");
     uml.push_str("!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml\n\n");
@@ -91,8 +84,7 @@ pub fn generate_c4_container(
     let system_id = sanitize_c4_id(system_name);
     uml.push_str(&format!(
         "System_Boundary({}, \"{}\") {{\n",
-        system_id,
-        system_name
+        system_id, system_name
     ));
 
     // Add containers (crates)
@@ -103,10 +95,7 @@ pub fn generate_c4_container(
 
         uml.push_str(&format!(
             "    Container({}, \"{}\", \"{}\", \"{}\")\n",
-            container_id,
-            crate_node.name,
-            tech,
-            desc
+            container_id, crate_node.name, tech, desc
         ));
     }
 
@@ -120,11 +109,7 @@ pub fn generate_c4_container(
                 let source_id = sanitize_c4_id(&crate_node.name);
                 let target_name = edge.target_id.replace("crate:", "");
                 let target_id = sanitize_c4_id(&target_name);
-                uml.push_str(&format!(
-                    "Rel({}, {}, \"uses\")\n",
-                    source_id,
-                    target_id
-                ));
+                uml.push_str(&format!("Rel({}, {}, \"uses\")\n", source_id, target_id));
             }
         }
     }
@@ -134,10 +119,7 @@ pub fn generate_c4_container(
 }
 
 /// Generate C4 Component diagram (C3) - Module level for a crate
-pub fn generate_c4_component(
-    engine: &GraphEngine,
-    crate_name: &str,
-) -> Result<String> {
+pub fn generate_c4_component(engine: &GraphEngine, crate_name: &str) -> Result<String> {
     let mut uml = String::new();
     uml.push_str("@startuml\n");
     uml.push_str("!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml\n\n");
@@ -150,8 +132,7 @@ pub fn generate_c4_component(
     let container_id = sanitize_c4_id(crate_name);
     uml.push_str(&format!(
         "Container_Boundary({}, \"{}\") {{\n",
-        container_id,
-        crate_name
+        container_id, crate_name
     ));
 
     // Get modules in this crate
@@ -166,10 +147,7 @@ pub fn generate_c4_component(
 
                     uml.push_str(&format!(
                         "    Component({}, \"{}\", \"{}\", \"{}\")\n",
-                        comp_id,
-                        module.name,
-                        tech,
-                        desc
+                        comp_id, module.name, tech, desc
                     ));
                 }
             }
@@ -192,8 +170,7 @@ pub fn generate_c4_component(
                                 let target_id = sanitize_c4_id(target_name);
                                 uml.push_str(&format!(
                                     "Rel({}, {}, \"imports\")\n",
-                                    source_id,
-                                    target_id
+                                    source_id, target_id
                                 ));
                             }
                         }
@@ -208,14 +185,14 @@ pub fn generate_c4_component(
 }
 
 /// Generate proposal architecture diagram (C4-like process view)
-pub fn generate_proposal_architecture(
-    engine: &GraphEngine,
-    proposal_id: &str,
-) -> Result<String> {
+pub fn generate_proposal_architecture(engine: &GraphEngine, proposal_id: &str) -> Result<String> {
     let mut uml = String::new();
     uml.push_str("@startuml\n");
     uml.push_str("!theme plain\n\n");
-    uml.push_str(&format!("title Proposal Architecture - {}\n\n", proposal_id));
+    uml.push_str(&format!(
+        "title Proposal Architecture - {}\n\n",
+        proposal_id
+    ));
 
     // Get proposal
     let prop_id = if proposal_id.starts_with("proposal:") {
@@ -233,7 +210,8 @@ pub fn generate_proposal_architecture(
         ));
 
         // Extract status and seams from properties
-        let status = prop.properties
+        let status = prop
+            .properties
             .get("status")
             .and_then(|v| v.as_str())
             .unwrap_or("proposed");
@@ -264,8 +242,7 @@ pub fn generate_proposal_architecture(
                     let seam_id = sanitize_c4_id(&seam.name);
                     uml.push_str(&format!(
                         "rectangle \"{}\" as {} #LightYellow\n",
-                        seam.name,
-                        seam_id
+                        seam.name, seam_id
                     ));
                     uml.push_str(&format!(
                         "{} --> {} : implements\n",
@@ -294,8 +271,7 @@ pub fn generate_proposal_architecture(
                                 ));
                                 uml.push_str(&format!(
                                     "{} --> {} : implements\n",
-                                    seam_id,
-                                    code_id
+                                    seam_id, code_id
                                 ));
                             }
                         }
@@ -310,10 +286,7 @@ pub fn generate_proposal_architecture(
 }
 
 /// Generate seam implementation diagram showing slices
-pub fn generate_seam_detail(
-    engine: &GraphEngine,
-    seam_id: &str,
-) -> Result<String> {
+pub fn generate_seam_detail(engine: &GraphEngine, seam_id: &str) -> Result<String> {
     let mut uml = String::new();
     uml.push_str("@startuml\n");
     uml.push_str("!theme plain\n\n");
@@ -325,21 +298,18 @@ pub fn generate_seam_detail(
     };
 
     if let Some(seam) = engine.get_node(&seam_id_full)? {
-        uml.push_str(&format!(
-            "title Seam Detail - {}\n\n",
-            seam.name
-        ));
+        uml.push_str(&format!("title Seam Detail - {}\n\n", seam.name));
 
         // Seam at top
         let seam_sid = sanitize_c4_id(&seam.name);
         uml.push_str(&format!(
             "rectangle \"{}\" as {} #Orange {{\n",
-            seam.name,
-            seam_sid
+            seam.name, seam_sid
         ));
 
         // Get description from properties
-        let desc = seam.properties
+        let desc = seam
+            .properties
             .get("description")
             .and_then(|v| v.as_str())
             .unwrap_or("");
@@ -356,14 +326,9 @@ pub fn generate_seam_detail(
                     let prop_sid = sanitize_c4_id(&prop.name);
                     uml.push_str(&format!(
                         "rectangle \"{} [proposal]\" as {} #LightBlue\n",
-                        prop.name,
-                        prop_sid
+                        prop.name, prop_sid
                     ));
-                    uml.push_str(&format!(
-                        "{} --> {} : governs\n",
-                        prop_sid,
-                        seam_sid
-                    ));
+                    uml.push_str(&format!("{} --> {} : governs\n", prop_sid, seam_sid));
                 }
             }
         }
@@ -388,16 +353,9 @@ pub fn generate_seam_detail(
                     };
                     uml.push_str(&format!(
                         "rectangle \"{}\" as {} {}\n",
-                        code.name,
-                        code_sid,
-                        color
+                        code.name, code_sid, color
                     ));
-                    uml.push_str(&format!(
-                        "{} --> {} : {}\n",
-                        seam_sid,
-                        code_sid,
-                        label
-                    ));
+                    uml.push_str(&format!("{} --> {} : {}\n", seam_sid, code_sid, label));
                 }
             }
         }
@@ -425,7 +383,8 @@ fn sanitize_c4_id(name: &str) -> String {
 }
 
 fn get_description(props: &serde_json::Value, kind: &NodeKind) -> String {
-    props.get("description")
+    props
+        .get("description")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("{:?}", kind))

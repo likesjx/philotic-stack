@@ -1,6 +1,32 @@
 use crate::muninn_bridge::MuninnBridgeConfig;
 use graph_intelligence::scanner::ScanConfig;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+pub fn resolve_graph_db_path() -> String {
+    std::env::var("PHILOTIC_GRAPH_DB")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("PHILOTIC_GRAPH_DB_PATH")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_else(|| {
+            default_graph_db_path()
+                .to_string_lossy()
+                .to_string()
+        })
+}
+
+fn default_graph_db_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".local")
+        .join("share")
+        .join("philotic")
+        .join("graph.db")
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PhiloticGraphConfig {
@@ -29,7 +55,7 @@ pub struct PhiloticGraphConfig {
 impl Default for PhiloticGraphConfig {
     fn default() -> Self {
         Self {
-            db_path: "philotic-graph.db".into(),
+            db_path: resolve_graph_db_path(),
             http_port: 8900,
             mcp_port: 8901,
             rust_roots: vec!["crates/".into()],

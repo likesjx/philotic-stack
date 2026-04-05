@@ -4,6 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Graph Intelligence — Philotic Stack</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="shortcut icon" href="/favicon.svg">
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
 
@@ -237,10 +239,12 @@ tbody tr:hover { background: rgba(0,229,255,0.03); }
 .kanban-cards { padding: 8px; }
 
 .kanban-card {
+  position: relative;
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 10px 12px;
+  padding-bottom: 34px;
   margin-bottom: 8px;
   cursor: pointer;
   transition: border-color 0.15s;
@@ -255,9 +259,67 @@ tbody tr:hover { background: rgba(0,229,255,0.03); }
   word-break: break-word;
 }
 
-.kanban-card .card-domain {
-  font-size: 11px;
+.kanban-card .card-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.kanban-card .card-domain-pill,
+.kanban-card .card-tag-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.kanban-card .card-domain-pill {
+  border: 1px solid rgba(0,229,255,0.18);
+  background: rgba(0,229,255,0.08);
+  color: var(--accent);
+}
+
+.kanban-card .card-tag-pill {
+  border: 1px solid rgba(255,255,255,0.12);
+  background: rgba(255,255,255,0.06);
   color: var(--text-secondary);
+}
+
+.kanban-card .card-priority {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  min-width: 24px;
+  height: 24px;
+  padding: 0 7px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 800;
+  border: 1px solid transparent;
+}
+
+.kanban-card .card-priority.priority-low {
+  color: #ff8a80;
+  background: rgba(255,138,128,0.12);
+  border-color: rgba(255,138,128,0.25);
+}
+
+.kanban-card .card-priority.priority-mid {
+  color: var(--amber);
+  background: rgba(255,193,7,0.12);
+  border-color: rgba(255,193,7,0.22);
+}
+
+.kanban-card .card-priority.priority-high {
+  color: var(--success);
+  background: rgba(76,175,80,0.14);
+  border-color: rgba(76,175,80,0.24);
 }
 
 .kanban-card .card-seams {
@@ -284,6 +346,51 @@ tbody tr:hover { background: rgba(0,229,255,0.03); }
   letter-spacing: 0.5px;
   color: var(--text-secondary);
   margin-bottom: 8px;
+}
+
+.harness-relationship-banner {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 16px 0;
+}
+
+.harness-relationship-card {
+  min-width: 180px;
+  flex: 1 1 220px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: rgba(0, 0, 0, 0.16);
+}
+
+.harness-relationship-card .eyebrow {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+
+.harness-relationship-card .title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  word-break: break-word;
+}
+
+.harness-relationship-card .note {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.45;
+}
+
+.harness-section-intro {
+  margin: 0 0 10px 0;
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.5;
 }
 
 .detail-props {
@@ -708,6 +815,219 @@ pre.code-block {
 .status-badge.completed { background: rgba(0,230,118,0.2); color: var(--success); }
 .status-badge.unknown { background: var(--border); color: var(--text-secondary); }
 
+.proposal-header {
+  margin-bottom: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.proposal-header-title-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.proposal-header-title-row h2 { margin: 0; }
+
+.proposal-meta-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  border: 1px solid var(--border);
+  background: rgba(255,255,255,0.03);
+  color: var(--text-secondary);
+}
+
+.pill.clickable { cursor: pointer; }
+.pill.clickable:hover { border-color: var(--accent); color: var(--accent); }
+.pill.status-active { background: rgba(0,230,118,0.14); color: var(--success); border-color: rgba(0,230,118,0.3); }
+.pill.status-between { background: rgba(255,193,7,0.12); color: var(--amber); border-color: rgba(255,193,7,0.28); }
+.pill.status-stopped { background: rgba(255,82,82,0.12); color: #ff8a80; border-color: rgba(255,82,82,0.28); }
+.pill.id-pill { font-family: var(--mono); color: var(--text-secondary); }
+
+.pill-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.pill-radio {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-secondary);
+  border-radius: 999px;
+  padding: 8px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s, color 0.15s, transform 0.15s;
+}
+
+.pill-radio:hover { border-color: var(--accent); color: var(--text); }
+.pill-radio.active { transform: translateY(-1px); }
+.pill-radio.status-active.active,
+.pill-radio.priority-high.active { background: rgba(0,230,118,0.16); color: var(--success); border-color: rgba(0,230,118,0.35); }
+.pill-radio.status-between.active,
+.pill-radio.priority-mid.active { background: rgba(255,193,7,0.14); color: var(--amber); border-color: rgba(255,193,7,0.35); }
+.pill-radio.status-stopped.active,
+.pill-radio.priority-low.active { background: rgba(255,82,82,0.14); color: #ff8a80; border-color: rgba(255,82,82,0.35); }
+
+.control-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+
+.control-row-label {
+  font-weight: 600;
+  min-width: 72px;
+  padding-top: 8px;
+}
+
+.control-row-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.tag-editor {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.tag-pill-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.tag-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(0,229,255,0.22);
+  background: rgba(0,229,255,0.08);
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.tag-pill button {
+  border: none;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+}
+
+.tag-input-shell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--bg);
+}
+
+.tag-input-shell input {
+  flex: 1;
+  min-width: 180px;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.tag-suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.tag-suggestion {
+  padding: 6px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(255,255,255,0.03);
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.tag-suggestion:hover { border-color: var(--accent); color: var(--accent); }
+
+.tag-overlay-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.6);
+  z-index: 1200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.tag-overlay {
+  width: min(720px, 100%);
+  max-height: 70vh;
+  overflow-y: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  padding: 20px;
+  box-shadow: 0 16px 40px rgba(0,0,0,0.35);
+}
+
+.tag-overlay-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 14px;
+}
+
+.tag-overlay-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.tag-overlay-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.tag-overlay-pill:hover { border-color: var(--accent); color: var(--accent); }
+
 /* Workstream Detail */
 .workstream-detail-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 24px; padding: 20px; background: var(--surface); border-radius: var(--radius); border: 1px solid var(--border); }
 .workstream-title-section { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
@@ -753,6 +1073,7 @@ pre.code-block {
 .live-sessions-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }
 .live-session-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; border-left: 4px solid var(--accent); }
 .live-session-card:hover { border-color: var(--accent); }
+.live-session-card.coord-risk { border-left-color: var(--error); box-shadow: inset 0 0 0 1px rgba(255,82,82,0.18); }
 .live-session-header { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
 .live-pulse { color: var(--error); animation: pulse 2s infinite; font-size: 12px; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
@@ -762,8 +1083,11 @@ pre.code-block {
 .live-session-phase.phase-coding { background: rgba(0,229,255,0.1); color: var(--accent); }
 .live-session-phase.phase-testing { background: rgba(156,39,176,0.1); color: #ce93d8; }
 .live-session-phase.phase-green { background: rgba(0,230,118,0.1); color: var(--success); }
+.live-session-alert { font-size: 11px; margin-bottom: 10px; color: var(--error); }
 .live-session-seam { font-family: var(--mono); font-size: 12px; color: var(--text-secondary); margin-bottom: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .live-session-meta { display: flex; gap: 16px; font-size: 12px; color: var(--text-secondary); margin-bottom: 8px; }
+.live-session-meta span { min-width: 0; }
+.live-session-context { font-family: var(--mono); }
 .live-session-time { font-size: 11px; color: var(--text-secondary); }
 .live-indicator { display: flex; align-items: center; gap: 8px; margin-left: auto; font-size: 12px; color: var(--text-secondary); }
 .live-dot { width: 8px; height: 8px; background: var(--success); border-radius: 50%; animation: pulse 2s infinite; }
@@ -995,6 +1319,10 @@ pre.code-block {
         <span class="nav-icon">☰</span>
         <span class="nav-label">Tasks</span>
       </div>
+      <div class="nav-item" data-view="harnesses">
+        <span class="nav-icon">⌘</span>
+        <span class="nav-label">Harnesses</span>
+      </div>
       <div class="nav-item" data-view="search">
         <span class="nav-icon">⌕</span>
         <span class="nav-label">Search</span>
@@ -1109,6 +1437,14 @@ pre.code-block {
       <div id="dashboard-tasks" class="tasks-panel">
         <div class="loading">Loading tasks…</div>
       </div>
+      <h3>Active Sessions</h3>
+      <div id="dashboard-sessions" class="table-wrap" style="margin-bottom:24px">
+        <div class="loading" style="padding:16px">Loading sessions…</div>
+      </div>
+      <h3>Recent Trials</h3>
+      <div id="dashboard-recent-sessions" class="table-wrap" style="margin-bottom:24px">
+        <div class="loading" style="padding:16px">Loading recent sessions…</div>
+      </div>
       <h3>Recent Activity</h3>
       <div id="activity-feed" class="table-wrap" style="margin-bottom:24px">
         <div class="loading" style="padding:16px">Loading activity…</div>
@@ -1185,6 +1521,37 @@ pre.code-block {
       <h2>Tasks</h2>
       <div id="tasks-table" class="table-wrap">
         <div class="loading" style="padding:16px">Loading tasks…</div>
+      </div>
+    </div>
+
+    <!-- Harnesses View -->
+    <div id="view-harnesses" class="view">
+      <div class="toolbar">
+        <button class="toolbar-btn" onclick="loadHarnesses()">
+          <span>↻</span> Refresh
+        </button>
+      </div>
+      <h2>Harnesses</h2>
+      <div id="harness-stats-row" class="stats-row">
+        <div class="loading">Loading harness summary…</div>
+      </div>
+      <div id="harnesses-table" class="table-wrap">
+        <div class="loading" style="padding:16px">Loading harnesses…</div>
+      </div>
+    </div>
+
+    <!-- Harness Detail View -->
+    <div id="view-harness-detail" class="view">
+      <div class="toolbar">
+        <button class="toolbar-btn secondary" onclick="backToHarnesses()">
+          <span>←</span> Back to Harnesses
+        </button>
+        <button class="toolbar-btn" onclick="refreshHarnessDetail()">
+          <span>↻</span> Refresh
+        </button>
+      </div>
+      <div id="harness-detail-content">
+        <div class="loading">Loading harness detail…</div>
       </div>
     </div>
 
@@ -1328,6 +1695,87 @@ function getStatus(props) {
   return 'proposed'; // default bucket
 }
 
+const proposalStatusOptions = [
+  'proposed',
+  'accepted',
+  'accepted-current-slice',
+  'in-progress',
+  'implemented',
+  'verified',
+  'archived',
+  'superseded',
+  'deferred'
+];
+
+function getProposalStatusValue(props) {
+  if (!props) return 'proposed';
+  const p = typeof props === 'string' ? JSON.parse(props) : props;
+  return (p.disposition || p.status || 'proposed').toLowerCase();
+}
+
+function proposalStatusMeta(statusValue) {
+  const value = (statusValue || 'proposed').toLowerCase();
+  const pretty = value.replaceAll('-', ' ');
+  if (['implemented', 'verified'].includes(value)) return { value, label: pretty, tone: 'status-active' };
+  if (['archived', 'superseded', 'deferred'].includes(value)) return { value, label: pretty, tone: 'status-stopped' };
+  return { value, label: pretty, tone: 'status-between' };
+}
+
+const proposalPriorityOptions = [
+  { value: 1, label: 'Low', tone: 'priority-low' },
+  { value: 2, label: '1', tone: 'priority-low' },
+  { value: 3, label: '2', tone: 'priority-mid' },
+  { value: 4, label: '3', tone: 'priority-mid' },
+  { value: 5, label: '4', tone: 'priority-high' },
+  { value: 6, label: '5', tone: 'priority-high' },
+  { value: 7, label: 'High', tone: 'priority-high' }
+];
+
+function normalizeProposalPriority(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 4;
+  return Math.max(1, Math.min(7, parsed));
+}
+
+function proposalPriorityMeta(value) {
+  const normalized = normalizeProposalPriority(value);
+  return proposalPriorityOptions.find(option => option.value === normalized) || proposalPriorityOptions[3];
+}
+
+function parseProposalContent(content) {
+  const raw = content || '';
+  const frontmatterMatch = raw.match(/^---\s*\n([\s\S]*?)\n---\s*\n/);
+  let frontmatter = {};
+  let bodyContent = raw;
+  if (frontmatterMatch) {
+    const frontmatterText = frontmatterMatch[1];
+    bodyContent = raw.slice(frontmatterMatch[0].length);
+    frontmatterText.split('\n').forEach(line => {
+      const match = line.match(/^(\w+):\s*(.+)$/);
+      if (match) {
+        let value = match[2].trim();
+        if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+          value = value.slice(1, -1);
+        }
+        frontmatter[match[1]] = value;
+      }
+    });
+  }
+  const headingMatch = bodyContent.match(/^\s*#\s+(.+)$/m);
+  const title = frontmatter.title || (headingMatch ? headingMatch[1].trim() : '');
+  return { frontmatter, bodyContent, title };
+}
+
+function collectKnownTags(nodes) {
+  const tags = new Set();
+  (nodes || []).forEach(item => {
+    const p = item.properties || item.node?.properties || {};
+    const props = typeof p === 'string' ? JSON.parse(p) : p;
+    (props.tags || []).forEach(tag => tags.add(String(tag)));
+  });
+  return [...tags].sort((a, b) => a.localeCompare(b));
+}
+
 function getProp(props, key) {
   if (!props) return '';
   const p = typeof props === 'string' ? JSON.parse(props) : props;
@@ -1341,13 +1789,62 @@ function formatTime(ts) {
   return d.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
+function formatDuration(ms) {
+  if (!ms || ms <= 0) return '—';
+  if (ms < 1000) return `${ms} ms`;
+  const totalSeconds = Math.floor(ms / 1000);
+  const seconds = totalSeconds % 60;
+  const minutes = Math.floor(totalSeconds / 60) % 60;
+  const hours = Math.floor(totalSeconds / 3600);
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
+}
+
+function formatWorktreeLabel(path) {
+  if (!path) return 'unavailable';
+  const trimmed = String(path).trim();
+  if (!trimmed) return 'unavailable';
+  const parts = trimmed.split('/').filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : trimmed;
+}
+
+function sessionTelemetryState(session) {
+  const filesTouched = Array.isArray(session.files_touched) ? session.files_touched.length : 0;
+  const linesChanged = session.lines_changed || 0;
+  const testRuns = session.test_runs || 0;
+  const tokensTotal = session.tokens_total || 0;
+  const elapsedMs = session.elapsed_ms || 0;
+  const missing = [];
+
+  if (filesTouched === 0) missing.push('files');
+  if (linesChanged === 0) missing.push('lines');
+  if (testRuns === 0) missing.push('tests');
+  if (tokensTotal === 0) missing.push('tokens');
+  if (elapsedMs === 0) missing.push('elapsed');
+
+  return {
+    filesTouched,
+    linesChanged,
+    testRuns,
+    tokensTotal,
+    elapsedMs,
+    missing,
+    telemetryGap: missing.length > 0,
+    telemetryEmpty: missing.length === 5
+  };
+}
+
 // ── Navigation ──
 
-const views = ['dashboard', 'workstreams', 'workstream-detail', 'hospital-board', 'proposals', 'proposal-detail', 'seams', 'seam-detail', 'tasks', 'task-detail', 'crates', 'crate-detail', 'search', 'timeline'];
+const views = ['dashboard', 'workstreams', 'workstream-detail', 'hospital-board', 'proposals', 'proposal-detail', 'seams', 'seam-detail', 'tasks', 'task-detail', 'harnesses', 'harness-detail', 'crates', 'crate-detail', 'search', 'timeline'];
 let currentView = 'dashboard';
 let currentProposalId = null;
 let currentSeamId = null;
 let currentTaskId = null;
+let currentHarnessId = null;
+let currentHarnessNodeKind = 'harness';
+const harnessSyntheticNodeCache = new Map();
 let currentCrateName = null;
 let wsConnection = null;
 
@@ -1374,6 +1871,7 @@ function switchView(view, skipLoad = false) {
       if (view === 'proposal-detail' && navView === 'proposals') active = true;
       if (view === 'seam-detail' && navView === 'seams') active = true;
       if (view === 'task-detail' && navView === 'tasks') active = true;
+      if (view === 'harness-detail' && navView === 'harnesses') active = true;
       if (view === 'crate-detail' && navView === 'crates') active = true;
     }
     n.classList.toggle('active', active);
@@ -1402,6 +1900,11 @@ function backToTasks() {
   switchView('tasks');
 }
 
+function backToHarnesses() {
+  currentHarnessId = null;
+  switchView('harnesses');
+}
+
 // Status & Tag Update Functions
 async function updateNodeStatus(nodeId, newStatus, kind) {
   const propName = kind === 'proposal' ? 'disposition' : 'status';
@@ -1426,13 +1929,7 @@ async function updateNodeStatus(nodeId, newStatus, kind) {
     const result = await response.json();
     if (result.result) {
       showToast(`Updated ${nodeId} status to ${newStatus}`);
-      // Update badge immediately without full refresh
-      const badge = document.getElementById('proposal-status-badge');
-      if (badge) {
-        const normalizedStatus = getStatus({ [propName]: newStatus });
-        badge.className = 'badge badge-' + normalizedStatus;
-        badge.textContent = normalizedStatus;
-      }
+      refreshProposalDetail();
     } else {
       showToast('Error: ' + (result.error?.message || 'Update failed'), 'error');
     }
@@ -1507,23 +2004,6 @@ async function updateNodePriority(nodeId, newPriority) {
     const result = await response.json();
     if (result.updated) {
       showToast(`Updated priority to ${newPriority}`);
-      
-      // Update priority indicator immediately
-      const indicator = document.getElementById('priority-indicator');
-      if (indicator) {
-        const priorityOptions = [
-          { value: 1, label: '1 - Minimal', color: '#666' },
-          { value: 2, label: '2 - Low', color: '#888' },
-          { value: 3, label: '3 - Medium', color: '#ffa500' },
-          { value: 4, label: '4 - High', color: '#ff6b35' },
-          { value: 5, label: '5 - Critical', color: '#dc3545' }
-        ];
-        const opt = priorityOptions.find(p => p.value === newPriority);
-        indicator.style.background = opt?.color || '#ffa500';
-        indicator.textContent = `Priority ${newPriority}`;
-      }
-      
-      // Refresh the detail view to show updated priority
       refreshProposalDetail();
     } else {
       showToast('Error: ' + (result.error?.message || 'Priority update failed'), 'error');
@@ -1531,6 +2011,112 @@ async function updateNodePriority(nodeId, newPriority) {
   } catch (err) {
     showToast('Error: ' + err.message, 'error');
   }
+}
+
+function renderPillRadioGroup(options, currentValue, onSelect) {
+  const group = el('div', { className: 'pill-group' });
+  options.forEach(option => {
+    group.appendChild(el('button', {
+      className: 'pill-radio ' + (option.tone || '') + (option.value === currentValue ? ' active' : ''),
+      textContent: option.label,
+      onclick: () => onSelect(option.value)
+    }));
+  });
+  return group;
+}
+
+function renderTagEditor(nodeId, currentTags, knownTags) {
+  const editor = el('div', { className: 'tag-editor' });
+  const currentTagsRow = el('div', { className: 'tag-pill-row' });
+  if (!currentTags.length) {
+    currentTagsRow.appendChild(el('span', { style: 'color: var(--muted); font-size: 13px; font-style: italic;', textContent: 'No tags yet' }));
+  } else {
+    currentTags.forEach(tag => {
+      currentTagsRow.appendChild(el('span', { className: 'tag-pill' },
+        el('span', { textContent: tag }),
+        el('button', { textContent: '×', title: 'Remove tag', onclick: () => removeTag(nodeId, tag, currentTags) })
+      ));
+    });
+  }
+  editor.appendChild(currentTagsRow);
+
+  const inputShell = el('div', { className: 'tag-input-shell' });
+  const input = el('input', { type: 'text', placeholder: 'Type to add a tag…' });
+  const addButton = el('button', { className: 'btn btn-sm', textContent: '+ Add', onclick: () => showTagOverlay(nodeId, currentTags, knownTags) });
+  inputShell.appendChild(input);
+  inputShell.appendChild(addButton);
+  editor.appendChild(inputShell);
+
+  const suggestions = el('div', { className: 'tag-suggestions' });
+  editor.appendChild(suggestions);
+
+  function addTypedTag() {
+    const raw = input.value.trim();
+    if (!raw) return;
+    addTag(nodeId, raw, currentTags);
+  }
+
+  function refreshSuggestions() {
+    suggestions.innerHTML = '';
+    const query = input.value.trim().toLowerCase();
+    if (!query) return;
+    knownTags
+      .filter(tag => tag.toLowerCase().includes(query) && !currentTags.includes(tag))
+      .slice(0, 8)
+      .forEach(tag => {
+        suggestions.appendChild(el('button', {
+          className: 'tag-suggestion',
+          textContent: tag,
+          onclick: () => addTag(nodeId, tag, currentTags)
+        }));
+      });
+  }
+
+  input.addEventListener('input', refreshSuggestions);
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' || event.key === 'Tab') {
+      const query = input.value.trim().toLowerCase();
+      const match = knownTags.find(tag => tag.toLowerCase().includes(query) && !currentTags.includes(tag));
+      if (query) {
+        event.preventDefault();
+        if (match) addTag(nodeId, match, currentTags);
+        else addTypedTag();
+      }
+    }
+  });
+
+  return editor;
+}
+
+function showTagOverlay(nodeId, currentTags, knownTags) {
+  const backdrop = el('div', { className: 'tag-overlay-backdrop' });
+  const overlay = el('div', { className: 'tag-overlay' });
+  const close = () => backdrop.remove();
+  backdrop.onclick = (event) => {
+    if (event.target === backdrop) close();
+  };
+  overlay.appendChild(el('div', { className: 'tag-overlay-header' },
+    el('h4', { textContent: 'Add Existing Tags' }),
+    el('button', { className: 'btn-small', textContent: 'Close', onclick: close })
+  ));
+  const grid = el('div', { className: 'tag-overlay-grid' });
+  knownTags
+    .filter(tag => !currentTags.includes(tag))
+    .forEach(tag => {
+      grid.appendChild(el('button', {
+        className: 'tag-overlay-pill',
+        onclick: () => {
+          addTag(nodeId, tag, currentTags);
+          close();
+        }
+      }, el('span', { textContent: tag }), el('span', { textContent: '+' })));
+    });
+  if (!grid.children.length) {
+    grid.appendChild(el('div', { style: 'color: var(--muted);' }, 'No additional tags available.'));
+  }
+  overlay.appendChild(grid);
+  backdrop.appendChild(overlay);
+  document.body.appendChild(backdrop);
 }
 
 function showToast(message, type = 'success') {
@@ -1579,6 +2165,8 @@ function loadView(view) {
     case 'seam-detail': if (currentSeamId) loadSeamDetail(currentSeamId); break;
     case 'tasks': loadTasks(); break;
     case 'task-detail': if (currentTaskId) loadTaskDetail(currentTaskId); break;
+    case 'harnesses': loadHarnesses(); break;
+    case 'harness-detail': if (currentHarnessId) loadHarnessDetail(currentHarnessId); break;
     case 'crates': loadCrates(); break;
     case 'crate-detail': if (currentCrateName) loadCrateDetail(currentCrateName); break;
     case 'search': initSearch(); break;
@@ -1590,14 +2178,17 @@ function loadView(view) {
 
 async function loadDashboard() {
   try {
-    const [status, mutations, crates, proposals] = await Promise.all([
+    const [status, mutations, crates, proposals, dashboard] = await Promise.all([
       api('/api/status'),
       api('/api/mutations?limit=10'),
       api('/api/nodes?kind=crate'),
       api('/api/proposals'),
+      api('/api/dashboard'),
     ]);
     renderStats(status);
     renderPipeline(proposals);
+    renderDashboardSessions(dashboard.active_sessions || [], document.getElementById('dashboard-sessions'), 'No active sessions');
+    renderDashboardSessions(dashboard.recent_closed || [], document.getElementById('dashboard-recent-sessions'), 'No recent sessions');
     renderActivity(mutations);
     renderCrateTable(crates);
   } catch (err) {
@@ -1677,6 +2268,56 @@ function renderActivity(mutations) {
       el('span', { className: 'activity-reason', textContent: m.reason || '' })
     ));
   });
+}
+
+function renderDashboardSessions(sessions, container, emptyText) {
+  if (!container) return;
+  if (!sessions || sessions.length === 0) {
+    container.innerHTML = `<div style="padding:16px;color:var(--text-secondary)">${emptyText}</div>`;
+    return;
+  }
+  container.innerHTML = '';
+  const table = el('table', { className: 'table' });
+  const thead = el('thead', null,
+    el('tr', null,
+      el('th', { textContent: 'Agent' }),
+      el('th', { textContent: 'Seam' }),
+      el('th', { textContent: 'Harness' }),
+      el('th', { textContent: 'Workflow' }),
+      el('th', { textContent: 'Phase' }),
+      el('th', { textContent: 'Elapsed' }),
+      el('th', { textContent: 'Tokens' }),
+      el('th', { textContent: 'Activity' })
+    )
+  );
+  const tbody = el('tbody');
+  sessions.forEach(session => {
+    const tokenDetail = session.tokens_total > 0
+      ? `${formatTokens(session.tokens_total)} total`
+      : '—';
+    const tokenBreakdown = session.tokens_total > 0
+      ? `In ${formatTokens(session.tokens_input || 0)} / Out ${formatTokens(session.tokens_output || 0)}`
+      : '';
+    tbody.appendChild(el('tr', null,
+      el('td', { textContent: session.agent || '—' }),
+      el('td', { textContent: session.seam_id || '—' }),
+      el('td', { textContent: session.harness_id || '—' }),
+      el('td', { textContent: session.workflow_name || '—' }),
+      el('td', { textContent: session.phase || '—' }),
+      el('td', { textContent: formatDuration(session.elapsed_ms || 0) }),
+      el('td', null,
+        el('div', { textContent: tokenDetail }),
+        tokenBreakdown ? el('div', { style: 'font-size:11px;color:var(--muted);', textContent: tokenBreakdown }) : null
+      ),
+      el('td', null,
+        el('div', { textContent: formatTime(session.started) }),
+        el('div', { style: 'font-size:11px;color:var(--muted);', textContent: session.last_activity ? `Last ${formatTime(session.last_activity)}` : '—' })
+      )
+    ));
+  });
+  table.appendChild(thead);
+  table.appendChild(tbody);
+  container.appendChild(table);
 }
 
 function renderCrateTable(crates) {
@@ -1761,65 +2402,87 @@ async function loadProposals() {
 }
 
 function renderKanban(proposals) {
-  const columns = {
-    proposed: [],
-    accepted: [],
-    'in-progress': [],
-    implemented: [],
-    deferred: [],
-  };
-  const labels = {
-    proposed: 'Proposed',
-    accepted: 'Accepted',
-    'in-progress': 'In Progress',
-    implemented: 'Implemented',
-    deferred: 'Deferred',
-  };
-  const headerColors = {
-    proposed: 'var(--accent)',
-    accepted: '#4dd0e1',
-    'in-progress': 'var(--amber)',
-    implemented: 'var(--success)',
-    deferred: 'var(--muted)',
-  };
+  const statusOrder = proposalStatusOptions;
+  const columns = Object.fromEntries(statusOrder.map(status => [status, []]));
 
   proposals.forEach(p => {
-    const s = getStatus(p.properties);
-    if (columns[s]) columns[s].push(p);
-    else columns.proposed.push(p);
+    const status = getProposalStatusValue(p.properties);
+    if (columns[status]) columns[status].push(p);
+    else {
+      if (!columns.proposed) columns.proposed = [];
+      columns.proposed.push(p);
+    }
   });
 
   const container = document.getElementById('kanban');
   container.innerHTML = '';
   container.className = 'kanban';
 
-  for (const [key, items] of Object.entries(columns)) {
+  statusOrder.forEach((key) => {
+    const items = columns[key] || [];
+    if (!items.length) return;
+    const meta = proposalStatusMeta(key);
     const col = el('div', { className: 'kanban-col' });
     const header = el('div', { className: 'kanban-col-header' });
-    header.style.borderBottom = '2px solid ' + headerColors[key];
-    header.appendChild(el('span', { textContent: labels[key] }));
+    const headerColor = meta.tone === 'status-active'
+      ? 'var(--success)'
+      : meta.tone === 'status-stopped'
+        ? '#ff8a80'
+        : 'var(--amber)';
+    header.style.borderBottom = '2px solid ' + headerColor;
+    header.appendChild(el('span', { textContent: meta.label }));
     header.appendChild(el('span', { className: 'count', textContent: String(items.length) }));
     col.appendChild(header);
 
     const cardsWrap = el('div', { className: 'kanban-cards' });
     items.forEach(p => {
       const domain = getProp(p.properties, 'domain') || '';
+      const props = typeof p.properties === 'string' ? JSON.parse(p.properties) : (p.properties || {});
       const seams = getProp(p.properties, 'active_seams');
       const seamCount = Array.isArray(seams) ? seams.length : 0;
+      const lastUpdated = getProp(p.properties, 'last_updated') || '';
+      const tags = Array.isArray(props.tags) ? props.tags.slice(0, 3) : [];
+      const hiddenTagCount = Array.isArray(props.tags) && props.tags.length > 3 ? props.tags.length - 3 : 0;
+      const priorityMeta = proposalPriorityMeta(props.priority);
+      const priorityToneClass = priorityMeta.tone === 'priority-high'
+        ? 'priority-high'
+        : priorityMeta.tone === 'priority-low'
+          ? 'priority-low'
+          : 'priority-mid';
 
       const card = el('div', {
         className: 'kanban-card',
         onclick: () => showProposalDetail(p.id),
       },
         el('div', { className: 'card-name', textContent: p.name }),
-        domain ? el('div', { className: 'card-domain', textContent: domain }) : null,
-        seamCount > 0 ? el('div', { className: 'card-seams', textContent: seamCount + ' seam' + (seamCount !== 1 ? 's' : '') }) : null
+        getProp(p.properties, 'proposal_id') || p.id
+          ? el('div', { style: 'display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0 4px;' },
+              el('span', {
+                className: 'pill id-pill',
+                style: 'padding:4px 10px;font-size:11px;',
+                textContent: getProp(p.properties, 'proposal_id') || p.id
+              })
+            )
+          : null,
+        domain || tags.length || hiddenTagCount
+          ? el('div', { className: 'card-tags' },
+              domain ? el('span', { className: 'card-domain-pill', textContent: domain }) : null,
+              ...tags.map(tag => el('span', { className: 'card-tag-pill', textContent: tag })),
+              hiddenTagCount ? el('span', { className: 'card-tag-pill', textContent: `+${hiddenTagCount}` }) : null
+            )
+          : null,
+        seamCount > 0 ? el('div', { className: 'card-seams', textContent: seamCount + ' seam' + (seamCount !== 1 ? 's' : '') }) : null,
+        lastUpdated ? el('div', { className: 'card-seams', textContent: `updated ${lastUpdated}` }) : null,
+        el('span', {
+          className: `card-priority ${priorityToneClass}`,
+          textContent: priorityMeta.label
+        })
       );
       cardsWrap.appendChild(card);
     });
     col.appendChild(cardsWrap);
     container.appendChild(col);
-  }
+  });
 }
 
 // (Old showProposalDetail, loadSeams, getVerificationBadge, showSeamDetail removed — 
@@ -2230,15 +2893,24 @@ async function loadProposalDetail(id) {
   const container = document.getElementById('proposal-detail-content');
   container.innerHTML = '<div class="loading">Loading proposal detail…</div>';
   try {
-    const [node, seams, tasks, mutations] = await Promise.all([
+    const [node, seams, tasks, mutations, allProposals, contentResponse] = await Promise.all([
       api('/api/nodes/' + encodeURIComponent(id)),
       api('/api/seams'),
       api('/api/nodes?kind=task'),
       api('/api/mutations?limit=20'),
+      api('/api/proposals'),
+      api('/api/proposals/' + encodeURIComponent(id) + '/content'),
     ]);
     
     const props = typeof node.properties === 'string' ? JSON.parse(node.properties) : (node.properties || {});
     const edges = node._edges || { outgoing: [], incoming: [] };
+    const { frontmatter, title: markdownTitle } = parseProposalContent(contentResponse.content || '');
+    const displayTitle = markdownTitle || node.name;
+    const currentStatus = getProposalStatusValue(props);
+    const statusMeta = proposalStatusMeta(currentStatus);
+    const knownTags = collectKnownTags(allProposals);
+    const currentTags = props.tags || [];
+    const currentPriority = normalizeProposalPriority(props.priority);
 
     const page = el('div', null);
     
@@ -2246,19 +2918,34 @@ async function loadProposalDetail(id) {
     page.appendChild(el('div', { className: 'page-nav' },
       el('span', { className: 'page-nav-link', onclick: backToProposals, textContent: 'Proposals' }),
       el('span', { className: 'page-nav-separator', textContent: '/' }),
-      el('span', { className: 'page-nav-current', textContent: node.name })
+      el('span', { className: 'page-nav-current', textContent: displayTitle })
     ));
 
-    // Title and status
-    const header = el('div', { style: 'margin-bottom: 24px;' });
-    header.appendChild(el('h2', null,
-      node.name,
-      el('span', { 
+    const header = el('div', { className: 'proposal-header' });
+    header.appendChild(el('div', { className: 'proposal-header-title-row' },
+      el('h2', { textContent: displayTitle }),
+      el('span', {
         id: 'proposal-status-badge',
-        className: 'badge badge-' + getStatus(props), 
-        style: 'margin-left: 12px; font-size: 12px;',
-        textContent: getStatus(props) 
-      })
+        className: 'pill ' + statusMeta.tone,
+        textContent: statusMeta.label
+      }),
+      el('span', { className: 'pill id-pill', textContent: props.proposal_id || node.id })
+    ));
+    header.appendChild(el('div', { className: 'proposal-meta-row' },
+      props.domain ? el('button', {
+        className: 'pill clickable',
+        textContent: props.domain,
+        onclick: () => {
+          switchView('search');
+          const input = document.getElementById('search-input');
+          if (input) {
+            input.value = props.domain;
+            doSearch(props.domain);
+          }
+        }
+      }) : null,
+      props.last_updated ? el('span', { className: 'pill', textContent: `Updated ${props.last_updated}` }) : null,
+      frontmatter.doc_type ? el('span', { className: 'pill', textContent: frontmatter.doc_type }) : null
     ));
     page.appendChild(header);
 
@@ -2277,12 +2964,12 @@ async function loadProposalDetail(id) {
     // Core properties from node
     const coreProps = {
       'Domain': props.domain,
-      'Doc Type': props.doc_type || node.kind,
+      'Doc Type': frontmatter.doc_type || props.doc_type || node.kind,
       'Last Updated': props.last_updated,
       'Proposal ID': props.proposal_id,
       'Current Slice': props.current_slice,
       'Assigned Agent': props.assigned_agent,
-      'Status': props.disposition || props.status,
+      'Status': currentStatus,
       'Tags': props.tags?.join(', ')
     };
     
@@ -2290,7 +2977,21 @@ async function loadProposalDetail(id) {
       if (value) {
         const item = el('div', { style: 'background: var(--surface); padding: 8px 12px; border-radius: 4px;' },
           el('div', { style: 'color: var(--muted); font-size: 11px; text-transform: uppercase; margin-bottom: 2px;', textContent: key }),
-          el('div', { style: 'color: var(--text); font-size: 13px;', textContent: Array.isArray(value) ? value.join(', ') : String(value) })
+          key === 'Domain'
+            ? el('button', {
+              className: 'pill clickable',
+              style: 'padding: 4px 10px;',
+              textContent: String(value),
+              onclick: () => {
+                switchView('search');
+                const input = document.getElementById('search-input');
+                if (input) {
+                  input.value = String(value);
+                  doSearch(String(value));
+                }
+              }
+            })
+            : el('div', { style: 'color: var(--text); font-size: 13px;', textContent: Array.isArray(value) ? value.join(', ') : String(value) })
         );
         combinedGrid.appendChild(item);
       }
@@ -2304,115 +3005,38 @@ async function loadProposalDetail(id) {
     statusTagsSection.appendChild(el('h4', { textContent: 'Status & Tags Management' }));
     
     // Status row
-    const statusRow = el('div', { style: 'display: flex; align-items: center; gap: 12px; margin-bottom: 16px;' });
-    statusRow.appendChild(el('span', { textContent: 'Status:', style: 'font-weight: 500; min-width: 60px;' }));
-    
-    const statusOptions = ['proposed', 'accepted', 'accepted-current-slice', 'in-progress', 'implemented', 'verified', 'archived', 'superseded', 'deferred'];
-    const currentStatus = props.disposition || props.status || 'unknown';
-    
-    const statusSelect = el('select', { 
-      className: 'status-dropdown',
-      style: 'padding: 6px 12px; border-radius: 4px; background: var(--bg); border: 1px solid var(--border); color: var(--text); min-width: 180px;',
-      onchange: (e) => updateNodeStatus(id, e.target.value, 'proposal')
-    });
-    statusOptions.forEach(opt => {
-      const option = el('option', { value: opt, textContent: opt, selected: opt === currentStatus });
-      statusSelect.appendChild(option);
-    });
-    statusRow.appendChild(statusSelect);
+    const statusRow = el('div', { className: 'control-row' });
+    statusRow.appendChild(el('span', { textContent: 'Status:', className: 'control-row-label' }));
+    const statusBody = el('div', { className: 'control-row-body' });
+    statusBody.appendChild(renderPillRadioGroup(
+      proposalStatusOptions.map(value => {
+        const meta = proposalStatusMeta(value);
+        return { value, label: meta.label, tone: meta.tone };
+      }),
+      currentStatus,
+      (value) => updateNodeStatus(id, value, 'proposal')
+    ));
+    statusBody.appendChild(el('div', { style: 'font-size:12px;color:var(--text-secondary);' }, 'Green = active, yellow = in-progress or proposed, red = stopped. Because the dropdown was lying by omission.'));
+    statusRow.appendChild(statusBody);
     statusTagsSection.appendChild(statusRow);
     
-    // Priority row
-    const priorityRow = el('div', { style: 'display: flex; align-items: center; gap: 12px; margin-bottom: 16px;' });
-    priorityRow.appendChild(el('span', { textContent: 'Priority:', style: 'font-weight: 500; min-width: 60px;' }));
-    
-    const priorityOptions = [
-      { value: 1, label: '1 - Minimal', color: '#666' },
-      { value: 2, label: '2 - Low', color: '#888' },
-      { value: 3, label: '3 - Medium', color: '#ffa500' },
-      { value: 4, label: '4 - High', color: '#ff6b35' },
-      { value: 5, label: '5 - Critical', color: '#dc3545' }
-    ];
-    const currentPriority = props.priority || 3;
-    
-    const prioritySelect = el('select', { 
-      className: 'priority-dropdown',
-      style: 'padding: 6px 12px; border-radius: 4px; background: var(--bg); border: 1px solid var(--border); color: var(--text); min-width: 180px;',
-      onchange: (e) => updateNodePriority(id, parseInt(e.target.value))
-    });
-    priorityOptions.forEach(opt => {
-      const option = el('option', { 
-        value: opt.value, 
-        textContent: opt.label, 
-        selected: opt.value === currentPriority 
-      });
-      prioritySelect.appendChild(option);
-    });
-    priorityRow.appendChild(prioritySelect);
-    
-    // Priority indicator
-    const priorityIndicator = el('span', {
-      id: 'priority-indicator',
-      className: 'badge',
-      style: `background: ${priorityOptions.find(p => p.value === currentPriority)?.color || '#ffa500'}; color: white; padding: 4px 8px; font-size: 11px; margin-left: 8px;`,
-      textContent: `Priority ${currentPriority}`
-    });
-    priorityRow.appendChild(priorityIndicator);
-    
+    const priorityRow = el('div', { className: 'control-row' });
+    priorityRow.appendChild(el('span', { textContent: 'Priority:', className: 'control-row-label' }));
+    const priorityBody = el('div', { className: 'control-row-body' });
+    priorityBody.appendChild(renderPillRadioGroup(
+      proposalPriorityOptions,
+      currentPriority,
+      (value) => updateNodePriority(id, value)
+    ));
+    priorityBody.appendChild(el('div', { style: 'font-size:12px;color:var(--text-secondary);' }, 'Low → High. The current value is selected instead of hiding inside a dropdown like it has stage fright.'));
+    priorityRow.appendChild(priorityBody);
     statusTagsSection.appendChild(priorityRow);
     
-    // Tags management
-    const tagsRow = el('div', { style: 'display: flex; align-items: flex-start; gap: 12px;' });
-    tagsRow.appendChild(el('span', { textContent: 'Tags:', style: 'font-weight: 500; min-width: 60px; margin-top: 8px;' }));
-    
-    const tagsContainer = el('div', { style: 'flex: 1;' });
-    
-    // Current tags display with remove buttons
-    const currentTagsDiv = el('div', { 
-      id: 'current-tags-display',
-      style: 'display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px;' 
-    });
-    
-    const currentTags = props.tags || [];
-    currentTags.forEach(tag => {
-      const tagEl = el('span', { 
-        className: 'badge badge-kind',
-        style: 'display: inline-flex; align-items: center; gap: 4px; padding: 4px 8px; cursor: pointer;',
-        textContent: tag + ' ×',
-        title: 'Click to remove',
-        onclick: () => removeTag(id, tag, currentTags)
-      });
-      currentTagsDiv.appendChild(tagEl);
-    });
-    
-    if (currentTags.length === 0) {
-      currentTagsDiv.appendChild(el('span', { 
-        style: 'color: var(--muted); font-size: 13px; font-style: italic;',
-        textContent: 'No tags yet'
-      }));
-    }
-    
-    tagsContainer.appendChild(currentTagsDiv);
-    
-    // Add tag input
-    const addTagRow = el('div', { style: 'display: flex; gap: 8px;' });
-    const tagInput = el('input', {
-      id: 'new-tag-input',
-      type: 'text',
-      placeholder: 'Add new tag...',
-      style: 'padding: 6px 10px; border-radius: 4px; background: var(--bg); border: 1px solid var(--border); color: var(--text); font-size: 13px; flex: 1; max-width: 200px;'
-    });
-    const addBtn = el('button', {
-      className: 'btn btn-sm',
-      textContent: '+ Add',
-      style: 'padding: 6px 12px;',
-      onclick: () => addTag(id, tagInput.value, currentTags)
-    });
-    addTagRow.appendChild(tagInput);
-    addTagRow.appendChild(addBtn);
-    tagsContainer.appendChild(addTagRow);
-    
-    tagsRow.appendChild(tagsContainer);
+    const tagsRow = el('div', { className: 'control-row' });
+    tagsRow.appendChild(el('span', { textContent: 'Tags:', className: 'control-row-label' }));
+    const tagsBody = el('div', { className: 'control-row-body' });
+    tagsBody.appendChild(renderTagEditor(id, currentTags, knownTags));
+    tagsRow.appendChild(tagsBody);
     statusTagsSection.appendChild(tagsRow);
     mainStack.appendChild(statusTagsSection);
 
@@ -2443,11 +3067,11 @@ async function loadProposalDetail(id) {
     
     const tabs = el('div', { className: 'diagram-tabs' });
     const tabTypes = [
+      { id: 'markdown', label: 'Markdown' },
       { id: 'diagram', label: 'Diagram' },
-      { id: 'source', label: 'Source' },
-      { id: 'markdown', label: 'Markdown' }
+      { id: 'source', label: 'Source' }
     ];
-    let currentTab = 'diagram';
+    let currentTab = 'markdown';
     
     tabTypes.forEach(t => {
       const tab = el('button', {
@@ -2463,7 +3087,7 @@ async function loadProposalDetail(id) {
     archSection.appendChild(diagramContainer);
     mainStack.appendChild(archSection);
     
-    loadProposalDiagram('diagram', diagramContainer, id);
+    loadMarkdownContent(diagramContainer, node);
 
     // Related tasks
     const relatedTasks = tasks.filter(t => {
@@ -2592,7 +3216,7 @@ async function loadProposalDetail(id) {
 
 async function switchDiagramTab(tabId, container, proposalId, node) {
   const tabs = container.parentElement.querySelectorAll('.diagram-tab');
-  const types = ['diagram', 'source', 'markdown'];
+  const types = ['markdown', 'diagram', 'source'];
   tabs.forEach((t, i) => {
     t.classList.toggle('active', types[i] === tabId);
   });
@@ -2644,31 +3268,7 @@ async function loadMarkdownContent(container, node) {
   try {
     const proposalId = node.id;
     const response = await api('/api/proposals/' + encodeURIComponent(proposalId) + '/content');
-    let content = response.content || 'No content available';
-    
-    // Parse frontmatter
-    const frontmatterMatch = content.match(/^---\s*\n([\s\S]*?)\n---\s*\n/);
-    let frontmatter = {};
-    let bodyContent = content;
-    
-    if (frontmatterMatch) {
-      const frontmatterText = frontmatterMatch[1];
-      bodyContent = content.slice(frontmatterMatch[0].length);
-      
-      // Simple YAML-like parsing
-      frontmatterText.split('\n').forEach(line => {
-        const match = line.match(/^(\w+):\s*(.+)$/);
-        if (match) {
-          let value = match[2].trim();
-          // Remove quotes if present
-          if ((value.startsWith('"') && value.endsWith('"')) || 
-              (value.startsWith("'") && value.endsWith("'"))) {
-            value = value.slice(1, -1);
-          }
-          frontmatter[match[1]] = value;
-        }
-      });
-    }
+    const { frontmatter, bodyContent } = parseProposalContent(response.content || 'No content available');
     
     container.innerHTML = '';
     
@@ -3128,7 +3728,14 @@ async function loadSeamDetail(id) {
     container.innerHTML = '';
     container.appendChild(page);
   } catch (err) {
-    showError(container, 'Failed to load seam: ' + err.message);
+    container.innerHTML = '';
+    container.appendChild(el('div', { style: 'padding:24px;text-align:center;' },
+      el('div', { style: 'font-size:48px;margin-bottom:12px;', textContent: '🔍' }),
+      el('h3', { textContent: 'Seam not found' }),
+      el('p', { style: 'color:var(--text-secondary);', textContent: `"${id}" does not exist in the graph.` }),
+      el('p', { style: 'color:var(--muted);font-size:12px;margin-bottom:16px;', textContent: 'Falling back to the Seams view is usually the least dramatic recovery.' }),
+      el('button', { className: 'toolbar-btn', textContent: '← Back to Seams', onclick: () => backToSeams() })
+    ));
   }
 }
 
@@ -3212,6 +3819,1035 @@ async function showTaskDetail(id) {
   currentTaskId = id;
   switchView('task-detail', true);
   await loadTaskDetail(id);
+}
+
+async function loadHarnesses() {
+  const statsContainer = document.getElementById('harness-stats-row');
+  const tableContainer = document.getElementById('harnesses-table');
+  try {
+    const [harnesses, bundles, canonicalProfiles, canonicalWorkflows, skills, projections, observations, drifts] = await Promise.all([
+      api('/api/nodes?kind=harness'),
+      api('/api/nodes?kind=harness_profile'),
+      api('/api/nodes?kind=canonical_profile'),
+      api('/api/nodes?kind=canonical_workflow'),
+      api('/api/nodes?kind=harness_skill'),
+      api('/api/nodes?kind=harness_projection'),
+      api('/api/nodes?kind=harness_observation'),
+      api('/api/nodes?kind=harness_drift'),
+    ]);
+
+    const derived = deriveHarnessViews({
+      harnesses,
+      bundles,
+      canonicalProfiles,
+      canonicalWorkflows,
+      skills,
+      projections,
+      observations,
+      drifts
+    });
+
+    const openDrifts = drifts.filter(d => {
+      const props = typeof d.properties === 'string' ? JSON.parse(d.properties) : (d.properties || {});
+      return props.status === 'open';
+    });
+
+    statsContainer.innerHTML = '';
+    const canonicalCards = [
+      { label: 'Profiles', value: canonicalProfiles.length, kind: 'canonical_profile' },
+      { label: 'Roles', value: derived.roles.length, kind: 'role_charter' },
+      { label: 'Workflows', value: canonicalWorkflows.length, kind: 'canonical_workflow' },
+      { label: 'Skills', value: skills.length, kind: 'harness_skill' },
+    ];
+    const projectionCards = [
+      { label: 'Harnesses', value: harnesses.length, kind: 'harness' },
+      { label: 'Projected Profiles', value: derived.profileDefinitions.length, kind: 'profile_definition' },
+      { label: 'Skill Bundles', value: bundles.length, kind: 'harness_profile' },
+      { label: 'Projections', value: projections.length, kind: 'harness_projection' },
+      { label: 'Observations', value: observations.length, kind: 'harness_observation' },
+      { label: 'Drift', value: drifts.length, kind: 'harness_drift' },
+      { label: 'Open Drift', value: openDrifts.length, kind: 'harness_drift', passive: true },
+    ];
+
+    statsContainer.appendChild(renderHarnessCardSection('Canonical', canonicalCards));
+    statsContainer.appendChild(renderHarnessCardSection('Projection', projectionCards));
+
+    tableContainer.innerHTML = '';
+    renderHarnessKindTable(
+      tableContainer,
+      currentHarnessNodeKind,
+      {
+        harnesses,
+        bundles,
+        canonicalProfiles,
+        canonicalWorkflows,
+        skills,
+        projections,
+        observations,
+        drifts,
+        ...derived
+      }
+    );
+  } catch (err) {
+    showError(tableContainer, 'Failed to load harnesses: ' + err.message);
+    if (statsContainer) statsContainer.innerHTML = '';
+  }
+}
+
+function renderHarnessCardSection(title, cards) {
+  const section = el('div', { style: 'width: 100%; margin-bottom: 12px;' });
+  section.appendChild(el('div', {
+    style: 'font-size: 12px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.08em; margin: 0 0 8px 2px;'
+  }, title));
+  const row = el('div', { className: 'stats-row' });
+  cards.forEach(card => {
+    const isActive = currentHarnessNodeKind === card.kind;
+    const attrs = {
+      className: 'stat-card' + (card.passive ? '' : ' clickable') + (isActive ? ' active' : ''),
+      style: card.passive
+        ? 'opacity:0.9;'
+        : (isActive ? 'outline: 2px solid var(--accent); outline-offset: 2px;' : 'cursor:pointer;'),
+    };
+    if (!card.passive) {
+      attrs.onclick = () => {
+        currentHarnessNodeKind = card.kind;
+        loadHarnesses();
+      };
+    }
+    row.appendChild(el('div', attrs,
+      el('div', { className: 'value', textContent: String(card.value) }),
+      el('div', { className: 'label', textContent: card.label })
+    ));
+  });
+  section.appendChild(row);
+  return section;
+}
+
+function deriveHarnessViews(data) {
+  harnessSyntheticNodeCache.clear();
+  const canonicalProfilesByName = new Map(
+    (data.canonicalProfiles || []).map(node => [node.name, node])
+  );
+  const roleMap = new Map();
+  const profileMap = new Map();
+  const workflowMap = new Map(
+    (data.canonicalWorkflows || []).map(node => [
+      node.id,
+      {
+        id: node.id,
+        kind: 'canonical_workflow',
+        name: node.name,
+        properties: {
+          ...parseProps(node),
+          markdown_source: 'graph',
+        },
+      }
+    ])
+  );
+
+  (data.canonicalProfiles || []).forEach(node => harnessSyntheticNodeCache.set(node.id, node));
+  (data.canonicalWorkflows || []).forEach(node => harnessSyntheticNodeCache.set(node.id, node));
+  (data.harnesses || []).forEach(node => harnessSyntheticNodeCache.set(node.id, enrichHarnessNodeCanonicalProjection(node, canonicalProfilesByName)));
+  (data.bundles || []).forEach(node => harnessSyntheticNodeCache.set(node.id, node));
+  (data.skills || []).forEach(node => harnessSyntheticNodeCache.set(node.id, node));
+  (data.projections || []).forEach(node => harnessSyntheticNodeCache.set(node.id, node));
+  (data.observations || []).forEach(node => harnessSyntheticNodeCache.set(node.id, node));
+  (data.drifts || []).forEach(node => harnessSyntheticNodeCache.set(node.id, node));
+  (data.canonicalProfiles || []).forEach(node => {
+    const props = parseProps(node);
+    const roleCharter = props.role_charter || node.name;
+    const roleId = `role_charter:${roleCharter}`;
+    if (!roleMap.has(roleId)) {
+      roleMap.set(roleId, {
+        id: roleId,
+        kind: 'role_charter',
+        name: roleCharter,
+        properties: {
+          role_charter: roleCharter,
+          runtime_kinds: [],
+          harness_ids: [],
+          canonical_profile_names: [],
+          bundle_names: [],
+          skill_refs: [],
+          markdown_source: 'derived',
+          derived_from: 'canonical profiles and harness desired state',
+        },
+      });
+    }
+    const roleNode = roleMap.get(roleId);
+    roleNode.properties.canonical_profile_names.push(node.name);
+    roleNode.properties.skill_refs.push(...(props.skill_refs || []));
+    roleNode.properties.runtime_kinds.push(...(props.supported_runtimes || []));
+  });
+
+  data.harnesses.forEach(node => {
+    const props = parseProps(node);
+    const desired = props.desired || {};
+    const runtimeKind = props.runtime_kind || 'unknown';
+    const roleCharter = desired.role_charter || 'unassigned';
+    const bundleName = desired.profile_name || null;
+    const canonicalProfileName = inferCanonicalProfileName({
+      desired,
+      runtime_kind: runtimeKind,
+      role_charter: roleCharter,
+    }, canonicalProfilesByName);
+    const skillRefs = Array.isArray(desired.skill_refs) ? desired.skill_refs : [];
+    const projectionTargets = Array.isArray(desired.projection_targets) ? desired.projection_targets : [];
+    const workflowKind = props.workflow_kind || null;
+
+    const roleId = `role_charter:${roleCharter}`;
+    if (!roleMap.has(roleId)) {
+      roleMap.set(roleId, {
+        id: roleId,
+        kind: 'role_charter',
+        name: roleCharter,
+        properties: {
+          role_charter: roleCharter,
+          runtime_kinds: [],
+          harness_ids: [],
+          canonical_profile_names: [],
+          bundle_names: [],
+          skill_refs: [],
+          markdown_source: 'derived',
+          derived_from: 'canonical profiles and harness desired state',
+        },
+      });
+    }
+    const roleNode = roleMap.get(roleId);
+    roleNode.properties.runtime_kinds.push(runtimeKind);
+    roleNode.properties.harness_ids.push(node.id);
+    if (canonicalProfileName) roleNode.properties.canonical_profile_names.push(canonicalProfileName);
+    if (bundleName) roleNode.properties.bundle_names.push(bundleName);
+    roleNode.properties.skill_refs.push(...skillRefs);
+
+    const profileSignature = [runtimeKind, canonicalProfileName || roleCharter, bundleName || 'direct-skills'].join(':');
+    const profileId = `profile_definition:${profileSignature}`;
+    if (!profileMap.has(profileId)) {
+      profileMap.set(profileId, {
+        id: profileId,
+        kind: 'profile_definition',
+        name: `${runtimeKind} / ${canonicalProfileName || roleCharter}${bundleName ? ` / ${bundleName}` : ''}`,
+        properties: {
+          runtime_kind: runtimeKind,
+          role_charter: roleCharter,
+          canonical_profile_name: canonicalProfileName,
+          inferred_canonical_profile_name: canonicalProfileName,
+          bundle_name: bundleName,
+          skill_refs: [],
+          harness_ids: [],
+          projection_targets: [],
+          markdown_source: 'derived',
+          derived_from: 'harness desired state',
+        },
+      });
+    }
+    const profileNode = profileMap.get(profileId);
+    profileNode.properties.harness_ids.push(node.id);
+    profileNode.properties.skill_refs.push(...skillRefs);
+    profileNode.properties.projection_targets.push(...projectionTargets.map(t => t.path).filter(Boolean));
+
+    if (workflowKind) {
+      const workflowId = `workflow_definition:${workflowKind}`;
+      if (!workflowMap.has(workflowId)) {
+        workflowMap.set(workflowId, {
+          id: workflowId,
+          kind: 'workflow_definition',
+          name: workflowKind,
+          properties: {
+            workflow_kind: workflowKind,
+            harness_ids: [],
+            role_charters: [],
+            canonical_profile_names: [],
+            bundle_names: [],
+            skill_refs: [],
+            markdown_source: 'derived',
+            derived_from: 'harness desired state',
+          },
+        });
+      }
+      const workflowNode = workflowMap.get(workflowId);
+      workflowNode.properties.harness_ids.push(node.id);
+      workflowNode.properties.role_charters.push(roleCharter);
+      if (canonicalProfileName) workflowNode.properties.canonical_profile_names.push(canonicalProfileName);
+      if (bundleName) workflowNode.properties.bundle_names.push(bundleName);
+      workflowNode.properties.skill_refs.push(...skillRefs);
+    }
+  });
+
+  const dedupeArrays = node => {
+    Object.entries(node.properties || {}).forEach(([key, value]) => {
+      if (Array.isArray(value)) {
+        node.properties[key] = [...new Set(value.filter(Boolean))];
+      }
+    });
+    harnessSyntheticNodeCache.set(node.id, node);
+    return node;
+  };
+
+  return {
+    profileDefinitions: [...profileMap.values()].map(dedupeArrays),
+    roles: [...roleMap.values()].map(dedupeArrays),
+    workflows: [...workflowMap.values()].map(dedupeArrays),
+  };
+}
+
+function renderHarnessKindTable(container, kind, data) {
+  const registry = {
+    harness: {
+      title: 'Harness Nodes',
+      rows: data.harnesses,
+      columns: ['Harness', 'Runtime', 'Profile', 'Bundle', 'Drift', 'Projection'],
+      renderRow(node) {
+        const props = parseProps(node);
+        const desired = props.desired || {};
+        const observed = props.observed_summary || {};
+        const projectionPath = ((desired.projection_targets || [])[0] || {}).path || '—';
+        const bundle = desired.profile_name || '—';
+        const profile = desired.role_charter || '—';
+        const drift = observed.drift_status || 'unknown';
+        const driftClass = driftBadgeClass(drift);
+        return [
+          node.name || node.id,
+          badgeKind(props.runtime_kind || '—'),
+          profile,
+          bundle,
+          badgeStatus(driftClass, drift),
+          projectionPathCell(projectionPath),
+        ];
+      }
+    },
+    profile_definition: {
+      title: 'Projected Profiles',
+      subtitle: 'Projected profiles show how canonical profiles land in each harness runtime after adapter-specific projection.',
+      rows: data.profileDefinitions,
+      columns: ['Profile', 'Runtime', 'Canonical', 'Role', 'Skill Bundle', 'Harnesses'],
+      renderRow(node) {
+        const props = parseProps(node);
+        return [
+          node.name,
+          badgeKind(props.runtime_kind || '—'),
+          props.canonical_profile_name || '—',
+          props.role_charter || '—',
+          props.bundle_name || '—',
+          String((props.harness_ids || []).length),
+        ];
+      }
+    },
+    canonical_profile: {
+      title: 'Canonical Profiles',
+      subtitle: 'Shared agent definitions that should stay as similar as possible across Codex, Claude Code, and other harnesses.',
+      rows: data.canonicalProfiles,
+      columns: ['Profile', 'Role', 'Skills', 'Runtimes', 'Description'],
+      renderRow(node) {
+        const props = parseProps(node);
+        return [
+          node.name,
+          props.role_charter || '—',
+          (props.skill_refs || []).join(', ') || '—',
+          (props.supported_runtimes || []).join(', ') || '—',
+          props.description || '—',
+        ];
+      }
+    },
+    role_charter: {
+      title: 'Role Charters',
+      subtitle: 'Roles are semantic responsibilities in the canonical layer. This view is derived from canonical profiles and live harness desired state.',
+      rows: data.roles,
+      columns: ['Role', 'Canonical Profiles', 'Runtimes', 'Skill Bundles', 'Harnesses'],
+      renderRow(node) {
+        const props = parseProps(node);
+        return [
+          node.name,
+          (props.canonical_profile_names || []).join(', ') || '—',
+          (props.runtime_kinds || []).join(', ') || '—',
+          (props.bundle_names || []).join(', ') || '—',
+          String((props.harness_ids || []).length),
+        ];
+      }
+    },
+    canonical_workflow: {
+      title: 'Canonical Workflows',
+      subtitle: 'Shared process definitions across harnesses. Projection differences belong in the adapter layer, not here.',
+      rows: data.canonicalWorkflows,
+      columns: ['Workflow', 'Phase Roles', 'Description', 'Status'],
+      renderRow(node) {
+        const props = parseProps(node);
+        return [
+          node.name,
+          (props.phase_roles || []).join(', ') || '—',
+          props.description || '—',
+          badgeStatus('implemented', props.status || 'active'),
+        ];
+      }
+    },
+    harness_profile: {
+      title: 'Skill Bundles',
+      subtitle: 'These are current `harness_profile` nodes. They are reusable skill bundles, not full agent profiles.',
+      rows: data.profiles,
+      columns: ['Bundle', 'Skills', 'Description', 'Status'],
+      renderRow(node) {
+        const props = parseProps(node);
+        return [
+          node.name,
+          (props.skills || []).join(', ') || '—',
+          props.description || '—',
+          badgeStatus('implemented', props.status || 'active'),
+        ];
+      }
+    },
+    harness_skill: {
+      title: 'Canonical Skills',
+      subtitle: 'Instruction-bundle skills intended to be shared across harnesses whenever possible.',
+      rows: data.skills,
+      columns: ['Skill', 'Description', 'Status'],
+      renderRow(node) {
+        const props = parseProps(node);
+        return [
+          node.name,
+          props.description || '—',
+          badgeStatus('implemented', props.status || 'active'),
+        ];
+      }
+    },
+    harness_projection: {
+      title: 'Projections',
+      rows: data.projections,
+      columns: ['Projection', 'Harness', 'Target', 'Status', 'Rendered At'],
+      renderRow(node) {
+        const props = parseProps(node);
+        return [
+          node.name,
+          props.harness_id || '—',
+          projectionPathCell(props.target_path || '—'),
+          badgeStatus('implemented', props.render_status || 'rendered'),
+          props.rendered_at || '—',
+        ];
+      }
+    },
+    harness_observation: {
+      title: 'Observations',
+      rows: data.observations,
+      columns: ['Observation', 'Harness', 'Status', 'Freshness', 'Observed At'],
+      renderRow(node) {
+        const props = parseProps(node);
+        return [
+          node.name,
+          props.harness_id || '—',
+          badgeStatus(props.status === 'ok' ? 'implemented' : 'deferred', props.status || '—'),
+          props.freshness || '—',
+          props.observed_at || '—',
+        ];
+      }
+    },
+    harness_drift: {
+      title: 'Drift Incidents',
+      rows: data.drifts,
+      columns: ['Drift', 'Harness', 'Class', 'Severity', 'Status'],
+      renderRow(node) {
+        const props = parseProps(node);
+        return [
+          node.name,
+          props.harness_id || '—',
+          props.drift_class || '—',
+          props.severity || '—',
+          badgeStatus(props.status === 'resolved' ? 'implemented' : 'deferred', props.status || '—'),
+        ];
+      }
+    },
+  };
+
+  const config = registry[kind] || registry.harness;
+  container.innerHTML = '';
+  container.appendChild(el('h3', { textContent: config.title, style: 'margin: 0 0 12px 0;' }));
+  if (config.subtitle) {
+    container.appendChild(el('div', {
+      style: 'margin: 0 0 12px 0; color: var(--text-secondary); font-size: 12px;'
+    }, config.subtitle));
+  }
+  if (!config.rows || config.rows.length === 0) {
+    container.appendChild(el('div', {
+      style: 'padding: 16px; color: var(--text-secondary);'
+    }, 'No items found'));
+    return;
+  }
+
+  const table = el('table');
+  const thead = el('thead', null, el('tr', null, ...config.columns.map(label => el('th', { textContent: label }))));
+  table.appendChild(thead);
+  const tbody = el('tbody');
+  config.rows.forEach(node => {
+    const row = el('tr', {
+      className: 'clickable',
+      onclick: () => showHarnessDetail(node.id),
+    });
+    config.renderRow(node).forEach(cell => {
+      if (typeof cell === 'string') {
+        row.appendChild(el('td', { textContent: cell }));
+      } else {
+        row.appendChild(el('td', null, cell));
+      }
+    });
+    tbody.appendChild(row);
+  });
+  table.appendChild(tbody);
+  container.appendChild(table);
+}
+
+async function showHarnessDetail(id) {
+  currentHarnessId = typeof id === 'string' ? id : id.id;
+  switchView('harness-detail', true);
+  await loadHarnessDetail(currentHarnessId);
+}
+
+function refreshHarnessDetail() {
+  if (currentHarnessId) loadHarnessDetail(currentHarnessId);
+}
+
+async function loadHarnessDetail(id) {
+  const container = document.getElementById('harness-detail-content');
+  container.innerHTML = '<div class="loading">Loading harness detail…</div>';
+  try {
+    const rawData = harnessSyntheticNodeCache.get(id) || await api('/api/nodes/' + encodeURIComponent(id));
+    const data = await maybeEnrichHarnessDetailNode(rawData);
+    const props = typeof data.properties === 'string' ? JSON.parse(data.properties) : (data.properties || {});
+
+    const page = el('div', null);
+    page.appendChild(el('div', { className: 'page-nav' },
+      el('span', { className: 'page-nav-link', onclick: backToHarnesses, textContent: 'Harnesses' }),
+      el('span', { className: 'page-nav-separator', textContent: '/' }),
+      el('span', { className: 'page-nav-current', textContent: data.name || id })
+    ));
+
+    page.appendChild(el('h2', null,
+      data.name || id,
+      el('span', {
+        className: 'badge badge-kind',
+        style: 'margin-left: 12px; font-size: 12px;',
+        textContent: data.kind
+      })
+    ));
+
+    const tabs = el('div', { className: 'diagram-tabs' });
+    const tabContainer = el('div', { className: 'diagram-container' });
+    const tabDefs = [
+      { id: 'summary', label: 'Summary' },
+      { id: 'graph', label: 'Graph' },
+      { id: 'table', label: 'Table' },
+      { id: 'markdown', label: 'Markdown' },
+    ];
+    tabDefs.forEach((tab, index) => {
+      tabs.appendChild(el('button', {
+        className: 'diagram-tab' + (index === 0 ? ' active' : ''),
+        textContent: tab.label,
+        onclick: () => switchHarnessDetailTab(tab.id, data, tabContainer),
+      }));
+    });
+    page.appendChild(tabs);
+    page.appendChild(tabContainer);
+    await switchHarnessDetailTab('summary', data, tabContainer);
+
+    container.innerHTML = '';
+    container.appendChild(page);
+  } catch (err) {
+    showError(container, 'Failed to load harness detail: ' + err.message);
+  }
+}
+
+async function maybeEnrichHarnessDetailNode(node) {
+  if (!node || !['harness', 'profile_definition'].includes(node.kind)) return node;
+  const props = parseProps(node);
+  if (resolveCanonicalProfileName(props)) return node;
+  const canonicalProfiles = await api('/api/nodes?kind=canonical_profile');
+  const canonicalProfilesByName = new Map((canonicalProfiles || []).map(profile => [profile.name, profile]));
+  return enrichHarnessNodeCanonicalProjection(node, canonicalProfilesByName);
+}
+
+async function switchHarnessDetailTab(tabId, node, container) {
+  const tabs = container.parentElement.querySelectorAll('.diagram-tab');
+  const tabOrder = ['summary', 'graph', 'table', 'markdown'];
+  tabs.forEach((tab, index) => tab.classList.toggle('active', tabOrder[index] === tabId));
+
+  if (tabId === 'graph') {
+    container.innerHTML = '';
+    await renderHarnessGraphTab(node, container);
+  } else if (tabId === 'table') {
+    renderHarnessTableTab(node, container);
+  } else if (tabId === 'markdown') {
+    renderHarnessMarkdownTab(node, container);
+  } else {
+    renderHarnessSummaryTab(node, container);
+  }
+}
+
+function renderHarnessSummaryTab(node, container) {
+  const props = parseProps(node);
+  const desired = props.desired || {};
+  const observed = props.observed_summary || {};
+  const rendered = props.rendered || {};
+  container.innerHTML = '';
+  const sourceBanner = renderHarnessRelationshipBanner(node, props);
+  if (sourceBanner) container.appendChild(sourceBanner);
+
+  const sections = buildHarnessSummarySections(node, props, desired, observed, rendered);
+  sections.forEach(section => container.appendChild(renderHarnessDetailSection(section)));
+}
+
+async function renderHarnessGraphTab(node, container) {
+  container.innerHTML = '';
+  const drill = el('div', { className: 'detail-section' });
+  drill.appendChild(el('h4', { textContent: 'Graph Drill-Down' }));
+  const props = parseProps(node);
+  if (props.derived_from) {
+    drill.appendChild(el('div', { style: 'color:var(--text-secondary);font-size:12px;margin-bottom:12px;' },
+      `This view is derived from ${props.derived_from}. Synthetic items do not yet have first-class graph edges.`
+    ));
+    const table = el('table');
+    const thead = el('thead', null, el('tr', null,
+      el('th', { textContent: 'Field' }),
+      el('th', { textContent: 'Value' })
+    ));
+    const tbody = el('tbody');
+    Object.entries(flattenObject(props)).forEach(([key, value]) => {
+      tbody.appendChild(el('tr', null,
+        el('td', { textContent: key, style: 'font-family:var(--mono);font-size:12px;' }),
+        el('td', { textContent: Array.isArray(value) ? value.join(', ') : String(value) })
+      ));
+    });
+    table.appendChild(thead);
+    table.appendChild(tbody);
+    drill.appendChild(table);
+    container.appendChild(drill);
+    return;
+  }
+  drill.appendChild(el('div', { style: 'color:var(--text-secondary);font-size:12px;margin-bottom:12px;' },
+    'Hierarchy, parents, children, and related nodes for this harness subgraph item.'
+  ));
+  const treeContainer = el('div', null);
+  drill.appendChild(treeContainer);
+  container.appendChild(drill);
+  await renderHierarchyTree(node.id, treeContainer);
+}
+
+function renderHarnessTableTab(node, container) {
+  const props = parseProps(node);
+  container.innerHTML = '';
+  const section = el('div', { className: 'detail-section' });
+  section.appendChild(el('h4', { textContent: 'Tabular Properties' }));
+  const table = el('table');
+  const thead = el('thead', null, el('tr', null,
+    el('th', { textContent: 'Field' }),
+    el('th', { textContent: 'Value' })
+  ));
+  const tbody = el('tbody');
+  Object.entries(flattenObject(props)).forEach(([key, value]) => {
+    tbody.appendChild(el('tr', null,
+      el('td', { textContent: key, style: 'font-family:var(--mono);font-size:12px;' }),
+      el('td', { textContent: Array.isArray(value) ? value.join(', ') : String(value) })
+    ));
+  });
+  table.appendChild(thead);
+  table.appendChild(tbody);
+  section.appendChild(table);
+  container.appendChild(section);
+}
+
+function renderHarnessMarkdownTab(node, container) {
+  container.innerHTML = '';
+  const meta = getHarnessMarkdownMeta(node, parseProps(node));
+  container.appendChild(el('div', {
+    style: 'margin: 0 0 12px 0; color: var(--text-secondary); font-size: 12px;'
+  }, `${meta.label}: ${meta.description}`));
+  const wrapper = el('div', { className: 'markdown-content' });
+  wrapper.innerHTML = renderHarnessMarkdown(node);
+  container.appendChild(wrapper);
+}
+
+function renderHarnessRelationshipBanner(node, props) {
+  const cards = getHarnessRelationshipCards(node, props);
+  if (!cards.length) return null;
+  const banner = el('div', { className: 'harness-relationship-banner' });
+  cards.forEach(card => {
+    const cardEl = el('div', { className: 'harness-relationship-card' });
+    cardEl.appendChild(el('div', { className: 'eyebrow', textContent: card.label }));
+    cardEl.appendChild(el('div', { className: 'title', textContent: card.value }));
+    if (card.note) {
+      cardEl.appendChild(el('div', { className: 'note', textContent: card.note }));
+    }
+    banner.appendChild(cardEl);
+  });
+  return banner;
+}
+
+function getHarnessRelationshipCards(node, props) {
+  const desired = props.desired || {};
+  const cards = [];
+  const canonicalProfile = resolveCanonicalProfileName(props);
+  const roleCharter = desired.role_charter || props.role_charter;
+  const skillBundle = desired.profile_name || props.bundle_name;
+  const kindLabels = {
+    harness: 'Projected Harness',
+    profile_definition: 'Projected Profile',
+    canonical_profile: 'Canonical Profile',
+    harness_profile: 'Skill Bundle',
+    role_charter: 'Role Charter',
+    canonical_workflow: 'Canonical Workflow',
+    workflow_definition: 'Derived Workflow View',
+    harness_projection: 'Projection Artifact',
+    harness_observation: 'Observed State',
+    harness_drift: 'Drift Incident',
+    harness_skill: 'Canonical Skill',
+  };
+
+  cards.push({
+    label: 'This View',
+    value: kindLabels[node.kind] || node.kind,
+    note: getHarnessKindExplanation(node.kind, props),
+  });
+  if (canonicalProfile) {
+    cards.push({
+      label: 'Canonical Profile',
+      value: canonicalProfile,
+      note: 'Shared profile defined in the canonical layer before any harness-specific projection.',
+    });
+  }
+  if (roleCharter) {
+    cards.push({
+      label: 'Role Charter',
+      value: roleCharter,
+      note: 'Semantic responsibility carried by the canonical profile or applied directly in desired harness state.',
+    });
+  }
+  if (skillBundle) {
+    cards.push({
+      label: 'Skill Bundle',
+      value: skillBundle,
+      note: node.kind === 'harness_profile'
+        ? 'Reusable harness-local skill bundle. This is projection-side configuration, not the canonical profile itself.'
+        : 'Reusable harness-local bundle assigned on top of the canonical role/profile relationship.',
+    });
+  }
+  return cards;
+}
+
+function getHarnessKindExplanation(kind, props) {
+  if (props.derived_from) {
+    return `Derived summary synthesized from ${props.derived_from}. Helpful for orientation, not a first-class source node.`;
+  }
+  if (kind === 'harness') {
+    return 'Runtime-specific desired/rendered/observed state for one harness projection target.';
+  }
+  if (kind === 'canonical_profile') {
+    return 'Shared definition intended to project into multiple harness runtimes without losing the common identity.';
+  }
+  if (kind === 'harness_profile') {
+    return 'Projection-layer bundle of skills. The naming irony is real: this is not the canonical profile document.';
+  }
+  if (kind === 'harness_projection') {
+    return 'Rendered output tracked in the graph so the UI can show where the projection landed.';
+  }
+  return 'Source-aware graph detail for the harness control plane.';
+}
+
+function buildHarnessSummarySections(node, props, desired, observed, rendered) {
+  const sections = [];
+  const canonicalProfile = resolveCanonicalProfileName(props);
+  const projectedProfile = node.kind === 'profile_definition'
+    ? node.name
+    : (props.profile_name || props.bundle_name);
+  const projectedSkillBundle = desired.profile_name || props.bundle_name || (node.kind === 'harness_profile' ? node.name : '');
+  const projectionTargets = formatList(preferArray(
+    ((desired.projection_targets || []).map(target => target.path).filter(Boolean)),
+    props.projection_targets
+  )) || props.target_path || node.file_path;
+
+  const canonicalSection = {
+    title: 'Canonical Layer',
+    intro: 'Shared definitions that should remain stable across Codex, Claude Code, and other harness projections.',
+    fields: [],
+  };
+  pushField(canonicalSection.fields, 'Canonical Profile', canonicalProfile);
+  pushField(canonicalSection.fields, 'Role Charter', desired.role_charter || props.role_charter);
+  pushField(canonicalSection.fields, 'Canonical Skills', formatList(preferArray(desired.skill_refs, props.skill_refs)));
+  pushField(canonicalSection.fields, 'Supported Runtimes', formatList(props.supported_runtimes));
+  pushField(canonicalSection.fields, 'Workflow Kind', props.workflow_kind);
+  pushField(canonicalSection.fields, 'Phase Roles', formatList(props.phase_roles));
+  if (canonicalSection.fields.length) sections.push(canonicalSection);
+
+  const projectedSection = {
+    title: 'Projection Layer',
+    intro: 'Harness-specific choices applied when the canonical relationship is projected into a runtime.',
+    fields: [],
+  };
+  pushField(projectedSection.fields, 'Harness', node.kind === 'harness' ? (node.name || node.id) : formatList(props.harness_ids));
+  pushField(projectedSection.fields, 'Runtime', props.runtime_kind || formatList(props.runtime_kinds));
+  pushField(projectedSection.fields, 'Projected Profile', projectedProfile);
+  pushField(projectedSection.fields, 'Skill Bundle', projectedSkillBundle);
+  pushField(projectedSection.fields, 'Bundle Skills', formatList(props.skills));
+  pushField(projectedSection.fields, 'Projection Target', projectionTargets);
+  if (projectedSection.fields.length) sections.push(projectedSection);
+
+  if (props.derived_from) {
+    const derivedSection = {
+      title: 'Derived View',
+      intro: 'Synthetic graph summaries are convenient, but they are derived from source records rather than being the source of truth themselves.',
+      fields: [],
+    };
+    pushField(derivedSection.fields, 'Derived From', props.derived_from);
+    pushField(derivedSection.fields, 'Canonical Profiles', formatList(props.canonical_profile_names));
+    pushField(derivedSection.fields, 'Role Charters', formatList(props.role_charters));
+    pushField(derivedSection.fields, 'Skill Bundles', formatList(props.bundle_names));
+    pushField(derivedSection.fields, 'Harnesses', formatList(props.harness_ids));
+    if (derivedSection.fields.length) sections.push(derivedSection);
+  }
+
+  const runtimeSection = {
+    title: 'Rendered And Observed State',
+    intro: 'What the projection rendered, what the runtime last reported back, and whether drift is currently visible.',
+    fields: [],
+  };
+  pushField(runtimeSection.fields, 'Rendered At', rendered.rendered_at || props.rendered_at);
+  pushField(runtimeSection.fields, 'Rendered Hash', rendered.config_hash || props.content_hash || props.profile_hash);
+  pushField(runtimeSection.fields, 'Observed Status', observed.status || props.status);
+  pushField(runtimeSection.fields, 'Observed Drift', observed.drift_status);
+  pushField(runtimeSection.fields, 'Last Checked', observed.last_checked_at || props.observed_at);
+  pushField(runtimeSection.fields, 'Freshness', observed.freshness || props.freshness);
+  if (runtimeSection.fields.length) sections.push(runtimeSection);
+
+  const metadataSection = {
+    title: 'Notes',
+    intro: 'Supporting description and classification fields that help explain the relationship without pretending to redefine it.',
+    fields: [],
+  };
+  pushField(metadataSection.fields, 'Description', props.description);
+  pushField(metadataSection.fields, 'Kind', node.kind);
+  pushField(metadataSection.fields, 'Markdown Source', props.markdown_source);
+  if (metadataSection.fields.length) sections.push(metadataSection);
+
+  return sections;
+}
+
+function renderHarnessDetailSection(section) {
+  const wrapper = el('div', { className: 'detail-section' });
+  wrapper.appendChild(el('h4', { textContent: section.title }));
+  if (section.intro) {
+    wrapper.appendChild(el('div', { className: 'harness-section-intro', textContent: section.intro }));
+  }
+  const grid = el('div', { className: 'detail-props' });
+  section.fields.forEach(field => {
+    grid.appendChild(el('span', { className: 'prop-key', textContent: field.label }));
+    grid.appendChild(el('span', { className: 'prop-val', textContent: field.value }));
+  });
+  wrapper.appendChild(grid);
+  return wrapper;
+}
+
+function pushField(fields, label, value) {
+  const normalized = normalizeHarnessFieldValue(value);
+  if (!normalized) return;
+  fields.push({ label, value: normalized });
+}
+
+function normalizeHarnessFieldValue(value) {
+  if (Array.isArray(value)) return formatList(value);
+  if (value === null || value === undefined) return '';
+  const text = String(value).trim();
+  return text && text !== '—' ? text : '';
+}
+
+function preferArray(primary, fallback) {
+  return Array.isArray(primary) && primary.length ? primary : fallback;
+}
+
+function formatList(items) {
+  if (!Array.isArray(items)) return normalizeHarnessFieldValue(items);
+  const values = items
+    .filter(Boolean)
+    .map(item => String(item).trim())
+    .filter(Boolean);
+  return values.length ? [...new Set(values)].join(', ') : '';
+}
+
+function resolveCanonicalProfileName(props) {
+  const desired = props.desired || {};
+  return desired.canonical_profile_name
+    || props.canonical_profile_name
+    || props.inferred_canonical_profile_name
+    || (Array.isArray(props.canonical_profile_names) && props.canonical_profile_names.length === 1 ? props.canonical_profile_names[0] : '');
+}
+
+function enrichHarnessNodeCanonicalProjection(node, canonicalProfilesByName) {
+  const props = parseProps(node);
+  const inferred = inferCanonicalProfileName(props, canonicalProfilesByName);
+  if (!inferred) return node;
+  return {
+    ...node,
+    properties: {
+      ...props,
+      inferred_canonical_profile_name: inferred,
+    },
+  };
+}
+
+function inferCanonicalProfileName(props, canonicalProfilesByName) {
+  const desired = props.desired || {};
+  if (desired.canonical_profile_name) return desired.canonical_profile_name;
+  if (props.canonical_profile_name) return props.canonical_profile_name;
+
+  const roleCharter = desired.role_charter || props.role_charter;
+  if (!roleCharter) return '';
+  const runtimeKind = props.runtime_kind;
+  const matches = [...canonicalProfilesByName.values()].filter(node => {
+    const profileProps = parseProps(node);
+    if ((profileProps.role_charter || node.name) !== roleCharter) return false;
+    const supported = Array.isArray(profileProps.supported_runtimes) ? profileProps.supported_runtimes : [];
+    return !runtimeKind || !supported.length || supported.includes(runtimeKind);
+  });
+  if (matches.length === 1) return matches[0].name;
+  return '';
+}
+
+function renderHarnessMarkdown(node) {
+  const props = parseProps(node);
+  const desired = props.desired || {};
+  const observed = props.observed_summary || {};
+  const rendered = props.rendered || {};
+  const canonicalProfile = resolveCanonicalProfileName(props);
+  const heading = `# ${node.name || node.id}`;
+  const lines = [heading, '', `- Kind: \`${node.kind}\``];
+
+  if (props.runtime_kind) lines.push(`- Runtime: \`${props.runtime_kind}\``);
+  if (canonicalProfile) lines.push(`- Canonical profile: \`${canonicalProfile}\``);
+  if (desired.role_charter || props.role_charter) lines.push(`- Role charter: \`${desired.role_charter || props.role_charter}\``);
+  if (desired.profile_name || props.bundle_name) lines.push(`- Assigned skill bundle: \`${desired.profile_name || props.bundle_name}\``);
+  if (Array.isArray(desired.skill_refs) && desired.skill_refs.length) {
+    lines.push(`- Skills: ${desired.skill_refs.map(s => `\`${s}\``).join(', ')}`);
+  }
+  if (Array.isArray(props.skill_refs) && props.skill_refs.length) {
+    lines.push(`- Skills: ${props.skill_refs.map(s => `\`${s}\``).join(', ')}`);
+  }
+  if (Array.isArray(props.skills) && props.skills.length) {
+    lines.push(`- Bundle skills: ${props.skills.map(s => `\`${s}\``).join(', ')}`);
+  }
+  if (Array.isArray(props.runtime_kinds) && props.runtime_kinds.length) lines.push(`- Runtimes: ${props.runtime_kinds.map(s => `\`${s}\``).join(', ')}`);
+  if (Array.isArray(props.supported_runtimes) && props.supported_runtimes.length) lines.push(`- Supported runtimes: ${props.supported_runtimes.map(s => `\`${s}\``).join(', ')}`);
+  if (Array.isArray(props.bundle_names) && props.bundle_names.length) lines.push(`- Skill bundles: ${props.bundle_names.map(s => `\`${s}\``).join(', ')}`);
+  if (Array.isArray(props.canonical_profile_names) && props.canonical_profile_names.length) lines.push(`- Canonical profiles: ${props.canonical_profile_names.map(s => `\`${s}\``).join(', ')}`);
+  if (Array.isArray(props.role_charters) && props.role_charters.length) lines.push(`- Roles: ${props.role_charters.map(s => `\`${s}\``).join(', ')}`);
+  if (Array.isArray(props.phase_roles) && props.phase_roles.length) lines.push(`- Phase roles: ${props.phase_roles.map(s => `\`${s}\``).join(', ')}`);
+  if (Array.isArray(props.harness_ids) && props.harness_ids.length) lines.push(`- Harnesses: ${props.harness_ids.map(s => `\`${s}\``).join(', ')}`);
+  if (props.description) lines.push(`- Description: ${props.description}`);
+  if (props.workflow_kind) lines.push(`- Workflow kind: \`${props.workflow_kind}\``);
+  if (props.derived_from) lines.push(`- Derived from: ${props.derived_from}`);
+  if (rendered.rendered_at || props.rendered_at) lines.push(`- Rendered at: \`${rendered.rendered_at || props.rendered_at}\``);
+  if (rendered.config_hash || props.content_hash || props.profile_hash) lines.push(`- Hash: \`${rendered.config_hash || props.content_hash || props.profile_hash}\``);
+  if (observed.status || props.status) lines.push(`- Status: \`${observed.status || props.status}\``);
+  if (observed.drift_status) lines.push(`- Drift: \`${observed.drift_status}\``);
+  if (((desired.projection_targets || [])[0] || {}).path || props.target_path || node.file_path) {
+    lines.push(`- Projection target: \`${((desired.projection_targets || [])[0] || {}).path || props.target_path || node.file_path}\``);
+  }
+
+  lines.push('', '## Raw JSON', '', '```json', escapeHtml(JSON.stringify(props, null, 2)), '```');
+  if (typeof marked !== 'undefined') {
+    marked.setOptions({ headerIds: false, mangle: false, sanitize: false });
+    return marked.parse(lines.join('\n'));
+  }
+  return `<pre>${escapeHtml(lines.join('\n'))}</pre>`;
+}
+
+function parseProps(node) {
+  return typeof node.properties === 'string' ? JSON.parse(node.properties) : (node.properties || {});
+}
+
+function getHarnessMarkdownMeta(node, props) {
+  if (props.derived_from) {
+    return {
+      label: 'Derived Markdown Summary',
+      description: `This item is synthesized from ${props.derived_from}; there is no first-class source markdown node yet.`,
+    };
+  }
+  if (node.kind === 'harness_projection' && typeof props.target_path === 'string' && props.target_path.endsWith('.md')) {
+    return {
+      label: 'Rendered Markdown Projection',
+      description: 'This represents markdown rendered into a local harness file. The UI is summarizing the graph record, not reading the filesystem file directly.',
+    };
+  }
+  if (node.kind === 'harness_skill') {
+    return {
+      label: 'Canonical Skill Summary',
+      description: 'Canonical skills live in the graph here, but their source SKILL.md packages are not yet indexed into this UI path.',
+    };
+  }
+  if (node.kind === 'harness_profile') {
+    return {
+      label: 'Derived Skill Bundle Summary',
+      description: 'Current harness_profile nodes behave as reusable skill bundles. They are not full agent profile documents yet.',
+    };
+  }
+  if (node.kind === 'canonical_profile') {
+    return {
+      label: 'Canonical Profile Summary',
+      description: 'This is a first-class shared profile definition intended to project into multiple harnesses.',
+    };
+  }
+  if (node.kind === 'canonical_workflow') {
+    return {
+      label: 'Canonical Workflow Summary',
+      description: 'This is a first-class shared workflow definition intended to stay stable across harnesses.',
+    };
+  }
+  return {
+    label: 'Derived Graph Summary',
+    description: 'This markdown view is rendered from graph properties for review convenience.',
+  };
+}
+
+function flattenObject(value, prefix = '', output = {}) {
+  if (Array.isArray(value)) {
+    output[prefix || 'value'] = value;
+    return output;
+  }
+  if (value && typeof value === 'object') {
+    Object.entries(value).forEach(([key, inner]) => {
+      const next = prefix ? `${prefix}.${key}` : key;
+      if (inner && typeof inner === 'object' && !Array.isArray(inner)) {
+        flattenObject(inner, next, output);
+      } else {
+        output[next] = inner;
+      }
+    });
+    return output;
+  }
+  output[prefix || 'value'] = value;
+  return output;
+}
+
+function driftBadgeClass(drift) {
+  if (drift === 'clean') return 'implemented';
+  if (drift === 'pending_verify') return 'accepted';
+  if (drift === 'drifted') return 'deferred';
+  return 'proposed';
+}
+
+function badgeKind(text) {
+  return el('span', { className: 'badge badge-kind', textContent: text });
+}
+
+function badgeStatus(kind, text) {
+  return el('span', { className: 'badge badge-' + kind, textContent: text });
+}
+
+function projectionPathCell(text) {
+  return el('span', {
+    textContent: text,
+    style: 'font-size:12px;color:var(--text-secondary);max-width:320px;overflow:hidden;text-overflow:ellipsis;display:inline-block;vertical-align:bottom;'
+  });
+}
+
+function escapeHtml(text) {
+  return String(text)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;');
 }
 
 async function loadTaskDetail(id) {
@@ -3691,6 +5327,15 @@ function navigateToNode(node) {
     showSeamDetail(node.id);
   } else if (kind === 'task') {
     showTaskDetail(node.id);
+  } else if (kind && (
+    kind.startsWith('harness')
+    || kind === 'profile_definition'
+    || kind === 'role_charter'
+    || kind === 'workflow_definition'
+    || kind === 'canonical_profile'
+    || kind === 'canonical_workflow'
+  )) {
+    showHarnessDetail(node.id || node);
   } else if (kind === 'crate') {
     showCrateDetail(node.name);
   } else {
@@ -3837,9 +5482,8 @@ async function loadLiveSessions() {
   container.innerHTML = '<div class="loading">Loading active sessions…</div>';
   
   try {
-    // Get active sessions
-    const sessions = await api('/api/nodes?kind=session');
-    const activeSessions = sessions.filter(s => s.properties?.status === 'active');
+    const dashboard = await api('/api/dashboard');
+    const activeSessions = dashboard.active_sessions || [];
     
     if (activeSessions.length === 0) {
       container.innerHTML = '<div class="empty-state">No active agent sessions</div>';
@@ -3848,27 +5492,95 @@ async function loadLiveSessions() {
     
     container.innerHTML = '';
     const grid = el('div', { className: 'live-sessions-grid' });
+    const worktreeCounts = new Map();
+
+    for (const session of activeSessions) {
+      const worktreePath = session.worktree_path || null;
+      if (!worktreePath) continue;
+      worktreeCounts.set(worktreePath, (worktreeCounts.get(worktreePath) || 0) + 1);
+    }
     
     for (const session of activeSessions) {
-      const props = session.properties || {};
-      const seamId = props.seam_id;
+      const seamId = session.seam_id;
+      const telemetry = sessionTelemetryState(session);
+      const harnessId = session.harness_id || null;
+      const workflowName = session.workflow_name || null;
+      const branch = session.branch || null;
+      const worktreePath = session.worktree_path || null;
+      const sharedWorktreeCount = worktreePath ? (worktreeCounts.get(worktreePath) || 0) : 0;
+      const sharedWorktree = sharedWorktreeCount > 1;
+      const telemetryMessage = telemetry.telemetryEmpty
+        ? 'Telemetry gap: files, lines, tests, tokens, and elapsed time have not been reported yet'
+        : telemetry.telemetryGap
+          ? `Telemetry gap: missing ${telemetry.missing.join(', ')}`
+          : null;
+      // Build metrics row before card creation
+      const metricsRow = el('div', { className: 'live-session-meta', style: 'display: flex; gap: 16px; flex-wrap: wrap; margin-top: 4px;' });
+      
+      // File metric
+      metricsRow.appendChild(el('span', { 
+        style: `font-size: 12px; ${telemetry.filesTouched > 0 ? 'color: var(--text);' : 'color: var(--muted);'}`,
+        title: telemetry.filesTouched > 0 ? `${telemetry.filesTouched} files touched` : 'Files not reported'
+      }, `📄 ${telemetry.filesTouched > 0 ? telemetry.filesTouched : '—'}`));
+      
+      // Lines metric
+      metricsRow.appendChild(el('span', { 
+        style: `font-size: 12px; ${telemetry.linesChanged > 0 ? 'color: var(--text);' : 'color: var(--muted);'}`,
+        title: telemetry.linesChanged > 0 ? `${telemetry.linesChanged} lines changed` : 'Lines not reported'
+      }, `📝 ${telemetry.linesChanged > 0 ? telemetry.linesChanged : '—'}`));
+      
+      // Tests metric
+      const testColor = telemetry.testRuns > 0 ? 'var(--success)' : 'var(--muted)';
+      metricsRow.appendChild(el('span', { 
+        style: `font-size: 12px; color: ${testColor};`,
+        title: telemetry.testRuns > 0 ? `${telemetry.testRuns} test runs` : 'Tests not reported'
+      }, `🧪 ${telemetry.testRuns > 0 ? telemetry.testRuns : '—'}`));
+      
+      // Elapsed metric
+      const hasElapsed = telemetry.elapsedMs > 0;
+      metricsRow.appendChild(el('span', { 
+        style: `font-size: 12px; ${hasElapsed ? 'color: var(--text);' : 'color: var(--muted);'}`,
+        title: hasElapsed ? formatDuration(telemetry.elapsedMs) : 'Elapsed time not reported'
+      }, `⏱️ ${hasElapsed ? formatDuration(telemetry.elapsedMs) : '—'}`));
+      
+      // Tokens metric (highlight when high)
+      const hasTokens = telemetry.tokensTotal > 0;
+      const tokenColor = telemetry.tokensTotal > 100000 ? 'var(--amber)' : hasTokens ? 'var(--text)' : 'var(--muted)';
+      metricsRow.appendChild(el('span', { 
+        style: `font-size: 12px; color: ${tokenColor};`,
+        title: hasTokens ? `${formatTokens(telemetry.tokensTotal)} tokens` : 'Tokens not reported'
+      }, `⚡ ${hasTokens ? formatTokens(telemetry.tokensTotal) : '—'}`));
+
       const card = el('div', { 
-        className: 'live-session-card',
+        className: 'live-session-card' + (sharedWorktree ? ' coord-risk' : ''),
         onclick: () => seamId ? showWorkstreamDetail(seamId) : null,
         style: seamId ? 'cursor: pointer;' : ''
       },
         el('div', { className: 'live-session-header' },
           el('span', { className: 'live-pulse', textContent: '●' }),
-          el('span', { className: 'live-session-agent', textContent: props.agent || 'unknown' }),
-          el('span', { className: 'live-session-phase phase-' + (props.phase || 'started'), textContent: props.phase || 'started' })
+          el('span', { className: 'live-session-agent', textContent: session.agent || 'unknown' }),
+          el('span', { className: 'live-session-phase phase-' + (session.phase || 'started'), textContent: session.phase || 'started' })
         ),
+        sharedWorktree
+          ? el('div', { className: 'live-session-alert' }, `Coordination risk: ${sharedWorktreeCount} active sessions share this worktree`)
+          : null,
         el('div', { className: 'live-session-seam', textContent: seamId || 'no seam' }),
         el('div', { className: 'live-session-meta' },
-          el('span', { textContent: `Files: ${(props.files_touched || []).length}` }),
-          el('span', { textContent: `Lines: ${props.lines_changed || 0}` }),
-          el('span', { textContent: `Tests: ${props.test_runs || 0}` })
+          el('span', { textContent: `Harness: ${harnessId || '—'}` }),
+          el('span', { textContent: `Workflow: ${workflowName || '—'}` })
         ),
-        el('div', { className: 'live-session-time', textContent: 'Started: ' + formatTime(props.start_time) })
+        el('div', { className: 'live-session-meta' },
+          el('span', { className: 'live-session-context', title: worktreePath || 'worktree unavailable', textContent: `Worktree: ${formatWorktreeLabel(worktreePath)}` }),
+          el('span', { className: 'live-session-context', textContent: `Branch: ${branch || 'unavailable'}` })
+        ),
+        metricsRow,
+        telemetryMessage
+          ? el('div', { className: 'live-session-time', style: 'color: var(--amber);' }, telemetryMessage)
+          : null,
+        el('div', { className: 'live-session-time', textContent: 'Started: ' + formatTime(session.started) }),
+        session.last_activity
+          ? el('div', { className: 'live-session-time', textContent: 'Last activity: ' + formatTime(session.last_activity) })
+          : null
       );
       grid.appendChild(card);
     }
@@ -4332,15 +6044,10 @@ async function refreshWorkstreamDetail() {
     try {
       nodeData = await api('/api/nodes/' + encodeURIComponent(currentWorkstreamId));
     } catch (e) {
-      // Node not found — show helpful error with back button
-      container.innerHTML = '';
-      container.appendChild(el('div', { style: 'padding:24px;text-align:center;' },
-        el('div', { style: 'font-size:48px;margin-bottom:12px;', textContent: '🔍' }),
-        el('h3', { textContent: 'Node not found' }),
-        el('p', { style: 'color:var(--text-secondary);', textContent: `"${currentWorkstreamId}" does not exist in the graph.` }),
-        el('p', { style: 'color:var(--muted);font-size:12px;margin-bottom:16px;', textContent: 'This can happen when a session referenced a seam that was never scanned, or a workstream was deleted.' }),
-        el('button', { className: 'toolbar-btn', textContent: '← Back to Workstreams', onclick: () => switchView('workstreams') })
-      ));
+      const missingId = currentWorkstreamId;
+      currentWorkstreamId = null;
+      switchView('workstreams');
+      showToast(`Missing workstream target: ${missingId}`, 'error');
       return;
     }
 

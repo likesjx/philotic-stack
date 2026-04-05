@@ -1,8 +1,8 @@
-use std::path::PathBuf;
 use clap::Parser;
+use std::path::PathBuf;
 
-use graph_intelligence::server::{serve, ServerConfig};
 use graph_intelligence::scanner::ScanConfig;
+use graph_intelligence::server::{serve, ServerConfig};
 
 #[derive(Parser)]
 #[command(name = "graph-intelligence")]

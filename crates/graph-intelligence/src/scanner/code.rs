@@ -50,11 +50,11 @@ pub fn scan_rust_workspace(
             file_path: Some(crate_path.join("Cargo.toml").display().to_string()),
             worktree: worktree.to_string(),
             created_at: now,
-                embedding: None,
-                embedding_model: None,
-                embedding_dims: None,
-                embedding_updated: None,
-                embedding_hash: None,
+            embedding: None,
+            embedding_model: None,
+            embedding_dims: None,
+            embedding_updated: None,
+            embedding_hash: None,
             updated_at: now,
         };
         engine.upsert_node(&crate_node)?;
@@ -69,9 +69,7 @@ pub fn scan_rust_workspace(
         for entry in WalkDir::new(&src_dir)
             .into_iter()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path().extension().map_or(false, |ext| ext == "rs")
-            })
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "rs"))
         {
             let file_path = entry.path();
             let rel_path = file_path
@@ -120,10 +118,7 @@ pub fn scan_rust_workspace(
             let file_ast = match syn::parse_file(&source) {
                 Ok(f) => f,
                 Err(e) => {
-                    eprintln!(
-                        "Warning: failed to parse {}: {}",
-                        rel_path, e
-                    );
+                    eprintln!("Warning: failed to parse {}: {}", rel_path, e);
                     metrics.parse_failures += 1;
                     continue;
                 }
@@ -202,11 +197,11 @@ fn scan_items(
                     file_path: Some(file_path.to_string()),
                     worktree: worktree.to_string(),
                     created_at: now,
-                embedding: None,
-                embedding_model: None,
-                embedding_dims: None,
-                embedding_updated: None,
-                embedding_hash: None,
+                    embedding: None,
+                    embedding_model: None,
+                    embedding_dims: None,
+                    embedding_updated: None,
+                    embedding_hash: None,
                     updated_at: now,
                 })?;
                 metrics.types_found += 1;
@@ -252,11 +247,11 @@ fn scan_items(
                     file_path: Some(file_path.to_string()),
                     worktree: worktree.to_string(),
                     created_at: now,
-                embedding: None,
-                embedding_model: None,
-                embedding_dims: None,
-                embedding_updated: None,
-                embedding_hash: None,
+                    embedding: None,
+                    embedding_model: None,
+                    embedding_dims: None,
+                    embedding_updated: None,
+                    embedding_hash: None,
                     updated_at: now,
                 })?;
                 metrics.types_found += 1;
@@ -302,11 +297,11 @@ fn scan_items(
                     file_path: Some(file_path.to_string()),
                     worktree: worktree.to_string(),
                     created_at: now,
-                embedding: None,
-                embedding_model: None,
-                embedding_dims: None,
-                embedding_updated: None,
-                embedding_hash: None,
+                    embedding: None,
+                    embedding_model: None,
+                    embedding_dims: None,
+                    embedding_updated: None,
+                    embedding_hash: None,
                     updated_at: now,
                 })?;
                 metrics.types_found += 1;
@@ -366,11 +361,11 @@ fn scan_items(
                     file_path: Some(file_path.to_string()),
                     worktree: worktree.to_string(),
                     created_at: now,
-                embedding: None,
-                embedding_model: None,
-                embedding_dims: None,
-                embedding_updated: None,
-                embedding_hash: None,
+                    embedding: None,
+                    embedding_model: None,
+                    embedding_dims: None,
+                    embedding_updated: None,
+                    embedding_hash: None,
                     updated_at: now,
                 })?;
                 if is_test {
@@ -411,9 +406,10 @@ fn scan_items(
 
             Item::Impl(imp) => {
                 let self_ty = imp.self_ty.to_token_stream().to_string();
-                let trait_name = imp.trait_.as_ref().map(|(_, path, _)| {
-                    path.to_token_stream().to_string()
-                });
+                let trait_name = imp
+                    .trait_
+                    .as_ref()
+                    .map(|(_, path, _)| path.to_token_stream().to_string());
 
                 let impl_label = match &trait_name {
                     Some(t) => format!("impl {} for {}", t, self_ty),
@@ -432,11 +428,11 @@ fn scan_items(
                     file_path: Some(file_path.to_string()),
                     worktree: worktree.to_string(),
                     created_at: now,
-                embedding: None,
-                embedding_model: None,
-                embedding_dims: None,
-                embedding_updated: None,
-                embedding_hash: None,
+                    embedding: None,
+                    embedding_model: None,
+                    embedding_dims: None,
+                    embedding_updated: None,
+                    embedding_hash: None,
                     updated_at: now,
                 })?;
                 metrics.impl_blocks += 1;
@@ -492,11 +488,11 @@ fn scan_items(
                             file_path: Some(file_path.to_string()),
                             worktree: worktree.to_string(),
                             created_at: now,
-                embedding: None,
-                embedding_model: None,
-                embedding_dims: None,
-                embedding_updated: None,
-                embedding_hash: None,
+                            embedding: None,
+                            embedding_model: None,
+                            embedding_dims: None,
+                            embedding_updated: None,
+                            embedding_hash: None,
                             updated_at: now,
                         })?;
                         if is_test {
@@ -613,11 +609,11 @@ fn scan_items(
                     file_path: Some(file_path.to_string()),
                     worktree: worktree.to_string(),
                     created_at: now,
-                embedding: None,
-                embedding_model: None,
-                embedding_dims: None,
-                embedding_updated: None,
-                embedding_hash: None,
+                    embedding: None,
+                    embedding_model: None,
+                    embedding_dims: None,
+                    embedding_updated: None,
+                    embedding_hash: None,
                     updated_at: now,
                 })?;
                 metrics.types_found += 1;
@@ -670,16 +666,20 @@ fn scan_items(
                     let sub_mod_node = Node {
                         id: sub_mod.clone(),
                         kind: NodeKind::Module,
-                        name: format!("{}::{}", module_id.strip_prefix("module:").unwrap_or(module_id), m.ident),
+                        name: format!(
+                            "{}::{}",
+                            module_id.strip_prefix("module:").unwrap_or(module_id),
+                            m.ident
+                        ),
                         properties: serde_json::json!({"inline": true}),
                         file_path: Some(file_path.to_string()),
                         worktree: worktree.to_string(),
                         created_at: now,
-                embedding: None,
-                embedding_model: None,
-                embedding_dims: None,
-                embedding_updated: None,
-                embedding_hash: None,
+                        embedding: None,
+                        embedding_model: None,
+                        embedding_dims: None,
+                        embedding_updated: None,
+                        embedding_hash: None,
                         updated_at: now,
                     };
                     engine.upsert_node(&sub_mod_node)?;
@@ -693,7 +693,9 @@ fn scan_items(
                     metrics.edges_created += 1;
                     metrics.modules_found += 1;
 
-                    scan_items(items, &sub_mod, file_path, worktree, source, engine, metrics, now)?;
+                    scan_items(
+                        items, &sub_mod, file_path, worktree, source, engine, metrics, now,
+                    )?;
                 }
             }
 
@@ -775,7 +777,11 @@ fn has_test_attr(attrs: &[Attribute]) -> bool {
         attr.path().is_ident("test")
             || attr.path().is_ident("tokio::test")
             || (attr.path().segments.len() == 2
-                && attr.path().segments.last().map_or(false, |s| s.ident == "test"))
+                && attr
+                    .path()
+                    .segments
+                    .last()
+                    .map_or(false, |s| s.ident == "test"))
     })
 }
 
@@ -811,11 +817,7 @@ fn format_struct_signature(s: &syn::ItemStruct) -> String {
             .named
             .iter()
             .map(|f| {
-                let fname = f
-                    .ident
-                    .as_ref()
-                    .map(|i| i.to_string())
-                    .unwrap_or_default();
+                let fname = f.ident.as_ref().map(|i| i.to_string()).unwrap_or_default();
                 let ty = f.ty.to_token_stream().to_string();
                 format!("    {}: {}", fname, ty)
             })
@@ -831,14 +833,9 @@ fn format_struct_signature(s: &syn::ItemStruct) -> String {
     if fields.is_empty() {
         format!("{} struct {}", vis, name).trim().to_string()
     } else {
-        format!(
-            "{} struct {} {{\n{}\n}}",
-            vis,
-            name,
-            fields.join(",\n")
-        )
-        .trim()
-        .to_string()
+        format!("{} struct {} {{\n{}\n}}", vis, name, fields.join(",\n"))
+            .trim()
+            .to_string()
     }
 }
 
@@ -859,14 +856,9 @@ fn format_trait_signature(t: &syn::ItemTrait) -> String {
     if methods.is_empty() {
         format!("{} trait {}", vis, name).trim().to_string()
     } else {
-        format!(
-            "{} trait {} {{\n{}\n}}",
-            vis,
-            name,
-            methods.join("\n")
-        )
-        .trim()
-        .to_string()
+        format!("{} trait {} {{\n{}\n}}", vis, name, methods.join("\n"))
+            .trim()
+            .to_string()
     }
 }
 
@@ -881,14 +873,9 @@ fn format_enum_signature(e: &syn::ItemEnum) -> String {
     if variants.is_empty() {
         format!("{} enum {}", vis, name).trim().to_string()
     } else {
-        format!(
-            "{} enum {} {{\n{}\n}}",
-            vis,
-            name,
-            variants.join(",\n")
-        )
-        .trim()
-        .to_string()
+        format!("{} enum {} {{\n{}\n}}", vis, name, variants.join(",\n"))
+            .trim()
+            .to_string()
     }
 }
 
@@ -904,7 +891,13 @@ fn extract_use_crate(tree: &syn::UseTree) -> Option<String> {
         syn::UseTree::Path(p) => {
             let ident = p.ident.to_string();
             // Skip standard library crates
-            if ident == "std" || ident == "core" || ident == "alloc" || ident == "self" || ident == "super" || ident == "crate" {
+            if ident == "std"
+                || ident == "core"
+                || ident == "alloc"
+                || ident == "self"
+                || ident == "super"
+                || ident == "crate"
+            {
                 None
             } else {
                 Some(ident)
@@ -912,7 +905,13 @@ fn extract_use_crate(tree: &syn::UseTree) -> Option<String> {
         }
         syn::UseTree::Name(n) => {
             let ident = n.ident.to_string();
-            if ident == "std" || ident == "core" || ident == "alloc" || ident == "self" || ident == "super" || ident == "crate" {
+            if ident == "std"
+                || ident == "core"
+                || ident == "alloc"
+                || ident == "self"
+                || ident == "super"
+                || ident == "crate"
+            {
                 None
             } else {
                 Some(ident)

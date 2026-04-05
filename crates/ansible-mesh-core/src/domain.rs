@@ -247,6 +247,11 @@ impl GraphDomain {
         Ok(out)
     }
 
+    /// Delete a guest record entirely.
+    pub fn remove_guest(&self, hotel_name: &str, guest_id: &str) -> Result<()> {
+        self.adapter.delete_node(&Self::guest_key(hotel_name, guest_id))
+    }
+
     /// Bulk upsert guest rows (used during initial seeding).
     pub fn seed_guests(&self, hotel_name: &str, guests: &[GuestRecord]) -> Result<()> {
         for g in guests {
@@ -757,6 +762,11 @@ impl GraphDomain {
                 .and_then(|v| v.as_str())
                 .map(str::to_string)),
         }
+    }
+
+    /// Delete an arbitrary JSON config value by key.
+    pub fn remove_config_value(&self, key: &str) -> Result<()> {
+        self.adapter.delete_node(&Self::config_key(key))
     }
 
     // ── Vault registry (stored as a config value) ─────────────────────────────

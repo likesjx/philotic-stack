@@ -6,7 +6,7 @@ use crate::schema::*;
 /// Generate a sequence diagram showing function call flow
 pub fn generate_sequence_diagram(
     engine: &GraphEngine,
-    entry_function: &str,  // e.g., "fn:aiua::router::handle_request"
+    entry_function: &str, // e.g., "fn:aiua::router::handle_request"
     max_depth: usize,
 ) -> Result<String> {
     let mut uml = String::new();
@@ -19,7 +19,15 @@ pub fn generate_sequence_diagram(
     let mut calls: Vec<(String, String, String, usize)> = Vec::new(); // (from, to, label, depth)
 
     // Build call tree
-    build_call_tree(engine, entry_function, &mut visited, &mut participants, &mut calls, 0, max_depth)?;
+    build_call_tree(
+        engine,
+        entry_function,
+        &mut visited,
+        &mut participants,
+        &mut calls,
+        0,
+        max_depth,
+    )?;
 
     // Add participants (unique modules/types)
     let mut participant_list: Vec<_> = participants.into_iter().collect();
@@ -36,7 +44,7 @@ pub fn generate_sequence_diagram(
         let to_id = sanitize_seq_id(&to);
         let indent = "  ".repeat(depth);
         uml.push_str(&format!("{}{} -> {}: {}\n", indent, from_id, to_id, label));
-        
+
         // Add activation bars for nested calls
         if depth > 0 {
             uml.push_str(&format!("{}activate {}\n", indent, to_id));
@@ -75,26 +83,37 @@ fn build_call_tree(
                 if let Some(target) = engine.get_node(&edge.target_id)? {
                     let target_participant = extract_participant(&target.name, &edge.target_id);
                     participants.insert(target_participant.clone());
-                    
-                    let label = format!("{}()", target.name.split("::").last().unwrap_or(&target.name));
+
+                    let label = format!(
+                        "{}()",
+                        target.name.split("::").last().unwrap_or(&target.name)
+                    );
                     calls.push((participant.clone(), target_participant, label, depth));
-                    
+
                     // Recurse if it's a function
                     if matches!(target.kind, NodeKind::Function) {
-                        build_call_tree(engine, &edge.target_id, visited, participants, calls, depth + 1, max_depth)?;
+                        build_call_tree(
+                            engine,
+                            &edge.target_id,
+                            visited,
+                            participants,
+                            calls,
+                            depth + 1,
+                            max_depth,
+                        )?;
                     }
                 }
             }
         }
     }
-    
+
     Ok(())
 }
 
 /// Generate state diagram for an enum (showing state machine)
 pub fn generate_state_diagram(
     engine: &GraphEngine,
-    enum_id: &str,  // e.g., "type:aiua::state::AgentState"
+    enum_id: &str, // e.g., "type:aiua::state::AgentState"
 ) -> Result<String> {
     let mut uml = String::new();
     uml.push_str("@startuml\n");
@@ -102,10 +121,10 @@ pub fn generate_state_diagram(
 
     if let Some(enum_node) = engine.get_node(enum_id)? {
         uml.push_str(&format!("title State Diagram - {}\n\n", enum_node.name));
-        
+
         // Get variants from properties or snippets
         let variants = extract_enum_variants(engine, enum_id, &enum_node)?;
-        
+
         if variants.is_empty() {
             uml.push_str("note \"No state variants found\" as N1\n");
         } else {
@@ -118,13 +137,13 @@ pub fn generate_state_diagram(
 
             // Try to find transitions by looking for match statements
             let transitions = find_state_transitions(engine, enum_id, &variants)?;
-            
+
             if transitions.is_empty() {
                 // If no transitions found, show all states with [*] entry
                 uml.push_str(&("[*] --> ".to_string() + &sanitize_state_id(&variants[0]) + "\n"));
-                for i in 0..variants.len()-1 {
+                for i in 0..variants.len() - 1 {
                     let from = sanitize_state_id(&variants[i]);
-                    let to = sanitize_state_id(&variants[i+1]);
+                    let to = sanitize_state_id(&variants[i + 1]);
                     uml.push_str(&format!("{} --> {}\n", from, to));
                 }
             } else {
@@ -150,7 +169,7 @@ fn extract_enum_variants(
     enum_node: &Node,
 ) -> Result<Vec<String>> {
     let mut variants = Vec::new();
-    
+
     // Try to get from snippets
     let snippets = engine.get_snippets_for_node(enum_id)?;
     for snippet in &snippets {
@@ -176,7 +195,7 @@ fn extract_enum_variants(
             }
         }
     }
-    
+
     // Also try properties
     if variants.is_empty() {
         if let Some(v) = enum_node.properties.get("variants") {
@@ -189,7 +208,7 @@ fn extract_enum_variants(
             }
         }
     }
-    
+
     Ok(variants)
 }
 
@@ -199,7 +218,7 @@ fn find_state_transitions(
     variants: &[String],
 ) -> Result<Vec<(String, String, String)>> {
     let mut transitions = Vec::new();
-    
+
     // Find functions that match on this enum
     let edges = engine.get_edges_to(enum_id)?;
     for edge in &edges {
@@ -213,21 +232,32 @@ fn find_state_transitions(
                         let body = snippet.body.as_deref().unwrap_or("");
                         for (i, line) in body.lines().enumerate() {
                             for variant in variants {
-                                if line.contains(&format!("::{} =>", variant)) || 
-                                   line.contains(&format!("{} =>", variant)) {
+                                if line.contains(&format!("::{} =>", variant))
+                                    || line.contains(&format!("{} =>", variant))
+                                {
                                     // Try to find the target state in the same or next line
                                     let search_text = if i + 1 < body.lines().count() {
-                                        format!("{} {}", line, body.lines().nth(i + 1).unwrap_or(""))
+                                        format!(
+                                            "{} {}",
+                                            line,
+                                            body.lines().nth(i + 1).unwrap_or("")
+                                        )
                                     } else {
                                         line.to_string()
                                     };
-                                    
+
                                     for target in variants {
-                                        if target != variant && 
-                                           search_text.contains(&format!("::{} ", target)) ||
-                                           search_text.contains(&format!("{}(", target)) {
-                                            let trigger = func.name.split("::").last().unwrap_or(&func.name);
-                                            transitions.push((variant.clone(), target.clone(), trigger.to_string()));
+                                        if target != variant
+                                            && search_text.contains(&format!("::{} ", target))
+                                            || search_text.contains(&format!("{}(", target))
+                                        {
+                                            let trigger =
+                                                func.name.split("::").last().unwrap_or(&func.name);
+                                            transitions.push((
+                                                variant.clone(),
+                                                target.clone(),
+                                                trigger.to_string(),
+                                            ));
                                         }
                                     }
                                 }
@@ -238,20 +268,17 @@ fn find_state_transitions(
             }
         }
     }
-    
+
     // If we found transitions, add entry point
     if !transitions.is_empty() && !variants.is_empty() {
         transitions.push(("[*]".to_string(), variants[0].clone(), "init".to_string()));
     }
-    
+
     Ok(transitions)
 }
 
 /// Generate a module interaction diagram showing who calls whom
-pub fn generate_module_interaction(
-    engine: &GraphEngine,
-    crate_name: &str,
-) -> Result<String> {
+pub fn generate_module_interaction(engine: &GraphEngine, crate_name: &str) -> Result<String> {
     let mut uml = String::new();
     uml.push_str("@startuml\n");
     uml.push_str("!theme plain\n\n");
@@ -268,15 +295,20 @@ pub fn generate_module_interaction(
             if let Some(module) = engine.get_node(&edge.target_id)? {
                 if matches!(module.kind, NodeKind::Module) {
                     modules.push(module.name.clone());
-                    
+
                     // Count imports from this module
                     let mod_edges = engine.get_edges_from(&module.id)?;
                     for me in &mod_edges {
                         if me.relation == EdgeRelation::Imports {
-                            let target_mod = me.target_id.split("::").last().unwrap_or(&me.target_id);
+                            let target_mod =
+                                me.target_id.split("::").last().unwrap_or(&me.target_id);
                             let source_mod = module.name.split("::").last().unwrap_or(&module.name);
                             if source_mod != target_mod {
-                                interactions.push((source_mod.to_string(), target_mod.to_string(), 1));
+                                interactions.push((
+                                    source_mod.to_string(),
+                                    target_mod.to_string(),
+                                    1,
+                                ));
                             }
                         }
                     }
@@ -288,7 +320,11 @@ pub fn generate_module_interaction(
     // Define participants
     for m in &modules {
         let short = m.split("::").last().unwrap_or(m);
-        uml.push_str(&format!("participant \"{}\" as {}\n", short, sanitize_seq_id(short)));
+        uml.push_str(&format!(
+            "participant \"{}\" as {}\n",
+            short,
+            sanitize_seq_id(short)
+        ));
     }
     uml.push_str("\n");
 

@@ -5,10 +5,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum C4Level {
-    Context,    // C1: Systems and external actors
-    Container,  // C2: Crates/runtimes/processes
-    Component,  // C3: Modules/layers within crates
-    Code,       // C4: Types, functions, traits
+    Context,   // C1: Systems and external actors
+    Container, // C2: Crates/runtimes/processes
+    Component, // C3: Modules/layers within crates
+    Code,      // C4: Types, functions, traits
 }
 
 impl C4Level {
@@ -35,19 +35,39 @@ impl C4Level {
     pub fn from_node_kind(kind: NodeKind) -> Option<Self> {
         match kind {
             // C1: Context level
-            NodeKind::Domain | NodeKind::Agent | NodeKind::Skill => Some(Self::Context),
-            
+            NodeKind::Domain
+            | NodeKind::Agent
+            | NodeKind::Skill
+            | NodeKind::Harness
+            | NodeKind::HarnessSkill
+            | NodeKind::HarnessProfile
+            | NodeKind::CanonicalProfile
+            | NodeKind::CanonicalWorkflow => Some(Self::Context),
+
             // C2: Container level
-            NodeKind::Crate | NodeKind::Worktree | NodeKind::Workstream | NodeKind::Component => Some(Self::Container),
-            
+            NodeKind::Crate | NodeKind::Worktree | NodeKind::Workstream | NodeKind::Component => {
+                Some(Self::Container)
+            }
+
             // C3: Component level
-            NodeKind::Module | NodeKind::Proposal | NodeKind::Seam | NodeKind::Slice => Some(Self::Component),
-            
+            NodeKind::Module | NodeKind::Proposal | NodeKind::Seam | NodeKind::Slice => {
+                Some(Self::Component)
+            }
+
             // C4: Code level
-            NodeKind::Type | NodeKind::Function | NodeKind::ImplBlock | NodeKind::Test | NodeKind::Commit => Some(Self::Code),
-            
+            NodeKind::Type
+            | NodeKind::Function
+            | NodeKind::ImplBlock
+            | NodeKind::Test
+            | NodeKind::Commit => Some(Self::Code),
+
             // Process/metadata
-            NodeKind::Task | NodeKind::Decision => Some(Self::Component),
+            NodeKind::Task
+            | NodeKind::Decision
+            | NodeKind::HarnessProjection
+            | NodeKind::HarnessObservation
+            | NodeKind::HarnessDrift
+            | NodeKind::HarnessRollout => Some(Self::Component),
             NodeKind::Branch => Some(Self::Container),
             NodeKind::Session => Some(Self::Context),
             NodeKind::Document => Some(Self::Context),
@@ -102,6 +122,15 @@ pub enum NodeKind {
     Test,
     Component,
     Skill,
+    Harness,
+    HarnessSkill,
+    HarnessProfile,
+    CanonicalProfile,
+    CanonicalWorkflow,
+    HarnessProjection,
+    HarnessObservation,
+    HarnessDrift,
+    HarnessRollout,
     Agent,
     Session,
     Decision,
@@ -135,6 +164,15 @@ impl NodeKind {
             Self::Test => "test",
             Self::Component => "component",
             Self::Skill => "skill",
+            Self::Harness => "harness",
+            Self::HarnessSkill => "harness_skill",
+            Self::HarnessProfile => "harness_profile",
+            Self::CanonicalProfile => "canonical_profile",
+            Self::CanonicalWorkflow => "canonical_workflow",
+            Self::HarnessProjection => "harness_projection",
+            Self::HarnessObservation => "harness_observation",
+            Self::HarnessDrift => "harness_drift",
+            Self::HarnessRollout => "harness_rollout",
             Self::Agent => "agent",
             Self::Session => "session",
             Self::Decision => "decision",
@@ -167,6 +205,15 @@ impl NodeKind {
             "test" => Some(Self::Test),
             "component" => Some(Self::Component),
             "skill" => Some(Self::Skill),
+            "harness" => Some(Self::Harness),
+            "harness_skill" => Some(Self::HarnessSkill),
+            "harness_profile" => Some(Self::HarnessProfile),
+            "canonical_profile" => Some(Self::CanonicalProfile),
+            "canonical_workflow" => Some(Self::CanonicalWorkflow),
+            "harness_projection" => Some(Self::HarnessProjection),
+            "harness_observation" => Some(Self::HarnessObservation),
+            "harness_drift" => Some(Self::HarnessDrift),
+            "harness_rollout" => Some(Self::HarnessRollout),
             "agent" => Some(Self::Agent),
             "session" => Some(Self::Session),
             "decision" => Some(Self::Decision),
@@ -378,9 +425,7 @@ pub struct ScanSnapshot {
 
 /// Serialize a Vec<f32> to bytes for SQLite BLOB storage
 pub fn serialize_embedding(vec: &[f32]) -> Vec<u8> {
-    vec.iter()
-        .flat_map(|f| f.to_le_bytes())
-        .collect()
+    vec.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 
 /// Deserialize bytes to Vec<f32>
@@ -396,15 +441,15 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
     }
-    
+
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    
+
     if norm_a == 0.0 || norm_b == 0.0 {
         return 0.0;
     }
-    
+
     dot / (norm_a * norm_b)
 }
 
@@ -427,5 +472,8 @@ pub fn should_embed(kind: NodeKind) -> bool {
             | NodeKind::Type
             | NodeKind::Module
             | NodeKind::Test
+            | NodeKind::Harness
+            | NodeKind::HarnessSkill
+            | NodeKind::HarnessProfile
     )
 }

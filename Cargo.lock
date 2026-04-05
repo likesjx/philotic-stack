@@ -2906,6 +2906,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "dirs 5.0.1",
  "graph-intelligence",
  "memory-core",
  "reqwest",
@@ -2945,6 +2946,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
+ "chrono",
  "clap",
  "dirs 5.0.1",
  "ed25519-dalek",

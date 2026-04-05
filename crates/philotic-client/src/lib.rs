@@ -45,6 +45,14 @@ pub struct OperatorAgentView {
     pub agent_id: String,
     pub persona_name: String,
     pub authority_hotel: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soul_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_context_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
     #[serde(default)]
     pub toolset_tags: Vec<String>,
     #[serde(default)]
@@ -790,6 +798,14 @@ pub enum IpcRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         persona_name: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        soul_text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        identity_text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_context_text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        system_prompt: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         default_toolset: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         default_skillset: Option<Vec<String>>,
@@ -940,6 +956,15 @@ pub enum IpcRequest {
     ///
     /// Responds with [`IpcResponse::Standard`].
     RestartComponent {
+        guest_id: String,
+    },
+    /// Remove a registered component entirely.
+    ///
+    /// The hotel terminates the running process if present, deletes the guest record,
+    /// and removes the stored `component:{guest_id}` config blob.
+    ///
+    /// Responds with [`IpcResponse::Standard`].
+    RemoveComponent {
         guest_id: String,
     },
     /// Inject a remote node incarnation into the local node registry.

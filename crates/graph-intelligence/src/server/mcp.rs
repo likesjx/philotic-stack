@@ -427,10 +427,7 @@ async fn handle_mcp(
         "tools/list" => Ok(tool_definitions()),
         "tools/call" => {
             let params = req.params.unwrap_or(serde_json::json!({}));
-            let tool_name = params
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let arguments = params
                 .get("arguments")
                 .cloned()
@@ -553,14 +550,20 @@ async fn tool_graph_status(state: &AppState) -> Result<serde_json::Value, JsonRp
 
     let mut counts = serde_json::Map::new();
     for kind in &kinds {
-        let count = engine.count_nodes(Some(*kind)).map_err(|e| mcp_err(&e.to_string()))?;
+        let count = engine
+            .count_nodes(Some(*kind))
+            .map_err(|e| mcp_err(&e.to_string()))?;
         counts.insert(kind.as_str().to_string(), serde_json::json!(count));
     }
-    let total = engine.count_nodes(None).map_err(|e| mcp_err(&e.to_string()))?;
+    let total = engine
+        .count_nodes(None)
+        .map_err(|e| mcp_err(&e.to_string()))?;
     counts.insert("total".to_string(), serde_json::json!(total));
 
     let edges = engine.count_edges().map_err(|e| mcp_err(&e.to_string()))?;
-    let snippets = engine.count_snippets().map_err(|e| mcp_err(&e.to_string()))?;
+    let snippets = engine
+        .count_snippets()
+        .map_err(|e| mcp_err(&e.to_string()))?;
 
     Ok(serde_json::json!({
         "content": [{
@@ -602,18 +605,24 @@ async fn tool_graph_query(
         });
     }
 
-    let compact = args.get("compact").and_then(|v| v.as_bool()).unwrap_or(false);
+    let compact = args
+        .get("compact")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let text = if compact {
-        let summaries: Vec<serde_json::Value> = nodes.iter().map(|n| {
-            serde_json::json!({
-                "id": n.id,
-                "name": n.name,
-                "kind": n.kind.as_str(),
-                "status": n.properties.get("status"),
-                "disposition": n.properties.get("disposition"),
+        let summaries: Vec<serde_json::Value> = nodes
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "id": n.id,
+                    "name": n.name,
+                    "kind": n.kind.as_str(),
+                    "status": n.properties.get("status"),
+                    "disposition": n.properties.get("disposition"),
+                })
             })
-        }).collect();
+            .collect();
         serde_json::to_string_pretty(&summaries).unwrap_or_default()
     } else {
         serde_json::to_string_pretty(&nodes).unwrap_or_default()
@@ -639,8 +648,12 @@ async fn tool_graph_node(
         .map_err(|e| mcp_err(&e.to_string()))?
         .ok_or_else(|| mcp_err(&format!("Node '{}' not found", id)))?;
 
-    let outgoing = engine.get_edges_from(id).map_err(|e| mcp_err(&e.to_string()))?;
-    let incoming = engine.get_edges_to(id).map_err(|e| mcp_err(&e.to_string()))?;
+    let outgoing = engine
+        .get_edges_from(id)
+        .map_err(|e| mcp_err(&e.to_string()))?;
+    let incoming = engine
+        .get_edges_to(id)
+        .map_err(|e| mcp_err(&e.to_string()))?;
 
     let text = serde_json::to_string_pretty(&serde_json::json!({
         "node": node,
@@ -690,7 +703,10 @@ async fn tool_graph_snippet(
         .map_err(|e| mcp_err(&e.to_string()))?;
 
     let result: Vec<serde_json::Value> = if full {
-        snippets.iter().map(|s| serde_json::to_value(s).unwrap_or_default()).collect()
+        snippets
+            .iter()
+            .map(|s| serde_json::to_value(s).unwrap_or_default())
+            .collect()
     } else {
         snippets
             .iter()
@@ -726,9 +742,7 @@ async fn tool_graph_search(
     let engine = state.engine.lock().await;
 
     // Search nodes by FTS first, fall back to substring match
-    let mut matching_nodes = engine
-        .search_nodes(query)
-        .unwrap_or_default();
+    let mut matching_nodes = engine.search_nodes(query).unwrap_or_default();
 
     // If FTS returned nothing (e.g., partial word), fall back to substring
     if matching_nodes.is_empty() {
@@ -771,7 +785,9 @@ async fn tool_graph_proposals(state: &AppState) -> Result<serde_json::Value, Jso
 
     let mut results = Vec::new();
     for p in &proposals {
-        let edges = engine.get_edges_from(&p.id).map_err(|e| mcp_err(&e.to_string()))?;
+        let edges = engine
+            .get_edges_from(&p.id)
+            .map_err(|e| mcp_err(&e.to_string()))?;
         let active_seams: Vec<&str> = edges
             .iter()
             .filter(|e| e.relation == EdgeRelation::Implements)
@@ -948,10 +964,17 @@ async fn tool_graph_create_node(
         .and_then(|v| v.as_str())
         .ok_or_else(|| mcp_err("Missing required parameter: name"))?;
 
-    let kind = NodeKind::from_str(kind_str).ok_or_else(|| mcp_err(&format!("Unknown node kind: {}", kind_str)))?;
+    let kind = NodeKind::from_str(kind_str)
+        .ok_or_else(|| mcp_err(&format!("Unknown node kind: {}", kind_str)))?;
 
-    let properties = args.get("properties").cloned().unwrap_or(serde_json::json!({}));
-    let file_path = args.get("file_path").and_then(|v| v.as_str()).map(String::from);
+    let properties = args
+        .get("properties")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
+    let file_path = args
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .map(String::from);
 
     let engine = state.engine.lock().await;
 
@@ -1121,9 +1144,15 @@ async fn tool_graph_writeback(
         .get("node_id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| mcp_err("Missing required parameter: node_id"))?;
-    let should_commit = args.get("commit").and_then(|v| v.as_bool()).unwrap_or(false);
+    let should_commit = args
+        .get("commit")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let agent = args.get("agent").and_then(|v| v.as_str());
-    let reason = args.get("reason").and_then(|v| v.as_str()).unwrap_or("Graph writeback");
+    let reason = args
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Graph writeback");
 
     let engine = state.engine.lock().await;
 
@@ -1140,7 +1169,8 @@ async fn tool_graph_writeback(
     let full_path = std::path::Path::new(&state.repo_root).join(file_path);
 
     // Build updates from node properties
-    let mut updates: std::collections::HashMap<String, serde_yaml::Value> = std::collections::HashMap::new();
+    let mut updates: std::collections::HashMap<String, serde_yaml::Value> =
+        std::collections::HashMap::new();
 
     if let serde_json::Value::Object(ref map) = node.properties {
         for (key, value) in map {
@@ -1172,8 +1202,7 @@ async fn tool_graph_writeback(
         )
         .map_err(|e| mcp_err(&e.to_string()))?;
     } else {
-        writeback::update_frontmatter(&full_path, &updates)
-            .map_err(|e| mcp_err(&e.to_string()))?;
+        writeback::update_frontmatter(&full_path, &updates).map_err(|e| mcp_err(&e.to_string()))?;
     }
 
     Ok(serde_json::json!({
@@ -1203,21 +1232,20 @@ async fn tool_graph_record_test_run(
         }
     }
     if targets.is_empty() {
-        return Err(mcp_err("Missing required parameter: target_id or target_ids"));
+        return Err(mcp_err(
+            "Missing required parameter: target_id or target_ids",
+        ));
     }
 
-    let test_count = args
-        .get("test_count")
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| mcp_err("Missing required parameter: test_count"))? as i64;
-    let pass_count = args
-        .get("pass_count")
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| mcp_err("Missing required parameter: pass_count"))? as i64;
-    let fail_count = args
-        .get("fail_count")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as i64;
+    let test_count =
+        args.get("test_count")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| mcp_err("Missing required parameter: test_count"))? as i64;
+    let pass_count =
+        args.get("pass_count")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| mcp_err("Missing required parameter: pass_count"))? as i64;
+    let fail_count = args.get("fail_count").and_then(|v| v.as_u64()).unwrap_or(0) as i64;
     let coverage_pct = args
         .get("coverage_pct")
         .and_then(|v| v.as_f64())
@@ -1283,7 +1311,9 @@ async fn tool_graph_record_test_run(
             properties: serde_json::json!({}),
             worktree: String::new(),
         };
-        engine.upsert_edge(&edge).map_err(|e| mcp_err(&e.to_string()))?;
+        engine
+            .upsert_edge(&edge)
+            .map_err(|e| mcp_err(&e.to_string()))?;
 
         // test_run -> target (validates)
         let edge2 = crate::schema::Edge {
@@ -1293,17 +1323,28 @@ async fn tool_graph_record_test_run(
             properties: serde_json::json!({}),
             worktree: String::new(),
         };
-        engine.upsert_edge(&edge2).map_err(|e| mcp_err(&e.to_string()))?;
+        engine
+            .upsert_edge(&edge2)
+            .map_err(|e| mcp_err(&e.to_string()))?;
 
         // Update each target seam's test status
         if let Ok(Some(mut seam)) = engine.get_node(tid) {
             let mut seam_props = seam.properties.as_object().cloned().unwrap_or_default();
             let status_key = if is_green { "test-green" } else { "test-red" };
-            seam_props.insert("last_test_status".to_string(), serde_json::json!(status_key));
+            seam_props.insert(
+                "last_test_status".to_string(),
+                serde_json::json!(status_key),
+            );
             seam_props.insert("last_test_run".to_string(), serde_json::json!(test_run_id));
-            seam_props.insert("last_test_at".to_string(), serde_json::json!(chrono::Utc::now().to_rfc3339()));
+            seam_props.insert(
+                "last_test_at".to_string(),
+                serde_json::json!(chrono::Utc::now().to_rfc3339()),
+            );
             if is_green {
-                seam_props.insert("last_green_at".to_string(), serde_json::json!(chrono::Utc::now().to_rfc3339()));
+                seam_props.insert(
+                    "last_green_at".to_string(),
+                    serde_json::json!(chrono::Utc::now().to_rfc3339()),
+                );
             }
             seam.properties = serde_json::Value::Object(seam_props);
             seam.updated_at = chrono::Utc::now();
@@ -1348,17 +1389,20 @@ async fn tool_graph_advance_verification(
         .get("level")
         .and_then(|v| v.as_str())
         .ok_or_else(|| mcp_err("Missing required parameter: level"))?;
-    let evidence = args
-        .get("evidence")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let evidence = args.get("evidence").and_then(|v| v.as_str()).unwrap_or("");
     let reason = args
         .get("reason")
         .and_then(|v| v.as_str())
         .unwrap_or("Verification advancement");
 
     // Validate level
-    let valid_levels = ["code-complete", "test-green", "smoke-green", "uat-green", "implemented"];
+    let valid_levels = [
+        "code-complete",
+        "test-green",
+        "smoke-green",
+        "uat-green",
+        "implemented",
+    ];
     if !valid_levels.contains(&level) {
         return Err(mcp_err(&format!(
             "Invalid level: {}. Must be one of: {:?}",
@@ -1397,8 +1441,14 @@ async fn tool_graph_advance_verification(
 
     // Update properties
     props.insert("verification_level".to_string(), serde_json::json!(level));
-    props.insert("verification_history".to_string(), serde_json::json!(history));
-    props.insert("last_updated".to_string(), serde_json::json!(chrono::Utc::now().format("%Y-%m-%d").to_string()));
+    props.insert(
+        "verification_history".to_string(),
+        serde_json::json!(history),
+    );
+    props.insert(
+        "last_updated".to_string(),
+        serde_json::json!(chrono::Utc::now().format("%Y-%m-%d").to_string()),
+    );
 
     node.properties = serde_json::Value::Object(props);
     node.updated_at = chrono::Utc::now();
@@ -1448,7 +1498,10 @@ async fn tool_graph_embed(
     state: &AppState,
     args: &serde_json::Value,
 ) -> Result<serde_json::Value, JsonRpcError> {
-    let node_id = args.get("node_id").and_then(|v| v.as_str()).ok_or_else(|| mcp_err("Missing node_id"))?;
+    let node_id = args
+        .get("node_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| mcp_err("Missing node_id"))?;
     let custom_text = args.get("text").and_then(|v| v.as_str());
 
     // Get the node from the graph
@@ -1523,7 +1576,10 @@ async fn tool_graph_embed(
         target_node: Some(node_id.to_string()),
         from_value: node.embedding_hash.clone(),
         to_value: Some(text_hash),
-        reason: Some(format!("Generated embedding using {}", embed_resp.model_gen)),
+        reason: Some(format!(
+            "Generated embedding using {}",
+            embed_resp.model_gen
+        )),
         details: serde_json::json!({"dims": embed_resp.embedding.len(), "model_gen": embed_resp.model_gen}),
     };
 
@@ -1557,10 +1613,16 @@ async fn tool_graph_semantic_search(
     state: &AppState,
     args: &serde_json::Value,
 ) -> Result<serde_json::Value, JsonRpcError> {
-    let query = args.get("query").and_then(|v| v.as_str()).ok_or_else(|| mcp_err("Missing query"))?;
+    let query = args
+        .get("query")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| mcp_err("Missing query"))?;
     let kind_filter = args.get("kind").and_then(|v| v.as_str());
     let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(10) as usize;
-    let threshold = args.get("threshold").and_then(|v| v.as_f64()).unwrap_or(0.7) as f32;
+    let threshold = args
+        .get("threshold")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.7) as f32;
 
     // Generate embedding for query
     let client = crate::embeddings::EmbeddingsClient::new();
@@ -1637,7 +1699,10 @@ async fn tool_graph_embed_batch(
     state: &AppState,
     args: &serde_json::Value,
 ) -> Result<serde_json::Value, JsonRpcError> {
-    let kind_str = args.get("kind").and_then(|v| v.as_str()).unwrap_or("proposal");
+    let kind_str = args
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("proposal");
     let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
 
     let kind = crate::schema::NodeKind::from_str(kind_str)
@@ -1762,9 +1827,18 @@ async fn tool_graph_embed_batch(
     });
 
     let status_text = if errors.is_empty() {
-        format!("Batch embed complete: {} processed, {} embedded, {} skipped", processed, embedded, skipped)
+        format!(
+            "Batch embed complete: {} processed, {} embedded, {} skipped",
+            processed, embedded, skipped
+        )
     } else {
-        format!("Batch embed complete with {} errors: {} processed, {} embedded, {} skipped", errors.len(), processed, embedded, skipped)
+        format!(
+            "Batch embed complete with {} errors: {} processed, {} embedded, {} skipped",
+            errors.len(),
+            processed,
+            embedded,
+            skipped
+        )
     };
 
     Ok(serde_json::json!({
@@ -1786,11 +1860,18 @@ async fn tool_graph_verify_semantic(
     state: &AppState,
     args: &serde_json::Value,
 ) -> Result<serde_json::Value, JsonRpcError> {
-    let proposal_id = args.get("proposal_id").and_then(|v| v.as_str())
+    let proposal_id = args
+        .get("proposal_id")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| mcp_err("Missing proposal_id"))?;
-    let code_node_ids: Vec<String> = args.get("code_node_ids")
+    let code_node_ids: Vec<String> = args
+        .get("code_node_ids")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
 
     let engine = state.engine.lock().await;
@@ -1802,8 +1883,12 @@ async fn tool_graph_verify_semantic(
         .ok_or_else(|| mcp_err(&format!("Proposal not found: {}", proposal_id)))?;
 
     // Check proposal has embedding
-    let proposal_embedding = proposal.embedding
-        .ok_or_else(|| mcp_err(&format!("Proposal {} has no embedding. Run graph_embed first.", proposal_id)))?;
+    let proposal_embedding = proposal.embedding.ok_or_else(|| {
+        mcp_err(&format!(
+            "Proposal {} has no embedding. Run graph_embed first.",
+            proposal_id
+        ))
+    })?;
 
     // Query code nodes if not provided
     let code_nodes: Vec<_> = if code_node_ids.is_empty() {
@@ -1848,7 +1933,8 @@ async fn tool_graph_verify_semantic(
     // Sort by similarity
     similarities.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    let avg_similarity: f32 = similarities.iter().map(|(s, _)| s).sum::<f32>() / similarities.len() as f32;
+    let avg_similarity: f32 =
+        similarities.iter().map(|(s, _)| s).sum::<f32>() / similarities.len() as f32;
     let top_similarity = similarities.first().map(|(s, _)| *s).unwrap_or(0.0);
 
     // Determine alignment status
@@ -1888,19 +1974,19 @@ async fn tool_graph_verify_semantic(
     }))
 }
 
-async fn tool_graph_digest(
-    state: &AppState,
-) -> Result<serde_json::Value, JsonRpcError> {
+async fn tool_graph_digest(state: &AppState) -> Result<serde_json::Value, JsonRpcError> {
     let engine = state.engine.lock().await;
-    let report = crate::egress::generate_digest(&engine)
-        .map_err(|e| mcp_err(&e.to_string()))?;
+    let report = crate::egress::generate_digest(&engine).map_err(|e| mcp_err(&e.to_string()))?;
 
     // Build compact text representation
     let mut text = String::new();
     text.push_str(&format!(
         "# Architecture Digest\n\nnodes: {}  edges: {}  proposals: {}  seams: {}  skills: {}\n\n",
-        report.total_nodes, report.total_edges,
-        report.proposal_count, report.seam_count, report.skill_count
+        report.total_nodes,
+        report.total_edges,
+        report.proposal_count,
+        report.seam_count,
+        report.skill_count
     ));
 
     for domain in &report.domains {
@@ -1985,7 +2071,10 @@ async fn tool_graph_export_docs(
     state: &AppState,
     args: &serde_json::Value,
 ) -> Result<serde_json::Value, JsonRpcError> {
-    let dry_run = args.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+    let dry_run = args
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let repo_root = std::path::Path::new(&state.repo_root);
 
     let engine = state.engine.lock().await;
@@ -2004,7 +2093,8 @@ async fn tool_graph_export_docs(
         let mut would_update = Vec::new();
         let mut would_skip = Vec::new();
         for kind in &doc_kinds {
-            let nodes = engine.query_nodes(Some(*kind), None)
+            let nodes = engine
+                .query_nodes(Some(*kind), None)
                 .map_err(|e| mcp_err(&e.to_string()))?;
             for node in nodes {
                 match node.file_path.as_deref() {
@@ -2039,8 +2129,8 @@ async fn tool_graph_export_docs(
         }));
     }
 
-    let report = crate::egress::export_docs(&engine, repo_root)
-        .map_err(|e| mcp_err(&e.to_string()))?;
+    let report =
+        crate::egress::export_docs(&engine, repo_root).map_err(|e| mcp_err(&e.to_string()))?;
 
     let text = format!(
         "export_docs: {} updated, {} skipped, {} errors\n\nUpdated:\n{}\n\nErrors:\n{}",
@@ -2075,14 +2165,13 @@ async fn tool_graph_export_sver(
     let write = args.get("write").and_then(|v| v.as_bool()).unwrap_or(false);
     let engine = state.engine.lock().await;
 
-    let markdown = crate::egress::export_sver_doc(&engine)
-        .map_err(|e| mcp_err(&e.to_string()))?;
+    let markdown = crate::egress::export_sver_doc(&engine).map_err(|e| mcp_err(&e.to_string()))?;
 
     let mut written_path: Option<String> = None;
 
     if write {
-        let out_path = std::path::Path::new(&state.repo_root)
-            .join("docs/architecture/SVER_STATE.md");
+        let out_path =
+            std::path::Path::new(&state.repo_root).join("docs/architecture/SVER_STATE.md");
 
         // Ensure directory exists
         if let Some(parent) = out_path.parent() {
@@ -2114,25 +2203,38 @@ async fn tool_graph_context_for(
     state: &AppState,
     args: &serde_json::Value,
 ) -> Result<serde_json::Value, JsonRpcError> {
-    let target_id = args.get("target_id").and_then(|v| v.as_str())
+    let target_id = args
+        .get("target_id")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| mcp_err("Missing required parameter: target_id"))?;
 
     let engine = state.engine.lock().await;
-    let ctx = crate::egress::context_for(&engine, target_id)
-        .map_err(|e| mcp_err(&e.to_string()))?;
+    let ctx =
+        crate::egress::context_for(&engine, target_id).map_err(|e| mcp_err(&e.to_string()))?;
 
     // Build compact text representation
     let mut text = String::new();
-    text.push_str(&format!("# Context: {} ({})\n\n", ctx.target_name, ctx.target_kind));
-    text.push_str(&format!("domain: {}  status: {}  disposition: {}  verification: {}\n\n",
-        ctx.domain, ctx.status, ctx.disposition, ctx.verification_level));
+    text.push_str(&format!(
+        "# Context: {} ({})\n\n",
+        ctx.target_name, ctx.target_kind
+    ));
+    text.push_str(&format!(
+        "domain: {}  status: {}  disposition: {}  verification: {}\n\n",
+        ctx.domain, ctx.status, ctx.disposition, ctx.verification_level
+    ));
 
     if let Some(ref body) = ctx.proposal_body {
         // Truncate body to first 2000 chars to save tokens
-        let truncated = if body.len() > 2000 { &body[..2000] } else { body.as_str() };
+        let truncated = if body.len() > 2000 {
+            &body[..2000]
+        } else {
+            body.as_str()
+        };
         text.push_str("## Proposal Body\n\n");
         text.push_str(truncated);
-        if body.len() > 2000 { text.push_str("\n\n...(truncated, use graph_snippet for full text)"); }
+        if body.len() > 2000 {
+            text.push_str("\n\n...(truncated, use graph_snippet for full text)");
+        }
         text.push_str("\n\n");
     }
 
@@ -2155,7 +2257,10 @@ async fn tool_graph_context_for(
     if !ctx.implementing_code.is_empty() {
         text.push_str("## Implementing Code\n");
         for c in &ctx.implementing_code {
-            text.push_str(&format!("  - {}:{}-{} `{}`\n", c.file_path, c.line_start, c.line_end, c.signature));
+            text.push_str(&format!(
+                "  - {}:{}-{} `{}`\n",
+                c.file_path, c.line_start, c.line_end, c.signature
+            ));
         }
         text.push('\n');
     }
@@ -2199,12 +2304,9 @@ async fn tool_graph_context_for(
     }))
 }
 
-async fn tool_graph_next_task(
-    state: &AppState,
-) -> Result<serde_json::Value, JsonRpcError> {
+async fn tool_graph_next_task(state: &AppState) -> Result<serde_json::Value, JsonRpcError> {
     let engine = state.engine.lock().await;
-    let result = crate::egress::next_task(&engine)
-        .map_err(|e| mcp_err(&e.to_string()))?;
+    let result = crate::egress::next_task(&engine).map_err(|e| mcp_err(&e.to_string()))?;
 
     match result {
         Some(task) => {
@@ -2234,12 +2336,10 @@ async fn tool_graph_next_task(
                 },
             }))
         }
-        None => {
-            Ok(serde_json::json!({
-                "content": [{ "type": "text", "text": "No unclaimed work items found. All proposals are either completed, deferred, or actively being worked on." }],
-                "task": null,
-            }))
-        }
+        None => Ok(serde_json::json!({
+            "content": [{ "type": "text", "text": "No unclaimed work items found. All proposals are either completed, deferred, or actively being worked on." }],
+            "task": null,
+        })),
     }
 }
 
@@ -2247,37 +2347,51 @@ async fn tool_graph_impact(
     state: &AppState,
     args: &serde_json::Value,
 ) -> Result<serde_json::Value, JsonRpcError> {
-    let target = args.get("target").and_then(|v| v.as_str())
+    let target = args
+        .get("target")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| mcp_err("Missing required parameter: target"))?;
 
     let engine = state.engine.lock().await;
-    let report = crate::egress::impact_analysis(&engine, target)
-        .map_err(|e| mcp_err(&e.to_string()))?;
+    let report =
+        crate::egress::impact_analysis(&engine, target).map_err(|e| mcp_err(&e.to_string()))?;
 
     let mut text = format!(
         "# Impact Analysis: {}\n\nSeed nodes: {}  Total reached: {}\n\n",
         report.target, report.seed_nodes, report.total_reached
     );
 
-    if report.affected_proposals.is_empty() && report.affected_seams.is_empty() && report.affected_tests.is_empty() {
+    if report.affected_proposals.is_empty()
+        && report.affected_seams.is_empty()
+        && report.affected_tests.is_empty()
+    {
         text.push_str("No proposals, seams, or tests affected by this change.\n");
     } else {
         if !report.affected_proposals.is_empty() {
-            text.push_str(&format!("## Affected Proposals ({})\n", report.affected_proposals.len()));
+            text.push_str(&format!(
+                "## Affected Proposals ({})\n",
+                report.affected_proposals.len()
+            ));
             for p in &report.affected_proposals {
                 text.push_str(&format!("  - {}\n", p));
             }
             text.push('\n');
         }
         if !report.affected_seams.is_empty() {
-            text.push_str(&format!("## Affected Seams ({})\n", report.affected_seams.len()));
+            text.push_str(&format!(
+                "## Affected Seams ({})\n",
+                report.affected_seams.len()
+            ));
             for s in &report.affected_seams {
                 text.push_str(&format!("  - {}\n", s));
             }
             text.push('\n');
         }
         if !report.affected_tests.is_empty() {
-            text.push_str(&format!("## Affected Tests ({})\n", report.affected_tests.len()));
+            text.push_str(&format!(
+                "## Affected Tests ({})\n",
+                report.affected_tests.len()
+            ));
             for t in &report.affected_tests {
                 text.push_str(&format!("  - {}\n", t));
             }
@@ -2294,12 +2408,9 @@ async fn tool_graph_impact(
     }))
 }
 
-async fn tool_graph_agent_dashboard(
-    state: &AppState,
-) -> Result<serde_json::Value, JsonRpcError> {
+async fn tool_graph_agent_dashboard(state: &AppState) -> Result<serde_json::Value, JsonRpcError> {
     let engine = state.engine.lock().await;
-    let report = crate::egress::agent_dashboard(&engine)
-        .map_err(|e| mcp_err(&e.to_string()))?;
+    let report = crate::egress::agent_dashboard(&engine).map_err(|e| mcp_err(&e.to_string()))?;
 
     let mut text = String::new();
     text.push_str(&format!(
@@ -2320,7 +2431,10 @@ async fn tool_graph_agent_dashboard(
     if report.active_sessions.is_empty() {
         text.push_str("## Active Sessions: none\n\n");
     } else {
-        text.push_str(&format!("## Active Sessions ({})\n", report.active_sessions.len()));
+        text.push_str(&format!(
+            "## Active Sessions ({})\n",
+            report.active_sessions.len()
+        ));
         for s in &report.active_sessions {
             text.push_str(&format!(
                 "  - {} ({}) on {} phase:{}\n",
@@ -2336,7 +2450,10 @@ async fn tool_graph_agent_dashboard(
         for a in &report.agents {
             text.push_str(&format!(
                 "  - **{}**: {} sessions ({} active), {} decisions, last active {}\n",
-                a.agent, a.total_sessions, a.active_sessions, a.decisions_made,
+                a.agent,
+                a.total_sessions,
+                a.active_sessions,
+                a.decisions_made,
                 a.last_active.format("%Y-%m-%d %H:%M")
             ));
         }
@@ -2359,9 +2476,7 @@ async fn tool_graph_agent_dashboard(
     }))
 }
 
-async fn tool_graph_persist_diagrams(
-    state: &AppState,
-) -> Result<serde_json::Value, JsonRpcError> {
+async fn tool_graph_persist_diagrams(state: &AppState) -> Result<serde_json::Value, JsonRpcError> {
     let repo_root = std::path::Path::new(&state.repo_root);
     let engine = state.engine.lock().await;
 
@@ -2371,10 +2486,17 @@ async fn tool_graph_persist_diagrams(
     let text = format!(
         "Persisted {} diagrams to docs/architecture/generated/\n\n{}",
         written.len(),
-        written.iter().map(|p| {
-            let name = std::path::Path::new(p).file_name().unwrap_or_default().to_string_lossy();
-            format!("  - {}", name)
-        }).collect::<Vec<_>>().join("\n"),
+        written
+            .iter()
+            .map(|p| {
+                let name = std::path::Path::new(p)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy();
+                format!("  - {}", name)
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
     );
 
     // Broadcast
@@ -2402,24 +2524,23 @@ async fn tool_graph_diagram(
         .get("target")
         .and_then(|v| v.as_str())
         .ok_or_else(|| mcp_err("Missing required parameter: target"))?;
-    let max_depth = args
-        .get("max_depth")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(3) as usize;
+    let max_depth = args.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
 
     let engine = state.engine.lock().await;
 
     let diagram = match diagram_type {
-        "c4_context" => crate::c4::generate_c4_context(&engine, target)
-            .map_err(|e| mcp_err(&e.to_string()))?,
+        "c4_context" => {
+            crate::c4::generate_c4_context(&engine, target).map_err(|e| mcp_err(&e.to_string()))?
+        }
         "c4_container" => crate::c4::generate_c4_container(&engine, target)
             .map_err(|e| mcp_err(&e.to_string()))?,
         "c4_component" => crate::c4::generate_c4_component(&engine, target)
             .map_err(|e| mcp_err(&e.to_string()))?,
         "proposal_architecture" => crate::c4::generate_proposal_architecture(&engine, target)
             .map_err(|e| mcp_err(&e.to_string()))?,
-        "seam_detail" => crate::c4::generate_seam_detail(&engine, target)
-            .map_err(|e| mcp_err(&e.to_string()))?,
+        "seam_detail" => {
+            crate::c4::generate_seam_detail(&engine, target).map_err(|e| mcp_err(&e.to_string()))?
+        }
         "sequence" => crate::diagrams::generate_sequence_diagram(&engine, target, max_depth)
             .map_err(|e| mcp_err(&e.to_string()))?,
         "state" => crate::diagrams::generate_state_diagram(&engine, target)
@@ -2459,14 +2580,20 @@ async fn tool_session_start(
         .get("agent")
         .and_then(|v| v.as_str())
         .ok_or_else(|| mcp_err("Missing required parameter: agent"))?;
-    let agent_model = args.get("agent_model").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let agent_model = args
+        .get("agent_model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
     let seam_id = args
         .get("seam_id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| mcp_err("Missing required parameter: seam_id"))?;
     let proposal_id = args.get("proposal_id").and_then(|v| v.as_str());
     let task_id = args.get("task_id").and_then(|v| v.as_str());
-    let phase = args.get("phase").and_then(|v| v.as_str()).unwrap_or("started");
+    let phase = args
+        .get("phase")
+        .and_then(|v| v.as_str())
+        .unwrap_or("started");
 
     let engine = state.engine.lock().await;
 
@@ -2507,7 +2634,9 @@ async fn tool_session_start(
         embedding_updated: None,
         embedding_hash: None,
     };
-    engine.upsert_node(&workstream).map_err(|e| mcp_err(&e.to_string()))?;
+    engine
+        .upsert_node(&workstream)
+        .map_err(|e| mcp_err(&e.to_string()))?;
 
     // Link workstream to seam (PartOf - workstream is part of the seam context)
     let ws_seam_edge = crate::schema::Edge {
@@ -2517,7 +2646,9 @@ async fn tool_session_start(
         properties: serde_json::json!({"role": "active_work"}),
         worktree: String::new(),
     };
-    engine.upsert_edge(&ws_seam_edge).map_err(|e| mcp_err(&e.to_string()))?;
+    engine
+        .upsert_edge(&ws_seam_edge)
+        .map_err(|e| mcp_err(&e.to_string()))?;
 
     // Link workstream to proposal (Governs - proposal governs what the work achieves)
     if let Some(prop_id) = proposal_id {
@@ -2528,14 +2659,20 @@ async fn tool_session_start(
             properties: serde_json::json!({"direction": "implements"}),
             worktree: String::new(),
         };
-        engine.upsert_edge(&ws_prop_edge).map_err(|e| mcp_err(&e.to_string()))?;
+        engine
+            .upsert_edge(&ws_prop_edge)
+            .map_err(|e| mcp_err(&e.to_string()))?;
     }
 
     // Create session node (represents this specific agent session)
     let session = Node {
         id: session_id.to_string(),
         kind: NodeKind::Session,
-        name: format!("Session {} - {}", agent, chrono::Utc::now().format("%Y-%m-%d %H:%M")),
+        name: format!(
+            "Session {} - {}",
+            agent,
+            chrono::Utc::now().format("%Y-%m-%d %H:%M")
+        ),
         properties: serde_json::json!({
             "agent": agent,
             "agent_model": agent_model,
@@ -2560,7 +2697,9 @@ async fn tool_session_start(
         embedding_hash: None,
     };
 
-    engine.upsert_node(&session).map_err(|e| mcp_err(&e.to_string()))?;
+    engine
+        .upsert_node(&session)
+        .map_err(|e| mcp_err(&e.to_string()))?;
 
     // Create edge: session -> seam (working_on)
     let edge = crate::schema::Edge {
@@ -2570,7 +2709,9 @@ async fn tool_session_start(
         properties: serde_json::json!({"since": chrono::Utc::now().to_rfc3339()}),
         worktree: String::new(),
     };
-    engine.upsert_edge(&edge).map_err(|e| mcp_err(&e.to_string()))?;
+    engine
+        .upsert_edge(&edge)
+        .map_err(|e| mcp_err(&e.to_string()))?;
 
     // Optionally link to task
     if let Some(task) = task_id {
@@ -2581,7 +2722,9 @@ async fn tool_session_start(
             properties: serde_json::json!({}),
             worktree: String::new(),
         };
-        engine.upsert_edge(&edge2).map_err(|e| mcp_err(&e.to_string()))?;
+        engine
+            .upsert_edge(&edge2)
+            .map_err(|e| mcp_err(&e.to_string()))?;
     }
 
     // Record mutation
@@ -2597,7 +2740,9 @@ async fn tool_session_start(
         reason: Some(format!("Session started on {}", seam_id)),
         details: serde_json::json!({"seam_id": seam_id, "phase": phase}),
     };
-    engine.record_mutation(&mutation).map_err(|e| mcp_err(&e.to_string()))?;
+    engine
+        .record_mutation(&mutation)
+        .map_err(|e| mcp_err(&e.to_string()))?;
 
     // Broadcast
     let _ = state.change_tx.send(ChangeEvent {
@@ -2636,7 +2781,10 @@ async fn tool_session_activity(
         .get("activity_type")
         .and_then(|v| v.as_str())
         .ok_or_else(|| mcp_err("Missing required parameter: activity_type"))?;
-    let details = args.get("details").cloned().unwrap_or(serde_json::json!({}));
+    let details = args
+        .get("details")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
     let new_phase = args.get("phase").and_then(|v| v.as_str());
 
     let engine = state.engine.lock().await;
@@ -2649,8 +2797,11 @@ async fn tool_session_activity(
 
     // Update session properties
     let mut props = session.properties.as_object().cloned().unwrap_or_default();
-    props.insert("last_activity".to_string(), serde_json::json!(chrono::Utc::now().to_rfc3339()));
-    
+    props.insert(
+        "last_activity".to_string(),
+        serde_json::json!(chrono::Utc::now().to_rfc3339()),
+    );
+
     if let Some(phase) = new_phase {
         props.insert("phase".to_string(), serde_json::json!(phase));
     }
@@ -2682,43 +2833,62 @@ async fn tool_session_activity(
             .get("lines_changed")
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
-        props.insert("lines_changed".to_string(), serde_json::json!(existing_lines + lines));
+        props.insert(
+            "lines_changed".to_string(),
+            serde_json::json!(existing_lines + lines),
+        );
     }
 
     // Track test runs
     if activity_type == "test_run" {
-        let existing_tests = props
-            .get("test_runs")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        props.insert("test_runs".to_string(), serde_json::json!(existing_tests + 1));
+        let existing_tests = props.get("test_runs").and_then(|v| v.as_i64()).unwrap_or(0);
+        props.insert(
+            "test_runs".to_string(),
+            serde_json::json!(existing_tests + 1),
+        );
     }
 
     // Track token usage (accumulate from each activity report)
-    let tokens_in = args.get("tokens_input").and_then(|v| v.as_i64())
+    let tokens_in = args
+        .get("tokens_input")
+        .and_then(|v| v.as_i64())
         .or_else(|| details.get("tokens_input").and_then(|v| v.as_i64()))
         .unwrap_or(0);
-    let tokens_out = args.get("tokens_output").and_then(|v| v.as_i64())
+    let tokens_out = args
+        .get("tokens_output")
+        .and_then(|v| v.as_i64())
         .or_else(|| details.get("tokens_output").and_then(|v| v.as_i64()))
         .unwrap_or(0);
-    
+
     if tokens_in > 0 || tokens_out > 0 {
-        let existing_in = props.get("tokens_input").and_then(|v| v.as_i64()).unwrap_or(0);
-        let existing_out = props.get("tokens_output").and_then(|v| v.as_i64()).unwrap_or(0);
+        let existing_in = props
+            .get("tokens_input")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let existing_out = props
+            .get("tokens_output")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
         let new_in = existing_in + tokens_in;
         let new_out = existing_out + tokens_out;
         props.insert("tokens_input".to_string(), serde_json::json!(new_in));
         props.insert("tokens_output".to_string(), serde_json::json!(new_out));
-        props.insert("tokens_total".to_string(), serde_json::json!(new_in + new_out));
+        props.insert(
+            "tokens_total".to_string(),
+            serde_json::json!(new_in + new_out),
+        );
     }
 
     session.properties = serde_json::Value::Object(props);
     session.updated_at = chrono::Utc::now();
 
-    engine.upsert_node(&session).map_err(|e| mcp_err(&e.to_string()))?;
+    engine
+        .upsert_node(&session)
+        .map_err(|e| mcp_err(&e.to_string()))?;
 
     // Record mutation with session_id
-    let agent = session.properties
+    let agent = session
+        .properties
         .get("agent")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
@@ -2736,7 +2906,9 @@ async fn tool_session_activity(
         reason: Some(format!("Session activity: {}", activity_type)),
         details: details.clone(),
     };
-    engine.record_mutation(&mutation).map_err(|e| mcp_err(&e.to_string()))?;
+    engine
+        .record_mutation(&mutation)
+        .map_err(|e| mcp_err(&e.to_string()))?;
 
     // Broadcast
     let _ = state.change_tx.send(ChangeEvent {
@@ -2782,7 +2954,8 @@ async fn tool_session_close(
         .map_err(|e| mcp_err(&e.to_string()))?
         .ok_or_else(|| mcp_err(&format!("Session {} not found", session_id)))?;
 
-    let agent = session.properties
+    let agent = session
+        .properties
         .get("agent")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
@@ -2791,7 +2964,10 @@ async fn tool_session_close(
     // Update session properties
     let mut props = session.properties.as_object().cloned().unwrap_or_default();
     props.insert("status".to_string(), serde_json::json!(status));
-    props.insert("end_time".to_string(), serde_json::json!(chrono::Utc::now().to_rfc3339()));
+    props.insert(
+        "end_time".to_string(),
+        serde_json::json!(chrono::Utc::now().to_rfc3339()),
+    );
     if let Some(v) = verified {
         props.insert("verified".to_string(), serde_json::json!(v));
     }
@@ -2801,20 +2977,34 @@ async fn tool_session_close(
 
     // Token totals: use override if provided, otherwise keep accumulated values
     if let Some(total_override) = args.get("tokens_total").and_then(|v| v.as_i64()) {
-        props.insert("tokens_total".to_string(), serde_json::json!(total_override));
+        props.insert(
+            "tokens_total".to_string(),
+            serde_json::json!(total_override),
+        );
     }
     if let Some(quota_rem) = args.get("quota_remaining").and_then(|v| v.as_i64()) {
         props.insert("quota_remaining".to_string(), serde_json::json!(quota_rem));
     }
 
-    let session_tokens_total = props.get("tokens_total").and_then(|v| v.as_i64()).unwrap_or(0);
-    let session_tokens_in = props.get("tokens_input").and_then(|v| v.as_i64()).unwrap_or(0);
-    let session_tokens_out = props.get("tokens_output").and_then(|v| v.as_i64()).unwrap_or(0);
+    let session_tokens_total = props
+        .get("tokens_total")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let session_tokens_in = props
+        .get("tokens_input")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let session_tokens_out = props
+        .get("tokens_output")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
 
     session.properties = serde_json::Value::Object(props);
     session.updated_at = chrono::Utc::now();
 
-    engine.upsert_node(&session).map_err(|e| mcp_err(&e.to_string()))?;
+    engine
+        .upsert_node(&session)
+        .map_err(|e| mcp_err(&e.to_string()))?;
     let closed_workstreams = engine
         .close_linked_workstreams(&session, status, Some(summary))
         .map_err(|e| mcp_err(&e.to_string()))?;
@@ -2823,15 +3013,36 @@ async fn tool_session_close(
     if session_tokens_total > 0 {
         if let Ok(edges) = engine.get_edges_from(session_id) {
             for edge in &edges {
-                if edge.relation == crate::schema::EdgeRelation::WorkingOn || edge.relation == crate::schema::EdgeRelation::Implements {
+                if edge.relation == crate::schema::EdgeRelation::WorkingOn
+                    || edge.relation == crate::schema::EdgeRelation::Implements
+                {
                     if let Ok(Some(mut seam)) = engine.get_node(&edge.target_id) {
-                        let mut seam_props = seam.properties.as_object().cloned().unwrap_or_default();
-                        let existing = seam_props.get("tokens_total").and_then(|v| v.as_i64()).unwrap_or(0);
-                        let existing_in = seam_props.get("tokens_input").and_then(|v| v.as_i64()).unwrap_or(0);
-                        let existing_out = seam_props.get("tokens_output").and_then(|v| v.as_i64()).unwrap_or(0);
-                        seam_props.insert("tokens_total".to_string(), serde_json::json!(existing + session_tokens_total));
-                        seam_props.insert("tokens_input".to_string(), serde_json::json!(existing_in + session_tokens_in));
-                        seam_props.insert("tokens_output".to_string(), serde_json::json!(existing_out + session_tokens_out));
+                        let mut seam_props =
+                            seam.properties.as_object().cloned().unwrap_or_default();
+                        let existing = seam_props
+                            .get("tokens_total")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0);
+                        let existing_in = seam_props
+                            .get("tokens_input")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0);
+                        let existing_out = seam_props
+                            .get("tokens_output")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0);
+                        seam_props.insert(
+                            "tokens_total".to_string(),
+                            serde_json::json!(existing + session_tokens_total),
+                        );
+                        seam_props.insert(
+                            "tokens_input".to_string(),
+                            serde_json::json!(existing_in + session_tokens_in),
+                        );
+                        seam_props.insert(
+                            "tokens_output".to_string(),
+                            serde_json::json!(existing_out + session_tokens_out),
+                        );
                         seam.properties = serde_json::Value::Object(seam_props);
                         seam.updated_at = chrono::Utc::now();
                         let _ = engine.upsert_node(&seam);
@@ -2854,7 +3065,9 @@ async fn tool_session_close(
         reason: Some(summary.to_string()),
         details: serde_json::json!({"verified": verified}),
     };
-    engine.record_mutation(&mutation).map_err(|e| mcp_err(&e.to_string()))?;
+    engine
+        .record_mutation(&mutation)
+        .map_err(|e| mcp_err(&e.to_string()))?;
 
     // Broadcast
     let _ = state.change_tx.send(ChangeEvent {

@@ -50,7 +50,13 @@ impl EmbeddingsClient {
     /// Check if the sidecar is healthy and reachable.
     pub async fn health_check(&self) -> Result<bool> {
         let url = format!("{}/api/health", self.base_url);
-        match self.http.get(&url).timeout(std::time::Duration::from_secs(2)).send().await {
+        match self
+            .http
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await
+        {
             Ok(resp) => Ok(resp.status().is_success()),
             Err(_) => Ok(false),
         }

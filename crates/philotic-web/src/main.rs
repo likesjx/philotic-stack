@@ -5,6 +5,7 @@ use std::path::PathBuf;
 mod component;
 mod flush;
 mod footprint;
+mod harness;
 mod init;
 mod load;
 mod muninn;
@@ -174,8 +175,8 @@ enum GraphAction {
         mcp_port: u16,
 
         /// Path to graph database
-        #[arg(long, default_value = "philotic-graph.db")]
-        db: String,
+        #[arg(long)]
+        db: Option<String>,
     },
 
     /// Show graph status summary
@@ -197,6 +198,12 @@ enum GraphAction {
     Search {
         /// Search query
         query: String,
+    },
+
+    /// Manage local external harnesses and record desired/rendered/observed state in intel-graph
+    Harness {
+        #[command(subcommand)]
+        action: harness::HarnessAction,
     },
 }
 
@@ -332,7 +339,9 @@ async fn main() -> Result<()> {
                     let mut cfg = config;
                     cfg.http_port = port;
                     cfg.mcp_port = mcp_port;
-                    cfg.db_path = db;
+                    if let Some(db) = db {
+                        cfg.db_path = db;
+                    }
                     let repo_root = std::env::current_dir()?.to_string_lossy().to_string();
                     let server_config = cfg.to_server_config(&repo_root);
                     graph_intelligence::server::serve(server_config).await
@@ -437,6 +446,7 @@ async fn main() -> Result<()> {
                     }
                     Ok(())
                 }
+                GraphAction::Harness { action } => harness::run(action),
             }
         }
         Command::Serve {

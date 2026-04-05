@@ -52,7 +52,11 @@ pub fn export_docs(engine: &GraphEngine, repo_root: &Path) -> Result<ExportDocsR
             };
 
             if !file_path.exists() {
-                skipped.push(format!("{} (file not found: {})", node.id, file_path.display()));
+                skipped.push(format!(
+                    "{} (file not found: {})",
+                    node.id,
+                    file_path.display()
+                ));
                 continue;
             }
 
@@ -63,7 +67,10 @@ pub fn export_docs(engine: &GraphEngine, repo_root: &Path) -> Result<ExportDocsR
                 updates.insert("status".into(), serde_yaml::Value::String(v.to_string()));
             }
             if let Some(v) = node.properties.get("disposition").and_then(|v| v.as_str()) {
-                updates.insert("disposition".into(), serde_yaml::Value::String(v.to_string()));
+                updates.insert(
+                    "disposition".into(),
+                    serde_yaml::Value::String(v.to_string()),
+                );
             }
             if let Some(v) = node.properties.get("domain").and_then(|v| v.as_str()) {
                 updates.insert("domain".into(), serde_yaml::Value::String(v.to_string()));
@@ -107,8 +114,15 @@ pub fn export_docs(engine: &GraphEngine, repo_root: &Path) -> Result<ExportDocsR
             }
 
             // Verification level
-            if let Some(v) = node.properties.get("verification_level").and_then(|v| v.as_str()) {
-                updates.insert("verification_level".into(), serde_yaml::Value::String(v.to_string()));
+            if let Some(v) = node
+                .properties
+                .get("verification_level")
+                .and_then(|v| v.as_str())
+            {
+                updates.insert(
+                    "verification_level".into(),
+                    serde_yaml::Value::String(v.to_string()),
+                );
             }
 
             // Stamp last_updated
@@ -129,7 +143,11 @@ pub fn export_docs(engine: &GraphEngine, repo_root: &Path) -> Result<ExportDocsR
         }
     }
 
-    Ok(ExportDocsReport { updated, skipped, errors })
+    Ok(ExportDocsReport {
+        updated,
+        skipped,
+        errors,
+    })
 }
 
 pub struct ExportDocsReport {
@@ -158,7 +176,9 @@ pub fn export_sver_doc(engine: &GraphEngine) -> Result<String> {
 
     out.push_str("# SVER — Verification Ladder State\n\n");
     out.push_str(&format!("> Auto-generated from graph on {}.  \n", now));
-    out.push_str("> Source of truth: the graph.  Do not hand-edit — rerun `graph_export_sver`.\n\n");
+    out.push_str(
+        "> Source of truth: the graph.  Do not hand-edit — rerun `graph_export_sver`.\n\n",
+    );
 
     // ── Per-domain proposal table ──────────────────────────────────────────
     out.push_str("## Proposals by Domain\n\n");
@@ -166,7 +186,8 @@ pub fn export_sver_doc(engine: &GraphEngine) -> Result<String> {
     let proposals = engine.query_nodes(Some(NodeKind::Proposal), None)?;
     let mut by_domain: HashMap<String, Vec<_>> = HashMap::new();
     for p in &proposals {
-        let domain = p.properties
+        let domain = p
+            .properties
             .get("domain")
             .and_then(|v| v.as_str())
             .unwrap_or("unassigned")
@@ -184,11 +205,13 @@ pub fn export_sver_doc(engine: &GraphEngine) -> Result<String> {
         out.push_str("|---|---|---|---|\n");
 
         for p in props {
-            let disposition = p.properties
+            let disposition = p
+                .properties
                 .get("disposition")
                 .and_then(|v| v.as_str())
                 .unwrap_or("—");
-            let verification = p.properties
+            let verification = p
+                .properties
                 .get("verification_level")
                 .and_then(|v| v.as_str())
                 .unwrap_or("none");
@@ -197,7 +220,9 @@ pub fn export_sver_doc(engine: &GraphEngine) -> Result<String> {
             let edges = engine.get_edges_from(&p.id)?;
             let seams: Vec<&str> = edges
                 .iter()
-                .filter(|e| e.relation == EdgeRelation::Implements && e.target_id.starts_with("seam:"))
+                .filter(|e| {
+                    e.relation == EdgeRelation::Implements && e.target_id.starts_with("seam:")
+                })
                 .map(|e| e.target_id.as_str())
                 .collect();
             let seams_str = if seams.is_empty() {
@@ -208,11 +233,7 @@ pub fn export_sver_doc(engine: &GraphEngine) -> Result<String> {
 
             out.push_str(&format!(
                 "| `{}` {} | {} | `{}` | {} |\n",
-                p.id,
-                p.name,
-                disposition,
-                verification,
-                seams_str
+                p.id, p.name, disposition, verification, seams_str
             ));
         }
         out.push('\n');
@@ -227,7 +248,8 @@ pub fn export_sver_doc(engine: &GraphEngine) -> Result<String> {
         out.push_str("| Seam | Status | Blocks |\n");
         out.push_str("|---|---|---|\n");
         for seam in &seams {
-            let status = seam.properties
+            let status = seam
+                .properties
                 .get("status")
                 .and_then(|v| v.as_str())
                 .unwrap_or("—");
@@ -237,8 +259,15 @@ pub fn export_sver_doc(engine: &GraphEngine) -> Result<String> {
                 .filter(|e| e.relation == EdgeRelation::Blocks)
                 .map(|e| e.target_id.as_str())
                 .collect();
-            let blocks_str = if blocks.is_empty() { "—".to_string() } else { blocks.join(", ") };
-            out.push_str(&format!("| `{}` | {} | {} |\n", seam.id, status, blocks_str));
+            let blocks_str = if blocks.is_empty() {
+                "—".to_string()
+            } else {
+                blocks.join(", ")
+            };
+            out.push_str(&format!(
+                "| `{}` | {} | {} |\n",
+                seam.id, status, blocks_str
+            ));
         }
         out.push('\n');
     }
@@ -249,7 +278,8 @@ pub fn export_sver_doc(engine: &GraphEngine) -> Result<String> {
     let smoke_runs = engine.query_nodes(Some(NodeKind::SmokeRun), None)?;
     let uat_runs = engine.query_nodes(Some(NodeKind::UatRun), None)?;
 
-    let mut all_runs: Vec<_> = test_runs.iter()
+    let mut all_runs: Vec<_> = test_runs
+        .iter()
         .chain(smoke_runs.iter())
         .chain(uat_runs.iter())
         .collect();
@@ -264,8 +294,16 @@ pub fn export_sver_doc(engine: &GraphEngine) -> Result<String> {
         out.push_str("|---|---|---|---|---|\n");
         for run in all_runs.iter().take(30) {
             let kind_str = run.kind.as_str();
-            let status = run.properties.get("status").and_then(|v| v.as_str()).unwrap_or("—");
-            let target = run.properties.get("target_node").and_then(|v| v.as_str()).unwrap_or("—");
+            let status = run
+                .properties
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("—");
+            let target = run
+                .properties
+                .get("target_node")
+                .and_then(|v| v.as_str())
+                .unwrap_or("—");
             let time = run.created_at.format("%Y-%m-%d %H:%M").to_string();
             out.push_str(&format!(
                 "| `{}` | {} | {} | {} | {} |\n",
@@ -282,7 +320,8 @@ pub fn export_sver_doc(engine: &GraphEngine) -> Result<String> {
         out.push_str("_No skills indexed._\n\n");
     } else {
         for skill in &skills {
-            let desc = skill.properties
+            let desc = skill
+                .properties
                 .get("description")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
@@ -313,25 +352,29 @@ pub fn generate_digest(engine: &GraphEngine) -> Result<DigestReport> {
     // Build domain chains
     let mut by_domain: HashMap<String, Vec<DomainProposalEntry>> = HashMap::new();
     for p in &proposals {
-        let domain = p.properties
+        let domain = p
+            .properties
             .get("domain")
             .and_then(|v| v.as_str())
             .unwrap_or("unassigned")
             .to_string();
 
-        let disposition = p.properties
+        let disposition = p
+            .properties
             .get("disposition")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown")
             .to_string();
 
-        let status = p.properties
+        let status = p
+            .properties
             .get("status")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown")
             .to_string();
 
-        let verification = p.properties
+        let verification = p
+            .properties
             .get("verification_level")
             .and_then(|v| v.as_str())
             .unwrap_or("none")
@@ -342,20 +385,25 @@ pub fn generate_digest(engine: &GraphEngine) -> Result<DigestReport> {
         let active_seams: Vec<String> = edges
             .iter()
             .filter(|e| {
-                matches!(e.relation, EdgeRelation::Implements | EdgeRelation::References)
-                    && e.target_id.starts_with("seam:")
+                matches!(
+                    e.relation,
+                    EdgeRelation::Implements | EdgeRelation::References
+                ) && e.target_id.starts_with("seam:")
             })
             .map(|e| e.target_id.clone())
             .collect();
 
-        by_domain.entry(domain).or_default().push(DomainProposalEntry {
-            id: p.id.clone(),
-            name: p.name.clone(),
-            disposition,
-            status,
-            verification,
-            active_seams,
-        });
+        by_domain
+            .entry(domain)
+            .or_default()
+            .push(DomainProposalEntry {
+                id: p.id.clone(),
+                name: p.name.clone(),
+                disposition,
+                status,
+                verification,
+                active_seams,
+            });
     }
 
     // Active seams (those without a status of "closed")
@@ -371,7 +419,8 @@ pub fn generate_digest(engine: &GraphEngine) -> Result<DigestReport> {
         .map(|s| SeamEntry {
             id: s.id.clone(),
             name: s.name.clone(),
-            status: s.properties
+            status: s
+                .properties
                 .get("status")
                 .and_then(|v| v.as_str())
                 .unwrap_or("open")
@@ -391,9 +440,24 @@ pub fn generate_digest(engine: &GraphEngine) -> Result<DigestReport> {
         })
         .map(|s| SessionEntry {
             id: s.id.clone(),
-            agent: s.properties.get("agent").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
-            seam_id: s.properties.get("seam_id").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
-            phase: s.properties.get("phase").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
+            agent: s
+                .properties
+                .get("agent")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string(),
+            seam_id: s
+                .properties
+                .get("seam_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string(),
+            phase: s
+                .properties
+                .get("phase")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string(),
         })
         .collect();
 
@@ -487,7 +551,8 @@ pub struct DecisionEntry {
 /// sessions, and a PlantUML diagram.
 pub fn context_for(engine: &GraphEngine, target_id: &str) -> Result<ContextPackage> {
     // Resolve the target node
-    let target = engine.get_node(target_id)?
+    let target = engine
+        .get_node(target_id)?
         .ok_or_else(|| anyhow::anyhow!("Node '{}' not found", target_id))?;
 
     let is_proposal = matches!(target.kind, NodeKind::Proposal);
@@ -549,15 +614,22 @@ pub fn context_for(engine: &GraphEngine, target_id: &str) -> Result<ContextPacka
     }
 
     // Verification state
-    let verification_level = target.properties
+    let verification_level = target
+        .properties
         .get("verification_level")
         .and_then(|v| v.as_str())
         .unwrap_or("none")
         .to_string();
 
     // Recent test runs against this target
-    let test_edges = in_edges.iter()
-        .filter(|e| matches!(e.relation, EdgeRelation::TestedBy | EdgeRelation::SmokedBy | EdgeRelation::UatBy))
+    let test_edges = in_edges
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.relation,
+                EdgeRelation::TestedBy | EdgeRelation::SmokedBy | EdgeRelation::UatBy
+            )
+        })
         .take(5);
     let mut recent_runs: Vec<ContextNode> = Vec::new();
     for edge in test_edges {
@@ -567,7 +639,8 @@ pub fn context_for(engine: &GraphEngine, target_id: &str) -> Result<ContextPacka
     }
 
     // Recent decisions about this target
-    let decision_edges = in_edges.iter()
+    let decision_edges = in_edges
+        .iter()
         .filter(|e| e.relation == EdgeRelation::AppliesTo)
         .take(10);
     let mut decisions: Vec<ContextNode> = Vec::new();
@@ -581,17 +654,23 @@ pub fn context_for(engine: &GraphEngine, target_id: &str) -> Result<ContextPacka
 
     // Active sessions working on this target
     let sessions = engine.query_nodes(Some(NodeKind::Session), None)?;
-    let active_sessions: Vec<ContextNode> = sessions.iter()
+    let active_sessions: Vec<ContextNode> = sessions
+        .iter()
         .filter(|s| {
-            let is_active = s.properties.get("status")
+            let is_active = s
+                .properties
+                .get("status")
                 .and_then(|v| v.as_str())
                 .map(|s| s == "active")
                 .unwrap_or(false);
-            let matches_target = s.properties.get("seam_id")
+            let matches_target = s
+                .properties
+                .get("seam_id")
                 .and_then(|v| v.as_str())
                 .map(|id| id == target_id)
                 .unwrap_or(false)
-                || s.properties.get("proposal_id")
+                || s.properties
+                    .get("proposal_id")
                     .and_then(|v| v.as_str())
                     .map(|id| id == target_id)
                     .unwrap_or(false);
@@ -609,17 +688,20 @@ pub fn context_for(engine: &GraphEngine, target_id: &str) -> Result<ContextPacka
         None
     };
 
-    let disposition = target.properties
+    let disposition = target
+        .properties
         .get("disposition")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
-    let status = target.properties
+    let status = target
+        .properties
         .get("status")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
-    let domain = target.properties
+    let domain = target
+        .properties
         .get("domain")
         .and_then(|v| v.as_str())
         .unwrap_or("unassigned")
@@ -650,7 +732,12 @@ fn context_node_from(node: &crate::schema::Node) -> ContextNode {
         id: node.id.clone(),
         name: node.name.clone(),
         kind: node.kind.as_str().to_string(),
-        status: node.properties.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        status: node
+            .properties
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
         properties: node.properties.clone(),
     }
 }
@@ -705,20 +792,26 @@ pub fn next_task(engine: &GraphEngine) -> Result<Option<NextTaskResult>> {
     let sessions = engine.query_nodes(Some(NodeKind::Session), None)?;
 
     // Build set of currently-claimed targets
-    let claimed: std::collections::HashSet<String> = sessions.iter()
+    let claimed: std::collections::HashSet<String> = sessions
+        .iter()
         .filter(|s| {
-            s.properties.get("status")
+            s.properties
+                .get("status")
                 .and_then(|v| v.as_str())
                 .map(|s| s == "active")
                 .unwrap_or(false)
         })
         .filter_map(|s| {
-            s.properties.get("seam_id")
+            s.properties
+                .get("seam_id")
                 .and_then(|v| v.as_str())
                 .map(|id| id.to_string())
-                .or_else(|| s.properties.get("proposal_id")
-                    .and_then(|v| v.as_str())
-                    .map(|id| id.to_string()))
+                .or_else(|| {
+                    s.properties
+                        .get("proposal_id")
+                        .and_then(|v| v.as_str())
+                        .map(|id| id.to_string())
+                })
         })
         .collect();
 
@@ -730,12 +823,21 @@ pub fn next_task(engine: &GraphEngine) -> Result<Option<NextTaskResult>> {
             continue;
         }
 
-        let disposition = p.properties.get("disposition")
-            .and_then(|v| v.as_str()).unwrap_or("unknown");
-        let verification = p.properties.get("verification_level")
-            .and_then(|v| v.as_str()).unwrap_or("none");
-        let status = p.properties.get("status")
-            .and_then(|v| v.as_str()).unwrap_or("unknown");
+        let disposition = p
+            .properties
+            .get("disposition")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let verification = p
+            .properties
+            .get("verification_level")
+            .and_then(|v| v.as_str())
+            .unwrap_or("none");
+        let status = p
+            .properties
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
 
         // Skip completed/superseded/deferred
         if matches!(disposition, "implemented" | "superseded" | "deferred") {
@@ -749,16 +851,18 @@ pub fn next_task(engine: &GraphEngine) -> Result<Option<NextTaskResult>> {
 
         // Priority modifier (1-5 scale, default 3)
         // Higher priority = higher score multiplier
-        let priority = p.properties.get("priority")
+        let priority = p
+            .properties
+            .get("priority")
             .and_then(|v| v.as_u64())
             .unwrap_or(3) as i32;
         let priority_multiplier = match priority {
-            5 => 25,  // Critical
-            4 => 15,  // High
-            3 => 10,  // Medium (default)
-            2 => 5,   // Low
-            1 => 2,   // Minimal
-            _ => 10,  // Default fallback
+            5 => 25, // Critical
+            4 => 15, // High
+            3 => 10, // Medium (default)
+            2 => 5,  // Low
+            1 => 2,  // Minimal
+            _ => 10, // Default fallback
         };
 
         // Disposition priority
@@ -782,7 +886,8 @@ pub fn next_task(engine: &GraphEngine) -> Result<Option<NextTaskResult>> {
 
         // Check if this proposal blocks others (blockers are higher priority)
         let edges = engine.get_edges_from(&p.id).unwrap_or_default();
-        let blocks_count = edges.iter()
+        let blocks_count = edges
+            .iter()
             .filter(|e| e.relation == EdgeRelation::Blocks)
             .count();
         score += (blocks_count as i32) * 15;
@@ -795,32 +900,38 @@ pub fn next_task(engine: &GraphEngine) -> Result<Option<NextTaskResult>> {
         if claimed.contains(&s.id) {
             continue;
         }
-        let status = s.properties.get("status")
-            .and_then(|v| v.as_str()).unwrap_or("open");
+        let status = s
+            .properties
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("open");
         if status == "closed" {
             continue;
         }
 
         // Priority modifier (1-5 scale, default 3)
-        let priority = s.properties.get("priority")
+        let priority = s
+            .properties
+            .get("priority")
             .and_then(|v| v.as_u64())
             .unwrap_or(3) as i32;
         let priority_multiplier = match priority {
-            5 => 25,  // Critical
-            4 => 15,  // High
-            3 => 10,  // Medium (default)
-            2 => 5,   // Low
-            1 => 2,   // Minimal
-            _ => 10,  // Default fallback
+            5 => 25, // Critical
+            4 => 15, // High
+            3 => 10, // Medium (default)
+            2 => 5,  // Low
+            1 => 2,  // Minimal
+            _ => 10, // Default fallback
         };
 
         let edges = engine.get_edges_from(&s.id).unwrap_or_default();
-        let blocks_count = edges.iter()
+        let blocks_count = edges
+            .iter()
             .filter(|e| e.relation == EdgeRelation::Blocks)
             .count();
 
         let mut score = 60 + (blocks_count as i32) * 15; // Seams are generally high-priority
-        // Apply priority multiplier to base score
+                                                         // Apply priority multiplier to base score
         score = (score * priority_multiplier) / 10;
         candidates.push((score, s.id.clone(), s.name.clone(), status.to_string()));
     }
@@ -828,9 +939,9 @@ pub fn next_task(engine: &GraphEngine) -> Result<Option<NextTaskResult>> {
     candidates.sort_by(|a, b| b.0.cmp(&a.0));
 
     Ok(candidates.first().map(|(score, id, name, disposition)| {
-        let runner_up = candidates.get(1).map(|(_, id, name, _)| {
-            format!("{} ({})", id, name)
-        });
+        let runner_up = candidates
+            .get(1)
+            .map(|(_, id, name, _)| format!("{} ({})", id, name));
         NextTaskResult {
             id: id.clone(),
             name: name.clone(),
@@ -845,11 +956,19 @@ pub fn next_task(engine: &GraphEngine) -> Result<Option<NextTaskResult>> {
 
 fn format_task_reason(score: i32) -> String {
     let mut reasons = Vec::new();
-    if score >= 100 { reasons.push("accepted for current slice"); }
-    else if score >= 50 { reasons.push("proposed"); }
-    if score % 100 >= 40 { reasons.push("no verification yet"); }
-    else if score % 100 >= 30 { reasons.push("needs tests"); }
-    if reasons.is_empty() { reasons.push("available work"); }
+    if score >= 100 {
+        reasons.push("accepted for current slice");
+    } else if score >= 50 {
+        reasons.push("proposed");
+    }
+    if score % 100 >= 40 {
+        reasons.push("no verification yet");
+    } else if score % 100 >= 30 {
+        reasons.push("needs tests");
+    }
+    if reasons.is_empty() {
+        reasons.push("available work");
+    }
     reasons.join(", ")
 }
 
@@ -876,7 +995,8 @@ pub fn impact_analysis(engine: &GraphEngine, target: &str) -> Result<ImpactRepor
     // If target looks like a file path, find all nodes at that path
     let seed_nodes: Vec<String> = if target.contains('/') || target.contains('.') {
         let all_nodes = engine.query_nodes(None, None)?;
-        all_nodes.iter()
+        all_nodes
+            .iter()
             .filter(|n| n.file_path.as_deref() == Some(target))
             .map(|n| n.id.clone())
             .collect()
@@ -896,12 +1016,16 @@ pub fn impact_analysis(engine: &GraphEngine, target: &str) -> Result<ImpactRepor
     let max_depth = 4;
 
     while let Some((node_id, depth)) = queue.pop_front() {
-        if depth > max_depth { continue; }
+        if depth > max_depth {
+            continue;
+        }
 
         // Check incoming edges (who references/tests/implements this node?)
         let incoming = engine.get_edges_to(&node_id)?;
         for edge in &incoming {
-            if visited.contains(&edge.source_id) { continue; }
+            if visited.contains(&edge.source_id) {
+                continue;
+            }
             visited.insert(edge.source_id.clone());
 
             if let Some(node) = engine.get_node(&edge.source_id)? {
@@ -920,7 +1044,9 @@ pub fn impact_analysis(engine: &GraphEngine, target: &str) -> Result<ImpactRepor
         // Check outgoing edges too (what does this node depend on / implement?)
         let outgoing = engine.get_edges_from(&node_id)?;
         for edge in &outgoing {
-            if visited.contains(&edge.target_id) { continue; }
+            if visited.contains(&edge.target_id) {
+                continue;
+            }
             visited.insert(edge.target_id.clone());
 
             if let Some(node) = engine.get_node(&edge.target_id)? {
@@ -974,38 +1100,212 @@ pub fn agent_dashboard(engine: &GraphEngine) -> Result<DashboardReport> {
     let proposals = engine.query_nodes(Some(NodeKind::Proposal), None)?;
 
     // Active sessions
-    let active_sessions: Vec<DashboardSession> = sessions.iter()
+    let active_sessions: Vec<DashboardSession> = sessions
+        .iter()
         .filter(|s| {
-            s.properties.get("status")
+            s.properties
+                .get("status")
                 .and_then(|v| v.as_str())
                 .map(|s| s == "active")
                 .unwrap_or(false)
         })
         .map(|s| DashboardSession {
             id: s.id.clone(),
-            agent: s.properties.get("agent").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
-            seam_id: s.properties.get("seam_id").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
-            proposal_id: s.properties.get("proposal_id").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            phase: s.properties.get("phase").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
+            agent: s
+                .properties
+                .get("agent")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string(),
+            seam_id: s
+                .properties
+                .get("seam_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string(),
+            proposal_id: s
+                .properties
+                .get("proposal_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            phase: s
+                .properties
+                .get("phase")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string(),
             started: s.created_at,
+            last_activity: s
+                .properties
+                .get("last_activity")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            tokens_total: s
+                .properties
+                .get("tokens_total")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+            tokens_input: s
+                .properties
+                .get("tokens_input")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+            tokens_output: s
+                .properties
+                .get("tokens_output")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+            elapsed_ms: s
+                .properties
+                .get("elapsed_ms")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+            harness_id: s
+                .properties
+                .get("harness_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            workflow_name: s
+                .properties
+                .get("workflow_name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            branch: s
+                .properties
+                .get("branch")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            worktree_path: s
+                .properties
+                .get("worktree_path")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            files_touched: s
+                .properties
+                .get("files_touched")
+                .and_then(|v| v.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            lines_changed: s
+                .properties
+                .get("lines_changed")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+            test_runs: s
+                .properties
+                .get("test_runs")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
         })
         .collect();
 
     // Recent closed sessions (last 20)
-    let mut closed_sessions: Vec<DashboardSession> = sessions.iter()
+    let mut closed_sessions: Vec<DashboardSession> = sessions
+        .iter()
         .filter(|s| {
-            s.properties.get("status")
+            s.properties
+                .get("status")
                 .and_then(|v| v.as_str())
                 .map(|s| s != "active")
                 .unwrap_or(true)
         })
         .map(|s| DashboardSession {
             id: s.id.clone(),
-            agent: s.properties.get("agent").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
-            seam_id: s.properties.get("seam_id").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
-            proposal_id: s.properties.get("proposal_id").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            phase: s.properties.get("status").and_then(|v| v.as_str()).unwrap_or("closed").to_string(),
+            agent: s
+                .properties
+                .get("agent")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string(),
+            seam_id: s
+                .properties
+                .get("seam_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string(),
+            proposal_id: s
+                .properties
+                .get("proposal_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            phase: s
+                .properties
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("closed")
+                .to_string(),
             started: s.created_at,
+            last_activity: s
+                .properties
+                .get("last_activity")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            tokens_total: s
+                .properties
+                .get("tokens_total")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+            tokens_input: s
+                .properties
+                .get("tokens_input")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+            tokens_output: s
+                .properties
+                .get("tokens_output")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+            elapsed_ms: s
+                .properties
+                .get("elapsed_ms")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+            harness_id: s
+                .properties
+                .get("harness_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            workflow_name: s
+                .properties
+                .get("workflow_name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            branch: s
+                .properties
+                .get("branch")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            worktree_path: s
+                .properties
+                .get("worktree_path")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            files_touched: s
+                .properties
+                .get("files_touched")
+                .and_then(|v| v.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            lines_changed: s
+                .properties
+                .get("lines_changed")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+            test_runs: s
+                .properties
+                .get("test_runs")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
         })
         .collect();
     closed_sessions.sort_by(|a, b| b.started.cmp(&a.started));
@@ -1014,17 +1314,21 @@ pub fn agent_dashboard(engine: &GraphEngine) -> Result<DashboardReport> {
     // Per-agent summary
     let mut agent_map: HashMap<String, AgentSummary> = HashMap::new();
     for s in &sessions {
-        let agent = s.properties.get("agent")
+        let agent = s
+            .properties
+            .get("agent")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown")
             .to_string();
-        let entry = agent_map.entry(agent.clone()).or_insert_with(|| AgentSummary {
-            agent,
-            total_sessions: 0,
-            active_sessions: 0,
-            decisions_made: 0,
-            last_active: s.created_at,
-        });
+        let entry = agent_map
+            .entry(agent.clone())
+            .or_insert_with(|| AgentSummary {
+                agent,
+                total_sessions: 0,
+                active_sessions: 0,
+                decisions_made: 0,
+                last_active: s.created_at,
+            });
         entry.total_sessions += 1;
         if s.properties.get("status").and_then(|v| v.as_str()) == Some("active") {
             entry.active_sessions += 1;
@@ -1049,7 +1353,9 @@ pub fn agent_dashboard(engine: &GraphEngine) -> Result<DashboardReport> {
     // Verification progress
     let mut verification_counts: HashMap<String, usize> = HashMap::new();
     for p in &proposals {
-        let level = p.properties.get("verification_level")
+        let level = p
+            .properties
+            .get("verification_level")
             .and_then(|v| v.as_str())
             .unwrap_or("none")
             .to_string();
@@ -1084,6 +1390,18 @@ pub struct DashboardSession {
     pub proposal_id: Option<String>,
     pub phase: String,
     pub started: chrono::DateTime<chrono::Utc>,
+    pub last_activity: Option<String>,
+    pub tokens_total: i64,
+    pub tokens_input: i64,
+    pub tokens_output: i64,
+    pub elapsed_ms: i64,
+    pub harness_id: Option<String>,
+    pub workflow_name: Option<String>,
+    pub branch: Option<String>,
+    pub worktree_path: Option<String>,
+    pub files_touched: Vec<String>,
+    pub lines_changed: i64,
+    pub test_runs: i64,
 }
 
 pub struct AgentSummary {
@@ -1107,7 +1425,9 @@ pub fn session_health_check(engine: &GraphEngine) -> Result<SessionHealthReport>
     let mut agents_with_multiple: HashMap<String, Vec<String>> = HashMap::new();
 
     for s in &sessions {
-        let status = s.properties.get("status")
+        let status = s
+            .properties
+            .get("status")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
 
@@ -1116,15 +1436,22 @@ pub fn session_health_check(engine: &GraphEngine) -> Result<SessionHealthReport>
         }
         active_count += 1;
 
-        let agent = s.properties.get("agent")
+        let agent = s
+            .properties
+            .get("agent")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown")
             .to_string();
-        agents_with_multiple.entry(agent.clone()).or_default().push(s.id.clone());
+        agents_with_multiple
+            .entry(agent.clone())
+            .or_default()
+            .push(s.id.clone());
 
         // Check staleness: active sessions with no activity for > 4 hours
         let age = now - s.updated_at;
-        let last_activity = s.properties.get("last_activity")
+        let last_activity = s
+            .properties
+            .get("last_activity")
             .and_then(|v| v.as_str())
             .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
             .map(|dt| now - dt.with_timezone(&Utc));
@@ -1136,12 +1463,16 @@ pub fn session_health_check(engine: &GraphEngine) -> Result<SessionHealthReport>
             stale_sessions.push(StaleSessionEntry {
                 id: s.id.clone(),
                 agent,
-                seam_id: s.properties.get("seam_id")
+                seam_id: s
+                    .properties
+                    .get("seam_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("?")
                     .to_string(),
                 age_hours: effective_age.num_hours(),
-                phase: s.properties.get("phase")
+                phase: s
+                    .properties
+                    .get("phase")
                     .and_then(|v| v.as_str())
                     .unwrap_or("?")
                     .to_string(),
@@ -1150,7 +1481,8 @@ pub fn session_health_check(engine: &GraphEngine) -> Result<SessionHealthReport>
     }
 
     // Agents with > 2 concurrent sessions = coordination risk
-    let overloaded_agents: Vec<OverloadedAgent> = agents_with_multiple.iter()
+    let overloaded_agents: Vec<OverloadedAgent> = agents_with_multiple
+        .iter()
         .filter(|(_, sessions)| sessions.len() > 2)
         .map(|(agent, sessions)| OverloadedAgent {
             agent: agent.clone(),
@@ -1161,17 +1493,28 @@ pub fn session_health_check(engine: &GraphEngine) -> Result<SessionHealthReport>
 
     // Check for orphaned workstreams (workstream nodes with no active session)
     let workstreams = engine.query_nodes(Some(NodeKind::Workstream), None)?;
-    let active_session_seam_ids: std::collections::HashSet<String> = sessions.iter()
+    let active_session_seam_ids: std::collections::HashSet<String> = sessions
+        .iter()
         .filter(|s| s.properties.get("status").and_then(|v| v.as_str()) == Some("active"))
-        .filter_map(|s| s.properties.get("seam_id").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .filter_map(|s| {
+            s.properties
+                .get("seam_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
         .collect();
 
-    let orphaned_workstreams: Vec<String> = workstreams.iter()
+    let orphaned_workstreams: Vec<String> = workstreams
+        .iter()
         .filter(|w| {
-            let ws_status = w.properties.get("status")
+            let ws_status = w
+                .properties
+                .get("status")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
-            let ws_seam = w.properties.get("seam_id")
+            let ws_seam = w
+                .properties
+                .get("seam_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             ws_status == "active" && !active_session_seam_ids.contains(ws_seam)
@@ -1238,20 +1581,32 @@ pub fn proposal_health_check(engine: &GraphEngine) -> Result<ProposalHealthRepor
     let mut verification_counts: HashMap<String, usize> = HashMap::new();
 
     for p in &proposals {
-        let disposition = p.properties.get("disposition")
+        let disposition = p
+            .properties
+            .get("disposition")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let domain = p.properties.get("domain")
+        let domain = p
+            .properties
+            .get("domain")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let verification = p.properties.get("verification_level")
+        let verification = p
+            .properties
+            .get("verification_level")
             .and_then(|v| v.as_str())
             .unwrap_or("none");
 
         // Track disposition distribution
-        let disp_key = if disposition.is_empty() { "missing" } else { disposition };
+        let disp_key = if disposition.is_empty() {
+            "missing"
+        } else {
+            disposition
+        };
         *disposition_counts.entry(disp_key.to_string()).or_insert(0) += 1;
-        *verification_counts.entry(verification.to_string()).or_insert(0) += 1;
+        *verification_counts
+            .entry(verification.to_string())
+            .or_insert(0) += 1;
 
         if disposition.is_empty() {
             missing_disposition.push(p.id.clone());
@@ -1271,10 +1626,11 @@ pub fn proposal_health_check(engine: &GraphEngine) -> Result<ProposalHealthRepor
         // Check for proposals with no linked seams
         let edges = engine.get_edges_from(&p.id)?;
         let has_seam = edges.iter().any(|e| {
-            e.target_id.starts_with("seam:") && matches!(
-                e.relation,
-                EdgeRelation::Implements | EdgeRelation::References | EdgeRelation::Governs
-            )
+            e.target_id.starts_with("seam:")
+                && matches!(
+                    e.relation,
+                    EdgeRelation::Implements | EdgeRelation::References | EdgeRelation::Governs
+                )
         });
         if !has_seam {
             no_seams.push(p.id.clone());
@@ -1340,7 +1696,9 @@ pub fn auto_persist_diagrams(engine: &GraphEngine, repo_root: &Path) -> Result<V
     // 2. Per-proposal architecture diagrams
     let proposals = engine.query_nodes(Some(NodeKind::Proposal), None)?;
     for p in &proposals {
-        let disposition = p.properties.get("disposition")
+        let disposition = p
+            .properties
+            .get("disposition")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
         // Only generate for active proposals
@@ -1358,10 +1716,14 @@ pub fn auto_persist_diagrams(engine: &GraphEngine, repo_root: &Path) -> Result<V
     // 3. Active seam detail diagrams
     let seams = engine.query_nodes(Some(NodeKind::Seam), None)?;
     for s in &seams {
-        let status = s.properties.get("status")
+        let status = s
+            .properties
+            .get("status")
             .and_then(|v| v.as_str())
             .unwrap_or("open");
-        if status == "closed" { continue; }
+        if status == "closed" {
+            continue;
+        }
         let slug = s.id.replace("seam:", "");
         if let Ok(uml) = crate::c4::generate_seam_detail(engine, &s.id) {
             let path = generated_dir.join(format!("seam-{}.puml", slug));
@@ -1378,10 +1740,17 @@ pub fn auto_persist_diagrams(engine: &GraphEngine, repo_root: &Path) -> Result<V
          Generated: {}\n\n\
          ## Files\n\n{}\n",
         Utc::now().format("%Y-%m-%d %H:%M UTC"),
-        written.iter().map(|p| {
-            let name = Path::new(p).file_name().unwrap_or_default().to_string_lossy();
-            format!("- `{}`", name)
-        }).collect::<Vec<_>>().join("\n"),
+        written
+            .iter()
+            .map(|p| {
+                let name = Path::new(p)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy();
+                format!("- `{}`", name)
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
     );
     let readme_path = generated_dir.join("README.md");
     std::fs::write(&readme_path, &readme)?;
