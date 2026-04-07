@@ -1741,7 +1741,16 @@ async fn run_seat_impl(
             // Branch 1: Wait for Telegram Updates (Long Polling)
             // The request runs in an independent tokio task so that the IPC branch
             // (below) never cancels it mid-flight.
-            poll_result = poll_handle.as_mut().unwrap(), if poll_handle.is_some() => {
+            //
+            // NOTE: tokio::select! evaluates the future *expression* before checking
+            // the guard, so `poll_handle.as_mut().unwrap()` would panic when None.
+            // We use a safe inline future that pends when no poll is in flight.
+            poll_result = async {
+                match poll_handle.as_mut() {
+                    Some(h) => h.await,
+                    None => std::future::pending().await,
+                }
+            }, if poll_handle.is_some() => {
                 poll_handle = None;
                 let http_result: Result<Value, reqwest::Error> = match poll_result {
                     Ok(r) => r,
