@@ -1721,6 +1721,7 @@ async fn run_seat_impl(
                 poll_handle = Some(tokio::spawn(async move {
                     let res = client
                         .get(&url)
+                        .timeout(Duration::from_secs(TELEGRAM_POLL_TIMEOUT_SECS + 5))
                         .query(&[
                             ("offset", off.to_string()),
                             ("timeout", TELEGRAM_POLL_TIMEOUT_SECS.to_string()),
@@ -2067,11 +2068,18 @@ async fn run_seat_impl(
                 }
                 Err(err) => {
                     warn!(
-                        "Failed to renew Telegram poll lease [{}]: {}. Seat exiting.",
+                        "Failed to renew Telegram poll lease [{}]: {}. Seat will restart with backoff.",
                         poll_lease_key, err
                     );
+                    // Release best-effort (lease may already be dropped by hotel after TTL expiry).
                     let _ = release_telegram_poll_lease(&mut ipc_client, &poll_lease_key).await;
-                    return Ok(());
+                    // Return Err so run_seat_with_backoff retries and re-acquires the lease.
+                    // This handles machine sleep: wall-clock TTL expires on hotel side while
+                    // tokio's monotonic timer is paused, causing renewal to be missed.
+                    return Err(anyhow::anyhow!(
+                        "Telegram poll lease lost ({}); triggering seat restart to re-acquire.",
+                        err
+                    ));
                 }
             }
         }
