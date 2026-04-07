@@ -190,6 +190,10 @@ worktree-create slug base="main":
 workstream-start slug base="develop":
     ./scripts/codex-workstream.sh start {{slug}} {{base}}
 
+# Alias for the multi-role workstream workflow.
+start-workstream slug base="develop":
+    ./scripts/codex-workstream.sh start {{slug}} {{base}}
+
 # Show git status plus hot-file overlap for an active workstream.
 workstream-status slug compare_ref="origin/develop":
     ./scripts/codex-workstream.sh status {{slug}} {{compare_ref}}
@@ -395,6 +399,7 @@ local-push:
         fi
         chmod u+w "${AIUA_CELLAR}/$bin"
         cp "target/release/$bin" "${AIUA_CELLAR}/$bin"
+        xattr -c "${AIUA_CELLAR}/$bin" 2>/dev/null || true
         chmod u-w "${AIUA_CELLAR}/$bin"
         echo "  ✓ $bin"
     done
