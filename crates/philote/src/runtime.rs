@@ -557,6 +557,83 @@ impl AgentRuntime {
         }
     }
 
+    /// Subscribe this philote to the inbox of every role incarnation it owns.
+    ///
+    /// Philote connects with `role: "agent"`, which only registers it for tasks
+    /// addressed to the generic "agent" role.  When an orchestrator calls
+    /// `delegate.whisper(role: "virtuosa")`, the hotel dispatches to the
+    /// "virtuosa" inbox — finding no subscriber and silently dropping the task.
+    ///
+    /// This method queries the hotel for all role incarnations belonging to this
+    /// agent and sends an additional `SubscribeInbox` for each role name, so
+    /// paracrine tasks routed to any named role land in this process.
+    async fn subscribe_role_inboxes(&mut self) {
+        match self
+            .ipc_client
+            .send_request(IpcRequest::ListRoleIncarnations {
+                agent_id: self.agent_id.clone(),
+            })
+            .await
+        {
+            Ok(IpcResponse::Standard {
+                ok: true,
+                data: Some(data),
+                ..
+            }) => {
+                let role_names: Vec<String> = data
+                    .get("roles")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|r| r.get("role_name").and_then(|n| n.as_str()))
+                            .map(|s| s.to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                for role_name in &role_names {
+                    match self
+                        .ipc_client
+                        .send_request(IpcRequest::SubscribeInbox {
+                            role: role_name.clone(),
+                        })
+                        .await
+                    {
+                        Ok(_) => info!(
+                            agent_id = %self.agent_id,
+                            role = %role_name,
+                            "Subscribed to role inbox for paracrine delivery."
+                        ),
+                        Err(e) => warn!(
+                            agent_id = %self.agent_id,
+                            role = %role_name,
+                            "Failed to subscribe to role inbox: {e}"
+                        ),
+                    }
+                }
+
+                info!(
+                    agent_id = %self.agent_id,
+                    count = role_names.len(),
+                    roles = ?role_names,
+                    "Role inbox subscriptions registered."
+                );
+            }
+            Ok(_) => {
+                warn!(
+                    agent_id = %self.agent_id,
+                    "ListRoleIncarnations returned unexpected response — paracrine delivery will only work for 'agent' role."
+                );
+            }
+            Err(e) => {
+                warn!(
+                    agent_id = %self.agent_id,
+                    "Failed to list role incarnations at startup: {e} — paracrine delivery will only work for 'agent' role."
+                );
+            }
+        }
+    }
+
     /// Fetch MuninnDB config from hotel IPC and store it for session use.
     async fn fetch_memory_config(&mut self) {
         info!("Requesting MuninnDB config from hotel...");
@@ -615,6 +692,7 @@ impl AgentRuntime {
         info!("Listening for inbound Persona tasks from the Philotic Web...");
         self.fetch_agent_profile().await;
         self.fetch_memory_config().await;
+        self.subscribe_role_inboxes().await;
 
         // Publish command manifest to the hotel so membrane can discover it.
         let manifest = command_manifest(&[]);
