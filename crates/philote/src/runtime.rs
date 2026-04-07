@@ -557,6 +557,70 @@ impl AgentRuntime {
         }
     }
 
+    /// Fetch a role incarnation from the hotel and return a `RoleActivation` for it.
+    /// Used by `ensure_session_loaded` to auto-activate the agent's default role.
+    async fn fetch_role_activation(&mut self, role_name: &str) -> Option<crate::session::RoleActivation> {
+        match self
+            .ipc_client
+            .send_request(IpcRequest::ListRoleIncarnations {
+                agent_id: self.agent_id.clone(),
+            })
+            .await
+        {
+            Ok(IpcResponse::Standard {
+                ok: true,
+                data: Some(data),
+                ..
+            }) => {
+                let roles = data.get("roles").and_then(|v| v.as_array())?;
+                let rec = roles.iter().find(|r| {
+                    r.get("role_name").and_then(|n| n.as_str()) == Some(role_name)
+                })?;
+
+                let toolset_profile = rec
+                    .get("toolset_profile")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("orchestrator")
+                    .to_string();
+                let role_manifest = rec
+                    .get("role_manifest")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let role_addendum = rec
+                    .get("role_identity_addendum")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+
+                Some(crate::session::RoleActivation {
+                    role_name: role_name.to_string(),
+                    active_incarnation_id: None,
+                    activation_reason: "default_role_auto_activation".into(),
+                    requested_by: None,
+                    role_addendum,
+                    role_manifest,
+                    base_identity_ref: None,
+                    activation_requester_class: Some("default_role".into()),
+                    activation_policy_owner: None,
+                    toolset_profile_ref: Some(toolset_profile),
+                    skillset_profile_ref: None,
+                    effective_skillset: vec![],
+                    effective_skill_guidance: vec![],
+                    working_memory_policy: None,
+                    memory_projection_policy: None,
+                    turn_loop_config: None,
+                })
+            }
+            _ => {
+                warn!(
+                    agent_id = %self.agent_id,
+                    role = %role_name,
+                    "Failed to fetch role incarnation for default activation."
+                );
+                None
+            }
+        }
+    }
+
     /// Fetch MuninnDB config from hotel IPC and store it for session use.
     async fn fetch_memory_config(&mut self) {
         info!("Requesting MuninnDB config from hotel...");
@@ -7070,6 +7134,21 @@ impl AgentRuntime {
         // Apply reflex materialization now that the profile (including reflex_context) is set.
         state.apply_reflex_materialization();
         Self::fetch_and_inject_rules(&mut self.ipc_client, &self.agent_id, &mut state).await;
+
+        // Auto-activate the agent's default role incarnation on fresh sessions so the
+        // correct manifest, toolset, and skill guidance are present from turn zero
+        // without requiring an explicit handoff.to_role call.
+        if let Some(ref default_role) = self.default_agent_profile.default_role_name.clone() {
+            if let Some(activation) = self.fetch_role_activation(default_role).await {
+                state.role_activation = Some(activation);
+                info!(
+                    session_id = %session_id,
+                    role = %default_role,
+                    "Auto-activated default role on fresh session."
+                );
+            }
+        }
+
         self.sessions.insert(session_id.to_string(), state);
         Ok(())
     }

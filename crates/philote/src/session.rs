@@ -623,6 +623,15 @@ pub struct AgentProfile {
     /// ensuring turn zero is correct without agent self-discovery.
     #[serde(default)]
     pub reflex_context: MaterializationContext,
+    /// Role incarnation name to activate automatically on every fresh session.
+    /// When set, `ensure_session_loaded` applies this role before the first turn
+    /// so the agent always starts with the correct manifest, toolset, and skills
+    /// without requiring an explicit `handoff.to_role` call.
+    ///
+    /// Example: `"orchestrator"` — ensures the orchestrator posture (including
+    /// `delegate.whisper` skill guidance) is present from turn zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_role_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -2122,7 +2131,12 @@ impl SessionState {
 
     fn render_prompt_from_projection(&self, projection: &ContextProjection) -> String {
         let mut prompt = String::new();
-        prompt.push_str(&format!("[System]\nCurrent date and time (UTC): {}\n", utc_datetime_string()));
+        let persona_line = if let Some(ref name) = self.agent_profile.persona_name {
+            format!("Name: {name}\nCurrent date and time (UTC): {}\n", utc_datetime_string())
+        } else {
+            format!("Current date and time (UTC): {}\n", utc_datetime_string())
+        };
+        prompt.push_str(&format!("[System]\n{persona_line}"));
         for layer in &projection.layers {
             let title = match layer.layer_id {
                 ContextLayerId::Identity => "Agent self projection",
