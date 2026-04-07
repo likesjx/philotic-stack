@@ -1704,9 +1704,13 @@ async fn run_seat_impl(
     // Poll task: spawned so that arriving IPC messages (agent replies) never cancel
     // the in-flight getUpdates HTTP request.  A cancelled request leaves a zombie
     // session on Telegram's server and causes immediate Conflict on the next retry.
+    // There is always at most ONE request in flight — one JoinHandle = one connection.
     let mut poll_handle: Option<tokio::task::JoinHandle<Result<Value, reqwest::Error>>> = None;
-    // When set, do not start a new poll until this instant (Conflict back-off).
+    // When set, do not start a new poll until this instant.
     let mut poll_resume_at: Option<tokio::time::Instant> = None;
+    // Exponential back-off state for poll errors and 409 Conflicts.
+    // Reset to the initial value after any successful update batch.
+    let mut poll_error_backoff_secs: u64 = MEMBRANE_ERROR_BACKOFF_INITIAL_SECS;
 
     // Main Long-Polling Loop
     loop {
@@ -1759,6 +1763,8 @@ async fn run_seat_impl(
                 match http_result {
                     Ok(json) => {
                         if let Some(result) = json.get("result").and_then(|r| r.as_array()) {
+                                // Successful response — reset exponential back-off.
+                                poll_error_backoff_secs = MEMBRANE_ERROR_BACKOFF_INITIAL_SECS;
                                 for update in result {
                                     if let Some(update_id) = update.get("update_id").and_then(|id| id.as_i64()) {
                                         offset = update_id + 1; // Ack the message
@@ -1860,23 +1866,32 @@ async fn run_seat_impl(
                                     }
                                 }
                             } else if let Some(desc) = json.get("description").and_then(|d| d.as_str()) {
-                                error!("Telegram API Error: {}", desc);
-                                // On Conflict, schedule a back-off before the next poll.
-                                // We do NOT sleep here so that IPC messages (agent replies) are
-                                // still processed during the back-off window.
-                                if desc.contains("Conflict") {
-                                    poll_resume_at = Some(
-                                        tokio::time::Instant::now()
-                                            + Duration::from_secs(TELEGRAM_POLL_TIMEOUT_SECS + 2),
-                                    );
-                                }
+                                error!("Telegram API error: {}", desc);
+                                // 409 Conflict: Telegram still has our previous connection open
+                                // (common after sleep/wake). Back off exponentially so we don't
+                                // hammer it. One JoinHandle = one connection; we just need to
+                                // wait for Telegram's server to drop the old session.
+                                poll_resume_at = Some(
+                                    tokio::time::Instant::now()
+                                        + Duration::from_secs(poll_error_backoff_secs),
+                                );
+                                poll_error_backoff_secs = next_error_backoff_secs(poll_error_backoff_secs);
+                                warn!(
+                                    backoff_secs = poll_error_backoff_secs,
+                                    "Telegram API error — will retry after back-off."
+                                );
                             }
                     }
                     Err(e) => {
-                        warn!("Telegram Long Polling failed: {}. Retrying in 5s...", e);
-                        poll_resume_at = Some(
-                            tokio::time::Instant::now() + Duration::from_secs(5),
+                        warn!(
+                            backoff_secs = poll_error_backoff_secs,
+                            "Telegram long-polling failed: {e}. Retrying after back-off."
                         );
+                        poll_resume_at = Some(
+                            tokio::time::Instant::now()
+                                + Duration::from_secs(poll_error_backoff_secs),
+                        );
+                        poll_error_backoff_secs = next_error_backoff_secs(poll_error_backoff_secs);
                     }
                 }
             }
