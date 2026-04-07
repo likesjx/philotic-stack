@@ -568,6 +568,22 @@ impl GraphDomain {
         Ok(out)
     }
 
+    /// Find the first role incarnation record with the given role_name, across all agents.
+    pub fn find_role_incarnation_by_name(
+        &self,
+        role_name: &str,
+    ) -> Result<Option<RoleIncarnationRecord>> {
+        for node in self.adapter.list_nodes_by_kind(NODE_KIND_ROLE_INCARNATION)? {
+            let record: RoleIncarnationRecord = serde_json::from_value(node.data).context(
+                "GraphDomain::find_role_incarnation_by_name: deserialize RoleIncarnationRecord",
+            )?;
+            if record.role_name == role_name {
+                return Ok(Some(record));
+            }
+        }
+        Ok(None)
+    }
+
     // ── Secret methods ────────────────────────────────────────────────────────
 
     fn secret_key(secret_ref: &str) -> String {

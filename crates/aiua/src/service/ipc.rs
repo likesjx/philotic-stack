@@ -4972,17 +4972,147 @@ impl IpcServer {
                     "final_reply_to": reply_to_node,
                     "final_reply_role": reply_to_role,
                 });
+                let task_json = paracrine_task.to_string();
+                let task_id = Uuid::new_v4();
 
-                // Deliver to the target role's inbox; parking lot materialises if needed.
-                Self::deliver_inbound_task(
-                    inboxes,
-                    local_node_id,
-                    &role,
-                    None,
-                    Uuid::new_v4(),
-                    paracrine_task.to_string(),
-                )
-                .await;
+                // Check if the target role has a live inbox subscriber.
+                let has_subscriber = {
+                    let guard = inboxes.lock().await;
+                    guard.get(&role).is_some_and(|subs| !subs.is_empty())
+                };
+
+                if has_subscriber {
+                    Self::deliver_inbound_task(
+                        inboxes,
+                        local_node_id,
+                        &role,
+                        None,
+                        task_id,
+                        task_json,
+                    )
+                    .await;
+                } else {
+                    // No live subscriber — look up the role incarnation, park the task
+                    // under the incarnation's guest_id, and trigger materialization of
+                    // a dedicated role-philote so it can connect and flush the park.
+                    match graph.find_role_incarnation_by_name(&role) {
+                        Ok(Some(inc)) => {
+                            // The philote that handles this role incarnation registers
+                            // with guest_id = "{agent_id}:{role_name}".
+                            let role_guest_id = inc.guest_id.clone();
+
+                            // Park the task — flushed when the role philote connects.
+                            {
+                                let mut guard = parked_inbound.lock().await;
+                                guard.entry(role_guest_id.clone()).or_default().push(
+                                    ParkedInboundTask {
+                                        source_node: local_node_id.to_string(),
+                                        task_id,
+                                        task_json,
+                                        activate_session_id: None,
+                                    },
+                                );
+                            }
+                            info!(
+                                role = %role,
+                                role_guest_id = %role_guest_id,
+                                task_id = %task_id,
+                                "Parked paracrine task; will trigger role-philote materialization."
+                            );
+
+                            // Ensure the role-philote guest record exists in the graph,
+                            // then ask the materializer to spawn it.
+                            if let Some(hotel_name) = Self::local_hotel_name(graph, local_node_id) {
+                                let hotel_guest_id =
+                                    format!("{}:philote-{}", hotel_name, inc.role_name);
+
+                                // Create the guest record if it doesn't already exist.
+                                if graph.get_guest(&hotel_name, &hotel_guest_id).ok().flatten().is_none() {
+                                    // Derive socket path from hotel record.
+                                    let socket_path = graph
+                                        .list_hotels()
+                                        .ok()
+                                        .and_then(|hs| {
+                                            hs.into_iter()
+                                                .find(|h| {
+                                                    h.capabilities.node_id == local_node_id
+                                                })
+                                                .map(|h| h.ipc_socket_path)
+                                        })
+                                        .unwrap_or_default();
+
+                                    let config_json = serde_json::json!({
+                                        "command": "philote",
+                                        "args": [],
+                                        "env": {
+                                            "PHILOTIC_AGENT_ID": inc.agent_id,
+                                            "PHILOTIC_ROLE_NAME": inc.role_name,
+                                            "PHILOTIC_HOTEL_SOCKET": socket_path,
+                                            "PHILOTIC_NODE_ID": local_node_id,
+                                        }
+                                    });
+                                    let rec = ansible_mesh_core::storage::GuestRecord {
+                                        hotel_name: hotel_name.clone(),
+                                        guest_id: hotel_guest_id.clone(),
+                                        role: inc.role_name.clone(),
+                                        config_json: config_json.to_string(),
+                                        is_active: true,
+                                        active_pid: None,
+                                        last_active_at: None,
+                                    };
+                                    if let Err(e) = graph.seed_guests(&hotel_name, &[rec]) {
+                                        warn!(
+                                            "Failed to seed role-philote guest record [{}]: {e}",
+                                            hotel_guest_id
+                                        );
+                                    } else {
+                                        info!(
+                                            "Created role-philote guest record: {}",
+                                            hotel_guest_id
+                                        );
+                                    }
+                                }
+
+                                // Trigger materialization.
+                                if let Some(requester) = materialization_requester {
+                                    match requester.ensure_guest_active(&hotel_guest_id).await {
+                                        Ok(true) => info!(
+                                            "Role-philote [{}] materialization triggered.",
+                                            hotel_guest_id
+                                        ),
+                                        Ok(false) => warn!(
+                                            "Role-philote [{}] could not be materialized.",
+                                            hotel_guest_id
+                                        ),
+                                        Err(e) => warn!(
+                                            "Role-philote [{}] materialization error: {e}",
+                                            hotel_guest_id
+                                        ),
+                                    }
+                                }
+                            } else {
+                                warn!(
+                                    "Cannot materialize role-philote for '{}': local hotel record missing.",
+                                    role
+                                );
+                            }
+                        }
+                        Ok(None) => {
+                            warn!(
+                                role = %role,
+                                "No role incarnation found for paracrine target '{}'; task dropped.",
+                                role
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                role = %role,
+                                "Role incarnation lookup failed for '{}': {e}; task dropped.",
+                                role
+                            );
+                        }
+                    }
+                }
 
                 IpcResponse::success("paracrine_emit", None)
             }
