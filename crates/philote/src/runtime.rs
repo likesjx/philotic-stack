@@ -1097,11 +1097,20 @@ impl AgentRuntime {
             // If this turn was triggered by a paracrine_request, capture the
             // originating paracrine_id so deliver_text_reply can echo it back
             // as a `paracrine_response` rather than a `send_reply`.
-            let paracrine_origin = task
-                .exosome
-                .as_ref()
-                .and_then(|v| serde_json::from_value::<Exosome>(v.clone()).ok())
-                .and_then(|e| e.paracrine_id);
+            // Also capture source_session_id / source_chat_id from the exosome so the
+            // response is routed back to the originating conversation channel, not the
+            // specialist's own ephemeral session.
+            let (paracrine_origin, paracrine_reply_session_id, paracrine_reply_chat_id) = {
+                let exosome = task
+                    .exosome
+                    .as_ref()
+                    .and_then(|v| serde_json::from_value::<Exosome>(v.clone()).ok());
+                (
+                    exosome.as_ref().and_then(|e| e.paracrine_id.clone()),
+                    exosome.as_ref().and_then(|e| e.source_session_id.clone()),
+                    exosome.as_ref().and_then(|e| e.source_chat_id.clone()),
+                )
+            };
 
             state.start_turn(WorkingTurn {
                 task_id,
@@ -1127,6 +1136,8 @@ impl AgentRuntime {
                 scripted_loop_context: None,
                 associated_paracrine_ids: Vec::new(),
                 paracrine_origin,
+                paracrine_reply_session_id,
+                paracrine_reply_chat_id,
             });
             state.set_active_turn_phase(TurnPhase::LoadingContext);
 
@@ -1420,6 +1431,25 @@ impl AgentRuntime {
             None => return Ok(()),
         };
         self.ensure_session_loaded(&session_id, "unknown").await?;
+
+        // Guard: if the active turn's turn_id doesn't match the incoming response, drop it.
+        // This prevents stale model or synthesis responses from corrupting a newer active turn
+        // (e.g., two overlapping voice memos where VM1's synthesis arrives after VM2's turn started).
+        let active_turn_id = self
+            .sessions
+            .get(&session_id)
+            .and_then(|s| s.active_turn.as_ref())
+            .map(|t| t.turn_id.clone());
+
+        if let Some(ref active_id) = active_turn_id {
+            if active_id != &turn_id {
+                warn!(
+                    "handle_model_response: dropping stale response for turn {} (active turn is {})",
+                    turn_id, active_id
+                );
+                return Ok(());
+            }
+        }
 
         // If the turn is waiting for voice synthesis, this is the audio response — route it
         // directly to the voice handler regardless of the agent_action kind.
@@ -3202,17 +3232,30 @@ impl AgentRuntime {
 
         // If this turn was triggered by a paracrine_request, reply as a
         // `paracrine_response` so A's routing reflex handles it correctly.
+        // Use source_session_id / source_chat_id from the exosome (stored on the turn)
+        // so the orchestrator routes the reply to the originating conversation channel
+        // rather than to this specialist's ephemeral session.
         // Otherwise use the normal `send_reply` path.
         let task_json = if let Some(ref pid) = completed_turn.paracrine_origin {
+            let reply_session_id = completed_turn
+                .paracrine_reply_session_id
+                .as_deref()
+                .unwrap_or(&session_id);
+            let reply_chat_id = completed_turn
+                .paracrine_reply_chat_id
+                .as_deref()
+                .unwrap_or(&completed_turn.chat_id);
             serde_json::json!({
                 "action": "paracrine_response",
-                "session_id": session_id,
+                "session_id": reply_session_id,
                 "turn_id": turn_id,
-                "chat_id": completed_turn.chat_id,
+                "chat_id": reply_chat_id,
                 "content": content,
                 "exosome": {
                     "prompt": "",
                     "paracrine_id": pid,
+                    "source_session_id": reply_session_id,
+                    "source_chat_id": reply_chat_id,
                 },
             })
             .to_string()
@@ -6854,17 +6897,30 @@ impl AgentRuntime {
 
                 // Log the outbound exosome ID on the active turn so the routing
                 // reflex can correlate the response when it arrives.
-                if let Some(state) = self.sessions.get_mut(&payload.session_id) {
-                    if let Some(turn) = state.active_turn.as_mut() {
-                        turn.associated_paracrine_ids.push(paracrine_id.clone());
+                // Also capture the current session_id and chat_id so the specialist's
+                // response can be routed back to the originating conversation channel.
+                let (source_session_id, source_chat_id) = {
+                    let mut sess_id = None;
+                    let mut chat_id = None;
+                    if let Some(state) = self.sessions.get_mut(&payload.session_id) {
+                        if let Some(turn) = state.active_turn.as_mut() {
+                            turn.associated_paracrine_ids.push(paracrine_id.clone());
+                            sess_id = Some(state.session_id.clone());
+                            if !turn.chat_id.is_empty() {
+                                chat_id = Some(turn.chat_id.clone());
+                            }
+                        }
                     }
-                }
+                    (sess_id, chat_id)
+                };
 
                 let exosome = Exosome {
                     prompt,
                     context: None,
                     paracrine_id: Some(paracrine_id.clone()),
                     response_routing,
+                    source_session_id,
+                    source_chat_id,
                 };
 
                 let (content, tool_err) = match self
@@ -6878,7 +6934,15 @@ impl AgentRuntime {
                     })
                     .await
                 {
-                    Ok(_) => (format!("paracrine dispatched (id: {paracrine_id})"), None),
+                    Ok(_) => (
+                        format!(
+                            "Whisper sent to specialist (paracrine_id: {paracrine_id}). \
+                             The specialist is processing asynchronously — their response \
+                             will arrive separately. Do NOT call delegate.whisper again. \
+                             Respond to the user now with a brief acknowledgment."
+                        ),
+                        None,
+                    ),
                     Err(e) => {
                         let err = TaskErrorPayload::transport_error(
                             "philote",
@@ -7559,6 +7623,8 @@ mod tests {
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
             paracrine_origin: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
         });
 
         assert!(should_attempt_provider_repair(&error, Some(&state)));

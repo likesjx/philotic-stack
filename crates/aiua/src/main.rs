@@ -4748,10 +4748,44 @@ async fn main() -> Result<()> {
     .with_materialization_requester(guest_manager.clone())
     .with_registry(registry.clone());
     let ipc_inboxes = ipc_server.inboxes();
+    let network_broadcast_tx = ipc_server.network_broadcast_tx();
 
     tokio::spawn(async move {
         if let Err(e) = ipc_server.run().await {
             error!("Hotel Front Desk (UDS) failed: {}", e);
+        }
+    });
+
+    // Network reachability monitor: TCP-probe 1.1.1.1:53 and broadcast NetworkState
+    // to all connected guests when the online/offline state changes.
+    tokio::spawn(async move {
+        use philotic_client::IpcResponse;
+        use std::time::Duration;
+        let mut last_online: Option<bool> = None;
+        loop {
+            let online = tokio::time::timeout(
+                Duration::from_secs(3),
+                tokio::net::TcpStream::connect("1.1.1.1:53"),
+            )
+            .await
+            .map(|r| r.is_ok())
+            .unwrap_or(false);
+
+            if last_online != Some(online) {
+                if last_online.is_some() {
+                    info!(
+                        online,
+                        "Network reachability changed — broadcasting NetworkState to guests."
+                    );
+                }
+                last_online = Some(online);
+                // Ignore send errors: no subscribers yet is fine.
+                let _ = network_broadcast_tx.send(IpcResponse::NetworkState { online });
+            }
+
+            // Poll every 30s when online, every 5s when offline (faster recovery).
+            let interval = if online { 30 } else { 5 };
+            tokio::time::sleep(Duration::from_secs(interval)).await;
         }
     });
 

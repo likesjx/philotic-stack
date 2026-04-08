@@ -1711,11 +1711,14 @@ async fn run_seat_impl(
     // Exponential back-off state for poll errors and 409 Conflicts.
     // Reset to the initial value after any successful update batch.
     let mut poll_error_backoff_secs: u64 = MEMBRANE_ERROR_BACKOFF_INITIAL_SECS;
+    // Set to false when the hotel broadcasts NetworkState { online: false }.
+    // Polling is suppressed until the hotel confirms connectivity is restored.
+    let mut network_online: bool = true;
 
     // Main Long-Polling Loop
     loop {
-        // Start a new poll if none is in flight and we are not in back-off.
-        if poll_handle.is_none() {
+        // Start a new poll if none is in flight, not in back-off, and network is reachable.
+        if poll_handle.is_none() && network_online {
             let ready = poll_resume_at.map_or(true, |t| tokio::time::Instant::now() >= t);
             if ready {
                 poll_resume_at = None;
@@ -2061,6 +2064,21 @@ async fn run_seat_impl(
                                     warn!("Received a reply task but 'chat_id' was missing. Cannot route to Telegram.");
                                 }
                             }
+                        }
+                    }
+                    Ok(IpcResponse::NetworkState { online }) => {
+                        if online != network_online {
+                            info!(online, "Network state changed; adjusting Telegram polling.");
+                            network_online = online;
+                            if online {
+                                // Resume immediately: clear back-off and let the loop start a
+                                // fresh poll on the next iteration.
+                                poll_resume_at = None;
+                                poll_error_backoff_secs = MEMBRANE_ERROR_BACKOFF_INITIAL_SECS;
+                            }
+                            // When offline: the in-flight poll (if any) is left to complete or
+                            // fail naturally.  network_online=false prevents new polls from
+                            // starting, so the membrane goes quiet without cancelling HTTP requests.
                         }
                     }
                     Ok(other) => info!("Hegemon received non-task IPC message: {:?}", other),

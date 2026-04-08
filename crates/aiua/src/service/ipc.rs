@@ -158,6 +158,9 @@ pub struct IpcServer {
     /// cross-hotel task forwarding without full mesh infrastructure.
     peer_sockets: Arc<RwLock<HashMap<String, String>>>,
     muninn_config: Option<Arc<memory_core::MuninnConfig>>,
+    /// Broadcast channel for hotel-wide push events (e.g. NetworkState).
+    /// The sender is cloned into each `handle_client` task for forwarding.
+    network_broadcast: tokio::sync::broadcast::Sender<IpcResponse>,
 }
 
 struct LoggingLeaseObserver;
@@ -1434,6 +1437,7 @@ impl IpcServer {
         dispatcher_tx: mpsc::Sender<LedgerCommand>,
         graph: Arc<GraphDomain>,
     ) -> Self {
+        let (network_broadcast, _) = tokio::sync::broadcast::channel(16);
         Self {
             socket_path: socket_path.into(),
             local_node_id: local_node_id.into(),
@@ -1450,7 +1454,14 @@ impl IpcServer {
             registry: Arc::new(RwLock::new(NodeRegistry::new())),
             peer_sockets: Arc::new(RwLock::new(HashMap::new())),
             muninn_config: None,
+            network_broadcast,
         }
+    }
+
+    /// Returns a sender for the hotel-wide broadcast channel.
+    /// Clone this before spawning `run()` to push `NetworkState` events to all connected guests.
+    pub fn network_broadcast_tx(&self) -> tokio::sync::broadcast::Sender<IpcResponse> {
+        self.network_broadcast.clone()
     }
 
     pub fn with_memory_config(mut self, config: Option<Arc<memory_core::MuninnConfig>>) -> Self {
@@ -1502,6 +1513,7 @@ impl IpcServer {
                     let registry = self.registry.clone();
                     let peer_sockets = self.peer_sockets.clone();
                     let muninn_config = self.muninn_config.clone();
+                    let network_broadcast_rx = self.network_broadcast.subscribe();
                     tokio::spawn(async move {
                         if let Err(e) = Self::handle_client(
                             stream,
@@ -1519,6 +1531,7 @@ impl IpcServer {
                             registry,
                             peer_sockets,
                             muninn_config,
+                            network_broadcast_rx,
                         )
                         .await
                         {
@@ -1549,6 +1562,7 @@ impl IpcServer {
         registry: Arc<RwLock<NodeRegistry>>,
         peer_sockets: Arc<RwLock<HashMap<String, String>>>,
         muninn_config: Option<Arc<memory_core::MuninnConfig>>,
+        network_broadcast_rx: tokio::sync::broadcast::Receiver<IpcResponse>,
     ) -> anyhow::Result<()> {
         let conn_id = Uuid::new_v4();
         let (mut reader, mut writer) = stream.into_split();
@@ -1568,6 +1582,27 @@ impl IpcServer {
             }
             Ok::<(), std::io::Error>(())
         });
+
+        // Forward hotel-wide broadcast events (e.g. NetworkState) to this guest.
+        {
+            let broadcast_outbound_tx = outbound_tx.clone();
+            let mut broadcast_rx = network_broadcast_rx;
+            tokio::spawn(async move {
+                loop {
+                    match broadcast_rx.recv().await {
+                        Ok(msg) => {
+                            if broadcast_outbound_tx.send(msg).is_err() {
+                                break; // guest disconnected
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("Guest broadcast receiver lagged by {} messages.", n);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+        }
 
         let mut subscribed_roles = Vec::new();
         let mut current_identity: Option<GuestIdentity> = None;
@@ -4965,12 +5000,18 @@ impl IpcServer {
                 reply_to_role,
                 ..
             } => {
+                // Include source_session_id / source_chat_id from the exosome so the
+                // specialist can echo them back in the paracrine_response, letting the
+                // orchestrator route the reply to the correct conversation channel.
                 let paracrine_task = serde_json::json!({
                     "action": "paracrine_request",
                     "content": exosome.prompt,
                     "exosome": exosome,
                     "final_reply_to": reply_to_node,
                     "final_reply_role": reply_to_role,
+                    // Note: do NOT set "session_id" here — the specialist runs in her
+                    // own ephemeral session. source_session_id lives inside the exosome
+                    // and is extracted by the specialist's philote for reply routing.
                 });
                 let task_json = paracrine_task.to_string();
                 let task_id = Uuid::new_v4();

@@ -359,6 +359,15 @@ pub struct Exosome {
     /// Defaults to [`ParacrineRouting::CognitiveReEntry`] if absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_routing: Option<ParacrineRouting>,
+    /// The session_id of the conversation that triggered this paracrine.
+    /// Carried through so the specialist's response can be routed back to the
+    /// correct session (e.g. a Telegram session rather than an ephemeral one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_session_id: Option<String>,
+    /// The chat_id (Telegram / membrane channel) of the originating conversation.
+    /// Used by the routing reflex to deliver the specialist's reply to the right channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_chat_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1240,6 +1249,12 @@ pub enum IpcResponse {
     GracefulShutdown {
         drain_timeout_secs: u64,
     },
+    /// Hotel → guest: network reachability state changed.
+    /// Pushed without a corresponding request. Guests should pause outbound connections
+    /// (e.g. long-polling) when `online=false` and resume when `online=true`.
+    NetworkState {
+        online: bool,
+    },
     /// NOTE: This variant MUST remain at the end of the enum. It has an all-optional
     /// field (`config_json: Option<String>`), which with `#[serde(untagged)]` means it
     /// will match ANY JSON object that serde hasn't already matched to an earlier variant.
@@ -1435,7 +1450,9 @@ impl PhiloticClient {
     fn is_push_message(response: &IpcResponse) -> bool {
         matches!(
             response,
-            IpcResponse::InboundTask { .. } | IpcResponse::ApartmentUpdate { .. }
+            IpcResponse::InboundTask { .. }
+                | IpcResponse::ApartmentUpdate { .. }
+                | IpcResponse::NetworkState { .. }
         )
     }
 

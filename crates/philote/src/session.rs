@@ -340,6 +340,13 @@ pub struct WorkingTurn {
     /// When present, `deliver_text_reply` emits `action: "paracrine_response"`
     /// (instead of `"send_reply"`) so A's routing reflex can handle it correctly.
     pub paracrine_origin: Option<String>,
+    /// The session_id of the conversation that originated the paracrine request.
+    /// Overrides the specialist's own ephemeral session_id in the `paracrine_response`
+    /// payload so the orchestrator can route the reply back to the correct channel.
+    pub paracrine_reply_session_id: Option<String>,
+    /// The chat_id (Telegram / membrane channel) of the originating conversation.
+    /// Included in the `paracrine_response` so the routing reflex knows where to deliver.
+    pub paracrine_reply_chat_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -3138,6 +3145,14 @@ impl SessionState {
                     .get("paracrine_origin")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string),
+                paracrine_reply_session_id: turn
+                    .get("paracrine_reply_session_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                paracrine_reply_chat_id: turn
+                    .get("paracrine_reply_chat_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
             })
         });
 
@@ -3746,6 +3761,8 @@ mod tests {
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
             paracrine_origin: None,
+                paracrine_reply_session_id: None,
+                paracrine_reply_chat_id: None,
         });
 
         let checkpoint = state.checkpoint_json();
@@ -3854,6 +3871,8 @@ mod tests {
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
             paracrine_origin: None,
+                paracrine_reply_session_id: None,
+                paracrine_reply_chat_id: None,
         });
 
         state.complete_active_turn("hi".into());
@@ -3894,6 +3913,8 @@ mod tests {
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
             paracrine_origin: None,
+                paracrine_reply_session_id: None,
+                paracrine_reply_chat_id: None,
         });
 
         state.complete_active_turn("transcription reply".into());
@@ -4534,6 +4555,8 @@ mod tests {
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
             paracrine_origin: None,
+                paracrine_reply_session_id: None,
+                paracrine_reply_chat_id: None,
         });
 
         let projection = state.build_context_projection("status");
@@ -4617,6 +4640,8 @@ mod tests {
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
             paracrine_origin: None,
+                paracrine_reply_session_id: None,
+                paracrine_reply_chat_id: None,
         });
 
         let prompt = state.build_prompt("status");
@@ -4694,6 +4719,8 @@ mod tests {
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
             paracrine_origin: None,
+                paracrine_reply_session_id: None,
+                paracrine_reply_chat_id: None,
         });
 
         let bundle = state.build_same_identity_handoff_bundle(
@@ -4768,6 +4795,8 @@ mod tests {
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
             paracrine_origin: None,
+                paracrine_reply_session_id: None,
+                paracrine_reply_chat_id: None,
         });
 
         let delegation = state.build_subagent_delegation(
@@ -5245,6 +5274,8 @@ mod tests {
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
             paracrine_origin: None,
+                paracrine_reply_session_id: None,
+                paracrine_reply_chat_id: None,
         });
         let index = merge_session_index(None, &first);
         assert_eq!(index["active_sessions"].as_array().unwrap().len(), 1);
@@ -5292,6 +5323,8 @@ mod tests {
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
             paracrine_origin: None,
+                paracrine_reply_session_id: None,
+                paracrine_reply_chat_id: None,
         });
 
         state.push_tool_history(
@@ -5354,6 +5387,8 @@ mod tests {
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
             paracrine_origin: None,
+                paracrine_reply_session_id: None,
+                paracrine_reply_chat_id: None,
         });
 
         state.push_tool_history(
@@ -5417,6 +5452,8 @@ mod tests {
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
             paracrine_origin: None,
+                paracrine_reply_session_id: None,
+                paracrine_reply_chat_id: None,
         });
 
         let reentry = state
@@ -5688,6 +5725,8 @@ mod tests {
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
             paracrine_origin: None,
+                paracrine_reply_session_id: None,
+                paracrine_reply_chat_id: None,
         });
 
         let projection = state.build_context_projection("continue the memory work");
