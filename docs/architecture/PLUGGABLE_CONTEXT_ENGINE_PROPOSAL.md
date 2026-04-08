@@ -175,8 +175,8 @@ The first contract should explicitly model five layers.
 ### 5. Knowledge Layer
 
 - canonical owner: mixed
-- graph contributes structural truth and traversable relationships
-- memory engine contributes episodic salience and recalled summaries
+- `intel-graph` provides structural truth and traversable project relationships (SQLite)
+- `intel-graph` simultaneously brokers semantic history via isolated Memory `Wings` (ChromaDB / Mempalace)
 - authority: mostly advisory, unless a graph-backed fact is explicitly authoritative
 - mutability: `refreshable`
 
@@ -349,9 +349,9 @@ Recommended checkpoints:
 
 ## First Implementations To Support
 
-1. graph-native context assembly
+1. graph-native context assembly (SQLite)
 2. imported OpenClaw/ZeroClaw identity projection
-3. memory-backed augmentation
+3. `intel-graph` brokered Reflexive Coding Agent Memory (via Mempalace IDE hooks)
 4. emergency/local fallback context mode
 
 ## First Slice Recommendation
