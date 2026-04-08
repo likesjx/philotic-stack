@@ -11,6 +11,7 @@ use axum::{
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
+use tracing;
 
 use crate::scanner::{full_scan, ScanConfig};
 use crate::schema::*;
@@ -107,6 +108,13 @@ pub struct TestRunBody {
     pub duration_ms: Option<u64>,
 }
 
+#[derive(Deserialize)]
+pub struct MempalaceTurnBody {
+    pub agent_id: String,
+    pub session_id: String,
+    pub turn_transcript: String,
+}
+
 // ── Response types ──
 
 #[derive(Serialize)]
@@ -198,12 +206,114 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/decide", post(post_decide))
         .route("/api/test-run", post(post_test_run))
         .route("/api/scan", post(trigger_scan))
+        .route("/api/edges", post(post_upsert_edge))
+        .route("/api/mempalace/turn", post(post_mempalace_turn))
         .layer(CorsLayer::permissive())
         .fallback(get(handle_ui_static))
         .with_state(state)
 }
 
+#[derive(Deserialize)]
+pub struct UpsertEdgeBody {
+    pub source_id: String,
+    pub target_id: String,
+    pub relation: EdgeRelation,
+    #[serde(default)]
+    pub properties: serde_json::Value,
+    #[serde(default)]
+    pub worktree: String,
+}
+
 // ── Handlers ──
+
+async fn post_mempalace_turn(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<MempalaceTurnBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::info!(
+        "Broker received reflexive turn for mempalace Wing [{}]: {} chars in session {}",
+        body.agent_id,
+        body.turn_transcript.len(),
+        body.session_id
+    );
+
+    // Write transcript to a persistent file for mempalace to mine
+    let convos_dir = Path::new(&state.repo_root).join(".mempalace_convos").join(&body.agent_id);
+    if let Err(e) = tokio::fs::create_dir_all(&convos_dir).await {
+        tracing::error!("Failed to create convos directory: {}", e);
+        return Err(internal_error(anyhow::anyhow!("Create dir failed: {}", e)));
+    }
+
+    let file_path = convos_dir.join(format!("{}.md", body.session_id));
+    use tokio::io::AsyncWriteExt;
+    
+    // Append the turn to the session file
+    let mut file = match tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&file_path)
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!("Failed to open session file: {}", e);
+            return Err(internal_error(anyhow::anyhow!("File open failed: {}", e)));
+        }
+    };
+
+    let payload = format!(
+        "\n\n### Turn At: {}\n{}\n",
+        chrono::Utc::now().to_rfc3339(),
+        body.turn_transcript
+    );
+
+    if let Err(e) = file.write_all(payload.as_bytes()).await {
+        tracing::error!("Failed to write to session file: {}", e);
+        return Err(internal_error(anyhow::anyhow!("Write file failed: {}", e)));
+    }
+
+    // Trigger mempalace mine in the background so we don't block the agent
+    let convos_path = convos_dir.clone();
+    tokio::spawn(async move {
+        tracing::info!("Executing mempalace mine on {:?}", convos_path);
+        match tokio::process::Command::new("mempalace")
+            .arg("mine")
+            .arg(&convos_path)
+            .arg("--mode")
+            .arg("convos")
+            .arg("--yes")
+            .output()
+            .await
+        {
+            Ok(output) => {
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    tracing::error!("Mempalace mine failed: {}", stderr);
+                } else {
+                    tracing::info!("Mempalace mine complete for Wing [{}]", body.agent_id);
+                }
+            }
+            Err(e) => tracing::error!("Failed to spawn mempalace: {}", e),
+        }
+    });
+
+    let _ = state.change_tx.send(ChangeEvent {
+        event_type: "mempalace_turn_received".to_string(),
+        payload: serde_json::json!({
+            "agent_id": body.agent_id,
+            "session_id": body.session_id,
+            "size": body.turn_transcript.len(),
+            "file": file_path.to_string_lossy(),
+        }),
+    });
+
+    Ok(Json(serde_json::json!({
+        "status": "brokered",
+        "wing": format!("wing_{}", body.agent_id),
+        "transcript_length": body.turn_transcript.len(),
+        "file": file_path.to_string_lossy(),
+    })))
+}
 
 async fn get_status(
     State(state): State<Arc<AppState>>,
@@ -1420,6 +1530,37 @@ async fn get_system_health(
             "no_verification": proposal_health.no_verification.len(),
             "no_embedding": proposal_health.no_embedding.len(),
         },
+    })))
+}
+
+async fn post_upsert_edge(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<UpsertEdgeBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let engine = state.engine.lock().await;
+    let edge = Edge {
+        source_id: body.source_id.clone(),
+        target_id: body.target_id.clone(),
+        relation: body.relation,
+        properties: body.properties,
+        worktree: body.worktree,
+    };
+    engine.upsert_edge(&edge).map_err(internal_error)?;
+
+    let _ = state.change_tx.send(ChangeEvent {
+        event_type: "edge_upserted".to_string(),
+        payload: serde_json::json!({
+            "source_id": body.source_id,
+            "target_id": body.target_id,
+            "relation": body.relation,
+        }),
+    });
+
+    Ok(Json(serde_json::json!({
+        "source_id": body.source_id,
+        "target_id": body.target_id,
+        "relation": body.relation,
+        "upserted": true,
     })))
 }
 

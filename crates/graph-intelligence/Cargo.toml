@@ -22,12 +22,13 @@ regex = "1"
 sha2 = "0.10"
 hex = "0.4"
 axum = { version = "0.7", features = ["ws"] }
-tokio = { version = "1.42", features = ["rt", "rt-multi-thread", "net", "macros", "signal", "sync"] }
+tokio = { version = "1.42", features = ["rt", "rt-multi-thread", "net", "macros", "signal", "sync", "fs", "process", "io-util"] }
 tower-http = { version = "0.5", features = ["cors"] }
 tokio-tungstenite = "0.24"
 rust-embed = { version = "8", features = ["mime-guess"] }
 reqwest = { version = "0.12", features = ["json"] }
 clap = { version = "4", features = ["derive"] }
+tracing = "0.1.44"
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }
