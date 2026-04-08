@@ -1,6 +1,9 @@
 use crate::catalog::{tool_catalog, tool_class, tool_requires_approval};
 use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
-use crate::reflex::{IngressAction, MaterializationContext, PolicyAssertion, ReflexEngine, ReflexEvent};
+use crate::protocol::InboundTaskPayload;
+use crate::reflex::{
+    IngressAction, MaterializationContext, PolicyAssertion, ReflexEngine, ReflexEvent,
+};
 use philotic_client::{
     HandoffBundle, SubagentCompletionContract, SubagentContextPacket, SubagentDelegation,
 };
@@ -864,6 +867,14 @@ pub struct SessionState {
     /// runtime delta events to derive routing policy assertions.
     /// Not serialized; always initialized fresh and re-applied from `agent_profile`.
     pub reflex_engine: ReflexEngine,
+    /// Inbound user tasks that arrived while a turn was already active.
+    /// Drained in FIFO order after each turn completes (or fails).
+    /// Each entry is `(hotel_task_id, payload)` — the task_id is needed to
+    /// complete the hotel-side task record when the queued turn finishes.
+    /// The payload preserves session_id, chat_id, and exosome context so the
+    /// correct Telegram session/chat is restored when the task is dispatched.
+    /// Voice tasks are queued raw and will be transcribed when they reach the front.
+    pub pending_user_tasks: std::collections::VecDeque<(uuid::Uuid, InboundTaskPayload)>,
 }
 
 impl SessionState {
@@ -888,11 +899,32 @@ impl SessionState {
             active_subagents: Vec::new(),
             rules: Vec::new(),
             reflex_engine: ReflexEngine::new(),
+            pending_user_tasks: std::collections::VecDeque::new(),
         }
     }
 
     pub fn start_turn(&mut self, turn: WorkingTurn) {
         self.active_turn = Some(turn);
+    }
+
+    /// Returns true if a turn is currently active (any phase except Completed/Failed).
+    pub fn is_turn_active(&self) -> bool {
+        self.active_turn.is_some()
+    }
+
+    /// Enqueue a user task for deferred processing after the current turn completes.
+    pub fn enqueue_user_task(&mut self, task_id: uuid::Uuid, task: InboundTaskPayload) {
+        self.pending_user_tasks.push_back((task_id, task));
+    }
+
+    /// Pop the next pending user task, if any.
+    pub fn dequeue_user_task(&mut self) -> Option<(uuid::Uuid, InboundTaskPayload)> {
+        self.pending_user_tasks.pop_front()
+    }
+
+    /// How many tasks are waiting in the queue.
+    pub fn pending_user_task_count(&self) -> usize {
+        self.pending_user_tasks.len()
     }
 
     pub fn set_active_turn_phase(&mut self, phase: TurnPhase) {
@@ -1010,9 +1042,7 @@ impl SessionState {
         }
     }
 
-    pub fn scripted_executor_advance(
-        &self,
-    ) -> Option<crate::scripted_loop::ScriptedLoopDecision> {
+    pub fn scripted_executor_advance(&self) -> Option<crate::scripted_loop::ScriptedLoopDecision> {
         self.active_turn
             .as_ref()
             .and_then(|t| t.scripted_loop_context.as_ref())
@@ -1374,8 +1404,12 @@ impl SessionState {
                 let v = value
                     .as_bool()
                     .ok_or("media_routing_policy.forward_media_to_model requires a boolean")?;
-                self.agent_profile.media_routing_policy.forward_media_to_model = v;
-                Ok(format!("Set media_routing_policy.forward_media_to_model = {v}."))
+                self.agent_profile
+                    .media_routing_policy
+                    .forward_media_to_model = v;
+                Ok(format!(
+                    "Set media_routing_policy.forward_media_to_model = {v}."
+                ))
             }
             "media_routing_policy.voice_action" => {
                 let v = value
@@ -1406,20 +1440,24 @@ impl SessionState {
                     .as_bool()
                     .ok_or("media_routing_policy.strip_tools_on_media requires a boolean")?;
                 self.agent_profile.media_routing_policy.strip_tools_on_media = v;
-                Ok(format!("Set media_routing_policy.strip_tools_on_media = {v}."))
+                Ok(format!(
+                    "Set media_routing_policy.strip_tools_on_media = {v}."
+                ))
             }
             // ── Voice response policy ────────────────────────────────────────────
             "voice_response_policy.mode" => {
-                let s = value
-                    .as_str()
-                    .ok_or("voice_response_policy.mode requires a string: 'off', 'auto', or 'on'")?;
+                let s = value.as_str().ok_or(
+                    "voice_response_policy.mode requires a string: 'off', 'auto', or 'on'",
+                )?;
                 let mode = match s {
                     "off" => TtsMode::Off,
                     "auto" => TtsMode::Auto,
                     "on" => TtsMode::On,
-                    other => return Err(format!(
-                        "Invalid voice_response_policy.mode '{other}'. Valid values: off, auto, on"
-                    )),
+                    other => {
+                        return Err(format!(
+                            "Invalid voice_response_policy.mode '{other}'. Valid values: off, auto, on"
+                        ));
+                    }
                 };
                 self.agent_profile.voice_response_policy.mode = mode;
                 Ok(format!("Set voice_response_policy.mode = '{s}'."))
@@ -1445,7 +1483,9 @@ impl SessionState {
                     .as_bool()
                     .ok_or("voice_response_policy.send_text_caption requires a boolean")?;
                 self.agent_profile.voice_response_policy.send_text_caption = v;
-                Ok(format!("Set voice_response_policy.send_text_caption = {v}."))
+                Ok(format!(
+                    "Set voice_response_policy.send_text_caption = {v}."
+                ))
             }
             "voice_response_policy.fallback_to_text" => {
                 let v = value
@@ -1728,7 +1768,11 @@ impl SessionState {
         let mut prompt = self.build_prompt_with_tools(&turn.user_content, &tools);
 
         if !turn.working_tool_history.is_empty() {
-            let max_result_chars = self.settings.context_window.max_tool_result_chars.max(1_000);
+            let max_result_chars = self
+                .settings
+                .context_window
+                .max_tool_result_chars
+                .max(1_000);
             prompt.push_str("\n\n[Tool call history]\n");
             for (i, (call, result)) in turn.working_tool_history.iter().enumerate() {
                 let args = serde_json::to_string(&call.arguments).unwrap_or_default();
@@ -2139,7 +2183,10 @@ impl SessionState {
     fn render_prompt_from_projection(&self, projection: &ContextProjection) -> String {
         let mut prompt = String::new();
         let persona_line = if let Some(ref name) = self.agent_profile.persona_name {
-            format!("Name: {name}\nCurrent date and time (UTC): {}\n", utc_datetime_string())
+            format!(
+                "Name: {name}\nCurrent date and time (UTC): {}\n",
+                utc_datetime_string()
+            )
         } else {
             format!("Current date and time (UTC): {}\n", utc_datetime_string())
         };
@@ -2270,7 +2317,11 @@ impl SessionState {
         // tool_history: accumulated (call, result) pairs from the active turn.
         // Always present in the envelope — empty on initial turn, populated on re-entry.
         // Results are truncated to max_tool_result_chars to prevent context overflow.
-        let max_result_chars = self.settings.context_window.max_tool_result_chars.max(1_000);
+        let max_result_chars = self
+            .settings
+            .context_window
+            .max_tool_result_chars
+            .max(1_000);
         let tool_history: Vec<Value> = self
             .active_turn
             .as_ref()
@@ -2546,7 +2597,12 @@ impl SessionState {
 
         let mut out = String::from("[Recalled memory]\n");
         for (i, memory) in turn.recalled_memories.iter().enumerate() {
-            out.push_str(&format!("{}. [{}] {}", i + 1, memory.concept, memory.content));
+            out.push_str(&format!(
+                "{}. [{}] {}",
+                i + 1,
+                memory.concept,
+                memory.content
+            ));
             if !memory.tags.is_empty() {
                 out.push_str(&format!(" ({})", memory.tags.join(", ")));
             }
@@ -3179,6 +3235,7 @@ impl SessionState {
                 .cloned()
                 .unwrap_or_default(),
             reflex_engine: ReflexEngine::new(),
+            pending_user_tasks: std::collections::VecDeque::new(),
         })
     }
 }
@@ -3694,7 +3751,10 @@ fn utc_datetime_string() -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
 
-    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC", y, m, d, hh, mm, ss)
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+        y, m, d, hh, mm, ss
+    )
 }
 
 /// Apply a set / append / remove operation to a `Vec<String>` field.
@@ -3761,8 +3821,8 @@ mod tests {
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
             paracrine_origin: None,
-                paracrine_reply_session_id: None,
-                paracrine_reply_chat_id: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
         });
 
         let checkpoint = state.checkpoint_json();
@@ -3838,9 +3898,11 @@ mod tests {
         let restored =
             SessionState::from_checkpoint(&checkpoint).expect("checkpoint should restore");
         // After restore, routes are gone — the hotel re-injects them on the next turn.
-        assert!(restored
-            .resolve_component_execution_route("text.generate")
-            .is_none());
+        assert!(
+            restored
+                .resolve_component_execution_route("text.generate")
+                .is_none()
+        );
     }
 
     #[test]
@@ -3871,8 +3933,8 @@ mod tests {
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
             paracrine_origin: None,
-                paracrine_reply_session_id: None,
-                paracrine_reply_chat_id: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
         });
 
         state.complete_active_turn("hi".into());
@@ -3913,8 +3975,8 @@ mod tests {
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
             paracrine_origin: None,
-                paracrine_reply_session_id: None,
-                paracrine_reply_chat_id: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
         });
 
         state.complete_active_turn("transcription reply".into());
@@ -3929,10 +3991,7 @@ mod tests {
     fn stale_audio_in_checkpoint_is_stripped_from_knowledge_projection() {
         // Regression: old checkpoints on disk may still have raw audio base64 in
         // recent_turns[].user_content. Ensure project_knowledge() never leaks it.
-        let audio_payload = format!(
-            r#"{{"audio_base64":"{}"}}"#,
-            "B".repeat(1_900_000)
-        );
+        let audio_payload = format!(r#"{{"audio_base64":"{}"}}"#, "B".repeat(1_900_000));
         let checkpoint = serde_json::json!({
             "session_id": "sess-1",
             "agent_id": "agent-jane-01",
@@ -3949,8 +4008,14 @@ mod tests {
         let state =
             SessionState::from_checkpoint(&checkpoint).expect("from_checkpoint must succeed");
         let knowledge = state.project_knowledge("", &[]);
-        assert!(!knowledge.contains("audio_base64"), "audio base64 must not appear in context");
-        assert!(knowledge.contains("[voice message]"), "placeholder must appear in context");
+        assert!(
+            !knowledge.contains("audio_base64"),
+            "audio base64 must not appear in context"
+        );
+        assert!(
+            knowledge.contains("[voice message]"),
+            "placeholder must appear in context"
+        );
     }
 
     #[test]
@@ -4302,7 +4367,11 @@ mod tests {
         );
         assert!(r.is_ok(), "{r:?}");
         assert_eq!(
-            state.agent_profile.media_routing_policy.voice_action.as_deref(),
+            state
+                .agent_profile
+                .media_routing_policy
+                .voice_action
+                .as_deref(),
             Some("transcribe")
         );
 
@@ -4314,7 +4383,11 @@ mod tests {
         );
         assert!(r.is_ok());
         assert_eq!(
-            state.agent_profile.media_routing_policy.image_action.as_deref(),
+            state
+                .agent_profile
+                .media_routing_policy
+                .image_action
+                .as_deref(),
             Some("analyze_media")
         );
 
@@ -4325,7 +4398,12 @@ mod tests {
             "set",
         );
         assert!(r.is_ok());
-        assert!(!state.agent_profile.media_routing_policy.forward_media_to_model);
+        assert!(
+            !state
+                .agent_profile
+                .media_routing_policy
+                .forward_media_to_model
+        );
 
         // strip_tools_on_media
         let r = state.apply_configure(
@@ -4334,7 +4412,12 @@ mod tests {
             "set",
         );
         assert!(r.is_ok());
-        assert!(!state.agent_profile.media_routing_policy.strip_tools_on_media);
+        assert!(
+            !state
+                .agent_profile
+                .media_routing_policy
+                .strip_tools_on_media
+        );
 
         // wrong type → error
         let r = state.apply_configure(
@@ -4351,7 +4434,11 @@ mod tests {
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
 
         // mode: valid values
-        for (input, expected) in &[("off", TtsMode::Off), ("auto", TtsMode::Auto), ("on", TtsMode::On)] {
+        for (input, expected) in &[
+            ("off", TtsMode::Off),
+            ("auto", TtsMode::Auto),
+            ("on", TtsMode::On),
+        ] {
             let r = state.apply_configure(
                 "voice_response_policy.mode",
                 &serde_json::json!(input),
@@ -4377,7 +4464,11 @@ mod tests {
         );
         assert!(r.is_ok());
         assert_eq!(
-            state.agent_profile.voice_response_policy.provider.as_deref(),
+            state
+                .agent_profile
+                .voice_response_policy
+                .provider
+                .as_deref(),
             Some("elevenlabs")
         );
 
@@ -4389,7 +4480,11 @@ mod tests {
         );
         assert!(r.is_ok());
         assert_eq!(
-            state.agent_profile.voice_response_policy.voice_id.as_deref(),
+            state
+                .agent_profile
+                .voice_response_policy
+                .voice_id
+                .as_deref(),
             Some("rachel")
         );
 
@@ -4555,8 +4650,8 @@ mod tests {
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
             paracrine_origin: None,
-                paracrine_reply_session_id: None,
-                paracrine_reply_chat_id: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
         });
 
         let projection = state.build_context_projection("status");
@@ -4640,8 +4735,8 @@ mod tests {
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
             paracrine_origin: None,
-                paracrine_reply_session_id: None,
-                paracrine_reply_chat_id: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
         });
 
         let prompt = state.build_prompt("status");
@@ -4719,8 +4814,8 @@ mod tests {
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
             paracrine_origin: None,
-                paracrine_reply_session_id: None,
-                paracrine_reply_chat_id: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
         });
 
         let bundle = state.build_same_identity_handoff_bundle(
@@ -4795,8 +4890,8 @@ mod tests {
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
             paracrine_origin: None,
-                paracrine_reply_session_id: None,
-                paracrine_reply_chat_id: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
         });
 
         let delegation = state.build_subagent_delegation(
@@ -5190,8 +5285,9 @@ mod tests {
         state.add_tool_binding("subagent.spawn");
         state.add_tool_binding("echo");
 
-        let projected =
-            state.project_tools_for_turn("Thanks Bjork, I really appreciate it. Looks like you're working pretty well now.");
+        let projected = state.project_tools_for_turn(
+            "Thanks Bjork, I really appreciate it. Looks like you're working pretty well now.",
+        );
         assert!(projected.is_empty());
     }
 
@@ -5274,8 +5370,8 @@ mod tests {
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
             paracrine_origin: None,
-                paracrine_reply_session_id: None,
-                paracrine_reply_chat_id: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
         });
         let index = merge_session_index(None, &first);
         assert_eq!(index["active_sessions"].as_array().unwrap().len(), 1);
@@ -5323,8 +5419,8 @@ mod tests {
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
             paracrine_origin: None,
-                paracrine_reply_session_id: None,
-                paracrine_reply_chat_id: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
         });
 
         state.push_tool_history(
@@ -5387,8 +5483,8 @@ mod tests {
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
             paracrine_origin: None,
-                paracrine_reply_session_id: None,
-                paracrine_reply_chat_id: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
         });
 
         state.push_tool_history(
@@ -5452,8 +5548,8 @@ mod tests {
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
             paracrine_origin: None,
-                paracrine_reply_session_id: None,
-                paracrine_reply_chat_id: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
         });
 
         let reentry = state
@@ -5725,8 +5821,8 @@ mod tests {
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
             paracrine_origin: None,
-                paracrine_reply_session_id: None,
-                paracrine_reply_chat_id: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
         });
 
         let projection = state.build_context_projection("continue the memory work");

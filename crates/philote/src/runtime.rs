@@ -1,5 +1,4 @@
 use crate::commands::{SlashCommand, command_manifest, parse_slash_command};
-use crate::reflex::{IngressAction, ReflexEvent};
 use crate::r#loop::{
     AgentAction, ApprovalRequest, ToolCall, ToolResult, TurnPhase, interpret_model_payload,
 };
@@ -7,6 +6,7 @@ use crate::protocol::{
     FinalReplyPayload, InboundTaskPayload, ModelRequestPayload, PartialReplyPayload,
     TaskRunnerOverlay, ToolExecutionPayload, TransportAttachment, TurnEventPayload,
 };
+use crate::reflex::{IngressAction, ReflexEvent};
 use crate::session::{
     ActivePlan, AgentProfile, ComponentRouteAssembly, MediaRoutingPolicy, RecalledMemoryRecord,
     SessionState, ToolExecutionRoute, TtsMode, VoiceResponsePolicy, WorkingTurn,
@@ -513,6 +513,9 @@ pub struct AgentRuntime {
     /// Agent profile (identity_text, soul_text, etc.) fetched from hotel at startup.
     /// Applied to every new session so the correct persona is used from the first turn.
     default_agent_profile: AgentProfile,
+    /// Tasks dequeued from a session's pending_user_tasks after a turn completed.
+    /// Dispatched at the top of the main event loop to avoid async recursion.
+    pending_drains: std::collections::VecDeque<(Uuid, InboundTaskPayload)>,
 }
 
 impl AgentRuntime {
@@ -524,6 +527,7 @@ impl AgentRuntime {
             muninn_config: None,
             configured_roles: HashMap::new(),
             default_agent_profile: AgentProfile::default(),
+            pending_drains: std::collections::VecDeque::new(),
         }
     }
 
@@ -559,7 +563,10 @@ impl AgentRuntime {
 
     /// Fetch a role incarnation from the hotel and return a `RoleActivation` for it.
     /// Used by `ensure_session_loaded` to auto-activate the agent's default role.
-    async fn fetch_role_activation(&mut self, role_name: &str) -> Option<crate::session::RoleActivation> {
+    async fn fetch_role_activation(
+        &mut self,
+        role_name: &str,
+    ) -> Option<crate::session::RoleActivation> {
         match self
             .ipc_client
             .send_request(IpcRequest::ListRoleIncarnations {
@@ -573,9 +580,9 @@ impl AgentRuntime {
                 ..
             }) => {
                 let roles = data.get("roles").and_then(|v| v.as_array())?;
-                let rec = roles.iter().find(|r| {
-                    r.get("role_name").and_then(|n| n.as_str()) == Some(role_name)
-                })?;
+                let rec = roles
+                    .iter()
+                    .find(|r| r.get("role_name").and_then(|n| n.as_str()) == Some(role_name))?;
 
                 let toolset_profile = rec
                     .get("toolset_profile")
@@ -698,6 +705,15 @@ impl AgentRuntime {
         }
 
         loop {
+            // Dispatch any tasks that were dequeued from a session's pending_user_tasks
+            // after the previous turn completed. Processed before blocking on IPC so that
+            // back-to-back voice memos are handled in order without additional round-trips.
+            while let Some((drain_task_id, drain_task)) = self.pending_drains.pop_front() {
+                if let Err(e) = self.handle_user_message(drain_task, drain_task_id).await {
+                    warn!("Failed to dispatch drained queued task: {}", e);
+                }
+            }
+
             match tokio::time::timeout(Duration::from_secs(5), self.ipc_client.recv_task()).await {
                 Ok(Ok(IpcResponse::InboundTask {
                     source_node,
@@ -749,9 +765,9 @@ impl AgentRuntime {
                             let task_ref = task.clone();
                             if let Err(err) = self.handle_voice_dialogue(task, task_id).await {
                                 error!("Failed to handle voice.dialogue: {}", err);
+                            }
                         }
-                    }
-                                            Ok(task) if task.action.as_deref() == Some("paracrine_request") => {
+                        Ok(task) if task.action.as_deref() == Some("paracrine_request") => {
                             // Paracrine sub-call — this philote is the specialist receiving
                             // an Exosome from a peer or Orchestrator. final_reply_to/role
                             // are set by the ParacrineEmit caller to route the response.
@@ -792,10 +808,7 @@ impl AgentRuntime {
                     let deadline = std::time::Instant::now()
                         + std::time::Duration::from_secs(drain_timeout_secs);
                     loop {
-                        let has_active = self
-                            .sessions
-                            .values()
-                            .any(|s| s.active_turn.is_some());
+                        let has_active = self.sessions.values().any(|s| s.active_turn.is_some());
                         if !has_active || std::time::Instant::now() >= deadline {
                             break;
                         }
@@ -837,9 +850,7 @@ impl AgentRuntime {
             .as_ref()
             .and_then(|v| serde_json::from_value::<Exosome>(v.clone()).ok());
 
-        let paracrine_id = exosome
-            .as_ref()
-            .and_then(|e| e.paracrine_id.clone());
+        let paracrine_id = exosome.as_ref().and_then(|e| e.paracrine_id.clone());
 
         let routing = exosome
             .as_ref()
@@ -1094,6 +1105,22 @@ impl AgentRuntime {
                 .sessions
                 .get_mut(&session_id)
                 .expect("session should exist after ensuring and binding transport target");
+
+            // If a turn is already active, queue this task for dispatch after the turn
+            // completes rather than overwriting the active turn. Paracrine requests are
+            // never queued — they must always start their own specialist turn.
+            let is_paracrine = task.action.as_deref() == Some("paracrine_request");
+            if !is_paracrine && state.is_turn_active() {
+                let queue_len = state.pending_user_task_count();
+                info!(
+                    session_id = %session_id,
+                    queue_depth = queue_len + 1,
+                    "Turn already active — queuing inbound task (session context preserved on payload)"
+                );
+                state.enqueue_user_task(task_id, task);
+                return Ok(());
+            }
+
             // If this turn was triggered by a paracrine_request, capture the
             // originating paracrine_id so deliver_text_reply can echo it back
             // as a `paracrine_response` rather than a `send_reply`.
@@ -1925,207 +1952,210 @@ impl AgentRuntime {
         bypass_approval: bool,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
-        // Agent-level approval enforcement: if the tool's policy annotation marks it as
-        // requiring approval, and the current approval policy does not preapprove it,
-        // synthesize an ApprovalRequest before executing. This runs independently of
-        // whether the model itself requested approval — it is the agent's safety gate.
-        // Skipped when bypass_approval is true (i.e. we are resuming after a resolution).
-        let force_approval = if bypass_approval {
-            false
-        } else {
-            self
+            // Agent-level approval enforcement: if the tool's policy annotation marks it as
+            // requiring approval, and the current approval policy does not preapprove it,
+            // synthesize an ApprovalRequest before executing. This runs independently of
+            // whether the model itself requested approval — it is the agent's safety gate.
+            // Skipped when bypass_approval is true (i.e. we are resuming after a resolution).
+            let force_approval = if bypass_approval {
+                false
+            } else {
+                self.sessions
+                    .get(&session_id)
+                    .map(|state| {
+                        let requires = state
+                            .tool_assembly
+                            .policy_annotations
+                            .get(&tool_call.tool_name)
+                            .map(|a| a.approval_required)
+                            .unwrap_or(false);
+                        if requires {
+                            let synthetic = ApprovalRequest {
+                                approval_id: None,
+                                reason: format!(
+                                    "Tool '{}' requires approval before execution.",
+                                    tool_call.tool_name
+                                ),
+                                approved_response: format!("Executing {}.", tool_call.tool_name),
+                            };
+                            !state.approval_policy_allows(&synthetic, Some(&tool_call))
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(false)
+            };
+
+            // Admin role creation requires live operator approval regardless of any approval policy.
+            // This check runs before the normal force_approval gate so it can set always_require_human.
+            // Bypassed when bypass_approval is true (already resolved by the operator).
+            let is_admin_role_creation = !bypass_approval
+                && tool_call.tool_name == "role.configure"
+                && tool_call
+                    .arguments
+                    .get("is_admin")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+            // rule.propose always requires live operator approval — cannot be preapproved or bypassed.
+            // Rules are durable and permanently affect agent behavior, so human confirmation is required.
+            // (bypass_approval does NOT bypass rule.propose — that one is unconditional.)
+            let is_rule_propose = !bypass_approval && tool_call.tool_name == "rule.propose";
+
+            if is_admin_role_creation || is_rule_propose || force_approval {
+                // Set pending_tool_call so the approval handler can read it for class lookup.
+                if let Some(state) = self.sessions.get_mut(&session_id) {
+                    state.set_pending_tool_call(tool_call.clone());
+                }
+                let role_name_hint = if is_admin_role_creation {
+                    tool_call
+                        .arguments
+                        .get("role_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string()
+                } else {
+                    String::new()
+                };
+                let (reason, approved_response) = if is_admin_role_creation {
+                    (
+                        format!(
+                            "Admin role '{}' creation requires your explicit live approval. \
+                         This cannot be preapproved or bypassed by policy.",
+                            role_name_hint
+                        ),
+                        format!("Admin role '{}' approved.", role_name_hint),
+                    )
+                } else if is_rule_propose {
+                    (
+                        "Rule proposal requires your explicit live approval.".to_string(),
+                        "Rule proposal approved.".to_string(),
+                    )
+                } else {
+                    (
+                        format!(
+                            "Tool '{}' requires approval before execution.",
+                            tool_call.tool_name
+                        ),
+                        format!("Executing {}.", tool_call.tool_name),
+                    )
+                };
+                let synthetic = ApprovalRequest {
+                    approval_id: Some(uuid::Uuid::new_v4().to_string()),
+                    reason,
+                    approved_response,
+                };
+                return self
+                    .handle_approval_request(
+                        session_id,
+                        turn_id,
+                        synthetic,
+                        is_admin_role_creation || is_rule_propose,
+                    )
+                    .await;
+            }
+
+            // Emit step_started if streaming is enabled.
+            let stream_events = self
                 .sessions
                 .get(&session_id)
-                .map(|state| {
-                    let requires = state
-                        .tool_assembly
-                        .policy_annotations
-                        .get(&tool_call.tool_name)
-                        .map(|a| a.approval_required)
-                        .unwrap_or(false);
-                    if requires {
-                        let synthetic = ApprovalRequest {
-                            approval_id: None,
-                            reason: format!(
-                                "Tool '{}' requires approval before execution.",
-                                tool_call.tool_name
-                            ),
-                            approved_response: format!("Executing {}.", tool_call.tool_name),
-                        };
-                        !state.approval_policy_allows(&synthetic, Some(&tool_call))
-                    } else {
-                        false
+                .map(|s| s.settings.execution.stream_tool_events)
+                .unwrap_or(true);
+            if stream_events {
+                let step_info = Some(tool_call.tool_name.clone());
+                let _ = self
+                    .emit_turn_event(&session_id, "step_started", step_info)
+                    .await;
+            }
+            let (
+                chat_id,
+                final_reply_to,
+                final_reply_role,
+                final_reply_guest_id,
+                workspace_ref,
+                route,
+                session_user_id,
+            ) = {
+                let Some(state) = self.sessions.get(&session_id) else {
+                    warn!(
+                        "Tool execution requested for unknown session {}",
+                        session_id
+                    );
+                    return Ok(());
+                };
+                let route = match Self::execute_bound_tool(state, &tool_call) {
+                    Ok(route) => route.clone(),
+                    Err(err) => {
+                        return self
+                            .fail_active_turn(session_id, turn_id, err.to_string())
+                            .await;
                     }
-                })
-                .unwrap_or(false)
-        };
+                };
+                let Some(active_turn) = state.active_turn.as_ref() else {
+                    warn!(
+                        "Dropping tool execution routing for session {} turn {} after active turn disappeared",
+                        session_id, turn_id
+                    );
+                    return Ok(());
+                };
+                (
+                    active_turn.chat_id.clone(),
+                    active_turn.final_reply_to.clone(),
+                    active_turn.final_reply_role.clone(),
+                    active_turn.final_reply_guest_id.clone(),
+                    state.bindings.effective_workspace_ref.clone(),
+                    route,
+                    state.source.clone(),
+                )
+            };
 
-        // Admin role creation requires live operator approval regardless of any approval policy.
-        // This check runs before the normal force_approval gate so it can set always_require_human.
-        // Bypassed when bypass_approval is true (already resolved by the operator).
-        let is_admin_role_creation = !bypass_approval
-            && tool_call.tool_name == "role.configure"
-            && tool_call
-                .arguments
-                .get("is_admin")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-
-        // rule.propose always requires live operator approval — cannot be preapproved or bypassed.
-        // Rules are durable and permanently affect agent behavior, so human confirmation is required.
-        // (bypass_approval does NOT bypass rule.propose — that one is unconditional.)
-        let is_rule_propose = !bypass_approval && tool_call.tool_name == "rule.propose";
-
-        if is_admin_role_creation || is_rule_propose || force_approval {
-            // Set pending_tool_call so the approval handler can read it for class lookup.
+            // Store the tool call on the active turn BEFORE dispatching so that when the
+            // result returns, handle_tool_result can recover the full (name + arguments)
+            // pair for the working_tool_history. Without this, the fallback uses empty args.
             if let Some(state) = self.sessions.get_mut(&session_id) {
                 state.set_pending_tool_call(tool_call.clone());
             }
-            let role_name_hint = if is_admin_role_creation {
-                tool_call
-                    .arguments
-                    .get("role_name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown")
-                    .to_string()
-            } else {
-                String::new()
-            };
-            let (reason, approved_response) = if is_admin_role_creation {
-                (
-                    format!(
-                        "Admin role '{}' creation requires your explicit live approval. \
-                         This cannot be preapproved or bypassed by policy.",
-                        role_name_hint
-                    ),
-                    format!("Admin role '{}' approved.", role_name_hint),
-                )
-            } else if is_rule_propose {
-                (
-                    "Rule proposal requires your explicit live approval.".to_string(),
-                    "Rule proposal approved.".to_string(),
-                )
-            } else {
-                (
-                    format!(
-                        "Tool '{}' requires approval before execution.",
-                        tool_call.tool_name
-                    ),
-                    format!("Executing {}.", tool_call.tool_name),
-                )
-            };
-            let synthetic = ApprovalRequest {
-                approval_id: Some(uuid::Uuid::new_v4().to_string()),
-                reason,
-                approved_response,
-            };
-            return self
-                .handle_approval_request(session_id, turn_id, synthetic, is_admin_role_creation || is_rule_propose)
-                .await;
-        }
 
-        // Emit step_started if streaming is enabled.
-        let stream_events = self
-            .sessions
-            .get(&session_id)
-            .map(|s| s.settings.execution.stream_tool_events)
-            .unwrap_or(true);
-        if stream_events {
-            let step_info = Some(tool_call.tool_name.clone());
-            let _ = self
-                .emit_turn_event(&session_id, "step_started", step_info)
-                .await;
-        }
-        let (
-            chat_id,
-            final_reply_to,
-            final_reply_role,
-            final_reply_guest_id,
-            workspace_ref,
-            route,
-            session_user_id,
-        ) = {
-            let Some(state) = self.sessions.get(&session_id) else {
-                warn!(
-                    "Tool execution requested for unknown session {}",
-                    session_id
-                );
-                return Ok(());
-            };
-            let route = match Self::execute_bound_tool(state, &tool_call) {
-                Ok(route) => route.clone(),
-                Err(err) => {
-                    return self
-                        .fail_active_turn(session_id, turn_id, err.to_string())
-                        .await;
-                }
-            };
-            let Some(active_turn) = state.active_turn.as_ref() else {
-                warn!(
-                    "Dropping tool execution routing for session {} turn {} after active turn disappeared",
-                    session_id, turn_id
-                );
-                return Ok(());
-            };
-            (
-                active_turn.chat_id.clone(),
-                active_turn.final_reply_to.clone(),
-                active_turn.final_reply_role.clone(),
-                active_turn.final_reply_guest_id.clone(),
-                state.bindings.effective_workspace_ref.clone(),
-                route,
-                state.source.clone(),
-            )
-        };
-
-        // Store the tool call on the active turn BEFORE dispatching so that when the
-        // result returns, handle_tool_result can recover the full (name + arguments)
-        // pair for the working_tool_history. Without this, the fallback uses empty args.
-        if let Some(state) = self.sessions.get_mut(&session_id) {
-            state.set_pending_tool_call(tool_call.clone());
-        }
-
-        let tool_req = ToolExecutionPayload {
-            action: "execute_tool",
-            session_id,
-            turn_id,
-            chat_id,
-            tool_name: tool_call.tool_name,
-            arguments: tool_call.arguments,
-            execution_mode: route.execution_mode.clone(),
-            agent_id: self.agent_id.clone(),
-            user_id: Some(session_user_id),
-            runner_id: route.runner_id.clone(),
-            incarnation_id: route.incarnation_id.clone(),
-            hotel_id: route.hotel_id.clone(),
-            environment_id: route.environment_id.clone(),
-            task_runner_kind: route.task_runner_kind.clone(),
-            task_runner_config: route.task_runner_config.clone(),
-            selection_reason: route.selection_reason.clone(),
-            workspace_ref: workspace_ref.clone(),
-            task_runner_overlay: route
-                .task_runner_kind
-                .as_deref()
-                .map(|kind| TaskRunnerOverlay {
-                    workspace_ref: if kind == "workspace" {
-                        workspace_ref
-                    } else {
-                        None
-                    },
-                    allowed_tools: None,
-                    max_read_bytes: None,
-                    max_search_results: None,
+            let tool_req = ToolExecutionPayload {
+                action: "execute_tool",
+                session_id,
+                turn_id,
+                chat_id,
+                tool_name: tool_call.tool_name,
+                arguments: tool_call.arguments,
+                execution_mode: route.execution_mode.clone(),
+                agent_id: self.agent_id.clone(),
+                user_id: Some(session_user_id),
+                runner_id: route.runner_id.clone(),
+                incarnation_id: route.incarnation_id.clone(),
+                hotel_id: route.hotel_id.clone(),
+                environment_id: route.environment_id.clone(),
+                task_runner_kind: route.task_runner_kind.clone(),
+                task_runner_config: route.task_runner_config.clone(),
+                selection_reason: route.selection_reason.clone(),
+                workspace_ref: workspace_ref.clone(),
+                task_runner_overlay: route.task_runner_kind.as_deref().map(|kind| {
+                    TaskRunnerOverlay {
+                        workspace_ref: if kind == "workspace" {
+                            workspace_ref
+                        } else {
+                            None
+                        },
+                        allowed_tools: None,
+                        max_read_bytes: None,
+                        max_search_results: None,
+                    }
                 }),
-            reply_to: local_node_id(),
-            reply_role: "agent".into(),
-            final_reply_to,
-            final_reply_role,
-            final_reply_guest_id,
-        };
+                reply_to: local_node_id(),
+                reply_role: "agent".into(),
+                final_reply_to,
+                final_reply_role,
+                final_reply_guest_id,
+            };
 
-        if route.execution_mode == "local_agent" {
-            return self.execute_local_agent_tool(tool_req).await;
-        }
+            if route.execution_mode == "local_agent" {
+                return self.execute_local_agent_tool(tool_req).await;
+            }
 
             self.ipc_client
                 .send_request(IpcRequest::EmitTask {
@@ -2210,7 +2240,11 @@ impl AgentRuntime {
                 )
             };
             if stream_events {
-                let event = if step_failed { "step_failed" } else { "step_completed" };
+                let event = if step_failed {
+                    "step_failed"
+                } else {
+                    "step_completed"
+                };
                 let _ = self.emit_turn_event(&session_id, event, None).await;
             }
             self.ipc_client
@@ -2746,7 +2780,10 @@ impl AgentRuntime {
             trigger: RecallTrigger::UserTurnStart,
             scope: MemoryScope::SelfOnly,
             recall_seed_text: active_turn.user_content.clone(),
-            active_goal: active_turn.active_plan.as_ref().map(|plan| plan.goal.clone()),
+            active_goal: active_turn
+                .active_plan
+                .as_ref()
+                .map(|plan| plan.goal.clone()),
             role_name: state
                 .role_activation
                 .as_ref()
@@ -3145,7 +3182,13 @@ impl AgentRuntime {
         }];
         // If the task had no content, provide a minimal placeholder so
         // normalized_user_content doesn't skip the message.
-        if synthetic.content.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        if synthetic
+            .content
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
             synthetic.content = Some(String::new());
         }
 
@@ -3281,6 +3324,9 @@ impl AgentRuntime {
             })
             .await?;
 
+        // After completing this turn, schedule the next pending user task for dispatch.
+        self.drain_next_user_task(&attend_session_id);
+
         // Attend hook (Slice E): fire-and-forget autobiographical memory write.
         if let Some(engine) = self.memory_engine_for(&self.agent_id, &self.agent_id) {
             let agent_id = self.agent_id.clone();
@@ -3371,6 +3417,7 @@ impl AgentRuntime {
             })
             .await?;
 
+        let drain_session_id = session_id.clone();
         let reply_payload = FinalReplyPayload {
             action: "send_reply",
             session_id,
@@ -3390,7 +3437,38 @@ impl AgentRuntime {
             })
             .await?;
 
+        // After failing this turn, schedule the next pending user task for dispatch.
+        self.drain_next_user_task(&drain_session_id);
+
         Ok(())
+    }
+
+    /// Move the next queued user task into `pending_drains` so the main event loop
+    /// can dispatch it without creating async recursion.
+    ///
+    /// Called after every turn completes or fails. The task retains its original
+    /// `session_id`, `chat_id`, and `exosome` context so the correct Telegram
+    /// session/chat is restored when the turn eventually starts.
+    fn drain_next_user_task(&mut self, session_id: &str) {
+        let next = if let Some(state) = self.sessions.get_mut(session_id) {
+            state.dequeue_user_task()
+        } else {
+            return;
+        };
+
+        if let Some((task_id, task)) = next {
+            let queued_depth = self
+                .sessions
+                .get(session_id)
+                .map(|s| s.pending_user_task_count())
+                .unwrap_or(0);
+            info!(
+                session_id = %session_id,
+                remaining_in_queue = queued_depth,
+                "Scheduling queued user task for dispatch after turn completion"
+            );
+            self.pending_drains.push_back((task_id, task));
+        }
     }
 
     // ── Scripted-loop routing ───────────────────────────────────────────────
@@ -3419,8 +3497,8 @@ impl AgentRuntime {
             .to_string();
 
         // Try to parse as JSON; fall back to a plain string value.
-        let output_value: Value = serde_json::from_str(&raw_text)
-            .unwrap_or(Value::String(raw_text));
+        let output_value: Value =
+            serde_json::from_str(&raw_text).unwrap_or(Value::String(raw_text));
 
         {
             let Some(state) = self.sessions.get_mut(&session_id) else {
@@ -3498,9 +3576,7 @@ impl AgentRuntime {
                         let Some(state) = self.sessions.get_mut(&session_id) else {
                             return Ok(());
                         };
-                        state.with_scripted_executor_mut(|exec| {
-                            exec.advance_past_tool_sequence()
-                        });
+                        state.with_scripted_executor_mut(|exec| exec.advance_past_tool_sequence());
                     }
                     self.scripted_dispatch_after_advance(
                         session_id,
@@ -3527,11 +3603,7 @@ impl AgentRuntime {
                         )
                     };
                     self.ipc_client
-                        .sync_apartment(
-                            &self.agent_id,
-                            &checkpoint_memory_type,
-                            checkpoint_json,
-                        )
+                        .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
                         .await?;
                     self.sync_session_index(&index_state).await?;
                     self.scripted_dispatch_after_advance(
@@ -3602,7 +3674,10 @@ impl AgentRuntime {
                     )
                     .await;
             };
-            let turn = state.active_turn.as_mut().expect("turn exists after envelope");
+            let turn = state
+                .active_turn
+                .as_mut()
+                .expect("turn exists after envelope");
             turn.iteration += 1;
             turn.phase = TurnPhase::WaitingModel;
             let task_id = turn.task_id;
@@ -4148,9 +4223,7 @@ impl AgentRuntime {
                 effective_skill_guidance: vec![],
                 working_memory_policy: None,
                 memory_projection_policy: None,
-                turn_loop_config: role_config
-                    .as_ref()
-                    .map(|c| c.turn_loop_config.clone()),
+                turn_loop_config: role_config.as_ref().map(|c| c.turn_loop_config.clone()),
             };
 
             state.role_activation = Some(activation);
@@ -5444,7 +5517,10 @@ impl AgentRuntime {
                                 turn_loop_config: args
                                     .get("turn_loop_config")
                                     .and_then(|v| {
-                                        serde_json::from_value::<ansible_mesh_core::graph::TurnLoopConfig>(v.clone()).ok()
+                                        serde_json::from_value::<
+                                            ansible_mesh_core::graph::TurnLoopConfig,
+                                        >(v.clone())
+                                        .ok()
                                     })
                                     .unwrap_or_default(),
                             },
@@ -6033,7 +6109,7 @@ impl AgentRuntime {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                
+
                 let target_focus_framing = args
                     .and_then(|a| a.get("target_focus_framing"))
                     .and_then(|v| v.as_str())
@@ -6044,12 +6120,14 @@ impl AgentRuntime {
                         .fail_active_turn(
                             payload.session_id,
                             payload.turn_id,
-                            "handoff.to_role: missing required argument 'target_focus_framing'".into(),
+                            "handoff.to_role: missing required argument 'target_focus_framing'"
+                                .into(),
                         )
                         .await;
                 };
 
-                let active_goal = active_goal.map(|g| format!("{}\n\nTarget Focus Framing:\n{}", g, target_focus_framing));
+                let active_goal = active_goal
+                    .map(|g| format!("{}\n\nTarget Focus Framing:\n{}", g, target_focus_framing));
 
                 let expected_return_mode = args
                     .and_then(|a| a.get("expected_return_mode"))
@@ -6151,7 +6229,7 @@ impl AgentRuntime {
                         final_reply_to: Some(payload.final_reply_to),
                         final_reply_role: Some(payload.final_reply_role),
                         final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
+                        ..Default::default()
                     })
                     .await
                 } else {
@@ -6249,7 +6327,7 @@ impl AgentRuntime {
                         final_reply_to: Some(payload.final_reply_to),
                         final_reply_role: Some(payload.final_reply_role),
                         final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
+                        ..Default::default()
                     })
                     .await
                 } else {
@@ -6317,7 +6395,10 @@ impl AgentRuntime {
                 let _ = self
                     .emit_partial_reply(
                         &payload.session_id,
-                        format!("Let me hand you over to {} to help with this...", target_agent_id),
+                        format!(
+                            "Let me hand you over to {} to help with this...",
+                            target_agent_id
+                        ),
                     )
                     .await;
 
@@ -6338,7 +6419,9 @@ impl AgentRuntime {
                         delegation_id,
                         status,
                     }) => (
-                        format!("Delegated task to peer '{target_agent_id}' (delegation {delegation_id}, status: {status})."),
+                        format!(
+                            "Delegated task to peer '{target_agent_id}' (delegation {delegation_id}, status: {status})."
+                        ),
                         None,
                     ),
                     Ok(IpcResponse::Error(msg)) => {
@@ -6462,7 +6545,9 @@ impl AgentRuntime {
                         delegation_id,
                         status,
                     }) => (
-                        format!("Delegated task to external peer type '{target_peer_type}' (delegation {delegation_id}, status: {status})."),
+                        format!(
+                            "Delegated task to external peer type '{target_peer_type}' (delegation {delegation_id}, status: {status})."
+                        ),
                         None,
                     ),
                     Ok(IpcResponse::Error(msg)) => {
@@ -6484,7 +6569,9 @@ impl AgentRuntime {
                     Err(e) => {
                         let err = TaskErrorPayload::transport_error(
                             "philote",
-                            format!("delegate.to_external_cognitive_peer: IPC transport error — {e}"),
+                            format!(
+                                "delegate.to_external_cognitive_peer: IPC transport error — {e}"
+                            ),
                         );
                         (err.display_message(), Some(err))
                     }
@@ -6827,7 +6914,6 @@ impl AgentRuntime {
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
                     ..Default::default()
-
                 })
                 .await
             }
@@ -6884,12 +6970,12 @@ impl AgentRuntime {
 
                 // Parse optional response_routing hint from arguments.
                 // Defaults to CognitiveReEntry if absent or unrecognised.
-                let response_routing = args
-                    .get("routing")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| serde_json::from_value::<ParacrineRouting>(
-                        serde_json::Value::String(s.to_string())
-                    ).ok());
+                let response_routing = args.get("routing").and_then(|v| v.as_str()).and_then(|s| {
+                    serde_json::from_value::<ParacrineRouting>(serde_json::Value::String(
+                        s.to_string(),
+                    ))
+                    .ok()
+                });
 
                 // Always generate a paracrine_id — it threads through the full
                 // thought graph and ties the response back to this turn.
@@ -7151,7 +7237,9 @@ impl AgentRuntime {
         // Role processes request a role-scoped snapshot so the hotel returns the
         // role-specific checkpoint rather than the orchestrator's base checkpoint.
         let snapshot_key = {
-            let role = std::env::var("PHILOTIC_ROLE_NAME").ok().filter(|r| !r.is_empty());
+            let role = std::env::var("PHILOTIC_ROLE_NAME")
+                .ok()
+                .filter(|r| !r.is_empty());
             match role {
                 Some(r) => format!("__session_snapshot__:{session_id}@{r}"),
                 None => format!("__session_snapshot__:{session_id}"),
@@ -7527,7 +7615,7 @@ mod tests {
                 capability: Some("voice.synthesize".into()),
                 retryable: Some(false),
             }),
-                    ..Default::default()
+            ..Default::default()
         };
 
         let error = extract_model_error(&payload).expect("structured error should be extracted");
@@ -7543,7 +7631,7 @@ mod tests {
     fn extract_model_error_payload_preserves_retryable_flag() {
         let payload = InboundTaskPayload {
             agent_action: None,
-                    handoff_bundle: None,
+            handoff_bundle: None,
             action: None,
             source: None,
             session_id: None,
@@ -7575,7 +7663,7 @@ mod tests {
                 capability: Some("text.generate".into()),
                 retryable: Some(true),
             }),
-                    ..Default::default()
+            ..Default::default()
         };
 
         let error =
@@ -7755,7 +7843,7 @@ mod tests {
         let task = InboundTaskPayload {
             action: None,
             agent_action: None,
-                    handoff_bundle: None,
+            handoff_bundle: None,
             source: Some("telegram".into()),
             session_id: None,
             turn_id: None,
@@ -7783,7 +7871,7 @@ mod tests {
             final_reply_role: None,
             final_reply_guest_id: None,
             error: None,
-                    ..Default::default()
+            ..Default::default()
         };
 
         assert_eq!(normalized_user_content(&task), Some("caption text".into()));
@@ -7794,7 +7882,7 @@ mod tests {
         let task = InboundTaskPayload {
             action: None,
             agent_action: None,
-                    handoff_bundle: None,
+            handoff_bundle: None,
             source: Some("telegram".into()),
             session_id: None,
             turn_id: None,
@@ -7822,7 +7910,7 @@ mod tests {
             final_reply_role: None,
             final_reply_guest_id: None,
             error: None,
-                    ..Default::default()
+            ..Default::default()
         };
 
         assert_eq!(
@@ -7839,7 +7927,7 @@ mod tests {
         let task = InboundTaskPayload {
             action: None,
             agent_action: None,
-                    handoff_bundle: None,
+            handoff_bundle: None,
             source: Some("telegram".into()),
             session_id: None,
             turn_id: None,
@@ -7860,7 +7948,7 @@ mod tests {
             final_reply_role: None,
             final_reply_guest_id: None,
             error: None,
-                    ..Default::default()
+            ..Default::default()
         };
 
         assert_eq!(
@@ -7874,7 +7962,7 @@ mod tests {
         let task = InboundTaskPayload {
             action: None,
             agent_action: None,
-                    handoff_bundle: None,
+            handoff_bundle: None,
             source: Some("telegram".into()),
             session_id: None,
             turn_id: None,
@@ -7923,7 +8011,7 @@ mod tests {
             final_reply_role: None,
             final_reply_guest_id: None,
             error: None,
-                    ..Default::default()
+            ..Default::default()
         };
 
         let attachments = media_analysis_attachments(&task);
