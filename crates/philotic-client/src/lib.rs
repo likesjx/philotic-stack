@@ -1,10 +1,10 @@
-use anyhow::{Context, Result};
+pub use ansible_mesh_core::cron::{CronJob, CronJobId, CronJobSource};
 pub use ansible_mesh_core::resources::{
     ResourceDenied, ResourceGranted, ResourceMaterializing, ResourceReleased, ResourceRequest,
     ResourceRevoked, ResourceType,
 };
-pub use ansible_mesh_core::cron::{CronJob, CronJobId, CronJobSource};
 pub use ansible_mesh_core::storage::ComponentManifest;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::io::ErrorKind;
@@ -337,6 +337,9 @@ pub enum ParacrineRouting {
     Heartbeat,
     /// Forward the response content directly to membrane. No model loop.
     RawForward,
+    /// Arbiter-promoted re-entry: queue at the FRONT of pending_user_tasks so the
+    /// orchestrator processes it next, ahead of any already-queued messages.
+    PriorityReEntry,
 }
 
 /// Paracrine message envelope — the vesicle a philote secretes when performing a

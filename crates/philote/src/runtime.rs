@@ -968,6 +968,24 @@ impl AgentRuntime {
                 // response into its context. If not, a new synthesis turn begins.
                 self.handle_user_message(task, task_id).await?;
             }
+
+            ParacrineRouting::PriorityReEntry => {
+                // Arbiter-promoted: prepend to the session queue so this task is
+                // processed NEXT, ahead of any already-waiting messages.
+                let session_id = task.session_id_or_default(&self.agent_id);
+                if let Some(state) = self.sessions.get_mut(&session_id) {
+                    if state.is_turn_active() {
+                        info!(
+                            session_id = %session_id,
+                            "PriorityReEntry: prepending arbiter-promoted task to front of queue"
+                        );
+                        state.prepend_user_task(task_id, task);
+                    } else {
+                        // No active turn — dispatch immediately.
+                        self.handle_user_message(task, task_id).await?;
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -1112,6 +1130,61 @@ impl AgentRuntime {
             let is_paracrine = task.action.as_deref() == Some("paracrine_request");
             if !is_paracrine && state.is_turn_active() {
                 let queue_len = state.pending_user_task_count();
+                let is_voice = task
+                    .message_kind
+                    .as_deref()
+                    .map(|k| matches!(k, "voice" | "audio"))
+                    .unwrap_or(false)
+                    || task.attachments.iter().any(|a| matches!(a.kind.as_str(), "voice" | "audio"));
+
+                // Safety valve: route TEXT tasks through the queue arbiter if one is
+                // configured. The arbiter evaluates priority and may call delegate.merge
+                // with PriorityReEntry to jump to the front of the queue.
+                // Voice tasks bypass the arbiter — they are always queued raw.
+                let arbiter_role = state.queue_arbiter_role.clone();
+                if !is_voice {
+                    if let Some(ref role) = arbiter_role {
+                        let task_content = task.content.clone().unwrap_or_default();
+                        let task_chat_id = task.chat_id.clone().unwrap_or_default();
+                        let task_session_id = session_id.clone();
+                        info!(
+                            session_id = %session_id,
+                            arbiter = %role,
+                            queue_depth = queue_len,
+                            "Routing queued TEXT task through queue arbiter for priority evaluation"
+                        );
+                        // Still enqueue the task normally so it's processed even if the arbiter
+                        // doesn't promote it. The arbiter's PriorityReEntry prepends on top if needed.
+                        state.enqueue_user_task(task_id, task);
+                        let arbiter_prompt = format!(
+                            "Incoming message queued behind {} waiting task(s): \"{}\". \
+                             Evaluate urgency and intent. If this requires immediate attention, \
+                             call delegate.merge with the message content to promote it to the front \
+                             of the queue. Otherwise do nothing — it will be processed in order.",
+                            queue_len, task_content
+                        );
+                        let exosome = philotic_client::Exosome {
+                            prompt: arbiter_prompt,
+                            context: None,
+                            paracrine_id: None,
+                            response_routing: Some(philotic_client::ParacrineRouting::PriorityReEntry),
+                            source_session_id: Some(task_session_id),
+                            source_chat_id: Some(task_chat_id),
+                        };
+                        let _ = self
+                            .ipc_client
+                            .send_request(IpcRequest::ParacrineEmit {
+                                role: role.clone(),
+                                exosome,
+                                reply_to_node: local_node_id(),
+                                reply_to_role: "orchestrator".into(),
+                                timeout_secs: None,
+                            })
+                            .await;
+                        return Ok(());
+                    }
+                }
+
                 info!(
                     session_id = %session_id,
                     queue_depth = queue_len + 1,

@@ -879,6 +879,13 @@ pub struct SessionState {
     /// correct Telegram session/chat is restored when the task is dispatched.
     /// Voice tasks are queued raw and will be transcribed when they reach the front.
     pub pending_user_tasks: std::collections::VecDeque<(uuid::Uuid, InboundTaskPayload)>,
+    /// Optional role name of the queue arbiter.
+    /// When set, TEXT tasks queued while a turn is active are routed to this specialist
+    /// role via paracrine dispatch for priority evaluation. The arbiter may call
+    /// `delegate.merge` to inject the task at the FRONT of the queue (high priority)
+    /// or simply let it sit (normal FIFO). Voice tasks bypass the arbiter (they are
+    /// always queued raw and transcribed at dispatch time).
+    pub queue_arbiter_role: Option<String>,
 }
 
 impl SessionState {
@@ -904,6 +911,7 @@ impl SessionState {
             rules: Vec::new(),
             reflex_engine: ReflexEngine::new(),
             pending_user_tasks: std::collections::VecDeque::new(),
+            queue_arbiter_role: None,
         }
     }
 
@@ -919,6 +927,11 @@ impl SessionState {
     /// Enqueue a user task for deferred processing after the current turn completes.
     pub fn enqueue_user_task(&mut self, task_id: uuid::Uuid, task: InboundTaskPayload) {
         self.pending_user_tasks.push_back((task_id, task));
+    }
+
+    /// Prepend a user task to the front of the queue (high priority, arbiter-promoted).
+    pub fn prepend_user_task(&mut self, task_id: uuid::Uuid, task: InboundTaskPayload) {
+        self.pending_user_tasks.push_front((task_id, task));
     }
 
     /// Pop the next pending user task, if any.
@@ -1986,7 +1999,38 @@ impl SessionState {
     }
 
     pub fn project_tools_for_turn(&self, user_content: &str) -> Vec<ToolDefinition> {
-        let all_tools = self.tool_assembly.tools_for_model.clone();
+        let mut all_tools = self.tool_assembly.tools_for_model.clone();
+
+        // Paracrine context: auto-inject delegate.merge so the specialist can explicitly
+        // push her response into the orchestrator's main loop without needing it configured
+        // in any toolset profile. Available whenever the active turn has a paracrine_origin.
+        let in_paracrine = self
+            .active_turn
+            .as_ref()
+            .map(|t| t.paracrine_origin.is_some())
+            .unwrap_or(false);
+        if in_paracrine && !all_tools.iter().any(|t| t.tool_name == "delegate.merge") {
+            all_tools.push(ToolDefinition {
+                tool_name: "delegate.merge".into(),
+                description: concat!(
+                    "Send your completed response back to the orchestrator's main conversation. ",
+                    "Call this when you are ready to deliver your result. ",
+                    "Arguments: { \"content\": \"<your response text>\" }. ",
+                    "After calling this your turn will close — do not call it more than once.",
+                ).into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "content": {
+                            "type": "string",
+                            "description": "The response to deliver to the orchestrator."
+                        }
+                    },
+                    "required": ["content"]
+                }),
+                class: Some("paracrine".into()),
+            });
+        }
         if all_tools.is_empty() {
             return all_tools;
         }
@@ -3248,6 +3292,10 @@ impl SessionState {
                 .unwrap_or_default(),
             reflex_engine: ReflexEngine::new(),
             pending_user_tasks: std::collections::VecDeque::new(),
+            queue_arbiter_role: checkpoint
+                .get("queue_arbiter_role")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
         })
     }
 }
