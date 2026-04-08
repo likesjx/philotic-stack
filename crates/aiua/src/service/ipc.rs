@@ -5036,22 +5036,22 @@ impl IpcServer {
                 reply_to_role,
                 ..
             } => {
-                // Populate session context from the exosome source fields so the specialist
-                // runs in a named session (not `unknown:ephemeral`) and approval requests,
-                // logs, and turn-window tracking all carry meaningful context.
+                // Session key: paracrine:{chat_id}:{role}
                 //
-                // session_id is scoped as `paracrine:{source_session_id}` to keep the
-                // specialist's history separate from the orchestrator's session while still
-                // making the originating conversation visible in logs and routing.
-                let specialist_session_id = exosome
-                    .source_session_id
-                    .as_deref()
-                    .map(|s| format!("paracrine:{s}"))
-                    .unwrap_or_else(|| format!("paracrine:{role}"));
+                // Keyed on chat_id (not the full source_session_id) so the specialist
+                // accumulates turn-window context per conversation. Multiple whisper calls
+                // from the same Telegram chat land in the same specialist session and are
+                // queued by the FIFO pending_user_tasks mechanism rather than overwriting
+                // each other. The role suffix keeps sessions distinct across specialists.
                 let specialist_chat_id = exosome.source_chat_id.clone().unwrap_or_default();
+                let specialist_session_id = if specialist_chat_id.is_empty() {
+                    format!("paracrine:{role}")
+                } else {
+                    format!("paracrine:{}:{role}", specialist_chat_id)
+                };
                 // Derive transport from the source_session_id prefix (e.g. "telegram" from
-                // "telegram:7898847424:agent-bjork-01") so the specialist's session_id_or_default
-                // resolves correctly.
+                // "telegram:7898847424:agent-bjork-01") so the specialist's session tracks
+                // its origin transport even though it runs in a distinct session.
                 let specialist_transport = exosome
                     .source_session_id
                     .as_deref()

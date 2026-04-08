@@ -350,6 +350,10 @@ pub struct WorkingTurn {
     /// The chat_id (Telegram / membrane channel) of the originating conversation.
     /// Included in the `paracrine_response` so the routing reflex knows where to deliver.
     pub paracrine_reply_chat_id: Option<String>,
+    /// Set to true when the specialist explicitly calls `delegate.merge` during a turn.
+    /// Suppresses the auto-emit of `paracrine_response` in deliver_text_reply so there
+    /// is no duplicate delivery after the explicit merge already fired.
+    pub paracrine_merge_completed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2942,6 +2946,10 @@ impl SessionState {
                 "had_voice_input": turn.had_voice_input,
                 "awaiting_transcription_reentry": turn.awaiting_transcription_reentry,
                 "scripted_loop_context": turn.scripted_loop_context,
+                "paracrine_origin": turn.paracrine_origin,
+                "paracrine_reply_session_id": turn.paracrine_reply_session_id,
+                "paracrine_reply_chat_id": turn.paracrine_reply_chat_id,
+                "paracrine_merge_completed": turn.paracrine_merge_completed,
             })
         });
 
@@ -3209,6 +3217,10 @@ impl SessionState {
                     .get("paracrine_reply_chat_id")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string),
+                paracrine_merge_completed: turn
+                    .get("paracrine_merge_completed")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
             })
         });
 
@@ -3823,6 +3835,7 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_merge_completed: false,
         });
 
         let checkpoint = state.checkpoint_json();
@@ -3935,6 +3948,7 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_merge_completed: false,
         });
 
         state.complete_active_turn("hi".into());
@@ -3977,6 +3991,7 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_merge_completed: false,
         });
 
         state.complete_active_turn("transcription reply".into());
@@ -4652,6 +4667,7 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_merge_completed: false,
         });
 
         let projection = state.build_context_projection("status");
@@ -4737,6 +4753,7 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_merge_completed: false,
         });
 
         let prompt = state.build_prompt("status");
@@ -4816,6 +4833,7 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_merge_completed: false,
         });
 
         let bundle = state.build_same_identity_handoff_bundle(
@@ -4892,6 +4910,7 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_merge_completed: false,
         });
 
         let delegation = state.build_subagent_delegation(
@@ -5372,6 +5391,7 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_merge_completed: false,
         });
         let index = merge_session_index(None, &first);
         assert_eq!(index["active_sessions"].as_array().unwrap().len(), 1);
@@ -5421,6 +5441,7 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_merge_completed: false,
         });
 
         state.push_tool_history(
@@ -5485,6 +5506,7 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_merge_completed: false,
         });
 
         state.push_tool_history(
@@ -5550,6 +5572,7 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_merge_completed: false,
         });
 
         let reentry = state
@@ -5823,6 +5846,7 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_merge_completed: false,
         });
 
         let projection = state.build_context_projection("continue the memory work");

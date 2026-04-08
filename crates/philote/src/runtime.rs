@@ -1165,6 +1165,7 @@ impl AgentRuntime {
                 paracrine_origin,
                 paracrine_reply_session_id,
                 paracrine_reply_chat_id,
+                paracrine_merge_completed: false,
             });
             state.set_active_turn_phase(TurnPhase::LoadingContext);
 
@@ -3278,8 +3279,20 @@ impl AgentRuntime {
         // Use source_session_id / source_chat_id from the exosome (stored on the turn)
         // so the orchestrator routes the reply to the originating conversation channel
         // rather than to this specialist's ephemeral session.
+        //
+        // If delegate.merge was called explicitly during this turn, the paracrine_response
+        // was already emitted — skip the auto-emit to avoid double-delivery.
         // Otherwise use the normal `send_reply` path.
         let task_json = if let Some(ref pid) = completed_turn.paracrine_origin {
+            if completed_turn.paracrine_merge_completed {
+                // Explicit merge already fired — complete the task but don't re-send.
+                info!(
+                    "deliver_text_reply: delegate.merge already emitted paracrine_response for turn {}; skipping auto-emit",
+                    turn_id
+                );
+                self.drain_next_user_task(&attend_session_id);
+                return Ok(());
+            }
             let reply_session_id = completed_turn
                 .paracrine_reply_session_id
                 .as_deref()
@@ -7067,6 +7080,142 @@ impl AgentRuntime {
                 .await
             }
 
+            // ── delegate.merge ───────────────────────────────────────────────
+            // Explicit paracrine merge: emit a paracrine_response back to the
+            // orchestrator immediately, without waiting for turn completion.
+            // Sets paracrine_merge_completed on the turn so deliver_text_reply
+            // does not auto-emit a duplicate response when the turn later closes.
+            //
+            // Call signature: { "content": "<response to send to orchestrator>" }
+            // Available in specialist (paracrine) toolsets.
+            "delegate.merge" => {
+                let session_id = payload.session_id.clone();
+                let turn_id = payload.turn_id.clone();
+                let args = &payload.arguments;
+
+                let content = match args.get("content").and_then(|v| v.as_str()) {
+                    Some(c) if !c.trim().is_empty() => c.to_string(),
+                    _ => {
+                        return self
+                            .fail_active_turn(
+                                session_id,
+                                turn_id,
+                                "delegate.merge: missing required argument 'content'".into(),
+                            )
+                            .await;
+                    }
+                };
+
+                // Capture routing info from the active turn before muting it.
+                let (paracrine_id, reply_session_id, reply_chat_id, final_reply_to, final_reply_role, final_reply_guest_id) = {
+                    let Some(state) = self.sessions.get_mut(&session_id) else {
+                        warn!("delegate.merge: unknown session {}", session_id);
+                        return Ok(());
+                    };
+                    let Some(turn) = state.active_turn.as_mut() else {
+                        warn!("delegate.merge: no active turn for session {}", session_id);
+                        return Ok(());
+                    };
+                    if turn.paracrine_origin.is_none() {
+                        return self
+                            .fail_active_turn(
+                                session_id,
+                                turn_id,
+                                "delegate.merge: not in a paracrine context — this tool is only available to specialist roles".into(),
+                            )
+                            .await;
+                    }
+                    let pid = turn.paracrine_origin.clone().unwrap();
+                    let rs = turn
+                        .paracrine_reply_session_id
+                        .clone()
+                        .unwrap_or_else(|| session_id.clone());
+                    let rc = turn
+                        .paracrine_reply_chat_id
+                        .clone()
+                        .unwrap_or_else(|| turn.chat_id.clone());
+                    let frt = turn.final_reply_to.clone();
+                    let frr = turn.final_reply_role.clone();
+                    let frg = turn.final_reply_guest_id.clone();
+                    // Mark merge as done so deliver_text_reply suppresses the auto-emit.
+                    turn.paracrine_merge_completed = true;
+                    (pid, rs, rc, frt, frr, frg)
+                };
+
+                // Append role attribution tag (same as deliver_text_reply does).
+                let attributed_content = if let Ok(role_name) = std::env::var("PHILOTIC_ROLE_NAME") {
+                    if !role_name.is_empty() {
+                        format!("{}\n\n@agent:{}", content, role_name)
+                    } else {
+                        content.clone()
+                    }
+                } else {
+                    content.clone()
+                };
+
+                // Fire the paracrine_response into the orchestrator's session.
+                let merge_task = serde_json::json!({
+                    "action": "paracrine_response",
+                    "session_id": reply_session_id,
+                    "turn_id": turn_id,
+                    "chat_id": reply_chat_id,
+                    "content": attributed_content,
+                    "exosome": {
+                        "prompt": "",
+                        "paracrine_id": paracrine_id,
+                        "source_session_id": reply_session_id,
+                        "source_chat_id": reply_chat_id,
+                    },
+                });
+                info!(
+                    session_id = %session_id,
+                    reply_session = %reply_session_id,
+                    "delegate.merge: emitting paracrine_response to orchestrator"
+                );
+                let _ = self
+                    .ipc_client
+                    .send_request(IpcRequest::EmitTask {
+                        target_node: final_reply_to,
+                        target_role: final_reply_role,
+                        target_guest_id: final_reply_guest_id,
+                        task_json: merge_task.to_string(),
+                    })
+                    .await;
+
+                // Return a tool result so the specialist's turn can continue or close.
+                let result_content = format!(
+                    "Merge sent to orchestrator (paracrine_id: {}). Your response has been delivered to the main conversation. Complete your turn now.",
+                    paracrine_id
+                );
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    handoff_bundle: None,
+                    source: Some("agent".into()),
+                    session_id: Some(session_id),
+                    turn_id: Some(turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(result_content),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: None,
+                    tool_name: Some("delegate.merge".into()),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
             other => {
                 self.fail_active_turn(
                     payload.session_id,
@@ -7713,6 +7862,7 @@ mod tests {
             paracrine_origin: None,
             paracrine_reply_session_id: None,
             paracrine_reply_chat_id: None,
+            paracrine_merge_completed: false,
         });
 
         assert!(should_attempt_provider_repair(&error, Some(&state)));
