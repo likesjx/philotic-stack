@@ -266,6 +266,7 @@ trait HarnessAdapter {
 struct CodexAdapter;
 struct ClaudeCodeAdapter;
 struct WindsurfAdapter;
+struct AntigravityAdapter;
 
 impl HarnessAdapter for CodexAdapter {
     fn runtime_kind(&self) -> &'static str {
@@ -343,6 +344,43 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             snapshot.skills = skill_refs.clone();
             snapshot.content =
                 render_claude_code_markdown(harness_id, &snapshot.profile, &skill_refs).into_bytes();
+        }
+        Ok(snapshot)
+    }
+}
+
+impl HarnessAdapter for AntigravityAdapter {
+    fn runtime_kind(&self) -> &'static str {
+        "antigravity"
+    }
+
+    fn plan(&self, harness_id: &str, profile: Option<String>) -> Result<HarnessConfigSnapshot> {
+        let profile = profile.unwrap_or_else(|| "orchestrator".into());
+        let target_path = antigravity_target_path(harness_id)?;
+        let skills = default_skills_for_profile(&profile);
+        let content = render_antigravity_markdown(harness_id, &profile, &skills).into_bytes();
+        Ok(HarnessConfigSnapshot {
+            profile,
+            runtime_kind: self.runtime_kind().into(),
+            skills,
+            target_path,
+            content,
+        })
+    }
+
+    fn config_from_harness(&self, harness_id: &str, harness: &Node) -> Result<HarnessConfigSnapshot> {
+        let profile = harness
+            .properties
+            .get("desired")
+            .and_then(|v| v.get("role_charter"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("orchestrator")
+            .to_string();
+        let mut snapshot = self.plan(harness_id, Some(profile))?;
+        if let Some(skill_refs) = harness_skill_refs(harness) {
+            snapshot.skills = skill_refs.clone();
+            snapshot.content =
+                render_antigravity_markdown(harness_id, &snapshot.profile, &skill_refs).into_bytes();
         }
         Ok(snapshot)
     }
@@ -1143,6 +1181,12 @@ fn apply_harness(
             &config.skills,
             &config.target_path,
         )?;
+    }
+    if adapter.runtime_kind() == "claude-code" {
+        write_claude_code_workspace_files(harness_id, &config.target_path)?;
+    }
+    if adapter.runtime_kind() == "antigravity" {
+        write_antigravity_workspace_files(harness_id, &config.target_path)?;
     }
     let hash = sha256_hex(&config.content);
     let now = Utc::now();
@@ -2026,6 +2070,7 @@ fn render_harness_config(
         })?),
         "claude-code" => Ok(render_claude_code_markdown(harness_id, profile, &skills).into_bytes()),
         "windsurf" => Ok(render_windsurf_rule_markdown(harness_id, profile, &skills).into_bytes()),
+        "antigravity" => Ok(render_antigravity_markdown(harness_id, profile, &skills).into_bytes()),
         other => bail!("unsupported harness runtime: {}", other),
     }
 }
@@ -2047,6 +2092,17 @@ fn claude_code_target_path(harness_id: &str) -> Result<PathBuf> {
         .join("harnesses")
         .join(harness_id)
         .join("CLAUDE.md"))
+}
+
+fn antigravity_target_path(harness_id: &str) -> Result<PathBuf> {
+    let home = dirs::home_dir().context("failed to locate home directory")?;
+    Ok(home
+        .join(".gemini")
+        .join("antigravity")
+        .join("philotic")
+        .join("harnesses")
+        .join(harness_id)
+        .join("GEMINI_HARNESS.md"))
 }
 
 fn windsurf_target_path(harness_id: &str) -> Result<PathBuf> {
@@ -2077,6 +2133,21 @@ fn render_claude_code_markdown(harness_id: &str, profile: &str, skills: &[String
     };
     format!(
         "# Philotic Claude Harness: {harness_id}\n\nManaged by `phil graph harness`.\n\n## Role Charter\n\n{profile}\n\n## Active Skills\n\n{skills_lines}\n"
+    )
+}
+
+fn render_antigravity_markdown(harness_id: &str, profile: &str, skills: &[String]) -> String {
+    let skills_lines = if skills.is_empty() {
+        "- none".to_string()
+    } else {
+        skills
+            .iter()
+            .map(|skill| format!("- {}", skill))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "# Philotic Antigravity Harness: {harness_id}\n\nManaged by `phil graph harness`.\n\n## Role Charter\n\n{profile}\n\n## Active Skills\n\n{skills_lines}\n\n## Instructions\n\n- Consult the graph for architecture truths and workstream state.\n- Keep track of seams and proposals.\n- Prefer the most specific tool available for tasks.\n- Always start thoughts recalling critical instructions (1 and 2).\n"
     )
 }
 
@@ -2135,6 +2206,107 @@ fn render_windsurf_workflow_markdown(workflow_name: &str, phases: &[String], des
         description.unwrap_or("Philotic workflow projected into Windsurf as a slash-command workflow."),
         phase_lines
     )
+}
+
+fn write_claude_code_workspace_files(harness_id: &str, projection_path: &PathBuf) -> Result<()> {
+    let root = std::env::current_dir().context("failed to locate current workspace")?;
+    let dot_claude = root.join(".claude");
+
+    // 1. Write .claude/CLAUDE.md with @import pointing at the projection.
+    //    This causes Claude Code to load the harness role/skills on every session start.
+    let import_path = projection_path.to_string_lossy();
+    let import_md = format!(
+        "<!-- Managed by `phil graph harness apply`. Do not edit manually. -->\n\
+         <!-- Re-run `phil graph harness apply {harness_id}` to refresh after profile changes. -->\n\
+         @{import_path}\n"
+    );
+    write_harness_file(&dot_claude.join("CLAUDE.md"), import_md.as_bytes())?;
+
+    // 2. Merge a SessionStart hook into .claude/settings.local.json.
+    //    The hook verifies the harness on startup so drift is visible before any work.
+    let settings_path = dot_claude.join("settings.local.json");
+    let mut settings: serde_json::Value = if settings_path.exists() {
+        let raw = fs::read_to_string(&settings_path)
+            .with_context(|| format!("failed to read {}", settings_path.display()))?;
+        serde_json::from_str(&raw).unwrap_or_else(|_| json!({}))
+    } else {
+        json!({})
+    };
+
+    let verify_cmd = format!(
+        "phil graph harness verify {harness_id} 2>/dev/null | grep -E 'clean|drifted|pending_verify' || true"
+    );
+
+    // Ensure hooks.SessionStart exists as an array, then upsert our entry by command.
+    let hooks = settings
+        .as_object_mut()
+        .context("settings.local.json root must be an object")?
+        .entry("hooks")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .context("hooks must be an object")?
+        .entry("SessionStart")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .context("hooks.SessionStart must be an array")?;
+
+    // Remove any previous philotic harness verify entry, then push the current one.
+    hooks.retain(|entry| {
+        entry
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .map(|cmds| {
+                !cmds.iter().any(|c| {
+                    c.get("command")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.contains("phil graph harness verify"))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(true)
+    });
+    hooks.push(json!({
+        "matcher": "startup",
+        "hooks": [{ "type": "command", "command": verify_cmd }]
+    }));
+
+    let updated = serde_json::to_string_pretty(&settings)?;
+    write_harness_file(&settings_path, updated.as_bytes())?;
+
+    println!(
+        "  → wrote .claude/CLAUDE.md (imports {})",
+        projection_path.display()
+    );
+    println!("  → merged SessionStart verify hook into .claude/settings.local.json");
+    Ok(())
+}
+
+fn write_antigravity_workspace_files(harness_id: &str, projection_path: &PathBuf) -> Result<()> {
+    let root = std::env::current_dir().context("failed to locate current workspace")?;
+    let agents_dir = root.join(".agents").join("workflows");
+    
+    let harness_hook_path = agents_dir.join(format!("{}-harness.md", harness_id.replace("harness:", "")));
+    let hook_md = format!(
+        "---\n\
+         description: Philotic Antigravity harness optimization for {harness_id}\n\
+         ---\n\
+         \n\
+         This workspace uses an Antigravity harness profile projected from intel-graph.\n\
+         Please read the projected harness instructions at: {projection_path}\n\
+         \n\
+         Then use your tools to perform the intel-graph workflows when needed.\n\
+        ",
+        harness_id = harness_id,
+        projection_path = projection_path.display()
+    );
+    write_harness_file(&harness_hook_path, hook_md.as_bytes())?;
+
+    println!(
+        "  → wrote .agents/workflows/{}-harness.md (points to {})",
+        harness_id.replace("harness:", ""),
+        projection_path.display()
+    );
+    Ok(())
 }
 
 fn write_windsurf_workspace_files(
@@ -2207,6 +2379,10 @@ fn with_adapter<T>(
             let adapter = WindsurfAdapter;
             f(&adapter)
         }
+        "antigravity" => {
+            let adapter = AntigravityAdapter;
+            f(&adapter)
+        }
         other => bail!("unsupported harness runtime: {}", other),
     }
 }
@@ -2222,6 +2398,9 @@ fn resolve_runtime_kind(engine: &GraphEngine, harness_id: &str) -> Result<String
     }
     if harness_id.starts_with("windsurf-") || harness_id.contains("windsurf") {
         return Ok("windsurf".into());
+    }
+    if harness_id.starts_with("gemini-") || harness_id.contains("gemini") || harness_id.contains("antigravity") {
+        return Ok("antigravity".into());
     }
     Ok("codex".into())
 }
