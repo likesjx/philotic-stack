@@ -5,7 +5,9 @@ edition = "2021"
 description = "Core mesh beacon types and transport"
 
 [dependencies]
+philotic-primitives-mesh = { path = "../philotic-primitives-mesh" }
 aes-gcm = "0.10"
+
 base64 = "0.22"
 async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }
