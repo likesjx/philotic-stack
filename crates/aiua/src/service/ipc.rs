@@ -7399,7 +7399,8 @@ mod tests {
     use ansible_mesh_core::registry::{CapabilityAdvertisement, NodeRegistry};
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
     use ansible_mesh_core::storage::{
-        AgentIdentityRecord, GuestRecord, HotelRecord, SessionRecord, SessionTurnRecord,
+        AgentIdentityRecord, GuestRecord, HotelRecord, SecretRecord,
+        SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,
     };
     use base64::Engine;
     use philotic_client::{
@@ -14027,6 +14028,247 @@ mod tests {
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
         }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    // ── Reflex E2E: membrane binding injection ────────────────────────────────
+
+    // NOTE: IpcResponse is #[serde(untagged)] and TelegramPollLease / DiscordGatewayLease
+    // share identical field shapes {granted, lease}, so serde always deserializes the
+    // Discord response as TelegramPollLease. Distinguish via LeaseEnvelope.lease_type instead.
+    fn expect_discord_gateway_lease(response: IpcResponse) -> (bool, Option<LeaseEnvelope>) {
+        match response {
+            IpcResponse::DiscordGatewayLease { granted, lease } => (granted, lease),
+            // Untagged serde ambiguity: TelegramPollLease matches the same shape —
+            // accept it and verify the inner lease_type is correct.
+            IpcResponse::TelegramPollLease { granted, lease } => {
+                if let Some(ref l) = lease {
+                    assert_eq!(l.lease_type, "discord_gateway",
+                        "received TelegramPollLease but inner lease_type was '{}', not 'discord_gateway'",
+                        l.lease_type);
+                }
+                (granted, lease)
+            }
+            other => panic!("unexpected discord gateway lease response: {other:?}"),
+        }
+    }
+
+    fn expect_config_data(response: IpcResponse) -> Option<serde_json::Value> {
+        match response {
+            IpcResponse::ConfigData { value_json, .. } => {
+                value_json.as_deref().map(|s| serde_json::from_str(s).expect("config data must be valid JSON"))
+            }
+            other => panic!("expected ConfigData, got: {other:?}"),
+        }
+    }
+
+    fn make_hotel_graph(socket_path: &str, agent_id: &str) -> Arc<GraphDomain> {
+        use ansible_mesh_core::storage::AgentIdentityRecord;
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.to_string(),
+                active_pid: None,
+            })
+            .expect("seed hotel");
+        graph
+            .upsert_agent_identity(&AgentIdentityRecord {
+                agent_id: agent_id.into(),
+                persona_name: "Jane".into(),
+                authority_hotel: "local-hotel".into(),
+                bundle_json: serde_json::json!({}),
+            })
+            .expect("seed agent identity");
+        graph
+    }
+
+    /// Scenario 1 — AcquireTelegramPollLease injects `kind: "telegram"` into
+    /// the agent's bundle reflex_context.membrane_bindings.
+    #[tokio::test]
+    async fn telegram_lease_injects_membrane_binding() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _rx) = mpsc::channel(16);
+        let graph = make_hotel_graph(&socket_path, "agent-jane-01");
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server_task = tokio::spawn(async move { server.run().await.expect("server run") });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe { std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path); }
+
+        let mut membrane = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-telegram-01".into(),
+            role: "membrane".into(),
+            supported_tools: vec![],
+        })
+        .await
+        .expect("connect membrane");
+
+        // Acquire lease — must be granted.
+        let lease_resp = membrane
+            .send_request(IpcRequest::AcquireTelegramPollLease {
+                lease_key: "telegram:bot_token:deadbeef".into(),
+                agent_id: "agent-jane-01".into(),
+            })
+            .await
+            .expect("lease request");
+        let (granted, _) = expect_telegram_poll_lease(lease_resp);
+        assert!(granted, "first acquire must be granted");
+
+        // Fetch the agent bundle and assert the binding was injected.
+        let bundle_resp = membrane
+            .send_request(IpcRequest::GetConfig {
+                key: "__agent_bundle__:agent-jane-01".into(),
+            })
+            .await
+            .expect("get config");
+        let bundle = expect_config_data(bundle_resp).expect("bundle must be present");
+        let bindings = bundle
+            .get("reflex_context")
+            .and_then(|rc| rc.get("membrane_bindings"))
+            .and_then(|b| b.as_array())
+            .expect("reflex_context.membrane_bindings must be present");
+
+        assert_eq!(bindings.len(), 1, "exactly one binding after one lease grant");
+        assert_eq!(
+            bindings[0].get("kind").and_then(|k| k.as_str()),
+            Some("telegram"),
+            "binding kind must be 'telegram'"
+        );
+
+        // Re-acquire (idempotent) — binding count must stay at 1.
+        let lease_resp2 = membrane
+            .send_request(IpcRequest::AcquireTelegramPollLease {
+                lease_key: "telegram:bot_token:deadbeef".into(),
+                agent_id: "agent-jane-01".into(),
+            })
+            .await
+            .expect("re-acquire lease");
+        let (granted2, _) = expect_telegram_poll_lease(lease_resp2);
+        assert!(granted2, "re-acquire by same owner must succeed");
+
+        let bundle_resp2 = membrane
+            .send_request(IpcRequest::GetConfig {
+                key: "__agent_bundle__:agent-jane-01".into(),
+            })
+            .await
+            .expect("get config after re-acquire");
+        let bundle2 = expect_config_data(bundle_resp2).expect("bundle");
+        let bindings2 = bundle2
+            .get("reflex_context")
+            .and_then(|rc| rc.get("membrane_bindings"))
+            .and_then(|b| b.as_array())
+            .expect("bindings after re-acquire");
+        assert_eq!(
+            bindings2.len(), 1,
+            "idempotent re-acquire must not duplicate binding (got: {bindings2:?})"
+        );
+
+        unsafe { std::env::remove_var("PHILOTIC_HOTEL_SOCKET"); }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    /// Scenario 2 — AcquireDiscordGatewayLease injects `kind: "discord_text"` into
+    /// the agent's bundle reflex_context.membrane_bindings.
+    #[tokio::test]
+    async fn discord_lease_injects_membrane_binding() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _rx) = mpsc::channel(16);
+        let graph = make_hotel_graph(&socket_path, "agent-jane-01");
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server_task = tokio::spawn(async move { server.run().await.expect("server run") });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe { std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path); }
+
+        let mut membrane = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-discord-01".into(),
+            role: "membrane".into(),
+            supported_tools: vec![],
+        })
+        .await
+        .expect("connect membrane");
+
+        // Acquire Discord gateway lease.
+        let lease_resp = membrane
+            .send_request(IpcRequest::AcquireDiscordGatewayLease {
+                lease_key: "discord:bot_token:cafebabe".into(),
+                agent_id: "agent-jane-01".into(),
+            })
+            .await
+            .expect("discord lease request");
+        let (granted, _) = expect_discord_gateway_lease(lease_resp);
+        assert!(granted, "first discord acquire must be granted");
+
+        // Fetch bundle and assert discord_text binding.
+        let bundle_resp = membrane
+            .send_request(IpcRequest::GetConfig {
+                key: "__agent_bundle__:agent-jane-01".into(),
+            })
+            .await
+            .expect("get config");
+        let bundle = expect_config_data(bundle_resp).expect("bundle must be present");
+        let bindings = bundle
+            .get("reflex_context")
+            .and_then(|rc| rc.get("membrane_bindings"))
+            .and_then(|b| b.as_array())
+            .expect("reflex_context.membrane_bindings must be present");
+
+        assert_eq!(bindings.len(), 1, "exactly one binding after discord lease grant");
+        assert_eq!(
+            bindings[0].get("kind").and_then(|k| k.as_str()),
+            Some("discord_text"),
+            "binding kind must be 'discord_text'"
+        );
+
+        // Re-acquire — idempotent, no duplicate.
+        let lease_resp2 = membrane
+            .send_request(IpcRequest::AcquireDiscordGatewayLease {
+                lease_key: "discord:bot_token:cafebabe".into(),
+                agent_id: "agent-jane-01".into(),
+            })
+            .await
+            .expect("re-acquire discord lease");
+        let (granted2, _) = expect_discord_gateway_lease(lease_resp2);
+        assert!(granted2);
+
+        let bundle_resp2 = membrane
+            .send_request(IpcRequest::GetConfig {
+                key: "__agent_bundle__:agent-jane-01".into(),
+            })
+            .await
+            .expect("get config after re-acquire");
+        let bundle2 = expect_config_data(bundle_resp2).expect("bundle");
+        let bindings2 = bundle2
+            .get("reflex_context")
+            .and_then(|rc| rc.get("membrane_bindings"))
+            .and_then(|b| b.as_array())
+            .expect("bindings after re-acquire");
+        assert_eq!(
+            bindings2.len(), 1,
+            "idempotent re-acquire must not duplicate discord binding (got: {bindings2:?})"
+        );
+
+        unsafe { std::env::remove_var("PHILOTIC_HOTEL_SOCKET"); }
         server_task.abort();
         let _ = server_task.await;
         if Path::new(&socket_path).exists() {
