@@ -1207,6 +1207,10 @@ pub struct ProviderConfigs {
     pub gemini_base_url: Option<String>,
     pub elevenlabs_api_key: Option<String>,
     pub elevenlabs_default_voice_id: Option<String>,
+    /// Base URL for a local Ollama server. Defaults to `http://localhost:11434`.
+    pub ollama_base_url: Option<String>,
+    /// Model tag to use for Ollama text generation. Defaults to `gemma4:e4b`.
+    pub ollama_model: Option<String>,
 }
 
 impl ProviderConfigs {
@@ -1239,6 +1243,10 @@ impl ProviderConfigs {
             .await?,
             elevenlabs_default_voice_id: fetch_config_string(ipc_client, "elevenlabs_voice_id")
                 .await?,
+            ollama_base_url: env_override("PHILOTIC_OLLAMA_BASE_URL")
+                .or(fetch_config_string(ipc_client, "ollama_base_url").await?),
+            ollama_model: env_override("PHILOTIC_OLLAMA_MODEL")
+                .or(fetch_config_string(ipc_client, "ollama_model").await?),
         })
     }
 }
