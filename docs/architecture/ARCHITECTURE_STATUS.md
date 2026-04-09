@@ -3,7 +3,7 @@ title: Philotic Architecture Status
 doc_type: status
 domain: runtime-sessions
 status: active
-last_updated: 2026-04-01
+last_updated: 2026-04-09
 tags:
 - source-of-truth
 - current-state
@@ -37,7 +37,7 @@ tracks_domains:
 
 # Philotic Architecture Status
 
-> **Status:** Transitional Snapshot | **Last Updated:** 2026-03-23
+> **Status:** Transitional Snapshot | **Last Updated:** 2026-04-09
 
 This document is a legacy human-readable projection of current architecture state.
 The SQLite graph is the canonical source of truth; this file exists for review,
@@ -126,6 +126,9 @@ Primary references:
 - tool assembly uses catalog-backed metadata and approval annotations
 - local workspace tooling exists through `tool-runner`, although broader routed error-envelope and management-plane work remains incomplete
 - `model-router` is the shared model execution boundary for current providers
+- an `OpenAIProvider` adapter and dedicated `model-controller-openai` guest now exist on that seam, with OpenRouter/Ollama treated as compatibility modes unless their runtime lifecycle forces a different boundary
+- OpenAI auth now has hotel-side key management and validation commands, with endpoint-scoped secret refs, explicit base URL/default model settings, and optional project header support; the first real startup smoke is now green
+- OpenAI capability overrides for reasoning effort, verbosity, background mode, and explicit built-in tool passthrough now flow through `provider_options` on the OpenAI provider
 
 Primary references:
 - [TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md)

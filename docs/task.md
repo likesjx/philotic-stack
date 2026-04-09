@@ -780,30 +780,34 @@ Seam IDs: `structured-model-envelope`, `hotel-gemini-oauth-flow`
 - [x] Run a full guest-path Gemini OAuth smoke through the materialized model-controller, not just hotel-side validation.
 - [ ] Wire refresh-token persistence and refresh lifecycle behind the hotel vault.
 - [x] Deliver an honest ElevenLabs end-to-end voice path beyond inline-audio/testing mode, including watched-live confirmation that `voice.synthesize` produces canonical audio artifacts instead of a model-router policy refusal.
-- [ ] Add `OpenAIProvider` to `model-router` on the existing provider seam:
+- [x] Add `OpenAIProvider` to `model-router` on the existing provider seam:
   - `text.generate`
   - structured outputs
   - tool calling
   - image-aware text input where supported
   - `text.embed`
-- [ ] Extend provider config/auth loading for OpenAI:
+- [x] Extend provider config/auth loading for OpenAI:
   - API key path
-  - OAuth bearer path
-  - refreshable OAuth path owned by the hotel
-- [ ] Define hotel CLI OAuth UX for OpenAI:
-  - browser launch
-  - temporary localhost callback listener
-  - token exchange
-  - token storage/refresh
-  - guest handoff
+  - OAuth/bearer compatibility path
+  - endpoint-scoped key refs owned by the hotel vault
+- [x] Define hotel CLI key-management UX for OpenAI:
+  - endpoint-scoped API-key onboarding
+  - vault secret-ref storage
   - validation command
-- [ ] Add the first OpenAI startup smoke through the materialized model-controller guest.
-- [ ] Define provider capability overrides for specialized OpenAI model features:
+  - project ID / endpoint metadata handoff
+  - guest handoff
+- [x] Add the first OpenAI startup smoke through the materialized model-controller guest.
+- [x] Define provider capability overrides for specialized OpenAI model features:
   - reasoning effort / depth
   - verbosity
   - background mode
   - built-in tools gated behind explicit provider options
   - realtime/audio kept as a follow-on slice, not part of the first parity path
+- [x] Define the provider-family strategy for OpenAI-compatible endpoints:
+  - OpenAI remains the canonical first-class provider path
+  - OpenRouter and similar hosted endpoints should usually ride the same adapter family with different endpoint/auth settings
+  - Ollama should be treated as an adapter or compatibility mode unless its lifecycle or protocol truly requires a separate controller boundary
+  - add explicit `provider`, `base_url`, and auth-shape config for the shared adapter path
 
 ## New Project: Key Vault
 
