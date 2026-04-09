@@ -3430,13 +3430,41 @@ impl AgentRuntime {
             tags.extend(memory_candidate.tags);
             let concept = memory_candidate.concept;
             let content_snapshot = memory_candidate.content;
+            // Tags from the model that signal a high-value memory worth enriching immediately.
+            // These bypass the background enrichment batch schedule.
+            const HIGH_VALUE_TAGS: &[&str] = &[
+                "decision",
+                "preference",
+                "identity",
+                "fact",
+                "architecture",
+                "constraint",
+                "operator",
+            ];
+            let should_enrich = tags
+                .iter()
+                .any(|t| HIGH_VALUE_TAGS.iter().any(|h| t == h || t.starts_with(&format!("{h}:"))));
+
             tokio::spawn(async move {
                 use memory_core::MemoryEngine as _;
-                if let Err(e) = engine
+                match engine
                     .remember(MemoryScope::SelfOnly, &concept, &content_snapshot, tags)
                     .await
                 {
-                    warn!(agent = %agent_id, error = %e, "Attend: memory write failed (non-fatal)");
+                    Ok(engram_ref) if should_enrich => {
+                        if let Err(e) = engine.retry_enrich(&engram_ref.id).await {
+                            tracing::debug!(
+                                agent = %agent_id,
+                                engram = %engram_ref.id,
+                                error = %e,
+                                "Attend: enrichment queue failed (non-fatal)"
+                            );
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(agent = %agent_id, error = %e, "Attend: memory write failed (non-fatal)");
+                    }
                 }
             });
         }

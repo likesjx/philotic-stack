@@ -49,6 +49,17 @@ pub trait MemoryEngine: Send + Sync {
     /// Soft delete — consolidation may finalize.
     async fn forget(&self, id: &EngramId) -> anyhow::Result<()>;
 
+    /// Immediately queue an engram for enrichment (entity extraction, summary,
+    /// relationship inference). Bypasses the background batch schedule.
+    /// Call after writing high-value memories (decisions, preferences, identity)
+    /// in the Attend phase so enrichment happens promptly rather than on the
+    /// next background sweep.
+    ///
+    /// Implementations that do not support enrichment may no-op safely.
+    async fn retry_enrich(&self, _id: &EngramId) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     // ── Read ──────────────────────────────────────────────────────────────────
 
     /// Retrieve the most salient engrams for a context string and scope.

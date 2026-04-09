@@ -31,6 +31,7 @@ use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
 mod auth;
+mod dream;
 mod graph;
 mod memory;
 mod muninn_provision;
@@ -4720,7 +4721,7 @@ async fn main() -> Result<()> {
         dispatcher_tx.clone(),
         graph_domain_arc.clone(),
     )
-    .with_memory_config(muninn_config_arc)
+    .with_memory_config(muninn_config_arc.clone())
     .with_materialization_requester(guest_manager.clone())
     .with_registry(registry.clone());
     let ipc_inboxes = ipc_server.inboxes();
@@ -4981,6 +4982,13 @@ async fn main() -> Result<()> {
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     }
     info!("All guest subscribers drained (or drain window elapsed). Shutting down hotel.");
+
+    // DreamsPhase: semantic consolidation + Hebbian sweep across all agent vaults.
+    // Runs after guests drain, before the internal shutdown broadcast.
+    // Uses direct HTTP to ONNX sidecar (:11435) and Ollama (:11434) — no IPC needed.
+    if let Some(ref cfg) = muninn_config_arc {
+        dream::dream_sweep(cfg, &graph_domain_arc, &hotel_name).await;
+    }
 
     let _ = shutdown_tx.send(());
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
