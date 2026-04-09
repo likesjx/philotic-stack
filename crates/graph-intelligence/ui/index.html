@@ -3925,8 +3925,19 @@ function renderHarnessCardSection(title, cards) {
 
 function deriveHarnessViews(data) {
   harnessSyntheticNodeCache.clear();
+  
+  // Filter out disabled nodes from all input arrays
+  const canonicalProfiles = filterVisible(data.canonicalProfiles);
+  const canonicalWorkflows = filterVisible(data.canonicalWorkflows);
+  const harnesses = filterVisible(data.harnesses);
+  const bundles = filterVisible(data.bundles);
+  const skills = filterVisible(data.skills);
+  const projections = filterVisible(data.projections);
+  const observations = filterVisible(data.observations);
+  const drifts = filterVisible(data.drifts);
+  
   const canonicalProfilesByName = new Map(
-    (data.canonicalProfiles || []).map(node => [node.name, node])
+    canonicalProfiles.map(node => [node.name, node])
   );
   const roleMap = new Map();
   const profileMap = new Map();
@@ -3945,15 +3956,15 @@ function deriveHarnessViews(data) {
     ])
   );
 
-  (data.canonicalProfiles || []).forEach(node => harnessSyntheticNodeCache.set(node.id, node));
-  (data.canonicalWorkflows || []).forEach(node => harnessSyntheticNodeCache.set(node.id, node));
-  (data.harnesses || []).forEach(node => harnessSyntheticNodeCache.set(node.id, enrichHarnessNodeCanonicalProjection(node, canonicalProfilesByName)));
-  (data.bundles || []).forEach(node => harnessSyntheticNodeCache.set(node.id, node));
-  (data.skills || []).forEach(node => harnessSyntheticNodeCache.set(node.id, node));
-  (data.projections || []).forEach(node => harnessSyntheticNodeCache.set(node.id, node));
-  (data.observations || []).forEach(node => harnessSyntheticNodeCache.set(node.id, node));
-  (data.drifts || []).forEach(node => harnessSyntheticNodeCache.set(node.id, node));
-  (data.canonicalProfiles || []).forEach(node => {
+  canonicalProfiles.forEach(node => harnessSyntheticNodeCache.set(node.id, node));
+  canonicalWorkflows.forEach(node => harnessSyntheticNodeCache.set(node.id, node));
+  harnesses.forEach(node => harnessSyntheticNodeCache.set(node.id, enrichHarnessNodeCanonicalProjection(node, canonicalProfilesByName)));
+  bundles.forEach(node => harnessSyntheticNodeCache.set(node.id, node));
+  skills.forEach(node => harnessSyntheticNodeCache.set(node.id, node));
+  projections.forEach(node => harnessSyntheticNodeCache.set(node.id, node));
+  observations.forEach(node => harnessSyntheticNodeCache.set(node.id, node));
+  drifts.forEach(node => harnessSyntheticNodeCache.set(node.id, node));
+  canonicalProfiles.forEach(node => {
     const props = parseProps(node);
     const roleCharter = props.role_charter || node.name;
     const roleId = `role_charter:${roleCharter}`;
@@ -3980,98 +3991,105 @@ function deriveHarnessViews(data) {
     roleNode.properties.runtime_kinds.push(...(props.supported_runtimes || []));
   });
 
-  data.harnesses.forEach(node => {
+  harnesses.forEach(node => {
     const props = parseProps(node);
     const desired = props.desired || {};
     const runtimeKind = props.runtime_kind || 'unknown';
-    const roleCharter = desired.role_charter || 'unassigned';
-    const bundleName = desired.profile_name || null;
-    const canonicalProfileName = inferCanonicalProfileName({
-      desired,
-      runtime_kind: runtimeKind,
-      role_charter: roleCharter,
-    }, canonicalProfilesByName);
     const skillRefs = Array.isArray(desired.skill_refs) ? desired.skill_refs : [];
     const projectionTargets = Array.isArray(desired.projection_targets) ? desired.projection_targets : [];
     const workflowKind = props.workflow_kind || null;
+    
+    // Support both single role (role_charter) and multi-role (supported_roles) patterns
+    const supportedRoles = Array.isArray(desired.supported_roles) 
+      ? desired.supported_roles 
+      : (desired.role_charter ? [desired.role_charter] : ['unassigned']);
+    
+    supportedRoles.forEach(roleCharter => {
+      const bundleName = desired.profile_name || null;
+      const canonicalProfileName = inferCanonicalProfileName({
+        desired: { ...desired, role_charter: roleCharter },
+        runtime_kind: runtimeKind,
+        role_charter: roleCharter,
+      }, canonicalProfilesByName);
 
-    const roleId = `role_charter:${roleCharter}`;
-    if (!roleMap.has(roleId)) {
-      roleMap.set(roleId, {
-        id: roleId,
-        kind: 'role_charter',
-        name: roleCharter,
-        properties: {
-          role_charter: roleCharter,
-          runtime_kinds: [],
-          harness_ids: [],
-          canonical_profile_names: [],
-          bundle_names: [],
-          skill_refs: [],
-          markdown_source: 'derived',
-          derived_from: 'canonical profiles and harness desired state',
-        },
-      });
-    }
-    const roleNode = roleMap.get(roleId);
-    roleNode.properties.runtime_kinds.push(runtimeKind);
-    roleNode.properties.harness_ids.push(node.id);
-    if (canonicalProfileName) roleNode.properties.canonical_profile_names.push(canonicalProfileName);
-    if (bundleName) roleNode.properties.bundle_names.push(bundleName);
-    roleNode.properties.skill_refs.push(...skillRefs);
-
-    const profileSignature = [runtimeKind, canonicalProfileName || roleCharter, bundleName || 'direct-skills'].join(':');
-    const profileId = `profile_definition:${profileSignature}`;
-    if (!profileMap.has(profileId)) {
-      profileMap.set(profileId, {
-        id: profileId,
-        kind: 'profile_definition',
-        name: `${runtimeKind} / ${canonicalProfileName || roleCharter}${bundleName ? ` / ${bundleName}` : ''}`,
-        properties: {
-          runtime_kind: runtimeKind,
-          role_charter: roleCharter,
-          canonical_profile_name: canonicalProfileName,
-          inferred_canonical_profile_name: canonicalProfileName,
-          bundle_name: bundleName,
-          skill_refs: [],
-          harness_ids: [],
-          projection_targets: [],
-          markdown_source: 'derived',
-          derived_from: 'harness desired state',
-        },
-      });
-    }
-    const profileNode = profileMap.get(profileId);
-    profileNode.properties.harness_ids.push(node.id);
-    profileNode.properties.skill_refs.push(...skillRefs);
-    profileNode.properties.projection_targets.push(...projectionTargets.map(t => t.path).filter(Boolean));
-
-    if (workflowKind) {
-      const workflowId = `workflow_definition:${workflowKind}`;
-      if (!workflowMap.has(workflowId)) {
-        workflowMap.set(workflowId, {
-          id: workflowId,
-          kind: 'workflow_definition',
-          name: workflowKind,
+      const roleId = `role_charter:${roleCharter}`;
+      if (!roleMap.has(roleId)) {
+        roleMap.set(roleId, {
+          id: roleId,
+          kind: 'role_charter',
+          name: roleCharter,
           properties: {
-            workflow_kind: workflowKind,
+            role_charter: roleCharter,
+            runtime_kinds: [],
             harness_ids: [],
-            role_charters: [],
             canonical_profile_names: [],
             bundle_names: [],
             skill_refs: [],
+            markdown_source: 'derived',
+            derived_from: 'canonical profiles and harness desired state',
+          },
+        });
+      }
+      const roleNode = roleMap.get(roleId);
+      roleNode.properties.runtime_kinds.push(runtimeKind);
+      roleNode.properties.harness_ids.push(node.id);
+      if (canonicalProfileName) roleNode.properties.canonical_profile_names.push(canonicalProfileName);
+      if (bundleName) roleNode.properties.bundle_names.push(bundleName);
+      roleNode.properties.skill_refs.push(...skillRefs);
+
+      const profileSignature = [runtimeKind, canonicalProfileName || roleCharter, bundleName || 'direct-skills'].join(':');
+      const profileId = `profile_definition:${profileSignature}`;
+      if (!profileMap.has(profileId)) {
+        profileMap.set(profileId, {
+          id: profileId,
+          kind: 'profile_definition',
+          name: `${runtimeKind} / ${canonicalProfileName || roleCharter}${bundleName ? ` / ${bundleName}` : ''}`,
+          properties: {
+            runtime_kind: runtimeKind,
+            role_charter: roleCharter,
+            canonical_profile_name: canonicalProfileName,
+            inferred_canonical_profile_name: canonicalProfileName,
+            bundle_name: bundleName,
+            skill_refs: [],
+            harness_ids: [],
+            projection_targets: [],
             markdown_source: 'derived',
             derived_from: 'harness desired state',
           },
         });
       }
-      const workflowNode = workflowMap.get(workflowId);
-      workflowNode.properties.harness_ids.push(node.id);
-      workflowNode.properties.role_charters.push(roleCharter);
-      if (canonicalProfileName) workflowNode.properties.canonical_profile_names.push(canonicalProfileName);
-      if (bundleName) workflowNode.properties.bundle_names.push(bundleName);
-      workflowNode.properties.skill_refs.push(...skillRefs);
-    }
+      const profileNode = profileMap.get(profileId);
+      profileNode.properties.harness_ids.push(node.id);
+      profileNode.properties.skill_refs.push(...skillRefs);
+      profileNode.properties.projection_targets.push(...projectionTargets.map(t => t.path).filter(Boolean));
+
+      if (workflowKind) {
+        const workflowId = `workflow_definition:${workflowKind}`;
+        if (!workflowMap.has(workflowId)) {
+          workflowMap.set(workflowId, {
+            id: workflowId,
+            kind: 'workflow_definition',
+            name: workflowKind,
+            properties: {
+              workflow_kind: workflowKind,
+              harness_ids: [],
+              role_charters: [],
+              canonical_profile_names: [],
+              bundle_names: [],
+              skill_refs: [],
+              markdown_source: 'derived',
+              derived_from: 'harness desired state',
+            },
+          });
+        }
+        const workflowNode = workflowMap.get(workflowId);
+        workflowNode.properties.harness_ids.push(node.id);
+        workflowNode.properties.role_charters.push(roleCharter);
+        if (canonicalProfileName) workflowNode.properties.canonical_profile_names.push(canonicalProfileName);
+        if (bundleName) workflowNode.properties.bundle_names.push(bundleName);
+        workflowNode.properties.skill_refs.push(...skillRefs);
+      }
+    });
   });
 
   const dedupeArrays = node => {
@@ -4264,7 +4282,11 @@ function renderHarnessKindTable(container, kind, data) {
       style: 'margin: 0 0 12px 0; color: var(--text-secondary); font-size: 12px;'
     }, config.subtitle));
   }
-  if (!config.rows || config.rows.length === 0) {
+  
+  // Filter out disabled nodes
+  const visibleRows = filterVisible(config.rows);
+  
+  if (!visibleRows || visibleRows.length === 0) {
     container.appendChild(el('div', {
       style: 'padding: 16px; color: var(--text-secondary);'
     }, 'No items found'));
@@ -4275,7 +4297,7 @@ function renderHarnessKindTable(container, kind, data) {
   const thead = el('thead', null, el('tr', null, ...config.columns.map(label => el('th', { textContent: label }))));
   table.appendChild(thead);
   const tbody = el('tbody');
-  config.rows.forEach(node => {
+  visibleRows.forEach(node => {
     const row = el('tr', {
       className: 'clickable',
       onclick: () => showHarnessDetail(node.id),
@@ -4755,7 +4777,17 @@ function renderHarnessMarkdown(node) {
 }
 
 function parseProps(node) {
-  return typeof node.properties === 'string' ? JSON.parse(node.properties) : (node.properties || {});
+  if (!node || !node.properties) return {};
+  return typeof node.properties === 'string' ? JSON.parse(node.properties) : node.properties;
+}
+
+function isNodeDisabled(node) {
+  const props = parseProps(node);
+  return props.disabled === true || props.disabled === 'true';
+}
+
+function filterVisible(nodes) {
+  return (nodes || []).filter(n => !isNodeDisabled(n));
 }
 
 function getHarnessMarkdownMeta(node, props) {
@@ -6079,6 +6111,11 @@ async function refreshWorkstreamDetail() {
       ...childEdges.map(e => e.target_id),
       ...incomingChildEdges.map(e => e.source_id)
     ])];
+    
+    // Fallback: if no edges link to a seam, use the seam_id property
+    if (childIds.length === 0 && props.seam_id) {
+      childIds.push(props.seam_id);
+    }
     
     let childSeams = [];
     for (const cid of childIds) {

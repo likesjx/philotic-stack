@@ -63,9 +63,17 @@ pub async fn run(kill_pattern: Option<String>) -> Result<()> {
 
         // Use SIGKILL for "all" (the p-53 kill switch for abandoned processes);
         // use SIGTERM for targeted pattern kills.
-        let (signal, signal_name) = if kill_all { ("-KILL", "SIGKILL") } else { ("-TERM", "SIGTERM") };
+        let (signal, signal_name) = if kill_all {
+            ("-KILL", "SIGKILL")
+        } else {
+            ("-TERM", "SIGTERM")
+        };
 
-        println!("\nKilling {} process(es) with {}:", to_kill.len(), signal_name);
+        println!(
+            "\nKilling {} process(es) with {}:",
+            to_kill.len(),
+            signal_name
+        );
         for p in &to_kill {
             let result = std::process::Command::new("kill")
                 .arg(signal)
@@ -151,7 +159,11 @@ fn find_sockets() -> Vec<String> {
 
     // /tmp sockets
     if let Ok(paths) = glob::glob("/tmp/philotic-*.sock") {
-        sockets.extend(paths.filter_map(|p| p.ok()).map(|p| p.display().to_string()));
+        sockets.extend(
+            paths
+                .filter_map(|p| p.ok())
+                .map(|p| p.display().to_string()),
+        );
     }
 
     // Profile dir sockets — ~/.philotic/*.sock and ~/.philotic/*/*.sock
@@ -162,7 +174,11 @@ fn find_sockets() -> Vec<String> {
         base.join("*").join("*.sock").to_string_lossy().into_owned(),
     ] {
         if let Ok(paths) = glob::glob(&pattern) {
-            sockets.extend(paths.filter_map(|p| p.ok()).map(|p| p.display().to_string()));
+            sockets.extend(
+                paths
+                    .filter_map(|p| p.ok())
+                    .map(|p| p.display().to_string()),
+            );
         }
     }
 

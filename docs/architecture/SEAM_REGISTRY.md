@@ -126,6 +126,7 @@ This registry makes the seam layer explicit without forcing every task bullet to
 | `elevenlabs-stt-surface` | `tooling-execution` | [STREAMING_TTS_AND_MUSIC_ANALYSIS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/STREAMING_TTS_AND_MUSIC_ANALYSIS_PROPOSAL.md) | `docs/task.md` → `New Project: Streaming TTS And Music Analysis` |
 | `onnx-music-analysis-surface` | `tooling-execution` | [STREAMING_TTS_AND_MUSIC_ANALYSIS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/STREAMING_TTS_AND_MUSIC_ANALYSIS_PROPOSAL.md) | `docs/task.md` → `New Project: Streaming TTS And Music Analysis` |
 | `midi-output-artifact` | `tooling-execution` | [STREAMING_TTS_AND_MUSIC_ANALYSIS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/STREAMING_TTS_AND_MUSIC_ANALYSIS_PROPOSAL.md) | `docs/task.md` → `New Project: Streaming TTS And Music Analysis` |
+| `graph-harness-control-plane` | `operator-control-plane` | [AGENT_WORKSTREAM_TRACKING_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/AGENT_WORKSTREAM_TRACKING_PROPOSAL.md) | `docs/task.md` → Harness desired/rendered/observed state management in intel-graph |
 
 ## Usage Rule
 

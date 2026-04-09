@@ -4,9 +4,9 @@
 /// Sequence: Identify → Ready → IP Discovery → Select Protocol → Session Description
 ///
 /// Reference: https://discord.com/developers/docs/topics/voice-connections
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::time::{interval, timeout};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -29,8 +29,14 @@ pub struct VoiceSession {
 /// Events emitted by the voice gateway session after handshake.
 #[derive(Debug)]
 pub enum VoiceGatewayEvent {
-    Speaking { user_id: String, ssrc: u32, speaking: bool },
-    ClientDisconnect { user_id: String },
+    Speaking {
+        user_id: String,
+        ssrc: u32,
+        speaking: bool,
+    },
+    ClientDisconnect {
+        user_id: String,
+    },
     Resumed,
 }
 
@@ -43,12 +49,12 @@ pub enum VoiceGatewayEvent {
 /// - An `mpsc::Receiver<VoiceGatewayEvent>` for speaking-state updates
 /// - A `tokio::task::JoinHandle` for the background heartbeat + event loop
 pub async fn connect_voice_gateway(
-    voice_endpoint: &str,    // from VOICE_SERVER_UPDATE (without wss:// prefix)
-    server_id: &str,         // guild_id
+    voice_endpoint: &str, // from VOICE_SERVER_UPDATE (without wss:// prefix)
+    server_id: &str,      // guild_id
     channel_id: &str,
-    user_id: &str,           // bot user id
-    session_id: &str,        // from VOICE_STATE_UPDATE
-    token: &str,             // from VOICE_SERVER_UPDATE
+    user_id: &str,    // bot user id
+    session_id: &str, // from VOICE_STATE_UPDATE
+    token: &str,      // from VOICE_SERVER_UPDATE
 ) -> Result<(VoiceSession, tokio::sync::mpsc::Receiver<VoiceGatewayEvent>)> {
     // Discord voice gateway URL uses ?v=4
     let url = format!("wss://{}?v=4", voice_endpoint.trim_start_matches("wss://"));
@@ -59,10 +65,11 @@ pub async fn connect_voice_gateway(
 
     // Step 1: receive Hello (opcode 8)
     let hello = recv_json(&mut read).await?;
-    let heartbeat_interval_ms = hello["d"]["heartbeat_interval"]
-        .as_f64()
-        .unwrap_or(13750.0) as u64;
-    info!("Voice GW Hello — heartbeat interval {}ms", heartbeat_interval_ms);
+    let heartbeat_interval_ms = hello["d"]["heartbeat_interval"].as_f64().unwrap_or(13750.0) as u64;
+    info!(
+        "Voice GW Hello — heartbeat interval {}ms",
+        heartbeat_interval_ms
+    );
 
     // Step 2: send Identify (opcode 0)
     write
@@ -76,7 +83,8 @@ pub async fn connect_voice_gateway(
                     "token": token
                 }
             })
-            .to_string().into(),
+            .to_string()
+            .into(),
         ))
         .await?;
 
@@ -91,7 +99,8 @@ pub async fn connect_voice_gateway(
         .to_string();
     let discord_port = ready["d"]["port"]
         .as_u64()
-        .ok_or_else(|| anyhow::anyhow!("Voice GW Ready missing port"))? as u16;
+        .ok_or_else(|| anyhow::anyhow!("Voice GW Ready missing port"))?
+        as u16;
     let modes: Vec<String> = ready["d"]["modes"]
         .as_array()
         .map(|arr| {
@@ -123,7 +132,10 @@ pub async fn connect_voice_gateway(
             )
         })?;
 
-    info!("Voice GW: selected encryption mode [{}]", selected_mode.as_str());
+    info!(
+        "Voice GW: selected encryption mode [{}]",
+        selected_mode.as_str()
+    );
 
     // Step 6: send Select Protocol (opcode 1)
     write
@@ -139,7 +151,8 @@ pub async fn connect_voice_gateway(
                     }
                 }
             })
-            .to_string().into(),
+            .to_string()
+            .into(),
         ))
         .await?;
 
@@ -182,7 +195,8 @@ pub async fn connect_voice_gateway(
                     "ssrc": bot_ssrc
                 }
             })
-            .to_string().into(),
+            .to_string()
+            .into(),
         ))
         .await?;
 
@@ -218,9 +232,7 @@ pub async fn connect_voice_gateway(
         let mut nonce: u64 = 0;
         loop {
             tick.tick().await;
-            let msg = Message::Text(
-                json!({ "op": 3, "d": nonce }).to_string().into(),
-            );
+            let msg = Message::Text(json!({ "op": 3, "d": nonce }).to_string().into());
             if hb_tx_clone.send(msg).is_err() {
                 break;
             }
@@ -282,7 +294,8 @@ where
                 "op": 5,
                 "d": { "speaking": speaking, "delay": 0, "ssrc": ssrc }
             })
-            .to_string().into(),
+            .to_string()
+            .into(),
         ))
         .await
         .map_err(|e| anyhow::anyhow!("Send speaking failed: {}", e))
@@ -324,7 +337,10 @@ where
             debug!("Voice GW: heartbeat ACK during handshake");
             continue;
         }
-        debug!("Voice GW: ignoring op {} while waiting for op {}", op, expected_op);
+        debug!(
+            "Voice GW: ignoring op {} while waiting for op {}",
+            op, expected_op
+        );
     }
 }
 

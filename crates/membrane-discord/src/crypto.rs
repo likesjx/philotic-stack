@@ -1,3 +1,7 @@
+use aes_gcm::{
+    Aes256Gcm, Key, Nonce as AesNonce,
+    aead::{Aead, KeyInit, Payload},
+};
 /// Discord voice transport encryption.
 ///
 /// Discord supports two encryption modes (preference order):
@@ -10,15 +14,10 @@
 /// is appended as the nonce.
 ///
 /// Reference: https://discord.com/developers/docs/topics/voice-connections
-use anyhow::{bail, Result};
-use aes_gcm::{
-    aead::{Aead, KeyInit, Payload},
-    Aes256Gcm, Key, Nonce as AesNonce,
-};
+use anyhow::{Result, bail};
 use chacha20poly1305::{
+    XChaCha20Poly1305, XNonce,
     aead::{Aead as _, KeyInit as _},
-    XChaCha20Poly1305,
-    XNonce,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,10 +45,7 @@ impl EncryptionMode {
 
     /// Preferred mode list to send in Select Protocol, in order.
     pub fn preference_list() -> &'static [&'static str] {
-        &[
-            "aead_aes256_gcm_rtpsize",
-            "aead_xchacha20_poly1305_rtpsize",
-        ]
+        &["aead_aes256_gcm_rtpsize", "aead_xchacha20_poly1305_rtpsize"]
     }
 }
 
@@ -219,14 +215,9 @@ mod tests {
     #[test]
     fn xchacha_roundtrip() {
         let key = make_key();
-        let mut enc = VoiceEncryptionState::new(
-            EncryptionMode::AeadXChaCha20Poly1305RtpSize,
-            key.clone(),
-        );
-        let dec = VoiceEncryptionState::new(
-            EncryptionMode::AeadXChaCha20Poly1305RtpSize,
-            key,
-        );
+        let mut enc =
+            VoiceEncryptionState::new(EncryptionMode::AeadXChaCha20Poly1305RtpSize, key.clone());
+        let dec = VoiceEncryptionState::new(EncryptionMode::AeadXChaCha20Poly1305RtpSize, key);
 
         let header = b"\x80\x78\x00\x01\x00\x00\x00\x01\x00\x00\x01\x00";
         let payload = b"Hello Opus frame";

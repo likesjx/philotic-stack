@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Normalized inbound transport envelope — same shape as the Telegram membrane uses,
 /// extended with optional Discord-specific fields.
@@ -14,7 +14,7 @@ pub struct DiscordIngressEnvelope {
     pub message_kind: &'static str, // "text" | "slash_command" | "reaction"
     pub content: String,
     pub attachments: Vec<Value>,
-    pub command: Option<String>,       // slash command name (without /)
+    pub command: Option<String>,         // slash command name (without /)
     pub command_options: Option<String>, // options serialized as string
     pub callback_data: Option<String>,
     pub raw_transport_event: Value,
@@ -73,7 +73,10 @@ pub fn normalize_message(
 
     let message_id = message["id"].as_str()?;
     let channel_id = message["channel_id"].as_str()?;
-    let guild_id = message.get("guild_id").and_then(|v| v.as_str()).unwrap_or("dm");
+    let guild_id = message
+        .get("guild_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("dm");
     let content = message["content"].as_str().unwrap_or("").to_string();
     let sender_id = message["author"]["id"].as_str().map(String::from);
     let sender_username = message["author"]["username"].as_str().map(String::from);
@@ -122,17 +125,22 @@ pub fn normalize_interaction(
 
     let interaction_id = event["id"].as_str()?;
     let channel_id = event["channel_id"].as_str()?;
-    let guild_id = event.get("guild_id").and_then(|v| v.as_str()).unwrap_or("dm");
+    let guild_id = event
+        .get("guild_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("dm");
     let data = event.get("data")?;
     let command_name = data["name"].as_str()?;
-    let user = event.get("member")
+    let user = event
+        .get("member")
         .and_then(|m| m.get("user"))
         .or_else(|| event.get("user"));
     let sender_id = user.and_then(|u| u["id"].as_str()).map(String::from);
     let sender_username = user.and_then(|u| u["username"].as_str()).map(String::from);
 
     // Serialize options as a simple string for the agent
-    let options_str = data.get("options")
+    let options_str = data
+        .get("options")
         .and_then(|o| serde_json::to_string(o).ok());
 
     // Extract a human-readable content string from options

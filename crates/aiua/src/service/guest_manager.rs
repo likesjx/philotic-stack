@@ -289,11 +289,17 @@ impl GuestManager {
         // Role incarnations (e.g. "agent-bjork-01:orchestrator") are not separate entries
         // in materialized_guests — they live inside the base philote process. When a role
         // sub-guest ID is requested and not found directly, fall back to the base agent ID.
-        let effective_id = match Self::refresh_guest_record(self.graph.as_ref(), &self.hotel_name, guest_id)? {
+        let effective_id = match Self::refresh_guest_record(
+            self.graph.as_ref(),
+            &self.hotel_name,
+            guest_id,
+        )? {
             Some(_) => guest_id.to_string(),
             None => {
                 if let Some(base_id) = guest_id.split_once(':').map(|(base, _)| base) {
-                    if Self::refresh_guest_record(self.graph.as_ref(), &self.hotel_name, base_id)?.is_some() {
+                    if Self::refresh_guest_record(self.graph.as_ref(), &self.hotel_name, base_id)?
+                        .is_some()
+                    {
                         info!(
                             "On-demand materialization: role guest [{}] not in materialized_guests; \
                              falling back to base agent [{}].",
@@ -537,7 +543,7 @@ mod tests {
     use super::*;
     use ansible_mesh_core::domain::GraphDomain;
     use ansible_mesh_core::graph::{GraphEdge, GraphNode};
-    use ansible_mesh_core::storage::{GuestRecord, GraphAdapter};
+    use ansible_mesh_core::storage::{GraphAdapter, GuestRecord};
     use anyhow::Result;
     use serde_json::json;
     use std::collections::HashMap;
@@ -604,10 +610,7 @@ mod tests {
             if kind == "guest" {
                 let call_index = self.list_guest_calls.fetch_add(1, Ordering::SeqCst);
                 if self.clear_guests_on_second_list && call_index >= 1 {
-                    self.nodes
-                        .lock()
-                        .unwrap()
-                        .retain(|_, n| n.kind != "guest");
+                    self.nodes.lock().unwrap().retain(|_, n| n.kind != "guest");
                 }
             }
             Ok(self

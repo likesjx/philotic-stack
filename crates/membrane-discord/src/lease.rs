@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use philotic_client::{IpcRequest, IpcResponse, PhiloticClient};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
@@ -31,7 +31,10 @@ impl DiscordGatewayLease {
         agent_id: &str,
     ) -> Result<Self> {
         let lease_key = gateway_lease_key(bot_token);
-        info!("Acquiring Discord gateway lease [{}] for agent [{}]", lease_key, agent_id);
+        info!(
+            "Acquiring Discord gateway lease [{}] for agent [{}]",
+            lease_key, agent_id
+        );
 
         let response = ipc
             .send_request(IpcRequest::AcquireDiscordGatewayLease {
@@ -70,7 +73,10 @@ impl DiscordGatewayLease {
                     holder
                 )
             }
-            other => bail!("Unexpected response to AcquireDiscordGatewayLease: {:?}", other),
+            other => bail!(
+                "Unexpected response to AcquireDiscordGatewayLease: {:?}",
+                other
+            ),
         }
     }
 
@@ -93,7 +99,10 @@ impl DiscordGatewayLease {
                 self.epoch = lease.lease_epoch;
                 Ok(())
             }
-            IpcResponse::DiscordGatewayLease { granted: false, lease } => {
+            IpcResponse::DiscordGatewayLease {
+                granted: false,
+                lease,
+            } => {
                 let holder = lease
                     .as_ref()
                     .map(|l| l.owner_guest_id.as_str())
@@ -104,7 +113,10 @@ impl DiscordGatewayLease {
                 );
                 bail!("Discord gateway lease lost to [{}]", holder)
             }
-            other => bail!("Unexpected response to RenewDiscordGatewayLease: {:?}", other),
+            other => bail!(
+                "Unexpected response to RenewDiscordGatewayLease: {:?}",
+                other
+            ),
         }
     }
 
@@ -130,6 +142,10 @@ impl DiscordGatewayLease {
 // sha2 doesn't re-export hex — pull in the hex crate via a small inline helper
 mod hex {
     pub fn encode(bytes: impl AsRef<[u8]>) -> String {
-        bytes.as_ref().iter().map(|b| format!("{:02x}", b)).collect()
+        bytes
+            .as_ref()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect()
     }
 }

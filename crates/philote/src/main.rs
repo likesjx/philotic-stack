@@ -45,7 +45,10 @@ async fn main() -> Result<()> {
     };
 
     if let Some(ref rn) = role_name {
-        info!("Starting as role-incarnation philote: agent={} role={} guest_id={}", agent_id, rn, guest_id);
+        info!(
+            "Starting as role-incarnation philote: agent={} role={} guest_id={}",
+            agent_id, rn, guest_id
+        );
     }
 
     let ipc_client = philotic_client::PhiloticClient::connect(identity).await?;

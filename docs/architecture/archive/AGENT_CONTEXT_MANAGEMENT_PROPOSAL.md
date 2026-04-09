@@ -1,3 +1,17 @@
+---
+title: Agent Context Management Proposal
+doc_type: historical
+domain: operator-control-plane
+status: historical
+last_updated: 2026-04-08
+tags:
+- archived
+- proposal
+- runtime
+related_docs:
+- ARCHITECTURE_STATUS.md
+---
+
 # Agent Context Management Proposal
 
 ## Goal

@@ -1,7 +1,7 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
-use graph_intelligence::GraphEngine;
 use graph_intelligence::schema::{Edge, EdgeRelation, Mutation, Node, NodeKind};
+use graph_intelligence::GraphEngine;
 use philotic_graph::PhiloticGraphConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -52,9 +52,7 @@ pub enum HarnessAction {
     },
 
     /// Show desired/rendered/observed state for one harness.
-    Status {
-        harness_id: String,
-    },
+    Status { harness_id: String },
 
     /// Plan local harness changes without writing anything.
     Plan {
@@ -75,19 +73,13 @@ pub enum HarnessAction {
     },
 
     /// Re-render local harness files from desired state.
-    Export {
-        harness_id: String,
-    },
+    Export { harness_id: String },
 
     /// Refresh observed state from the local harness projection.
-    Verify {
-        harness_id: String,
-    },
+    Verify { harness_id: String },
 
     /// Report current drift.
-    Drift {
-        harness_id: Option<String>,
-    },
+    Drift { harness_id: Option<String> },
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -260,7 +252,11 @@ struct GitSessionContext {
 trait HarnessAdapter {
     fn runtime_kind(&self) -> &'static str;
     fn plan(&self, harness_id: &str, profile: Option<String>) -> Result<HarnessConfigSnapshot>;
-    fn config_from_harness(&self, harness_id: &str, harness: &Node) -> Result<HarnessConfigSnapshot>;
+    fn config_from_harness(
+        &self,
+        harness_id: &str,
+        harness: &Node,
+    ) -> Result<HarnessConfigSnapshot>;
 }
 
 struct CodexAdapter;
@@ -287,7 +283,11 @@ impl HarnessAdapter for CodexAdapter {
         })
     }
 
-    fn config_from_harness(&self, harness_id: &str, harness: &Node) -> Result<HarnessConfigSnapshot> {
+    fn config_from_harness(
+        &self,
+        harness_id: &str,
+        harness: &Node,
+    ) -> Result<HarnessConfigSnapshot> {
         let profile = harness
             .properties
             .get("desired")
@@ -331,7 +331,11 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         })
     }
 
-    fn config_from_harness(&self, harness_id: &str, harness: &Node) -> Result<HarnessConfigSnapshot> {
+    fn config_from_harness(
+        &self,
+        harness_id: &str,
+        harness: &Node,
+    ) -> Result<HarnessConfigSnapshot> {
         let profile = harness
             .properties
             .get("desired")
@@ -343,7 +347,8 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         if let Some(skill_refs) = harness_skill_refs(harness) {
             snapshot.skills = skill_refs.clone();
             snapshot.content =
-                render_claude_code_markdown(harness_id, &snapshot.profile, &skill_refs).into_bytes();
+                render_claude_code_markdown(harness_id, &snapshot.profile, &skill_refs)
+                    .into_bytes();
         }
         Ok(snapshot)
     }
@@ -368,7 +373,11 @@ impl HarnessAdapter for AntigravityAdapter {
         })
     }
 
-    fn config_from_harness(&self, harness_id: &str, harness: &Node) -> Result<HarnessConfigSnapshot> {
+    fn config_from_harness(
+        &self,
+        harness_id: &str,
+        harness: &Node,
+    ) -> Result<HarnessConfigSnapshot> {
         let profile = harness
             .properties
             .get("desired")
@@ -380,7 +389,8 @@ impl HarnessAdapter for AntigravityAdapter {
         if let Some(skill_refs) = harness_skill_refs(harness) {
             snapshot.skills = skill_refs.clone();
             snapshot.content =
-                render_antigravity_markdown(harness_id, &snapshot.profile, &skill_refs).into_bytes();
+                render_antigravity_markdown(harness_id, &snapshot.profile, &skill_refs)
+                    .into_bytes();
         }
         Ok(snapshot)
     }
@@ -405,7 +415,11 @@ impl HarnessAdapter for WindsurfAdapter {
         })
     }
 
-    fn config_from_harness(&self, harness_id: &str, harness: &Node) -> Result<HarnessConfigSnapshot> {
+    fn config_from_harness(
+        &self,
+        harness_id: &str,
+        harness: &Node,
+    ) -> Result<HarnessConfigSnapshot> {
         let profile = harness
             .properties
             .get("desired")
@@ -417,7 +431,8 @@ impl HarnessAdapter for WindsurfAdapter {
         if let Some(skill_refs) = harness_skill_refs(harness) {
             snapshot.skills = skill_refs.clone();
             snapshot.content =
-                render_windsurf_rule_markdown(harness_id, &snapshot.profile, &skill_refs).into_bytes();
+                render_windsurf_rule_markdown(harness_id, &snapshot.profile, &skill_refs)
+                    .into_bytes();
         }
         Ok(snapshot)
     }
@@ -431,7 +446,9 @@ pub fn run(action: HarnessAction) -> Result<()> {
         HarnessAction::Bootstrap => bootstrap_canonical_model(&engine),
         HarnessAction::Skills { action } => run_skill_action(&engine, action),
         HarnessAction::Profiles { action } => run_profile_action(&engine, action),
-        HarnessAction::CanonicalProfiles { action } => run_canonical_profile_action(&engine, action),
+        HarnessAction::CanonicalProfiles { action } => {
+            run_canonical_profile_action(&engine, action)
+        }
         HarnessAction::Workflows { action } => run_workflow_action(&engine, action),
         HarnessAction::Trials { action } => run_trial_action(&engine, action),
         HarnessAction::Status { harness_id } => show_status(&engine, &harness_node_id(&harness_id)),
@@ -466,7 +483,10 @@ fn list_harnesses(engine: &GraphEngine) -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<24} {:<12} {:<14} {}", "HARNESS", "RUNTIME", "DRIFT", "PROFILE");
+    println!(
+        "{:<24} {:<12} {:<14} {}",
+        "HARNESS", "RUNTIME", "DRIFT", "PROFILE"
+    );
     println!("{}", "─".repeat(70));
     for node in nodes {
         let runtime = prop_str(&node, &["runtime_kind"]).unwrap_or("?");
@@ -480,15 +500,18 @@ fn list_harnesses(engine: &GraphEngine) -> Result<()> {
 fn run_skill_action(engine: &GraphEngine, action: HarnessSkillAction) -> Result<()> {
     match action {
         HarnessSkillAction::List => list_harness_skills(engine),
-        HarnessSkillAction::Register { skill_name, description } => {
-            register_harness_skill(engine, &skill_name, description.as_deref())
-        }
-        HarnessSkillAction::Assign { harness_id, skill_name } => {
-            assign_harness_skill(engine, &harness_id, &skill_name)
-        }
-        HarnessSkillAction::Unassign { harness_id, skill_name } => {
-            unassign_harness_skill(engine, &harness_id, &skill_name)
-        }
+        HarnessSkillAction::Register {
+            skill_name,
+            description,
+        } => register_harness_skill(engine, &skill_name, description.as_deref()),
+        HarnessSkillAction::Assign {
+            harness_id,
+            skill_name,
+        } => assign_harness_skill(engine, &harness_id, &skill_name),
+        HarnessSkillAction::Unassign {
+            harness_id,
+            skill_name,
+        } => unassign_harness_skill(engine, &harness_id, &skill_name),
     }
 }
 
@@ -507,7 +530,10 @@ fn run_profile_action(engine: &GraphEngine, action: HarnessProfileAction) -> Res
     }
 }
 
-fn run_canonical_profile_action(engine: &GraphEngine, action: CanonicalProfileAction) -> Result<()> {
+fn run_canonical_profile_action(
+    engine: &GraphEngine,
+    action: CanonicalProfileAction,
+) -> Result<()> {
     match action {
         CanonicalProfileAction::List => list_canonical_profiles(engine),
         CanonicalProfileAction::Register {
@@ -627,7 +653,11 @@ fn list_harness_skills(engine: &GraphEngine) -> Result<()> {
     Ok(())
 }
 
-fn register_harness_skill(engine: &GraphEngine, skill_name: &str, description: Option<&str>) -> Result<()> {
+fn register_harness_skill(
+    engine: &GraphEngine,
+    skill_name: &str,
+    description: Option<&str>,
+) -> Result<()> {
     let now = Utc::now();
     let node = Node {
         id: harness_skill_node_id(skill_name),
@@ -736,7 +766,10 @@ fn bootstrap_canonical_model(engine: &GraphEngine) -> Result<()> {
         ("review", "Code review skill bundle"),
         ("verification", "Verification and validation skill bundle"),
     ] {
-        if engine.get_node(&harness_skill_node_id(skill_name))?.is_none() {
+        if engine
+            .get_node(&harness_skill_node_id(skill_name))?
+            .is_none()
+        {
             register_harness_skill(engine, skill_name, Some(description))?;
         }
     }
@@ -798,11 +831,16 @@ fn list_canonical_profiles(engine: &GraphEngine) -> Result<()> {
         println!("No canonical profiles registered.");
         return Ok(());
     }
-    println!("{:<18} {:<16} {:<28} {}", "PROFILE", "ROLE", "SKILLS", "RUNTIMES");
+    println!(
+        "{:<18} {:<16} {:<28} {}",
+        "PROFILE", "ROLE", "SKILLS", "RUNTIMES"
+    );
     println!("{}", "─".repeat(96));
     for node in nodes {
-        let skills = join_str_array(node.properties.get("skill_refs")).unwrap_or_else(|| "-".into());
-        let runtimes = join_str_array(node.properties.get("supported_runtimes")).unwrap_or_else(|| "-".into());
+        let skills =
+            join_str_array(node.properties.get("skill_refs")).unwrap_or_else(|| "-".into());
+        let runtimes =
+            join_str_array(node.properties.get("supported_runtimes")).unwrap_or_else(|| "-".into());
         println!(
             "{:<18} {:<16} {:<28} {}",
             node.name,
@@ -880,7 +918,8 @@ fn list_canonical_workflows(engine: &GraphEngine) -> Result<()> {
     println!("{:<28} {:<36} {}", "WORKFLOW", "PHASES", "DESCRIPTION");
     println!("{}", "─".repeat(112));
     for node in nodes {
-        let phases = join_str_array(node.properties.get("phase_roles")).unwrap_or_else(|| "-".into());
+        let phases =
+            join_str_array(node.properties.get("phase_roles")).unwrap_or_else(|| "-".into());
         println!(
             "{:<28} {:<36} {}",
             node.name,
@@ -935,7 +974,11 @@ fn register_canonical_workflow(
     Ok(())
 }
 
-fn assign_harness_profile(engine: &GraphEngine, harness_id: &str, profile_name: &str) -> Result<()> {
+fn assign_harness_profile(
+    engine: &GraphEngine,
+    harness_id: &str,
+    profile_name: &str,
+) -> Result<()> {
     let profile_node_id = harness_profile_node_id(profile_name);
     let Some(profile) = engine.get_node(&profile_node_id)? else {
         bail!("Harness profile not found: {}", profile_name);
@@ -952,11 +995,16 @@ fn assign_harness_profile(engine: &GraphEngine, harness_id: &str, profile_name: 
         })
         .unwrap_or_default();
     let harness_node_id = harness_node_id(harness_id);
-    let harness = update_harness_node_with_retry(engine, &harness_node_id, harness_id, |properties, _now| {
-        ensure_desired_object(properties);
-        properties["desired"]["profile_name"] = json!(profile_name);
-        properties["desired"]["skill_refs"] = json!(skills);
-    })?;
+    let harness = update_harness_node_with_retry(
+        engine,
+        &harness_node_id,
+        harness_id,
+        |properties, _now| {
+            ensure_desired_object(properties);
+            properties["desired"]["profile_name"] = json!(profile_name);
+            properties["desired"]["skill_refs"] = json!(skills);
+        },
+    )?;
     engine.upsert_edge(&Edge {
         source_id: harness.id.clone(),
         target_id: profile_node_id.clone(),
@@ -970,10 +1018,16 @@ fn assign_harness_profile(engine: &GraphEngine, harness_id: &str, profile_name: 
         Some(harness.id.clone()),
         None,
         Some(profile_name.into()),
-        Some(format!("Assigned harness profile {} to {}", profile_name, harness_id)),
+        Some(format!(
+            "Assigned harness profile {} to {}",
+            profile_name, harness_id
+        )),
         json!({ "profile_id": profile_node_id }),
     )?;
-    println!("Assigned harness profile {} to {}", profile_name, harness_id);
+    println!(
+        "Assigned harness profile {} to {}",
+        profile_name, harness_id
+    );
     Ok(())
 }
 
@@ -981,15 +1035,20 @@ fn assign_harness_skill(engine: &GraphEngine, harness_id: &str, skill_name: &str
     ensure_harness_skill_exists(engine, skill_name)?;
     let harness_node_id = harness_node_id(harness_id);
     let skill_node_id = harness_skill_node_id(skill_name);
-    let harness = update_harness_node_with_retry(engine, &harness_node_id, harness_id, |properties, _now| {
-        let mut skills = skill_refs_from_properties(properties);
-        if !skills.iter().any(|s| s == skill_name) {
-            skills.push(skill_name.to_string());
-            skills.sort();
-        }
-        ensure_desired_object(properties);
-        properties["desired"]["skill_refs"] = json!(skills);
-    })?;
+    let harness = update_harness_node_with_retry(
+        engine,
+        &harness_node_id,
+        harness_id,
+        |properties, _now| {
+            let mut skills = skill_refs_from_properties(properties);
+            if !skills.iter().any(|s| s == skill_name) {
+                skills.push(skill_name.to_string());
+                skills.sort();
+            }
+            ensure_desired_object(properties);
+            properties["desired"]["skill_refs"] = json!(skills);
+        },
+    )?;
     engine.upsert_edge(&Edge {
         source_id: harness.id.clone(),
         target_id: skill_node_id.clone(),
@@ -1003,7 +1062,10 @@ fn assign_harness_skill(engine: &GraphEngine, harness_id: &str, skill_name: &str
         Some(harness.id.clone()),
         None,
         Some(skill_name.into()),
-        Some(format!("Assigned harness skill {} to {}", skill_name, harness_id)),
+        Some(format!(
+            "Assigned harness skill {} to {}",
+            skill_name, harness_id
+        )),
         json!({ "skill_id": skill_node_id }),
     )?;
     println!("Assigned harness skill {} to {}", skill_name, harness_id);
@@ -1012,22 +1074,33 @@ fn assign_harness_skill(engine: &GraphEngine, harness_id: &str, skill_name: &str
 
 fn unassign_harness_skill(engine: &GraphEngine, harness_id: &str, skill_name: &str) -> Result<()> {
     let harness_node_id = harness_node_id(harness_id);
-    let harness = update_harness_node_with_retry(engine, &harness_node_id, harness_id, |properties, _now| {
-        let mut skills = skill_refs_from_properties(properties);
-        skills.retain(|s| s != skill_name);
-        ensure_desired_object(properties);
-        properties["desired"]["skill_refs"] = json!(skills);
-    })?;
+    let harness = update_harness_node_with_retry(
+        engine,
+        &harness_node_id,
+        harness_id,
+        |properties, _now| {
+            let mut skills = skill_refs_from_properties(properties);
+            skills.retain(|s| s != skill_name);
+            ensure_desired_object(properties);
+            properties["desired"]["skill_refs"] = json!(skills);
+        },
+    )?;
     record_mutation(
         engine,
         "harness_skill_unassign",
         Some(harness.id.clone()),
         None,
         Some(skill_name.into()),
-        Some(format!("Unassigned harness skill {} from {}", skill_name, harness_id)),
+        Some(format!(
+            "Unassigned harness skill {} from {}",
+            skill_name, harness_id
+        )),
         json!({}),
     )?;
-    println!("Unassigned harness skill {} from {}", skill_name, harness_id);
+    println!(
+        "Unassigned harness skill {} from {}",
+        skill_name, harness_id
+    );
     Ok(())
 }
 
@@ -1038,7 +1111,8 @@ fn show_status(engine: &GraphEngine, node_id: &str) -> Result<()> {
     let mutations = engine.get_mutations(Some(node_id), 10)?;
     let last_apply = mutations.iter().find(|m| m.action == "harness_apply");
     let last_verify = mutations.iter().find(|m| m.action == "harness_verify");
-    let latest_observation = latest_harness_node_by_kind(engine, NodeKind::HarnessObservation, node_id)?;
+    let latest_observation =
+        latest_harness_node_by_kind(engine, NodeKind::HarnessObservation, node_id)?;
     let open_drift = open_harness_drift(engine, node_id)?;
     let projection_path = node
         .properties
@@ -1052,7 +1126,11 @@ fn show_status(engine: &GraphEngine, node_id: &str) -> Result<()> {
     let canonical_profile = prop_str(&node, &["desired", "canonical_profile_name"]).unwrap_or("-");
     let desired_profile = prop_str(&node, &["desired", "role_charter"]).unwrap_or("-");
     let desired_bundle = prop_str(&node, &["desired", "profile_name"]).unwrap_or("-");
-    let desired_skills = join_str_array(node.properties.get("desired").and_then(|v| v.get("skill_refs")));
+    let desired_skills = join_str_array(
+        node.properties
+            .get("desired")
+            .and_then(|v| v.get("skill_refs")),
+    );
     let rendered_hash = prop_str(&node, &["rendered", "config_hash"]).unwrap_or("-");
     let rendered_at = prop_str(&node, &["rendered", "rendered_at"]).unwrap_or("-");
     let observed_status = prop_str(&node, &["observed_summary", "status"]).unwrap_or("-");
@@ -1062,11 +1140,17 @@ fn show_status(engine: &GraphEngine, node_id: &str) -> Result<()> {
 
     println!("Harness: {}", node.id);
     println!("{}", "─".repeat(60));
-    println!("Runtime: {}", prop_str(&node, &["runtime_kind"]).unwrap_or("-"));
+    println!(
+        "Runtime: {}",
+        prop_str(&node, &["runtime_kind"]).unwrap_or("-")
+    );
     println!("Canonical profile: {}", canonical_profile);
     println!("Desired profile: {}", desired_profile);
     println!("Assigned bundle: {}", desired_bundle);
-    println!("Desired skills: {}", desired_skills.unwrap_or_else(|| "-".into()));
+    println!(
+        "Desired skills: {}",
+        desired_skills.unwrap_or_else(|| "-".into())
+    );
     println!("Projection target: {}", projection_path);
     println!("Rendered at: {}", rendered_at);
     println!("Rendered hash: {}", rendered_hash);
@@ -1077,13 +1161,21 @@ fn show_status(engine: &GraphEngine, node_id: &str) -> Result<()> {
     println!(
         "Last apply: {}",
         last_apply
-            .map(|m| format!("{} ({})", m.timestamp.to_rfc3339(), m.to_value.clone().unwrap_or_else(|| "-".into())))
+            .map(|m| format!(
+                "{} ({})",
+                m.timestamp.to_rfc3339(),
+                m.to_value.clone().unwrap_or_else(|| "-".into())
+            ))
             .unwrap_or_else(|| "-".into())
     );
     println!(
         "Last verify: {}",
         last_verify
-            .map(|m| format!("{} ({})", m.timestamp.to_rfc3339(), m.to_value.clone().unwrap_or_else(|| "-".into())))
+            .map(|m| format!(
+                "{} ({})",
+                m.timestamp.to_rfc3339(),
+                m.to_value.clone().unwrap_or_else(|| "-".into())
+            ))
             .unwrap_or_else(|| "-".into())
     );
     if let Some(observation) = latest_observation {
@@ -1106,7 +1198,10 @@ fn show_status(engine: &GraphEngine, node_id: &str) -> Result<()> {
     } else {
         println!("Open drift: none");
     }
-    println!("\nRaw properties:\n{}", serde_json::to_string_pretty(&node.properties)?);
+    println!(
+        "\nRaw properties:\n{}",
+        serde_json::to_string_pretty(&node.properties)?
+    );
     Ok(())
 }
 
@@ -1133,7 +1228,10 @@ fn plan_harness(
     println!("  profile: {}", config.profile);
     println!(
         "  canonical: {}",
-        desired.canonical_profile_name.clone().unwrap_or_else(|| "-".into())
+        desired
+            .canonical_profile_name
+            .clone()
+            .unwrap_or_else(|| "-".into())
     );
     println!(
         "  bundle:  {}",
@@ -1163,7 +1261,11 @@ fn apply_harness(
         .as_ref()
         .map(|value| json!(value));
     let desired_profile_name = desired.profile_name.as_ref().map(|value| json!(value));
-    if let Some(skill_refs) = desired.skill_refs.clone().or_else(|| existing_harness.as_ref().and_then(harness_skill_refs)) {
+    if let Some(skill_refs) = desired
+        .skill_refs
+        .clone()
+        .or_else(|| existing_harness.as_ref().and_then(harness_skill_refs))
+    {
         config.skills = skill_refs;
         config.content = render_harness_config(
             adapter.runtime_kind(),
@@ -1192,11 +1294,8 @@ fn apply_harness(
     let now = Utc::now();
     let harness_node_id = harness_node_id(harness_id);
     let projection_node_id = harness_projection_node_id(harness_id, "main-config");
-    let harness = update_harness_node_with_retry(
-        engine,
-        &harness_node_id,
-        harness_id,
-        |properties, now| {
+    let harness =
+        update_harness_node_with_retry(engine, &harness_node_id, harness_id, |properties, now| {
             properties["runtime_kind"] = json!(config.runtime_kind);
             properties["status"] = json!("active");
             properties["owner"] = json!("operator");
@@ -1227,8 +1326,7 @@ fn apply_harness(
                 "freshness": "unknown",
                 "drift_status": "pending_verify"
             });
-        },
-    )?;
+        })?;
 
     let projection = Node {
         id: projection_node_id.clone(),
@@ -1269,7 +1367,11 @@ fn apply_harness(
         Some(harness.id.clone()),
         None,
         Some("rendered".into()),
-        Some(format!("Applied {} harness {}", adapter.runtime_kind(), harness_id)),
+        Some(format!(
+            "Applied {} harness {}",
+            adapter.runtime_kind(),
+            harness_id
+        )),
         json!({
             "path": config.target_path.to_string_lossy().to_string(),
             "canonical_profile": harness.properties["desired"].get("canonical_profile_name").cloned(),
@@ -1391,7 +1493,11 @@ fn resolve_desired_apply_state(
     })
 }
 
-fn export_harness(engine: &GraphEngine, adapter: &dyn HarnessAdapter, harness_id: &str) -> Result<()> {
+fn export_harness(
+    engine: &GraphEngine,
+    adapter: &dyn HarnessAdapter,
+    harness_id: &str,
+) -> Result<()> {
     let Some(node) = engine.get_node(&harness_node_id(harness_id))? else {
         bail!("Harness not found: {}", harness_id);
     };
@@ -1399,7 +1505,11 @@ fn export_harness(engine: &GraphEngine, adapter: &dyn HarnessAdapter, harness_id
     apply_harness(engine, adapter, harness_id, Some(config.profile), None)
 }
 
-fn verify_harness(engine: &GraphEngine, adapter: &dyn HarnessAdapter, harness_id: &str) -> Result<()> {
+fn verify_harness(
+    engine: &GraphEngine,
+    adapter: &dyn HarnessAdapter,
+    harness_id: &str,
+) -> Result<()> {
     let harness_id_full = harness_node_id(harness_id);
     let drift_class = "rendered_observed";
     let drift_id = harness_drift_node_id(harness_id, drift_class);
@@ -1421,8 +1531,12 @@ fn verify_harness(engine: &GraphEngine, adapter: &dyn HarnessAdapter, harness_id
             .unwrap_or("");
 
         let (status, profile_hash, freshness) = if config.target_path.exists() {
-            let content = fs::read(&config.target_path)
-                .with_context(|| format!("failed to read harness file {}", config.target_path.display()))?;
+            let content = fs::read(&config.target_path).with_context(|| {
+                format!(
+                    "failed to read harness file {}",
+                    config.target_path.display()
+                )
+            })?;
             let observed_hash = sha256_hex(&content);
             if observed_hash != rendered_hash {
                 drift_status = "drifted";
@@ -1542,7 +1656,11 @@ fn verify_harness(engine: &GraphEngine, adapter: &dyn HarnessAdapter, harness_id
             Some(harness_id_full.clone()),
             None,
             Some(drift_status.into()),
-            Some(format!("Verified {} harness {}", adapter.runtime_kind(), harness_id)),
+            Some(format!(
+                "Verified {} harness {}",
+                adapter.runtime_kind(),
+                harness_id
+            )),
             json!({
                 "path": config.target_path.to_string_lossy().to_string(),
                 "runtime_kind": adapter.runtime_kind(),
@@ -1607,7 +1725,13 @@ fn start_harness_trial(
 ) -> Result<()> {
     if let Some(profile_name) = profile {
         with_adapter(engine, harness_id, |adapter| {
-            apply_harness(engine, adapter, harness_id, Some(profile_name.to_string()), None)
+            apply_harness(
+                engine,
+                adapter,
+                harness_id,
+                Some(profile_name.to_string()),
+                None,
+            )
         })?;
     }
 
@@ -1886,7 +2010,10 @@ fn report_harness_trial_activity(
             .get("lines_changed")
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
-        props.insert("lines_changed".to_string(), json!(existing_lines + lines_changed));
+        props.insert(
+            "lines_changed".to_string(),
+            json!(existing_lines + lines_changed),
+        );
     }
 
     if activity_type == "test_run" {
@@ -1897,8 +2024,14 @@ fn report_harness_trial_activity(
     let tokens_in = tokens_input.unwrap_or(0);
     let tokens_out = tokens_output.unwrap_or(0);
     if tokens_in > 0 || tokens_out > 0 {
-        let existing_in = props.get("tokens_input").and_then(|v| v.as_i64()).unwrap_or(0);
-        let existing_out = props.get("tokens_output").and_then(|v| v.as_i64()).unwrap_or(0);
+        let existing_in = props
+            .get("tokens_input")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let existing_out = props
+            .get("tokens_output")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
         let new_in = existing_in + tokens_in;
         let new_out = existing_out + tokens_out;
         props.insert("tokens_input".to_string(), json!(new_in));
@@ -1907,8 +2040,14 @@ fn report_harness_trial_activity(
     }
 
     if let Some(elapsed_ms) = elapsed_ms {
-        let existing_elapsed = props.get("elapsed_ms").and_then(|v| v.as_i64()).unwrap_or(0);
-        props.insert("elapsed_ms".to_string(), json!(existing_elapsed.max(elapsed_ms)));
+        let existing_elapsed = props
+            .get("elapsed_ms")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        props.insert(
+            "elapsed_ms".to_string(),
+            json!(existing_elapsed.max(elapsed_ms)),
+        );
     }
 
     session.properties = serde_json::Value::Object(props);
@@ -1979,10 +2118,22 @@ fn close_harness_trial(
     if let Some(quota_remaining) = quota_remaining {
         props.insert("quota_remaining".to_string(), json!(quota_remaining));
     }
-    let session_tokens_total = props.get("tokens_total").and_then(|v| v.as_i64()).unwrap_or(0);
-    let session_tokens_in = props.get("tokens_input").and_then(|v| v.as_i64()).unwrap_or(0);
-    let session_tokens_out = props.get("tokens_output").and_then(|v| v.as_i64()).unwrap_or(0);
-    let session_elapsed_ms = props.get("elapsed_ms").and_then(|v| v.as_i64()).unwrap_or(0);
+    let session_tokens_total = props
+        .get("tokens_total")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let session_tokens_in = props
+        .get("tokens_input")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let session_tokens_out = props
+        .get("tokens_output")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let session_elapsed_ms = props
+        .get("elapsed_ms")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
 
     session.properties = serde_json::Value::Object(props);
     session.updated_at = now;
@@ -1991,20 +2142,45 @@ fn close_harness_trial(
 
     if session_tokens_total > 0 || session_elapsed_ms > 0 {
         for edge in engine.get_edges_from(session_id)? {
-            if edge.relation == EdgeRelation::WorkingOn || edge.relation == EdgeRelation::Implements {
+            if edge.relation == EdgeRelation::WorkingOn || edge.relation == EdgeRelation::Implements
+            {
                 if let Some(mut node) = engine.get_node(&edge.target_id)? {
                     let mut node_props = node.properties.as_object().cloned().unwrap_or_default();
                     if session_tokens_total > 0 {
-                        let existing = node_props.get("tokens_total").and_then(|v| v.as_i64()).unwrap_or(0);
-                        let existing_in = node_props.get("tokens_input").and_then(|v| v.as_i64()).unwrap_or(0);
-                        let existing_out = node_props.get("tokens_output").and_then(|v| v.as_i64()).unwrap_or(0);
-                        node_props.insert("tokens_total".to_string(), json!(existing + session_tokens_total));
-                        node_props.insert("tokens_input".to_string(), json!(existing_in + session_tokens_in));
-                        node_props.insert("tokens_output".to_string(), json!(existing_out + session_tokens_out));
+                        let existing = node_props
+                            .get("tokens_total")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0);
+                        let existing_in = node_props
+                            .get("tokens_input")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0);
+                        let existing_out = node_props
+                            .get("tokens_output")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0);
+                        node_props.insert(
+                            "tokens_total".to_string(),
+                            json!(existing + session_tokens_total),
+                        );
+                        node_props.insert(
+                            "tokens_input".to_string(),
+                            json!(existing_in + session_tokens_in),
+                        );
+                        node_props.insert(
+                            "tokens_output".to_string(),
+                            json!(existing_out + session_tokens_out),
+                        );
                     }
                     if session_elapsed_ms > 0 {
-                        let existing_elapsed = node_props.get("elapsed_ms").and_then(|v| v.as_i64()).unwrap_or(0);
-                        node_props.insert("elapsed_ms".to_string(), json!(existing_elapsed + session_elapsed_ms));
+                        let existing_elapsed = node_props
+                            .get("elapsed_ms")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0);
+                        node_props.insert(
+                            "elapsed_ms".to_string(),
+                            json!(existing_elapsed + session_elapsed_ms),
+                        );
                     }
                     node.updated_at = now;
                     node.properties = serde_json::Value::Object(node_props);
@@ -2030,7 +2206,9 @@ fn close_harness_trial(
         Some(session_id.to_string()),
         Some("active".into()),
         Some(status.to_string()),
-        summary.map(str::to_string).or_else(|| Some("Closed measured harness trial".into())),
+        summary
+            .map(str::to_string)
+            .or_else(|| Some("Closed measured harness trial".into())),
         details,
     )?;
 
@@ -2190,7 +2368,11 @@ fn render_windsurf_skill_markdown(skill: &str) -> String {
     )
 }
 
-fn render_windsurf_workflow_markdown(workflow_name: &str, phases: &[String], description: Option<&str>) -> String {
+fn render_windsurf_workflow_markdown(
+    workflow_name: &str,
+    phases: &[String],
+    description: Option<&str>,
+) -> String {
     let phase_lines = if phases.is_empty() {
         "- none".to_string()
     } else {
@@ -2284,8 +2466,9 @@ fn write_claude_code_workspace_files(harness_id: &str, projection_path: &PathBuf
 fn write_antigravity_workspace_files(harness_id: &str, projection_path: &PathBuf) -> Result<()> {
     let root = std::env::current_dir().context("failed to locate current workspace")?;
     let agents_dir = root.join(".agents").join("workflows");
-    
-    let harness_hook_path = agents_dir.join(format!("{}-harness.md", harness_id.replace("harness:", "")));
+
+    let harness_hook_path =
+        agents_dir.join(format!("{}-harness.md", harness_id.replace("harness:", "")));
     let hook_md = format!(
         "---\n\
          description: Philotic Antigravity harness optimization for {harness_id}\n\
@@ -2316,14 +2499,20 @@ fn write_windsurf_workspace_files(
     skills: &[String],
     rule_path: &PathBuf,
 ) -> Result<()> {
-    write_harness_file(rule_path, render_windsurf_rule_markdown(harness_id, profile, skills).as_bytes())?;
+    write_harness_file(
+        rule_path,
+        render_windsurf_rule_markdown(harness_id, profile, skills).as_bytes(),
+    )?;
 
     let root = std::env::current_dir().context("failed to locate current workspace")?;
     let skills_root = root.join(".windsurf").join("skills");
     for skill in skills {
         let skill_dir = skills_root.join(format!("philotic-{}", skill));
         let skill_path = skill_dir.join("SKILL.md");
-        write_harness_file(&skill_path, render_windsurf_skill_markdown(skill).as_bytes())?;
+        write_harness_file(
+            &skill_path,
+            render_windsurf_skill_markdown(skill).as_bytes(),
+        )?;
     }
 
     let workflows_root = root.join(".windsurf").join("workflows");
@@ -2344,7 +2533,10 @@ fn write_windsurf_workspace_files(
         let markdown = render_windsurf_workflow_markdown(
             &workflow.name,
             &phases,
-            workflow.properties.get("description").and_then(|v| v.as_str()),
+            workflow
+                .properties
+                .get("description")
+                .and_then(|v| v.as_str()),
         );
         write_harness_file(&workflow_path, markdown.as_bytes())?;
     }
@@ -2399,7 +2591,10 @@ fn resolve_runtime_kind(engine: &GraphEngine, harness_id: &str) -> Result<String
     if harness_id.starts_with("windsurf-") || harness_id.contains("windsurf") {
         return Ok("windsurf".into());
     }
-    if harness_id.starts_with("gemini-") || harness_id.contains("gemini") || harness_id.contains("antigravity") {
+    if harness_id.starts_with("gemini-")
+        || harness_id.contains("gemini")
+        || harness_id.contains("antigravity")
+    {
         return Ok("antigravity".into());
     }
     Ok("codex".into())
@@ -2458,7 +2653,9 @@ fn resolve_canonical_profile(engine: &GraphEngine, profile_name: &str) -> Result
 }
 
 fn ensure_canonical_workflow_exists(engine: &GraphEngine, workflow_name: &str) -> Result<()> {
-    let exists = engine.get_node(&canonical_workflow_node_id(workflow_name))?.is_some()
+    let exists = engine
+        .get_node(&canonical_workflow_node_id(workflow_name))?
+        .is_some()
         || engine
             .query_nodes(Some(NodeKind::CanonicalWorkflow), None)?
             .into_iter()
@@ -2590,10 +2787,7 @@ fn latest_harness_node_by_kind(
         .query_nodes(Some(kind), None)?
         .into_iter()
         .filter(|node| {
-            node.properties
-                .get("harness_id")
-                .and_then(|v| v.as_str())
-                == Some(harness_id)
+            node.properties.get("harness_id").and_then(|v| v.as_str()) == Some(harness_id)
         })
         .collect();
     nodes.sort_by_key(|node| node.updated_at);
@@ -2605,10 +2799,7 @@ fn open_harness_drift(engine: &GraphEngine, harness_id: &str) -> Result<Option<N
         .query_nodes(Some(NodeKind::HarnessDrift), None)?
         .into_iter()
         .filter(|node| {
-            node.properties
-                .get("harness_id")
-                .and_then(|v| v.as_str())
-                == Some(harness_id)
+            node.properties.get("harness_id").and_then(|v| v.as_str()) == Some(harness_id)
                 && node.properties.get("status").and_then(|v| v.as_str()) == Some("open")
         })
         .collect();
@@ -2646,7 +2837,10 @@ fn harness_skill_refs(harness: &Node) -> Option<Vec<String>> {
 }
 
 fn ensure_harness_skill_exists(engine: &GraphEngine, skill_name: &str) -> Result<()> {
-    if engine.get_node(&harness_skill_node_id(skill_name))?.is_none() {
+    if engine
+        .get_node(&harness_skill_node_id(skill_name))?
+        .is_none()
+    {
         bail!("Harness skill not found: {}", skill_name);
     }
     Ok(())
@@ -2667,7 +2861,11 @@ fn skill_refs_from_properties(properties: &serde_json::Value) -> Vec<String> {
 }
 
 fn ensure_desired_object(properties: &mut serde_json::Value) {
-    if !properties.get("desired").map(|v| v.is_object()).unwrap_or(false) {
+    if !properties
+        .get("desired")
+        .map(|v| v.is_object())
+        .unwrap_or(false)
+    {
         properties["desired"] = json!({});
     }
 }

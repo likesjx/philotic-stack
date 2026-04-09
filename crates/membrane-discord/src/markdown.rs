@@ -71,9 +71,7 @@ pub fn split_for_discord(text: &str) -> Vec<String> {
 
     while remaining.len() > LIMIT {
         // Try to split at a newline near the limit
-        let split_at = remaining[..LIMIT]
-            .rfind('\n')
-            .unwrap_or(LIMIT);
+        let split_at = remaining[..LIMIT].rfind('\n').unwrap_or(LIMIT);
 
         let (chunk, rest) = remaining.split_at(split_at);
         if !chunk.is_empty() {

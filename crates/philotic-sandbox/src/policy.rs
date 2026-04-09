@@ -159,7 +159,12 @@ impl SandboxPolicy {
             )));
         }
 
-        let valid_profiles = ["strict", "shell_executor", "file_processor", "network_server"];
+        let valid_profiles = [
+            "strict",
+            "shell_executor",
+            "file_processor",
+            "network_server",
+        ];
         if !valid_profiles.contains(&self.seccomp.profile.as_str()) {
             return Err(PolicyError::Validation(format!(
                 "seccomp.profile must be one of {:?}, got '{}'",

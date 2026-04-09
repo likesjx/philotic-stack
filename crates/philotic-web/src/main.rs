@@ -251,12 +251,15 @@ enum ServiceAction {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Init { config, force, interactive, non_interactive } => {
-            let config_path = config.unwrap_or_else(|| {
-                match init::active_profile() {
-                    Some(_) => init::profile_dir().join("config.json"),
-                    None => std::path::PathBuf::from("mesh-config.json"),
-                }
+        Command::Init {
+            config,
+            force,
+            interactive,
+            non_interactive,
+        } => {
+            let config_path = config.unwrap_or_else(|| match init::active_profile() {
+                Some(_) => init::profile_dir().join("config.json"),
+                None => std::path::PathBuf::from("mesh-config.json"),
             });
 
             // Interactive by default when no config exists, unless --non-interactive
@@ -282,7 +285,13 @@ async fn main() -> Result<()> {
             println!();
             for (name, desc) in presets::list_preset_names() {
                 let agents = presets::load_preset(&name)
-                    .map(|p| p.agents.iter().map(|a| a.persona_name.clone()).collect::<Vec<_>>().join(", "))
+                    .map(|p| {
+                        p.agents
+                            .iter()
+                            .map(|a| a.persona_name.clone())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
                     .unwrap_or_default();
                 println!("  {name:<8} {desc}");
                 println!("  {:<8} Agents: {agents}", "");
@@ -309,8 +318,8 @@ async fn main() -> Result<()> {
             ComponentAction::Remove { guest_id } => component::remove(guest_id).await,
         },
         Command::Graph { action } => {
+            use graph_intelligence::{scanner, GraphEngine};
             use philotic_graph::PhiloticGraphConfig;
-            use graph_intelligence::{GraphEngine, scanner};
 
             let config = PhiloticGraphConfig::default();
 
@@ -328,10 +337,7 @@ async fn main() -> Result<()> {
                         "  {} tests, {} snippets, {} docs",
                         result.tests, result.snippets, result.docs
                     );
-                    println!(
-                        "  {} commits, {} branches",
-                        result.commits, result.branches
-                    );
+                    println!("  {} commits, {} branches", result.commits, result.branches);
                     println!("  Duration: {}ms", result.duration_ms);
                     Ok(())
                 }
@@ -348,22 +354,14 @@ async fn main() -> Result<()> {
                 }
                 GraphAction::Status => {
                     let engine = GraphEngine::open(&config.db_path)?;
-                    let proposals = engine.query_nodes(
-                        Some(graph_intelligence::schema::NodeKind::Proposal),
-                        None,
-                    )?;
-                    let crates = engine.query_nodes(
-                        Some(graph_intelligence::schema::NodeKind::Crate),
-                        None,
-                    )?;
-                    let types = engine.query_nodes(
-                        Some(graph_intelligence::schema::NodeKind::Type),
-                        None,
-                    )?;
-                    let fns = engine.query_nodes(
-                        Some(graph_intelligence::schema::NodeKind::Function),
-                        None,
-                    )?;
+                    let proposals = engine
+                        .query_nodes(Some(graph_intelligence::schema::NodeKind::Proposal), None)?;
+                    let crates = engine
+                        .query_nodes(Some(graph_intelligence::schema::NodeKind::Crate), None)?;
+                    let types = engine
+                        .query_nodes(Some(graph_intelligence::schema::NodeKind::Type), None)?;
+                    let fns = engine
+                        .query_nodes(Some(graph_intelligence::schema::NodeKind::Function), None)?;
 
                     println!("Graph Intelligence Status");
                     println!("{}", "\u{2500}".repeat(25));
@@ -397,10 +395,8 @@ async fn main() -> Result<()> {
                 }
                 GraphAction::Proposals => {
                     let engine = GraphEngine::open(&config.db_path)?;
-                    let proposals = engine.query_nodes(
-                        Some(graph_intelligence::schema::NodeKind::Proposal),
-                        None,
-                    )?;
+                    let proposals = engine
+                        .query_nodes(Some(graph_intelligence::schema::NodeKind::Proposal), None)?;
                     println!("{:<45} {:<25} {}", "PROPOSAL", "STATUS", "DOMAIN");
                     println!("{}", "\u{2500}".repeat(90));
                     for p in &proposals {
@@ -420,10 +416,8 @@ async fn main() -> Result<()> {
                 }
                 GraphAction::Seams => {
                     let engine = GraphEngine::open(&config.db_path)?;
-                    let seams = engine.query_nodes(
-                        Some(graph_intelligence::schema::NodeKind::Seam),
-                        None,
-                    )?;
+                    let seams = engine
+                        .query_nodes(Some(graph_intelligence::schema::NodeKind::Seam), None)?;
                     println!("Registered seams: {}", seams.len());
                     for s in &seams {
                         println!("  {}", s.name);
@@ -441,7 +435,12 @@ async fn main() -> Result<()> {
                     if !snippets.is_empty() {
                         println!("\nSnippets matching '{}': {}", query, snippets.len());
                         for s in snippets.iter().take(10) {
-                            println!("  [{}] {} \u{2014} {}", s.kind.as_str(), s.node_id, s.signature);
+                            println!(
+                                "  [{}] {} \u{2014} {}",
+                                s.kind.as_str(),
+                                s.node_id,
+                                s.signature
+                            );
                         }
                     }
                     Ok(())

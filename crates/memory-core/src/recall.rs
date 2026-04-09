@@ -290,8 +290,10 @@ mod tests {
 
     #[test]
     fn explicit_tool_call_always_recalls() {
-        let decision =
-            evaluate_recall(&base_context(RecallTrigger::ExplicitToolCall, "user preference"));
+        let decision = evaluate_recall(&base_context(
+            RecallTrigger::ExplicitToolCall,
+            "user preference",
+        ));
         assert_eq!(decision.mode, RecallMode::Explicit);
         assert_eq!(decision.reason, "explicit_tool_call");
     }

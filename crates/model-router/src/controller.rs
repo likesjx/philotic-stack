@@ -567,7 +567,9 @@ impl ControllerTask {
                     no_error && (has_url || has_inline)
                 });
                 if !has_usable_attachment {
-                    bail!("{kind_label} task requires at least one blob-backed or inline attachment");
+                    bail!(
+                        "{kind_label} task requires at least one blob-backed or inline attachment"
+                    );
                 }
             }
             TaskKind::VoiceSynthesize => {
@@ -1829,7 +1831,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.result["spoken_text"], "Hello back, warmly.");
-        assert_eq!(response.result["partial_replies"], json!(["Hello", "Hello back"]));
+        assert_eq!(
+            response.result["partial_replies"],
+            json!(["Hello", "Hello back"])
+        );
         assert_eq!(
             response.result["working_memory_delta"],
             "The user greeted the assistant."

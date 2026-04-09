@@ -1296,11 +1296,7 @@ fn normalize_attachment_mime_type(mime_type: &str) -> Cow<'_, str> {
 ///
 /// Builds a minimal RIFF/WAV header followed by the raw PCM data so that
 /// Gemini (and other providers) can consume it as `audio/wav`.
-fn pcm_i16_b64_to_wav(
-    pcm_b64: &str,
-    sample_rate: u32,
-    channels: u16,
-) -> Result<Vec<u8>> {
+fn pcm_i16_b64_to_wav(pcm_b64: &str, sample_rate: u32, channels: u16) -> Result<Vec<u8>> {
     use base64::Engine;
     let pcm_bytes = BASE64_STANDARD
         .decode(pcm_b64)
@@ -1326,8 +1322,8 @@ fn pcm_i16_b64_to_wav(
 
     // fmt sub-chunk
     wav.extend_from_slice(b"fmt ");
-    wav.extend_from_slice(&16u32.to_le_bytes());       // sub-chunk size = 16 for PCM
-    wav.extend_from_slice(&1u16.to_le_bytes());         // AudioFormat = PCM
+    wav.extend_from_slice(&16u32.to_le_bytes()); // sub-chunk size = 16 for PCM
+    wav.extend_from_slice(&1u16.to_le_bytes()); // AudioFormat = PCM
     wav.extend_from_slice(&channels.to_le_bytes());
     wav.extend_from_slice(&sample_rate.to_le_bytes());
     wav.extend_from_slice(&byte_rate.to_le_bytes());

@@ -77,11 +77,12 @@ impl ModelCache {
             .with_context(|| format!("could not download ONNX model from {}", repo_id))?;
 
         // Also fetch the .onnx_data file if present (for split models like q4)
-        let model_data_filename = model_path.file_stem()
+        let model_data_filename = model_path
+            .file_stem()
             .and_then(|s| s.to_str())
             .map(|s| format!("onnx/{}_data", s))
             .unwrap_or_else(|| "onnx/model.onnx_data".to_string());
-        
+
         if let Ok(data_path) = repo.get(&model_data_filename) {
             tracing::info!(?data_path, "downloaded companion weights file");
         }

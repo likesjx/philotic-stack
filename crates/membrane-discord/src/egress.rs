@@ -1,6 +1,6 @@
 use anyhow::Result;
 use reqwest::Client;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::{error, info};
 
 use crate::markdown::{split_for_discord, to_discord_markdown};
@@ -33,7 +33,10 @@ pub async fn send_text_reply(
         }
 
         let resp = http
-            .post(format!("{}/channels/{}/messages", DISCORD_API_BASE, channel_id))
+            .post(format!(
+                "{}/channels/{}/messages",
+                DISCORD_API_BASE, channel_id
+            ))
             .header("Authorization", format!("Bot {}", bot_token))
             .json(&body)
             .send()
@@ -42,12 +45,20 @@ pub async fn send_text_reply(
         if !resp.status().is_success() {
             let status = resp.status();
             let body_text = resp.text().await.unwrap_or_default();
-            error!("Discord send_message failed [{} {}]: {}", channel_id, status, body_text);
+            error!(
+                "Discord send_message failed [{} {}]: {}",
+                channel_id, status, body_text
+            );
             anyhow::bail!("Discord API error {}: {}", status, body_text);
         }
 
         last_response = resp.json().await?;
-        info!("Sent Discord message chunk {}/{} to channel [{}]", i + 1, chunks.len(), channel_id);
+        info!(
+            "Sent Discord message chunk {}/{} to channel [{}]",
+            i + 1,
+            chunks.len(),
+            channel_id
+        );
     }
 
     Ok(last_response)
@@ -120,7 +131,10 @@ pub async fn respond_to_interaction(
     if !resp.status().is_success() {
         let status = resp.status();
         let body_text = resp.text().await.unwrap_or_default();
-        error!("Discord interaction response failed: {} {}", status, body_text);
+        error!(
+            "Discord interaction response failed: {} {}",
+            status, body_text
+        );
         anyhow::bail!("Discord API error {}: {}", status, body_text);
     }
 
@@ -130,7 +144,10 @@ pub async fn respond_to_interaction(
 /// Send a typing indicator to the channel.
 pub async fn send_typing(http: &Client, bot_token: &str, channel_id: &str) {
     let _ = http
-        .post(format!("{}/channels/{}/typing", DISCORD_API_BASE, channel_id))
+        .post(format!(
+            "{}/channels/{}/typing",
+            DISCORD_API_BASE, channel_id
+        ))
         .header("Authorization", format!("Bot {}", bot_token))
         .send()
         .await;

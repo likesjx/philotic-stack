@@ -16,7 +16,7 @@
 ///   - SDP / WebRTC — that's Slice 3 if hotel grows a WebRtcGuest
 ///   - Multi-speaker diarization — loudest-speaker-wins for now (OQ2 decision)
 use anyhow::Result;
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use opus::{Application, Channels, Decoder as OpusDecoder, Encoder as OpusEncoder};
 use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot};
@@ -97,10 +97,8 @@ impl VoiceBridge {
         // Separate inbound/outbound crypto state — they share the same key but
         // track independent nonce counters (decrypt reads nonce from packet,
         // encrypt increments an outbound counter).
-        let crypto_in = VoiceEncryptionState::new(
-            session.mode.clone(),
-            session.crypto.secret_key().to_vec(),
-        );
+        let crypto_in =
+            VoiceEncryptionState::new(session.mode.clone(), session.crypto.secret_key().to_vec());
         let crypto_out = session.crypto;
 
         let encoder = OpusEncoder::new(SAMPLE_RATE, Channels::Stereo, Application::Voip)?;
@@ -175,7 +173,11 @@ fn flush_utterance(
     utterance_tx: &mpsc::Sender<VoiceUtteranceEvent>,
 ) {
     if frames.len() < VAD_MIN_SPEECH_FRAMES {
-        debug!("VoiceBridge: SSRC {} utterance too short ({} frames), discarding", ssrc, frames.len());
+        debug!(
+            "VoiceBridge: SSRC {} utterance too short ({} frames), discarding",
+            ssrc,
+            frames.len()
+        );
         return;
     }
 
@@ -187,10 +189,7 @@ fn flush_utterance(
     }
 
     // Convert i16 samples to bytes (LE), then base64
-    let bytes: Vec<u8> = pcm
-        .iter()
-        .flat_map(|&s| s.to_le_bytes())
-        .collect();
+    let bytes: Vec<u8> = pcm.iter().flat_map(|&s| s.to_le_bytes()).collect();
     let pcm_b64 = B64.encode(&bytes);
 
     let event = VoiceUtteranceEvent {
@@ -204,7 +203,10 @@ fn flush_utterance(
     // Non-blocking send — if the channel is full the utterance is lost rather
     // than blocking the receive loop.
     if let Err(e) = utterance_tx.try_send(event) {
-        warn!("VoiceBridge: utterance channel full, dropping (SSRC {}): {}", ssrc, e);
+        warn!(
+            "VoiceBridge: utterance channel full, dropping (SSRC {}): {}",
+            ssrc, e
+        );
     }
 }
 
@@ -334,7 +336,14 @@ async fn run_bridge(
     // Flush any in-progress utterances on shutdown
     for (ssrc, state) in vad {
         if let VadState::Speaking { frames, .. } = state {
-            flush_utterance(ssrc, frames, &guild_id, &channel_id, &session_id, &utterance_tx);
+            flush_utterance(
+                ssrc,
+                frames,
+                &guild_id,
+                &channel_id,
+                &session_id,
+                &utterance_tx,
+            );
         }
     }
 

@@ -7,12 +7,12 @@
 /// Port: 11435 (leaves Ollama's 11434 free for optional proxy fallback).
 use anyhow::Result;
 use axum::{
+    Json, Router,
     body::Bytes,
     extract::State,
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
 };
 use onnx_runner::{EmbeddingsBackend, ModelCache, WhisperBackend};
 use serde::{Deserialize, Serialize};
@@ -33,7 +33,10 @@ impl SidecarState {
         embeddings: Arc<RwLock<Option<EmbeddingsBackend>>>,
         whisper: Arc<RwLock<Option<WhisperBackend>>>,
     ) -> Self {
-        Self { embeddings, whisper }
+        Self {
+            embeddings,
+            whisper,
+        }
     }
 }
 
@@ -105,10 +108,7 @@ pub struct TranscribeResponse {
 
 /// Accept raw WAV bytes in the request body (Content-Type: audio/wav or
 /// application/octet-stream).  Returns the transcript as JSON.
-async fn transcribe(
-    State(state): State<SidecarState>,
-    body: Bytes,
-) -> impl IntoResponse {
+async fn transcribe(State(state): State<SidecarState>, body: Bytes) -> impl IntoResponse {
     let guard = state.whisper.read().await;
     let Some(backend) = guard.as_ref() else {
         error!("sidecar: Whisper backend not loaded");

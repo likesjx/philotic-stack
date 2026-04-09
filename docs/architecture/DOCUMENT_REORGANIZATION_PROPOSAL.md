@@ -1,4 +1,36 @@
+---
+title: Architecture Documentation Reorganization Proposal
+doc_type: proposal
+domain: workflow-docs
+status: proposed
+last_updated: 2026-04-08
+tags:
+- docs
+- metadata
+- taxonomy
+- frontmatter
+related_docs:
+- DOC_TAGGING_FRONTMATTER_PROPOSAL.md
+- PROPOSAL_ORGANIZATION_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+task_refs:
+- docs/task.md
+proposal_id: document-reorganization
+source_of_truth_targets:
+- ARCHITECTURE_STATUS.md
+---
+
 # Architecture Documentation Reorganization Proposal
+
+## Disposition
+
+`proposed`
+
+## Current Slice
+
+- normalize proposal and archive metadata so the graph scanner can classify docs reliably
+- mark archive-only proposal narratives as historical instead of leaving them in proposal-shaped limbo
+- keep the reorganization proposal itself explicit about what the repo is asking for right now
 
 ## Current State Analysis
 

@@ -10,14 +10,14 @@ mod voice_bridge;
 mod voice_gateway;
 mod voice_udp;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use clap::Parser;
 use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use session::{ActiveTurn, ActiveTurns, GuildCache};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
-use tokio::time::{interval, Duration};
+use tokio::time::{Duration, interval};
 use tracing::{debug, error, info, warn};
 use voice_bridge::{VoiceBridge, VoiceUtteranceEvent};
 
@@ -25,12 +25,10 @@ const MEMBRANE_ERROR_BACKOFF_INITIAL_SECS: u64 = 1;
 const MEMBRANE_ERROR_BACKOFF_MAX_SECS: u64 = 600;
 
 fn next_error_backoff_secs(current_secs: u64) -> u64 {
-    current_secs
-        .saturating_mul(2)
-        .clamp(
-            MEMBRANE_ERROR_BACKOFF_INITIAL_SECS,
-            MEMBRANE_ERROR_BACKOFF_MAX_SECS,
-        )
+    current_secs.saturating_mul(2).clamp(
+        MEMBRANE_ERROR_BACKOFF_INITIAL_SECS,
+        MEMBRANE_ERROR_BACKOFF_MAX_SECS,
+    )
 }
 
 /// Discord Membrane — bridges Discord text/voice into the Philotic hotel.
@@ -91,9 +89,7 @@ struct PendingVoiceConnect {
 
 impl PendingVoiceConnect {
     fn is_ready(&self) -> bool {
-        self.voice_session_id.is_some()
-            && self.endpoint.is_some()
-            && self.token.is_some()
+        self.voice_session_id.is_some() && self.endpoint.is_some() && self.token.is_some()
     }
 }
 
@@ -167,7 +163,10 @@ async fn run_once(args: Args) -> Result<()> {
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
 
-    info!("membrane-discord seat loop started for agent [{}]", args.agent_id);
+    info!(
+        "membrane-discord seat loop started for agent [{}]",
+        args.agent_id
+    );
 
     loop {
         tokio::select! {
@@ -533,7 +532,10 @@ async fn run_once(args: Args) -> Result<()> {
     }
 
     // Clean shutdown
-    info!("membrane-discord shutting down for agent [{}]", args.agent_id);
+    info!(
+        "membrane-discord shutting down for agent [{}]",
+        args.agent_id
+    );
     let _ = shutdown_tx.send(());
     if let Err(e) = gateway_lease.release(&mut ipc).await {
         warn!("Failed to release Discord gateway lease: {}", e);
@@ -579,17 +581,17 @@ async fn attempt_voice_connect(
         return;
     };
 
-    let (voice_session_id, endpoint, token) = match (
-        pending.voice_session_id,
-        pending.endpoint,
-        pending.token,
-    ) {
-        (Some(s), Some(e), Some(t)) => (s, e, t),
-        _ => {
-            warn!("attempt_voice_connect: missing state for guild {}", guild_id);
-            return;
-        }
-    };
+    let (voice_session_id, endpoint, token) =
+        match (pending.voice_session_id, pending.endpoint, pending.token) {
+            (Some(s), Some(e), Some(t)) => (s, e, t),
+            _ => {
+                warn!(
+                    "attempt_voice_connect: missing state for guild {}",
+                    guild_id
+                );
+                return;
+            }
+        };
 
     let hotel_session_id = format!("discord:{}:{}", guild_id, pending.channel_id);
 
@@ -609,7 +611,12 @@ async fn attempt_voice_connect(
     .await
     {
         Ok((session, _event_rx)) => {
-            match VoiceBridge::start(session, utterance_tx, hotel_session_id, pending.text_channel_id.clone()) {
+            match VoiceBridge::start(
+                session,
+                utterance_tx,
+                hotel_session_id,
+                pending.text_channel_id.clone(),
+            ) {
                 Ok(bridge) => {
                     info!(
                         "VoiceBridge: active for guild={} channel={}",
@@ -685,7 +692,9 @@ async fn handle_agent_reply(
             let turn = active_turns.get_mut(session_id);
             if let Some(turn) = turn {
                 if let Some(ref draft_id) = turn.draft_message_id.clone() {
-                    let _ = egress::edit_message(http, bot_token, &reply_channel, draft_id, content).await;
+                    let _ =
+                        egress::edit_message(http, bot_token, &reply_channel, draft_id, content)
+                            .await;
                 } else {
                     // Send first draft
                     match egress::send_text_reply(
@@ -698,8 +707,7 @@ async fn handle_agent_reply(
                     .await
                     {
                         Ok(msg) => {
-                            turn.draft_message_id =
-                                msg["id"].as_str().map(String::from);
+                            turn.draft_message_id = msg["id"].as_str().map(String::from);
                         }
                         Err(e) => warn!("Failed to send partial reply: {}", e),
                     }
@@ -731,13 +739,19 @@ async fn handle_agent_reply(
                 .unwrap_or("");
 
             if guild_id.is_empty() {
-                warn!("send_voice_reply: can't parse guild_id from session_id [{}]", session_id);
+                warn!(
+                    "send_voice_reply: can't parse guild_id from session_id [{}]",
+                    session_id
+                );
                 return Ok(());
             }
 
             let audio_b64 = task["audio_b64"].as_str().unwrap_or("");
             if audio_b64.is_empty() {
-                warn!("send_voice_reply: empty audio_b64 for session [{}]", session_id);
+                warn!(
+                    "send_voice_reply: empty audio_b64 for session [{}]",
+                    session_id
+                );
                 return Ok(());
             }
 
@@ -746,7 +760,10 @@ async fn handle_agent_reply(
                     if let Some(bridge) = active_bridges.get(guild_id) {
                         bridge.send_pcm(samples).await;
                     } else {
-                        warn!("send_voice_reply: no active bridge for guild [{}]", guild_id);
+                        warn!(
+                            "send_voice_reply: no active bridge for guild [{}]",
+                            guild_id
+                        );
                     }
                 }
                 Err(e) => warn!("send_voice_reply: decode_pcm_b64 failed: {}", e),
@@ -759,7 +776,10 @@ async fn handle_agent_reply(
         }
 
         _ => {
-            warn!("Unknown agent reply action [{}] for session [{}]", action, session_id);
+            warn!(
+                "Unknown agent reply action [{}] for session [{}]",
+                action, session_id
+            );
         }
     }
 

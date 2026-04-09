@@ -12,11 +12,7 @@ pub fn resolve_graph_db_path() -> String {
                 .ok()
                 .filter(|value| !value.trim().is_empty())
         })
-        .unwrap_or_else(|| {
-            default_graph_db_path()
-                .to_string_lossy()
-                .to_string()
-        })
+        .unwrap_or_else(|| default_graph_db_path().to_string_lossy().to_string())
 }
 
 fn default_graph_db_path() -> PathBuf {

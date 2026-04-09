@@ -1,6 +1,6 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep, timeout};
@@ -48,10 +48,7 @@ pub async fn run_gateway(
     let mut last_sequence: Option<u64> = None;
 
     loop {
-        let connect_url = resume_url
-            .as_deref()
-            .unwrap_or(GATEWAY_URL)
-            .to_string();
+        let connect_url = resume_url.as_deref().unwrap_or(GATEWAY_URL).to_string();
 
         info!("Connecting to Discord Gateway: {}", connect_url);
 
@@ -117,11 +114,12 @@ async fn connect_and_identify(
 
     // Read Hello (Opcode 10) to get heartbeat interval
     let hello = read_json_message(&mut read).await?;
-    let heartbeat_interval_ms = hello["d"]["heartbeat_interval"]
-        .as_u64()
-        .unwrap_or(41250);
+    let heartbeat_interval_ms = hello["d"]["heartbeat_interval"].as_u64().unwrap_or(41250);
 
-    info!("Gateway Hello received — heartbeat interval: {}ms", heartbeat_interval_ms);
+    info!(
+        "Gateway Hello received — heartbeat interval: {}ms",
+        heartbeat_interval_ms
+    );
 
     // Send Identify or Resume
     let identify_payload = if let Some(sid) = session_id {
@@ -340,9 +338,7 @@ where
         + Unpin,
 {
     match timeout(Duration::from_secs(30), stream.next()).await {
-        Ok(Some(Ok(Message::Text(text)))) => {
-            Ok(serde_json::from_str(&text)?)
-        }
+        Ok(Some(Ok(Message::Text(text)))) => Ok(serde_json::from_str(&text)?),
         Ok(Some(Ok(other))) => bail!("Expected text message, got {:?}", other),
         Ok(Some(Err(e))) => bail!("WebSocket error: {}", e),
         Ok(None) => bail!("Connection closed before Hello"),

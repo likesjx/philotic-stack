@@ -1,6 +1,6 @@
 use anyhow::Result;
 use reqwest::Client;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::info;
 
 const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
@@ -57,7 +57,11 @@ pub async fn register_guild_commands(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("Failed to register guild slash commands: {} {}", status, body);
+        anyhow::bail!(
+            "Failed to register guild slash commands: {} {}",
+            status,
+            body
+        );
     }
 
     info!(

@@ -1,3 +1,17 @@
+---
+title: Native Overlay / VPN Proposal
+doc_type: historical
+domain: mesh-placement
+status: historical
+last_updated: 2026-04-08
+tags:
+- archived
+- proposal
+- networking
+related_docs:
+- ARCHITECTURE_STATUS.md
+---
+
 # Native Overlay / VPN Proposal
 
 ## Goal

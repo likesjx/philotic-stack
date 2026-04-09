@@ -1,3 +1,17 @@
+---
+title: Philotic Rust Forge Proposal
+doc_type: historical
+domain: deployment-distribution
+status: historical
+last_updated: 2026-04-08
+tags:
+- archived
+- proposal
+- forge
+related_docs:
+- ARCHITECTURE_STATUS.md
+---
+
 # Philotic Rust Forge Proposal
 
 ## Goal

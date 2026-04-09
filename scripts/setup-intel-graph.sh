@@ -108,20 +108,41 @@ download_model() {
     fi
 }
 
-is_running() {
-    local pid_file="$1"
-    if [[ -f "$pid_file" ]]; then
-        local pid=$(cat "$pid_file" 2>/dev/null)
-        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-            return 0
-        fi
+live_pid_for_port() {
+    local port="$1"
+    local pid
+    pid=$(lsof -t -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | head -1)
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        echo "$pid"
+        return 0
     fi
     return 1
 }
 
+running_pid() {
+    local pid_file="$1"
+    local port="$2"
+
+    if [[ -f "$pid_file" ]]; then
+        local pid=$(cat "$pid_file" 2>/dev/null)
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            echo "$pid"
+            return 0
+        fi
+    fi
+
+    if pid=$(live_pid_for_port "$port"); then
+        echo "$pid" > "$pid_file"
+        echo "$pid"
+        return 0
+    fi
+
+    return 1
+}
+
 start_onnx() {
-    if is_running "$PID_DIR/onnx.pid"; then
-        warn "ONNX sidecar already running (PID: $(cat "$PID_DIR/onnx.pid"))"
+    if pid=$(running_pid "$PID_DIR/onnx.pid" "$ONNX_PORT"); then
+        warn "ONNX sidecar already running (PID: $pid)"
         return 0
     fi
     
@@ -129,7 +150,7 @@ start_onnx() {
     log "Embedding model: $EMBED_MODEL (${EMBED_DIM}-dim)"
     
     cd "$PHILOTIC_ROOT"
-    nohup cargo run --release -p model-router --bin model-controller-onnx -- \
+    nohup ~/.cargo/bin/cargo run --release -p model-router --bin model-controller-onnx -- \
         --sidecar-only \
         --embed-repo "$EMBED_MODEL" \
         > "$LOG_DIR/onnx.log" 2>&1 &
@@ -154,8 +175,8 @@ start_onnx() {
 }
 
 start_graph() {
-    if is_running "$PID_DIR/graph.pid"; then
-        warn "Graph intelligence already running (PID: $(cat "$PID_DIR/graph.pid"))"
+    if pid=$(running_pid "$PID_DIR/graph.pid" "$GRAPH_PORT"); then
+        warn "Graph intelligence already running (PID: $pid)"
         return 0
     fi
     
@@ -165,7 +186,7 @@ start_graph() {
     cd "$PHILOTIC_ROOT"
     export PHILOTIC_GRAPH_DB="$GRAPH_DB"
     
-    nohup cargo run --release -p graph-intelligence -- \
+    nohup ~/.cargo/bin/cargo run --release -p graph-intelligence -- \
         --port $GRAPH_PORT \
         --mcp-port $((GRAPH_PORT + 1)) \
         --db "$GRAPH_DB" \
@@ -214,22 +235,16 @@ start_all() {
 stop_all() {
     log "Stopping Intel Graph stack..."
     
-    if [[ -f "$PID_DIR/graph.pid" ]]; then
-        local pid=$(cat "$PID_DIR/graph.pid")
-        if kill -0 "$pid" 2>/dev/null; then
-            log "Stopping graph intelligence (PID: $pid)..."
-            kill "$pid" 2>/dev/null || true
-            rm -f "$PID_DIR/graph.pid"
-        fi
+    if pid=$(running_pid "$PID_DIR/graph.pid" "$GRAPH_PORT"); then
+        log "Stopping graph intelligence (PID: $pid)..."
+        kill "$pid" 2>/dev/null || true
+        rm -f "$PID_DIR/graph.pid"
     fi
     
-    if [[ -f "$PID_DIR/onnx.pid" ]]; then
-        local pid=$(cat "$PID_DIR/onnx.pid")
-        if kill -0 "$pid" 2>/dev/null; then
-            log "Stopping ONNX sidecar (PID: $pid)..."
-            kill "$pid" 2>/dev/null || true
-            rm -f "$PID_DIR/onnx.pid"
-        fi
+    if pid=$(running_pid "$PID_DIR/onnx.pid" "$ONNX_PORT"); then
+        log "Stopping ONNX sidecar (PID: $pid)..."
+        kill "$pid" 2>/dev/null || true
+        rm -f "$PID_DIR/onnx.pid"
     fi
     
     success "Intel Graph stack stopped"
@@ -239,12 +254,12 @@ status() {
     local onnx_status="${RED}stopped${NC}"
     local graph_status="${RED}stopped${NC}"
     
-    if is_running "$PID_DIR/onnx.pid"; then
-        onnx_status="${GREEN}running${NC} (PID: $(cat "$PID_DIR/onnx.pid"), port: $ONNX_PORT)"
+    if pid=$(running_pid "$PID_DIR/onnx.pid" "$ONNX_PORT"); then
+        onnx_status="${GREEN}running${NC} (PID: $pid, port: $ONNX_PORT)"
     fi
     
-    if is_running "$PID_DIR/graph.pid"; then
-        graph_status="${GREEN}running${NC} (PID: $(cat "$PID_DIR/graph.pid"), port: $GRAPH_PORT)"
+    if pid=$(running_pid "$PID_DIR/graph.pid" "$GRAPH_PORT"); then
+        graph_status="${GREEN}running${NC} (PID: $pid, port: $GRAPH_PORT)"
     fi
     
     echo ""
@@ -256,7 +271,7 @@ status() {
     echo "Embed model:    $EMBED_MODEL (${EMBED_DIM}-dim)"
     echo ""
     
-    if is_running "$PID_DIR/graph.pid"; then
+    if running_pid "$PID_DIR/graph.pid" "$GRAPH_PORT" >/dev/null; then
         echo "Web UI: http://127.0.0.1:$GRAPH_PORT"
         echo "API:    http://127.0.0.1:$GRAPH_PORT/api"
         echo "MCP:    http://127.0.0.1:$GRAPH_PORT/mcp"
@@ -270,7 +285,7 @@ timeout_watchdog() {
     
     (
         sleep $((timeout_minutes * 60))
-        if is_running "$PID_DIR/graph.pid" || is_running "$PID_DIR/onnx.pid"; then
+        if running_pid "$PID_DIR/graph.pid" "$GRAPH_PORT" || running_pid "$PID_DIR/onnx.pid" "$ONNX_PORT"; then
             warn "Timeout reached (${timeout_minutes} min). Shutting down..."
             stop_all
         fi
@@ -330,7 +345,7 @@ case "${1:-}" in
     ensure)
         # Start if not running, no-op if already running. Silent for scripting.
         ensure_dirs
-        if is_running "$PID_DIR/graph.pid" && is_running "$PID_DIR/onnx.pid"; then
+        if running_pid "$PID_DIR/graph.pid" "$GRAPH_PORT" && running_pid "$PID_DIR/onnx.pid" "$ONNX_PORT"; then
             echo '{"status":"already_running","graph_port":'$GRAPH_PORT',"mcp_endpoint":"http://127.0.0.1:'$((GRAPH_PORT+1))'/mcp"}'
         else
             start_onnx

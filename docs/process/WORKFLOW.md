@@ -19,10 +19,11 @@ The first three are the standing loop. Retrospective is not mandatory for every 
 
 At session start or when resuming meaningful work:
 
-- do Muninn bootstrap and orientation
+- do Muninn bootstrap and orientation (`just session-start` — also runs harness drift check)
 - identify the current owner of truth
 - inspect the relevant code, tests, and nearby docs
 - name the current slice and the next seam
+- if starting focused work on a seam, open a harness trial: `just harness-trial-start <seam-id>`
 
 Use:
 
@@ -52,6 +53,7 @@ At slice close or end of session:
 - update docs/tasks if current truth or active seams changed
 - store durable memory to Muninn
 - state what is working, what is incomplete, and the next highest-value seam
+- close any open harness trial: `just harness-trial-close`
 
 Use:
 
@@ -125,6 +127,7 @@ Put process rules here and in repo-local skills:
 - verification and close-out flow
 - rollout and watched-live discipline
 - worktree/workstream habits
+- harness attachment/refresh before any workstream starts
 - operator and collaborator rituals
 
 Examples in this repo:
@@ -206,12 +209,36 @@ See `$verification-orchestrator` skill for the full ladder and evidence rules.
 - **E (End)**: `check-engine` includes Graph Health Check (Check 6) — stale sessions, proposal gaps, embedding coverage
 - **R (Retrospective)**: Review `GET /api/dashboard` for agent coordination patterns
 
+## Harness Management
+
+Managed harnesses track desired/rendered/observed state for each coding agent runtime. Use these justfile recipes:
+
+- `just harness-drift` — drift report for all managed harnesses
+- `just harness-apply [harness] [profile]` — re-apply canonical profile and verify (default: `claude-local` / `philotic-operator`)
+- `just harness-trial-start <seam-id> [harness] [profile]` — begin a measured trial; session ID written to `/tmp/philotic-harness-trial-session`
+- `just harness-trial-report <activity-type> [tokens_in] [tokens_out]` — record activity against the active trial
+- `just harness-trial-close [status] [summary]` — close the active trial
+
+Canonical profiles for this repo:
+
+| Profile | Role | Skills |
+|---|---|---|
+| `philotic-operator` | orchestrator | graph-intelligence, implementation, philotic-slice-closeout, verification-orchestrator, session-hygiene, muninn-memory-habit, check-engine |
+| `philotic-implementer` | implementer | graph-intelligence, implementation, runtime-debugger, runtime-materialization, runtime-rollout-watch, subagent-delegation |
+| `philotic-reviewer` | reviewer | graph-intelligence, review, verification-ladder, verification-orchestrator, architecture-docs-maintainer, proposal-maintainer |
+| `philotic-orchestrator` | orchestrator | graph-intelligence, planning, multi-agent-orchestration, subagent-delegation, session-hygiene, proposal-maintainer, muninn-memory-habit |
+| `philotic-verifier` | verifier | graph-intelligence, verification, verification-ladder, verification-orchestrator, runtime-rollout-watch, philotic-slice-closeout, check-engine |
+
+Registered harnesses: `claude-local` (philotic-operator), `claude-native` (philotic-orchestrator), `windsurf-native` (orchestrator), plus codex harnesses.
+
 ## Skills Map
 
 Use repo-local skills for process execution:
 
 - `graph-intelligence` — graph as primary context source, MCP tool reference, agent workflow
 - `session-hygiene` — session lifecycle monitoring, stale cleanup, coordination health
+- `multi-agent-orchestration` — coordinating implementer/reviewer/verifier/orchestrator roles on one workstream
+- `windsurf-harness-setup` — single-harness multi-role configuration for windsurf-native
 - `verification-orchestrator` — SVER state, test-run pipeline, verification evidence
 - `proposal-pipeline` — proposal lifecycle, disposition management, metadata hygiene
 - `check-engine` — end-of-session review (now includes graph health check)

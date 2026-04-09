@@ -1,5 +1,5 @@
-use philotic_graph::sver::{self, ProposalStatus};
 use philotic_graph::fleet;
+use philotic_graph::sver::{self, ProposalStatus};
 
 #[test]
 fn test_valid_transitions() {

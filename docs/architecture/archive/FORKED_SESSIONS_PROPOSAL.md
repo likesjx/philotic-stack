@@ -1,3 +1,17 @@
+---
+title: Philotic Forked Sessions Proposal
+doc_type: historical
+domain: runtime-sessions
+status: historical
+last_updated: 2026-04-08
+tags:
+- archived
+- proposal
+- sessions
+related_docs:
+- ARCHITECTURE_STATUS.md
+---
+
 # Philotic Forked Sessions Proposal
 
 ## Goal

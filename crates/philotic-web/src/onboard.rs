@@ -130,7 +130,11 @@ pub async fn run_interactive(config_path: &Path, force: bool) -> Result<()> {
                     .without_confirmation()
                     .prompt()
                     .unwrap_or_default();
-                    if token.is_empty() { None } else { Some(token) }
+                    if token.is_empty() {
+                        None
+                    } else {
+                        Some(token)
+                    }
                 } else {
                     None
                 };
@@ -248,9 +252,17 @@ pub async fn run_interactive(config_path: &Path, force: bool) -> Result<()> {
 
     println!();
     println!("  ✓ Config written to {}", config_path.display());
-    println!("  ✓ {} agent{} configured", agent_count, if agent_count > 1 { "s" } else { "" });
+    println!(
+        "  ✓ {} agent{} configured",
+        agent_count,
+        if agent_count > 1 { "s" } else { "" }
+    );
     if telegram_count > 0 {
-        println!("  ✓ {} Telegram bot{} connected", telegram_count, if telegram_count > 1 { "s" } else { "" });
+        println!(
+            "  ✓ {} Telegram bot{} connected",
+            telegram_count,
+            if telegram_count > 1 { "s" } else { "" }
+        );
     }
     if !elevenlabs_key.is_empty() {
         println!("  ✓ ElevenLabs voice enabled");

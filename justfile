@@ -23,6 +23,45 @@ install-git-hooks:
 # Mandatory Muninn bootstrap gate for meaningful sessions.
 session-start:
     python3 scripts/muninn_mcp.py bootstrap
+    @just harness-drift 2>/dev/null || true
+
+# Show drift status for all managed harnesses.
+harness-drift:
+    @phil graph harness drift
+
+# Re-apply the canonical profile to a harness (default: claude-local with philotic-operator).
+harness-apply harness="claude-local" profile="philotic-operator":
+    phil graph harness apply {{harness}} --profile {{profile}}
+    phil graph harness verify {{harness}}
+
+# Start a measured harness trial for focused work on a seam.
+# Usage: just harness-trial-start <seam-id> [harness] [profile]
+harness-trial-start seam harness="claude-local" profile="philotic-operator":
+    #!/usr/bin/env bash
+    SESSION=$(phil graph harness trials start {{harness}} {{seam}} \
+      --profile {{profile}} --agent claude --agent-model claude-sonnet-4-6 2>&1 | grep -oE 'session:[^ ]+' | head -1)
+    echo "Trial started: $SESSION"
+    echo "$SESSION" > /tmp/philotic-harness-trial-session
+
+# Report activity against the current harness trial.
+# Usage: just harness-trial-report <activity-type> [tokens_in] [tokens_out]
+harness-trial-report activity tokens_in="0" tokens_out="0":
+    #!/usr/bin/env bash
+    SESSION=$(cat /tmp/philotic-harness-trial-session 2>/dev/null || echo "")
+    if [ -z "$SESSION" ]; then echo "No active trial session (run harness-trial-start first)"; exit 1; fi
+    phil graph harness trials report "$SESSION" {{activity}} \
+      --tokens-input {{tokens_in}} --tokens-output {{tokens_out}}
+
+# Close the current harness trial.
+# Usage: just harness-trial-close [status] [summary]
+harness-trial-close status="completed" summary="":
+    #!/usr/bin/env bash
+    SESSION=$(cat /tmp/philotic-harness-trial-session 2>/dev/null || echo "")
+    if [ -z "$SESSION" ]; then echo "No active trial session found"; exit 1; fi
+    phil graph harness trials close "$SESSION" --status {{status}} \
+      $([ -n "{{summary}}" ] && echo "--summary '{{summary}}'")
+    rm -f /tmp/philotic-harness-trial-session
+    echo "Trial closed: $SESSION"
 
 # Merge mesh-config.secrets.json into mesh-config.json.
 # mesh-config.secrets.json holds only rotating secrets (API keys, bot tokens).

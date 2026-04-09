@@ -20,12 +20,10 @@ const MEMBRANE_ERROR_BACKOFF_INITIAL_SECS: u64 = 1;
 const MEMBRANE_ERROR_BACKOFF_MAX_SECS: u64 = 600;
 
 fn next_error_backoff_secs(current_secs: u64) -> u64 {
-    current_secs
-        .saturating_mul(2)
-        .clamp(
-            MEMBRANE_ERROR_BACKOFF_INITIAL_SECS,
-            MEMBRANE_ERROR_BACKOFF_MAX_SECS,
-        )
+    current_secs.saturating_mul(2).clamp(
+        MEMBRANE_ERROR_BACKOFF_INITIAL_SECS,
+        MEMBRANE_ERROR_BACKOFF_MAX_SECS,
+    )
 }
 
 fn local_node_id() -> String {
@@ -705,7 +703,11 @@ fn strip_attribution_tag(content: &str) -> (String, Option<String>) {
     let trimmed = content.trim_end();
     if let Some(tag_start) = trimmed.rfind("\n@agent:") {
         let role = trimmed[tag_start + "\n@agent:".len()..].trim().to_string();
-        if !role.is_empty() && role.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+        if !role.is_empty()
+            && role
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        {
             let clean = trimmed[..tag_start].trim_end().to_string();
             return (clean, Some(role));
         }
@@ -840,13 +842,29 @@ async fn upsert_formatted_text(
             Some(message_id)
         }
         _ => {
-            let markup = if last_idx == 0 { reply_markup.clone() } else { None };
-            send_telegram_text(http_client, tg_base, chat_id, thread_id, first_chunk, markup).await
+            let markup = if last_idx == 0 {
+                reply_markup.clone()
+            } else {
+                None
+            };
+            send_telegram_text(
+                http_client,
+                tg_base,
+                chat_id,
+                thread_id,
+                first_chunk,
+                markup,
+            )
+            .await
         }
     };
 
     for (i, chunk) in chunks.iter().enumerate().skip(1) {
-        let markup = if i == last_idx { reply_markup.clone() } else { None };
+        let markup = if i == last_idx {
+            reply_markup.clone()
+        } else {
+            None
+        };
         send_telegram_text(http_client, tg_base, chat_id, thread_id, chunk, markup).await;
     }
 

@@ -123,8 +123,8 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "explain the remote model placement smoke".to_string());
     // The source hotel's node ID — used as task target and final reply destination.
     // Defaults to the legacy static node ID for backwards compatibility.
-    let local_node_id = std::env::var("PHILOTIC_NODE_ID")
-        .unwrap_or_else(|_| "local-aiua-01".to_string());
+    let local_node_id =
+        std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string());
     // Optional: direct UDS socket path of the remote hotel for cross-hotel forwarding
     // in smoke environments where mesh beaconing is not running.
     let remote_socket_path = std::env::var("PHILOTIC_REMOTE_HOTEL_SOCKET").ok();

@@ -42,7 +42,10 @@ impl C4Level {
             | NodeKind::HarnessSkill
             | NodeKind::HarnessProfile
             | NodeKind::CanonicalProfile
-            | NodeKind::CanonicalWorkflow => Some(Self::Context),
+            | NodeKind::CanonicalWorkflow
+            // Profile projection tracking
+            | NodeKind::ProfileDefinition
+            | NodeKind::RoleCharter => Some(Self::Context),
 
             // C2: Container level
             NodeKind::Crate | NodeKind::Worktree | NodeKind::Workstream | NodeKind::Component => {
@@ -131,6 +134,9 @@ pub enum NodeKind {
     HarnessObservation,
     HarnessDrift,
     HarnessRollout,
+    // Profile projection tracking
+    ProfileDefinition,
+    RoleCharter,
     Agent,
     Session,
     Decision,
@@ -173,6 +179,9 @@ impl NodeKind {
             Self::HarnessObservation => "harness_observation",
             Self::HarnessDrift => "harness_drift",
             Self::HarnessRollout => "harness_rollout",
+            // Profile projection tracking
+            Self::ProfileDefinition => "profile_definition",
+            Self::RoleCharter => "role_charter",
             Self::Agent => "agent",
             Self::Session => "session",
             Self::Decision => "decision",
@@ -214,6 +223,9 @@ impl NodeKind {
             "harness_observation" => Some(Self::HarnessObservation),
             "harness_drift" => Some(Self::HarnessDrift),
             "harness_rollout" => Some(Self::HarnessRollout),
+            // Profile projection tracking
+            "profile_definition" => Some(Self::ProfileDefinition),
+            "role_charter" => Some(Self::RoleCharter),
             "agent" => Some(Self::Agent),
             "session" => Some(Self::Session),
             "decision" => Some(Self::Decision),
@@ -475,5 +487,7 @@ pub fn should_embed(kind: NodeKind) -> bool {
             | NodeKind::Harness
             | NodeKind::HarnessSkill
             | NodeKind::HarnessProfile
+            | NodeKind::ProfileDefinition
+            | NodeKind::RoleCharter
     )
 }

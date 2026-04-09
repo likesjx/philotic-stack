@@ -9,13 +9,13 @@
 /// Does NOT handle:
 /// - Opus codec encode/decode (that's voice_codec.rs)
 /// - WebRTC bridging (that's voice_bridge.rs, Slice 2)
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use byteorder::{BigEndian, ByteOrder};
 use std::{
     net::{IpAddr, SocketAddr},
     sync::{
-        atomic::{AtomicU16, AtomicU32, Ordering},
         Arc,
+        atomic::{AtomicU16, AtomicU32, Ordering},
     },
 };
 use tokio::net::UdpSocket;
@@ -184,7 +184,10 @@ impl VoiceUdpTransport {
 
         // Validate RTP version byte
         if packet[0] != RTP_VERSION_FLAGS {
-            debug!("Voice UDP: unexpected RTP version byte 0x{:02x}, skipping", packet[0]);
+            debug!(
+                "Voice UDP: unexpected RTP version byte 0x{:02x}, skipping",
+                packet[0]
+            );
             return Ok(None);
         }
 

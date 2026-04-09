@@ -17,9 +17,9 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use clap::{Parser, Subcommand, ValueEnum};
 use philotic_client::{
-    GuestIdentity, IpcRequest, IpcResponse, OperatorSurfaceQueryHandoff,
-    OperatorTargetGuestInventoryView, OperatorTargetStatusView, PhiloticClient,
-    OPERATOR_SURFACE_QUERY_HANDOFF_KIND, OPERATOR_SURFACE_QUERY_ROLE,
+    GuestIdentity, IpcRequest, IpcResponse, OPERATOR_SURFACE_QUERY_HANDOFF_KIND,
+    OPERATOR_SURFACE_QUERY_ROLE, OperatorSurfaceQueryHandoff, OperatorTargetGuestInventoryView,
+    OperatorTargetStatusView, PhiloticClient,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
@@ -148,10 +148,7 @@ async fn run_operator_surface_query_worker(
                 continue;
             }
             Err(err) => {
-                warn!(
-                    "Operator surface query worker failed to subscribe: {}",
-                    err
-                );
+                warn!("Operator surface query worker failed to subscribe: {}", err);
                 continue;
             }
         }
@@ -227,37 +224,29 @@ async fn handle_operator_surface_query_task(
                 note: Some("derived from the target hotel's canonical guest table".into()),
             })?
         }
-        "operator.targets.status" => {
-            serde_json::to_string(&OperatorTargetStatusView {
+        "operator.targets.status" => serde_json::to_string(&OperatorTargetStatusView {
+            target_node_id: local_node_id.to_string(),
+            target_hotel: hotel.hotel.clone(),
+            source_hotel: hotel.hotel,
+            observation_kind: "remote-canonical".into(),
+            daemon_status: hotel.daemon,
+            freshness_state: "remote-query-now".into(),
+            freshness_age_secs: 0,
+            freshness_ttl_secs: 0,
+            reachability: None,
+            note: Some("derived from the target hotel's canonical status view".into()),
+        })?,
+        "operator.targets.agents" => serde_json::to_string(&match client
+            .send_request(IpcRequest::QueryOperatorTargetAgents {
                 target_node_id: local_node_id.to_string(),
-                target_hotel: hotel.hotel.clone(),
-                source_hotel: hotel.hotel,
-                observation_kind: "remote-canonical".into(),
-                daemon_status: hotel.daemon,
-                freshness_state: "remote-query-now".into(),
-                freshness_age_secs: 0,
-                freshness_ttl_secs: 0,
-                reachability: None,
-                note: Some("derived from the target hotel's canonical status view".into()),
-            })?
-        }
-        "operator.targets.agents" => {
-            serde_json::to_string(
-                &match client
-                    .send_request(IpcRequest::QueryOperatorTargetAgents {
-                        target_node_id: local_node_id.to_string(),
-                    })
-                    .await?
-                {
-                    IpcResponse::OperatorTargetAgentsView {
-                        operator_target_agents,
-                    } => operator_target_agents,
-                    other => anyhow::bail!(
-                        "unexpected operator target agents response: {other:?}"
-                    ),
-                },
-            )?
-        }
+            })
+            .await?
+        {
+            IpcResponse::OperatorTargetAgentsView {
+                operator_target_agents,
+            } => operator_target_agents,
+            other => anyhow::bail!("unexpected operator target agents response: {other:?}"),
+        })?,
         _ => return Ok(()),
     };
 
@@ -667,19 +656,17 @@ fn handle_cron_fired_broadcast(graph: &GraphDomain, payload_json: &str) {
             if job.next_fire_at != parsed.fire_epoch {
                 return; // epoch mismatch — stale or duplicate broadcast
             }
-            let next = match ansible_mesh_core::cron::next_fire_after(
-                &job.schedule,
-                parsed.fire_epoch,
-            ) {
-                Ok(n) => n,
-                Err(e) => {
-                    warn!(
-                        "handle_cron_fired_broadcast: no next fire for job {}: {e}",
-                        parsed.job_id
-                    );
-                    return;
-                }
-            };
+            let next =
+                match ansible_mesh_core::cron::next_fire_after(&job.schedule, parsed.fire_epoch) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        warn!(
+                            "handle_cron_fired_broadcast: no next fire for job {}: {e}",
+                            parsed.job_id
+                        );
+                        return;
+                    }
+                };
             let mut updated = job;
             updated.last_fired_epoch = Some(parsed.fire_epoch);
             updated.next_fire_at = next;
@@ -759,10 +746,7 @@ fn handle_cron_job_sync(graph: &GraphDomain, payload_json: &str) {
     }
 }
 
-fn mesh_target_addr_for_node(
-    graph: &GraphDomain,
-    target_node_id: &str,
-) -> Result<Option<String>> {
+fn mesh_target_addr_for_node(graph: &GraphDomain, target_node_id: &str) -> Result<Option<String>> {
     Ok(graph
         .list_hotels()?
         .into_iter()
@@ -1856,12 +1840,7 @@ fn deactivate_legacy_managed_guests(
                 || (!guest.guest_id.starts_with(&format!("{hotel_name}:"))
                     && matches!(
                         guest.role.as_str(),
-                        "agent"
-                            | "hegemon"
-                            | "membrane"
-                            | "model"
-                            | "model.elevenlabs"
-                            | "tool"
+                        "agent" | "hegemon" | "membrane" | "model" | "model.elevenlabs" | "tool"
                     ))
         })
         .map(|mut guest| {
@@ -2192,10 +2171,7 @@ Approval posture:
 /// This ensures every agent has a fully populated toolset and manifest from the first session
 /// turn, breaking the chicken-and-egg where role.configure requires tools that only appear
 /// after a role exists.
-fn seed_orchestrator_roles(
-    graph: &GraphDomain,
-    profiles: &[AgentProfile],
-) -> anyhow::Result<()> {
+fn seed_orchestrator_roles(graph: &GraphDomain, profiles: &[AgentProfile]) -> anyhow::Result<()> {
     for profile in profiles {
         let record = ansible_mesh_core::graph::RoleIncarnationRecord {
             agent_id: profile.agent_id.clone(),
@@ -4985,12 +4961,15 @@ async fn main() -> Result<()> {
                 count += 1;
             }
         }
-        info!("Graceful drain signal sent to {} guest subscriber(s).", count);
+        info!(
+            "Graceful drain signal sent to {} guest subscriber(s).",
+            count
+        );
     }
 
     // Phase 2: wait for guest PIDs to exit (poll every 500ms, up to DRAIN_TIMEOUT_SECS).
-    let drain_deadline = tokio::time::Instant::now()
-        + tokio::time::Duration::from_secs(DRAIN_TIMEOUT_SECS);
+    let drain_deadline =
+        tokio::time::Instant::now() + tokio::time::Duration::from_secs(DRAIN_TIMEOUT_SECS);
     loop {
         let all_gone = {
             let guard = ipc_inboxes.lock().await;
@@ -5605,8 +5584,12 @@ mod tests {
             .seed_guests("startup-test-hotel", &guests)
             .expect("seed guests");
 
-        enable_guest_test_overrides(&graph_domain, "startup-test-hotel", StartupTest::TextRoundTrip)
-            .expect("apply startup overrides");
+        enable_guest_test_overrides(
+            &graph_domain,
+            "startup-test-hotel",
+            StartupTest::TextRoundTrip,
+        )
+        .expect("apply startup overrides");
 
         let stored = graph_domain
             .list_guests("startup-test-hotel", false)

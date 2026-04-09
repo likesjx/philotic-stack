@@ -1,3 +1,17 @@
+---
+title: Philotic Slash Commands Proposal
+doc_type: historical
+domain: membrane-transport
+status: historical
+last_updated: 2026-04-08
+tags:
+- archived
+- proposal
+- commands
+related_docs:
+- ARCHITECTURE_STATUS.md
+---
+
 # Philotic Slash Commands Proposal
 
 ## Goal

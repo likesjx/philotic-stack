@@ -4,10 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// Records a graph decision as a Muninn memory.
 /// This allows agents to recall past decisions through Muninn's cognitive search.
-pub async fn bridge_decision_to_muninn(
-    muninn_endpoint: &str,
-    mutation: &Mutation,
-) -> Result<()> {
+pub async fn bridge_decision_to_muninn(muninn_endpoint: &str, mutation: &Mutation) -> Result<()> {
     let memory_text = format_decision_as_memory(mutation);
 
     let client = reqwest::Client::new();

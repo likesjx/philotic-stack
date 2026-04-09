@@ -176,18 +176,11 @@ impl PolicyAssertion {
     /// Map to the `(config_path, value)` pair consumed by `apply_configure`.
     pub fn to_configure_args(&self) -> (&'static str, serde_json::Value) {
         match self {
-            Self::SetVoiceAction(v) => (
-                "media_routing_policy.voice_action",
-                serde_json::json!(v),
-            ),
-            Self::SetImageAction(v) => (
-                "media_routing_policy.image_action",
-                serde_json::json!(v),
-            ),
-            Self::SetDocumentAction(v) => (
-                "media_routing_policy.document_action",
-                serde_json::json!(v),
-            ),
+            Self::SetVoiceAction(v) => ("media_routing_policy.voice_action", serde_json::json!(v)),
+            Self::SetImageAction(v) => ("media_routing_policy.image_action", serde_json::json!(v)),
+            Self::SetDocumentAction(v) => {
+                ("media_routing_policy.document_action", serde_json::json!(v))
+            }
             Self::SetForwardMedia(v) => (
                 "media_routing_policy.forward_media_to_model",
                 serde_json::json!(v),
@@ -447,7 +440,8 @@ impl ReflexEngine {
                 vec![PolicyAssertion::SetTtsMode("auto".into())]
             }
             ReflexEvent::CapabilityRemoved(CapabilityKind::ElevenLabsTts) => {
-                self.active_capabilities.retain(|c| c != &CapabilityKind::ElevenLabsTts);
+                self.active_capabilities
+                    .retain(|c| c != &CapabilityKind::ElevenLabsTts);
                 // Only fall back to off if there's no operator override keeping it on.
                 let operator_pinning = self.overrides.iter().any(|o| {
                     o.source == OverrideSource::Operator
@@ -518,12 +512,13 @@ mod tests {
         let mut engine = ReflexEngine::new();
         let assertions = engine.apply_materialization(&discord_voice_ctx());
 
-        let voice_action = assertions.iter().find(|a| {
-            matches!(a, PolicyAssertion::SetVoiceAction(_))
-        });
-        let tts_mode = assertions.iter().filter(|a| {
-            matches!(a, PolicyAssertion::SetTtsMode(_))
-        }).count();
+        let voice_action = assertions
+            .iter()
+            .find(|a| matches!(a, PolicyAssertion::SetVoiceAction(_)));
+        let tts_mode = assertions
+            .iter()
+            .filter(|a| matches!(a, PolicyAssertion::SetTtsMode(_)))
+            .count();
 
         assert!(
             matches!(voice_action, Some(PolicyAssertion::SetVoiceAction(s)) if s == "transcribe"),
@@ -600,7 +595,10 @@ mod tests {
     fn context_pressure_strips_tools_on_media() {
         let mut engine = ReflexEngine::new();
         let assertions = engine.handle_event(&ReflexEvent::ContextPressure { used_pct: 85 });
-        assert_eq!(assertions, vec![PolicyAssertion::SetStripToolsOnMedia(true)]);
+        assert_eq!(
+            assertions,
+            vec![PolicyAssertion::SetStripToolsOnMedia(true)]
+        );
     }
 
     #[test]

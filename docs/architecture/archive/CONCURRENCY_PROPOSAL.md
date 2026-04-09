@@ -1,3 +1,17 @@
+---
+title: Concurrency Proposal
+doc_type: historical
+domain: runtime-sessions
+status: historical
+last_updated: 2026-04-08
+tags:
+- archived
+- proposal
+- concurrency
+related_docs:
+- ARCHITECTURE_STATUS.md
+---
+
 # Concurrency Proposal
 
 ## Goal

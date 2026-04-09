@@ -25,7 +25,7 @@ struct DocFrontmatter {
     implemented_by: Option<Vec<String>>,
     active_seams: Option<Vec<String>>,
     source_of_truth_targets: Option<Vec<String>>,
-    tags: Option<String>,
+    tags: Option<Vec<String>>,
     last_updated: Option<String>,
     sver: Option<String>,
 }
@@ -154,7 +154,10 @@ pub fn scan_docs(root: &Path, engine: &GraphEngine) -> Result<usize> {
 
         let scanned_properties = serde_json::json!({
             "status": frontmatter.status,
-            "disposition": frontmatter.disposition,
+            "disposition": frontmatter
+                .disposition
+                .clone()
+                .or_else(|| normalize_disposition(frontmatter.status.as_deref())),
             "domain": frontmatter.domain,
             "doc_type": frontmatter.doc_type,
             "tags": frontmatter.tags,
@@ -668,4 +671,70 @@ fn slugify(s: &str) -> String {
         .chars()
         .filter(|c| c.is_alphanumeric() || *c == '-')
         .collect()
+}
+
+fn normalize_disposition(status: Option<&str>) -> Option<String> {
+    let status = status?.trim();
+
+    match status {
+        "proposed" | "draft" => Some("proposed".to_string()),
+        "accepted-current-slice" | "accepted for current slice" | "accepted_current_slice" => {
+            Some("accepted-current-slice".to_string())
+        }
+        "in-progress" | "in progress" | "active" => Some("accepted-current-slice".to_string()),
+        "implemented" => Some("implemented".to_string()),
+        "superseded" => Some("superseded".to_string()),
+        "deferred" => Some("deferred".to_string()),
+        other => Some(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_disposition, parse_frontmatter};
+
+    #[test]
+    fn parses_array_tags_and_status_fields() {
+        let content = r#"---
+title: Example Proposal
+doc_type: proposal
+domain: runtime-sessions
+status: implemented
+tags:
+  - sessions
+  - approvals
+related_docs:
+  - ARCHITECTURE_STATUS.md
+---
+
+# Body
+"#;
+
+        let (frontmatter, body) = parse_frontmatter(content);
+        assert_eq!(frontmatter.title.as_deref(), Some("Example Proposal"));
+        assert_eq!(frontmatter.doc_type.as_deref(), Some("proposal"));
+        assert_eq!(frontmatter.domain.as_deref(), Some("runtime-sessions"));
+        assert_eq!(frontmatter.status.as_deref(), Some("implemented"));
+        assert_eq!(
+            frontmatter.tags.as_ref().unwrap(),
+            &vec!["sessions".to_string(), "approvals".to_string()]
+        );
+        assert!(body.contains("# Body"));
+    }
+
+    #[test]
+    fn normalizes_common_disposition_aliases() {
+        assert_eq!(
+            normalize_disposition(Some("draft")).as_deref(),
+            Some("proposed")
+        );
+        assert_eq!(
+            normalize_disposition(Some("in-progress")).as_deref(),
+            Some("accepted-current-slice")
+        );
+        assert_eq!(
+            normalize_disposition(Some("implemented")).as_deref(),
+            Some("implemented")
+        );
+    }
 }
