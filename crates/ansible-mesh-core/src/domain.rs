@@ -21,7 +21,7 @@ use crate::graph::{
 use crate::storage::{
     AgentIdentityRecord, GraphAdapter, GraphRunnerInstanceRecord, GuestRecord, HotelRecord,
     SecretRecord, SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,
-    VaultRegistryEntry, CONFIG_GRAPH_RUNNER_REGISTRY, CONFIG_MUNINN_ENDPOINT,
+    UserProfile, VaultRegistryEntry, CONFIG_GRAPH_RUNNER_REGISTRY, CONFIG_MUNINN_ENDPOINT,
     CONFIG_VAULT_REGISTRY,
 };
 use crate::NodeCapabilities;
@@ -54,6 +54,7 @@ pub const NODE_KIND_NODE_CAPABILITIES: &str = "node_capabilities";
 pub const NODE_KIND_CONFIG: &str = "config";
 pub const NODE_KIND_APARTMENT: &str = "apartment";
 pub const NODE_KIND_CRON_JOB: &str = "cron_job";
+pub const NODE_KIND_USER_PROFILE: &str = "user_profile";
 
 // ── GraphDomain ───────────────────────────────────────────────────────────────
 
@@ -738,6 +739,33 @@ impl GraphDomain {
                     .context("GraphDomain::list_toolset_profiles: deserialize ToolsetProfileRecord")
             })
             .collect()
+    }
+
+    // ── User profile ──────────────────────────────────────────────────────────
+
+    fn user_profile_key(hotel_name: &str) -> String {
+        format!("{}:{}", NODE_KIND_USER_PROFILE, hotel_name)
+    }
+
+    pub fn upsert_user_profile(&self, hotel_name: &str, profile: &UserProfile) -> Result<()> {
+        let data = serde_json::to_value(profile)
+            .context("GraphDomain::upsert_user_profile: serialize UserProfile")?;
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::user_profile_key(hotel_name),
+            kind: NODE_KIND_USER_PROFILE.to_string(),
+            label: Some(hotel_name.to_string()),
+            data,
+        })
+    }
+
+    pub fn get_user_profile(&self, hotel_name: &str) -> Result<Option<UserProfile>> {
+        self.adapter
+            .get_node(&Self::user_profile_key(hotel_name))?
+            .map(|n| {
+                serde_json::from_value(n.data)
+                    .context("GraphDomain::get_user_profile: deserialize UserProfile")
+            })
+            .transpose()
     }
 
     // ── Node capabilities ─────────────────────────────────────────────────────

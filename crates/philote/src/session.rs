@@ -646,6 +646,11 @@ pub struct AgentProfile {
     /// `delegate.whisper` skill guidance) is present from turn zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_role_name: Option<String>,
+    /// IANA timezone name for the human user (e.g. `"America/New_York"`).
+    /// Injected into the cognitive header so the model can interpret relative
+    /// time references correctly. Optional; UTC is assumed when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_timezone: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1270,6 +1275,15 @@ impl SessionState {
                         .to_string(),
                 );
                 Ok("Updated profile.persona_name.".into())
+            }
+            "profile.user_timezone" => {
+                self.agent_profile.user_timezone = Some(
+                    value
+                        .as_str()
+                        .ok_or("profile.user_timezone requires a string value")?
+                        .to_string(),
+                );
+                Ok("Updated profile.user_timezone.".into())
             }
             "profile.soul_text" => {
                 self.agent_profile.soul_text = Some(
@@ -2230,13 +2244,22 @@ impl SessionState {
 
     fn render_prompt_from_projection(&self, projection: &ContextProjection) -> String {
         let mut prompt = String::new();
+        let tz_suffix = self
+            .agent_profile
+            .user_timezone
+            .as_deref()
+            .map(|tz| format!(" (user timezone: {tz})"))
+            .unwrap_or_default();
         let persona_line = if let Some(ref name) = self.agent_profile.persona_name {
             format!(
-                "Name: {name}\nCurrent date and time (UTC): {}\n",
+                "Name: {name}\nCurrent date and time (UTC): {}{tz_suffix}\n",
                 utc_datetime_string()
             )
         } else {
-            format!("Current date and time (UTC): {}\n", utc_datetime_string())
+            format!(
+                "Current date and time (UTC): {}{tz_suffix}\n",
+                utc_datetime_string()
+            )
         };
         prompt.push_str(&format!("[System]\n{persona_line}"));
         for layer in &projection.layers {
@@ -2643,7 +2666,12 @@ impl SessionState {
             return String::new();
         }
 
-        let mut out = String::from("[Recalled memory]\n");
+        let mut out = String::from(
+            "[Recalled memory]\n\
+             Note: if a memory describes an event (something that happened), \
+             it must include a timestamp in its content. \
+             When writing new memories of this kind, always include an ISO 8601 date.\n",
+        );
         for (i, memory) in turn.recalled_memories.iter().enumerate() {
             out.push_str(&format!(
                 "{}. [{}] {}",

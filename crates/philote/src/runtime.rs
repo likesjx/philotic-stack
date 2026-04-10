@@ -559,6 +559,32 @@ impl AgentRuntime {
                 warn!("Unexpected response to agent bundle fetch — using default profile.");
             }
         }
+
+        // Fetch hotel-level user profile and inject into agent profile when the
+        // agent-specific profile doesn't already override the field.
+        let hotel_name = local_node_id();
+        match self
+            .ipc_client
+            .send_request(IpcRequest::GetUserProfile {
+                hotel_name: hotel_name.clone(),
+            })
+            .await
+        {
+            Ok(IpcResponse::UserProfileData {
+                timezone,
+                display_name: _,
+            }) => {
+                if self.default_agent_profile.user_timezone.is_none() {
+                    if let Some(tz) = timezone {
+                        info!(hotel = %hotel_name, tz = %tz, "Injecting user timezone from hotel user profile.");
+                        self.default_agent_profile.user_timezone = Some(tz);
+                    }
+                }
+            }
+            Ok(_) | Err(_) => {
+                // Non-fatal — hotel may not have a user profile configured yet.
+            }
+        }
     }
 
     /// Fetch a role incarnation from the hotel and return a `RoleActivation` for it.

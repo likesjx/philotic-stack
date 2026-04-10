@@ -4546,6 +4546,48 @@ impl IpcServer {
                     ),
                 }
             }
+            IpcRequest::GetUserProfile { hotel_name } => {
+                match graph.get_user_profile(&hotel_name) {
+                    Ok(Some(p)) => IpcResponse::UserProfileData {
+                        timezone: p.timezone,
+                        display_name: p.display_name,
+                    },
+                    Ok(None) => IpcResponse::UserProfileData {
+                        timezone: None,
+                        display_name: None,
+                    },
+                    Err(e) => IpcResponse::error(
+                        "get_user_profile",
+                        "GET_USER_PROFILE_ERROR",
+                        e.to_string(),
+                    ),
+                }
+            }
+            IpcRequest::PatchUserProfile {
+                hotel_name,
+                timezone,
+                display_name,
+            } => {
+                let existing = graph
+                    .get_user_profile(&hotel_name)
+                    .unwrap_or_default()
+                    .unwrap_or_default();
+                let updated = ansible_mesh_core::storage::UserProfile {
+                    timezone: timezone.or(existing.timezone),
+                    display_name: display_name.or(existing.display_name),
+                };
+                match graph.upsert_user_profile(&hotel_name, &updated) {
+                    Ok(()) => IpcResponse::UserProfileData {
+                        timezone: updated.timezone,
+                        display_name: updated.display_name,
+                    },
+                    Err(e) => IpcResponse::error(
+                        "patch_user_profile",
+                        "PATCH_USER_PROFILE_ERROR",
+                        e.to_string(),
+                    ),
+                }
+            }
             IpcRequest::AssignSkill {
                 agent_id,
                 role_name,
