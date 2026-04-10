@@ -3,7 +3,7 @@ title: Philotic Architecture Status
 doc_type: status
 domain: runtime-sessions
 status: active
-last_updated: 2026-04-01
+last_updated: 2026-04-10
 tags:
 - source-of-truth
 - current-state
@@ -69,6 +69,7 @@ Philotic currently operates as a hotel-centered runtime:
 - canonical session state now lives in the context graph, while apartment-style checkpoints remain derived recovery projections rather than a competing source of truth.
 - Telegram ingress is session-aware and guarded by hotel-owned poll-lease authority, with explicit delegated remote polling available as a transitional exception; Telegram hotels should now materialize `membrane-telegram` directly while the bare `membrane` binary remains a transitional compatibility wrapper.
 - local and remote execution routing both exist, but several placement, delegation, and admin/control-plane seams are still under active development.
+- the primitives split is now implemented in repo truth: `philotic-primitives-mesh` owns envelope and node identity types, `philotic-primitives-hotel` owns hotel/runtime capability records, `philotic-primitives-data` owns generic graph/storage primitives, `philotic-primitives-agent` owns agent/session/memory primitives, `philotic-primitives-tool` owns tool/skill governance and tool runner route/config envelopes, and `philotic-primitives-model` owns model-routing DTOs while `ansible-mesh-core` remains a transitional compatibility shim for reexports and legacy module paths; `model-router` now owns the `model_manager` runtime wiring.
 
 ## Implemented Foundations
 
@@ -124,7 +125,7 @@ Primary references:
 
 - abstract tool catalog seeding exists in the context graph
 - tool assembly uses catalog-backed metadata and approval annotations
-- local workspace tooling exists through `tool-runner`, although broader routed error-envelope and management-plane work remains incomplete
+- local workspace tooling exists through `tool-runner`, and its shell path (`bash.exec`) can now delegate to `philotic-sandbox` as the backing enforcement worker when sandbox mode is configured, although broader routed error-envelope and management-plane work remains incomplete
 - `model-router` is the shared model execution boundary for current providers
 
 Primary references:
