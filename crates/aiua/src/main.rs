@@ -1,9 +1,5 @@
 use ansible_mesh_core::beacon::BeaconDaemon;
-use ansible_mesh_core::catalog_rights::{component_right, skill_right, tool_right};
-use ansible_mesh_core::graph::{
-    AbstractModelRecord, AbstractRightRecord, AbstractSkillRecord, AbstractToolRecord,
-    ToolsetProfileRecord, WorkflowSkillRecord,
-};
+use ansible_mesh_core::graph::{AbstractSkillRecord, AbstractToolRecord, ToolsetProfileRecord};
 use ansible_mesh_core::heartbeat::emit_heartbeat;
 use ansible_mesh_core::registry::{CapabilityAdvertisement, ExecutionReachability, NodeRegistry};
 use ansible_mesh_core::storage::{
@@ -12,7 +8,6 @@ use ansible_mesh_core::storage::{
 use ansible_mesh_core::{NodeCapabilities, NodeRole};
 use anyhow::{Context, Result};
 use axum::body::{Body, to_bytes};
-use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, Query, Request, State};
 use axum::http::{Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -26,7 +21,6 @@ use philotic_client::{
     OPERATOR_SURFACE_QUERY_ROLE, OperatorSurfaceQueryHandoff, OperatorTargetGuestInventoryView,
     OperatorTargetStatusView, PhiloticClient,
 };
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
@@ -37,6 +31,7 @@ use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
 mod auth;
+mod dream;
 mod graph;
 mod memory;
 mod muninn_provision;
@@ -66,50 +61,6 @@ use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::event::EventEnvelope;
 use auth::AuthCommand;
 use vault::{SecretInput, store_secret};
-
-const ROLE_AUTHORING_SKILL_MD: &str = include_str!("../../../skills/role-authoring/SKILL.md");
-const ROLE_CREATE_OR_UPDATE_WORKFLOW_MD: &str =
-    include_str!("../../../workflows/role-create-or-update/WORKFLOW.md");
-
-#[derive(Debug, Deserialize)]
-struct RepoCatalogSkillFrontmatter {
-    skill_name: String,
-    #[serde(default)]
-    implied_tools: Vec<String>,
-    #[serde(default)]
-    validation_state: Option<String>,
-    #[serde(default)]
-    skill_markers: Vec<String>,
-    #[serde(default)]
-    field_sources: serde_json::Value,
-}
-
-#[derive(Debug, Deserialize)]
-struct RepoSkillFrontmatter {
-    name: String,
-    description: String,
-    catalog: RepoCatalogSkillFrontmatter,
-}
-
-#[derive(Debug, Deserialize)]
-struct RepoWorkflowCatalogFrontmatter {
-    workflow_name: String,
-    workflow_kind: String,
-    owner_scope: String,
-    target_class: String,
-    description: String,
-    target_selection_policy: serde_json::Value,
-    context_requirements: serde_json::Value,
-    return_contract: serde_json::Value,
-    governance: serde_json::Value,
-    rollout_state: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct RepoWorkflowFrontmatter {
-    name: String,
-    workflow: RepoWorkflowCatalogFrontmatter,
-}
 
 /// Instructions for the strictly-serialized DB writer thread
 pub enum LedgerCommand {
@@ -356,15 +307,6 @@ enum Command {
         #[arg(long, default_value = "default")]
         hotel: String,
     },
-    /// Import config deltas into an existing hotel's Context Graph without reseeding guests.
-    ImportConfig {
-        /// Path to the JSON config file to apply
-        #[arg(long)]
-        file: String,
-        /// Hotel section to import (default: "default")
-        #[arg(long, default_value = "default")]
-        hotel: String,
-    },
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -377,8 +319,6 @@ enum StartupTest {
     CognitiveRoundTrip,
     #[value(name = "gemini-oauth-roundtrip", alias = "gemini-oauth")]
     GeminiOAuthRoundTrip,
-    #[value(name = "gemini-live-roundtrip", alias = "gemini-live")]
-    GeminiLiveRoundTrip,
     VoiceSample,
     #[value(name = "telegram-roundtrip", alias = "telegram-round-trip")]
     TelegramRoundTrip,
@@ -389,7 +329,6 @@ enum StartupTest {
 const STARTUP_TEST_TEXT_REPLY: &str = "startup text smoke ok";
 const STARTUP_TEST_COGNITIVE_REPLY: &str = "startup cognitive smoke ok";
 const STARTUP_TEST_GEMINI_OAUTH_REPLY: &str = "oauth-guest-ok";
-const STARTUP_TEST_GEMINI_LIVE_REPLY: &str = "gemini live startup ok";
 const STARTUP_TEST_TELEGRAM_TOKEN: &str = "startup-test-telegram-token";
 const STARTUP_TEST_GEMINI_API_KEY: &str = "startup-test-gemini-key";
 const STARTUP_TEST_TELEGRAM_TEXT_REPLY: &str = "startup telegram text smoke ok";
@@ -416,14 +355,6 @@ struct FakeTelegramFile {
 #[derive(Debug, Default)]
 struct FakeGeminiMediaState {
     requests: std::sync::Mutex<Vec<serde_json::Value>>,
-}
-
-#[derive(Debug, Default)]
-struct FakeGeminiLiveState {
-    websocket_connections: AtomicUsize,
-    setup_messages: AtomicUsize,
-    prompt_messages: AtomicUsize,
-    tool_response_messages: AtomicUsize,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -526,6 +457,43 @@ fn startup_test_blob_base_url(hotel_name: &str) -> String {
 
 fn hotel_execution_port(hotel_name: &str) -> u16 {
     hotel_base_port(hotel_name) + 2
+}
+
+/// Detect the current git worktree branch by matching the working directory against
+/// `git worktree list --porcelain`. Returns `None` if not in a worktree, on the
+/// main checkout, or if git is unavailable.
+fn detect_git_worktree_branch() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let output = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut current_path = String::new();
+    let mut current_branch = String::new();
+    for line in stdout.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            current_path = path.to_string();
+            current_branch.clear();
+        } else if let Some(branch) = line.strip_prefix("branch refs/heads/") {
+            current_branch = branch.to_string();
+        } else if line.is_empty() && !current_path.is_empty() {
+            if std::path::Path::new(&current_path) == cwd {
+                // Only return if it's a codex/* branch — main checkout is not a workstream.
+                return if current_branch.starts_with("codex/") {
+                    Some(current_branch.clone())
+                } else {
+                    None
+                };
+            }
+            current_path.clear();
+            current_branch.clear();
+        }
+    }
+    None
 }
 
 fn is_udp_port_available(port: u16) -> bool {
@@ -1475,7 +1443,7 @@ fn hotel_shared_guests(hotel_name: &str, profiles: &[AgentProfile]) -> Vec<Guest
             guest_id: format!("{hotel_name}:membrane-gateway"),
             role: "membrane".into(),
             config_json: serde_json::json!({
-                "command": "membrane",
+                "command": "membrane-telegram",
                 "args": [],
                 "env": {
                     "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
@@ -1904,7 +1872,7 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                 .into(),
             input_schema: serde_json::json!({ "type": "object", "properties": {} }),
             class: "session".into(),
-            tool_markers: vec!["session_introspection".into()],
+            tool_markers: Vec::new(),
         },
         AbstractToolRecord {
             tool_name: "echo".into(),
@@ -1919,7 +1887,7 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                 "required": ["text"]
             }),
             class: "utility".into(),
-            tool_markers: vec!["remote_safe".into(), "low_agency".into()],
+            tool_markers: Vec::new(),
         },
         AbstractToolRecord {
             tool_name: "workspace.list".into(),
@@ -1936,7 +1904,7 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                 }
             }),
             class: "workspace".into(),
-            tool_markers: vec!["workspace_bound".into(), "local_only".into()],
+            tool_markers: Vec::new(),
         },
         AbstractToolRecord {
             tool_name: "workspace.read".into(),
@@ -1962,48 +1930,7 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                 "required": ["path"]
             }),
             class: "workspace".into(),
-            tool_markers: vec!["workspace_bound".into(), "local_only".into()],
-        },
-        AbstractToolRecord {
-            tool_name: "agent.graph.read".into(),
-            description: "Read structured state from the agent's own graph substrate, including agent-local routing and tool preferences.".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "entity": {
-                        "type": "string",
-                        "enum": ["resource_grants", "tool_preferences", "routing_preferences", "reflex_preferences", "resource_declarations"]
-                    }
-                },
-                "required": ["entity"]
-            }),
-            class: "capability".into(),
-            tool_markers: vec!["agent_memory".into(), "local_only".into()],
-        },
-        AbstractToolRecord {
-            tool_name: "agent.graph.write".into(),
-            description: "Write an agent-local graph preference record such as a tool or routing preference. Does not mutate hotel authority directly.".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "entity": {
-                        "type": "string",
-                        "enum": ["tool_preference", "routing_preference", "reflex_preference"]
-                    },
-                    "tool_name": { "type": "string" },
-                    "preference_key": { "type": "string" },
-                    "stage_kind": { "type": "string" },
-                    "capability": { "type": "string" },
-                    "provider_hint": { "type": "string" },
-                    "model_ref": { "type": "string" },
-                    "preference_level": { "type": "integer" },
-                    "weight": { "type": "integer" },
-                    "config": {}
-                },
-                "required": ["entity"]
-            }),
-            class: "capability".into(),
-            tool_markers: vec!["agent_memory".into(), "high_agency".into(), "local_only".into()],
+            tool_markers: Vec::new(),
         },
         AbstractToolRecord {
             tool_name: "agent.configure".into(),
@@ -2024,61 +1951,7 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                 "required": ["config_path", "value"]
             }),
             class: "config".into(),
-            tool_markers: vec!["high_agency".into(), "local_only".into()],
-        },
-        AbstractToolRecord {
-            tool_name: "role.create_or_update".into(),
-            description: "Governed workflow surface for creating or updating a role incarnation for the current agent identity. Prompt-facing orchestration should use this surface instead of treating low-level role mutation as the cognitive plan.".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "role_name": { "type": "string" },
-                    "toolset_profile": { "type": "string" },
-                    "role_identity_addendum": { "type": "string" },
-                    "role_manifest": { "type": "string" },
-                    "is_admin": { "type": "boolean" },
-                    "inactive_ttl_seconds": { "type": "integer" },
-                    "iteration_cap": { "type": "integer" },
-                    "approval_policy": { "type": "string" },
-                    "model_profile": { "type": "string" },
-                    "context_window_policy": { "type": "string" },
-                    "reasoning": {
-                        "type": "object",
-                        "properties": {
-                            "purpose": { "type": "string" },
-                            "toolset_rationale": { "type": "string" },
-                            "handoff_posture_and_limits": { "type": "string" }
-                        },
-                        "required": ["purpose", "toolset_rationale", "handoff_posture_and_limits"]
-                    }
-                },
-                "required": ["role_name", "toolset_profile", "reasoning"]
-            }),
-            class: "config".into(),
-            tool_markers: vec!["workflow".into(), "high_agency".into(), "local_only".into()],
-        },
-        AbstractToolRecord {
-            tool_name: "role.configure".into(),
-            description: "Low-level compatibility surface for mutating a role incarnation. Prefer role.create_or_update for prompt-facing workflow use.".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "role_name": { "type": "string" },
-                    "toolset_profile": { "type": "string" },
-                    "reasoning": {
-                        "type": "object",
-                        "properties": {
-                            "purpose": { "type": "string" },
-                            "toolset_rationale": { "type": "string" },
-                            "handoff_posture_and_limits": { "type": "string" }
-                        },
-                        "required": ["purpose", "toolset_rationale", "handoff_posture_and_limits"]
-                    }
-                },
-                "required": ["role_name", "toolset_profile", "reasoning"]
-            }),
-            class: "config".into(),
-            tool_markers: vec!["compatibility".into(), "high_agency".into(), "local_only".into()],
+            tool_markers: Vec::new(),
         },
     ];
 
@@ -2088,418 +1961,68 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Seed the built-in abstract rights catalog into the context graph.
-fn seed_abstract_right_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
-    let catalog = [
-        AbstractRightRecord {
-            right_name: tool_right("session.status"),
-            description: "Allows visibility and invocation of the session.status tool.".into(),
-            target_kind: "tool".into(),
-            target_ref: "session.status".into(),
-        },
-        AbstractRightRecord {
-            right_name: tool_right("echo"),
-            description: "Allows visibility and invocation of the echo tool.".into(),
-            target_kind: "tool".into(),
-            target_ref: "echo".into(),
-        },
-        AbstractRightRecord {
-            right_name: tool_right("workspace.list"),
-            description: "Allows visibility and invocation of the workspace.list tool.".into(),
-            target_kind: "tool".into(),
-            target_ref: "workspace.list".into(),
-        },
-        AbstractRightRecord {
-            right_name: tool_right("workspace.read"),
-            description: "Allows visibility and invocation of the workspace.read tool.".into(),
-            target_kind: "tool".into(),
-            target_ref: "workspace.read".into(),
-        },
-        AbstractRightRecord {
-            right_name: tool_right("agent.graph.read"),
-            description: "Allows visibility and invocation of the agent.graph.read tool.".into(),
-            target_kind: "tool".into(),
-            target_ref: "agent.graph.read".into(),
-        },
-        AbstractRightRecord {
-            right_name: tool_right("agent.graph.write"),
-            description: "Allows visibility and invocation of the agent.graph.write tool.".into(),
-            target_kind: "tool".into(),
-            target_ref: "agent.graph.write".into(),
-        },
-        AbstractRightRecord {
-            right_name: tool_right("agent.configure"),
-            description: "Allows visibility and invocation of the agent.configure tool.".into(),
-            target_kind: "tool".into(),
-            target_ref: "agent.configure".into(),
-        },
-        AbstractRightRecord {
-            right_name: tool_right("role.create_or_update"),
-            description: "Allows visibility and invocation of the role.create_or_update workflow surface.".into(),
-            target_kind: "tool".into(),
-            target_ref: "role.create_or_update".into(),
-        },
-        AbstractRightRecord {
-            right_name: tool_right("role.configure"),
-            description: "Allows visibility and invocation of the low-level role.configure compatibility surface.".into(),
-            target_kind: "tool".into(),
-            target_ref: "role.configure".into(),
-        },
-        AbstractRightRecord {
-            right_name: skill_right("handoff.to_role"),
-            description: "Allows activation of the handoff.to_role skill posture.".into(),
-            target_kind: "skill".into(),
-            target_ref: "handoff.to_role".into(),
-        },
-        AbstractRightRecord {
-            right_name: skill_right("handoff.back"),
-            description: "Allows activation of the handoff.back skill posture.".into(),
-            target_kind: "skill".into(),
-            target_ref: "handoff.back".into(),
-        },
-        AbstractRightRecord {
-            right_name: skill_right("role.governance"),
-            description: "Allows activation of the role.governance skill posture.".into(),
-            target_kind: "skill".into(),
-            target_ref: "role.governance".into(),
-        },
-        AbstractRightRecord {
-            right_name: skill_right("role.authoring"),
-            description: "Allows activation of the role.authoring skill posture.".into(),
-            target_kind: "skill".into(),
-            target_ref: "role.authoring".into(),
-        },
-        AbstractRightRecord {
-            right_name: skill_right("delegate.to_peer"),
-            description: "Allows activation of the delegate.to_peer skill posture.".into(),
-            target_kind: "skill".into(),
-            target_ref: "delegate.to_peer".into(),
-        },
-        AbstractRightRecord {
-            right_name: skill_right("delegate.to_external_cognitive_peer"),
-            description:
-                "Allows activation of the delegate.to_external_cognitive_peer skill posture.".into(),
-            target_kind: "skill".into(),
-            target_ref: "delegate.to_external_cognitive_peer".into(),
-        },
-        AbstractRightRecord {
-            right_name: skill_right("routing.refinement"),
-            description: "Allows activation of the routing.refinement skill posture.".into(),
-            target_kind: "skill".into(),
-            target_ref: "routing.refinement".into(),
-        },
-        AbstractRightRecord {
-            right_name: component_right("text.generate"),
-            description: "Allows routing a turn through text.generate model execution.".into(),
-            target_kind: "component".into(),
-            target_ref: "text.generate".into(),
-        },
-        AbstractRightRecord {
-            right_name: component_right("media.analyze"),
-            description: "Allows routing a turn through media.analyze model execution.".into(),
-            target_kind: "component".into(),
-            target_ref: "media.analyze".into(),
-        },
-        AbstractRightRecord {
-            right_name: component_right("voice.synthesize"),
-            description: "Allows routing a turn through voice.synthesize model execution.".into(),
-            target_kind: "component".into(),
-            target_ref: "voice.synthesize".into(),
-        },
-        AbstractRightRecord {
-            right_name: component_right("voice.transcribe"),
-            description: "Allows routing a turn through voice.transcribe model execution.".into(),
-            target_kind: "component".into(),
-            target_ref: "voice.transcribe".into(),
-        },
-        AbstractRightRecord {
-            right_name: component_right("text.embed"),
-            description: "Allows routing a turn through text.embed model execution.".into(),
-            target_kind: "component".into(),
-            target_ref: "text.embed".into(),
-        },
-    ];
-
-    for right in &catalog {
-        graph.upsert_abstract_right(right)?;
-    }
-    Ok(())
-}
-
-/// Seed the built-in abstract model catalog into the context graph.
-fn seed_abstract_model_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
-    let catalog = [
-        AbstractModelRecord {
-            model_ref: "gemini-3.1-flash".into(),
-            provider_hint: "gemini".into(),
-            description: "Fast multimodal cognitive model with strong general tool-use posture."
-                .into(),
-            capability_markers: vec!["text.generate".into(), "media.analyze".into()],
-            endpoint_stem: Some("google.generativeai".into()),
-            speed_marker: 90,
-            thinking_marker: 72,
-            tool_use_marker: 84,
-            audio_native_marker: 20,
-        },
-        AbstractModelRecord {
-            model_ref: "mlx/qwen".into(),
-            provider_hint: "mlx".into(),
-            description: "Local cognitive model marker for low-latency on-device text turns."
-                .into(),
-            capability_markers: vec!["text.generate".into()],
-            endpoint_stem: Some("local.mlx".into()),
-            speed_marker: 68,
-            thinking_marker: 78,
-            tool_use_marker: 62,
-            audio_native_marker: 0,
-        },
-        AbstractModelRecord {
-            model_ref: "scribe_v1".into(),
-            provider_hint: "elevenlabs".into(),
-            description: "Streaming transcription model marker for receptor ingress.".into(),
-            capability_markers: vec!["voice.transcribe".into()],
-            endpoint_stem: Some("api.elevenlabs.io/v1/speech-to-text".into()),
-            speed_marker: 88,
-            thinking_marker: 10,
-            tool_use_marker: 0,
-            audio_native_marker: 95,
-        },
-        AbstractModelRecord {
-            model_ref: "eleven_multilingual_v2".into(),
-            provider_hint: "elevenlabs".into(),
-            description: "Streaming voice synthesis model marker for response egress.".into(),
-            capability_markers: vec!["voice.synthesize".into()],
-            endpoint_stem: Some("api.elevenlabs.io/v1/text-to-speech".into()),
-            speed_marker: 86,
-            thinking_marker: 0,
-            tool_use_marker: 0,
-            audio_native_marker: 98,
-        },
-    ];
-
-    for model in &catalog {
-        graph.upsert_abstract_model(model)?;
-    }
-    Ok(())
-}
-
-fn parse_repo_frontmatter<T>(label: &str, markdown: &str) -> anyhow::Result<T>
-where
-    T: serde::de::DeserializeOwned,
-{
-    let mut lines = markdown.lines();
-    anyhow::ensure!(
-        matches!(lines.next(), Some("---")),
-        "{label}: missing frontmatter start fence"
-    );
-    let mut yaml = String::new();
-    let mut closed = false;
-    for line in lines {
-        if line == "---" {
-            closed = true;
-            break;
-        }
-        yaml.push_str(line);
-        yaml.push('\n');
-    }
-    anyhow::ensure!(closed, "{label}: missing frontmatter end fence");
-    serde_yaml::from_str(&yaml).with_context(|| format!("{label}: parse frontmatter"))
-}
-
-fn parse_skill_validation_state(
-    raw: Option<&str>,
-) -> ansible_mesh_core::graph::SkillValidationState {
-    match raw.unwrap_or("validated") {
-        "draft" => ansible_mesh_core::graph::SkillValidationState::Draft,
-        "registered" => ansible_mesh_core::graph::SkillValidationState::Registered,
-        "deprecated" => ansible_mesh_core::graph::SkillValidationState::Deprecated,
-        "invalid" => ansible_mesh_core::graph::SkillValidationState::Invalid {
-            errors: vec!["repo-frontmatter requested invalid state".into()],
-        },
-        "suspended" => ansible_mesh_core::graph::SkillValidationState::Suspended {
-            reason: "repo-frontmatter requested suspended state".into(),
-        },
-        _ => ansible_mesh_core::graph::SkillValidationState::Validated,
-    }
-}
-
-fn load_role_authoring_skill_record() -> anyhow::Result<AbstractSkillRecord> {
-    let frontmatter: RepoSkillFrontmatter =
-        parse_repo_frontmatter("role-authoring skill", ROLE_AUTHORING_SKILL_MD)?;
-    anyhow::ensure!(
-        frontmatter.catalog.skill_name == "role.authoring",
-        "role-authoring skill: expected catalog.skill_name=role.authoring, got {}",
-        frontmatter.catalog.skill_name
-    );
-    anyhow::ensure!(
-        frontmatter.name == "role-authoring",
-        "role-authoring skill: expected name=role-authoring, got {}",
-        frontmatter.name
-    );
-    Ok(AbstractSkillRecord {
-        skill_name: frontmatter.catalog.skill_name,
-        description: frontmatter.description,
-        implied_tools: frontmatter.catalog.implied_tools,
-        validation_state: parse_skill_validation_state(
-            frontmatter.catalog.validation_state.as_deref(),
-        ),
-        field_sources: frontmatter.catalog.field_sources,
-        skill_markers: frontmatter.catalog.skill_markers,
-        ..Default::default()
-    })
-}
-
-fn load_role_create_or_update_workflow_record() -> anyhow::Result<WorkflowSkillRecord> {
-    let frontmatter: RepoWorkflowFrontmatter = parse_repo_frontmatter(
-        "role-create-or-update workflow",
-        ROLE_CREATE_OR_UPDATE_WORKFLOW_MD,
-    )?;
-    anyhow::ensure!(
-        frontmatter.name == "role-create-or-update",
-        "role-create-or-update workflow: expected name=role-create-or-update, got {}",
-        frontmatter.name
-    );
-    anyhow::ensure!(
-        frontmatter.workflow.workflow_name == "role.create_or_update",
-        "role-create-or-update workflow: expected workflow_name=role.create_or_update, got {}",
-        frontmatter.workflow.workflow_name
-    );
-    Ok(WorkflowSkillRecord {
-        workflow_name: frontmatter.workflow.workflow_name,
-        workflow_kind: frontmatter.workflow.workflow_kind,
-        owner_scope: frontmatter.workflow.owner_scope,
-        target_class: frontmatter.workflow.target_class,
-        description: frontmatter.workflow.description,
-        target_selection_policy: frontmatter.workflow.target_selection_policy,
-        context_requirements: frontmatter.workflow.context_requirements,
-        return_contract: frontmatter.workflow.return_contract,
-        governance: frontmatter.workflow.governance,
-        rollout_state: frontmatter.workflow.rollout_state,
-    })
-}
-
 /// Seed the built-in abstract skill catalog into the context graph.
 ///
 /// These skills are prompt-facing posture records first; their implied tool
 /// grants stay intentionally narrow until the governed handoff and role
 /// provisioning layers are fully wired.
 fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
-    let role_authoring = load_role_authoring_skill_record()?;
     let catalog = [
         AbstractSkillRecord {
             skill_name: "handoff.to_role".into(),
             description: "Handoff to a specialist role cleanly, explicitly transferring context, goals, and known constraints so the target can start work immediately without thrashing.".into(),
             implied_tools: vec!["session.status".into()],
-            validation_state: ansible_mesh_core::graph::SkillValidationState::Validated,
-            field_sources: serde_json::json!({
-                "required_inputs": [
-                    "target_role.role_name",
-                    "target_role.toolset_profile",
-                    "target_role.role_manifest_or_identity_addendum",
-                    "current_turn.active_goal_or_summary"
-                ],
-                "workflow_note": "Use the target role's manifest, toolset profile, and role rules as the primary lens for handoff intent assembly rather than ad hoc trigger inference.",
-                "handoff_packet_fields": [
-                    "goal",
-                    "context_excerpt",
-                    "active_constraints",
-                    "relevant_session_facts",
-                    "expected_return_mode",
-                    "cleanup_actions"
-                ]
-            }),
-            skill_markers: vec!["workflow".into(), "governed".into()],
             ..Default::default()
         },
         AbstractSkillRecord {
             skill_name: "handoff.back".into(),
             description: "Return a session from a specialist role back to the orchestrator with a concise summary of completed work, open questions, and the next recommended action.".into(),
             implied_tools: vec!["session.status".into()],
-            skill_markers: vec!["workflow".into(), "governed".into()],
             ..Default::default()
         },
         AbstractSkillRecord {
             skill_name: "role.governance".into(),
             description: "Govern role definitions deliberately for the current agent identity, reasoning explicitly about purpose, capability posture, handoff behavior, and limits before proposing changes.".into(),
-            implied_tools: vec![
-                "session.status".into(),
-                "agent.configure".into(),
-                "role.create_or_update".into(),
-            ],
-            skill_markers: vec!["governed".into(), "high_agency".into()],
+            implied_tools: vec!["session.status".into(), "agent.configure".into(), "role.configure".into()],
             ..Default::default()
         },
-        role_authoring,
+        AbstractSkillRecord {
+            skill_name: "role.authoring".into(),
+            description: "Create or update roles through role.configure using a complete payload. Gather missing role inputs first, always include role_name and reasoning fields, and optionally hand off into the new role once creation succeeds.".into(),
+            implied_tools: vec![
+                "session.status".into(),
+                "role.configure".into(),
+                "handoff.to_role".into(),
+            ],
+            validation_state: ansible_mesh_core::graph::SkillValidationState::Validated,
+            field_sources: serde_json::json!({
+                "required_fields": [
+                    "role_name",
+                    "toolset_profile",
+                    "reasoning.purpose",
+                    "reasoning.toolset_rationale",
+                    "reasoning.handoff_posture_and_limits"
+                ],
+                "repo_skill_path": "skills/role-authoring/SKILL.md"
+            }),
+            ..Default::default()
+        },
         AbstractSkillRecord {
             skill_name: "delegate.to_peer".into(),
             description: "Cross-agent delegation: hand off a bounded task to another trusted peer agent on the mesh instead of changing roles. Best for leveraging a different identity, rather than shifting internal capabilities.".into(),
             implied_tools: vec!["delegate.to_peer".into()],
-            skill_markers: vec!["workflow".into(), "delegation".into()],
             ..Default::default()
         },
         AbstractSkillRecord {
             skill_name: "delegate.to_external_cognitive_peer".into(),
             description: "External delegation: hand off a bounded task to an unmanaged external system like Claude Code or Codex. Best when crossing deep security or execution boundaries where managed Philotic actors cannot natively reach.".into(),
             implied_tools: vec!["delegate.to_external_cognitive_peer".into()],
-            skill_markers: vec!["workflow".into(), "delegation".into()],
-            ..Default::default()
-        },
-        AbstractSkillRecord {
-            skill_name: "routing.refinement".into(),
-            description: "Notice repeated routing failures or stage-affordance mismatches, inspect and update agent-local routing preferences in the agent graph, and escalate durable routing-policy refinements for operator review instead of silently mutating behavior.".into(),
-            implied_tools: vec![
-                "session.status".into(),
-                "agent.graph.read".into(),
-                "agent.graph.write".into(),
-                "routing.policy.propose".into(),
-            ],
-            validation_state: ansible_mesh_core::graph::SkillValidationState::Validated,
-            field_sources: serde_json::json!({
-                "transitional_note": "Uses durable rule storage as the current governed persistence path for routing-policy proposals.",
-                "agent_graph_note": "Agent-local routing preferences are stored in the active agent graph and may reference model-graph facts indirectly via stable capability/provider/model identifiers.",
-            }),
-            skill_markers: vec!["adaptive".into(), "governed".into()],
             ..Default::default()
         },
     ];
 
     for skill in &catalog {
         graph.upsert_abstract_skill(skill)?;
-    }
-    Ok(())
-}
-
-fn seed_workflow_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
-    let role_create_or_update = load_role_create_or_update_workflow_record()?;
-    let catalog = [
-        WorkflowSkillRecord {
-            workflow_name: "handoff.to_role".into(),
-            workflow_kind: "handoff.to_role".into(),
-            owner_scope: "orchestrator".into(),
-            target_class: "same_identity_role".into(),
-            description: "Governed same-identity role handoff that selects a target role lens, packages context, and transfers session custody without widening authority.".into(),
-            target_selection_policy: serde_json::json!({
-                "inputs": ["target_role.role_name", "target_role.role_manifest", "target_role.toolset_profile"],
-                "selection_mode": "role_lens_first"
-            }),
-            context_requirements: serde_json::json!({
-                "required_fields": ["goal", "context_excerpt", "active_constraints", "relevant_session_facts"],
-                "field_sources": "target role manifest/toolset lens plus current turn state"
-            }),
-            return_contract: serde_json::json!({
-                "modes": ["return_when_complete", "return_on_block", "stay_active_until_manual_return"]
-            }),
-            governance: serde_json::json!({
-                "execution_surface": "handoff.to_role",
-                "approval_mode": "same_identity_low_friction"
-            }),
-            rollout_state: "active".into(),
-        },
-        role_create_or_update,
-    ];
-
-    for workflow in &catalog {
-        graph.upsert_workflow_skill(workflow)?;
     }
     Ok(())
 }
@@ -2512,12 +2035,13 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "session.status".into(),
                 "echo".into(),
                 "agent.configure".into(),
-                "role.create_or_update".into(),
+                "role.configure".into(),
                 "skill.register".into(),
                 "subagent.spawn".into(),
                 "workspace.list".into(),
                 "workspace.read".into(),
                 "bash.exec".into(),
+                "delegate.whisper".into(),
             ],
             allowed_classes: vec!["session".into(), "utility".into(), "config".into()],
             allowed_skills: vec![
@@ -2525,7 +2049,6 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "handoff.back".into(),
                 "role.governance".into(),
                 "role.authoring".into(),
-                "routing.refinement".into(),
                 "delegate.to_peer".into(),
                 "delegate.to_external_cognitive_peer".into(),
             ],
@@ -2568,10 +2091,11 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "skill.assign".into(),
                 "skill.revoke".into(),
                 "subagent.spawn".into(),
-                "role.create_or_update".into(),
+                "role.configure".into(),
                 "workspace.list".into(),
                 "workspace.read".into(),
                 "bash.exec".into(),
+                "delegate.whisper".into(),
             ],
             allowed_classes: vec![
                 "session".into(),
@@ -2585,7 +2109,6 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "handoff.back".into(),
                 "role.governance".into(),
                 "role.authoring".into(),
-                "routing.refinement".into(),
                 "delegate.to_peer".into(),
                 "delegate.to_external_cognitive_peer".into(),
             ],
@@ -2612,9 +2135,9 @@ fn seed_skill_crafting(graph: &GraphDomain) -> anyhow::Result<()> {
             "skill.assign".into(),
             "skill.revoke".into(),
             "subagent.spawn".into(),
-            "role.create_or_update".into(),
+            "role.configure".into(),
         ],
-        skill_markers: vec!["governed".into(), "high_agency".into()],
+        skill_markers: Vec::new(),
         validation_state: SkillValidationState::Validated,
         source_snapshot: None,
         field_sources: serde_json::json!({}),
@@ -2625,9 +2148,7 @@ fn seed_skill_crafting(graph: &GraphDomain) -> anyhow::Result<()> {
 
 /// Governance document seeded for every agent's orchestrator role.
 /// This is the agent's self-description — it tells the agent what it IS, what it can do,
-/// what requires approval, and how to delegate. Agents can update this via the
-/// governed role.create_or_update workflow, which currently resolves through
-/// the low-level role.configure mutation surface.
+/// what requires approval, and how to delegate. Agents can update this via role.configure.
 const ORCHESTRATOR_MANIFEST: &str = "\
 You are in orchestrator posture — the sovereign identity layer of your agent.
 
@@ -2640,22 +2161,22 @@ Responsibilities:
 
 Rules:
 - Reason explicitly before creating a role: purpose, toolset, handoff posture, limits.
-- Use the role.authoring skill to assemble the role lens, then execute the role.create_or_update workflow; do not treat role.configure itself as the cognitive plan.
-- role.create_or_update always requires: role_name, toolset_profile, reasoning.purpose, reasoning.toolset_rationale, and reasoning.handoff_posture_and_limits. Runtime execution still resolves through role.configure as a transitional hotel mutation surface.
+- Use the role.authoring skill when preparing a role.configure call so required fields are not omitted.
+- role.configure always requires: role_name, toolset_profile, reasoning.purpose, reasoning.toolset_rationale, and reasoning.handoff_posture_and_limits.
 - After role creation succeeds, hand off into the new role only when the operator asked to use it immediately.
 - Do not bypass the approval gate; if a tool requires operator approval, surface it clearly.
 - Keep soul_text and core identity stable — those changes require operator approval.
 - Use handoff.to_role for sustained specialist work; use subagent.spawn for parallel bounded tasks.
 
 Approval posture:
-- Governance tools (role.create_or_update, skill.register, handoff.to_role, handoff.back) run without per-action approval.
+- Governance tools (role.configure, skill.register, handoff.to_role, handoff.back) run without per-action approval.
 - Self-configuration (agent.configure for approval_policy, profile, bindings) runs without approval.
 - Shell execution (bash.exec) and core identity field changes require operator approval.";
 
 /// Seeds an orchestrator RoleIncarnationRecord for each agent profile.
 ///
 /// This ensures every agent has a fully populated toolset and manifest from the first session
-/// turn, breaking the chicken-and-egg where role creation requires tools that only appear
+/// turn, breaking the chicken-and-egg where role.configure requires tools that only appear
 /// after a role exists.
 fn seed_orchestrator_roles(graph: &GraphDomain, profiles: &[AgentProfile]) -> anyhow::Result<()> {
     for profile in profiles {
@@ -2781,31 +2302,6 @@ fn enable_guest_test_overrides(
                 guest.config_json = config.to_string();
             }
         }
-        StartupTest::GeminiLiveRoundTrip => {
-            graph.set_config_value(
-                "gemini_api_key",
-                &serde_json::Value::String(STARTUP_TEST_GEMINI_API_KEY.into()).to_string(),
-            )?;
-
-            for guest in &mut guests {
-                if guest.role != "model" {
-                    continue;
-                }
-
-                let mut config: serde_json::Value =
-                    serde_json::from_str(&guest.config_json).unwrap_or_default();
-                let env = config
-                    .as_object_mut()
-                    .and_then(|obj| obj.get_mut("env"))
-                    .and_then(serde_json::Value::as_object_mut)
-                    .context("guest config missing env object")?;
-                env.insert(
-                    "PHILOTIC_GEMINI_BASE_URL".into(),
-                    serde_json::Value::String(startup_test_gemini_base_url(hotel_name)),
-                );
-                guest.config_json = config.to_string();
-            }
-        }
         StartupTest::VoiceSample => {
             for guest in &mut guests {
                 if guest.role != "model.elevenlabs" {
@@ -2900,7 +2396,7 @@ fn enable_guest_test_overrides(
                     guest_id: standby_guest_id.clone(),
                     role: "membrane".into(),
                     config_json: serde_json::json!({
-                        "command": "membrane",
+                        "command": "membrane-telegram",
                         "args": [],
                         "env": {
                             "PHILOTIC_HOTEL_SOCKET": hotel.ipc_socket_path.clone(),
@@ -2969,40 +2465,6 @@ fn spawn_fake_gemini_server(
 
         if let Err(err) = axum::serve(listener, app).await {
             warn!("Fake Gemini startup server exited with error: {}", err);
-        }
-    })
-}
-
-fn spawn_fake_gemini_live_server(
-    hotel_name: &str,
-    expected_reply: String,
-    state: Arc<FakeGeminiLiveState>,
-) -> tokio::task::JoinHandle<()> {
-    let bind_addr: SocketAddr = format!("127.0.0.1:{}", startup_test_gemini_port(hotel_name))
-        .parse()
-        .expect("startup fake Gemini Live socket address should parse");
-
-    let app = Router::new()
-        .route(
-            "/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent",
-            any(fake_gemini_live_handler),
-        )
-        .with_state((state, expected_reply));
-
-    tokio::spawn(async move {
-        let listener = match tokio::net::TcpListener::bind(bind_addr).await {
-            Ok(listener) => listener,
-            Err(err) => {
-                warn!(
-                    "Failed to bind fake Gemini Live startup server at {}: {}",
-                    bind_addr, err
-                );
-                return;
-            }
-        };
-
-        if let Err(err) = axum::serve(listener, app).await {
-            warn!("Fake Gemini Live startup server exited with error: {}", err);
         }
     })
 }
@@ -3144,184 +2606,6 @@ async fn fake_gemini_handler(
         })),
     )
         .into_response()
-}
-
-async fn fake_gemini_live_handler(
-    State((state, expected_reply)): State<(Arc<FakeGeminiLiveState>, String)>,
-    ws: WebSocketUpgrade,
-    request: Request<Body>,
-) -> Response {
-    let uses_api_key_query = request
-        .uri()
-        .query()
-        .map(|query| query.contains("key="))
-        .unwrap_or(false);
-    if !uses_api_key_query {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": { "message": "startup Gemini Live smoke expected api-key query auth" }
-            })),
-        )
-            .into_response();
-    }
-
-    ws.on_upgrade(move |socket| fake_gemini_live_session(socket, state, expected_reply))
-}
-
-async fn fake_gemini_live_session(
-    mut socket: WebSocket,
-    state: Arc<FakeGeminiLiveState>,
-    expected_reply: String,
-) {
-    state.websocket_connections.fetch_add(1, Ordering::Relaxed);
-
-    while let Some(Ok(message)) = socket.recv().await {
-        let text = match message {
-            WsMessage::Text(text) => text,
-            WsMessage::Binary(bytes) => match String::from_utf8(bytes.to_vec()) {
-                Ok(text) => text.into(),
-                Err(err) => {
-                    warn!(
-                        "Fake Gemini Live startup server received invalid binary frame: {}",
-                        err
-                    );
-                    break;
-                }
-            },
-            WsMessage::Close(_) => break,
-            WsMessage::Ping(_) | WsMessage::Pong(_) => continue,
-        };
-
-        let payload: serde_json::Value = match serde_json::from_str(&text) {
-            Ok(payload) => payload,
-            Err(err) => {
-                warn!(
-                    "Fake Gemini Live startup server received invalid JSON: {}",
-                    err
-                );
-                break;
-            }
-        };
-
-        if payload.get("setup").is_some() {
-            state.setup_messages.fetch_add(1, Ordering::Relaxed);
-            if socket
-                .send(WsMessage::Text(
-                    serde_json::json!({ "setupComplete": {} })
-                        .to_string()
-                        .into(),
-                ))
-                .await
-                .is_err()
-            {
-                break;
-            }
-            continue;
-        }
-
-        if payload.get("clientContent").is_some() {
-            state.prompt_messages.fetch_add(1, Ordering::Relaxed);
-            let prompt = payload
-                .get("clientContent")
-                .and_then(|value| value.get("turns"))
-                .and_then(serde_json::Value::as_array)
-                .and_then(|turns| turns.first())
-                .and_then(|turn| turn.get("parts"))
-                .and_then(serde_json::Value::as_array)
-                .and_then(|parts| parts.first())
-                .and_then(|part| part.get("text"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            if !prompt.contains(&expected_reply) {
-                warn!(
-                    "Fake Gemini Live startup server prompt missing expected reply token: {:?}",
-                    prompt
-                );
-                break;
-            }
-
-            let tool_call = serde_json::json!({
-                "sessionResumptionUpdate": {
-                    "resumable": true,
-                    "newHandle": "startup-live-handle"
-                },
-                "toolCall": {
-                    "functionCalls": [{
-                        "id": "startup-live-call-1",
-                        "name": "echo",
-                        "args": { "text": expected_reply }
-                    }]
-                }
-            });
-            if socket
-                .send(WsMessage::Text(tool_call.to_string().into()))
-                .await
-                .is_err()
-            {
-                break;
-            }
-            continue;
-        }
-
-        if payload.get("toolResponse").is_some() {
-            state.tool_response_messages.fetch_add(1, Ordering::Relaxed);
-            let response = payload
-                .get("toolResponse")
-                .and_then(|value| value.get("functionResponses"))
-                .and_then(serde_json::Value::as_array)
-                .and_then(|responses| responses.first())
-                .cloned()
-                .unwrap_or_default();
-            let response_id = response
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            let echoed = response
-                .get("response")
-                .and_then(|value| {
-                    value
-                        .get("result")
-                        .or_else(|| value.get("echo").map(|_| value))
-                })
-                .and_then(|value| value.get("echo"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            if response_id != "startup-live-call-1" || echoed != expected_reply {
-                warn!(
-                    "Fake Gemini Live startup server received unexpected tool response id={:?} echo={:?}",
-                    response_id, echoed
-                );
-                break;
-            }
-
-            let content = serde_json::json!({
-                "serverContent": {
-                    "modelTurn": {
-                        "parts": [{ "text": expected_reply }]
-                    }
-                }
-            });
-            if socket
-                .send(WsMessage::Text(content.to_string().into()))
-                .await
-                .is_err()
-            {
-                break;
-            }
-
-            let complete = serde_json::json!({
-                "serverContent": {
-                    "generationComplete": true,
-                    "turnComplete": true
-                }
-            });
-            let _ = socket
-                .send(WsMessage::Text(complete.to_string().into()))
-                .await;
-            continue;
-        }
-    }
 }
 
 fn fake_telegram_router(state: Arc<FakeTelegramState>) -> Router {
@@ -4088,193 +3372,6 @@ async fn run_startup_test(
 
             info!(
                 "Startup Gemini OAuth round-trip received {:?} through provider {:?}",
-                content, trace_provider
-            );
-            Ok(())
-        }
-        StartupTest::GeminiLiveRoundTrip => {
-            let expected_reply = text
-                .unwrap_or(STARTUP_TEST_GEMINI_LIVE_REPLY)
-                .trim()
-                .to_string();
-            let prompt = format!("Reply with exactly: {}", expected_reply);
-            let live_state = Arc::new(FakeGeminiLiveState::default());
-            let fake_gemini = spawn_fake_gemini_live_server(
-                hotel_name,
-                expected_reply.clone(),
-                Arc::clone(&live_state),
-            );
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-
-            let mut client = PhiloticClient::connect_at(
-                socket_path,
-                GuestIdentity {
-                    guest_id: "aiua-startup-test-client".into(),
-                    role: "aiua-startup-test".into(),
-                    supported_tools: Vec::new(),
-                },
-            )
-            .await?;
-
-            let task_payload = |provider_options: Option<serde_json::Value>| {
-                serde_json::json!({
-                    "kind": "response.generate",
-                    "provider": "gemini",
-                    "model": "gemini-3.1-flash-live-preview",
-                    "prompt": prompt,
-                    "response_contract": {
-                        "channels": ["display_text"]
-                    },
-                    "tools_for_model": [{
-                        "tool_name": "echo",
-                        "description": "Echo back the provided text.",
-                        "input_schema": {
-                            "type": "object",
-                            "properties": {
-                                "text": { "type": "string" }
-                            },
-                            "required": ["text"]
-                        }
-                    }],
-                    "effective_rights": ["tool.echo"],
-                    "session_id": "startup-test:gemini-live-roundtrip",
-                    "turn_id": "startup-test-live-turn-1",
-                    "chat_id": "startup-test-chat",
-                    "reply_to": local_node_id.clone(),
-                    "reply_role": "aiua-startup-test",
-                    "final_reply_to": local_node_id.clone(),
-                    "final_reply_role": "aiua-startup-test",
-                    "final_reply_guest_id": "aiua-startup-test-client",
-                    "provider_options": provider_options.unwrap_or_else(|| serde_json::json!({}))
-                })
-            };
-
-            let response = client
-                .send_request(IpcRequest::EmitTask {
-                    target_node: local_node_id.clone(),
-                    target_role: "model".into(),
-                    target_guest_id: None,
-                    task_json: task_payload(None).to_string(),
-                })
-                .await?;
-
-            match response {
-                IpcResponse::Standard { ok: true, .. } => {}
-                other => anyhow::bail!("unexpected startup live emit response: {other:?}"),
-            }
-
-            let first_reply =
-                tokio::time::timeout(tokio::time::Duration::from_secs(30), client.recv_task())
-                    .await
-                    .context("timed out waiting for Gemini Live tool call")??;
-            let IpcResponse::InboundTask { task_json, .. } = first_reply else {
-                anyhow::bail!("unexpected startup live envelope: {first_reply:?}");
-            };
-            let payload: serde_json::Value = serde_json::from_str(&task_json)
-                .context("failed to decode startup Gemini Live tool call")?;
-            let tool_name = payload
-                .get("agent_action")
-                .and_then(|value| value.get("tool_name"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            if tool_name != "echo" {
-                anyhow::bail!("unexpected startup Gemini Live tool call: {:?}", tool_name);
-            }
-            let function_call_id = payload
-                .get("agent_action")
-                .and_then(|value| value.get("model_result"))
-                .and_then(|value| value.get("native_live"))
-                .and_then(|value| value.get("pending_function_call_id"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            if function_call_id != "startup-live-call-1" {
-                anyhow::bail!(
-                    "unexpected startup Gemini Live pending function call id: {:?}",
-                    function_call_id
-                );
-            }
-
-            let continuation = client
-                .send_request(IpcRequest::EmitTask {
-                    target_node: local_node_id.clone(),
-                    target_role: "model".into(),
-                    target_guest_id: None,
-                    task_json: task_payload(Some(serde_json::json!({
-                        "live_tool_response": {
-                            "function_call_id": function_call_id,
-                            "tool_name": "echo",
-                            "tool_response": {
-                                "echo": expected_reply
-                            }
-                        }
-                    })))
-                    .to_string(),
-                })
-                .await?;
-
-            match continuation {
-                IpcResponse::Standard { ok: true, .. } => {}
-                other => anyhow::bail!("unexpected startup live continuation response: {other:?}"),
-            }
-
-            let final_reply =
-                tokio::time::timeout(tokio::time::Duration::from_secs(30), client.recv_task())
-                    .await
-                    .context("timed out waiting for Gemini Live final response")??;
-            fake_gemini.abort();
-
-            let IpcResponse::InboundTask { task_json, .. } = final_reply else {
-                anyhow::bail!("unexpected startup live final envelope: {final_reply:?}");
-            };
-            let payload: serde_json::Value = serde_json::from_str(&task_json)
-                .context("failed to decode startup Gemini Live final reply")?;
-            let content = payload
-                .get("content")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            if content != expected_reply {
-                anyhow::bail!(
-                    "unexpected Gemini Live startup reply: expected {:?}, got {:?}",
-                    expected_reply,
-                    content
-                );
-            }
-            let trace_provider = payload
-                .get("agent_action")
-                .and_then(|value| value.get("model_result"))
-                .and_then(|value| value.get("trace"))
-                .and_then(|value| value.get("provider"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            if trace_provider != "gemini" {
-                anyhow::bail!(
-                    "unexpected Gemini Live startup trace provider: {:?}",
-                    trace_provider
-                );
-            }
-
-            let websocket_connections = live_state.websocket_connections.load(Ordering::Relaxed);
-            let setup_messages = live_state.setup_messages.load(Ordering::Relaxed);
-            let prompt_messages = live_state.prompt_messages.load(Ordering::Relaxed);
-            let tool_response_messages = live_state.tool_response_messages.load(Ordering::Relaxed);
-            if websocket_connections != 1
-                || setup_messages != 1
-                || prompt_messages != 1
-                || tool_response_messages != 1
-            {
-                anyhow::bail!(
-                    "unexpected Gemini Live startup receptor counts: ws={} setup={} prompt={} tool_response={}",
-                    websocket_connections,
-                    setup_messages,
-                    prompt_messages,
-                    tool_response_messages
-                );
-            }
-
-            info!(
-                "Startup Gemini Live round-trip received {:?} through provider {:?} over one live websocket receptor",
                 content, trace_provider
             );
             Ok(())
@@ -5239,10 +4336,7 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
 
     seed_orchestrator_roles(&graph_domain, &all_profiles)?;
     seed_abstract_tool_catalog(&graph_domain)?;
-    seed_abstract_model_catalog(&graph_domain)?;
-    seed_abstract_right_catalog(&graph_domain)?;
     seed_abstract_skill_catalog(&graph_domain)?;
-    seed_workflow_skill_catalog(&graph_domain)?;
     seed_toolset_profiles(&graph_domain)?;
     seed_skill_crafting(&graph_domain)?;
 
@@ -5265,66 +4359,6 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Import config deltas into the Context Graph DB and exit.
-/// This updates config keys and agent identity bundles without reseeding guests.
-async fn run_import_config_command(file: &str, hotel_name: &str) -> Result<()> {
-    info!(
-        "Importing config deltas from '{}' into hotel '{}'...",
-        file, hotel_name
-    );
-
-    let db_path_buf;
-    let db_path: &Path = if let Some(ref pdir) = profile_dir() {
-        fs::create_dir_all(pdir)
-            .with_context(|| format!("create profile dir {}", pdir.display()))?;
-        db_path_buf = pdir.join("context.db");
-        &db_path_buf
-    } else {
-        Path::new("aiua_context.db")
-    };
-    let graph_storage = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open(db_path)?;
-    let graph_domain = GraphDomain::new(Arc::new(graph_storage.adapter()));
-    let hotel = reconcile_hotel_record(&graph_domain, hotel_name)?;
-    graph_domain.upsert_hotel(&hotel)?;
-
-    let config_data = fs::read_to_string(file).context("Failed to read config file")?;
-    let config_json: serde_json::Value =
-        serde_json::from_str(&config_data).context("Invalid JSON in config file")?;
-
-    let entries = extract_context_graph_entries(&config_json, Some(hotel_name));
-    let mut config_count = 0usize;
-    for (key, value) in entries {
-        let val_str = if value.is_string() {
-            serde_json::to_string(&value)?
-        } else {
-            value.to_string()
-        };
-        graph_domain.set_config_value(&key, &val_str)?;
-        config_count += 1;
-    }
-
-    let all_profiles = all_agent_profiles_from_config(&config_json, hotel_name);
-    let mut identity_count = 0usize;
-    for profile in &all_profiles {
-        let agent_config = raw_agent_config_for_key(&config_json, hotel_name, &profile.agent_key);
-        let identity =
-            agent_identity_record_for_profile(profile, hotel_name, agent_config.as_ref());
-        graph_domain
-            .upsert_agent_identity(&identity)
-            .with_context(|| format!("Failed to upsert identity for {}", identity.agent_id))?;
-        identity_count += 1;
-    }
-
-    println!(
-        "✓ Config imported into DB ({}).\n  Updated {} config key(s) and {} agent identity bundle(s) for hotel '{}'.",
-        db_path.display(),
-        config_count,
-        identity_count,
-        hotel_name
-    );
-    Ok(())
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -5340,16 +4374,25 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Detect which git worktree the hotel is running from and expose it to all
+    // spawned guests via PHILOTIC_WORKTREE. Guests (philote, membrane, etc.) can
+    // use this to tag sessions and let the intel-graph link live sessions to
+    // their workstream branch. No-op if not inside a git worktree or if already set.
+    if std::env::var_os("PHILOTIC_WORKTREE").is_none() {
+        if let Some(worktree_branch) = detect_git_worktree_branch() {
+            unsafe {
+                std::env::set_var("PHILOTIC_WORKTREE", &worktree_branch);
+            }
+            info!("Detected git worktree branch: {}", worktree_branch);
+        }
+    }
+
     if let Some(Command::Auth { provider }) = args.command {
         return auth::run_auth_command(provider).await;
     }
 
     if let Some(Command::Load { file, hotel }) = args.command {
         return run_load_command(&file, &hotel).await;
-    }
-
-    if let Some(Command::ImportConfig { file, hotel }) = args.command {
-        return run_import_config_command(&file, &hotel).await;
     }
 
     info!("Starting Philotic Ansible Daemon Boot Sequence...");
@@ -5436,10 +4479,7 @@ async fn main() -> Result<()> {
     let mut hotel = reconcile_hotel_record(&graph_domain_arc, &hotel_name)?;
 
     seed_abstract_tool_catalog(&graph_domain_arc)?;
-    seed_abstract_model_catalog(&graph_domain_arc)?;
-    seed_abstract_right_catalog(&graph_domain_arc)?;
     seed_abstract_skill_catalog(&graph_domain_arc)?;
-    seed_workflow_skill_catalog(&graph_domain_arc)?;
     seed_toolset_profiles(&graph_domain_arc)?;
     seed_skill_crafting(&graph_domain_arc)?;
 
@@ -5688,14 +4728,48 @@ async fn main() -> Result<()> {
         dispatcher_tx.clone(),
         graph_domain_arc.clone(),
     )
-    .with_memory_config(muninn_config_arc)
+    .with_memory_config(muninn_config_arc.clone())
     .with_materialization_requester(guest_manager.clone())
     .with_registry(registry.clone());
     let ipc_inboxes = ipc_server.inboxes();
+    let network_broadcast_tx = ipc_server.network_broadcast_tx();
 
     tokio::spawn(async move {
         if let Err(e) = ipc_server.run().await {
             error!("Hotel Front Desk (UDS) failed: {}", e);
+        }
+    });
+
+    // Network reachability monitor: TCP-probe 1.1.1.1:53 and broadcast NetworkState
+    // to all connected guests when the online/offline state changes.
+    tokio::spawn(async move {
+        use philotic_client::IpcResponse;
+        use std::time::Duration;
+        let mut last_online: Option<bool> = None;
+        loop {
+            let online = tokio::time::timeout(
+                Duration::from_secs(3),
+                tokio::net::TcpStream::connect("1.1.1.1:53"),
+            )
+            .await
+            .map(|r| r.is_ok())
+            .unwrap_or(false);
+
+            if last_online != Some(online) {
+                if last_online.is_some() {
+                    info!(
+                        online,
+                        "Network reachability changed — broadcasting NetworkState to guests."
+                    );
+                }
+                last_online = Some(online);
+                // Ignore send errors: no subscribers yet is fine.
+                let _ = network_broadcast_tx.send(IpcResponse::NetworkState { online });
+            }
+
+            // Poll every 30s when online, every 5s when offline (faster recovery).
+            let interval = if online { 30 } else { 5 };
+            tokio::time::sleep(Duration::from_secs(interval)).await;
         }
     });
 
@@ -5865,21 +4939,24 @@ async fn main() -> Result<()> {
             error!("Blob HTTP Server failed: {}", e);
         }
     });
+    // Wait for either Ctrl-C or SIGTERM.
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
         let mut sigterm = signal(SignalKind::terminate())?;
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => { warn!("Ctrl-C received — initiating graceful drain."); }
-            _ = sigterm.recv() => { warn!("SIGTERM received — initiating graceful drain."); }
+            _ = tokio::signal::ctrl_c() => {
+                warn!("Ctrl-C received — initiating graceful drain.");
+            }
+            _ = sigterm.recv() => {
+                warn!("SIGTERM received — initiating graceful drain.");
+            }
         }
     }
     #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c().await?;
-        warn!("Ctrl-C received — initiating graceful drain.");
-    }
+    tokio::signal::ctrl_c().await?;
 
+    // Phase 1: signal every registered guest to drain in-flight work and exit.
     const DRAIN_TIMEOUT_SECS: u64 = 30;
     {
         let guard = ipc_inboxes.lock().await;
@@ -5892,8 +4969,13 @@ async fn main() -> Result<()> {
                 count += 1;
             }
         }
-        info!("Graceful drain signal sent to {} guest subscriber(s).", count);
+        info!(
+            "Graceful drain signal sent to {} guest subscriber(s).",
+            count
+        );
     }
+
+    // Phase 2: wait for guest PIDs to exit (poll every 500ms, up to DRAIN_TIMEOUT_SECS).
     let drain_deadline =
         tokio::time::Instant::now() + tokio::time::Duration::from_secs(DRAIN_TIMEOUT_SECS);
     loop {
@@ -5907,6 +4989,13 @@ async fn main() -> Result<()> {
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     }
     info!("All guest subscribers drained (or drain window elapsed). Shutting down hotel.");
+
+    // DreamsPhase: semantic consolidation + Hebbian sweep across all agent vaults.
+    // Runs after guests drain, before the internal shutdown broadcast.
+    // Uses direct HTTP to ONNX sidecar (:11435) and Ollama (:11434) — no IPC needed.
+    if let Some(ref cfg) = muninn_config_arc {
+        dream::dream_sweep(cfg, &graph_domain_arc, &hotel_name).await;
+    }
 
     let _ = shutdown_tx.send(());
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -5926,10 +5015,8 @@ mod tests {
         default_agent_profile_for_hotel, default_guest_seed, default_hotel_record,
         enable_guest_test_overrides, execution_reachability_for_hotel,
         extract_context_graph_entries, guest_seed_for_profile, guest_supervision_enabled,
-        hotel_base_port, hotel_ipc_socket_path, load_role_authoring_skill_record,
-        load_role_create_or_update_workflow_record, local_capability_advertisements,
-        nearest_available_base_port, resolve_runtime_ports, seed_abstract_skill_catalog,
-        seed_abstract_tool_catalog, seed_workflow_skill_catalog, startup_test_gemini_base_url,
+        hotel_base_port, hotel_ipc_socket_path, local_capability_advertisements,
+        nearest_available_base_port, resolve_runtime_ports, startup_test_gemini_base_url,
     };
     use ansible_mesh_core::domain::GraphDomain;
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
@@ -6085,105 +5172,6 @@ mod tests {
         assert!(
             ads.iter()
                 .all(|ad| ad.selection_hint.as_deref() == Some("local_materialization_required"))
-        );
-    }
-
-    #[test]
-    fn seed_workflow_skill_catalog_projects_role_creation_as_workflow() {
-        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite graph");
-        let graph = GraphDomain::new(Arc::new(storage.adapter()));
-
-        seed_abstract_skill_catalog(&graph).expect("seed abstract skills");
-        seed_workflow_skill_catalog(&graph).expect("seed workflow skills");
-
-        let authoring = graph
-            .get_abstract_skill("role.authoring")
-            .expect("read abstract skill")
-            .expect("role.authoring skill");
-        assert_eq!(
-            authoring.field_sources["workflow_handoff"],
-            serde_json::json!("role.create_or_update")
-        );
-
-        let workflow = graph
-            .get_workflow_skill("role.create_or_update")
-            .expect("read workflow skill")
-            .expect("role create workflow");
-        assert_eq!(workflow.workflow_kind, "role.configure");
-        assert_eq!(workflow.owner_scope, "orchestrator");
-        assert_eq!(
-            workflow.governance["execution_surface"],
-            serde_json::json!("role.configure")
-        );
-        assert_eq!(
-            workflow.governance["source_workflow_path"],
-            serde_json::json!("workflows/role-create-or-update/WORKFLOW.md")
-        );
-    }
-
-    #[test]
-    fn seed_abstract_tool_catalog_includes_role_create_workflow_surface() {
-        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite graph");
-        let graph = GraphDomain::new(Arc::new(storage.adapter()));
-
-        seed_abstract_tool_catalog(&graph).expect("seed abstract tools");
-
-        let workflow_tool = graph
-            .get_abstract_tool("role.create_or_update")
-            .expect("read abstract tool")
-            .expect("workflow tool present");
-        assert_eq!(workflow_tool.class, "config");
-        assert!(workflow_tool.tool_markers.contains(&"workflow".to_string()));
-
-        let low_level_tool = graph
-            .get_abstract_tool("role.configure")
-            .expect("read legacy tool")
-            .expect("legacy tool present");
-        assert!(
-            low_level_tool
-                .tool_markers
-                .contains(&"compatibility".to_string())
-        );
-    }
-
-    #[test]
-    fn role_authoring_catalog_seed_comes_from_repo_skill_frontmatter() {
-        let record = load_role_authoring_skill_record().expect("load role authoring skill");
-
-        assert_eq!(record.skill_name, "role.authoring");
-        assert!(
-            record
-                .description
-                .contains("role.create_or_update workflow")
-        );
-        assert_eq!(
-            record.field_sources["repo_skill_path"],
-            serde_json::json!("skills/role-authoring/SKILL.md")
-        );
-        assert_eq!(
-            record.implied_tools,
-            vec![
-                "session.status".to_string(),
-                "role.create_or_update".to_string(),
-                "handoff.to_role".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn role_create_workflow_seed_comes_from_repo_workflow_frontmatter() {
-        let workflow = load_role_create_or_update_workflow_record()
-            .expect("load role create or update workflow");
-
-        assert_eq!(workflow.workflow_name, "role.create_or_update");
-        assert_eq!(workflow.workflow_kind, "role.configure");
-        assert_eq!(
-            workflow.governance["source_workflow_path"],
-            serde_json::json!("workflows/role-create-or-update/WORKFLOW.md")
-        );
-        assert_eq!(
-            workflow.context_requirements["supporting_skill"],
-            serde_json::json!("role.authoring")
         );
     }
 

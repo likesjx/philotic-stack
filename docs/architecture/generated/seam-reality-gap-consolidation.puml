@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - reality-gap-consolidation
+
+rectangle "reality-gap-consolidation" as reality_gap_consolidation #Orange {
+}
+
+
+@enduml

@@ -600,22 +600,33 @@ impl GeminiProvider {
 
         for attachment in task.media_attachments().iter().filter(|attachment| {
             attachment
-                .url
+                .transport_error
                 .as_deref()
-                .map(|url| !url.trim().is_empty())
-                .unwrap_or(false)
-                && attachment
-                    .transport_error
-                    .as_deref()
-                    .map(|error| error.trim().is_empty())
-                    .unwrap_or(true)
+                .map(|error| error.trim().is_empty())
+                .unwrap_or(true)
         }) {
+            // Inline PCM audio (Discord voice bridge) — convert to WAV and include directly.
+            if let Some(inline_b64) = &attachment.inline_audio_b64 {
+                let sample_rate = attachment.inline_audio_sample_rate.unwrap_or(48_000);
+                let channels = attachment.inline_audio_channels.unwrap_or(2);
+                let wav_bytes = pcm_i16_b64_to_wav(inline_b64, sample_rate, channels)
+                    .context("failed to build WAV from inline PCM audio")?;
+                parts.push(json!({
+                    "inline_data": {
+                        "mime_type": "audio/wav",
+                        "data": BASE64_STANDARD.encode(&wav_bytes)
+                    }
+                }));
+                continue;
+            }
+
+            // Blob-backed attachment — fetch from URL.
+            let url = match attachment.url.as_deref().filter(|u| !u.trim().is_empty()) {
+                Some(u) => u,
+                None => continue,
+            };
             let mime_type = attachment_mime_type(attachment)
                 .with_context(|| format!("attachment {:?} missing mime type", attachment.kind))?;
-            let url = attachment
-                .url
-                .as_deref()
-                .context("media attachment missing download url")?;
             let response = self.http_client.get(url).send().await?;
             let status = response.status();
             if !status.is_success() {
@@ -1714,6 +1725,7 @@ mod tests {
             url: Some("http://127.0.0.1:9001/download/sha256-1".into()),
             blob_ref: Some("sha256-1".into()),
             transport_error: None,
+            ..Default::default()
         };
 
         assert_eq!(
@@ -1731,6 +1743,7 @@ mod tests {
             url: Some("http://127.0.0.1:9001/download/sha256-doc".into()),
             blob_ref: Some("sha256-doc".into()),
             transport_error: None,
+            ..Default::default()
         };
 
         assert_eq!(
@@ -1770,6 +1783,7 @@ mod tests {
                     url: Some("http://127.0.0.1:9001/download/sha256-2".into()),
                     blob_ref: Some("sha256-2".into()),
                     transport_error: None,
+                    ..Default::default()
                 }],
                 ..Default::default()
             },
@@ -1815,6 +1829,7 @@ mod tests {
                     url: Some("http://127.0.0.1:9001/download/sha256-voice-1".into()),
                     blob_ref: Some("sha256-voice-1".into()),
                     transport_error: None,
+                    ..Default::default()
                 }],
                 ..Default::default()
             },
@@ -2251,4 +2266,50 @@ fn normalize_attachment_mime_type(mime_type: &str) -> Cow<'_, str> {
     } else {
         Cow::Borrowed(normalized)
     }
+}
+
+/// Convert base64-encoded i16 LE PCM audio to a WAV-format byte vector.
+///
+/// Builds a minimal RIFF/WAV header followed by the raw PCM data so that
+/// Gemini (and other providers) can consume it as `audio/wav`.
+fn pcm_i16_b64_to_wav(pcm_b64: &str, sample_rate: u32, channels: u16) -> Result<Vec<u8>> {
+    use base64::Engine;
+    let pcm_bytes = BASE64_STANDARD
+        .decode(pcm_b64)
+        .context("failed to base64-decode inline PCM audio")?;
+
+    // Validate byte alignment (each i16 sample = 2 bytes)
+    if pcm_bytes.len() % 2 != 0 {
+        anyhow::bail!("inline PCM audio has odd byte count ({})", pcm_bytes.len());
+    }
+
+    let bits_per_sample: u16 = 16;
+    let byte_rate = sample_rate * u32::from(channels) * u32::from(bits_per_sample) / 8;
+    let block_align: u16 = channels * bits_per_sample / 8;
+    let data_len = pcm_bytes.len() as u32;
+    let chunk_size = 36 + data_len; // 4-byte RIFF size field = header - 8 + data
+
+    let mut wav = Vec::with_capacity(44 + pcm_bytes.len());
+
+    // RIFF header
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&chunk_size.to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+
+    // fmt sub-chunk
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes()); // sub-chunk size = 16 for PCM
+    wav.extend_from_slice(&1u16.to_le_bytes()); // AudioFormat = PCM
+    wav.extend_from_slice(&channels.to_le_bytes());
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    wav.extend_from_slice(&byte_rate.to_le_bytes());
+    wav.extend_from_slice(&block_align.to_le_bytes());
+    wav.extend_from_slice(&bits_per_sample.to_le_bytes());
+
+    // data sub-chunk
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    wav.extend_from_slice(&pcm_bytes);
+
+    Ok(wav)
 }

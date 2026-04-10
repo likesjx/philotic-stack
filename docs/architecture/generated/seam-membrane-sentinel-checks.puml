@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - membrane-sentinel-checks
+
+rectangle "membrane-sentinel-checks" as membrane_sentinel_checks #Orange {
+}
+
+
+@enduml

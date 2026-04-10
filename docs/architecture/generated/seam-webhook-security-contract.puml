@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - webhook-security-contract
+
+rectangle "webhook-security-contract" as webhook_security_contract #Orange {
+}
+
+
+@enduml

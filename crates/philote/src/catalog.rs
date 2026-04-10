@@ -409,7 +409,8 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         ToolDefinition {
             tool_name: "agent.configure".into(),
             description: "Update an agent configuration field. Supports approval_policy, \
-                          profile, and bindings sections. Changes to sensitive fields \
+                          profile, bindings, settings, media_routing_policy, and \
+                          voice_response_policy sections. Changes to sensitive fields \
                           (soul, identity, approval policy) require operator approval unless \
                           preapproved. Use operation 'set' to replace, 'append' to add to \
                           arrays, or 'remove' to delete from arrays."
@@ -428,7 +429,17 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                                         'profile.user_context_text', \
                                         'profile.memory_summary', \
                                         'bindings.effective_toolset', \
-                                        'bindings.effective_skillset'"
+                                        'bindings.effective_skillset', \
+                                        'media_routing_policy.voice_action', \
+                                        'media_routing_policy.image_action', \
+                                        'media_routing_policy.document_action', \
+                                        'media_routing_policy.forward_media_to_model', \
+                                        'media_routing_policy.strip_tools_on_media', \
+                                        'voice_response_policy.mode', \
+                                        'voice_response_policy.provider', \
+                                        'voice_response_policy.voice_id', \
+                                        'voice_response_policy.send_text_caption', \
+                                        'voice_response_policy.fallback_to_text'"
                     },
                     "value": {
                         "description": "The new value. For array fields with 'append'/'remove', \
@@ -670,6 +681,45 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                 "required": ["role_name", "toolset_profile", "reasoning"]
             }),
             class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "delegate.whisper".into(),
+        ToolDefinition {
+            tool_name: "delegate.whisper".into(),
+            description: "Fire-and-forget paracrine dispatch — silently consults a specialist \
+                          role without interrupting the current turn. The specialist's response \
+                          arrives back asynchronously as a paracrine_response. Use for quiet \
+                          delegation, mid-turn enrichment, or specialist consultation where the \
+                          user does not need to see the handoff. \
+                          Set reply_to='membrane' to route the specialist's response directly \
+                          to the user with an inline role-switch button."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "role": {
+                        "type": "string",
+                        "description": "The target specialist role name to dispatch the exosome to."
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "The prompt or question for the specialist."
+                    },
+                    "reply_to": {
+                        "type": "string",
+                        "description": "Where the specialist's response should go. 'self' = back to this philote as paracrine_response (default). 'membrane' = directly to the user with a role-switch button. '<node>/<role>' = explicit routing."
+                    },
+                    "routing": {
+                        "type": "string",
+                        "enum": ["cognitive_re_entry", "enriched_tool_result", "datasource_injection", "memory_enrichment", "progress_update", "heartbeat", "raw_forward"],
+                        "description": "How to handle the specialist's response when it arrives. Defaults to cognitive_re_entry."
+                    }
+                },
+                "required": ["role", "prompt"]
+            }),
+            class: Some("delegate".into()),
         },
     );
 

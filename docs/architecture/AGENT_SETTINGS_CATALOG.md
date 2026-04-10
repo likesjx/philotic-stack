@@ -1,20 +1,20 @@
 ---
-title: "Agent Settings Catalog"
+title: Agent Settings Catalog
 doc_type: reference
 domain: runtime-sessions
 status: active
-last_updated: 2026-03-18
+last_updated: 2026-03-31
 tags:
-  - settings
-  - agent-loop
-  - context-envelope
-  - memory
-  - execution
+- settings
+- agent-loop
+- context-envelope
+- memory
+- execution
 related_docs:
-  - COGNITIVE_LOOP_PROPOSAL.md
-  - PHILOTIC_AGENT_LOOP_SPEC.md
+- COGNITIVE_LOOP_PROPOSAL.md
+- PHILOTIC_AGENT_LOOP_SPEC.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 ---
 
 # Agent Settings Catalog

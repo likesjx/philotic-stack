@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - remote-materialization-ceremony
+
+rectangle "remote-materialization-ceremony" as remote_materialization_ceremony #Orange {
+}
+
+
+@enduml

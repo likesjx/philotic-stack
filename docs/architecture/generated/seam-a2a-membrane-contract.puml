@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - a2a-membrane-contract
+
+rectangle "a2a-membrane-contract" as a2a_membrane_contract #Orange {
+}
+
+
+@enduml

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - session-leases
+
+rectangle "session-leases" as session_leases #Orange {
+}
+
+
+@enduml

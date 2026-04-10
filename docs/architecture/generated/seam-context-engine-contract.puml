@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - context-engine-contract
+
+rectangle "context-engine-contract" as context_engine_contract #Orange {
+}
+
+
+@enduml

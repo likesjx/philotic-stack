@@ -1,33 +1,33 @@
 ---
-title: "Philotic Task Runner Proposal"
+title: Philotic Task Runner Proposal
 doc_type: proposal
 domain: tooling-execution
 status: accepted-current-slice
-last_updated: 2026-03-12
+last_updated: 2026-03-31
 tags:
-  - task-runner
-  - tooling
-  - execution
-  - workspace
-  - active-seam
+- task-runner
+- tooling
+- execution
+- workspace
+- active-seam
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md
-  - TOOL_MANAGEMENT_PLANE_PROPOSAL.md
-  - RUNNER_ARTIFACT_BUILD_DISTRIBUTION_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md
+- TOOL_MANAGEMENT_PLANE_PROPOSAL.md
+- RUNNER_ARTIFACT_BUILD_DISTRIBUTION_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: task-runner
 implements: []
 implemented_by:
-  - workspace-runner-overlay-slice
-  - workspace-runner-base-policy-slice
+- workspace-runner-overlay-slice
+- workspace-runner-base-policy-slice
 active_seams:
-  - shell-runner-split
-  - runner-materialization-policy
-  - unreachable-runner-fallback
+- shell-runner-split
+- runner-materialization-policy
+- unreachable-runner-fallback
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
+- ARCHITECTURE_STATUS.md
 ---
 
 # Philotic Task Runner Proposal

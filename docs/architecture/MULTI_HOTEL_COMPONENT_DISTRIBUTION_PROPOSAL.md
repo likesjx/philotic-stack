@@ -1,32 +1,32 @@
 ---
-title: "Multi-Hotel Component Distribution Proposal"
+title: Multi-Hotel Component Distribution Proposal
 doc_type: proposal
 domain: mesh-placement
 status: proposed
-last_updated: 2026-03-12
+last_updated: 2026-03-31
 tags:
-  - distribution
-  - routing
-  - mesh
-  - placement
-  - active-seam
+- distribution
+- routing
+- mesh
+- placement
+- active-seam
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - INTER_HOTEL_ROUTING_PROPOSAL.md
-  - HOTEL_PERIMETER_TRUST_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- INTER_HOTEL_ROUTING_PROPOSAL.md
+- HOTEL_PERIMETER_TRUST_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: multi-hotel-component-distribution
 implements: []
 implemented_by: []
 active_seams:
-  - multi-hotel-route-consistency
-  - cross-host-distributed-validation
-  - remote-materialization-ceremony
-  - capacity-relief-placement
+- multi-hotel-route-consistency
+- cross-host-distributed-validation
+- remote-materialization-ceremony
+- capacity-relief-placement
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
-  - ARCHITECTURE.md
+- ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
 ---
 
 # Multi-Hotel Component Distribution Proposal

@@ -23,6 +23,45 @@ install-git-hooks:
 # Mandatory Muninn bootstrap gate for meaningful sessions.
 session-start:
     python3 scripts/muninn_mcp.py bootstrap
+    @just harness-drift 2>/dev/null || true
+
+# Show drift status for all managed harnesses.
+harness-drift:
+    @phil graph harness drift
+
+# Re-apply the canonical profile to a harness (default: claude-local with philotic-operator).
+harness-apply harness="claude-local" profile="philotic-operator":
+    phil graph harness apply {{harness}} --profile {{profile}}
+    phil graph harness verify {{harness}}
+
+# Start a measured harness trial for focused work on a seam.
+# Usage: just harness-trial-start <seam-id> [harness] [profile]
+harness-trial-start seam harness="claude-local" profile="philotic-operator":
+    #!/usr/bin/env bash
+    SESSION=$(phil graph harness trials start {{harness}} {{seam}} \
+      --profile {{profile}} --agent claude --agent-model claude-sonnet-4-6 2>&1 | grep -oE 'session:[^ ]+' | head -1)
+    echo "Trial started: $SESSION"
+    echo "$SESSION" > /tmp/philotic-harness-trial-session
+
+# Report activity against the current harness trial.
+# Usage: just harness-trial-report <activity-type> [tokens_in] [tokens_out]
+harness-trial-report activity tokens_in="0" tokens_out="0":
+    #!/usr/bin/env bash
+    SESSION=$(cat /tmp/philotic-harness-trial-session 2>/dev/null || echo "")
+    if [ -z "$SESSION" ]; then echo "No active trial session (run harness-trial-start first)"; exit 1; fi
+    phil graph harness trials report "$SESSION" {{activity}} \
+      --tokens-input {{tokens_in}} --tokens-output {{tokens_out}}
+
+# Close the current harness trial.
+# Usage: just harness-trial-close [status] [summary]
+harness-trial-close status="completed" summary="":
+    #!/usr/bin/env bash
+    SESSION=$(cat /tmp/philotic-harness-trial-session 2>/dev/null || echo "")
+    if [ -z "$SESSION" ]; then echo "No active trial session found"; exit 1; fi
+    phil graph harness trials close "$SESSION" --status {{status}} \
+      $([ -n "{{summary}}" ] && echo "--summary '{{summary}}'")
+    rm -f /tmp/philotic-harness-trial-session
+    echo "Trial closed: $SESSION"
 
 # Merge mesh-config.secrets.json into mesh-config.json.
 # mesh-config.secrets.json holds only rotating secrets (API keys, bot tokens).
@@ -188,6 +227,10 @@ worktree-create slug base="main":
 
 # Bootstrap an implementation workstream with a dedicated sibling worktree and checklist.
 workstream-start slug base="develop":
+    ./scripts/codex-workstream.sh start {{slug}} {{base}}
+
+# Alias for the multi-role workstream workflow.
+start-workstream slug base="develop":
     ./scripts/codex-workstream.sh start {{slug}} {{base}}
 
 # Show git status plus hot-file overlap for an active workstream.
@@ -386,9 +429,9 @@ local-push:
     set -euo pipefail
     AIUA_CELLAR=/opt/homebrew/Cellar/aiua/0.1.0-alpha/bin
     PHIL_CELLAR=/opt/homebrew/Cellar/philotic-web/0.1.0-alpha/bin
-    AIUA_BINS="aiua philote membrane model-router model-controller-gemini model-controller-elevenlabs model-controller-mlx philote-worker tool-runner graph-runner"
+    AIUA_BINS="aiua philote membrane membrane-telegram model-router model-controller-gemini model-controller-elevenlabs model-controller-mlx model-controller-onnx philote-worker tool-runner graph-runner graph-intelligence"
     echo "▶ Building release binaries..."
-    cargo build --release -p aiua -p philote -p membrane -p model-router -p tool-runner -p graph-runner -p philotic-web
+    cargo build --release -p aiua -p philote -p membrane -p membrane-telegram -p model-router -p tool-runner -p graph-runner -p graph-intelligence -p philotic-web
     echo "▶ Installing aiua stack to ${AIUA_CELLAR}..."
     for bin in $AIUA_BINS; do
         if [ ! -f "target/release/$bin" ]; then
@@ -401,6 +444,7 @@ local-push:
         fi
         chmod u+w "${AIUA_CELLAR}/$bin"
         cp "target/release/$bin" "${AIUA_CELLAR}/$bin"
+        xattr -c "${AIUA_CELLAR}/$bin" 2>/dev/null || true
         chmod u-w "${AIUA_CELLAR}/$bin"
         echo "  ✓ $bin"
     done
@@ -420,7 +464,7 @@ jane-push:
     set -euo pipefail
     REMOTE=mbp-jane
     REMOTE_CELLAR=/opt/homebrew/Cellar/aiua/0.1.0-alpha/bin
-    BINS="aiua philote membrane model-router model-controller-gemini model-controller-elevenlabs model-controller-mlx philote-worker tool-runner graph-runner philotic-web"
+    BINS="aiua philote membrane membrane-telegram model-router model-controller-gemini model-controller-elevenlabs model-controller-mlx philote-worker tool-runner graph-runner philotic-web"
     # Safety guard: verify we are actually talking to mbp-jane before touching anything.
     # mbp-jane's system hostname is "MacBookPro" — the SSH alias is just our local label.
     ACTUAL_HOST="$(ssh "${REMOTE}" hostname -s 2>/dev/null)"
@@ -429,7 +473,7 @@ jane-push:
         exit 1
     fi
     echo "▶ Building release binaries (local)..."
-    cargo build --release -p aiua -p philote -p membrane -p model-router -p tool-runner -p graph-runner -p philotic-web
+    cargo build --release -p aiua -p philote -p membrane -p membrane-telegram -p model-router -p tool-runner -p graph-runner -p philotic-web
     echo "▶ Stopping Jane on ${REMOTE}..."
     ssh "${REMOTE}" "pkill -f '/opt/homebrew/bin/aiua' 2>/dev/null || true; sleep 2"
     echo "▶ Pushing binaries to ${REMOTE}:${REMOTE_CELLAR}..."
@@ -482,3 +526,203 @@ ansible-check:
 # Deploy the mesh node playbook to configured hosts
 ansible-deploy:
     cd ansible && ansible-playbook deploy_mesh_node.yml
+
+# ── Intel Graph (Semantic Intelligence) ─────────────────────────────────────────
+
+# Install and build intel-graph components
+intel-graph-install:
+    ./scripts/setup-intel-graph.sh install
+
+# Start the intel-graph stack (ONNX sidecar + graph intelligence)
+intel-graph-start:
+    ./scripts/setup-intel-graph.sh start
+
+# Start with 768-dim embedding model (higher quality, slower)
+intel-graph-start-768:
+    PHILOTIC_EMBED_DIM=768 ./scripts/setup-intel-graph.sh start
+
+# Start with custom embedding model
+intel-graph-start-custom model:
+    PHILOTIC_EMBED_MODEL={{model}} ./scripts/setup-intel-graph.sh start
+
+# Stop the intel-graph stack
+intel-graph-stop:
+    ./scripts/setup-intel-graph.sh stop
+
+# Restart the intel-graph stack
+intel-graph-restart:
+    ./scripts/setup-intel-graph.sh restart
+
+# Check intel-graph stack status
+intel-graph-status:
+    ./scripts/setup-intel-graph.sh status
+
+# Start intel-graph only if not already running (idempotent, for scripts/agents)
+intel-graph-ensure:
+    ./scripts/setup-intel-graph.sh ensure
+
+# Start intel-graph with agent timeout (auto-shutdown after N minutes)
+intel-graph-agent timeout_minutes="60":
+    ./scripts/setup-intel-graph.sh agent-start {{timeout_minutes}}
+
+# Tail intel-graph logs
+intel-graph-logs:
+    ./scripts/setup-intel-graph.sh logs
+
+# Health check both services
+intel-graph-health:
+    @echo "ONNX Sidecar: $(curl -s http://127.0.0.1:11435/api/health 2>/dev/null && echo '✓' || echo '✗')"
+    @echo "Graph Intel:  $(curl -s http://127.0.0.1:8900/api/nodes 2>/dev/null | head -1 && echo '✓' || echo '✗')"
+
+# Quick embed a proposal node
+intel-graph-embed node_id:
+    curl -s -X POST http://127.0.0.1:8901/mcp -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"graph_embed","arguments":{"node_id":"{{node_id}}"}},"id":1}' | jq .result.content[0].text
+
+# Batch embed all proposals
+intel-graph-embed-proposals:
+    curl -s -X POST http://127.0.0.1:8901/mcp -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"graph_embed_batch","arguments":{"kind":"proposal"}},"id":1}' | jq '.result | {processed, embedded}'
+
+# Run the full agent workflow smoke (scan → next_task → context → session → decide → close → dashboard)
+smoke-agent-workflow:
+    bash scripts/smoke-agent-workflow.sh
+
+# Run tests and record results to the graph (Option C foundation)
+# Works even with partial compilation failures - records what tests did run
+test-and-record target_id:
+    #!/bin/bash
+    set +e  # Don't fail on test errors
+    echo "Running tests for {{target_id}}..."
+    START_TIME=$(date +%s%N)
+    cargo test --workspace 2>&1 | tee /tmp/test-output.txt
+    EXIT_CODE=$?
+    END_TIME=$(date +%s%N)
+    DURATION_MS=$(( (END_TIME - START_TIME) / 1000000 ))
+    
+    # Parse test results from output
+    # Handle both "running N tests" and "test result: X passed Y failed"
+    TEST_COUNT=$(grep -oE "running [0-9]+ tests" /tmp/test-output.txt | awk '{sum+=$2} END {print sum+0}')
+    RESULT_LINE=$(grep "^test result:" /tmp/test-output.txt | tail -1)
+    
+    if [ -n "$RESULT_LINE" ]; then
+        PASS_COUNT=$(echo "$RESULT_LINE" | grep -oE "[0-9]+ passed" | grep -oE "[0-9]+")
+        FAIL_COUNT=$(echo "$RESULT_LINE" | grep -oE "[0-9]+ failed" | grep -oE "[0-9]+")
+    else
+        PASS_COUNT=$(grep -c "^test .* ... ok$" /tmp/test-output.txt || echo "0")
+        FAIL_COUNT=$(grep -c "^test .* ... FAILED$" /tmp/test-output.txt || echo "0")
+    fi
+    
+    # Ensure values are set
+    TEST_COUNT=${TEST_COUNT:-0}
+    PASS_COUNT=${PASS_COUNT:-0}
+    FAIL_COUNT=${FAIL_COUNT:-0}
+    
+    echo "Results: $PASS_COUNT/$TEST_COUNT passed, $FAIL_COUNT failed"
+    echo "Recording to graph..."
+    
+    curl -s -X POST http://127.0.0.1:8900/api/test-run \
+      -H "Content-Type: application/json" \
+      -d "{\"target_id\":\"{{target_id}}\",\"test_count\":$TEST_COUNT,\"pass_count\":$PASS_COUNT,\"fail_count\":$FAIL_COUNT,\"duration_ms\":$DURATION_MS}" | jq .
+    
+    exit $EXIT_CODE
+
+# Combined system health check (sessions + proposals + graph stats)
+intel-graph-health-check:
+    @echo "── Intel Graph System Health ──"
+    @curl -s http://127.0.0.1:8900/api/health 2>/dev/null | jq . || echo "Graph server not running"
+
+# Session health report
+intel-graph-session-health:
+    @curl -s http://127.0.0.1:8900/api/health/sessions 2>/dev/null | jq . || echo "Graph server not running"
+
+# Auto-close stale sessions (default: older than 4 hours)
+intel-graph-session-cleanup max_age_hours="4":
+    @echo "Cleaning stale sessions (max age: {{max_age_hours}}h)..."
+    @curl -s -X POST http://127.0.0.1:8900/api/session/cleanup \
+      -H "Content-Type: application/json" \
+      -d '{"max_age_hours": {{max_age_hours}}}' 2>/dev/null | jq . || echo "Graph server not running"
+
+# Proposal pipeline health report
+intel-graph-proposal-health:
+    @curl -s http://127.0.0.1:8900/api/health/proposals 2>/dev/null | jq . || echo "Graph server not running"
+
+# Embed all embeddable node kinds (proposals, seams, tasks, functions, types, modules, tests)
+intel-graph-embed-all:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for kind in proposal seam task function type module test; do
+        echo "Embedding ${kind}s..."
+        curl -s -X POST http://127.0.0.1:8901/mcp \
+          -H "Content-Type: application/json" \
+          -d "{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"graph_embed_batch\",\"arguments\":{\"kind\":\"${kind}\"}},\"id\":1}" | jq -r '.result.content[0].text' 2>/dev/null || echo "  failed for ${kind}"
+    done
+
+# Full graph maintenance: scan + cleanup + health check
+intel-graph-maintain:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "── Step 1: Scan ──"
+    curl -s -X POST http://127.0.0.1:8900/api/scan | jq '{crates, modules, types, functions, tests, docs, duration_ms}' 2>/dev/null || echo "Scan failed"
+    echo ""
+    echo "── Step 2: Session Cleanup ──"
+    curl -s -X POST http://127.0.0.1:8900/api/session/cleanup | jq . 2>/dev/null || echo "Cleanup failed"
+    echo ""
+    echo "── Step 3: Health Check ──"
+    curl -s http://127.0.0.1:8900/api/health | jq . 2>/dev/null || echo "Health check failed"
+    echo ""
+    echo "── Step 4: Embed Proposals ──"
+    curl -s -X POST http://127.0.0.1:8901/mcp \
+      -H "Content-Type: application/json" \
+      -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"graph_embed_batch","arguments":{"kind":"proposal"}},"id":1}' | jq -r '.result.content[0].text' 2>/dev/null || echo "Embedding failed"
+    echo ""
+    echo "✅ Maintenance complete."
+
+# Semantic search
+intel-graph-search query limit="10":
+    curl -s -X POST http://127.0.0.1:8901/mcp -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"graph_semantic_search","arguments":{"query":"{{query}}","limit":{{limit}}}},"id":1}' | jq '.result.results | map({name, kind, similarity})'
+
+# Open Web UI in browser (macOS)
+intel-graph-ui:
+    open http://127.0.0.1:8900
+
+# Close active workstream with summary and disposition
+close-workstream:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    
+    # Get active workstream
+    WORKSTREAM=$(curl -s "http://127.0.0.1:8900/api/nodes?kind=workstream" | jq -r '.[] | select(.properties.status == "active") | .id' | head -1)
+    if [ -z "$WORKSTREAM" ]; then
+        echo "No active workstream found"
+        exit 1
+    fi
+    
+    # Get session
+    SESSION=$(curl -s "http://127.0.0.1:8900/api/nodes?kind=session" | jq -r '.[] | select(.properties.status == "active") | .id' | head -1)
+    
+    echo "Closing workstream: $WORKSTREAM"
+    echo "Session: ${SESSION:-none}"
+    echo ""
+    
+    # Prompt for details
+    read -p "Disposition (completed/partial/blocked/superseded/cancelled): " DISPOSITION
+    DISPOSITION=${DISPOSITION:-completed}
+    
+    read -p "Verification level (none/test-green/smoke-green/watched-live-green): " VERIFIED
+    VERIFIED=${VERIFIED:-test-green}
+    
+    read -p "Summary of work: " SUMMARY
+    
+    # Close workstream
+    curl -s -X POST "http://127.0.0.1:8900/api/nodes/${WORKSTREAM}/update" \
+      -H "Content-Type: application/json" \
+      -d "{\"properties\":{\"status\":\"closed\",\"disposition\":\"${DISPOSITION}\",\"verified\":\"${VERIFIED}\",\"summary\":\"${SUMMARY}\",\"end_time\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}}" | jq '.updated'
+    
+    # Close session if exists
+    if [ -n "$SESSION" ]; then
+        curl -s -X POST http://127.0.0.1:8901/mcp \
+          -H "Content-Type: application/json" \
+          -d "{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"session_close\",\"arguments\":{\"session_id\":\"${SESSION}\",\"status\":\"${DISPOSITION}\",\"verified\":\"${VERIFIED}\",\"summary\":\"${SUMMARY}\"}},\"id\":1}" | jq -r '.result.content[0].text'
+    fi
+    
+    echo ""
+    echo "✅ Workstream closed"

@@ -376,6 +376,39 @@ Seam IDs: `local-admin-capability-envelope`, `onnx-admin-fallback-path`
 - [ ] Decide how ONNX fits for embeddings, tool-calling support, and local degraded-mode admin workflows.
 - [ ] Prove one local fallback path without external models.
 
+## New Project: EmbeddingGemma Swap
+
+Seam IDs: `embeddinggemma-swap-validation`
+
+- [x] Add [EMBEDDINGGEMMA_SWAP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/EMBEDDINGGEMMA_SWAP_PROPOSAL.md) and register seam.
+- [x] Start graph workstream for this session and claim the seam.
+- [ ] Switch graph embedding default from MiniLM to EmbeddingGemma in the active sidecar path.
+- [ ] Run embedding smoke validation: `graph_embed`, `graph_embed_batch(kind=proposal)`, `graph_semantic_search`.
+- [ ] Record session decision and verification status in graph before close-out.
+
+## New Project: Multi-Agent Coding Fleet
+
+Proposal: [MULTI_AGENT_CODING_FLEET_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MULTI_AGENT_CODING_FLEET_PROPOSAL.md)
+Seam IDs: `cross-agent-seam-ownership`, `role-charter-contract`, `verification-custody`, `handoff-packet-shape`
+
+- [x] Open proposal for multi-agent parallel coding topology across Codex, Claude Code, Gemini/Antigravity, and Copilot.
+- [ ] Define first role charters with explicit authority boundaries:
+  - orchestrator
+  - implementer
+  - explorer/reviewer
+  - verifier
+  - docs/state maintainer
+- [ ] Define and enforce first delegation packet schema:
+  - `seam_id`
+  - `truth_level`
+  - `in_scope`
+  - `out_of_scope`
+  - `success_condition`
+  - `output_contract`
+  - `verification_expectation`
+- [ ] Run first pilot with two parallel implementation lanes plus independent verifier lane.
+- [ ] Capture at least one observed coordination failure and codify it into a standing workflow rule.
+
 ## New Project: OpenClaw Parity And Migration
 
 - [ ] Review [OPENCLAW_PARITY_MIGRATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OPENCLAW_PARITY_MIGRATION_PROPOSAL.md).
@@ -815,30 +848,34 @@ Seam IDs: `structured-model-envelope`, `hotel-gemini-oauth-flow`
 - [x] Run a full guest-path Gemini OAuth smoke through the materialized model-controller, not just hotel-side validation.
 - [ ] Wire refresh-token persistence and refresh lifecycle behind the hotel vault.
 - [x] Deliver an honest ElevenLabs end-to-end voice path beyond inline-audio/testing mode, including watched-live confirmation that `voice.synthesize` produces canonical audio artifacts instead of a model-router policy refusal.
-- [ ] Add `OpenAIProvider` to `model-router` on the existing provider seam:
+- [x] Add `OpenAIProvider` to `model-router` on the existing provider seam:
   - `text.generate`
   - structured outputs
   - tool calling
   - image-aware text input where supported
   - `text.embed`
-- [ ] Extend provider config/auth loading for OpenAI:
+- [x] Extend provider config/auth loading for OpenAI:
   - API key path
-  - OAuth bearer path
-  - refreshable OAuth path owned by the hotel
-- [ ] Define hotel CLI OAuth UX for OpenAI:
-  - browser launch
-  - temporary localhost callback listener
-  - token exchange
-  - token storage/refresh
-  - guest handoff
+  - OAuth/bearer compatibility path
+  - endpoint-scoped key refs owned by the hotel vault
+- [x] Define hotel CLI key-management UX for OpenAI:
+  - endpoint-scoped API-key onboarding
+  - vault secret-ref storage
   - validation command
-- [ ] Add the first OpenAI startup smoke through the materialized model-controller guest.
-- [ ] Define provider capability overrides for specialized OpenAI model features:
+  - project ID / endpoint metadata handoff
+  - guest handoff
+- [x] Add the first OpenAI startup smoke through the materialized model-controller guest.
+- [x] Define provider capability overrides for specialized OpenAI model features:
   - reasoning effort / depth
   - verbosity
   - background mode
   - built-in tools gated behind explicit provider options
   - realtime/audio kept as a follow-on slice, not part of the first parity path
+- [x] Define the provider-family strategy for OpenAI-compatible endpoints:
+  - OpenAI remains the canonical first-class provider path
+  - OpenRouter and similar hosted endpoints should usually ride the same adapter family with different endpoint/auth settings
+  - Ollama should be treated as an adapter or compatibility mode unless its lifecycle or protocol truly requires a separate controller boundary
+  - add explicit `provider`, `base_url`, and auth-shape config for the shared adapter path
 
 ## New Project: Key Vault
 
@@ -1111,6 +1148,10 @@ Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membra
 - [x] Add graph runner instance inventory (Slice 4): `GET /api/graphs`, `GET /api/graphs/:graph_id` — via new `ListGraphInstances` IPC variant.
 - [x] Add secret refs read-only inventory (Slice 4): `GET /api/secrets` — vault registry entries + known config-key ref presence flags; no values exposed.
 - [x] Add skill assignment mutations (Slice 4): `POST /api/agents/:agent_id/roles/:role_name/skills`, `DELETE /api/agents/:agent_id/roles/:role_name/skills/:skill_name` — management-role bypass added to `AssignSkill`/`RevokeSkill` authority checks.
+- [x] Add desktop component authoring parity (Slice 5): `POST /api/components`, `PATCH /api/components/:guest_id`, backed by the canonical `ComponentManifest` contract and hotel-owned manifest-complete inventory/detail reads instead of partial desktop-only shape guessing.
+- [x] Add schema-driven component templates (Slice 6): `GET /api/component-templates`, backend-owned template metadata for known component families, structured desktop rendering for representative fields, and explicit vault-only guidance for secrets/config refs.
+- [x] Expand desktop agent editing (Slice 7): agent settings now surface editable base persona/identity fields (`identity_text`, `soul_text`, `user_context_text`, `system_prompt`), roles show richer role posture details, and the same agent editor exposes durable rules in a first-class tab instead of making the persona spine disappear behind nickname-only edits.
+- [x] Move graph-owned base agent persona editing into a dedicated desktop window launched from the agent graph/persona object, with labeled fields plus explicit Cancel/Save, instead of burying those edits inline inside the list panel.
 
 ## Next Project: Tool Assembly and Routed Execution
 
@@ -1184,6 +1225,12 @@ Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membra
   - conversational agents
   - workers
   - subagents
+- [ ] Define the four-layer memory split and datasource boundary:
+  - working memory (turn window / role-local)
+  - heuristic memory (relevance-ranked recall)
+  - rote memory (durable references / pointers / dates / standing facts)
+  - work product (datasource truth, shareable polished records)
+- [ ] Define how agent-shared and role-scoped durable references should coexist with heuristics and work-product datasource records.
 - [ ] Keep the first implementation slice personality-first; do not try to solve the full memory backend story in the same change.
 - [ ] Build the first ZeroClaw/OpenClaw bridge slice:
   - [ ] import one agent from `openclaw.json`
@@ -1255,6 +1302,7 @@ Seam IDs: `wider-client-adoption`, `philotic-native-memory-integration`
 - [x] Telegram slash-command elevation (first slice): `/ping` handled in `membrane` before agent-core — `handle_membrane_command` short-circuits the `EmitTask` dispatch and replies directly.
 - [ ] Telegram slash-command elevation (next): `/new` resets session_id in membrane (start fresh conversation without round-trip); `/help` lists available commands from membrane directly.
 - [x] Telegram bot command registration/UI: call Telegram `setMyCommands` from `membrane` startup so supported slash commands show up in the Telegram client command UI instead of existing only as hidden transport behavior.
+- [ ] Telegram provider binary (`telegram-provider-binary`): materialize Telegram hotels with `membrane-telegram` instead of the compatibility `membrane` wrapper, and keep rollout/install recipes aware of the provider binary.
 - [x] Telegram poll ownership (first slice): add a hotel-owned poll lease per bot token fingerprint so only one local membrane long-polls `getUpdates` for a token at a time, and fail closed when lease acquisition is denied.
 - [x] Telegram poll ownership (authority slice): anchor agent identity to `authority_hotel` and deny poll-lease acquisition when the current hotel is not that agent's home authority.
 - [x] Telegram poll delegated authority (transitional slice): allow a non-home hotel to acquire the poll lease only when the agent identity bundle explicitly lists that hotel in `telegram_poll_delegate_hotels`.
@@ -1384,3 +1432,9 @@ Seam IDs: `active-proposal-frontmatter-rollout`, `architecture-doc-metadata-roll
 - [x] Decide that seam docs remain exception-based artifacts and only graduate from proposal + registry + task surfaces when cross-cutting complexity or repeated confusion justifies their own boundary doc.
 - [x] Tighten [docs/architecture/ARCHITECTURE.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE.md) against current execution-transport and current session-authority reality.
 - [x] Audit historical docs and clearly mark any remaining non-authoritative architecture narratives as legacy or historical.
+- [ ] Define reintegration tracking for worktrees and branches in intel-graph/SVER so operators can see:
+  - whether a slice is only on a side branch
+  - whether it is merged to `develop`
+  - whether local `develop` is behind `origin/develop`
+  - whether watched-live verification is about to run from stale local truth
+  - proposal: [docs/architecture/WORKTREE_REINTEGRATION_TRACKING_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/WORKTREE_REINTEGRATION_TRACKING_PROPOSAL.md)

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - agent-default-toolsets
+
+rectangle "agent-default-toolsets" as agent_default_toolsets #Orange {
+}
+
+
+@enduml

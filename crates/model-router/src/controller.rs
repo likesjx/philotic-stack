@@ -148,6 +148,10 @@ pub struct AttachmentInput {
     pub url: Option<String>,
     pub blob_ref: Option<String>,
     pub transport_error: Option<String>,
+    /// Inline PCM audio — base64 i16 LE; bypasses blob store (Discord voice bridge).
+    pub inline_audio_b64: Option<String>,
+    pub inline_audio_sample_rate: Option<u32>,
+    pub inline_audio_channels: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -602,19 +606,24 @@ impl ControllerTask {
                 if self.context.attachments.is_empty() {
                     bail!("{kind_label} task requires at least one attachment");
                 }
-                if !self.context.attachments.iter().any(|attachment| {
-                    attachment
+                let has_usable_attachment = self.context.attachments.iter().any(|attachment| {
+                    let no_error = attachment
+                        .transport_error
+                        .as_deref()
+                        .map(|error| error.trim().is_empty())
+                        .unwrap_or(true);
+                    let has_url = attachment
                         .url
                         .as_deref()
                         .map(|url| !url.trim().is_empty())
-                        .unwrap_or(false)
-                        && attachment
-                            .transport_error
-                            .as_deref()
-                            .map(|error| error.trim().is_empty())
-                            .unwrap_or(true)
-                }) {
-                    bail!("{kind_label} task requires at least one blob-backed attachment url");
+                        .unwrap_or(false);
+                    let has_inline = attachment.inline_audio_b64.is_some();
+                    no_error && (has_url || has_inline)
+                });
+                if !has_usable_attachment {
+                    bail!(
+                        "{kind_label} task requires at least one blob-backed or inline attachment"
+                    );
                 }
             }
             TaskKind::VoiceDialogue => {
@@ -864,6 +873,18 @@ fn parse_attachments(value: Option<&Value>) -> Vec<AttachmentInput> {
                             .and_then(|obj| obj.get("transport_error"))
                             .and_then(Value::as_str)
                             .map(str::to_string),
+                        inline_audio_b64: object
+                            .and_then(|obj| obj.get("inline_audio_b64"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        inline_audio_sample_rate: object
+                            .and_then(|obj| obj.get("inline_audio_sample_rate"))
+                            .and_then(Value::as_u64)
+                            .map(|v| v as u32),
+                        inline_audio_channels: object
+                            .and_then(|obj| obj.get("inline_audio_channels"))
+                            .and_then(Value::as_u64)
+                            .map(|v| v as u16),
                     }
                 })
                 .collect()
@@ -1291,6 +1312,16 @@ pub struct ProviderConfigs {
     pub gemini_base_url: Option<String>,
     pub elevenlabs_api_key: Option<String>,
     pub elevenlabs_default_voice_id: Option<String>,
+    /// Base URL for a local Ollama server. Defaults to `http://localhost:11434`.
+    pub ollama_base_url: Option<String>,
+    /// Model tag to use for Ollama text generation. Defaults to `gemma4:e4b`.
+    pub ollama_model: Option<String>,
+    pub openai_oauth_access_token: Option<String>,
+    pub openai_api_key: Option<String>,
+    pub openai_base_url: Option<String>,
+    pub openai_project_id: Option<String>,
+    pub openai_default_model: Option<String>,
+    pub openai_default_embedding_model: Option<String>,
 }
 
 impl ProviderConfigs {
@@ -1323,6 +1354,32 @@ impl ProviderConfigs {
             .await?,
             elevenlabs_default_voice_id: fetch_config_string(ipc_client, "elevenlabs_voice_id")
                 .await?,
+            ollama_base_url: env_override("PHILOTIC_OLLAMA_BASE_URL")
+                .or(fetch_config_string(ipc_client, "ollama_base_url").await?),
+            ollama_model: env_override("PHILOTIC_OLLAMA_MODEL")
+                .or(fetch_config_string(ipc_client, "ollama_model").await?),
+            openai_oauth_access_token: load_env_or_config_secret_string(
+                ipc_client,
+                "PHILOTIC_OPENAI_OAUTH_ACCESS_TOKEN",
+                "PHILOTIC_OPENAI_OAUTH_ACCESS_TOKEN_REF",
+                "openai_oauth_access_token",
+                "openai_oauth_access_token_ref",
+            )
+            .await?,
+            openai_api_key: fetch_config_or_secret_string(
+                ipc_client,
+                "openai_api_key",
+                "openai_api_key_ref",
+            )
+            .await?,
+            openai_base_url: env_override("PHILOTIC_OPENAI_BASE_URL")
+                .or(fetch_config_string(ipc_client, "openai_base_url").await?),
+            openai_project_id: env_override("PHILOTIC_OPENAI_PROJECT_ID")
+                .or(fetch_config_string(ipc_client, "openai_project_id").await?),
+            openai_default_model: env_override("PHILOTIC_OPENAI_DEFAULT_MODEL")
+                .or(fetch_config_string(ipc_client, "openai_default_model").await?),
+            openai_default_embedding_model: env_override("PHILOTIC_OPENAI_DEFAULT_EMBEDDING_MODEL")
+                .or(fetch_config_string(ipc_client, "openai_default_embedding_model").await?),
         })
     }
 }

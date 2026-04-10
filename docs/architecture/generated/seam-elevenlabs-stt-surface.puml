@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - elevenlabs-stt-surface
+
+rectangle "elevenlabs-stt-surface" as elevenlabs_stt_surface #Orange {
+}
+
+
+@enduml

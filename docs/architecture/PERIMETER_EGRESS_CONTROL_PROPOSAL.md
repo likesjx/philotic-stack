@@ -1,31 +1,31 @@
 ---
-title: "Perimeter Egress Control Proposal"
+title: Perimeter Egress Control Proposal
 doc_type: proposal
 domain: operator-control-plane
 status: proposed
-last_updated: 2026-03-12
+last_updated: 2026-03-31
 tags:
-  - egress
-  - perimeter
-  - security
-  - control-plane
-  - active-seam
+- egress
+- perimeter
+- security
+- control-plane
+- active-seam
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - HOTEL_PERIMETER_TRUST_PROPOSAL.md
-  - MEMBRANE_COMPONENT_PROPOSAL.md
-  - MEMBRANE_EXTERNAL_AGENT_AND_EVENT_TRANSPORT_PROPOSAL.md
-  - CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- HOTEL_PERIMETER_TRUST_PROPOSAL.md
+- MEMBRANE_COMPONENT_PROPOSAL.md
+- MEMBRANE_EXTERNAL_AGENT_AND_EVENT_TRANSPORT_PROPOSAL.md
+- CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: perimeter-egress-control
 implements: []
 implemented_by: []
 active_seams:
-  - egress-policy-object
-  - outbound-classification
+- egress-policy-object
+- outbound-classification
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
+- ARCHITECTURE_STATUS.md
 ---
 
 # Perimeter Egress Control Proposal

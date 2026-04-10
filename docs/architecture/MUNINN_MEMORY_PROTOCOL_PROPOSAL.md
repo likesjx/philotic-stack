@@ -1,30 +1,30 @@
 ---
-title: "Muninn Memory Protocol Proposal"
+title: Muninn Memory Protocol Proposal
 doc_type: proposal
 domain: memory-context
 status: accepted-current-slice
-last_updated: 2026-03-15
+last_updated: 2026-03-31
 tags:
-  - muninn
-  - memory
-  - protocol
-  - continuity
-  - active-seam
+- muninn
+- memory
+- protocol
+- continuity
+- active-seam
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - MUNINN_CLIENT_MEMORY_PROTOCOL.md
-  - AGENT_WORKFLOW_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- MUNINN_CLIENT_MEMORY_PROTOCOL.md
+- AGENT_WORKFLOW_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: muninn-memory-protocol
 implements: []
 implemented_by:
-  - muninn-helper-and-skill-slice
+- muninn-helper-and-skill-slice
 active_seams:
-  - wider-client-adoption
-  - philotic-native-memory-integration
+- wider-client-adoption
+- philotic-native-memory-integration
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
+- ARCHITECTURE_STATUS.md
 ---
 
 # Muninn Memory Protocol Proposal
@@ -85,17 +85,19 @@ This proposal now has three concrete artifacts behind it:
 
 ## Core Recommendation
 
-Treat Muninn as a shared memory protocol with three layers:
+Treat Muninn/Mempalace as a shared memory protocol orchestrated entirely by the **`intel-graph` Coding Management Plane**.
 
-1. Shared memory habit
-2. Shared helper/client transport
-3. Client-specific instruction adapters
+The core shift is from **Ceremonial Habits** to **100% Reflexive Operations**:
+
+1. **Coding Agents (Operator/CLI Agents)**: They no longer use an active `muninn-memory-habit` script. Instead, they use IDE-native `Save`/`PreCompact` hooks that reflexively push conversation turns directly to the `intel-graph` REST API. The graph automatically isolates these records into the agent's dedicated Mempalace `Wing`.
+2. **Philotic Engine (Internal Agents)**: Internal `philote` processes remain bounded by strict runtime context management. They do not leak their state into the coding agent's semantic history.
+3. **Unified Intelligence**: The `intel-graph` serves as the sole broker. When an admin or architect philote needs systemic insight, the graph provides a unified response spanning the deterministic SQLite codebase and the semantic Mempalace histories.
 
 That means:
 
-- the memory habit should be consistent across clients
-- the transport plumbing should not be reimplemented by hand in every session
-- client-specific skills or prompts should wrap the shared helper instead of duplicating the protocol
+- the memory habit is completely automatic (100% reflex) for the coding layer.
+- the transport plumbing avoids fragmenting storage logic.
+- the `intel-graph` API abstracts the Mempalace implementation entirely.
 
 ## Memory Triad
 
@@ -119,31 +121,13 @@ Clients should organize retrieval around three questions:
 
 This triad is simple enough to share across clients without forcing all of them into the same personality model.
 
-## Default Habit
+### The Reflexive Write
 
-### Retrieve
+Manual write-backs via `muninn_remember` and `muninn_decide` are deprecated for coding agents.
 
-Before meaningful work:
+Instead, the `intel-graph` hooks into the execution lifecycle via IDE `Save` and `PreCompact` hooks. At the end of every conversation turn, the raw `WorkingTurn` delta is automatically posted to the `intel-graph` API, which pipes it natively into the agent's partitioned Mempalace instance.
 
-- call `muninn_where_left_off`
-- call `muninn_recall`
-
-Meaningful work includes:
-
-- continuing a design or coding thread
-- resuming a paused conversation
-- making architecture or implementation decisions
-- personalized collaboration where continuity matters
-- deciding what to do next
-
-Skip retrieval for trivial chatter.
-
-### Write Back
-
-After important outcomes:
-
-- call `muninn_remember` for atomic facts, preferences, and small decisions
-- call `muninn_decide` for explicit decisions with rationale
+This effectively means the memory overhead costs 0 execution tokens locally and requires no explicit tool invocation.
 
 Good write-back candidates:
 
@@ -271,44 +255,31 @@ Each client should then have its own lightweight wrapper:
 
 For Philotic specifically:
 
-- keep Muninn as an external heuristic memory substrate during the experiment
-- use the helper script from development clients immediately
-- treat this work as a separate work item from personality/context modeling and from Philotic-native memory design
-- later decide whether to:
-  - keep Muninn external over MCP
-  - build a Rust client wrapper using the Go SDK as a reference implementation
-  - embed directly in an agent-core binary via `muninn.Open()` (now viable — no network hop, no daemon)
-  - port proven behavior into native Philotic memory systems
+- deprecate the `muninn-memory-habit` CLI script for agent sessions and migrate to **100% Reflexive Hooks** (`PreCompact` / `Stop`).
+- establish the `intel-graph` as the central broker that receives `POST /api/mempalace/turn` events from the agent IDEs.
+- use Mempalace's `Wing` / `Room` semantic vector indices backend for coding agents to achieve maximum retrieval performance.
+- keep Philotic OS `philote` runtime context strictly decoupled from the chat histories.
 
-Do not port first.
+### Production Deployment Topology (Graph-Brokered Continuity)
 
-Prove that the memory behavior helps first.
-
-### Production Deployment Topology (distributed Philotic)
-
-As Philotic moves toward distributed projects, the recommended topology is:
+As Philotic moves toward distributed projects, the recommended topology centers around `intel-graph`:
 
 ```
-jane-vps  →  muninndb (Cortex, single writer, Docker)
-              ├─ vault: philotic          ← system-level shared memory
-              ├─ vault: agent/<id>        ← per-agent isolated memory
-              └─ vault: project/<name>    ← per-project working memory
-
-agents connect via:
-  - MCP over HTTP (remote, with --listen-host 0.0.0.0)
-  - muninn exec (one-shot writes, no persistent connection)
-  - muninn.Open() (embedded, for fully isolated local agents)
+jane-vps  →  intel-graph API (The Broker)
+              ├─ AIUA SQLite (Hotel State)
+              ├─ Project Graph (Proposals, Seams, Nodes)
+              └─ Mempalace ChromaDB (Semantic Histories)
+                  ├─ Wing: gemini-architect
+                  ├─ Wing: claude-implementer
+                  └─ Wing: cursor-operator
 ```
 
 Key decisions:
 
-1. **Vault-per-agent** — one vault per agent identity, isolated API keys. Write-only keys for ingest-only agents; full keys for persona agents.
-2. **Central Cortex on jane-vps** — single writer for now. Lobe on the dev machine is viable once read scaling matters (uses MBP protocol, very low replication lag).
-3. **`muninn exec` as agent sidecar** — for agents that need one-shot writes without managing a persistent MCP session. Eliminates the handshake ceremony problem.
-4. **`muninn.Open()` for embedded agents** — if an agent-worker binary runs fully locally and needs no cross-agent memory sharing, embedding directly is now the lowest-friction option.
-5. **`--listen-host 0.0.0.0`** — required for remote agent access. Pair with Caddy TLS proxy and per-vault API keys for security boundary.
-
-This topology defers the native Rust port question. The embedded Go API (`muninn.Open()`) is now close enough to native that a thin Rust FFI wrapper over it is a realistic medium-term option if network latency ever becomes the bottleneck.
+1. **Graph-Backed Broker** — `intel-graph` unifies the deterministic codebase and semantic memory, providing a single endpoint for all operations.
+2. **Wing Partitioning** — the `intel-graph` isolates incoming reflexes into separate Mempalace Wings based on the `agent_id`.
+3. **Reflexive IDE Hooks** — Claude Code, Gemini Antigravity, and Cursor utilize invisible bash hooks to post their transcripts to `intel-graph` without manual `muninn` invocation.
+4. **Unified Admin Querying** — `intel-graph` enables an admin philote to retrieve a fused context of code facts and conversation histories seamlessly.
 
 ## Success Criteria
 

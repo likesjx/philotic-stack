@@ -1,28 +1,28 @@
 ---
-title: "Context Graph Tool Runner"
+title: Context Graph Tool Runner
 doc_type: proposal
 domain: tooling-execution
 status: proposed
-last_updated: 2026-03-17
+last_updated: 2026-03-31
 tags:
-  - graph
-  - tool-runner
-  - knowledge-graph
-  - shared-state
-  - multi-identity
-  - replication
+- graph
+- tool-runner
+- knowledge-graph
+- shared-state
+- multi-identity
+- replication
 related_docs:
-  - TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md
-  - TOOL_MANAGEMENT_PLANE_PROPOSAL.md
-  - ARCHITECTURE_STATUS.md
+- TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md
+- TOOL_MANAGEMENT_PLANE_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: context-graph-runner
 active_seams:
-  - graph-runner-store
-  - graph-runner-visibility
-  - graph-runner-tool-surface
-  - graph-runner-hotel-registry
+- graph-runner-store
+- graph-runner-visibility
+- graph-runner-tool-surface
+- graph-runner-hotel-registry
 ---
 
 # Context Graph Tool Runner

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - deterministic-context-assembly
+
+rectangle "deterministic-context-assembly" as deterministic_context_assembly #Orange {
+}
+
+
+@enduml

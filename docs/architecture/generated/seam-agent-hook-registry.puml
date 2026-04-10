@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - agent-hook-registry
+
+rectangle "agent-hook-registry" as agent_hook_registry #Orange {
+}
+
+
+@enduml

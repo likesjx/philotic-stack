@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - model-router-embed-kind
+
+rectangle "model-router-embed-kind" as model_router_embed_kind #Orange {
+}
+
+
+@enduml

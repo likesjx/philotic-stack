@@ -2,6 +2,8 @@
 members = [
     "crates/aiua",
     "crates/membrane",
+    "crates/membrane-discord",
+    "crates/membrane-telegram",
     "crates/philote",
     "crates/model-router",
     "crates/onnx-runner",
@@ -15,5 +17,7 @@ members = [
     "crates/philotic-sandbox",
     "crates/mlx-runner",
     "crates/media-prep",
+    "crates/graph-intelligence",
+    "crates/philotic-graph",
 ]
 resolver = "2"

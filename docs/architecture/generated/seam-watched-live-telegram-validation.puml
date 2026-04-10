@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - watched-live-telegram-validation
+
+rectangle "watched-live-telegram-validation" as watched_live_telegram_validation #Orange {
+}
+
+
+@enduml

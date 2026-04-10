@@ -13,6 +13,7 @@
 //!   GET  /api/agents/:agent_id/rules
 //!   GET  /api/agents/:agent_id/routing-policies
 //!   POST /api/routing-policies/:proposal_id/disposition
+//!   PATCH /api/agents/:agent_id/roles/:role_name
 //!   GET  /api/skills
 //!   GET  /api/mesh/targets
 //!   GET  /api/mesh/targets/:target_node_id/status
@@ -23,7 +24,11 @@
 //!   GET  /api/config/telegram
 //!   GET  /api/config/gemini
 //!   GET  /api/components
+//!   GET  /api/component-templates
+//!   POST /api/components
 //!   GET  /api/components/:guest_id
+//!   PATCH /api/components/:guest_id
+//!   DELETE /api/components/:guest_id
 //!   POST /api/components/:guest_id/enable
 //!   POST /api/components/:guest_id/disable
 //!   POST /api/components/:guest_id/restart
@@ -61,7 +66,7 @@ use tokio::sync::{broadcast, watch, Mutex};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use philotic_client::{
-    CronJob, CronJobSource, DesktopMembraneAgentView, DesktopMembraneGuestView,
+    ComponentManifest, CronJob, CronJobSource, DesktopMembraneAgentView, DesktopMembraneGuestView,
     DesktopMembraneStatusView, GuestIdentity, IpcRequest, IpcResponse, LeaseEnvelope,
     OperatorTargetAgentInventoryView, OperatorTargetGuestInventoryView, OperatorTargetStatusView,
     OperatorTargetView, PhiloticClient, OPERATOR_CHAT_REPLY_ROLE,
@@ -122,6 +127,98 @@ struct SetRoutingPolicyDispositionBody {
     state: String,
     reason: String,
 }
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct ComponentInventoryEntry {
+    guest_id: String,
+    role: String,
+    hotel: String,
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    env: HashMap<String, String>,
+    component_type: String,
+    is_active: bool,
+    auto_start: bool,
+    #[serde(default)]
+    active_pid: Option<String>,
+    #[serde(default)]
+    last_active_at: Option<u64>,
+    #[serde(default)]
+    component_config: Value,
+    #[serde(default)]
+    capabilities: Vec<String>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct ComponentTemplateFieldView {
+    key: String,
+    label: String,
+    target: String,
+    input_kind: String,
+    required: bool,
+    #[serde(default)]
+    secret: bool,
+    #[serde(default)]
+    vault_only: bool,
+    #[serde(default)]
+    placeholder: Option<String>,
+    #[serde(default)]
+    help: Option<String>,
+    #[serde(default)]
+    default_value: Option<Value>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct ComponentTemplateDependencyView {
+    key: String,
+    label: String,
+    location: String,
+    required: bool,
+    #[serde(default)]
+    secret: bool,
+    #[serde(default)]
+    vault_only: bool,
+    help: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct ComponentTemplateView {
+    id: String,
+    label: String,
+    description: String,
+    command: String,
+    role: String,
+    #[serde(default)]
+    env_fields: Vec<ComponentTemplateFieldView>,
+    #[serde(default)]
+    component_config_fields: Vec<ComponentTemplateFieldView>,
+    #[serde(default)]
+    dependencies: Vec<ComponentTemplateDependencyView>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct PatchComponentBody {
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    hotel: Option<String>,
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    args: Option<Vec<String>>,
+    #[serde(default)]
+    env: Option<HashMap<String, String>>,
+    #[serde(default)]
+    component_config: Option<Value>,
+    #[serde(default)]
+    auto_start: Option<bool>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct DeleteComponentBody {
+    confirm_guest_id: String,
+}
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
@@ -173,6 +270,10 @@ pub async fn run(
             axum::routing::patch(handle_agent_patch),
         )
         .route("/api/agents/:agent_id/roles", get(handle_agent_roles))
+        .route(
+            "/api/agents/:agent_id/roles/:role_name",
+            axum::routing::patch(handle_role_patch),
+        )
         .route("/api/agents/:agent_id/rules", get(handle_agent_rules))
         .route(
             "/api/agents/:agent_id/routing-policies",
@@ -187,8 +288,17 @@ pub async fn run(
         .route("/api/config", get(handle_config))
         .route("/api/config/telegram", get(handle_config_telegram))
         .route("/api/config/gemini", get(handle_config_gemini))
-        .route("/api/components", get(handle_components))
-        .route("/api/components/:guest_id", get(handle_component_detail))
+        .route(
+            "/api/components",
+            get(handle_components).post(handle_component_create),
+        )
+        .route("/api/component-templates", get(handle_component_templates))
+        .route(
+            "/api/components/:guest_id",
+            get(handle_component_detail)
+                .patch(handle_component_patch)
+                .delete(handle_component_delete),
+        )
         .route(
             "/api/components/:guest_id/enable",
             post(handle_component_enable),
@@ -1807,9 +1917,41 @@ struct PatchAgentBody {
     #[serde(default)]
     persona_name: Option<String>,
     #[serde(default)]
+    soul_text: Option<String>,
+    #[serde(default)]
+    identity_text: Option<String>,
+    #[serde(default)]
+    user_context_text: Option<String>,
+    #[serde(default)]
+    system_prompt: Option<String>,
+    #[serde(default)]
     default_toolset: Option<Vec<String>>,
     #[serde(default)]
     default_skillset: Option<Vec<String>>,
+}
+
+#[derive(serde::Deserialize)]
+struct PatchRoleBody {
+    #[serde(default)]
+    guest_id: Option<String>,
+    #[serde(default)]
+    toolset_profile: Option<String>,
+    #[serde(default)]
+    role_identity_addendum: Option<String>,
+    #[serde(default)]
+    role_manifest: Option<String>,
+    #[serde(default)]
+    is_admin: Option<bool>,
+    #[serde(default)]
+    inactive_ttl_seconds: Option<u64>,
+    #[serde(default)]
+    iteration_cap: Option<u32>,
+    #[serde(default)]
+    approval_policy: Option<String>,
+    #[serde(default)]
+    model_profile: Option<String>,
+    #[serde(default)]
+    context_window_policy: Option<String>,
 }
 
 async fn handle_agent_patch(
@@ -1825,6 +1967,10 @@ async fn handle_agent_patch(
         &state.socket,
         &agent_id,
         body.persona_name,
+        body.soul_text,
+        body.identity_text,
+        body.user_context_text,
+        body.system_prompt,
         body.default_toolset,
         body.default_skillset,
     )
@@ -1843,10 +1989,56 @@ async fn handle_agent_patch(
     }
 }
 
+async fn handle_role_patch(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path((agent_id, role_name)): Path<(String, String)>,
+    Json(body): Json<PatchRoleBody>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_patch_role(
+        &state.socket,
+        &agent_id,
+        &role_name,
+        body.guest_id,
+        body.toolset_profile,
+        body.role_identity_addendum,
+        body.role_manifest,
+        body.is_admin,
+        body.inactive_ttl_seconds,
+        body.iteration_cap,
+        body.approval_policy,
+        body.model_profile,
+        body.context_window_policy,
+    )
+    .await
+    {
+        Ok(role) => {
+            let event = json!({
+                "type": "role:updated",
+                "payload": { "agent_id": agent_id, "role_name": role_name }
+            });
+            let _ = state.tx.send(event.to_string());
+            Json(role).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 async fn ipc_patch_agent_bundle(
     socket: &str,
     agent_id: &str,
     persona_name: Option<String>,
+    soul_text: Option<String>,
+    identity_text: Option<String>,
+    user_context_text: Option<String>,
+    system_prompt: Option<String>,
     default_toolset: Option<Vec<String>>,
     default_skillset: Option<Vec<String>>,
 ) -> Result<Value> {
@@ -1855,6 +2047,10 @@ async fn ipc_patch_agent_bundle(
         .send_request(IpcRequest::PatchAgentBundle {
             agent_id: agent_id.to_string(),
             persona_name,
+            soul_text,
+            identity_text,
+            user_context_text,
+            system_prompt,
             default_toolset,
             default_skillset,
         })
@@ -1863,6 +2059,131 @@ async fn ipc_patch_agent_bundle(
         IpcResponse::AgentUpdated { agent } => Ok(serde_json::to_value(agent)?),
         IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected patch_agent_bundle response: {other:?}")),
+    }
+}
+
+async fn ipc_patch_role(
+    socket: &str,
+    agent_id: &str,
+    role_name: &str,
+    guest_id: Option<String>,
+    toolset_profile: Option<String>,
+    role_identity_addendum: Option<String>,
+    role_manifest: Option<String>,
+    is_admin: Option<bool>,
+    inactive_ttl_seconds: Option<u64>,
+    iteration_cap: Option<u32>,
+    approval_policy: Option<String>,
+    model_profile: Option<String>,
+    context_window_policy: Option<String>,
+) -> Result<Value> {
+    let role_data = ipc_list_role_incarnations(socket, agent_id).await?;
+    let existing = role_data
+        .get("roles")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|role| role.get("role_name").and_then(Value::as_str) == Some(role_name))
+        .cloned()
+        .ok_or_else(|| anyhow!("role [{role_name}] not configured for agent [{agent_id}]"))?;
+
+    let existing_guest_id = existing
+        .get("guest_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("role [{role_name}] missing guest_id"))?;
+    let existing_toolset_profile = existing
+        .get("toolset_profile")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("role [{role_name}] missing toolset_profile"))?;
+    let existing_is_admin = existing
+        .get("is_admin")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let existing_inactive_ttl_seconds =
+        existing.get("inactive_ttl_seconds").and_then(Value::as_u64);
+    let turn_loop_config = existing
+        .get("turn_loop_config")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    let mut client = connect_management_client(socket, "philotic-web-patch-role").await?;
+    match client
+        .send_request(IpcRequest::ConfigureRole {
+            agent_id: agent_id.to_string(),
+            role_name: role_name.to_string(),
+            guest_id: guest_id.unwrap_or_else(|| existing_guest_id.to_string()),
+            calling_role: "orchestrator".into(),
+            toolset_profile: toolset_profile
+                .unwrap_or_else(|| existing_toolset_profile.to_string()),
+            role_identity_addendum: Some(role_identity_addendum.unwrap_or_else(|| {
+                existing
+                    .get("role_identity_addendum")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            })),
+            role_manifest: Some(role_manifest.unwrap_or_else(|| {
+                existing
+                    .get("role_manifest")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            })),
+            is_admin: is_admin.unwrap_or(existing_is_admin),
+            inactive_ttl_seconds: Some(
+                inactive_ttl_seconds
+                    .or(existing_inactive_ttl_seconds)
+                    .unwrap_or(0),
+            )
+            .filter(|ttl| *ttl > 0),
+            iteration_cap: Some(iteration_cap.unwrap_or_else(|| {
+                turn_loop_config
+                    .get("iteration_cap")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .unwrap_or(0)
+            }))
+            .filter(|cap| *cap > 0),
+            approval_policy: Some(approval_policy.unwrap_or_else(|| {
+                turn_loop_config
+                    .get("approval_policy")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            }))
+            .filter(|policy| !policy.trim().is_empty()),
+            model_profile: Some(model_profile.unwrap_or_else(|| {
+                turn_loop_config
+                    .get("model_profile")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            }))
+            .filter(|profile| !profile.trim().is_empty()),
+            context_window_policy: Some(context_window_policy.unwrap_or_else(|| {
+                turn_loop_config
+                    .get("context_window_policy")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            }))
+            .filter(|policy| !policy.trim().is_empty()),
+        })
+        .await?
+    {
+        IpcResponse::ConfigureRoleOk { .. } => {
+            let refreshed = ipc_list_role_incarnations(socket, agent_id).await?;
+            refreshed
+                .get("roles")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .find(|role| role.get("role_name").and_then(Value::as_str) == Some(role_name))
+                .cloned()
+                .ok_or_else(|| anyhow!("role [{role_name}] missing after patch"))
+        }
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected patch_role response: {other:?}")),
     }
 }
 
@@ -1882,6 +2203,39 @@ async fn handle_components(headers: HeaderMap, State(state): State<AppState>) ->
     }
 }
 
+// ── GET /api/component-templates ─────────────────────────────────────────────
+
+async fn handle_component_templates(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    Json(component_templates()).into_response()
+}
+
+// ── POST /api/components ──────────────────────────────────────────────────────
+
+async fn handle_component_create(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(manifest): Json<ComponentManifest>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_register_component(&state.socket, manifest).await {
+        Ok(component) => {
+            let event = json!({ "type": "component:created", "payload": { "guest_id": component.guest_id } });
+            let _ = state.tx.send(event.to_string());
+            (StatusCode::CREATED, Json(component)).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 // ── GET /api/components/:guest_id ─────────────────────────────────────────────
 
 async fn handle_component_detail(
@@ -1892,19 +2246,104 @@ async fn handle_component_detail(
     if !check_auth(&headers, &state) {
         return unauthorized();
     }
-    match ipc_list_components(&state.socket).await {
-        Ok(components) => {
-            let found = components
-                .into_iter()
-                .find(|c| c.get("guest_id").and_then(|v| v.as_str()) == Some(guest_id.as_str()));
-            match found {
-                Some(c) => Json(c).into_response(),
-                None => (
-                    StatusCode::NOT_FOUND,
-                    Json(json!({"error": "component not found"})),
+    match ipc_get_component(&state.socket, &guest_id).await {
+        Ok(component) => Json(component).into_response(),
+        Err(e) if e.to_string().contains("component not found") => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "component not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// ── PATCH /api/components/:guest_id ───────────────────────────────────────────
+
+async fn handle_component_patch(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(guest_id): Path<String>,
+    Json(body): Json<PatchComponentBody>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_get_component(&state.socket, &guest_id).await {
+        Ok(current) => {
+            let manifest = ComponentManifest {
+                guest_id: guest_id.clone(),
+                role: body.role.unwrap_or(current.role),
+                hotel: body.hotel.unwrap_or(current.hotel),
+                command: body.command.unwrap_or(current.command),
+                args: body.args.unwrap_or(current.args),
+                env: body.env.unwrap_or(current.env),
+                component_config: body.component_config.unwrap_or(current.component_config),
+                auto_start: body.auto_start.unwrap_or(current.auto_start),
+            };
+            match ipc_register_component(&state.socket, manifest).await {
+                Ok(component) => {
+                    let event =
+                        json!({ "type": "component:updated", "payload": { "guest_id": guest_id } });
+                    let _ = state.tx.send(event.to_string());
+                    Json(component).into_response()
+                }
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": e.to_string()})),
                 )
                     .into_response(),
             }
+        }
+        Err(e) if e.to_string().contains("component not found") => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "component not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// ── DELETE /api/components/:guest_id ─────────────────────────────────────────
+
+async fn handle_component_delete(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(guest_id): Path<String>,
+    Json(body): Json<DeleteComponentBody>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    if body.confirm_guest_id != guest_id {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "confirmation text must exactly match guest_id"})),
+        )
+            .into_response();
+    }
+    match ipc_remove_component(&state.socket, &guest_id).await {
+        Ok(_) => {
+            let event = json!({ "type": "component:deleted", "payload": { "guest_id": guest_id } });
+            let _ = state.tx.send(event.to_string());
+            Json(json!({"ok": true, "guest_id": guest_id})).into_response()
+        }
+        Err(e)
+            if e.to_string().contains("GUEST_NOT_FOUND")
+                || e.to_string().contains("component not found") =>
+        {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "component not found"})),
+            )
+                .into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2466,14 +2905,45 @@ async fn ipc_revoke_skill(
     }
 }
 
-async fn ipc_list_components(socket: &str) -> Result<Vec<Value>> {
+async fn ipc_list_components(socket: &str) -> Result<Vec<ComponentInventoryEntry>> {
     let mut client = connect_management_client(socket, "philotic-web-components").await?;
     match client.send_request(IpcRequest::ListComponents {}).await? {
-        IpcResponse::ComponentInventory { components } => Ok(components),
+        IpcResponse::ComponentInventory { components } => components
+            .into_iter()
+            .map(serde_json::from_value)
+            .collect::<Result<Vec<ComponentInventoryEntry>, _>>()
+            .map_err(Into::into),
         IpcResponse::Standard {
             ok: false, message, ..
         } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected list_components response: {other:?}")),
+    }
+}
+
+async fn ipc_get_component(socket: &str, guest_id: &str) -> Result<ComponentInventoryEntry> {
+    let components = ipc_list_components(socket).await?;
+    components
+        .into_iter()
+        .find(|component| component.guest_id == guest_id)
+        .ok_or_else(|| anyhow!("component not found"))
+}
+
+async fn ipc_register_component(
+    socket: &str,
+    manifest: ComponentManifest,
+) -> Result<ComponentInventoryEntry> {
+    let guest_id = manifest.guest_id.clone();
+    let mut client = connect_management_client(socket, "philotic-web-components").await?;
+    match client
+        .send_request(IpcRequest::RegisterComponent { manifest })
+        .await?
+    {
+        IpcResponse::ComponentRegistered { .. } => ipc_get_component(socket, &guest_id).await,
+        IpcResponse::Standard {
+            ok: false, message, ..
+        } => Err(anyhow!(message)),
+        IpcResponse::Error(message) => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected register_component response: {other:?}")),
     }
 }
 
@@ -2506,6 +2976,480 @@ async fn ipc_restart_component(socket: &str, guest_id: &str) -> Result<()> {
         IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected restart_component response: {other:?}")),
     }
+}
+
+async fn ipc_remove_component(socket: &str, guest_id: &str) -> Result<()> {
+    let mut client = connect_management_client(socket, "philotic-web-components").await?;
+    match client
+        .send_request(IpcRequest::RemoveComponent {
+            guest_id: guest_id.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::Standard { ok: true, .. } => Ok(()),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        IpcResponse::Error(message) => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected remove_component response: {other:?}")),
+    }
+}
+
+fn component_templates() -> Vec<ComponentTemplateView> {
+    vec![
+        ComponentTemplateView {
+            id: "membrane-telegram".into(),
+            label: "Telegram Provider".into(),
+            description: "Telegram ingress/egress provider. System socket and node env vars are hotel-owned; operator-authored fields should stay focused on agent targeting and token/config references.".into(),
+            command: "membrane-telegram".into(),
+            role: "membrane".into(),
+            env_fields: vec![
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_TARGET_AGENT_ID".into(),
+                    label: "Target Agent ID".into(),
+                    target: "env".into(),
+                    input_kind: "string".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some("agent-bjork-01".into()),
+                    help: Some("Use for a single-agent membrane instance. Hotel-seeded shared membranes may instead rely on PHILOTIC_AGENT_ROSTER.".into()),
+                    default_value: None,
+                },
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_TELEGRAM_BOT_TOKEN_KEY".into(),
+                    label: "Telegram Token Config Key".into(),
+                    target: "env".into(),
+                    input_kind: "string".into(),
+                    required: true,
+                    secret: true,
+                    vault_only: true,
+                    placeholder: Some("telegram_bot_token".into()),
+                    help: Some("Name of the hotel config key that resolves the bot token. Store the actual token in the vault/config surface, not in this component manifest.".into()),
+                    default_value: Some(json!("telegram_bot_token")),
+                },
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_TELEGRAM_API_BASE_URL".into(),
+                    label: "Telegram API Base URL".into(),
+                    target: "env".into(),
+                    input_kind: "string".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some("https://api.telegram.org".into()),
+                    help: Some("Optional override for alternate Telegram API endpoints or local testing.".into()),
+                    default_value: None,
+                },
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_TELEGRAM_FILE_API_BASE_URL".into(),
+                    label: "Telegram File API Base URL".into(),
+                    target: "env".into(),
+                    input_kind: "string".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some("https://api.telegram.org".into()),
+                    help: Some("Optional override for file downloads when the API base differs.".into()),
+                    default_value: None,
+                },
+            ],
+            component_config_fields: vec![],
+            dependencies: vec![
+                ComponentTemplateDependencyView {
+                    key: "telegram_bot_token".into(),
+                    label: "Telegram Bot Token".into(),
+                    location: "hotel-config".into(),
+                    required: true,
+                    secret: true,
+                    vault_only: true,
+                    help: "Create or rotate this through the vault/config surface. The component should reference the config key, not store the token directly.".into(),
+                },
+            ],
+        },
+        ComponentTemplateView {
+            id: "membrane-discord".into(),
+            label: "Discord Provider".into(),
+            description: "Discord provider membrane. Guest identity, hotel socket, and node id are hotel-owned; the operator should provide the target agent plus Discord registration/config references.".into(),
+            command: "membrane-discord".into(),
+            role: "membrane".into(),
+            env_fields: vec![
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_TARGET_AGENT_ID".into(),
+                    label: "Target Agent ID".into(),
+                    target: "env".into(),
+                    input_kind: "string".into(),
+                    required: true,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some("agent-01".into()),
+                    help: Some("Agent served by this Discord provider instance.".into()),
+                    default_value: None,
+                },
+                ComponentTemplateFieldView {
+                    key: "DISCORD_BOT_TOKEN_KEY".into(),
+                    label: "Discord Token Config Key".into(),
+                    target: "env".into(),
+                    input_kind: "string".into(),
+                    required: true,
+                    secret: true,
+                    vault_only: true,
+                    placeholder: Some("discord_bot_token".into()),
+                    help: Some("Hotel config key used to resolve the Discord bot token. Keep the actual token in vault/config, not here.".into()),
+                    default_value: Some(json!("discord_bot_token")),
+                },
+                ComponentTemplateFieldView {
+                    key: "DISCORD_APPLICATION_ID".into(),
+                    label: "Discord Application ID".into(),
+                    target: "env".into(),
+                    input_kind: "string".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some("123456789012345678".into()),
+                    help: Some("Needed for slash command registration and application-scoped Discord features.".into()),
+                    default_value: None,
+                },
+            ],
+            component_config_fields: vec![],
+            dependencies: vec![
+                ComponentTemplateDependencyView {
+                    key: "discord_bot_token".into(),
+                    label: "Discord Bot Token".into(),
+                    location: "hotel-config".into(),
+                    required: true,
+                    secret: true,
+                    vault_only: true,
+                    help: "Store the bot token in the vault/config surface and reference it by config key from the component.".into(),
+                },
+            ],
+        },
+        ComponentTemplateView {
+            id: "model-controller-gemini".into(),
+            label: "Gemini Model Controller".into(),
+            description: "Gemini-backed model controller. The component itself is usually system-light; most meaningful configuration lives in hotel config and secret refs.".into(),
+            command: "model-controller-gemini".into(),
+            role: "model".into(),
+            env_fields: vec![
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_GEMINI_BASE_URL".into(),
+                    label: "Gemini Base URL Override".into(),
+                    target: "env".into(),
+                    input_kind: "string".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some("https://generativelanguage.googleapis.com".into()),
+                    help: Some("Optional per-component override; hotel config usually owns this.".into()),
+                    default_value: None,
+                },
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_GEMINI_OAUTH_ACCESS_TOKEN_REF".into(),
+                    label: "Gemini OAuth Access Token Ref".into(),
+                    target: "env".into(),
+                    input_kind: "secret_ref".into(),
+                    required: false,
+                    secret: true,
+                    vault_only: true,
+                    placeholder: Some("secret://hotel/default/gemini/oauth-access".into()),
+                    help: Some("Optional env override for OAuth token resolution. Prefer secret refs over raw tokens.".into()),
+                    default_value: None,
+                },
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_GEMINI_OAUTH_PROJECT_ID".into(),
+                    label: "Gemini OAuth Project ID".into(),
+                    target: "env".into(),
+                    input_kind: "string".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some("my-gcp-project".into()),
+                    help: Some("Optional OAuth project override.".into()),
+                    default_value: None,
+                },
+            ],
+            component_config_fields: vec![],
+            dependencies: vec![
+                ComponentTemplateDependencyView {
+                    key: "gemini_api_key_ref".into(),
+                    label: "Gemini API Key Ref".into(),
+                    location: "hotel-config".into(),
+                    required: false,
+                    secret: true,
+                    vault_only: true,
+                    help: "Use a secret_ref-backed hotel config entry for API-key auth.".into(),
+                },
+                ComponentTemplateDependencyView {
+                    key: "gemini_oauth_access_token_ref".into(),
+                    label: "Gemini OAuth Access Token Ref".into(),
+                    location: "hotel-config".into(),
+                    required: false,
+                    secret: true,
+                    vault_only: true,
+                    help: "Preferred for refreshable OAuth auth. Store the token in vault and place the secret_ref in hotel config.".into(),
+                },
+                ComponentTemplateDependencyView {
+                    key: "gemini_oauth_project_id".into(),
+                    label: "Gemini OAuth Project ID".into(),
+                    location: "hotel-config".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    help: "Companion config when OAuth auth is used.".into(),
+                },
+            ],
+        },
+        ComponentTemplateView {
+            id: "model-controller-elevenlabs".into(),
+            label: "ElevenLabs Voice Controller".into(),
+            description: "ElevenLabs-backed model controller. The API key should always arrive via secret ref rather than plaintext manifest fields.".into(),
+            command: "model-controller-elevenlabs".into(),
+            role: "model.elevenlabs".into(),
+            env_fields: vec![ComponentTemplateFieldView {
+                key: "PHILOTIC_MODEL_CONTROLLER_INLINE_AUDIO".into(),
+                label: "Allow Inline Audio".into(),
+                target: "env".into(),
+                input_kind: "boolean".into(),
+                required: false,
+                secret: false,
+                vault_only: false,
+                placeholder: None,
+                help: Some("Enable inline PCM audio inputs when the transport supports them.".into()),
+                default_value: Some(json!(false)),
+            }],
+            component_config_fields: vec![],
+            dependencies: vec![
+                ComponentTemplateDependencyView {
+                    key: "elevenlabs_api_key_ref".into(),
+                    label: "ElevenLabs API Key Ref".into(),
+                    location: "hotel-config".into(),
+                    required: true,
+                    secret: true,
+                    vault_only: true,
+                    help: "Store the ElevenLabs key in vault and place the secret_ref in hotel config.".into(),
+                },
+                ComponentTemplateDependencyView {
+                    key: "elevenlabs_voice_id".into(),
+                    label: "Default Voice ID".into(),
+                    location: "hotel-config".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    help: "Optional default voice selection for synthesis tasks.".into(),
+                },
+            ],
+        },
+        ComponentTemplateView {
+            id: "model-controller-mlx".into(),
+            label: "MLX Local Model Controller".into(),
+            description: "Local MLX-backed controller. The important operator-owned shape lives in component_config, especially the model fleet definition.".into(),
+            command: "model-controller-mlx".into(),
+            role: "model.mlx".into(),
+            env_fields: vec![
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_MLX_CONFIG".into(),
+                    label: "Fleet Config File Path".into(),
+                    target: "env".into(),
+                    input_kind: "string".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some("/Users/jaredlikes/.philotic/mlx/fleet.json".into()),
+                    help: Some("Optional file-path override. Prefer component_config for hotel-managed components so the manifest stays self-contained.".into()),
+                    default_value: None,
+                },
+            ],
+            component_config_fields: vec![
+                ComponentTemplateFieldView {
+                    key: "health_check_interval_secs".into(),
+                    label: "Health Check Interval (secs)".into(),
+                    target: "component_config".into(),
+                    input_kind: "integer".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some("300".into()),
+                    help: Some("How often the MLX provider checks fleet health in the background.".into()),
+                    default_value: Some(json!(300)),
+                },
+                ComponentTemplateFieldView {
+                    key: "python_path".into(),
+                    label: "Python Interpreter".into(),
+                    target: "component_config".into(),
+                    input_kind: "string".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some("/opt/homebrew/bin/python3".into()),
+                    help: Some("Required when any fleet model uses managed mode or transcription.".into()),
+                    default_value: None,
+                },
+                ComponentTemplateFieldView {
+                    key: "models".into(),
+                    label: "MLX Models JSON".into(),
+                    target: "component_config".into(),
+                    input_kind: "mlx_models".into(),
+                    required: true,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some(
+                        "[\n  {\n    \"class\": \"text\",\n    \"repo_id\": \"mlx-community/Qwen2.5-7B-Instruct-4bit\",\n    \"mode\": \"attached\",\n    \"host\": \"127.0.0.1\",\n    \"port\": 8091,\n    \"priority\": 100,\n    \"extra_args\": [],\n    \"server_variant\": \"mlx_lm\"\n  }\n]".into(),
+                    ),
+                    help: Some("Fleet definition array for MLX models. This is the real shape the controller consumes, so the structured field stays JSON rather than pretending it is a few flat strings.".into()),
+                    default_value: Some(json!([])),
+                },
+            ],
+            dependencies: vec![],
+        },
+        ComponentTemplateView {
+            id: "model-controller-onnx".into(),
+            label: "ONNX Local Model Controller".into(),
+            description: "Local ONNX-backed controller with an Ollama-compatible sidecar. These knobs are mostly env-driven and do not require raw secret entry.".into(),
+            command: "model-controller-onnx".into(),
+            role: "model.local".into(),
+            env_fields: vec![
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_ONNX_SIDECAR_ONLY".into(),
+                    label: "Sidecar Only".into(),
+                    target: "env".into(),
+                    input_kind: "boolean".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: None,
+                    help: Some("Skip hotel IPC registration and only serve the local HTTP sidecar.".into()),
+                    default_value: Some(json!(false)),
+                },
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_ONNX_SIDECAR_ADDR".into(),
+                    label: "Sidecar Address".into(),
+                    target: "env".into(),
+                    input_kind: "string".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some("127.0.0.1:11435".into()),
+                    help: Some("Bind address for the Ollama-compatible sidecar.".into()),
+                    default_value: Some(json!("127.0.0.1:11435")),
+                },
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_ONNX_EMBED_REPO".into(),
+                    label: "Embedding Repo".into(),
+                    target: "env".into(),
+                    input_kind: "string".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some("onnx-community/embeddinggemma-300m-ONNX".into()),
+                    help: Some("Hugging Face repo id for the embedding model.".into()),
+                    default_value: Some(json!("onnx-community/embeddinggemma-300m-ONNX")),
+                },
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_ONNX_WHISPER_REPO".into(),
+                    label: "Whisper Repo".into(),
+                    target: "env".into(),
+                    input_kind: "string".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some("onnx-community/whisper-small".into()),
+                    help: Some("Hugging Face repo id for the transcription model.".into()),
+                    default_value: Some(json!("onnx-community/whisper-small")),
+                },
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_ONNX_PREFER_QUANTIZED".into(),
+                    label: "Prefer Quantized Models".into(),
+                    target: "env".into(),
+                    input_kind: "boolean".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: None,
+                    help: Some("Use quantized ONNX variants when available.".into()),
+                    default_value: Some(json!(true)),
+                },
+            ],
+            component_config_fields: vec![],
+            dependencies: vec![],
+        },
+        ComponentTemplateView {
+            id: "agent-graph-runner".into(),
+            label: "Agent Graph Runner".into(),
+            description: "Per-agent cognitive graph guest. The agent id is required; the graph DB path is optional unless you want an explicit storage location.".into(),
+            command: "agent-graph-runner".into(),
+            role: "agent-graph".into(),
+            env_fields: vec![
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_AGENT_ID".into(),
+                    label: "Owning Agent ID".into(),
+                    target: "env".into(),
+                    input_kind: "string".into(),
+                    required: true,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some("agent-jane-01".into()),
+                    help: Some("Agent whose cognitive graph this guest serves.".into()),
+                    default_value: None,
+                },
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_GRAPH_RUNNER_ID".into(),
+                    label: "Agent Graph Guest ID".into(),
+                    target: "env".into(),
+                    input_kind: "string".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some("agent-graph-agent-jane-01".into()),
+                    help: Some("Optional override for the guest id used during IPC registration.".into()),
+                    default_value: None,
+                },
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_AGENT_GRAPH_DB".into(),
+                    label: "Agent Graph DB Path".into(),
+                    target: "env".into(),
+                    input_kind: "string".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some("~/.philotic/agent-graph-agent-jane-01.db".into()),
+                    help: Some("Optional explicit SQLite path for the per-agent graph store.".into()),
+                    default_value: None,
+                },
+            ],
+            component_config_fields: vec![],
+            dependencies: vec![],
+        },
+        ComponentTemplateView {
+            id: "tool-runner".into(),
+            label: "Tool Runner".into(),
+            description: "Generic tool execution guest. Most deployments only need the canonical hotel socket and node id, which the hotel should provide.".into(),
+            command: "tool-runner".into(),
+            role: "tool".into(),
+            env_fields: vec![],
+            component_config_fields: vec![],
+            dependencies: vec![],
+        },
+        ComponentTemplateView {
+            id: "graph-runner".into(),
+            label: "Graph Runner".into(),
+            description: "Graph query/tool guest. The hotel usually injects the graph runner id automatically; operator-authored config is minimal.".into(),
+            command: "graph-runner".into(),
+            role: "tool.graph".into(),
+            env_fields: vec![
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_GRAPH_RUNNER_ID".into(),
+                    label: "Graph Runner ID".into(),
+                    target: "env".into(),
+                    input_kind: "string".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some("local-telegram:graph-runner".into()),
+                    help: Some("Optional explicit runner id when not hotel-seeded.".into()),
+                    default_value: None,
+                },
+            ],
+            component_config_fields: vec![],
+            dependencies: vec![],
+        },
+    ]
 }
 
 fn new_operator_chat_id(prefix: &str) -> String {

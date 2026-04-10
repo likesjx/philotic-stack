@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - placement-policy-broadening
+
+rectangle "placement-policy-broadening" as placement_policy_broadening #Orange {
+}
+
+
+@enduml

@@ -1,30 +1,30 @@
 ---
-title: "Philotic Agent Workflow Proposal"
+title: Philotic Agent Workflow Proposal
 doc_type: proposal
 domain: workflow-docs
 status: accepted-current-slice
-last_updated: 2026-03-12
+last_updated: 2026-03-31
 tags:
-  - workflow
-  - slices
-  - verification
-  - docs
+- workflow
+- slices
+- verification
+- docs
 related_docs:
-  - README.md
-  - DOC_TAGGING_FRONTMATTER_PROPOSAL.md
-  - ARCHITECTURE_STATUS.md
+- README.md
+- DOC_TAGGING_FRONTMATTER_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: agent-workflow
 implements: []
 implemented_by:
-  - repo-agents-protocol
-  - verify-vertical-slice
+- repo-agents-protocol
+- verify-vertical-slice
 active_seams:
-  - proposal-disposition-rollout
-  - watched-live-recipe
+- proposal-disposition-rollout
+- watched-live-recipe
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
+- ARCHITECTURE_STATUS.md
 ---
 
 # Philotic Agent Workflow Proposal
@@ -47,12 +47,17 @@ Implemented so far:
 - executable workflow commands in [justfile](/Users/jaredlikes/code/philotic-stack/justfile):
   - `verify-vertical-slice`
   - `operator-checklist`
+- **NEW**: Agent session tracking via graph-intelligence MCP tools
+  - `session_start` / `session_activity` / `session_close`
+  - Workstream auto-creation with proposal linkage
+  - Status Board ("The Pitt" style) for live work visibility
 
 Still pending in [task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md):
 
 - proposal disposition rollout across remaining active docs
 - lightweight skill/rules optimization loop
 - watched-live recipe for supervised guest/runtime validation
+- **NEW**: Bulk graph update — audit all proposals for missing seams/tasks
 
 ## Core Recommendation
 
@@ -187,6 +192,7 @@ The close-out should also capture:
 
 - assumption/reality gaps exposed during the slice
 - whether any standing instructions, skills, or rules now need tuning
+- **session_close**: Call `session_close` with verification level (`test-green`, `smoke-green`, `watched-live-green`) and summary
 
 ## Slice Contract
 

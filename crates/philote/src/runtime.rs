@@ -6,6 +6,7 @@ use crate::protocol::{
     FinalReplyPayload, InboundTaskPayload, ModelRequestPayload, PartialReplyPayload,
     TaskRunnerOverlay, ToolExecutionPayload, TransportAttachment, TurnEventPayload,
 };
+use crate::reflex::{IngressAction, ReflexEvent};
 use crate::session::{
     ActivePlan, AgentProfile, ApprovalInterruptDisposition, ComponentRouteAssembly,
     MediaRoutingPolicy, RecalledMemoryRecord, RoleActivation, RoutingPreferenceBinding,
@@ -20,15 +21,16 @@ use memory_core::{
     MemoryScope, MuninnConfig, MuninnRestEngine, RecallContext, RecallTrigger, VaultResolver,
 };
 use philotic_client::{
-    HandoffBundle, IpcRequest, IpcResponse, PhiloticClient, TaskErrorPayload, is_ipc_disconnect,
+    Exosome, HandoffBundle, IpcRequest, IpcResponse, ParacrineRouting, PhiloticClient,
+    TaskErrorPayload, is_ipc_disconnect,
 };
 use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Duration;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-pub const DEFAULT_AGENT_ID: &str = "agent-jane-01";
+pub const DEFAULT_AGENT_ID: &str = "agent-bjork-01";
 const DEFAULT_REPLY_ROLE: &str = "membrane";
 const DEFAULT_TEXT_MODEL_ROLE: &str = "model";
 const DEFAULT_VOICE_MODEL_ROLE: &str = "model.elevenlabs";
@@ -292,20 +294,22 @@ fn media_analysis_attachments(task: &InboundTaskPayload) -> Vec<TransportAttachm
     task.attachments
         .iter()
         .filter(|attachment| {
-            attachment
+            let has_url = attachment
                 .blob_download_url
                 .as_deref()
                 .map(|url| !url.is_empty())
-                .unwrap_or(false)
-                && attachment
-                    .transport_error
-                    .as_deref()
-                    .map(|error| error.is_empty())
-                    .unwrap_or(true)
-                && matches!(
-                    attachment.kind.as_str(),
-                    "photo" | "image" | "voice" | "audio" | "document"
-                )
+                .unwrap_or(false);
+            let has_inline = attachment.inline_audio_b64.is_some();
+            let no_error = attachment
+                .transport_error
+                .as_deref()
+                .map(|error| error.is_empty())
+                .unwrap_or(true);
+            let right_kind = matches!(
+                attachment.kind.as_str(),
+                "photo" | "image" | "voice" | "audio" | "document"
+            );
+            (has_url || has_inline) && no_error && right_kind
         })
         .cloned()
         .collect()
@@ -1152,6 +1156,9 @@ pub struct AgentRuntime {
     /// Agent profile (identity_text, soul_text, etc.) fetched from hotel at startup.
     /// Applied to every new session so the correct persona is used from the first turn.
     default_agent_profile: AgentProfile,
+    /// Tasks dequeued from a session's pending_user_tasks after a turn completed.
+    /// Dispatched at the top of the main event loop to avoid async recursion.
+    pending_drains: std::collections::VecDeque<(Uuid, InboundTaskPayload)>,
 }
 
 impl AgentRuntime {
@@ -1168,6 +1175,7 @@ impl AgentRuntime {
             muninn_config: None,
             configured_roles: HashMap::new(),
             default_agent_profile: AgentProfile::default(),
+            pending_drains: std::collections::VecDeque::new(),
         }
     }
 
@@ -1241,6 +1249,73 @@ impl AgentRuntime {
             }
             Ok(_) | Err(_) => {
                 warn!("Unexpected response to agent bundle fetch — using default profile.");
+            }
+        }
+    }
+
+    /// Fetch a role incarnation from the hotel and return a `RoleActivation` for it.
+    /// Used by `ensure_session_loaded` to auto-activate the agent's default role.
+    async fn fetch_role_activation(
+        &mut self,
+        role_name: &str,
+    ) -> Option<crate::session::RoleActivation> {
+        match self
+            .ipc_client
+            .send_request(IpcRequest::ListRoleIncarnations {
+                agent_id: self.agent_id.clone(),
+            })
+            .await
+        {
+            Ok(IpcResponse::Standard {
+                ok: true,
+                data: Some(data),
+                ..
+            }) => {
+                let roles = data.get("roles").and_then(|v| v.as_array())?;
+                let rec = roles
+                    .iter()
+                    .find(|r| r.get("role_name").and_then(|n| n.as_str()) == Some(role_name))?;
+
+                let toolset_profile = rec
+                    .get("toolset_profile")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("orchestrator")
+                    .to_string();
+                let role_manifest = rec
+                    .get("role_manifest")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let role_addendum = rec
+                    .get("role_identity_addendum")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+
+                Some(crate::session::RoleActivation {
+                    role_name: role_name.to_string(),
+                    active_incarnation_id: None,
+                    activation_reason: "default_role_auto_activation".into(),
+                    requested_by: None,
+                    role_addendum,
+                    role_manifest,
+                    base_identity_ref: None,
+                    activation_requester_class: Some("default_role".into()),
+                    activation_policy_owner: None,
+                    toolset_profile_ref: Some(toolset_profile),
+                    skillset_profile_ref: None,
+                    effective_skillset: vec![],
+                    effective_skill_guidance: vec![],
+                    working_memory_policy: None,
+                    memory_projection_policy: None,
+                    turn_loop_config: None,
+                })
+            }
+            _ => {
+                warn!(
+                    agent_id = %self.agent_id,
+                    role = %role_name,
+                    "Failed to fetch role incarnation for default activation."
+                );
+                None
             }
         }
     }
@@ -1322,6 +1397,15 @@ impl AgentRuntime {
         }
 
         loop {
+            // Dispatch any tasks that were dequeued from a session's pending_user_tasks
+            // after the previous turn completed. Processed before blocking on IPC so that
+            // back-to-back voice memos are handled in order without additional round-trips.
+            while let Some((drain_task_id, drain_task)) = self.pending_drains.pop_front() {
+                if let Err(e) = self.handle_user_message(drain_task, drain_task_id).await {
+                    warn!("Failed to dispatch drained queued task: {}", e);
+                }
+            }
+
             match tokio::time::timeout(Duration::from_secs(5), self.ipc_client.recv_task()).await {
                 Ok(Ok(IpcResponse::InboundTask {
                     source_node,
@@ -1378,6 +1462,32 @@ impl AgentRuntime {
                                 let _ = self.emit_error_reply(&task_ref, task_id, err).await;
                             }
                         }
+                        Ok(task) if task.action.as_deref() == Some("voice.dialogue") => {
+                            let task_ref = task.clone();
+                            if let Err(err) = self.handle_voice_dialogue(task, task_id).await {
+                                error!("Failed to handle voice.dialogue: {}", err);
+                            }
+                        }
+                        Ok(task) if task.action.as_deref() == Some("paracrine_request") => {
+                            // Paracrine sub-call — this philote is the specialist receiving
+                            // an Exosome from a peer or Orchestrator. final_reply_to/role
+                            // are set by the ParacrineEmit caller to route the response.
+                            let task_ref = task.clone();
+                            if let Err(err) = self.handle_user_message(task, task_id).await {
+                                error!("Failed to handle paracrine_request: {}", err);
+                                let _ = self.emit_error_reply(&task_ref, task_id, err).await;
+                            }
+                        }
+                        Ok(task) if task.action.as_deref() == Some("paracrine_response") => {
+                            // Exosome response arriving back from a prior paracrine
+                            // dispatch. Route through the lookaside reflex — not the
+                            // main user-message path.
+                            let task_ref = task.clone();
+                            if let Err(err) = self.handle_paracrine_response(task, task_id).await {
+                                error!("Failed to handle paracrine_response: {}", err);
+                                let _ = self.emit_error_reply(&task_ref, task_id, err).await;
+                            }
+                        }
                         Ok(task) => {
                             let task_ref = task.clone();
                             if let Err(err) = self.handle_user_message(task, task_id).await {
@@ -1389,6 +1499,13 @@ impl AgentRuntime {
                     }
                 }
                 Ok(Ok(IpcResponse::GracefulShutdown { drain_timeout_secs })) => {
+                    info!(
+                        "Hotel requested graceful shutdown (drain window: {}s). \
+                         Finishing in-flight work then exiting.",
+                        drain_timeout_secs
+                    );
+                    // Wait up to drain_timeout_secs for any active turns to complete,
+                    // then exit. We poll once per second.
                     let deadline = std::time::Instant::now()
                         + std::time::Duration::from_secs(drain_timeout_secs);
                     loop {
@@ -1414,6 +1531,165 @@ impl AgentRuntime {
                 Err(_) => {}
             }
         }
+    }
+
+    /// Lookaside routing reflex — dispatches an incoming `paracrine_response`
+    /// based on the [`ParacrineRouting`] hint carried in the exosome.
+    ///
+    /// This is a separate path from [`handle_user_message`]: the main cognitive
+    /// loop is not re-entered unless the routing explicitly calls for it. The
+    /// `paracrine_id` threads through every branch for cross-mesh provenance.
+    async fn handle_paracrine_response(
+        &mut self,
+        task: InboundTaskPayload,
+        task_id: Uuid,
+    ) -> Result<()> {
+        // Extract the exosome envelope from the task payload so we can read the
+        // paracrine_id and response_routing hint set at dispatch time.
+        let exosome: Option<Exosome> = task
+            .exosome
+            .as_ref()
+            .and_then(|v| serde_json::from_value::<Exosome>(v.clone()).ok());
+
+        let paracrine_id = exosome.as_ref().and_then(|e| e.paracrine_id.clone());
+
+        let routing = exosome
+            .as_ref()
+            .and_then(|e| e.response_routing.clone())
+            .unwrap_or(ParacrineRouting::CognitiveReEntry);
+
+        // Locate the owning session by matching paracrine_id against turn logs,
+        // falling back to the task's session_id field.
+        let session_id = task
+            .session_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                if let Some(pid) = &paracrine_id {
+                    self.sessions.iter().find_map(|(sid, state)| {
+                        state
+                            .active_turn
+                            .as_ref()
+                            .filter(|t| t.associated_paracrine_ids.contains(pid))
+                            .map(|_| sid.as_str())
+                    })
+                } else {
+                    None
+                }
+            })
+            .map(str::to_string);
+
+        match routing {
+            ParacrineRouting::RawForward => {
+                // Emit content directly to membrane — no model loop.
+                let content = task.content.clone().unwrap_or_default();
+                let node_id = local_node_id();
+                let _ = self
+                    .ipc_client
+                    .send_request(IpcRequest::EmitTask {
+                        target_node: node_id,
+                        target_role: "membrane".into(),
+                        target_guest_id: None,
+                        task_json: serde_json::json!({
+                            "action": "send_message",
+                            "content": content,
+                            "paracrine_id": paracrine_id,
+                        })
+                        .to_string(),
+                    })
+                    .await;
+            }
+
+            ParacrineRouting::ProgressUpdate => {
+                // Emit a partial/ephemeral update to membrane without closing
+                // or interrupting the active turn.
+                let content = task.content.clone().unwrap_or_default();
+                if let Some(sid) = &session_id {
+                    let _ = self.emit_partial_reply(sid, content).await;
+                }
+            }
+
+            ParacrineRouting::Heartbeat => {
+                // No model involvement — just log and acknowledge.
+                info!(
+                    paracrine_id = paracrine_id.as_deref().unwrap_or("?"),
+                    "paracrine heartbeat received"
+                );
+            }
+
+            ParacrineRouting::MemoryEnrichment => {
+                // Push specialist content into the session memory window.
+                // Falls through to CognitiveReEntry if no session found.
+                if session_id.is_none() {
+                    warn!(
+                        paracrine_id = paracrine_id.as_deref().unwrap_or("?"),
+                        "MemoryEnrichment: no session found, dropping"
+                    );
+                    return Ok(());
+                }
+                // Memory injection handled by model re-entry with enriched context.
+                self.handle_user_message(task, task_id).await?;
+            }
+
+            ParacrineRouting::DatasourceInjection => {
+                // Structured retrieval — inject into session context and re-enter
+                // the model so it can reason over the data.
+                if session_id.is_none() {
+                    warn!(
+                        paracrine_id = paracrine_id.as_deref().unwrap_or("?"),
+                        "DatasourceInjection: no session found, dropping"
+                    );
+                    return Ok(());
+                }
+                self.handle_user_message(task, task_id).await?;
+            }
+
+            ParacrineRouting::EnrichedToolResult => {
+                // Replace the "paracrine dispatched" placeholder with the real
+                // specialist response and re-enter the model as if the tool call
+                // completed normally.
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    tool_name: Some("delegate.whisper".into()),
+                    content: task.content.clone(),
+                    session_id: session_id.clone().or(task.session_id.clone()),
+                    turn_id: task.turn_id.clone(),
+                    chat_id: task.chat_id.clone(),
+                    source: Some("paracrine".into()),
+                    final_reply_to: task.final_reply_to.clone(),
+                    final_reply_role: task.final_reply_role.clone(),
+                    ..task
+                })
+                .await?;
+            }
+
+            ParacrineRouting::CognitiveReEntry => {
+                // Standard path: feed into cognitive re-entry.
+                // If there is an active turn, the re-entry will merge this
+                // response into its context. If not, a new synthesis turn begins.
+                self.handle_user_message(task, task_id).await?;
+            }
+
+            ParacrineRouting::PriorityReEntry => {
+                // Arbiter-promoted: prepend to the session queue so this task is
+                // processed NEXT, ahead of any already-waiting messages.
+                let session_id = task.session_id_or_default(&self.agent_id);
+                if let Some(state) = self.sessions.get_mut(&session_id) {
+                    if state.is_turn_active() {
+                        info!(
+                            session_id = %session_id,
+                            "PriorityReEntry: prepending arbiter-promoted task to front of queue"
+                        );
+                        state.prepend_user_task(task_id, task);
+                    } else {
+                        // No active turn — dispatch immediately.
+                        self.handle_user_message(task, task_id).await?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     async fn handle_user_message(&mut self, task: InboundTaskPayload, task_id: Uuid) -> Result<()> {
@@ -1548,6 +1824,95 @@ impl AgentRuntime {
                 .sessions
                 .get_mut(&session_id)
                 .expect("session should exist after ensuring and binding transport target");
+
+            // If a turn is already active, queue this task for dispatch after the turn
+            // completes rather than overwriting the active turn. Paracrine requests are
+            // never queued — they must always start their own specialist turn.
+            let is_paracrine = task.action.as_deref() == Some("paracrine_request");
+            if !is_paracrine && state.is_turn_active() {
+                let queue_len = state.pending_user_task_count();
+                let is_voice = task
+                    .message_kind
+                    .as_deref()
+                    .map(|k| matches!(k, "voice" | "audio"))
+                    .unwrap_or(false)
+                    || task.attachments.iter().any(|a| matches!(a.kind.as_str(), "voice" | "audio"));
+
+                // Safety valve: route TEXT tasks through the queue arbiter if one is
+                // configured. The arbiter evaluates priority and may call delegate.merge
+                // with PriorityReEntry to jump to the front of the queue.
+                // Voice tasks bypass the arbiter — they are always queued raw.
+                let arbiter_role = state.queue_arbiter_role.clone();
+                if !is_voice {
+                    if let Some(ref role) = arbiter_role {
+                        let task_content = task.content.clone().unwrap_or_default();
+                        let task_chat_id = task.chat_id.clone().unwrap_or_default();
+                        let task_session_id = session_id.clone();
+                        info!(
+                            session_id = %session_id,
+                            arbiter = %role,
+                            queue_depth = queue_len,
+                            "Routing queued TEXT task through queue arbiter for priority evaluation"
+                        );
+                        // Still enqueue the task normally so it's processed even if the arbiter
+                        // doesn't promote it. The arbiter's PriorityReEntry prepends on top if needed.
+                        state.enqueue_user_task(task_id, task);
+                        let arbiter_prompt = format!(
+                            "Incoming message queued behind {} waiting task(s): \"{}\". \
+                             Evaluate urgency and intent. If this requires immediate attention, \
+                             call delegate.merge with the message content to promote it to the front \
+                             of the queue. Otherwise do nothing — it will be processed in order.",
+                            queue_len, task_content
+                        );
+                        let exosome = philotic_client::Exosome {
+                            prompt: arbiter_prompt,
+                            context: None,
+                            paracrine_id: None,
+                            response_routing: Some(philotic_client::ParacrineRouting::PriorityReEntry),
+                            source_session_id: Some(task_session_id),
+                            source_chat_id: Some(task_chat_id),
+                        };
+                        let _ = self
+                            .ipc_client
+                            .send_request(IpcRequest::ParacrineEmit {
+                                role: role.clone(),
+                                exosome,
+                                reply_to_node: local_node_id(),
+                                reply_to_role: "orchestrator".into(),
+                                timeout_secs: None,
+                            })
+                            .await;
+                        return Ok(());
+                    }
+                }
+
+                info!(
+                    session_id = %session_id,
+                    queue_depth = queue_len + 1,
+                    "Turn already active — queuing inbound task (session context preserved on payload)"
+                );
+                state.enqueue_user_task(task_id, task);
+                return Ok(());
+            }
+
+            // If this turn was triggered by a paracrine_request, capture the
+            // originating paracrine_id so deliver_text_reply can echo it back
+            // as a `paracrine_response` rather than a `send_reply`.
+            // Also capture source_session_id / source_chat_id from the exosome so the
+            // response is routed back to the originating conversation channel, not the
+            // specialist's own ephemeral session.
+            let (paracrine_origin, paracrine_reply_session_id, paracrine_reply_chat_id) = {
+                let exosome = task
+                    .exosome
+                    .as_ref()
+                    .and_then(|v| serde_json::from_value::<Exosome>(v.clone()).ok());
+                (
+                    exosome.as_ref().and_then(|e| e.paracrine_id.clone()),
+                    exosome.as_ref().and_then(|e| e.source_session_id.clone()),
+                    exosome.as_ref().and_then(|e| e.source_chat_id.clone()),
+                )
+            };
+
             state.start_turn(WorkingTurn {
                 task_id,
                 turn_id: turn_id.clone(),
@@ -1571,6 +1936,11 @@ impl AgentRuntime {
                 turn_routing_plan: None,
                 awaiting_transcription_reentry: false,
                 scripted_loop_context: None,
+                associated_paracrine_ids: Vec::new(),
+                paracrine_origin,
+                paracrine_reply_session_id,
+                paracrine_reply_chat_id,
+                paracrine_merge_completed: false,
             });
             state.set_active_turn_phase(TurnPhase::LoadingContext);
 
@@ -1967,6 +2337,25 @@ impl AgentRuntime {
             )
             .await;
 
+        // Guard: if the active turn's turn_id doesn't match the incoming response, drop it.
+        // This prevents stale model or synthesis responses from corrupting a newer active turn
+        // (e.g., two overlapping voice memos where VM1's synthesis arrives after VM2's turn started).
+        let active_turn_id = self
+            .sessions
+            .get(&session_id)
+            .and_then(|s| s.active_turn.as_ref())
+            .map(|t| t.turn_id.clone());
+
+        if let Some(ref active_id) = active_turn_id {
+            if active_id != &turn_id {
+                warn!(
+                    "handle_model_response: dropping stale response for turn {} (active turn is {})",
+                    turn_id, active_id
+                );
+                return Ok(());
+            }
+        }
+
         // If the turn is waiting for voice synthesis, this is the audio response — route it
         // directly to the voice handler regardless of the agent_action kind.
         let waiting_voice = self
@@ -1989,6 +2378,19 @@ impl AgentRuntime {
                     "Session [{}] voice synthesis failed before audio delivery: {}",
                     session_id, model_error
                 );
+                // Fire TTS failure reflex — ensures fallback_to_text is on and
+                // any future turns know synthesis is unreliable.
+                if let Some(state) = self.sessions.get_mut(&session_id) {
+                    state.fire_reflex_event(ReflexEvent::TtsFailure {
+                        provider: state
+                            .agent_profile
+                            .voice_response_policy
+                            .provider
+                            .clone()
+                            .unwrap_or_else(|| "unknown".into()),
+                    });
+                }
+
                 let voice_policy = self
                     .sessions
                     .get(&session_id)
@@ -3922,6 +4324,67 @@ impl AgentRuntime {
         .await
     }
 
+    /// Handle a `voice.dialogue` task from the Discord membrane.
+    ///
+    /// Converts the inline PCM payload into a synthetic voice-attachment message and routes it
+    /// through the normal media-routing path (typically → `voice.transcribe` → Claude → reply).
+    async fn handle_voice_dialogue(
+        &mut self,
+        task: InboundTaskPayload,
+        task_id: Uuid,
+    ) -> Result<()> {
+        use crate::protocol::TransportAttachment;
+
+        // Ingress-time reflex: ensure voice_action == "transcribe" regardless of
+        // what the agent profile defaulted to. Belt-and-suspenders over materialization.
+        let session_id = task.session_id_or_default(&self.agent_id);
+        if let Some(state) = self.sessions.get_mut(&session_id) {
+            state.apply_reflex_ingress(IngressAction::VoiceDialogue);
+        }
+
+        let pcm_b64 = match task.pcm_b64.as_deref() {
+            Some(b) if !b.is_empty() => b.to_string(),
+            _ => {
+                debug!("voice.dialogue task has no pcm_b64, skipping");
+                return Ok(());
+            }
+        };
+
+        let sample_rate = task.sample_rate.unwrap_or(48_000);
+        let speaker_ssrc = task.speaker_ssrc.unwrap_or(0);
+
+        // Build a synthetic inbound task that looks like a voice-note message.
+        // The action is cleared so the normal handle_user_message dispatch applies.
+        let mut synthetic = task.clone();
+        synthetic.action = None;
+        synthetic.message_kind = Some("voice".into());
+        synthetic.pcm_b64 = None;
+        synthetic.sample_rate = None;
+        synthetic.speaker_ssrc = None;
+        synthetic.attachments = vec![TransportAttachment {
+            kind: "voice".into(),
+            file_id: format!("discord-voice-{}", speaker_ssrc),
+            mime_type: Some("audio/wav".into()),
+            inline_audio_b64: Some(pcm_b64),
+            inline_audio_sample_rate: Some(sample_rate),
+            inline_audio_channels: Some(2),
+            ..Default::default()
+        }];
+        // If the task had no content, provide a minimal placeholder so
+        // normalized_user_content doesn't skip the message.
+        if synthetic
+            .content
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
+            synthetic.content = Some(String::new());
+        }
+
+        self.handle_user_message(synthetic, task_id).await
+    }
+
     /// Final step: complete the turn, sync state, and emit `FinalReplyPayload` to membrane.
     async fn deliver_text_reply(
         &mut self,
@@ -3989,14 +4452,78 @@ impl AgentRuntime {
         let attend_content = content.clone();
         let attend_session_id = session_id.clone();
 
-        let reply_payload = FinalReplyPayload {
-            action: "send_reply",
-            session_id,
-            turn_id,
-            chat_id: completed_turn.chat_id,
-            content,
-            audio_artifact,
-            send_text_caption,
+        // Named specialist philotes always append an @agent attribution tag so the
+        // membrane (or receiving philote) knows which role secreted this Exosome.
+        // Format: `@agent:<role_name>` on its own line at the end of content.
+        // Membrane strips the tag before transport delivery and attaches an affordance.
+        let content = if let Ok(role_name) = std::env::var("PHILOTIC_ROLE_NAME") {
+            if !role_name.is_empty() {
+                format!("{}\n\n@agent:{}", content, role_name)
+            } else {
+                content
+            }
+        } else {
+            content
+        };
+
+        // Capture fields needed after the task_json if-else (values may be moved into the else branch).
+        let emit_session_id = session_id.clone();
+        let emit_turn_id = turn_id.clone();
+        let emit_chat_id = completed_turn.chat_id.clone();
+        let emit_audio_has_artifact = audio_artifact.is_some();
+
+        // If this turn was triggered by a paracrine_request, reply as a
+        // `paracrine_response` so A's routing reflex handles it correctly.
+        // Use source_session_id / source_chat_id from the exosome (stored on the turn)
+        // so the orchestrator routes the reply to the originating conversation channel
+        // rather than to this specialist's ephemeral session.
+        //
+        // If delegate.merge was called explicitly during this turn, the paracrine_response
+        // was already emitted — skip the auto-emit to avoid double-delivery.
+        // Otherwise use the normal `send_reply` path.
+        let task_json = if let Some(ref pid) = completed_turn.paracrine_origin {
+            if completed_turn.paracrine_merge_completed {
+                // Explicit merge already fired — complete the task but don't re-send.
+                info!(
+                    "deliver_text_reply: delegate.merge already emitted paracrine_response for turn {}; skipping auto-emit",
+                    turn_id
+                );
+                self.drain_next_user_task(&attend_session_id);
+                return Ok(());
+            }
+            let reply_session_id = completed_turn
+                .paracrine_reply_session_id
+                .as_deref()
+                .unwrap_or(&session_id);
+            let reply_chat_id = completed_turn
+                .paracrine_reply_chat_id
+                .as_deref()
+                .unwrap_or(&completed_turn.chat_id);
+            serde_json::json!({
+                "action": "paracrine_response",
+                "session_id": reply_session_id,
+                "turn_id": turn_id,
+                "chat_id": reply_chat_id,
+                "content": content,
+                "exosome": {
+                    "prompt": "",
+                    "paracrine_id": pid,
+                    "source_session_id": reply_session_id,
+                    "source_chat_id": reply_chat_id,
+                },
+            })
+            .to_string()
+        } else {
+            let reply_payload = FinalReplyPayload {
+                action: "send_reply",
+                session_id,
+                turn_id,
+                chat_id: completed_turn.chat_id,
+                content,
+                audio_artifact,
+                send_text_caption,
+            };
+            serde_json::to_string(&reply_payload)?
         };
         let final_reply_to = completed_turn.final_reply_to.clone();
         let final_reply_role = completed_turn.final_reply_role.clone();
@@ -4007,23 +4534,23 @@ impl AgentRuntime {
                 target_node: final_reply_to.clone(),
                 target_role: final_reply_role.clone(),
                 target_guest_id: final_reply_guest_id.clone(),
-                task_json: serde_json::to_string(&reply_payload)?,
+                task_json,
             })
             .await?;
 
         let _ = self
             .emit_turn_event_to(
-                reply_payload.session_id.clone(),
-                reply_payload.turn_id.clone(),
-                reply_payload.chat_id.clone(),
+                emit_session_id,
+                emit_turn_id,
+                emit_chat_id,
                 final_reply_to,
                 final_reply_role,
                 final_reply_guest_id,
                 "reply_delivery_emitted",
                 Some(format!(
                     "Reply emitted to membrane audio_artifact={} text_caption={}",
-                    reply_payload.audio_artifact.is_some(),
-                    reply_payload.send_text_caption
+                    emit_audio_has_artifact,
+                    send_text_caption
                 )),
             )
             .await;
@@ -4045,13 +4572,41 @@ impl AgentRuntime {
             tags.extend(memory_candidate.tags);
             let concept = memory_candidate.concept;
             let content_snapshot = memory_candidate.content;
+            // Tags from the model that signal a high-value memory worth enriching immediately.
+            // These bypass the background enrichment batch schedule.
+            const HIGH_VALUE_TAGS: &[&str] = &[
+                "decision",
+                "preference",
+                "identity",
+                "fact",
+                "architecture",
+                "constraint",
+                "operator",
+            ];
+            let should_enrich = tags
+                .iter()
+                .any(|t| HIGH_VALUE_TAGS.iter().any(|h| t == h || t.starts_with(&format!("{h}:"))));
+
             tokio::spawn(async move {
                 use memory_core::MemoryEngine as _;
-                if let Err(e) = engine
+                match engine
                     .remember(MemoryScope::SelfOnly, &concept, &content_snapshot, tags)
                     .await
                 {
-                    warn!(agent = %agent_id, error = %e, "Attend: memory write failed (non-fatal)");
+                    Ok(engram_ref) if should_enrich => {
+                        if let Err(e) = engine.retry_enrich(&engram_ref.id).await {
+                            tracing::debug!(
+                                agent = %agent_id,
+                                engram = %engram_ref.id,
+                                error = %e,
+                                "Attend: enrichment queue failed (non-fatal)"
+                            );
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(agent = %agent_id, error = %e, "Attend: memory write failed (non-fatal)");
+                    }
                 }
             });
         }
@@ -4118,6 +4673,7 @@ impl AgentRuntime {
             })
             .await?;
 
+        let drain_session_id = session_id.clone();
         let reply_payload = FinalReplyPayload {
             action: "send_reply",
             session_id,
@@ -4137,7 +4693,38 @@ impl AgentRuntime {
             })
             .await?;
 
+        // After failing this turn, schedule the next pending user task for dispatch.
+        self.drain_next_user_task(&drain_session_id);
+
         Ok(())
+    }
+
+    /// Move the next queued user task into `pending_drains` so the main event loop
+    /// can dispatch it without creating async recursion.
+    ///
+    /// Called after every turn completes or fails. The task retains its original
+    /// `session_id`, `chat_id`, and `exosome` context so the correct Telegram
+    /// session/chat is restored when the turn eventually starts.
+    fn drain_next_user_task(&mut self, session_id: &str) {
+        let next = if let Some(state) = self.sessions.get_mut(session_id) {
+            state.dequeue_user_task()
+        } else {
+            return;
+        };
+
+        if let Some((task_id, task)) = next {
+            let queued_depth = self
+                .sessions
+                .get(session_id)
+                .map(|s| s.pending_user_task_count())
+                .unwrap_or(0);
+            info!(
+                session_id = %session_id,
+                remaining_in_queue = queued_depth,
+                "Scheduling queued user task for dispatch after turn completion"
+            );
+            self.pending_drains.push_back((task_id, task));
+        }
     }
 
     // ── Scripted-loop routing ───────────────────────────────────────────────
@@ -6029,6 +6616,7 @@ impl AgentRuntime {
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
                 })
                 .await
             }
@@ -6124,6 +6712,7 @@ impl AgentRuntime {
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
                 })
                 .await
             }
@@ -6390,6 +6979,7 @@ impl AgentRuntime {
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
                 })
                 .await
             }
@@ -6527,6 +7117,7 @@ impl AgentRuntime {
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
                 })
                 .await
             }
@@ -6614,6 +7205,7 @@ impl AgentRuntime {
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
                 })
                 .await
             }
@@ -6721,6 +7313,7 @@ impl AgentRuntime {
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
                 })
                 .await
             }
@@ -6867,6 +7460,7 @@ impl AgentRuntime {
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
                 })
                 .await
             }
@@ -7084,6 +7678,7 @@ impl AgentRuntime {
                         final_reply_to: Some(payload.final_reply_to),
                         final_reply_role: Some(payload.final_reply_role),
                         final_reply_guest_id: payload.final_reply_guest_id,
+                        ..Default::default()
                     })
                     .await
                 } else {
@@ -7181,6 +7776,7 @@ impl AgentRuntime {
                         final_reply_to: Some(payload.final_reply_to),
                         final_reply_role: Some(payload.final_reply_role),
                         final_reply_guest_id: payload.final_reply_guest_id,
+                        ..Default::default()
                     })
                     .await
                 } else {
@@ -7326,6 +7922,7 @@ impl AgentRuntime {
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
                 })
                 .await
             }
@@ -7453,6 +8050,7 @@ impl AgentRuntime {
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
                 })
                 .await
             }
@@ -7530,6 +8128,7 @@ impl AgentRuntime {
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
                 })
                 .await
             }
@@ -7606,6 +8205,7 @@ impl AgentRuntime {
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
                 })
                 .await
             }
@@ -7673,6 +8273,7 @@ impl AgentRuntime {
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
                 })
                 .await
             }
@@ -7761,6 +8362,292 @@ impl AgentRuntime {
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            "delegate.whisper" => {
+                let args = &payload.arguments;
+                let role = match args.get("role").and_then(|v| v.as_str()) {
+                    Some(r) => r.to_string(),
+                    None => {
+                        return self
+                            .fail_active_turn(
+                                payload.session_id,
+                                payload.turn_id,
+                                "delegate.whisper: missing required argument 'role'".into(),
+                            )
+                            .await;
+                    }
+                };
+                let prompt = match args.get("prompt").and_then(|v| v.as_str()) {
+                    Some(p) => p.to_string(),
+                    None => {
+                        return self
+                            .fail_active_turn(
+                                payload.session_id,
+                                payload.turn_id,
+                                "delegate.whisper: missing required argument 'prompt'".into(),
+                            )
+                            .await;
+                    }
+                };
+
+                // `reply_to` controls where the specialist's response goes.
+                // "self"     → back to this philote as paracrine_response
+                // "membrane" → directly to the membrane role
+                // "<node>/<role>" → explicit routing
+                // default    → "self"
+                let reply_to_str = args
+                    .get("reply_to")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("self");
+
+                let node_id = local_node_id();
+                let (reply_to_node, reply_to_role) = match reply_to_str {
+                    "membrane" => (node_id.clone(), "membrane".to_string()),
+                    "self" | "" => (node_id.clone(), "agent".to_string()),
+                    other => {
+                        if let Some((node, role_part)) = other.split_once('/') {
+                            (node.to_string(), role_part.to_string())
+                        } else {
+                            (node_id.clone(), other.to_string())
+                        }
+                    }
+                };
+
+                // Parse optional response_routing hint from arguments.
+                // Defaults to CognitiveReEntry if absent or unrecognised.
+                let response_routing = args.get("routing").and_then(|v| v.as_str()).and_then(|s| {
+                    serde_json::from_value::<ParacrineRouting>(serde_json::Value::String(
+                        s.to_string(),
+                    ))
+                    .ok()
+                });
+
+                // Always generate a paracrine_id — it threads through the full
+                // thought graph and ties the response back to this turn.
+                let paracrine_id = Uuid::new_v4().to_string();
+
+                // Log the outbound exosome ID on the active turn so the routing
+                // reflex can correlate the response when it arrives.
+                // Also capture the current session_id and chat_id so the specialist's
+                // response can be routed back to the originating conversation channel.
+                let (source_session_id, source_chat_id) = {
+                    let mut sess_id = None;
+                    let mut chat_id = None;
+                    if let Some(state) = self.sessions.get_mut(&payload.session_id) {
+                        if let Some(turn) = state.active_turn.as_mut() {
+                            turn.associated_paracrine_ids.push(paracrine_id.clone());
+                            sess_id = Some(state.session_id.clone());
+                            if !turn.chat_id.is_empty() {
+                                chat_id = Some(turn.chat_id.clone());
+                            }
+                        }
+                    }
+                    (sess_id, chat_id)
+                };
+
+                let exosome = Exosome {
+                    prompt,
+                    context: None,
+                    paracrine_id: Some(paracrine_id.clone()),
+                    response_routing,
+                    source_session_id,
+                    source_chat_id,
+                };
+
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::ParacrineEmit {
+                        role,
+                        exosome,
+                        reply_to_node,
+                        reply_to_role,
+                        timeout_secs: None,
+                    })
+                    .await
+                {
+                    Ok(_) => (
+                        format!(
+                            "Whisper sent to specialist (paracrine_id: {paracrine_id}). \
+                             The specialist is processing asynchronously — their response \
+                             will arrive separately. Do NOT call delegate.whisper again. \
+                             Respond to the user now with a brief acknowledgment."
+                        ),
+                        None,
+                    ),
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("delegate.whisper: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    handoff_bundle: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(content),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            // ── delegate.merge ───────────────────────────────────────────────
+            // Explicit paracrine merge: emit a paracrine_response back to the
+            // orchestrator immediately, without waiting for turn completion.
+            // Sets paracrine_merge_completed on the turn so deliver_text_reply
+            // does not auto-emit a duplicate response when the turn later closes.
+            //
+            // Call signature: { "content": "<response to send to orchestrator>" }
+            // Available in specialist (paracrine) toolsets.
+            "delegate.merge" => {
+                let session_id = payload.session_id.clone();
+                let turn_id = payload.turn_id.clone();
+                let args = &payload.arguments;
+
+                let content = match args.get("content").and_then(|v| v.as_str()) {
+                    Some(c) if !c.trim().is_empty() => c.to_string(),
+                    _ => {
+                        return self
+                            .fail_active_turn(
+                                session_id,
+                                turn_id,
+                                "delegate.merge: missing required argument 'content'".into(),
+                            )
+                            .await;
+                    }
+                };
+
+                // Capture routing info from the active turn before muting it.
+                let (paracrine_id, reply_session_id, reply_chat_id, final_reply_to, final_reply_role, final_reply_guest_id) = {
+                    let Some(state) = self.sessions.get_mut(&session_id) else {
+                        warn!("delegate.merge: unknown session {}", session_id);
+                        return Ok(());
+                    };
+                    let Some(turn) = state.active_turn.as_mut() else {
+                        warn!("delegate.merge: no active turn for session {}", session_id);
+                        return Ok(());
+                    };
+                    if turn.paracrine_origin.is_none() {
+                        return self
+                            .fail_active_turn(
+                                session_id,
+                                turn_id,
+                                "delegate.merge: not in a paracrine context — this tool is only available to specialist roles".into(),
+                            )
+                            .await;
+                    }
+                    let pid = turn.paracrine_origin.clone().unwrap();
+                    let rs = turn
+                        .paracrine_reply_session_id
+                        .clone()
+                        .unwrap_or_else(|| session_id.clone());
+                    let rc = turn
+                        .paracrine_reply_chat_id
+                        .clone()
+                        .unwrap_or_else(|| turn.chat_id.clone());
+                    let frt = turn.final_reply_to.clone();
+                    let frr = turn.final_reply_role.clone();
+                    let frg = turn.final_reply_guest_id.clone();
+                    // Mark merge as done so deliver_text_reply suppresses the auto-emit.
+                    turn.paracrine_merge_completed = true;
+                    (pid, rs, rc, frt, frr, frg)
+                };
+
+                // Append role attribution tag (same as deliver_text_reply does).
+                let attributed_content = if let Ok(role_name) = std::env::var("PHILOTIC_ROLE_NAME") {
+                    if !role_name.is_empty() {
+                        format!("{}\n\n@agent:{}", content, role_name)
+                    } else {
+                        content.clone()
+                    }
+                } else {
+                    content.clone()
+                };
+
+                // Fire the paracrine_response into the orchestrator's session.
+                let merge_task = serde_json::json!({
+                    "action": "paracrine_response",
+                    "session_id": reply_session_id,
+                    "turn_id": turn_id,
+                    "chat_id": reply_chat_id,
+                    "content": attributed_content,
+                    "exosome": {
+                        "prompt": "",
+                        "paracrine_id": paracrine_id,
+                        "source_session_id": reply_session_id,
+                        "source_chat_id": reply_chat_id,
+                    },
+                });
+                info!(
+                    session_id = %session_id,
+                    reply_session = %reply_session_id,
+                    "delegate.merge: emitting paracrine_response to orchestrator"
+                );
+                let _ = self
+                    .ipc_client
+                    .send_request(IpcRequest::EmitTask {
+                        target_node: final_reply_to,
+                        target_role: final_reply_role,
+                        target_guest_id: final_reply_guest_id,
+                        task_json: merge_task.to_string(),
+                    })
+                    .await;
+
+                // Return a tool result so the specialist's turn can continue or close.
+                let result_content = format!(
+                    "Merge sent to orchestrator (paracrine_id: {}). Your response has been delivered to the main conversation. Complete your turn now.",
+                    paracrine_id
+                );
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    handoff_bundle: None,
+                    source: Some("agent".into()),
+                    session_id: Some(session_id),
+                    turn_id: Some(turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(result_content),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: None,
+                    tool_name: Some("delegate.merge".into()),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
                 })
                 .await
             }
@@ -8010,6 +8897,7 @@ impl AgentRuntime {
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
                 })
                 .await
             }
@@ -8257,8 +9145,12 @@ impl AgentRuntime {
             return Ok(());
         }
 
+        // Role processes request a role-scoped snapshot so the hotel returns the
+        // role-specific checkpoint rather than the orchestrator's base checkpoint.
         let snapshot_key = {
-            let role = std::env::var("PHILOTIC_ROLE_NAME").ok().filter(|r| !r.is_empty());
+            let role = std::env::var("PHILOTIC_ROLE_NAME")
+                .ok()
+                .filter(|r| !r.is_empty());
             match role {
                 Some(r) => format!("__session_snapshot__:{session_id}@{r}"),
                 None => format!("__session_snapshot__:{session_id}"),
@@ -8266,9 +9158,7 @@ impl AgentRuntime {
         };
         let response = self
             .ipc_client
-            .send_request(IpcRequest::GetConfig {
-                key: snapshot_key,
-            })
+            .send_request(IpcRequest::GetConfig { key: snapshot_key })
             .await?;
 
         if let IpcResponse::ConfigData {
@@ -8283,6 +9173,8 @@ impl AgentRuntime {
                     == Some(session_id)
                 {
                     if let Some(mut state) = SessionState::from_checkpoint(&checkpoint) {
+                        // Re-apply reflex materialization from the restored profile.
+                        state.apply_reflex_materialization();
                         Self::fetch_and_inject_rules(
                             &mut self.ipc_client,
                             &self.agent_id,
@@ -8302,7 +9194,24 @@ impl AgentRuntime {
             fallback_source.into(),
         );
         state.agent_profile = self.default_agent_profile.clone();
+        // Apply reflex materialization now that the profile (including reflex_context) is set.
+        state.apply_reflex_materialization();
         Self::fetch_and_inject_rules(&mut self.ipc_client, &self.agent_id, &mut state).await;
+
+        // Auto-activate the agent's default role incarnation on fresh sessions so the
+        // correct manifest, toolset, and skill guidance are present from turn zero
+        // without requiring an explicit handoff.to_role call.
+        if let Some(ref default_role) = self.default_agent_profile.default_role_name.clone() {
+            if let Some(activation) = self.fetch_role_activation(default_role).await {
+                state.role_activation = Some(activation);
+                info!(
+                    session_id = %session_id,
+                    role = %default_role,
+                    "Auto-activated default role on fresh session."
+                );
+            }
+        }
+
         self.sessions.insert(session_id.to_string(), state);
         Ok(())
     }
@@ -8692,6 +9601,7 @@ mod tests {
                 capability: Some("voice.synthesize".into()),
                 retryable: Some(false),
             }),
+            ..Default::default()
         };
 
         let error = extract_model_error(&payload).expect("structured error should be extracted");
@@ -8739,6 +9649,7 @@ mod tests {
                 capability: Some("text.generate".into()),
                 retryable: Some(true),
             }),
+            ..Default::default()
         };
 
         let error =
@@ -8785,6 +9696,11 @@ mod tests {
             turn_routing_plan: None,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
+            paracrine_merge_completed: false,
         });
 
         assert!(should_attempt_provider_repair(&error, Some(&state)));
@@ -8999,12 +9915,9 @@ mod tests {
                 kind: "photo".into(),
                 file_id: "photo-1".into(),
                 mime_type: None,
-                file_name: None,
-                file_size: None,
-                telegram_file_path: None,
-                blob_id: None,
                 blob_download_url: None,
                 transport_error: None,
+                ..Default::default()
             }],
             command: None,
             callback_data: None,
@@ -9015,6 +9928,7 @@ mod tests {
             final_reply_role: None,
             final_reply_guest_id: None,
             error: None,
+            ..Default::default()
         };
 
         assert_eq!(normalized_user_content(&task), Some("caption text".into()));
@@ -9040,12 +9954,9 @@ mod tests {
                 kind: "voice".into(),
                 file_id: "voice-1".into(),
                 mime_type: Some("audio/ogg".into()),
-                file_name: None,
-                file_size: None,
-                telegram_file_path: None,
-                blob_id: None,
                 blob_download_url: None,
                 transport_error: None,
+                ..Default::default()
             }],
             command: None,
             callback_data: None,
@@ -9056,6 +9967,7 @@ mod tests {
             final_reply_role: None,
             final_reply_guest_id: None,
             error: None,
+            ..Default::default()
         };
 
         assert_eq!(
@@ -9093,6 +10005,7 @@ mod tests {
             final_reply_role: None,
             final_reply_guest_id: None,
             error: None,
+            ..Default::default()
         };
 
         assert_eq!(
@@ -9122,34 +10035,28 @@ mod tests {
                     kind: "photo".into(),
                     file_id: "photo-1".into(),
                     mime_type: Some("image/jpeg".into()),
-                    file_name: None,
-                    file_size: None,
-                    telegram_file_path: None,
                     blob_id: Some("sha256-1".into()),
                     blob_download_url: Some("http://127.0.0.1:9001/download/sha256-1".into()),
                     transport_error: None,
+                    ..Default::default()
                 },
                 TransportAttachment {
                     kind: "sticker".into(),
                     file_id: "sticker-1".into(),
                     mime_type: Some("image/webp".into()),
-                    file_name: None,
-                    file_size: None,
-                    telegram_file_path: None,
                     blob_id: Some("sha256-2".into()),
                     blob_download_url: Some("http://127.0.0.1:9001/download/sha256-2".into()),
                     transport_error: None,
+                    ..Default::default()
                 },
                 TransportAttachment {
                     kind: "voice".into(),
                     file_id: "voice-1".into(),
                     mime_type: Some("audio/ogg".into()),
-                    file_name: None,
-                    file_size: None,
-                    telegram_file_path: None,
                     blob_id: Some("sha256-3".into()),
                     blob_download_url: None,
                     transport_error: None,
+                    ..Default::default()
                 },
             ],
             command: None,
@@ -9161,6 +10068,7 @@ mod tests {
             final_reply_role: None,
             final_reply_guest_id: None,
             error: None,
+            ..Default::default()
         };
 
         let attachments = media_analysis_attachments(&task);
@@ -9177,12 +10085,10 @@ mod tests {
             } else {
                 "image/jpeg".into()
             }),
-            file_name: None,
-            file_size: None,
-            telegram_file_path: None,
             blob_id: Some(format!("sha256-{kind}-1")),
             blob_download_url: Some(format!("http://127.0.0.1:9001/download/sha256-{kind}-1")),
             transport_error: None,
+            ..Default::default()
         }
     }
 

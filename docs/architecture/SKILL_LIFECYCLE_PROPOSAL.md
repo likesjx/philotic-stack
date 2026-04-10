@@ -1,25 +1,25 @@
 ---
-title: "Skill Lifecycle and Delegation Contract Proposal"
+title: Skill Lifecycle and Delegation Contract Proposal
 doc_type: proposal
 domain: runtime-sessions
 status: accepted
-last_updated: 2026-03-13
+last_updated: 2026-03-31
 tags:
-  - skills
-  - delegation
-  - subagents
-  - lifecycle
-  - governance
-  - active-seam
+- skills
+- delegation
+- subagents
+- lifecycle
+- governance
+- active-seam
 related_docs:
-  - GOVERNED_WORKFLOW_SKILLS_PROPOSAL.md
-  - ROLE_ACTIVATION_AND_SUBAGENT_CONTRACTS_PROPOSAL.md
-  - RUNTIME_AUTHORITY_LEASES_PROPOSAL.md
-  - ARCHITECTURE_STATUS.md
+- GOVERNED_WORKFLOW_SKILLS_PROPOSAL.md
+- ROLE_ACTIVATION_AND_SUBAGENT_CONTRACTS_PROPOSAL.md
+- RUNTIME_AUTHORITY_LEASES_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
 proposal_id: skill-lifecycle-delegation-contract
 active_seams:
-  - governed-workflow-skills
-  - role-incarnation-model
+- governed-workflow-skills
+- role-incarnation-model
 ---
 
 # Skill Lifecycle and Delegation Contract Proposal

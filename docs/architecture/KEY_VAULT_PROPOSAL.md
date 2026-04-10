@@ -1,33 +1,33 @@
 ---
-title: "Key Vault Proposal"
+title: Key Vault Proposal
 doc_type: proposal
 domain: operator-control-plane
 status: accepted-current-slice
-last_updated: 2026-03-12
+last_updated: 2026-03-31
 tags:
-  - vault
-  - secrets
-  - oauth
-  - control-plane
-  - active-seam
+- vault
+- secrets
+- oauth
+- control-plane
+- active-seam
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md
-  - MODEL_CONTROLLER_PROPOSAL.md
-  - PERIMETER_EGRESS_CONTROL_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md
+- MODEL_CONTROLLER_PROPOSAL.md
+- PERIMETER_EGRESS_CONTROL_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: key-vault
 implements: []
 implemented_by:
-  - vault-secret-ref-slice
-  - keychain-root-key-slice
+- vault-secret-ref-slice
+- keychain-root-key-slice
 active_seams:
-  - vault-secret-refs
-  - remote-vault-delegation
+- vault-secret-refs
+- remote-vault-delegation
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
-  - ARCHITECTURE.md
+- ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
 ---
 
 # Key Vault Proposal

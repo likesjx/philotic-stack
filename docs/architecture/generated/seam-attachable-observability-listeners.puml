@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - attachable-observability-listeners
+
+rectangle "attachable-observability-listeners" as attachable_observability_listeners #Orange {
+}
+
+
+@enduml

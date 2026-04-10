@@ -1,31 +1,31 @@
 ---
-title: "Pluggable Context Engine Proposal"
+title: Pluggable Context Engine Proposal
 doc_type: proposal
 domain: memory-context
 status: accepted-current-slice
-last_updated: 2026-03-12
+last_updated: 2026-03-31
 tags:
-  - context
-  - engine
-  - assembly
-  - memory
-  - active-seam
+- context
+- engine
+- assembly
+- memory
+- active-seam
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - ARCHITECTURE.md
-  - MEMORY_ENGINE_ABSTRACTION_PROPOSAL.md
-  - AGENT_PLUGIN_HOOKS_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
+- MEMORY_ENGINE_ABSTRACTION_PROPOSAL.md
+- AGENT_PLUGIN_HOOKS_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: pluggable-context-engine
 implements: []
 implemented_by: []
 active_seams:
-  - context-engine-contract
-  - deterministic-context-assembly
+- context-engine-contract
+- deterministic-context-assembly
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
-  - ARCHITECTURE.md
+- ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
 ---
 
 # Pluggable Context Engine Proposal
@@ -175,8 +175,8 @@ The first contract should explicitly model five layers.
 ### 5. Knowledge Layer
 
 - canonical owner: mixed
-- graph contributes structural truth and traversable relationships
-- memory engine contributes episodic salience and recalled summaries
+- `intel-graph` provides structural truth and traversable project relationships (SQLite)
+- `intel-graph` simultaneously brokers semantic history via isolated Memory `Wings` (ChromaDB / Mempalace)
 - authority: mostly advisory, unless a graph-backed fact is explicitly authoritative
 - mutability: `refreshable`
 
@@ -349,9 +349,9 @@ Recommended checkpoints:
 
 ## First Implementations To Support
 
-1. graph-native context assembly
+1. graph-native context assembly (SQLite)
 2. imported OpenClaw/ZeroClaw identity projection
-3. memory-backed augmentation
+3. `intel-graph` brokered Reflexive Coding Agent Memory (via Mempalace IDE hooks)
 4. emergency/local fallback context mode
 
 ## First Slice Recommendation

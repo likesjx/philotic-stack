@@ -1,21 +1,16 @@
-# `membrane` — Telegram/External Gateway Guest
+# `membrane` — Compatibility Wrapper
 
-`membrane` is a materialized guest process that acts as the external gateway
-for the Philotic hotel — currently handling Telegram bot integration and
-inbound message routing.
+`membrane` is a transitional compatibility package that forwards to
+`membrane-telegram`.
 
 ## Responsibilities
 
-- Register with the hotel via `PhiloticClient`
-- Accept inbound Telegram/external messages
-- Route them as `EventEnvelope`s into the hotel ledger
-- Handle model routing requests for conversation responses
-- Periodically sync session memory apartments
+- Preserve compatibility for existing `membrane` binary references during migration
 
 ## Boot Sequence
 
 ```
-main()
+membrane::run()
   │
   ├─ PhiloticClient::connect(ansible_port)
   ├─ client.register(GuestIdentity { guest_id: "membrane-telegram-01" })
@@ -25,15 +20,20 @@ main()
 
 ## Integration Points
 
-- Talks to `aiua` hotel via local IPC (UDS/UDP loopback)
-- May publish events for `philote` or `model-router` via the hotel
-- Uses `client.sync_apartment()` to persist conversation state
+- `membrane-telegram` is the current provider binary that owns the Telegram runtime
+- `aiua` should point Telegram hotels at `membrane-telegram`
+- Future sibling providers should live beside Telegram, not behind the bare `membrane` name
 
 ## Running
 
-Spawned automatically by `GuestManager` when `is_active=1` in the Context Graph.
-Can also be run standalone for development:
+`membrane` remains runnable as a compatibility wrapper:
 
 ```bash
 cargo run -p membrane -- --ansible-port 9000
+```
+
+The preferred Telegram provider binary is:
+
+```bash
+cargo run -p membrane-telegram -- --ansible-port 9000
 ```

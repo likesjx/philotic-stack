@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use model_router::providers::{ElevenLabsProvider, GeminiProvider};
+use model_router::providers::{ElevenLabsProvider, GeminiProvider, OllamaProvider};
 use model_router::runtime::{ControllerGuestConfig, run_model_controller};
 
 #[derive(Parser, Debug)]
@@ -33,9 +33,14 @@ async fn main() -> Result<()> {
                     configs.gemini_base_url.clone(),
                 )),
                 std::sync::Arc::new(ElevenLabsProvider::new(
-                    http_client,
+                    http_client.clone(),
                     configs.elevenlabs_api_key.clone(),
                     configs.elevenlabs_default_voice_id.clone(),
+                )),
+                std::sync::Arc::new(OllamaProvider::new(
+                    http_client,
+                    configs.ollama_base_url.clone(),
+                    configs.ollama_model.clone(),
                 )),
             ]
         }),

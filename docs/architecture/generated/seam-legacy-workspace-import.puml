@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - legacy-workspace-import
+
+rectangle "legacy-workspace-import" as legacy_workspace_import #Orange {
+}
+
+
+@enduml

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - perimeter-authz-policy
+
+rectangle "perimeter-authz-policy" as perimeter_authz_policy #Orange {
+}
+
+
+@enduml

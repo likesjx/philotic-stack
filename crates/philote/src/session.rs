@@ -1,6 +1,10 @@
 use crate::catalog::{tool_catalog, tool_class, tool_requires_approval};
 use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
 use ansible_mesh_core::catalog_rights::{has_right, tool_right};
+use crate::protocol::InboundTaskPayload;
+use crate::reflex::{
+    IngressAction, MaterializationContext, PolicyAssertion, ReflexEngine, ReflexEvent,
+};
 use philotic_client::{
     HandoffBundle, SubagentCompletionContract, SubagentContextPacket, SubagentDelegation,
 };
@@ -501,6 +505,26 @@ pub struct WorkingTurn {
     /// the standard tool re-entry loop. Persisted through approval-gate
     /// re-entry via checkpoint_json.
     pub scripted_loop_context: Option<crate::scripted_loop::ScriptedLoopExecutor>,
+    /// IDs of every [`Exosome`] dispatched from this turn via `delegate.whisper`.
+    /// Used to correlate incoming `paracrine_response` tasks back to this turn
+    /// and to reconstruct the full thought graph across the mesh.
+    pub associated_paracrine_ids: Vec<String>,
+    /// Set when this turn was started by an incoming `paracrine_request`.
+    /// Holds the `paracrine_id` from the originating exosome.
+    /// When present, `deliver_text_reply` emits `action: "paracrine_response"`
+    /// (instead of `"send_reply"`) so A's routing reflex can handle it correctly.
+    pub paracrine_origin: Option<String>,
+    /// The session_id of the conversation that originated the paracrine request.
+    /// Overrides the specialist's own ephemeral session_id in the `paracrine_response`
+    /// payload so the orchestrator can route the reply back to the correct channel.
+    pub paracrine_reply_session_id: Option<String>,
+    /// The chat_id (Telegram / membrane channel) of the originating conversation.
+    /// Included in the `paracrine_response` so the routing reflex knows where to deliver.
+    pub paracrine_reply_chat_id: Option<String>,
+    /// Set to true when the specialist explicitly calls `delegate.merge` during a turn.
+    /// Suppresses the auto-emit of `paracrine_response` in deliver_text_reply so there
+    /// is no duplicate delivery after the explicit merge already fired.
+    pub paracrine_merge_completed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -564,6 +588,10 @@ pub struct MediaRoutingPolicy {
     /// When false, all attachments are stripped and the turn is treated as text-only.
     #[serde(default = "default_true")]
     pub forward_media_to_model: bool,
+    /// When true, tool definitions are stripped from the model call when media attachments
+    /// are present. Useful for models that don't support simultaneous tool use and vision.
+    #[serde(default)]
+    pub strip_tools_on_media: bool,
     /// Action to use for voice/audio attachments. None = "analyze_media".
     #[serde(default)]
     pub voice_action: Option<String>,
@@ -579,6 +607,7 @@ impl Default for MediaRoutingPolicy {
     fn default() -> Self {
         Self {
             forward_media_to_model: true,
+            strip_tools_on_media: false,
             voice_action: None,
             image_action: None,
             document_action: None,
@@ -780,6 +809,22 @@ pub struct AgentProfile {
     /// `/tools add` commands. Falls back to `["echo"]` when empty.
     #[serde(default)]
     pub default_toolset: Vec<String>,
+    /// Materialization context pushed by the hotel at guest spawn time.
+    ///
+    /// Contains the membrane bindings and capabilities known at spawn. The reflex
+    /// engine evaluates this at session open to derive the initial routing policy,
+    /// ensuring turn zero is correct without agent self-discovery.
+    #[serde(default)]
+    pub reflex_context: MaterializationContext,
+    /// Role incarnation name to activate automatically on every fresh session.
+    /// When set, `ensure_session_loaded` applies this role before the first turn
+    /// so the agent always starts with the correct manifest, toolset, and skills
+    /// without requiring an explicit `handoff.to_role` call.
+    ///
+    /// Example: `"orchestrator"` — ensures the orchestrator posture (including
+    /// `delegate.whisper` skill guidance) is present from turn zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_role_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1068,6 +1113,25 @@ pub struct SessionState {
     /// Injected into the `instructions` section of every cognitive call and never
     /// rolled off by the dialogue window.
     pub rules: Vec<Value>,
+    /// Reflex engine — evaluates static rules against materialization context and
+    /// runtime delta events to derive routing policy assertions.
+    /// Not serialized; always initialized fresh and re-applied from `agent_profile`.
+    pub reflex_engine: ReflexEngine,
+    /// Inbound user tasks that arrived while a turn was already active.
+    /// Drained in FIFO order after each turn completes (or fails).
+    /// Each entry is `(hotel_task_id, payload)` — the task_id is needed to
+    /// complete the hotel-side task record when the queued turn finishes.
+    /// The payload preserves session_id, chat_id, and exosome context so the
+    /// correct Telegram session/chat is restored when the task is dispatched.
+    /// Voice tasks are queued raw and will be transcribed when they reach the front.
+    pub pending_user_tasks: std::collections::VecDeque<(uuid::Uuid, InboundTaskPayload)>,
+    /// Optional role name of the queue arbiter.
+    /// When set, TEXT tasks queued while a turn is active are routed to this specialist
+    /// role via paracrine dispatch for priority evaluation. The arbiter may call
+    /// `delegate.merge` to inject the task at the FRONT of the queue (high priority)
+    /// or simply let it sit (normal FIFO). Voice tasks bypass the arbiter (they are
+    /// always queued raw and transcribed at dispatch time).
+    pub queue_arbiter_role: Option<String>,
 }
 
 impl SessionState {
@@ -1092,12 +1156,40 @@ impl SessionState {
             last_handoff_summary: None,
             active_subagents: Vec::new(),
             rules: Vec::new(),
+            reflex_engine: ReflexEngine::new(),
+            pending_user_tasks: std::collections::VecDeque::new(),
+            queue_arbiter_role: None,
         }
     }
 
     pub fn start_turn(&mut self, turn: WorkingTurn) {
         self.active_turn = Some(turn);
         self.pending_native_live_function_call_id = None;
+    }
+
+    /// Returns true if a turn is currently active (any phase except Completed/Failed).
+    pub fn is_turn_active(&self) -> bool {
+        self.active_turn.is_some()
+    }
+
+    /// Enqueue a user task for deferred processing after the current turn completes.
+    pub fn enqueue_user_task(&mut self, task_id: uuid::Uuid, task: InboundTaskPayload) {
+        self.pending_user_tasks.push_back((task_id, task));
+    }
+
+    /// Prepend a user task to the front of the queue (high priority, arbiter-promoted).
+    pub fn prepend_user_task(&mut self, task_id: uuid::Uuid, task: InboundTaskPayload) {
+        self.pending_user_tasks.push_front((task_id, task));
+    }
+
+    /// Pop the next pending user task, if any.
+    pub fn dequeue_user_task(&mut self) -> Option<(uuid::Uuid, InboundTaskPayload)> {
+        self.pending_user_tasks.pop_front()
+    }
+
+    /// How many tasks are waiting in the queue.
+    pub fn pending_user_task_count(&self) -> usize {
+        self.pending_user_tasks.len()
     }
 
     pub fn set_active_turn_phase(&mut self, phase: TurnPhase) {
@@ -1653,6 +1745,101 @@ impl SessionState {
                 self.settings.execution.stream_tool_events = v;
                 Ok(format!("Set settings.execution.stream_tool_events = {v}."))
             }
+            // ── Media routing policy ─────────────────────────────────────────────
+            "media_routing_policy.forward_media_to_model" => {
+                let v = value
+                    .as_bool()
+                    .ok_or("media_routing_policy.forward_media_to_model requires a boolean")?;
+                self.agent_profile
+                    .media_routing_policy
+                    .forward_media_to_model = v;
+                Ok(format!(
+                    "Set media_routing_policy.forward_media_to_model = {v}."
+                ))
+            }
+            "media_routing_policy.voice_action" => {
+                let v = value
+                    .as_str()
+                    .ok_or("media_routing_policy.voice_action requires a string (e.g. 'transcribe', 'analyze_media')")?
+                    .to_string();
+                self.agent_profile.media_routing_policy.voice_action = Some(v.clone());
+                Ok(format!("Set media_routing_policy.voice_action = '{v}'."))
+            }
+            "media_routing_policy.image_action" => {
+                let v = value
+                    .as_str()
+                    .ok_or("media_routing_policy.image_action requires a string")?
+                    .to_string();
+                self.agent_profile.media_routing_policy.image_action = Some(v.clone());
+                Ok(format!("Set media_routing_policy.image_action = '{v}'."))
+            }
+            "media_routing_policy.document_action" => {
+                let v = value
+                    .as_str()
+                    .ok_or("media_routing_policy.document_action requires a string")?
+                    .to_string();
+                self.agent_profile.media_routing_policy.document_action = Some(v.clone());
+                Ok(format!("Set media_routing_policy.document_action = '{v}'."))
+            }
+            "media_routing_policy.strip_tools_on_media" => {
+                let v = value
+                    .as_bool()
+                    .ok_or("media_routing_policy.strip_tools_on_media requires a boolean")?;
+                self.agent_profile.media_routing_policy.strip_tools_on_media = v;
+                Ok(format!(
+                    "Set media_routing_policy.strip_tools_on_media = {v}."
+                ))
+            }
+            // ── Voice response policy ────────────────────────────────────────────
+            "voice_response_policy.mode" => {
+                let s = value.as_str().ok_or(
+                    "voice_response_policy.mode requires a string: 'off', 'auto', or 'on'",
+                )?;
+                let mode = match s {
+                    "off" => TtsMode::Off,
+                    "auto" => TtsMode::Auto,
+                    "on" => TtsMode::On,
+                    other => {
+                        return Err(format!(
+                            "Invalid voice_response_policy.mode '{other}'. Valid values: off, auto, on"
+                        ));
+                    }
+                };
+                self.agent_profile.voice_response_policy.mode = mode;
+                Ok(format!("Set voice_response_policy.mode = '{s}'."))
+            }
+            "voice_response_policy.provider" => {
+                let v = value
+                    .as_str()
+                    .ok_or("voice_response_policy.provider requires a string (e.g. 'elevenlabs')")?
+                    .to_string();
+                self.agent_profile.voice_response_policy.provider = Some(v.clone());
+                Ok(format!("Set voice_response_policy.provider = '{v}'."))
+            }
+            "voice_response_policy.voice_id" => {
+                let v = value
+                    .as_str()
+                    .ok_or("voice_response_policy.voice_id requires a string")?
+                    .to_string();
+                self.agent_profile.voice_response_policy.voice_id = Some(v.clone());
+                Ok(format!("Set voice_response_policy.voice_id = '{v}'."))
+            }
+            "voice_response_policy.send_text_caption" => {
+                let v = value
+                    .as_bool()
+                    .ok_or("voice_response_policy.send_text_caption requires a boolean")?;
+                self.agent_profile.voice_response_policy.send_text_caption = v;
+                Ok(format!(
+                    "Set voice_response_policy.send_text_caption = {v}."
+                ))
+            }
+            "voice_response_policy.fallback_to_text" => {
+                let v = value
+                    .as_bool()
+                    .ok_or("voice_response_policy.fallback_to_text requires a boolean")?;
+                self.agent_profile.voice_response_policy.fallback_to_text = v;
+                Ok(format!("Set voice_response_policy.fallback_to_text = {v}."))
+            }
             other => Err(format!(
                 "Unknown config path: '{other}'. Supported paths: \
                 approval_policy.auto_approve_all, approval_policy.preapproved_tools, \
@@ -1667,9 +1854,64 @@ impl SessionState {
                 settings.memory.recall_limit, \
                 settings.execution.iteration_cap, \
                 settings.execution.stall_detection_threshold, \
-                settings.execution.stream_tool_events"
+                settings.execution.stream_tool_events, \
+                media_routing_policy.forward_media_to_model, \
+                media_routing_policy.voice_action, \
+                media_routing_policy.image_action, \
+                media_routing_policy.document_action, \
+                media_routing_policy.strip_tools_on_media, \
+                voice_response_policy.mode, \
+                voice_response_policy.provider, \
+                voice_response_policy.voice_id, \
+                voice_response_policy.send_text_caption, \
+                voice_response_policy.fallback_to_text"
             )),
         }
+    }
+
+    // ── Reflex engine integration ─────────────────────────────────────────────
+
+    /// Apply a list of `PolicyAssertion`s to this session by driving `apply_configure`.
+    ///
+    /// Errors from individual assertions are logged and skipped rather than
+    /// propagating — a partial reflex application is better than none.
+    pub fn apply_reflex_assertions(&mut self, assertions: Vec<PolicyAssertion>) {
+        for assertion in assertions {
+            let (path, value) = assertion.to_configure_args();
+            if let Err(e) = self.apply_configure(path, &value, "set") {
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    path, error = %e,
+                    "Reflex assertion failed (skipping)"
+                );
+            }
+        }
+    }
+
+    /// Evaluate static rules against the materialization context embedded in the
+    /// agent profile and apply all resulting assertions.
+    ///
+    /// Called once at session open (after `agent_profile` is set). Ensures routing
+    /// policy is correct from turn zero without relying on agent self-discovery.
+    pub fn apply_reflex_materialization(&mut self) {
+        let ctx = self.agent_profile.reflex_context.clone();
+        let assertions = self.reflex_engine.apply_materialization(&ctx);
+        self.apply_reflex_assertions(assertions);
+    }
+
+    /// Evaluate ingress-time rules for the given action and apply resulting assertions.
+    ///
+    /// Called at task arrival for typed actions (e.g. `VoiceDialogue`). Belt-and-suspenders
+    /// on top of materialization — catches cases where context wasn't known at spawn.
+    pub fn apply_reflex_ingress(&mut self, action: IngressAction) {
+        let assertions = self.reflex_engine.apply_ingress(&action);
+        self.apply_reflex_assertions(assertions);
+    }
+
+    /// Fire a runtime reflex event (e.g. TTS failure) and apply resulting assertions.
+    pub fn fire_reflex_event(&mut self, event: ReflexEvent) {
+        let assertions = self.reflex_engine.handle_event(&event);
+        self.apply_reflex_assertions(assertions);
     }
 
     pub fn set_status(&mut self, status: impl Into<String>) {
@@ -2092,7 +2334,38 @@ impl SessionState {
     }
 
     pub fn project_tools_for_turn(&self, user_content: &str) -> Vec<ToolDefinition> {
-        let all_tools = self.tool_assembly.tools_for_model.clone();
+        let mut all_tools = self.tool_assembly.tools_for_model.clone();
+
+        // Paracrine context: auto-inject delegate.merge so the specialist can explicitly
+        // push her response into the orchestrator's main loop without needing it configured
+        // in any toolset profile. Available whenever the active turn has a paracrine_origin.
+        let in_paracrine = self
+            .active_turn
+            .as_ref()
+            .map(|t| t.paracrine_origin.is_some())
+            .unwrap_or(false);
+        if in_paracrine && !all_tools.iter().any(|t| t.tool_name == "delegate.merge") {
+            all_tools.push(ToolDefinition {
+                tool_name: "delegate.merge".into(),
+                description: concat!(
+                    "Send your completed response back to the orchestrator's main conversation. ",
+                    "Call this when you are ready to deliver your result. ",
+                    "Arguments: { \"content\": \"<your response text>\" }. ",
+                    "After calling this your turn will close — do not call it more than once.",
+                ).into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "content": {
+                            "type": "string",
+                            "description": "The response to deliver to the orchestrator."
+                        }
+                    },
+                    "required": ["content"]
+                }),
+                class: Some("paracrine".into()),
+            });
+        }
         if all_tools.is_empty() {
             return all_tools;
         }
@@ -2533,10 +2806,15 @@ impl SessionState {
 
     fn render_prompt_from_projection(&self, projection: &ContextProjection) -> String {
         let mut prompt = String::new();
-        prompt.push_str(&format!(
-            "[System]\nCurrent date and time (UTC): {}\n",
-            utc_datetime_string()
-        ));
+        let persona_line = if let Some(ref name) = self.agent_profile.persona_name {
+            format!(
+                "Name: {name}\nCurrent date and time (UTC): {}\n",
+                utc_datetime_string()
+            )
+        } else {
+            format!("Current date and time (UTC): {}\n", utc_datetime_string())
+        };
+        prompt.push_str(&format!("[System]\n{persona_line}"));
         for layer in &projection.layers {
             let title = match layer.layer_id {
                 ContextLayerId::Identity => "Agent self projection",
@@ -3506,6 +3784,10 @@ impl SessionState {
                 "turn_routing_plan": turn.turn_routing_plan,
                 "awaiting_transcription_reentry": turn.awaiting_transcription_reentry,
                 "scripted_loop_context": turn.scripted_loop_context,
+                "paracrine_origin": turn.paracrine_origin,
+                "paracrine_reply_session_id": turn.paracrine_reply_session_id,
+                "paracrine_reply_chat_id": turn.paracrine_reply_chat_id,
+                "paracrine_merge_completed": turn.paracrine_merge_completed,
             })
         });
 
@@ -3757,6 +4039,31 @@ impl SessionState {
                     .get("scripted_loop_context")
                     .cloned()
                     .and_then(|v| serde_json::from_value(v).ok()),
+                associated_paracrine_ids: turn
+                    .get("associated_paracrine_ids")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                paracrine_origin: turn
+                    .get("paracrine_origin")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                paracrine_reply_session_id: turn
+                    .get("paracrine_reply_session_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                paracrine_reply_chat_id: turn
+                    .get("paracrine_reply_chat_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                paracrine_merge_completed: turn
+                    .get("paracrine_merge_completed")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
             })
         });
 
@@ -3786,6 +4093,12 @@ impl SessionState {
                 .and_then(|v| v.as_array())
                 .cloned()
                 .unwrap_or_default(),
+            reflex_engine: ReflexEngine::new(),
+            pending_user_tasks: std::collections::VecDeque::new(),
+            queue_arbiter_role: checkpoint
+                .get("queue_arbiter_role")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
         })
     }
 }
@@ -4180,6 +4493,7 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
             | "role.configure"
             | "handoff.to_role"
             | "handoff.back"
+            | "delegate.whisper"
     )
 }
 
@@ -4590,6 +4904,11 @@ mod tests {
             }),
             awaiting_transcription_reentry: true,
             scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
+            paracrine_merge_completed: false,
         });
 
         let checkpoint = state.checkpoint_json();
@@ -4703,6 +5022,11 @@ mod tests {
             turn_routing_plan: None,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
+            paracrine_merge_completed: false,
         });
 
         state.complete_active_turn("hi".into());
@@ -4742,6 +5066,11 @@ mod tests {
             turn_routing_plan: None,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
+            paracrine_merge_completed: false,
         });
 
         state.complete_active_turn("transcription reply".into());
@@ -5359,6 +5688,159 @@ mod tests {
     }
 
     #[test]
+    fn agent_configure_media_routing_policy() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+
+        // voice_action
+        let r = state.apply_configure(
+            "media_routing_policy.voice_action",
+            &serde_json::json!("transcribe"),
+            "set",
+        );
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(
+            state
+                .agent_profile
+                .media_routing_policy
+                .voice_action
+                .as_deref(),
+            Some("transcribe")
+        );
+
+        // image_action
+        let r = state.apply_configure(
+            "media_routing_policy.image_action",
+            &serde_json::json!("analyze_media"),
+            "set",
+        );
+        assert!(r.is_ok());
+        assert_eq!(
+            state
+                .agent_profile
+                .media_routing_policy
+                .image_action
+                .as_deref(),
+            Some("analyze_media")
+        );
+
+        // forward_media_to_model
+        let r = state.apply_configure(
+            "media_routing_policy.forward_media_to_model",
+            &serde_json::json!(false),
+            "set",
+        );
+        assert!(r.is_ok());
+        assert!(
+            !state
+                .agent_profile
+                .media_routing_policy
+                .forward_media_to_model
+        );
+
+        // strip_tools_on_media
+        let r = state.apply_configure(
+            "media_routing_policy.strip_tools_on_media",
+            &serde_json::json!(false),
+            "set",
+        );
+        assert!(r.is_ok());
+        assert!(
+            !state
+                .agent_profile
+                .media_routing_policy
+                .strip_tools_on_media
+        );
+
+        // wrong type → error
+        let r = state.apply_configure(
+            "media_routing_policy.forward_media_to_model",
+            &serde_json::json!("yes"),
+            "set",
+        );
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn agent_configure_voice_response_policy() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+
+        // mode: valid values
+        for (input, expected) in &[
+            ("off", TtsMode::Off),
+            ("auto", TtsMode::Auto),
+            ("on", TtsMode::On),
+        ] {
+            let r = state.apply_configure(
+                "voice_response_policy.mode",
+                &serde_json::json!(input),
+                "set",
+            );
+            assert!(r.is_ok(), "mode={input}: {r:?}");
+            assert_eq!(&state.agent_profile.voice_response_policy.mode, expected);
+        }
+
+        // mode: invalid value
+        let r = state.apply_configure(
+            "voice_response_policy.mode",
+            &serde_json::json!("loud"),
+            "set",
+        );
+        assert!(r.is_err());
+
+        // provider
+        let r = state.apply_configure(
+            "voice_response_policy.provider",
+            &serde_json::json!("elevenlabs"),
+            "set",
+        );
+        assert!(r.is_ok());
+        assert_eq!(
+            state
+                .agent_profile
+                .voice_response_policy
+                .provider
+                .as_deref(),
+            Some("elevenlabs")
+        );
+
+        // voice_id
+        let r = state.apply_configure(
+            "voice_response_policy.voice_id",
+            &serde_json::json!("rachel"),
+            "set",
+        );
+        assert!(r.is_ok());
+        assert_eq!(
+            state
+                .agent_profile
+                .voice_response_policy
+                .voice_id
+                .as_deref(),
+            Some("rachel")
+        );
+
+        // send_text_caption
+        let r = state.apply_configure(
+            "voice_response_policy.send_text_caption",
+            &serde_json::json!(false),
+            "set",
+        );
+        assert!(r.is_ok());
+        assert!(!state.agent_profile.voice_response_policy.send_text_caption);
+
+        // fallback_to_text
+        let r = state.apply_configure(
+            "voice_response_policy.fallback_to_text",
+            &serde_json::json!(false),
+            "set",
+        );
+        assert!(r.is_ok());
+        assert!(!state.agent_profile.voice_response_policy.fallback_to_text);
+    }
+
+    #[test]
     fn agent_configure_rejects_unknown_path() {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
@@ -5544,6 +6026,11 @@ mod tests {
             turn_routing_plan: None,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
+            paracrine_merge_completed: false,
         });
 
         let projection = state.build_context_projection("status");
@@ -5626,6 +6113,11 @@ mod tests {
             turn_routing_plan: None,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
+            paracrine_merge_completed: false,
         });
 
         let prompt = state.build_prompt("status");
@@ -5702,6 +6194,11 @@ mod tests {
             turn_routing_plan: None,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
+            paracrine_merge_completed: false,
         });
 
         let bundle = state.build_same_identity_handoff_bundle(
@@ -5840,6 +6337,11 @@ mod tests {
             turn_routing_plan: None,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
+            paracrine_merge_completed: false,
         });
 
         let delegation = state.build_subagent_delegation(
@@ -6659,6 +7161,11 @@ mod tests {
             turn_routing_plan: None,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
+            paracrine_merge_completed: false,
         });
         let index = merge_session_index(None, &first);
         assert_eq!(index["active_sessions"].as_array().unwrap().len(), 1);
@@ -6705,6 +7212,11 @@ mod tests {
             turn_routing_plan: None,
             awaiting_transcription_reentry: true,
             scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
+            paracrine_merge_completed: false,
         });
 
         state.push_tool_history(
@@ -6766,6 +7278,11 @@ mod tests {
             turn_routing_plan: None,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
+            paracrine_merge_completed: false,
         });
 
         state.push_tool_history(
@@ -6828,6 +7345,11 @@ mod tests {
             turn_routing_plan: None,
             awaiting_transcription_reentry: true,
             scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
+            paracrine_merge_completed: false,
         });
 
         let reentry = state
@@ -7182,6 +7704,11 @@ mod tests {
             turn_routing_plan: None,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
+            paracrine_merge_completed: false,
         });
 
         let projection = state.build_context_projection("continue the memory work");

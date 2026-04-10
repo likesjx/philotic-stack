@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - session-preapproval-ux
+
+rectangle "session-preapproval-ux" as session_preapproval_ux #Orange {
+}
+
+
+@enduml

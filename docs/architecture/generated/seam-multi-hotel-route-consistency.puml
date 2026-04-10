@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - multi-hotel-route-consistency
+
+rectangle "multi-hotel-route-consistency" as multi_hotel_route_consistency #Orange {
+}
+
+
+@enduml

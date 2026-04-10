@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - approval-card-ux
+
+rectangle "approval-card-ux" as approval_card_ux #Orange {
+}
+
+
+@enduml

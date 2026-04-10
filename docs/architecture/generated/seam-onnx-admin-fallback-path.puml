@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - onnx-admin-fallback-path
+
+rectangle "onnx-admin-fallback-path" as onnx_admin_fallback_path #Orange {
+}
+
+
+@enduml

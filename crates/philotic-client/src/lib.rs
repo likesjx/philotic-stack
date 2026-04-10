@@ -45,6 +45,14 @@ pub struct OperatorAgentView {
     pub agent_id: String,
     pub persona_name: String,
     pub authority_hotel: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soul_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_context_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
     #[serde(default)]
     pub toolset_tags: Vec<String>,
     #[serde(default)]
@@ -517,6 +525,67 @@ impl LeaseEnvelope {
     }
 }
 
+/// How the receiving philote's response should be handled when it arrives
+/// back at the emitter. Declared at dispatch time by the caller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ParacrineRouting {
+    /// Feed the response into a model cognitive re-entry. If an active turn
+    /// exists, inject as enriched context; otherwise start a synthesis turn.
+    #[default]
+    CognitiveReEntry,
+    /// Replace the "paracrine dispatched" placeholder tool result with the real
+    /// response and re-enter the model as if the tool call completed normally.
+    EnrichedToolResult,
+    /// Structured retrieval payload — inject into a named context slot on the
+    /// session. No model invocation unless explicitly requested.
+    DatasourceInjection,
+    /// Memory recall result — push into the session's memory window.
+    MemoryEnrichment,
+    /// Mid-turn progress note — emit partial content to membrane without
+    /// interrupting or closing the active turn.
+    ProgressUpdate,
+    /// Lightweight status ping. No model involvement; just ACK and update
+    /// pending lookaside state.
+    Heartbeat,
+    /// Forward the response content directly to membrane. No model loop.
+    RawForward,
+    /// Arbiter-promoted re-entry: queue at the FRONT of pending_user_tasks so the
+    /// orchestrator processes it next, ahead of any already-queued messages.
+    PriorityReEntry,
+}
+
+/// Paracrine message envelope — the vesicle a philote secretes when performing a
+/// paracrine dispatch. Carries the prompt and optional context to the receiving
+/// philote, which endocytoses it as a `paracrine_request` inbound task.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Exosome {
+    /// The prompt or model-request content for the specialist.
+    pub prompt: String,
+    /// Optional structured context (e.g. session excerpt, tool results).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<serde_json::Value>,
+    /// Runtime-assigned correlation ID. Ties the `paracrine_response` back to
+    /// the originating turn and threads through the full thought graph for
+    /// cross-mesh provenance. Always set by the emitting philote; never dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paracrine_id: Option<String>,
+    /// How the receiving philote's response should be handled when it arrives
+    /// back at the emitter. Declared at dispatch time by the caller.
+    /// Defaults to [`ParacrineRouting::CognitiveReEntry`] if absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_routing: Option<ParacrineRouting>,
+    /// The session_id of the conversation that triggered this paracrine.
+    /// Carried through so the specialist's response can be routed back to the
+    /// correct session (e.g. a Telegram session rather than an ephemeral one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_session_id: Option<String>,
+    /// The chat_id (Telegram / membrane channel) of the originating conversation.
+    /// Used by the routing reflex to deliver the specialist's reply to the right channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_chat_id: Option<String>,
+}
+
 /// Represents the types of operations a Guest can perform locally over IPC to the Ansible Hotel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "operation", content = "payload")]
@@ -616,6 +685,21 @@ pub enum IpcRequest {
         lease_key: String,
     },
     ReleaseDesktopMembraneLease {
+        lease_key: String,
+    },
+    AcquireDiscordGatewayLease {
+        lease_key: String,
+        agent_id: String,
+    },
+    GetDiscordGatewayLeaseOwner {
+        lease_key: String,
+    },
+    RenewDiscordGatewayLease {
+        lease_key: String,
+        agent_id: String,
+        lease_epoch: u64,
+    },
+    ReleaseDiscordGatewayLease {
         lease_key: String,
     },
     HandoffToRole {
@@ -723,6 +807,14 @@ pub enum IpcRequest {
         agent_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         persona_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        soul_text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        identity_text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_context_text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        system_prompt: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         default_toolset: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -937,6 +1029,15 @@ pub enum IpcRequest {
     RestartComponent {
         guest_id: String,
     },
+    /// Remove a registered component entirely.
+    ///
+    /// The hotel terminates the running process if present, deletes the guest record,
+    /// and removes the stored `component:{guest_id}` config blob.
+    ///
+    /// Responds with [`IpcResponse::Standard`].
+    RemoveComponent {
+        guest_id: String,
+    },
     /// Inject a remote node incarnation into the local node registry.
     ///
     /// Used in smoke / integration tests to simulate mesh discovery without
@@ -983,6 +1084,20 @@ pub enum IpcRequest {
     /// the no-op handler in ipc.rs covers the case where one arrives unexpectedly.
     GracefulShutdown {
         drain_timeout_secs: u64,
+    },
+    /// Fire-and-forget paracrine dispatch from one agent to a specialist role.
+    ParacrineEmit {
+        /// Target role name (e.g. "theoretician").
+        role: String,
+        /// The message envelope to deliver.
+        exosome: Exosome,
+        /// Node to route the specialist's response to.
+        reply_to_node: String,
+        /// Role at that node ("membrane", "agent", etc.).
+        reply_to_role: String,
+        /// Materialisation timeout for the target role. `None` uses the hotel default.
+        #[serde(default)]
+        timeout_secs: Option<u64>,
     },
 }
 
@@ -1191,10 +1306,24 @@ pub enum IpcResponse {
     CronJobList {
         jobs: Vec<CronJob>,
     },
+    DiscordGatewayLease {
+        granted: bool,
+        lease: Option<LeaseEnvelope>,
+    },
+    DiscordGatewayLeaseStatus {
+        active: bool,
+        lease: Option<LeaseEnvelope>,
+    },
     /// Sent from hotel to guests during graceful shutdown. Guests should drain
     /// in-flight work and exit within `drain_timeout_secs`.
     GracefulShutdown {
         drain_timeout_secs: u64,
+    },
+    /// Hotel → guest: network reachability state changed.
+    /// Pushed without a corresponding request. Guests should pause outbound connections
+    /// (e.g. long-polling) when `online=false` and resume when `online=true`.
+    NetworkState {
+        online: bool,
     },
     /// Response to [`IpcRequest::FetchMemoryConfig`].
     /// `config_json` is `None` if MuninnDB is not configured on this hotel.

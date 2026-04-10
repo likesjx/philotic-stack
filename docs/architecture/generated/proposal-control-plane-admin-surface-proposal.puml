@@ -1,0 +1,7 @@
+@startuml
+!theme plain
+
+title Proposal Architecture - doc:control-plane-admin-surface-proposal
+
+
+@enduml

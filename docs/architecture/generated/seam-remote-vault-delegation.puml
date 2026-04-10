@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - remote-vault-delegation
+
+rectangle "remote-vault-delegation" as remote_vault_delegation #Orange {
+}
+
+
+@enduml

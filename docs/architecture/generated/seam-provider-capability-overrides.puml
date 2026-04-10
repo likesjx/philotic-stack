@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - provider-capability-overrides
+
+rectangle "provider-capability-overrides" as provider_capability_overrides #Orange {
+}
+
+
+@enduml

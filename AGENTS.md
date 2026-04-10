@@ -23,6 +23,73 @@ Philotic is a distributed AI agent operating system built around:
 
 Read [CLAUDE.md](/Users/jaredlikes/code/philotic-stack/CLAUDE.md) for the concise repository map and command inventory.
 
+### Project Graph (Optional But Recommended)
+
+The project intelligence graph (`phil graph`) is a powerful orientation tool when available.
+It contains the full codebase structure (types, functions, traits), all proposals
+and seams, git history, agent sessions, and a decision audit trail.
+
+**The graph is not a hard dependency.** Agents can work effectively without it by reading
+raw files, docs, and using standard search. When the graph IS available, prefer it — it's
+faster and provides richer context than manual file reading.
+
+Start the graph server with `just intel-graph-start`. MCP endpoint: `http://127.0.0.1:8901/mcp`.
+REST API: `http://127.0.0.1:8900`. Use `just intel-graph-ensure` to start only if not already running.
+
+**Standard agent workflow** (when graph is available — see `$graph-intelligence` skill):
+
+1. `graph_next_task` → scored work recommendation with conflict avoidance
+2. `graph_context_for` → one-call context: proposal + seams + code + verification + diagram
+3. `session_start` → claim the work, visible on dashboard
+4. *(do the work)*
+5. `graph_impact` → blast-radius analysis before committing
+6. `graph_record_test_run` → record test results (pass/fail counts) for verification tracking
+7. `graph_decide` → record what you did and why
+8. `session_close` → release claim
+9. `graph_scan` → update graph and auto-persist PlantUML diagrams
+
+**Test Recording** (automated via `just test-and-record`):
+
+After running tests, record the results in the graph:
+
+```bash
+# Option C: Just recipe (runs tests + records to graph)
+just test-and-record proposal:agent-onboarding
+
+# Or manually via REST API:
+curl -X POST http://127.0.0.1:8900/api/test-run \
+  -H "Content-Type: application/json" \
+  -d '{
+    "target_id": "proposal:agent-onboarding",
+    "test_count": 27,
+    "pass_count": 27,
+    "fail_count": 0,
+    "duration_ms": 5000
+  }'
+
+# Or via MCP:
+graph_record_test_run({
+  "target_id": "proposal:agent-onboarding",
+  "test_count": 27,
+  "pass_count": 27,
+  "fail_count": 0,
+  "duration_ms": 5000
+})
+```
+
+Required fields: `target_id`, `test_count`, `pass_count`.
+Optional: `fail_count` (default 0), `coverage_pct`, `commit_sha`, `duration_ms`.
+
+Quick orientation shortcuts:
+
+- **Orient**: `graph_status` or `graph_digest` at session start
+- **Inspect**: `graph_skeleton <crate>` for type diagrams, `graph_snippet` for code
+- **Search**: `graph_search "<text>"` across code and docs
+- **Dashboard**: `graph_agent_dashboard` to see who else is working
+
+The graph gives you structural facts. Muninn gives you cognitive context
+(learnings, preferences, patterns). Use both. See `$graph-intelligence` skill.
+
 ## 2. Working Principles
 
 ### 2.1 One Canonical Owner Per State Type
@@ -145,6 +212,7 @@ Controlled domain vocabulary:
 - `membrane-transport`
 - `mesh-placement`
 - `memory-context`
+- `product-management-plane`
 - `tooling-execution`
 - `operator-control-plane`
 - `deployment-distribution`
@@ -179,11 +247,22 @@ Do not let one of these quietly impersonate another because it happens to be nea
 
 Before substantial edits:
 
-- inspect the relevant code paths
-- inspect adjacent tests
-- inspect relevant architecture/task docs
+- call `graph_context_for` with the target proposal or seam to load context in one call
+- or manually: inspect the relevant code paths, adjacent tests, and architecture/task docs
 - identify the current owner of truth
 - check for unrelated worktree changes
+- check `graph_agent_dashboard` for active sessions that might conflict
+
+### 5.1.1 Graph Session Protocol
+
+When starting meaningful work on a proposal or seam:
+
+1. call `session_start` with your agent name, session ID, and the target seam/proposal
+2. call `session_activity` to report progress (files touched, phase changes)
+3. call `session_close` when done
+
+This creates visibility for all agents and prevents conflicting work.
+The dashboard (`graph_agent_dashboard` or `GET /api/dashboard`) shows all active sessions.
 
 ### 5.2 Smallest Honest Slice
 
@@ -460,6 +539,7 @@ The repository contains specialized skills in `skills/` to standardize common wo
 
 | Skill | Purpose |
 |---|---|
+| `graph-intelligence` | **Graph as primary context source** — orientation, task selection, context loading, impact analysis, session lifecycle, diagrams |
 | `check-engine` | **End-of-session review** — memory sweep, MEMORY.md sync, open threads, process gaps, green status |
 | `philotic-slice-closeout` | Finalizing implementation slices (tasks, proposals, commits) |
 | `verification-ladder` | Deciding and reporting the honest validation level |
@@ -472,6 +552,7 @@ The repository contains specialized skills in `skills/` to standardize common wo
 | `runtime-rollout-watch` | Proving installed/runtime rollout truth before claiming live validation |
 | `retrospective-workflow` | Running seam-based retrospectives and turning lessons into code/process/SVE changes |
 | `muninn-memory-protocol` | Client adapter contract for memory integration |
+| `role-authoring` | Creating or updating agent roles through `role.configure` |
 
 ## 12. Repository-Specific Notes
 
@@ -482,8 +563,12 @@ The repository contains specialized skills in `skills/` to standardize common wo
 - Treat domains and frontmatter as standing architecture-doc metadata, not optional polish.
 - When changing runtime boundaries, prefer proving them with code and smokes before broadening the design story.
 
-## 12. Key References
+## 13. Key References
 
-- [CLAUDE.md](/Users/jaredlikes/code/philotic-stack/CLAUDE.md)
-- [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md)
+- [CLAUDE.md](/Users/jaredlikes/code/philotic-stack/CLAUDE.md) — Claude Code session bootstrap and commands
+- [CODEX.md](/Users/jaredlikes/code/philotic-stack/CODEX.md) — OpenAI Codex session bootstrap and commands
+- [GEMINI.md](/Users/jaredlikes/code/philotic-stack/GEMINI.md) — Google Gemini session bootstrap and commands
+- [skills/graph-intelligence/SKILL.md](/Users/jaredlikes/code/philotic-stack/skills/graph-intelligence/SKILL.md) — full MCP tool reference and agent workflow
+- [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md) — active execution surface
+- [docs/process/WORKFLOW.md](/Users/jaredlikes/code/philotic-stack/docs/process/WORKFLOW.md) — SVE operating loop
 - [docs/architecture/AGENT_WORKFLOW_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/AGENT_WORKFLOW_PROPOSAL.md)

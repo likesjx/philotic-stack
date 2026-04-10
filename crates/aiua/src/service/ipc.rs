@@ -92,6 +92,10 @@ const LOCAL_DELIVERY_PROVENANCE_TTL_SECS: u64 = 900;
 #[cfg(test)]
 const LOCAL_DELIVERY_PROVENANCE_TTL_SECS: u64 = 5;
 
+const DISCORD_GATEWAY_LEASE_TTL_SECS: u64 = 45;
+#[cfg(test)]
+const DISCORD_GATEWAY_LEASE_TTL_SECS: u64 = 1;
+
 fn normalize_marker_text(text: &str) -> String {
     text.chars()
         .map(|ch| {
@@ -855,6 +859,7 @@ pub struct IpcServer {
     materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
     telegram_poll_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
     desktop_membrane_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
+    discord_gateway_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
     subagent_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
     subagent_hooks: SubagentHookRegistry,
     registry: Arc<RwLock<NodeRegistry>>,
@@ -862,6 +867,9 @@ pub struct IpcServer {
     /// cross-hotel task forwarding without full mesh infrastructure.
     peer_sockets: Arc<RwLock<HashMap<String, String>>>,
     muninn_config: Option<Arc<memory_core::MuninnConfig>>,
+    /// Broadcast channel for hotel-wide push events (e.g. NetworkState).
+    /// The sender is cloned into each `handle_client` task for forwarding.
+    network_broadcast: tokio::sync::broadcast::Sender<IpcResponse>,
 }
 
 struct LoggingLeaseObserver;
@@ -979,6 +987,33 @@ impl IpcServer {
             owner_guest_id: owner_guest_id.to_string(),
             owner_hotel: Some(authority_hotel.to_string()),
             owner_component_type: Some("membrane".into()),
+            lease_epoch: 0,
+            lease_expires_at: 0,
+            last_heartbeat_at: 0,
+            status: LeaseStatus::Active,
+            delegated_from: None,
+            metadata: serde_json::json!({
+                "agent_id": agent_id,
+                "authority_node_id": local_node_id,
+            }),
+        }
+    }
+
+    fn discord_gateway_lease(
+        lease_key: &str,
+        authority_hotel: &str,
+        local_node_id: &str,
+        owner_guest_id: &str,
+        agent_id: &str,
+    ) -> LeaseEnvelope {
+        LeaseEnvelope {
+            lease_type: "discord_gateway".into(),
+            lease_scope: lease_key.to_string(),
+            authority_hotel: authority_hotel.to_string(),
+            authority_component: Some("aiua".into()),
+            owner_guest_id: owner_guest_id.to_string(),
+            owner_hotel: Some(authority_hotel.to_string()),
+            owner_component_type: Some("membrane.discord".into()),
             lease_epoch: 0,
             lease_expires_at: 0,
             last_heartbeat_at: 0,
@@ -1771,11 +1806,22 @@ impl IpcServer {
                 })
                 .unwrap_or_default()
         };
+        let str_opt = |key: &str| {
+            identity
+                .bundle_json
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
 
         OperatorAgentView {
             agent_id: identity.agent_id,
             persona_name: identity.persona_name,
             authority_hotel: identity.authority_hotel,
+            soul_text: str_opt("soul_text"),
+            identity_text: str_opt("identity_text"),
+            user_context_text: str_opt("user_context_text"),
+            system_prompt: str_opt("system_prompt"),
             toolset_tags: str_vec("toolset_tags"),
             default_toolset: str_vec("default_toolset"),
             default_skillset: str_vec("default_skillset"),
@@ -1923,6 +1969,56 @@ impl IpcServer {
             .unwrap_or(false)
     }
 
+    /// Inject a membrane binding into an agent's bundle_json reflex_context.
+    /// Called on successful lease acquisition so the agent's next bundle fetch
+    /// reflects the active membrane without any dynamic query.
+    /// Bindings are never removed on release — the agent owns its membranes until
+    /// it explicitly relinquishes them (operator-pinned by design).
+    fn inject_membrane_binding(
+        graph: &GraphDomain,
+        agent_id: &str,
+        kind: &str,
+        membrane_guest_id: &str,
+    ) {
+        let Ok(Some(mut identity)) = graph.get_agent_identity(agent_id) else {
+            return;
+        };
+        let new_binding = serde_json::json!({
+            "kind": kind,
+            "membrane_guest_id": membrane_guest_id,
+        });
+        let bindings = identity
+            .bundle_json
+            .get_mut("reflex_context")
+            .and_then(|rc| rc.get_mut("membrane_bindings"))
+            .and_then(|b| b.as_array_mut());
+        if let Some(arr) = bindings {
+            arr.retain(|b| {
+                !(b.get("kind").and_then(|k| k.as_str()) == Some(kind)
+                    && b.get("membrane_guest_id").and_then(|g| g.as_str())
+                        == Some(membrane_guest_id))
+            });
+            arr.push(new_binding);
+        } else {
+            if let Some(obj) = identity.bundle_json.as_object_mut() {
+                let rc = obj
+                    .entry("reflex_context")
+                    .or_insert_with(|| serde_json::json!({}));
+                if let Some(rc_obj) = rc.as_object_mut() {
+                    rc_obj.insert(
+                        "membrane_bindings".to_string(),
+                        serde_json::json!([new_binding]),
+                    );
+                }
+            }
+        }
+        if let Err(e) = graph.upsert_agent_identity(&identity) {
+            warn!(
+                "Failed to inject membrane binding [{kind}/{membrane_guest_id}] for agent [{agent_id}]: {e}"
+            );
+        }
+    }
+
     fn hotel_may_poll_for_agent(
         agent_identity: &ansible_mesh_core::storage::AgentIdentityRecord,
         local_hotel_name: &str,
@@ -1994,6 +2090,39 @@ impl IpcServer {
         );
     }
 
+    fn drop_stale_discord_gateway_lease_if_needed(
+        guard: &mut RuntimeLeaseRegistry,
+        graph: &GraphDomain,
+        local_node_id: &str,
+        lease_key: &str,
+    ) {
+        let mut observer = LoggingLeaseObserver;
+        let _ = guard.drop_if_stale(
+            lease_key,
+            |existing| {
+                Self::discord_gateway_lease_is_expired(existing)
+                    || !Self::discord_gateway_lease_owner_is_live(
+                        graph,
+                        local_node_id,
+                        &existing.owner_guest_id,
+                    )
+            },
+            &mut observer,
+        );
+    }
+
+    fn discord_gateway_lease_is_expired(lease: &LeaseEnvelope) -> bool {
+        lease.lease_expires_at > 0 && unix_ts() > lease.lease_expires_at
+    }
+
+    fn discord_gateway_lease_owner_is_live(
+        graph: &GraphDomain,
+        local_node_id: &str,
+        owner_guest_id: &str,
+    ) -> bool {
+        Self::telegram_poll_lease_owner_is_live(graph, local_node_id, owner_guest_id)
+    }
+
     async fn write_frame<W: AsyncWriteExt + Unpin>(
         writer: &mut W,
         payload: &[u8],
@@ -2027,6 +2156,7 @@ impl IpcServer {
         dispatcher_tx: mpsc::Sender<LedgerCommand>,
         graph: Arc<GraphDomain>,
     ) -> Self {
+        let (network_broadcast, _) = tokio::sync::broadcast::channel(16);
         Self {
             socket_path: socket_path.into(),
             local_node_id: local_node_id.into(),
@@ -2037,12 +2167,20 @@ impl IpcServer {
             materialization_requester: None,
             telegram_poll_leases: Arc::new(Mutex::new(RuntimeLeaseRegistry::default())),
             desktop_membrane_leases: Arc::new(Mutex::new(RuntimeLeaseRegistry::default())),
+            discord_gateway_leases: Arc::new(Mutex::new(RuntimeLeaseRegistry::default())),
             subagent_leases: Arc::new(Mutex::new(RuntimeLeaseRegistry::default())),
             subagent_hooks: Arc::new(Mutex::new(HashMap::new())),
             registry: Arc::new(RwLock::new(NodeRegistry::new())),
             peer_sockets: Arc::new(RwLock::new(HashMap::new())),
             muninn_config: None,
+            network_broadcast,
         }
+    }
+
+    /// Returns a sender for the hotel-wide broadcast channel.
+    /// Clone this before spawning `run()` to push `NetworkState` events to all connected guests.
+    pub fn network_broadcast_tx(&self) -> tokio::sync::broadcast::Sender<IpcResponse> {
+        self.network_broadcast.clone()
     }
 
     pub fn with_memory_config(mut self, config: Option<Arc<memory_core::MuninnConfig>>) -> Self {
@@ -2088,11 +2226,13 @@ impl IpcServer {
                     let materialization_requester = self.materialization_requester.clone();
                     let telegram_poll_leases = self.telegram_poll_leases.clone();
                     let desktop_membrane_leases = self.desktop_membrane_leases.clone();
+                    let discord_gateway_leases = self.discord_gateway_leases.clone();
                     let subagent_leases = self.subagent_leases.clone();
                     let subagent_hooks = self.subagent_hooks.clone();
                     let registry = self.registry.clone();
                     let peer_sockets = self.peer_sockets.clone();
                     let muninn_config = self.muninn_config.clone();
+                    let network_broadcast_rx = self.network_broadcast.subscribe();
                     tokio::spawn(async move {
                         if let Err(e) = Self::handle_client(
                             stream,
@@ -2104,11 +2244,13 @@ impl IpcServer {
                             materialization_requester,
                             telegram_poll_leases,
                             desktop_membrane_leases,
+                            discord_gateway_leases,
                             subagent_leases,
                             subagent_hooks,
                             registry,
                             peer_sockets,
                             muninn_config,
+                            network_broadcast_rx,
                         )
                         .await
                         {
@@ -2133,11 +2275,13 @@ impl IpcServer {
         materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
         telegram_poll_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
         desktop_membrane_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
+        discord_gateway_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
         subagent_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
         subagent_hooks: SubagentHookRegistry,
         registry: Arc<RwLock<NodeRegistry>>,
         peer_sockets: Arc<RwLock<HashMap<String, String>>>,
         muninn_config: Option<Arc<memory_core::MuninnConfig>>,
+        network_broadcast_rx: tokio::sync::broadcast::Receiver<IpcResponse>,
     ) -> anyhow::Result<()> {
         let conn_id = Uuid::new_v4();
         let (mut reader, mut writer) = stream.into_split();
@@ -2158,6 +2302,27 @@ impl IpcServer {
             Ok::<(), std::io::Error>(())
         });
 
+        // Forward hotel-wide broadcast events (e.g. NetworkState) to this guest.
+        {
+            let broadcast_outbound_tx = outbound_tx.clone();
+            let mut broadcast_rx = network_broadcast_rx;
+            tokio::spawn(async move {
+                loop {
+                    match broadcast_rx.recv().await {
+                        Ok(msg) => {
+                            if broadcast_outbound_tx.send(msg).is_err() {
+                                break; // guest disconnected
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("Guest broadcast receiver lagged by {} messages.", n);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+        }
+
         let mut subscribed_roles = Vec::new();
         let mut current_identity: Option<GuestIdentity> = None;
         loop {
@@ -2166,6 +2331,7 @@ impl IpcServer {
                     Self::remove_subscriptions(&inboxes, conn_id, &subscribed_roles).await;
                     Self::remove_telegram_poll_leases(&telegram_poll_leases, conn_id).await;
                     Self::remove_desktop_membrane_leases(&desktop_membrane_leases, conn_id).await;
+                    Self::remove_discord_gateway_leases(&discord_gateway_leases, conn_id).await;
                     let _ = write_task.await;
                     return Ok(());
                 }
@@ -2192,6 +2358,7 @@ impl IpcServer {
                             materialization_requester.as_deref(),
                             &telegram_poll_leases,
                             &desktop_membrane_leases,
+                            &discord_gateway_leases,
                             &subagent_leases,
                             &subagent_hooks,
                             &registry,
@@ -2293,6 +2460,22 @@ impl IpcServer {
             .map(|lease| lease.lease_scope)
             .collect();
         let mut observer = LoggingDesktopMembraneLeaseObserver;
+        for scope in scopes {
+            let _ = guard.release(&scope, conn_id, &mut observer);
+        }
+    }
+
+    async fn remove_discord_gateway_leases(
+        discord_gateway_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
+        conn_id: Uuid,
+    ) {
+        let mut guard = discord_gateway_leases.lock().await;
+        let scopes: Vec<String> = guard
+            .active_leases_for_connection(conn_id)
+            .into_iter()
+            .map(|lease| lease.lease_scope)
+            .collect();
+        let mut observer = LoggingLeaseObserver;
         for scope in scopes {
             let _ = guard.release(&scope, conn_id, &mut observer);
         }
@@ -3388,6 +3571,7 @@ impl IpcServer {
         materialization_requester: Option<&dyn GuestMaterializationRequester>,
         telegram_poll_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
         desktop_membrane_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
+        discord_gateway_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
         subagent_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
         subagent_hooks: &SubagentHookRegistry,
         registry: &Arc<RwLock<NodeRegistry>>,
@@ -3466,8 +3650,7 @@ impl IpcServer {
                     };
                 }
                 if let Some(rest) = key.strip_prefix("__session_snapshot__:") {
-                    // Key format: __session_snapshot__:{session_id} (orchestrator)
-                    //          or __session_snapshot__:{session_id}@{role_name} (role process)
+                    // Format: `{session_id}` (orchestrator) or `{session_id}@{role_name}` (role process)
                     let (session_id, role_name) = match rest.split_once('@') {
                         Some((sess, role)) => (sess, Some(role)),
                         None => (rest, None),
@@ -3930,10 +4113,18 @@ impl IpcServer {
                     unix_ts(),
                     &mut observer,
                 ) {
-                    LeaseAcquireOutcome::Granted(lease) => IpcResponse::TelegramPollLease {
-                        granted: true,
-                        lease: Some(lease),
-                    },
+                    LeaseAcquireOutcome::Granted(lease) => {
+                        Self::inject_membrane_binding(
+                            graph,
+                            &agent_id,
+                            "telegram",
+                            &identity.guest_id,
+                        );
+                        IpcResponse::TelegramPollLease {
+                            granted: true,
+                            lease: Some(lease),
+                        }
+                    }
                     LeaseAcquireOutcome::Denied(lease) => {
                         info!(
                             "Telegram poll lease [{}] denied for guest [{}]; held by [{}] epoch {}.",
@@ -4373,6 +4564,230 @@ impl IpcServer {
                         ),
                     ),
                     None => IpcResponse::success("desktop_membrane_lease_release", None),
+                }
+            }
+            IpcRequest::AcquireDiscordGatewayLease {
+                lease_key,
+                agent_id,
+            } => {
+                let Some(identity) = current_identity.as_ref() else {
+                    return IpcResponse::error(
+                        "discord_gateway_lease",
+                        "LEASE_UNREGISTERED",
+                        "guest must register before acquiring a Discord gateway lease",
+                    );
+                };
+                let Some(agent_identity) = graph.get_agent_identity(&agent_id).ok().flatten()
+                else {
+                    return IpcResponse::error(
+                        "discord_gateway_lease",
+                        "LEASE_AGENT_UNKNOWN",
+                        format!("no agent identity found for [{}]", agent_id),
+                    );
+                };
+                let Some(local_hotel_name) = Self::local_hotel_name(graph, local_node_id) else {
+                    return IpcResponse::error(
+                        "discord_gateway_lease",
+                        "LEASE_AUTHORITY_UNKNOWN",
+                        format!(
+                            "current hotel authority could not be resolved for node [{}]",
+                            local_node_id
+                        ),
+                    );
+                };
+                if !Self::hotel_may_poll_for_agent(&agent_identity, &local_hotel_name) {
+                    return IpcResponse::error(
+                        "discord_gateway_lease",
+                        "LEASE_FOREIGN_AUTHORITY",
+                        format!(
+                            "agent [{}] is owned by hotel [{}] and hotel [{}] is not authorized",
+                            agent_id, agent_identity.authority_hotel, local_hotel_name
+                        ),
+                    );
+                }
+
+                let mut guard = discord_gateway_leases.lock().await;
+                Self::drop_stale_discord_gateway_lease_if_needed(
+                    &mut guard,
+                    graph,
+                    local_node_id,
+                    &lease_key,
+                );
+                let candidate = Self::discord_gateway_lease(
+                    &lease_key,
+                    &local_hotel_name,
+                    local_node_id,
+                    &identity.guest_id,
+                    &agent_id,
+                );
+                let mut observer = LoggingLeaseObserver;
+                match guard.acquire(
+                    conn_id,
+                    candidate,
+                    DISCORD_GATEWAY_LEASE_TTL_SECS,
+                    unix_ts(),
+                    &mut observer,
+                ) {
+                    LeaseAcquireOutcome::Granted(lease) => {
+                        Self::inject_membrane_binding(
+                            graph,
+                            &agent_id,
+                            "discord_text",
+                            &identity.guest_id,
+                        );
+                        IpcResponse::DiscordGatewayLease {
+                            granted: true,
+                            lease: Some(lease),
+                        }
+                    }
+                    LeaseAcquireOutcome::Denied(lease) => {
+                        info!(
+                            "Discord gateway lease [{}] denied for guest [{}]; held by [{}] epoch {}.",
+                            lease.lease_scope,
+                            identity.guest_id,
+                            lease.owner_guest_id,
+                            lease.lease_epoch
+                        );
+                        IpcResponse::DiscordGatewayLease {
+                            granted: false,
+                            lease: Some(lease),
+                        }
+                    }
+                }
+            }
+            IpcRequest::GetDiscordGatewayLeaseOwner { lease_key } => {
+                let mut guard = discord_gateway_leases.lock().await;
+                Self::drop_stale_discord_gateway_lease_if_needed(
+                    &mut guard,
+                    graph,
+                    local_node_id,
+                    &lease_key,
+                );
+                if let Some(existing) = guard.inspect(&lease_key) {
+                    IpcResponse::DiscordGatewayLeaseStatus {
+                        active: true,
+                        lease: Some(existing),
+                    }
+                } else {
+                    IpcResponse::DiscordGatewayLeaseStatus {
+                        active: false,
+                        lease: None,
+                    }
+                }
+            }
+            IpcRequest::RenewDiscordGatewayLease {
+                lease_key,
+                agent_id,
+                lease_epoch,
+            } => {
+                let Some(identity) = current_identity.as_ref() else {
+                    return IpcResponse::error(
+                        "discord_gateway_lease",
+                        "LEASE_UNREGISTERED",
+                        "guest must register before renewing a Discord gateway lease",
+                    );
+                };
+                let Some(agent_identity) = graph.get_agent_identity(&agent_id).ok().flatten()
+                else {
+                    return IpcResponse::error(
+                        "discord_gateway_lease",
+                        "LEASE_AGENT_UNKNOWN",
+                        format!("no agent identity found for [{}]", agent_id),
+                    );
+                };
+                let Some(local_hotel_name) = Self::local_hotel_name(graph, local_node_id) else {
+                    return IpcResponse::error(
+                        "discord_gateway_lease",
+                        "LEASE_AUTHORITY_UNKNOWN",
+                        format!(
+                            "current hotel authority could not be resolved for node [{}]",
+                            local_node_id
+                        ),
+                    );
+                };
+                if !Self::hotel_may_poll_for_agent(&agent_identity, &local_hotel_name) {
+                    return IpcResponse::error(
+                        "discord_gateway_lease",
+                        "LEASE_FOREIGN_AUTHORITY",
+                        format!(
+                            "agent [{}] is owned by hotel [{}] and hotel [{}] is not authorized",
+                            agent_id, agent_identity.authority_hotel, local_hotel_name
+                        ),
+                    );
+                }
+
+                let mut guard = discord_gateway_leases.lock().await;
+                Self::drop_stale_discord_gateway_lease_if_needed(
+                    &mut guard,
+                    graph,
+                    local_node_id,
+                    &lease_key,
+                );
+                let mut observer = LoggingLeaseObserver;
+                match guard.renew(
+                    &lease_key,
+                    conn_id,
+                    lease_epoch,
+                    DISCORD_GATEWAY_LEASE_TTL_SECS,
+                    unix_ts(),
+                    &mut observer,
+                ) {
+                    LeaseRenewOutcome::Renewed(lease) => IpcResponse::DiscordGatewayLease {
+                        granted: true,
+                        lease: Some(lease),
+                    },
+                    LeaseRenewOutcome::Lost(lease) => {
+                        if let Some(ref lease) = lease {
+                            info!(
+                                "Discord gateway lease [{}] renew denied for guest [{}]; held by [{}] epoch {}.",
+                                lease.lease_scope,
+                                identity.guest_id,
+                                lease.owner_guest_id,
+                                lease.lease_epoch
+                            );
+                        }
+                        IpcResponse::DiscordGatewayLease {
+                            granted: false,
+                            lease,
+                        }
+                    }
+                }
+            }
+            IpcRequest::ReleaseDiscordGatewayLease { lease_key } => {
+                let Some(identity) = current_identity.as_ref() else {
+                    return IpcResponse::error(
+                        "discord_gateway_lease",
+                        "LEASE_UNREGISTERED",
+                        "guest must register before releasing a Discord gateway lease",
+                    );
+                };
+
+                let mut guard = discord_gateway_leases.lock().await;
+                let mut observer = LoggingLeaseObserver;
+                match guard.inspect(&lease_key) {
+                    Some(existing) if existing.owner_guest_id == identity.guest_id => {
+                        if guard.release(&lease_key, conn_id, &mut observer).is_some() {
+                            IpcResponse::success("discord_gateway_lease_release", None)
+                        } else {
+                            IpcResponse::error(
+                                "discord_gateway_lease_release",
+                                "LEASE_NOT_OWNER",
+                                format!(
+                                    "guest [{}] does not hold the active connection for lease [{}]",
+                                    identity.guest_id, lease_key
+                                ),
+                            )
+                        }
+                    }
+                    Some(existing) => IpcResponse::error(
+                        "discord_gateway_lease_release",
+                        "LEASE_NOT_OWNER",
+                        format!(
+                            "guest [{}] cannot release lease [{}] owned by [{}]",
+                            identity.guest_id, lease_key, existing.owner_guest_id
+                        ),
+                    ),
+                    None => IpcResponse::success("discord_gateway_lease_release", None),
                 }
             }
             IpcRequest::ReleaseTelegramPollLease { lease_key } => {
@@ -5488,6 +5903,10 @@ impl IpcServer {
             IpcRequest::PatchAgentBundle {
                 agent_id,
                 persona_name,
+                soul_text,
+                identity_text,
+                user_context_text,
+                system_prompt,
                 default_toolset,
                 default_skillset,
             } => {
@@ -5496,6 +5915,10 @@ impl IpcServer {
                     local_node_id,
                     &agent_id,
                     persona_name,
+                    soul_text,
+                    identity_text,
+                    user_context_text,
+                    system_prompt,
                     default_toolset,
                     default_skillset,
                 ) {
@@ -6297,6 +6720,9 @@ impl IpcServer {
                 )
                 .await
             }
+            IpcRequest::RemoveComponent { guest_id } => {
+                Self::handle_remove_component(graph, local_node_id, &guest_id).await
+            }
             IpcRequest::SeedRemoteIncarnation {
                 node_id,
                 hotel_id,
@@ -6388,11 +6814,202 @@ impl IpcServer {
                 Ok(None) => IpcResponse::Error(format!("cron job not found: {job_id}")),
                 Err(e) => IpcResponse::Error(format!("DisableCronJob failed: {e}")),
             },
+            // GracefulShutdown is hotel→guest only; a guest sending it is a no-op.
             IpcRequest::GracefulShutdown { .. } => IpcResponse::error(
                 "graceful_shutdown",
                 "NOT_APPLICABLE",
                 "GracefulShutdown is a hotel-to-guest signal; guests do not send it.",
             ),
+
+            // Fire-and-forget paracrine dispatch.
+            // The caller does NOT wait for the specialist's response — it arrives later
+            // as a paracrine_response inbound task at reply_to_node/reply_to_role.
+            IpcRequest::ParacrineEmit {
+                role,
+                exosome,
+                reply_to_node,
+                reply_to_role,
+                ..
+            } => {
+                // Session key: paracrine:{chat_id}:{role}
+                //
+                // Keyed on chat_id (not the full source_session_id) so the specialist
+                // accumulates turn-window context per conversation. Multiple whisper calls
+                // from the same Telegram chat land in the same specialist session and are
+                // queued by the FIFO pending_user_tasks mechanism rather than overwriting
+                // each other. The role suffix keeps sessions distinct across specialists.
+                let specialist_chat_id = exosome.source_chat_id.clone().unwrap_or_default();
+                let specialist_session_id = if specialist_chat_id.is_empty() {
+                    format!("paracrine:{role}")
+                } else {
+                    format!("paracrine:{}:{role}", specialist_chat_id)
+                };
+                // Derive transport from the source_session_id prefix (e.g. "telegram" from
+                // "telegram:7898847424:agent-bjork-01") so the specialist's session tracks
+                // its origin transport even though it runs in a distinct session.
+                let specialist_transport = exosome
+                    .source_session_id
+                    .as_deref()
+                    .and_then(|s| s.split(':').next())
+                    .unwrap_or("paracrine")
+                    .to_string();
+                let paracrine_task = serde_json::json!({
+                    "action": "paracrine_request",
+                    "content": exosome.prompt,
+                    "exosome": exosome,
+                    "session_id": specialist_session_id,
+                    "chat_id": specialist_chat_id,
+                    "transport": specialist_transport,
+                    "final_reply_to": reply_to_node,
+                    "final_reply_role": reply_to_role,
+                });
+                let task_json = paracrine_task.to_string();
+                let task_id = Uuid::new_v4();
+
+                // Check if the target role has a live inbox subscriber.
+                let has_subscriber = {
+                    let guard = inboxes.lock().await;
+                    guard.get(&role).is_some_and(|subs| !subs.is_empty())
+                };
+
+                if has_subscriber {
+                    Self::deliver_inbound_task(
+                        inboxes,
+                        local_node_id,
+                        &role,
+                        None,
+                        task_id,
+                        task_json,
+                    )
+                    .await;
+                } else {
+                    // No live subscriber — look up the role incarnation, park the task
+                    // under the incarnation's guest_id, and trigger materialization of
+                    // a dedicated role-philote so it can connect and flush the park.
+                    match graph.find_role_incarnation_by_name(&role) {
+                        Ok(Some(inc)) => {
+                            // The philote that handles this role incarnation registers
+                            // with guest_id = "{agent_id}:{role_name}".
+                            let role_guest_id = inc.guest_id.clone();
+
+                            // Park the task — flushed when the role philote connects.
+                            {
+                                let mut guard = parked_inbound.lock().await;
+                                guard.entry(role_guest_id.clone()).or_default().push(
+                                    ParkedInboundTask {
+                                        source_node: local_node_id.to_string(),
+                                        task_id,
+                                        task_json,
+                                        activate_session_id: None,
+                                    },
+                                );
+                            }
+                            info!(
+                                role = %role,
+                                role_guest_id = %role_guest_id,
+                                task_id = %task_id,
+                                "Parked paracrine task; will trigger role-philote materialization."
+                            );
+
+                            // Ensure the role-philote guest record exists in the graph,
+                            // then ask the materializer to spawn it.
+                            if let Some(hotel_name) = Self::local_hotel_name(graph, local_node_id) {
+                                let hotel_guest_id =
+                                    format!("{}:philote-{}", hotel_name, inc.role_name);
+
+                                // Create the guest record if it doesn't already exist.
+                                if graph
+                                    .get_guest(&hotel_name, &hotel_guest_id)
+                                    .ok()
+                                    .flatten()
+                                    .is_none()
+                                {
+                                    // Derive socket path from hotel record.
+                                    let socket_path = graph
+                                        .list_hotels()
+                                        .ok()
+                                        .and_then(|hs| {
+                                            hs.into_iter()
+                                                .find(|h| h.capabilities.node_id == local_node_id)
+                                                .map(|h| h.ipc_socket_path)
+                                        })
+                                        .unwrap_or_default();
+
+                                    let config_json = serde_json::json!({
+                                        "command": "philote",
+                                        "args": [],
+                                        "env": {
+                                            "PHILOTIC_AGENT_ID": inc.agent_id,
+                                            "PHILOTIC_ROLE_NAME": inc.role_name,
+                                            "PHILOTIC_HOTEL_SOCKET": socket_path,
+                                            "PHILOTIC_NODE_ID": local_node_id,
+                                        }
+                                    });
+                                    let rec = ansible_mesh_core::storage::GuestRecord {
+                                        hotel_name: hotel_name.clone(),
+                                        guest_id: hotel_guest_id.clone(),
+                                        role: inc.role_name.clone(),
+                                        config_json: config_json.to_string(),
+                                        is_active: true,
+                                        active_pid: None,
+                                        last_active_at: None,
+                                    };
+                                    if let Err(e) = graph.seed_guests(&hotel_name, &[rec]) {
+                                        warn!(
+                                            "Failed to seed role-philote guest record [{}]: {e}",
+                                            hotel_guest_id
+                                        );
+                                    } else {
+                                        info!(
+                                            "Created role-philote guest record: {}",
+                                            hotel_guest_id
+                                        );
+                                    }
+                                }
+
+                                // Trigger materialization.
+                                if let Some(requester) = materialization_requester {
+                                    match requester.ensure_guest_active(&hotel_guest_id).await {
+                                        Ok(true) => info!(
+                                            "Role-philote [{}] materialization triggered.",
+                                            hotel_guest_id
+                                        ),
+                                        Ok(false) => warn!(
+                                            "Role-philote [{}] could not be materialized.",
+                                            hotel_guest_id
+                                        ),
+                                        Err(e) => warn!(
+                                            "Role-philote [{}] materialization error: {e}",
+                                            hotel_guest_id
+                                        ),
+                                    }
+                                }
+                            } else {
+                                warn!(
+                                    "Cannot materialize role-philote for '{}': local hotel record missing.",
+                                    role
+                                );
+                            }
+                        }
+                        Ok(None) => {
+                            warn!(
+                                role = %role,
+                                "No role incarnation found for paracrine target '{}'; task dropped.",
+                                role
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                role = %role,
+                                "Role incarnation lookup failed for '{}': {e}; task dropped.",
+                                role
+                            );
+                        }
+                    }
+                }
+
+                IpcResponse::success("paracrine_emit", None)
+            }
         }
     }
 
@@ -6533,6 +7150,10 @@ impl IpcServer {
         local_node_id: &str,
         agent_id: &str,
         persona_name: Option<String>,
+        soul_text: Option<String>,
+        identity_text: Option<String>,
+        user_context_text: Option<String>,
+        system_prompt: Option<String>,
         default_toolset: Option<Vec<String>>,
         default_skillset: Option<Vec<String>>,
     ) -> anyhow::Result<DesktopMembraneAgentView> {
@@ -6549,6 +7170,18 @@ impl IpcServer {
 
         if let Some(name) = persona_name {
             identity.persona_name = name;
+        }
+        if let Some(value) = soul_text {
+            identity.bundle_json["soul_text"] = serde_json::json!(value);
+        }
+        if let Some(value) = identity_text {
+            identity.bundle_json["identity_text"] = serde_json::json!(value);
+        }
+        if let Some(value) = user_context_text {
+            identity.bundle_json["user_context_text"] = serde_json::json!(value);
+        }
+        if let Some(value) = system_prompt {
+            identity.bundle_json["system_prompt"] = serde_json::json!(value);
         }
         if let Some(toolset) = default_toolset {
             identity.bundle_json["default_toolset"] = serde_json::json!(toolset);
@@ -6623,9 +7256,26 @@ impl IpcServer {
 
         let components: Vec<serde_json::Value> = guests
             .into_iter()
-            .filter_map(|g| {
-                // Infer component type from role prefix — only model-controllers and tool-runners
-                // are surfaced here. Agents, membrane, and other guests belong in /api/guests.
+            .map(|g| {
+                let spawn_config = serde_json::from_str::<serde_json::Value>(&g.config_json)
+                    .unwrap_or(serde_json::Value::Null);
+                let command = spawn_config
+                    .get("command")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let args = spawn_config
+                    .get("args")
+                    .and_then(|value| value.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let env = spawn_config
+                    .get("env")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+
+                // Keep the compatibility component_type hint, but stop pretending
+                // only model/tool-ish components exist on the authoring surface.
                 let component_type = if g.role == "model"
                     || g.role.starts_with("model.")
                     || g.role.starts_with("model-controller")
@@ -6636,8 +7286,14 @@ impl IpcServer {
                     || g.role.starts_with("tool-runner")
                 {
                     "tool-runner"
+                } else if g.role == "membrane" || g.role.starts_with("membrane.") {
+                    "membrane"
+                } else if g.role == "agent" || g.role.starts_with("agent.") {
+                    "agent"
+                } else if g.role == "graph-runner" || g.role.starts_with("graph.") {
+                    "graph-runner"
                 } else {
-                    return None;
+                    "other"
                 };
 
                 // Read per-component config blob.
@@ -6669,16 +7325,21 @@ impl IpcServer {
                     })
                     .unwrap_or_default();
 
-                Some(serde_json::json!({
+                serde_json::json!({
                     "guest_id": g.guest_id,
                     "role": g.role,
+                    "hotel": g.hotel_name,
+                    "command": command,
+                    "args": args,
+                    "env": env,
                     "component_type": component_type,
                     "is_active": g.is_active,
+                    "auto_start": g.is_active,
                     "active_pid": g.active_pid,
                     "last_active_at": g.last_active_at,
                     "component_config": component_config,
                     "capabilities": capabilities,
-                }))
+                })
             })
             .collect();
 
@@ -6819,6 +7480,60 @@ impl IpcServer {
         info!(guest_id = %guest_id, "component restarted");
         IpcResponse::success(
             "restart_component",
+            Some(serde_json::json!({ "guest_id": guest_id })),
+        )
+    }
+
+    async fn handle_remove_component(
+        graph: &GraphDomain,
+        local_node_id: &str,
+        guest_id: &str,
+    ) -> IpcResponse {
+        let hotel_name = match Self::local_hotel_name(graph, local_node_id) {
+            Some(h) => h,
+            None => {
+                return IpcResponse::error(
+                    "remove_component",
+                    "HOTEL_NOT_FOUND",
+                    "local hotel record not found",
+                );
+            }
+        };
+
+        let guest = match graph.get_guest(&hotel_name, guest_id) {
+            Ok(Some(guest)) => guest,
+            Ok(None) => {
+                return IpcResponse::error(
+                    "remove_component",
+                    "GUEST_NOT_FOUND",
+                    format!("No component registered with guest_id={guest_id}"),
+                );
+            }
+            Err(e) => {
+                return IpcResponse::error("remove_component", "STORAGE_ERROR", e.to_string());
+            }
+        };
+
+        if let Some(ref pid_str) = guest.active_pid {
+            if let Ok(pid) = pid_str.parse::<u32>() {
+                let _ = ProcessCommand::new("kill")
+                    .args(["-15", &pid.to_string()])
+                    .status();
+            }
+        }
+
+        if let Err(e) = graph.remove_guest(&hotel_name, guest_id) {
+            return IpcResponse::error("remove_component", "STORAGE_ERROR", e.to_string());
+        }
+
+        let config_key = format!("component:{guest_id}");
+        if let Err(e) = graph.remove_config_value(&config_key) {
+            warn!("RemoveComponent: failed to remove component config for {guest_id}: {e}");
+        }
+
+        info!(guest_id = %guest_id, "component removed");
+        IpcResponse::success(
+            "remove_component",
             Some(serde_json::json!({ "guest_id": guest_id })),
         )
     }
@@ -7406,7 +8121,8 @@ impl IpcServer {
         registry: &Arc<RwLock<NodeRegistry>>,
         local_node_id: &str,
         session_id: &str,
-        // Role-scoped key suffix: Some("virtuosa") → reads short_session:{id}:virtuosa
+        // When a role process requests its snapshot, it passes its role name so we
+        // return the role-scoped checkpoint instead of the orchestrator's base one.
         role_name: Option<&str>,
     ) -> anyhow::Result<Option<serde_json::Value>> {
         let Some(session) = graph.get_session(session_id)? else {
@@ -8951,7 +9667,8 @@ mod tests {
     use ansible_mesh_core::registry::{CapabilityAdvertisement, NodeRegistry};
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
     use ansible_mesh_core::storage::{
-        AgentIdentityRecord, GuestRecord, HotelRecord, SessionRecord, SessionTurnRecord,
+        AgentIdentityRecord, GuestRecord, HotelRecord, SecretRecord,
+        SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,
     };
     use base64::Engine;
     use philotic_client::{
@@ -9080,6 +9797,143 @@ mod tests {
             } => operator_target_agents,
             other => panic!("unexpected operator target agents response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn list_components_returns_manifest_relevant_fields_for_registered_components() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: "/tmp/test.sock".into(),
+                active_pid: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .upsert_guest(&GuestRecord {
+                hotel_name: "local-hotel".into(),
+                guest_id: "membrane-discord-01".into(),
+                role: "membrane.discord".into(),
+                config_json: serde_json::json!({
+                    "command": "membrane-discord",
+                    "args": ["--agent-id", "agent-01"],
+                    "env": {
+                        "DISCORD_BOT_TOKEN": "token"
+                    }
+                })
+                .to_string(),
+                is_active: true,
+                active_pid: Some("4242".into()),
+                last_active_at: Some(123),
+            })
+            .expect("seed component guest");
+        graph
+            .set_config_value(
+                "component:membrane-discord-01",
+                &serde_json::json!({
+                    "guild_id": "1234"
+                })
+                .to_string(),
+            )
+            .expect("seed component config");
+
+        let response = IpcServer::handle_list_components(&graph, "local-aiua-01");
+        let components = match response {
+            IpcResponse::ComponentInventory { components } => components,
+            other => panic!("unexpected list_components response: {other:?}"),
+        };
+
+        assert_eq!(components.len(), 1);
+        assert_eq!(components[0]["guest_id"], "membrane-discord-01");
+        assert_eq!(components[0]["role"], "membrane.discord");
+        assert_eq!(components[0]["hotel"], "local-hotel");
+        assert_eq!(components[0]["command"], "membrane-discord");
+        assert_eq!(components[0]["args"][0], "--agent-id");
+        assert_eq!(components[0]["env"]["DISCORD_BOT_TOKEN"], "token");
+        assert_eq!(components[0]["component_type"], "membrane");
+        assert_eq!(components[0]["auto_start"], true);
+        assert_eq!(components[0]["component_config"]["guild_id"], "1234");
+    }
+
+    #[test]
+    fn remove_component_deletes_guest_and_component_config() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: "/tmp/test.sock".into(),
+                active_pid: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .upsert_guest(&GuestRecord {
+                hotel_name: "local-hotel".into(),
+                guest_id: "tool-echo-01".into(),
+                role: "tool.echo".into(),
+                config_json: serde_json::json!({
+                    "command": "tool-runner",
+                    "args": ["--help"],
+                    "env": {}
+                })
+                .to_string(),
+                is_active: false,
+                active_pid: None,
+                last_active_at: None,
+            })
+            .expect("seed component guest");
+        graph
+            .set_config_value(
+                "component:tool-echo-01",
+                &serde_json::json!({ "description": "temporary" }).to_string(),
+            )
+            .expect("seed component config");
+
+        let runtime = tokio::runtime::Runtime::new().expect("create tokio runtime");
+        let response = runtime.block_on(IpcServer::handle_remove_component(
+            &graph,
+            "local-aiua-01",
+            "tool-echo-01",
+        ));
+
+        match response {
+            IpcResponse::Standard { ok: true, .. } => {}
+            other => panic!("unexpected remove_component response: {other:?}"),
+        }
+
+        assert!(
+            graph
+                .get_guest("local-hotel", "tool-echo-01")
+                .expect("load guest")
+                .is_none()
+        );
+        assert!(
+            graph
+                .get_config_value("component:tool-echo-01")
+                .expect("load component config")
+                .is_none()
+        );
     }
 
     fn expect_operator_chat_reply(response: IpcResponse) -> OperatorChatTurnReply {
@@ -19837,6 +20691,247 @@ mod tests {
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
         }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    // ── Reflex E2E: membrane binding injection ────────────────────────────────
+
+    // NOTE: IpcResponse is #[serde(untagged)] and TelegramPollLease / DiscordGatewayLease
+    // share identical field shapes {granted, lease}, so serde always deserializes the
+    // Discord response as TelegramPollLease. Distinguish via LeaseEnvelope.lease_type instead.
+    fn expect_discord_gateway_lease(response: IpcResponse) -> (bool, Option<LeaseEnvelope>) {
+        match response {
+            IpcResponse::DiscordGatewayLease { granted, lease } => (granted, lease),
+            // Untagged serde ambiguity: TelegramPollLease matches the same shape —
+            // accept it and verify the inner lease_type is correct.
+            IpcResponse::TelegramPollLease { granted, lease } => {
+                if let Some(ref l) = lease {
+                    assert_eq!(l.lease_type, "discord_gateway",
+                        "received TelegramPollLease but inner lease_type was '{}', not 'discord_gateway'",
+                        l.lease_type);
+                }
+                (granted, lease)
+            }
+            other => panic!("unexpected discord gateway lease response: {other:?}"),
+        }
+    }
+
+    fn expect_config_data(response: IpcResponse) -> Option<serde_json::Value> {
+        match response {
+            IpcResponse::ConfigData { value_json, .. } => {
+                value_json.as_deref().map(|s| serde_json::from_str(s).expect("config data must be valid JSON"))
+            }
+            other => panic!("expected ConfigData, got: {other:?}"),
+        }
+    }
+
+    fn make_hotel_graph(socket_path: &str, agent_id: &str) -> Arc<GraphDomain> {
+        use ansible_mesh_core::storage::AgentIdentityRecord;
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.to_string(),
+                active_pid: None,
+            })
+            .expect("seed hotel");
+        graph
+            .upsert_agent_identity(&AgentIdentityRecord {
+                agent_id: agent_id.into(),
+                persona_name: "Jane".into(),
+                authority_hotel: "local-hotel".into(),
+                bundle_json: serde_json::json!({}),
+            })
+            .expect("seed agent identity");
+        graph
+    }
+
+    /// Scenario 1 — AcquireTelegramPollLease injects `kind: "telegram"` into
+    /// the agent's bundle reflex_context.membrane_bindings.
+    #[tokio::test]
+    async fn telegram_lease_injects_membrane_binding() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _rx) = mpsc::channel(16);
+        let graph = make_hotel_graph(&socket_path, "agent-jane-01");
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server_task = tokio::spawn(async move { server.run().await.expect("server run") });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe { std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path); }
+
+        let mut membrane = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-telegram-01".into(),
+            role: "membrane".into(),
+            supported_tools: vec![],
+        })
+        .await
+        .expect("connect membrane");
+
+        // Acquire lease — must be granted.
+        let lease_resp = membrane
+            .send_request(IpcRequest::AcquireTelegramPollLease {
+                lease_key: "telegram:bot_token:deadbeef".into(),
+                agent_id: "agent-jane-01".into(),
+            })
+            .await
+            .expect("lease request");
+        let (granted, _) = expect_telegram_poll_lease(lease_resp);
+        assert!(granted, "first acquire must be granted");
+
+        // Fetch the agent bundle and assert the binding was injected.
+        let bundle_resp = membrane
+            .send_request(IpcRequest::GetConfig {
+                key: "__agent_bundle__:agent-jane-01".into(),
+            })
+            .await
+            .expect("get config");
+        let bundle = expect_config_data(bundle_resp).expect("bundle must be present");
+        let bindings = bundle
+            .get("reflex_context")
+            .and_then(|rc| rc.get("membrane_bindings"))
+            .and_then(|b| b.as_array())
+            .expect("reflex_context.membrane_bindings must be present");
+
+        assert_eq!(bindings.len(), 1, "exactly one binding after one lease grant");
+        assert_eq!(
+            bindings[0].get("kind").and_then(|k| k.as_str()),
+            Some("telegram"),
+            "binding kind must be 'telegram'"
+        );
+
+        // Re-acquire (idempotent) — binding count must stay at 1.
+        let lease_resp2 = membrane
+            .send_request(IpcRequest::AcquireTelegramPollLease {
+                lease_key: "telegram:bot_token:deadbeef".into(),
+                agent_id: "agent-jane-01".into(),
+            })
+            .await
+            .expect("re-acquire lease");
+        let (granted2, _) = expect_telegram_poll_lease(lease_resp2);
+        assert!(granted2, "re-acquire by same owner must succeed");
+
+        let bundle_resp2 = membrane
+            .send_request(IpcRequest::GetConfig {
+                key: "__agent_bundle__:agent-jane-01".into(),
+            })
+            .await
+            .expect("get config after re-acquire");
+        let bundle2 = expect_config_data(bundle_resp2).expect("bundle");
+        let bindings2 = bundle2
+            .get("reflex_context")
+            .and_then(|rc| rc.get("membrane_bindings"))
+            .and_then(|b| b.as_array())
+            .expect("bindings after re-acquire");
+        assert_eq!(
+            bindings2.len(), 1,
+            "idempotent re-acquire must not duplicate binding (got: {bindings2:?})"
+        );
+
+        unsafe { std::env::remove_var("PHILOTIC_HOTEL_SOCKET"); }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    /// Scenario 2 — AcquireDiscordGatewayLease injects `kind: "discord_text"` into
+    /// the agent's bundle reflex_context.membrane_bindings.
+    #[tokio::test]
+    async fn discord_lease_injects_membrane_binding() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _rx) = mpsc::channel(16);
+        let graph = make_hotel_graph(&socket_path, "agent-jane-01");
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server_task = tokio::spawn(async move { server.run().await.expect("server run") });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe { std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path); }
+
+        let mut membrane = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-discord-01".into(),
+            role: "membrane".into(),
+            supported_tools: vec![],
+        })
+        .await
+        .expect("connect membrane");
+
+        // Acquire Discord gateway lease.
+        let lease_resp = membrane
+            .send_request(IpcRequest::AcquireDiscordGatewayLease {
+                lease_key: "discord:bot_token:cafebabe".into(),
+                agent_id: "agent-jane-01".into(),
+            })
+            .await
+            .expect("discord lease request");
+        let (granted, _) = expect_discord_gateway_lease(lease_resp);
+        assert!(granted, "first discord acquire must be granted");
+
+        // Fetch bundle and assert discord_text binding.
+        let bundle_resp = membrane
+            .send_request(IpcRequest::GetConfig {
+                key: "__agent_bundle__:agent-jane-01".into(),
+            })
+            .await
+            .expect("get config");
+        let bundle = expect_config_data(bundle_resp).expect("bundle must be present");
+        let bindings = bundle
+            .get("reflex_context")
+            .and_then(|rc| rc.get("membrane_bindings"))
+            .and_then(|b| b.as_array())
+            .expect("reflex_context.membrane_bindings must be present");
+
+        assert_eq!(bindings.len(), 1, "exactly one binding after discord lease grant");
+        assert_eq!(
+            bindings[0].get("kind").and_then(|k| k.as_str()),
+            Some("discord_text"),
+            "binding kind must be 'discord_text'"
+        );
+
+        // Re-acquire — idempotent, no duplicate.
+        let lease_resp2 = membrane
+            .send_request(IpcRequest::AcquireDiscordGatewayLease {
+                lease_key: "discord:bot_token:cafebabe".into(),
+                agent_id: "agent-jane-01".into(),
+            })
+            .await
+            .expect("re-acquire discord lease");
+        let (granted2, _) = expect_discord_gateway_lease(lease_resp2);
+        assert!(granted2);
+
+        let bundle_resp2 = membrane
+            .send_request(IpcRequest::GetConfig {
+                key: "__agent_bundle__:agent-jane-01".into(),
+            })
+            .await
+            .expect("get config after re-acquire");
+        let bundle2 = expect_config_data(bundle_resp2).expect("bundle");
+        let bindings2 = bundle2
+            .get("reflex_context")
+            .and_then(|rc| rc.get("membrane_bindings"))
+            .and_then(|b| b.as_array())
+            .expect("bindings after re-acquire");
+        assert_eq!(
+            bindings2.len(), 1,
+            "idempotent re-acquire must not duplicate discord binding (got: {bindings2:?})"
+        );
+
+        unsafe { std::env::remove_var("PHILOTIC_HOTEL_SOCKET"); }
         server_task.abort();
         let _ = server_task.await;
         if Path::new(&socket_path).exists() {

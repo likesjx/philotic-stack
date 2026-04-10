@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - session-admin-elevation
+
+rectangle "session-admin-elevation" as session_admin_elevation #Orange {
+}
+
+
+@enduml
