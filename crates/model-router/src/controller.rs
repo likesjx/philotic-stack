@@ -70,6 +70,25 @@ impl RequestClass {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseRouteBucket {
+    TextOnly,
+    ImageMultimodal,
+    AudioMultimodal,
+    RealtimeWebsocket,
+}
+
+impl ResponseRouteBucket {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::TextOnly => "text_only",
+            Self::ImageMultimodal => "image_multimodal",
+            Self::AudioMultimodal => "audio_multimodal",
+            Self::RealtimeWebsocket => "realtime_websocket",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ResponseContract {
     pub modalities: Vec<String>,
@@ -200,6 +219,18 @@ pub struct RoutingHints {
     pub implementation: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LigandEnvelope {
+    pub signal_type: Option<String>,
+    pub purpose: Option<String>,
+    pub preferred_provider: Option<String>,
+    pub preferred_model: Option<String>,
+    pub visible_tools: Vec<String>,
+    pub visible_tool_classes: Vec<String>,
+    pub approval_posture: Option<Value>,
+    pub rationale: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControllerTask {
     pub kind: TaskKind,
@@ -215,10 +246,12 @@ pub struct ControllerTask {
     pub output_format: Option<String>,
     pub language_code: Option<String>,
     pub response_contract: ResponseContract,
+    pub response_route: Option<ResponseRouteBucket>,
     pub context: ContextEnvelope,
     pub context_projection: ContextProjectionEnvelope,
     pub affordances: Affordances,
     pub routing_hints: RoutingHints,
+    pub ligand: Option<LigandEnvelope>,
     pub provider_options: Map<String, Value>,
     /// Tools the agent has available this turn. Non-empty signals tool-enabled mode.
     /// Each entry is a raw JSON object with at minimum `tool_name` and `description`.
@@ -228,10 +261,12 @@ pub struct ControllerTask {
 impl ControllerTask {
     pub fn from_value(task: &Value) -> Result<Self> {
         let response_contract = parse_response_contract(task.get("response_contract"));
+        let response_route = parse_response_route(task.get("response_route"))?;
         let mut context = parse_context(task.get("context"));
         let context_projection = parse_context_projection(task.get("context_projection"));
         let affordances = parse_affordances(task.get("affordances"));
         let routing_hints = parse_routing_hints(task.get("routing_hints"));
+        let ligand = parse_ligand(task.get("ligand"));
         let top_level_attachments = parse_attachments(task.get("attachments"));
         if !top_level_attachments.is_empty() {
             context.attachments.extend(top_level_attachments);
@@ -279,11 +314,13 @@ impl ControllerTask {
                 .get("provider")
                 .and_then(Value::as_str)
                 .map(str::to_string)
+                .or_else(|| ligand.as_ref().and_then(|l| l.preferred_provider.clone()))
                 .or_else(|| routing_hints.implementation.clone()),
             model: task
                 .get("model")
                 .and_then(Value::as_str)
-                .map(str::to_string),
+                .map(str::to_string)
+                .or_else(|| ligand.as_ref().and_then(|l| l.preferred_model.clone())),
             prompt: task
                 .get("prompt")
                 .and_then(Value::as_str)
@@ -320,10 +357,12 @@ impl ControllerTask {
                 .and_then(Value::as_str)
                 .map(str::to_string),
             response_contract,
+            response_route,
             context,
             context_projection,
             affordances,
             routing_hints,
+            ligand,
             provider_options,
             tools: task
                 .get("tools_for_model")
@@ -524,6 +563,48 @@ impl ControllerTask {
         &self.context.attachments
     }
 
+    pub fn response_route_bucket(&self) -> ResponseRouteBucket {
+        if let Some(route) = self.response_route {
+            return route;
+        }
+
+        if matches!(
+            self.provider_option_str("response_mode"),
+            Some("realtime_websocket" | "realtime_ws" | "realtime")
+        ) {
+            return ResponseRouteBucket::RealtimeWebsocket;
+        }
+
+        if matches!(
+            self.provider_option_str("response_mode"),
+            Some("native_audio")
+        ) || self
+            .response_contract
+            .modalities
+            .iter()
+            .any(|modality| modality == "audio")
+        {
+            return ResponseRouteBucket::AudioMultimodal;
+        }
+
+        if self.media_attachments().iter().any(|attachment| {
+            attachment
+                .mime_type
+                .as_deref()
+                .map(|mime| mime.starts_with("image/"))
+                .unwrap_or(false)
+                || attachment
+                    .kind
+                    .as_deref()
+                    .map(|kind| kind.contains("image"))
+                    .unwrap_or(false)
+        }) {
+            return ResponseRouteBucket::ImageMultimodal;
+        }
+
+        ResponseRouteBucket::TextOnly
+    }
+
     pub fn wants_channel(&self, channel: &str) -> bool {
         self.response_contract
             .channels
@@ -633,6 +714,22 @@ impl ControllerTask {
 
         Ok(())
     }
+}
+
+fn parse_response_route(value: Option<&Value>) -> Result<Option<ResponseRouteBucket>> {
+    let Some(raw) = value.and_then(Value::as_str) else {
+        return Ok(None);
+    };
+
+    let route = match raw {
+        "text_only" => ResponseRouteBucket::TextOnly,
+        "image_multimodal" => ResponseRouteBucket::ImageMultimodal,
+        "audio_multimodal" => ResponseRouteBucket::AudioMultimodal,
+        "realtime_websocket" => ResponseRouteBucket::RealtimeWebsocket,
+        other => bail!("unsupported response_route [{}]", other),
+    };
+
+    Ok(Some(route))
 }
 
 fn parse_response_contract(value: Option<&Value>) -> ResponseContract {
@@ -973,6 +1070,56 @@ fn parse_routing_hints(value: Option<&Value>) -> RoutingHints {
     }
 }
 
+fn parse_ligand(value: Option<&Value>) -> Option<LigandEnvelope> {
+    let object = value.and_then(Value::as_object)?;
+
+    Some(LigandEnvelope {
+        signal_type: object
+            .get("signal_type")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        purpose: object
+            .get("purpose")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        preferred_provider: object
+            .get("preferred_provider")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        preferred_model: object
+            .get("preferred_model")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        visible_tools: object
+            .get("visible_tools")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+        visible_tool_classes: object
+            .get("visible_tool_classes")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+        approval_posture: object.get("approval_posture").cloned(),
+        rationale: object
+            .get("rationale")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    })
+}
+
 fn active_turn_text(context: Option<&Value>) -> Option<String> {
     context
         .and_then(Value::as_object)
@@ -1207,6 +1354,12 @@ pub struct ProviderConfigs {
     pub gemini_oauth_access_token: Option<String>,
     pub gemini_oauth_project_id: Option<String>,
     pub gemini_base_url: Option<String>,
+    pub openai_api_key: Option<String>,
+    pub openai_oauth_access_token: Option<String>,
+    pub openai_base_url: Option<String>,
+    pub openai_project_id: Option<String>,
+    pub openai_default_model: Option<String>,
+    pub openai_default_embedding_model: Option<String>,
     pub elevenlabs_api_key: Option<String>,
     pub elevenlabs_default_voice_id: Option<String>,
 }
@@ -1233,6 +1386,39 @@ impl ProviderConfigs {
                 "gemini_base_url",
             )
             .await?),
+            openai_api_key: load_env_or_config_secret_string(
+                ipc_client,
+                "PHILOTIC_OPENAI_API_KEY",
+                "PHILOTIC_OPENAI_API_KEY_REF",
+                "openai_api_key",
+                "openai_api_key_ref",
+            )
+            .await?,
+            openai_oauth_access_token: load_env_or_config_secret_string(
+                ipc_client,
+                "PHILOTIC_OPENAI_OAUTH_ACCESS_TOKEN",
+                "PHILOTIC_OPENAI_OAUTH_ACCESS_TOKEN_REF",
+                "openai_oauth_access_token",
+                "openai_oauth_access_token_ref",
+            )
+            .await?,
+            openai_base_url: env_override("PHILOTIC_OPENAI_BASE_URL").or(fetch_config_string(
+                ipc_client,
+                "openai_base_url",
+            )
+            .await?),
+            openai_project_id: env_override("PHILOTIC_OPENAI_PROJECT_ID").or(fetch_config_string(
+                ipc_client,
+                "openai_project_id",
+            )
+            .await?),
+            openai_default_model: env_override("PHILOTIC_OPENAI_MODEL").or(fetch_config_string(
+                ipc_client,
+                "openai_model",
+            )
+            .await?),
+            openai_default_embedding_model: env_override("PHILOTIC_OPENAI_EMBEDDING_MODEL")
+                .or(fetch_config_string(ipc_client, "openai_embedding_model").await?),
             elevenlabs_api_key: fetch_config_or_secret_string(
                 ipc_client,
                 "elevenlabs_api_key",
@@ -1400,7 +1586,7 @@ async fn fetch_secret_string(
 mod tests {
     use super::{
         AudioArtifact, ControllerResponseEnvelope, ControllerTask, ProviderOutput,
-        ProviderRegistry, RequestClass, TaskKind, serialize_audio_artifact,
+        ProviderRegistry, RequestClass, ResponseRouteBucket, TaskKind, serialize_audio_artifact,
     };
     use anyhow::Result;
     use async_trait::async_trait;
@@ -1708,6 +1894,35 @@ mod tests {
     }
 
     #[test]
+    fn ligand_provides_provider_and_model_hints() {
+        let task = ControllerTask::from_value(&json!({
+            "kind": "text.generate",
+            "context": {
+                "active_turn": { "text": "plan the next step" }
+            },
+            "ligand": {
+                "signal_type": "tool_planning",
+                "purpose": "synchronous planning and tool-selection advisory",
+                "preferred_provider": "functiongemma",
+                "preferred_model": "functiongemma-7b",
+                "visible_tools": ["workspace.read"],
+                "visible_tool_classes": ["workspace"],
+                "approval_posture": {
+                    "mode": "conservative_planning",
+                    "preapproved_classes": ["workspace", "utility"]
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(task.provider_hint(), Some("functiongemma"));
+        assert_eq!(task.model.as_deref(), Some("functiongemma-7b"));
+        let ligand = task.ligand.as_ref().expect("ligand should parse");
+        assert_eq!(ligand.signal_type.as_deref(), Some("tool_planning"));
+        assert_eq!(ligand.visible_tools, vec!["workspace.read".to_string()]);
+    }
+
+    #[test]
     fn parses_affordances_separately_from_context() {
         let task = ControllerTask::from_value(&json!({
             "kind": "text.generate",
@@ -1754,6 +1969,81 @@ mod tests {
         assert!(task.wants_channel("spoken_text"));
         assert!(task.wants_channel("working_memory_delta"));
         assert!(!task.wants_channel("follow_up_questions"));
+    }
+
+    #[test]
+    fn classifies_response_route_buckets_explicitly() {
+        let explicit_route = ControllerTask::from_value(&json!({
+            "kind": "text.generate",
+            "context": {
+                "active_turn": { "text": "hello" }
+            },
+            "response_route": "image_multimodal"
+        }))
+        .unwrap();
+        assert_eq!(
+            explicit_route.response_route_bucket(),
+            ResponseRouteBucket::ImageMultimodal
+        );
+
+        let text_only = ControllerTask::from_value(&json!({
+            "kind": "text.generate",
+            "context": {
+                "active_turn": { "text": "hello" }
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            text_only.response_route_bucket(),
+            ResponseRouteBucket::TextOnly
+        );
+
+        let image_multimodal = ControllerTask::from_value(&json!({
+            "kind": "media.analyze",
+            "context": {
+                "active_turn": { "text": "describe the image" },
+                "attachments": [{
+                    "kind": "image",
+                    "mime_type": "image/png",
+                    "url": "https://example.com/image.png"
+                }]
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            image_multimodal.response_route_bucket(),
+            ResponseRouteBucket::ImageMultimodal
+        );
+
+        let audio_multimodal = ControllerTask::from_value(&json!({
+            "kind": "text.generate",
+            "context": {
+                "active_turn": { "text": "say hello" }
+            },
+            "response_contract": {
+                "modalities": ["text", "audio"]
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            audio_multimodal.response_route_bucket(),
+            ResponseRouteBucket::AudioMultimodal
+        );
+
+        let realtime_websocket = ControllerTask::from_value(&json!({
+            "kind": "text.generate",
+            "context": {
+                "active_turn": { "text": "say hello" }
+            },
+            "provider_options": {
+                "response_mode": "realtime_websocket"
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            realtime_websocket.response_route_bucket(),
+            ResponseRouteBucket::RealtimeWebsocket
+        );
     }
 
     #[test]

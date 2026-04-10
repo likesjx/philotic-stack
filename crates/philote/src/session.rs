@@ -282,6 +282,31 @@ pub struct ActivePlan {
     pub steps: Vec<PlanStep>,
     /// One of: "planning", "executing", "done", "failed"
     pub status: String,
+    /// Optional context-1 advisory captured alongside the plan on long planning turns.
+    /// This is advisory only; approval policy still decides whether a tool may run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_1_advisory: Option<Context1Advisory>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalRiskHint {
+    /// Low-risk, read-mostly actions on a planning turn.
+    Low,
+    /// Some caution is warranted, but the turn is still largely planning-oriented.
+    #[default]
+    Medium,
+    /// The model does not have enough confidence to widen preapproval.
+    High,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Context1Advisory {
+    pub approval_risk_hint: ApprovalRiskHint,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recommended_preapproved_classes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -436,6 +461,27 @@ impl Default for MediaRoutingPolicy {
     }
 }
 
+/// Controls whether voice replies are delivered through provider-native audio or
+/// the classic TTS follow-up path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceDeliveryMode {
+    Synthesized,
+    NativeAudio,
+}
+
+impl VoiceDeliveryMode {
+    pub fn is_native_audio(&self) -> bool {
+        matches!(self, Self::NativeAudio)
+    }
+}
+
+impl Default for VoiceDeliveryMode {
+    fn default() -> Self {
+        Self::Synthesized
+    }
+}
+
 /// Controls whether the agent synthesizes speech for its text responses and, if so, how.
 ///
 /// The agent's `voice_id` is the permanent voice identity for this persona — it doesn't change
@@ -455,6 +501,9 @@ pub struct VoiceResponsePolicy {
     /// Provider model override (e.g. "eleven_multilingual_v2").
     #[serde(default)]
     pub model: Option<String>,
+    /// How the response should be delivered when voice synthesis is active.
+    #[serde(default)]
+    pub delivery_mode: VoiceDeliveryMode,
     /// Speech speed as a percentage of normal rate. `100` means provider default speed.
     /// Lower values slow the voice down; higher values speed it up.
     #[serde(default)]
@@ -495,11 +544,54 @@ impl Default for VoiceResponsePolicy {
             provider: None,
             voice_id: None,
             model: None,
+            delivery_mode: VoiceDeliveryMode::Synthesized,
             speed_percent: None,
             send_text_caption: true,
             fallback_to_text: true,
         }
     }
+}
+
+/// Configures the preferred default route for model responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseRouteMode {
+    Auto,
+    TextOnly,
+    ImageMultimodal,
+    AudioMultimodal,
+    RealtimeWebsocket,
+}
+
+impl ResponseRouteMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::TextOnly => "text_only",
+            Self::ImageMultimodal => "image_multimodal",
+            Self::AudioMultimodal => "audio_multimodal",
+            Self::RealtimeWebsocket => "realtime_websocket",
+        }
+    }
+
+    pub fn is_auto(self) -> bool {
+        matches!(self, Self::Auto)
+    }
+}
+
+impl Default for ResponseRouteMode {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+/// Agent-level preference for the default model response route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ResponseRoutePolicy {
+    /// Preferred default route when the current turn does not already force a
+    /// route via explicit provider options or multimodal content.
+    #[serde(default)]
+    pub default_route: ResponseRouteMode,
 }
 
 /// Configures how the rolling `dialogue_window` is assembled and bounded.
@@ -619,6 +711,8 @@ pub struct AgentProfile {
     #[serde(default)]
     pub memory_summary: Option<String>,
     #[serde(default)]
+    pub response_route_policy: ResponseRoutePolicy,
+    #[serde(default)]
     pub media_routing_policy: MediaRoutingPolicy,
     #[serde(default)]
     pub voice_response_policy: VoiceResponsePolicy,
@@ -646,6 +740,11 @@ pub struct AgentProfile {
     /// `delegate.whisper` skill guidance) is present from turn zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_role_name: Option<String>,
+    /// IANA timezone name for the human user (e.g. `"America/New_York"`).
+    /// Injected into the cognitive header so the model can interpret relative
+    /// time references correctly. Optional; UTC is assumed when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_timezone: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1164,6 +1263,26 @@ impl SessionState {
                 {
                     return true;
                 }
+
+                if let Some(advisory) = self
+                    .active_turn
+                    .as_ref()
+                    .and_then(|turn| turn.active_plan.as_ref())
+                    .filter(|plan| plan.status == "planning")
+                    .and_then(|plan| plan.context_1_advisory.as_ref())
+                {
+                    if advisory.approval_risk_hint == ApprovalRiskHint::Low
+                        && Self::context1_preapproval_classes()
+                            .iter()
+                            .any(|allowed| allowed == &class)
+                        && advisory
+                            .recommended_preapproved_classes
+                            .iter()
+                            .any(|candidate| candidate == class)
+                    {
+                        return true;
+                    }
+                }
             }
         }
         false
@@ -1270,6 +1389,15 @@ impl SessionState {
                         .to_string(),
                 );
                 Ok("Updated profile.persona_name.".into())
+            }
+            "profile.user_timezone" => {
+                self.agent_profile.user_timezone = Some(
+                    value
+                        .as_str()
+                        .ok_or("profile.user_timezone requires a string value")?
+                        .to_string(),
+                );
+                Ok("Updated profile.user_timezone.".into())
             }
             "profile.soul_text" => {
                 self.agent_profile.soul_text = Some(
@@ -1495,6 +1623,24 @@ impl SessionState {
                 self.agent_profile.voice_response_policy.voice_id = Some(v.clone());
                 Ok(format!("Set voice_response_policy.voice_id = '{v}'."))
             }
+            "voice_response_policy.delivery_mode" => {
+                let s = value.as_str().ok_or(
+                    "voice_response_policy.delivery_mode requires a string: 'synthesized' or 'native_audio'",
+                )?;
+                let delivery_mode = match s {
+                    "synthesized" | "tts" | "voice_synthesize" => VoiceDeliveryMode::Synthesized,
+                    "native_audio" | "native" | "response_generate" => {
+                        VoiceDeliveryMode::NativeAudio
+                    }
+                    other => {
+                        return Err(format!(
+                            "Invalid voice_response_policy.delivery_mode '{other}'. Valid values: synthesized, native_audio"
+                        ));
+                    }
+                };
+                self.agent_profile.voice_response_policy.delivery_mode = delivery_mode;
+                Ok(format!("Set voice_response_policy.delivery_mode = '{s}'."))
+            }
             "voice_response_policy.send_text_caption" => {
                 let v = value
                     .as_bool()
@@ -1511,11 +1657,39 @@ impl SessionState {
                 self.agent_profile.voice_response_policy.fallback_to_text = v;
                 Ok(format!("Set voice_response_policy.fallback_to_text = {v}."))
             }
+            "profile.response_route_policy.default_route" => {
+                let s = value.as_str().ok_or(
+                    "profile.response_route_policy.default_route requires a string: 'auto', 'text_only', 'image_multimodal', 'audio_multimodal', or 'realtime_websocket'",
+                )?;
+                let route = match s {
+                    "auto" => ResponseRouteMode::Auto,
+                    "text_only" | "text" => ResponseRouteMode::TextOnly,
+                    "image_multimodal" | "image" | "image_multi" => {
+                        ResponseRouteMode::ImageMultimodal
+                    }
+                    "audio_multimodal" | "audio" | "audio_multi" => {
+                        ResponseRouteMode::AudioMultimodal
+                    }
+                    "realtime_websocket" | "realtime_ws" | "realtime" => {
+                        ResponseRouteMode::RealtimeWebsocket
+                    }
+                    other => {
+                        return Err(format!(
+                            "Invalid profile.response_route_policy.default_route '{other}'. Valid values: auto, text_only, image_multimodal, audio_multimodal, realtime_websocket"
+                        ));
+                    }
+                };
+                self.agent_profile.response_route_policy.default_route = route;
+                Ok(format!(
+                    "Set profile.response_route_policy.default_route = '{s}'."
+                ))
+            }
             other => Err(format!(
                 "Unknown config path: '{other}'. Supported paths: \
                 approval_policy.auto_approve_all, approval_policy.preapproved_tools, \
                 approval_policy.preapproved_classes, profile.persona_name, profile.soul_text, \
                 profile.identity_text, profile.user_context_text, profile.memory_summary, \
+                profile.response_route_policy.default_route, \
                 bindings.effective_toolset, bindings.effective_skillset, \
                 settings.context_window.dialogue_window_minutes, \
                 settings.context_window.dialogue_window_chars, \
@@ -1534,6 +1708,7 @@ impl SessionState {
                 voice_response_policy.mode, \
                 voice_response_policy.provider, \
                 voice_response_policy.voice_id, \
+                voice_response_policy.delivery_mode, \
                 voice_response_policy.send_text_caption, \
                 voice_response_policy.fallback_to_text"
             )),
@@ -1851,6 +2026,10 @@ impl SessionState {
         )
     }
 
+    fn context1_preapproval_classes() -> &'static [&'static str] {
+        &["utility", "workspace"]
+    }
+
     pub fn session_status_text(&self) -> String {
         let active_turn = self
             .active_turn
@@ -2017,7 +2196,8 @@ impl SessionState {
                     "Call this when you are ready to deliver your result. ",
                     "Arguments: { \"content\": \"<your response text>\" }. ",
                     "After calling this your turn will close — do not call it more than once.",
-                ).into(),
+                )
+                .into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -2067,6 +2247,10 @@ impl SessionState {
 
         if looks_like_conversational_goal(&normalized) {
             return Vec::new();
+        }
+
+        if !looks_like_execution_goal(&normalized) {
+            all_tools.retain(|tool| tool.class.as_deref() != Some("shell"));
         }
 
         all_tools
@@ -2230,13 +2414,22 @@ impl SessionState {
 
     fn render_prompt_from_projection(&self, projection: &ContextProjection) -> String {
         let mut prompt = String::new();
+        let tz_suffix = self
+            .agent_profile
+            .user_timezone
+            .as_deref()
+            .map(|tz| format!(" (user timezone: {tz})"))
+            .unwrap_or_default();
         let persona_line = if let Some(ref name) = self.agent_profile.persona_name {
             format!(
-                "Name: {name}\nCurrent date and time (UTC): {}\n",
+                "Name: {name}\nCurrent date and time (UTC): {}{tz_suffix}\n",
                 utc_datetime_string()
             )
         } else {
-            format!("Current date and time (UTC): {}\n", utc_datetime_string())
+            format!(
+                "Current date and time (UTC): {}{tz_suffix}\n",
+                utc_datetime_string()
+            )
         };
         prompt.push_str(&format!("[System]\n{persona_line}"));
         for layer in &projection.layers {
@@ -2643,7 +2836,12 @@ impl SessionState {
             return String::new();
         }
 
-        let mut out = String::from("[Recalled memory]\n");
+        let mut out = String::from(
+            "[Recalled memory]\n\
+             Note: if a memory describes an event (something that happened), \
+             it must include a timestamp in its content. \
+             When writing new memories of this kind, always include an ISO 8601 date.\n",
+        );
         for (i, memory) in turn.recalled_memories.iter().enumerate() {
             out.push_str(&format!(
                 "{}. [{}] {}",
@@ -2779,6 +2977,36 @@ impl SessionState {
             format!("Current phase: {}.", turn.phase.as_str()),
             format!("Cognitive step iteration: {}.", turn.iteration),
         ];
+
+        if let Some(plan) = turn.active_plan.as_ref() {
+            lines.push(format!(
+                "Active plan: goal='{}', status='{}', steps={}.",
+                plan.goal,
+                plan.status,
+                plan.steps.len()
+            ));
+            if let Some(advisory) = plan.context_1_advisory.as_ref() {
+                lines.push(format!(
+                    "Context-1 advisory: approval_risk_hint={}, recommended_preapproved_classes=[{}]{}.",
+                    match advisory.approval_risk_hint {
+                        ApprovalRiskHint::Low => "low",
+                        ApprovalRiskHint::Medium => "medium",
+                        ApprovalRiskHint::High => "high",
+                    },
+                    advisory.recommended_preapproved_classes.join(", "),
+                    advisory
+                        .rationale
+                        .as_deref()
+                        .map(|r| format!(", rationale={r}"))
+                        .unwrap_or_default()
+                ));
+            } else if plan.status == "planning" {
+                lines.push(
+                    "If this is a long planning turn, you may include context_1_advisory inside active_plan with approval_risk_hint (low, medium, or high), recommended_preapproved_classes, and an optional rationale. Keep the recommendations conservative and limited to low-risk classes such as utility or workspace."
+                        .into(),
+                );
+            }
+        }
 
         if !turn.working_tool_history.is_empty() {
             lines.push(format!(
@@ -3268,6 +3496,14 @@ impl SessionState {
             })
         });
 
+        // On restart, only restore turns whose state is genuinely resumable.
+        // WaitingApproval: approval request is persisted, can be re-surfaced.
+        // WaitingTool: pending tool call is persisted, can be re-dispatched.
+        // Everything else (WaitingModel, WaitingVoice, Thinking, Queued, Failed,
+        // unknown phase strings) is dropped so the queue can drain cleanly.
+        let active_turn = active_turn
+            .filter(|t| matches!(t.phase, TurnPhase::WaitingApproval | TurnPhase::WaitingTool));
+
         Some(Self {
             session_id,
             agent_id,
@@ -3340,6 +3576,30 @@ fn looks_like_conversational_goal(normalized: &str) -> bool {
         ]
         .iter()
         .any(|prefix| normalized.starts_with(prefix))
+}
+
+fn looks_like_execution_goal(normalized: &str) -> bool {
+    [
+        "implement",
+        "fix",
+        "patch",
+        "edit",
+        "change",
+        "update",
+        "run ",
+        "execute",
+        "shell",
+        "bash",
+        "command",
+        "script",
+        "build",
+        "test",
+        "smoke",
+        "check",
+        "verify",
+    ]
+    .iter()
+    .any(|keyword| normalized.contains(keyword))
 }
 
 fn normalized_turn_text(user_content: &str) -> String {
@@ -3843,15 +4103,47 @@ fn apply_string_list_op(list: &mut Vec<String>, item: &str, operation: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        ApprovalPolicy, ComponentExecutionRoute, ComponentRouteAssembly, ComponentRouteBinding,
-        ContextAuthority, ContextLayerId, ContextMutability, HookRequest, HookResult,
-        PromotionAction, RecalledMemoryRecord, RefreshRequest, RoleActivation, SessionBindings,
+        ActivePlan, ApprovalPolicy, ApprovalRiskHint, ComponentExecutionRoute,
+        ComponentRouteAssembly, ComponentRouteBinding, Context1Advisory, ContextAuthority,
+        ContextLayerId, ContextMutability, HookRequest, HookResult, PlanStep, PromotionAction,
+        RecalledMemoryRecord, RefreshRequest, ResponseRouteMode, RoleActivation, SessionBindings,
         SessionState, TaskRunnerBaseConfig, ToolRunnerIncarnationBinding,
-        TransportReplyTargetBinding, TtsMode, VoiceResponsePolicy, WorkingTurn,
+        TransportReplyTargetBinding, TtsMode, VoiceDeliveryMode, VoiceResponsePolicy, WorkingTurn,
         default_tool_assembly_for_bindings, merge_session_index, session_checkpoint_memory_type,
     };
     use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
     use uuid::Uuid;
+
+    fn test_working_turn(active_plan: Option<ActivePlan>) -> WorkingTurn {
+        WorkingTurn {
+            task_id: Uuid::nil(),
+            turn_id: "turn-1".into(),
+            chat_id: "123".into(),
+            user_content: "hello".into(),
+            final_reply_to: "local-aiua-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: Some("membrane-telegram-01".into()),
+            phase: TurnPhase::Queued,
+            iteration: 0,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
+            active_plan,
+            consecutive_step_failures: 0,
+            provider_repair_note: None,
+            provider_repair_attempts: 0,
+            pending_text_reply: Some("hello back".into()),
+            had_voice_input: true,
+            awaiting_transcription_reentry: true,
+            scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
+            paracrine_merge_completed: false,
+        }
+    }
 
     #[test]
     fn checkpoint_contains_active_turn_and_history() {
@@ -3909,6 +4201,46 @@ mod tests {
         // by compose_session_snapshot on every turn.
         assert!(checkpoint.get("component_route_assembly").is_none());
         assert!(checkpoint.get("tool_assembly").is_none());
+    }
+
+    #[test]
+    fn checkpoint_round_trip_preserves_context1_advisory_on_active_plan() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        let mut turn = test_working_turn(Some(ActivePlan {
+            goal: "close out the implementation slice".into(),
+            steps: vec![PlanStep {
+                id: 1,
+                description: "route the advisory through the normal model path".into(),
+                tool_name: None,
+                status: "in_progress".into(),
+            }],
+            status: "planning".into(),
+            context_1_advisory: Some(Context1Advisory {
+                approval_risk_hint: ApprovalRiskHint::Low,
+                recommended_preapproved_classes: vec!["workspace".into(), "utility".into()],
+                rationale: Some("Long planning turn with read-only follow-up work".into()),
+            }),
+        }));
+        turn.phase = TurnPhase::WaitingTool;
+        state.start_turn(turn);
+
+        let checkpoint = state.checkpoint_json();
+        let restored = SessionState::from_checkpoint(&checkpoint).expect("rehydrate state");
+        let plan = restored
+            .active_turn
+            .as_ref()
+            .and_then(|turn| turn.active_plan.as_ref())
+            .expect("active plan");
+        let advisory = plan
+            .context_1_advisory
+            .as_ref()
+            .expect("context-1 advisory");
+        assert_eq!(advisory.approval_risk_hint, ApprovalRiskHint::Low);
+        assert_eq!(
+            advisory.recommended_preapproved_classes,
+            vec!["workspace".to_string(), "utility".to_string()]
+        );
     }
 
     #[test]
@@ -4192,26 +4524,7 @@ mod tests {
             }
         );
         assert_eq!(state.recent_turns.len(), 1);
-        assert_eq!(state.active_turn.as_ref().unwrap().turn_id, "turn-2");
-        assert_eq!(
-            state.active_turn.as_ref().unwrap().phase,
-            TurnPhase::WaitingModel
-        );
-        assert_eq!(
-            state.active_turn.as_ref().unwrap().pending_tool_call,
-            Some(ToolCall {
-                tool_name: "echo".into(),
-                arguments: serde_json::json!({ "text": "hello" }),
-            })
-        );
-        assert_eq!(
-            state.active_turn.as_ref().unwrap().pending_approval,
-            Some(ApprovalRequest {
-                approval_id: Some("appr-1".into()),
-                reason: "Need confirmation".into(),
-                approved_response: "Confirmed".into(),
-            })
-        );
+        assert!(state.active_turn.is_none());
         assert_eq!(state.tool_assembly.tools_for_model[0].tool_name, "echo");
         assert_eq!(
             state
@@ -4280,6 +4593,44 @@ mod tests {
             preapproved_tools: Vec::new(),
             preapproved_classes: vec!["workspace".into()],
         };
+        let approval = ApprovalRequest {
+            approval_id: None,
+            reason: "read file".into(),
+            approved_response: "ok".into(),
+        };
+        let workspace_call = ToolCall {
+            tool_name: "workspace.read".into(),
+            arguments: serde_json::json!({}),
+        };
+        let config_call = ToolCall {
+            tool_name: "agent.configure".into(),
+            arguments: serde_json::json!({}),
+        };
+
+        assert!(state.approval_policy_allows(&approval, Some(&workspace_call)));
+        assert!(!state.approval_policy_allows(&approval, Some(&config_call)));
+    }
+
+    #[test]
+    fn context1_advisory_allows_only_safe_planning_classes() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.start_turn(test_working_turn(Some(ActivePlan {
+            goal: "close out the implementation slice".into(),
+            steps: vec![PlanStep {
+                id: 1,
+                description: "route the advisory through the normal model path".into(),
+                tool_name: None,
+                status: "in_progress".into(),
+            }],
+            status: "planning".into(),
+            context_1_advisory: Some(Context1Advisory {
+                approval_risk_hint: ApprovalRiskHint::Low,
+                recommended_preapproved_classes: vec!["workspace".into(), "utility".into()],
+                rationale: Some("planning posture".into()),
+            }),
+        })));
+
         let approval = ApprovalRequest {
             approval_id: None,
             reason: "read file".into(),
@@ -4551,6 +4902,18 @@ mod tests {
             Some("rachel")
         );
 
+        // delivery_mode
+        let r = state.apply_configure(
+            "voice_response_policy.delivery_mode",
+            &serde_json::json!("native_audio"),
+            "set",
+        );
+        assert!(r.is_ok());
+        assert_eq!(
+            state.agent_profile.voice_response_policy.delivery_mode,
+            VoiceDeliveryMode::NativeAudio
+        );
+
         // send_text_caption
         let r = state.apply_configure(
             "voice_response_policy.send_text_caption",
@@ -4568,6 +4931,38 @@ mod tests {
         );
         assert!(r.is_ok());
         assert!(!state.agent_profile.voice_response_policy.fallback_to_text);
+    }
+
+    #[test]
+    fn agent_configure_response_route_policy_default_route() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+
+        for (input, expected) in &[
+            ("auto", ResponseRouteMode::Auto),
+            ("text_only", ResponseRouteMode::TextOnly),
+            ("image_multimodal", ResponseRouteMode::ImageMultimodal),
+            ("audio_multimodal", ResponseRouteMode::AudioMultimodal),
+            ("realtime_websocket", ResponseRouteMode::RealtimeWebsocket),
+        ] {
+            let r = state.apply_configure(
+                "profile.response_route_policy.default_route",
+                &serde_json::json!(input),
+                "set",
+            );
+            assert!(r.is_ok(), "route={input}: {r:?}");
+            assert_eq!(
+                state.agent_profile.response_route_policy.default_route,
+                *expected
+            );
+        }
+
+        let r = state.apply_configure(
+            "profile.response_route_policy.default_route",
+            &serde_json::json!("unknown"),
+            "set",
+        );
+        assert!(r.is_err());
     }
 
     #[test]
@@ -5381,6 +5776,45 @@ mod tests {
         let projected = state.project_tools_for_turn("use echo hello there");
         assert_eq!(projected.len(), 1);
         assert_eq!(projected[0].tool_name, "echo");
+    }
+
+    #[test]
+    fn planning_turns_do_not_project_shell_tools_by_default() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("echo");
+        state.add_tool_binding("workspace.read");
+        state.add_tool_binding("bash.exec");
+
+        let projected =
+            state.project_tools_for_turn("Help me plan the next slice for the model graph");
+        let projected_names = projected
+            .iter()
+            .map(|tool| tool.tool_name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(projected_names.contains(&"echo"));
+        assert!(projected_names.contains(&"workspace.read"));
+        assert!(!projected_names.contains(&"bash.exec"));
+    }
+
+    #[test]
+    fn execution_intent_keeps_shell_tools_visible() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("echo");
+        state.add_tool_binding("workspace.read");
+        state.add_tool_binding("bash.exec");
+
+        let projected = state.project_tools_for_turn("run cargo test for the philote crate");
+        let projected_names = projected
+            .iter()
+            .map(|tool| tool.tool_name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(projected_names.contains(&"bash.exec"));
     }
 
     #[test]

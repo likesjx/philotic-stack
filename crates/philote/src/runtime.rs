@@ -3,13 +3,14 @@ use crate::r#loop::{
     AgentAction, ApprovalRequest, ToolCall, ToolResult, TurnPhase, interpret_model_payload,
 };
 use crate::protocol::{
-    FinalReplyPayload, InboundTaskPayload, ModelRequestPayload, PartialReplyPayload,
-    TaskRunnerOverlay, ToolExecutionPayload, TransportAttachment, TurnEventPayload,
+    FinalReplyPayload, InboundTaskPayload, LigandEnvelope, ModelRequestPayload,
+    PartialReplyPayload, TaskRunnerOverlay, ToolExecutionPayload, TransportAttachment,
+    TurnEventPayload,
 };
 use crate::reflex::{IngressAction, ReflexEvent};
 use crate::session::{
     ActivePlan, AgentProfile, ComponentRouteAssembly, MediaRoutingPolicy, RecalledMemoryRecord,
-    SessionState, ToolExecutionRoute, TtsMode, VoiceResponsePolicy, WorkingTurn,
+    SessionState, ToolDefinition, ToolExecutionRoute, TtsMode, VoiceResponsePolicy, WorkingTurn,
     merge_session_index,
 };
 use anyhow::Result;
@@ -20,8 +21,8 @@ use philotic_client::{
     Exosome, HandoffBundle, IpcRequest, IpcResponse, ParacrineRouting, PhiloticClient,
     TaskErrorPayload, is_ipc_disconnect,
 };
-use serde_json::Value;
-use std::collections::HashMap;
+use serde_json::{Map, Value, json};
+use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -136,6 +137,216 @@ fn implementation_to_model_role(implementation: &str) -> String {
     } else {
         "model".into()
     }
+}
+
+fn voice_response_provider_options(policy: &VoiceResponsePolicy) -> Map<String, Value> {
+    let mut options = Map::new();
+
+    if policy.delivery_mode.is_native_audio() {
+        options.insert("response_mode".into(), json!("native_audio"));
+    }
+
+    if let Some(voice_id) = policy
+        .voice_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|voice_id| !voice_id.is_empty())
+    {
+        options.insert("voice_id".into(), json!(voice_id));
+    }
+
+    if let Some(model) = policy
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    {
+        options.insert("model".into(), json!(model));
+    }
+
+    options
+}
+
+fn voice_response_contract(policy: &VoiceResponsePolicy) -> Value {
+    if policy.delivery_mode.is_native_audio() {
+        json!({
+            "channels": ["spoken_text", "memory_candidate", "active_plan", "memory_concept"],
+            "modalities": ["text", "audio"]
+        })
+    } else {
+        json!({
+            "channels": ["spoken_text", "memory_candidate", "active_plan", "memory_concept"]
+        })
+    }
+}
+
+fn voice_delivery_envelope(
+    state: Option<&SessionState>,
+    base_contract: Option<Value>,
+) -> (Option<Value>, Map<String, Value>) {
+    let Some(state) = state else {
+        return (base_contract, Map::new());
+    };
+
+    let voice_policy = state.agent_profile.voice_response_policy.clone();
+    let had_voice_input = state
+        .active_turn
+        .as_ref()
+        .map(|turn| turn.had_voice_input)
+        .unwrap_or(false);
+
+    if voice_policy.is_active(had_voice_input) && voice_policy.delivery_mode.is_native_audio() {
+        let _ = &base_contract;
+        (
+            Some(voice_response_contract(&voice_policy)),
+            voice_response_provider_options(&voice_policy),
+        )
+    } else {
+        (base_contract, Map::new())
+    }
+}
+
+fn model_response_route(
+    state: Option<&SessionState>,
+    response_contract: Option<&Value>,
+    provider_options: &Map<String, Value>,
+    attachments: &[TransportAttachment],
+) -> String {
+    if matches!(
+        provider_options
+            .get("response_mode")
+            .and_then(Value::as_str),
+        Some("realtime_websocket" | "realtime_ws" | "realtime")
+    ) {
+        return "realtime_websocket".into();
+    }
+
+    if response_contract
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("modalities"))
+        .and_then(Value::as_array)
+        .map(|modalities| {
+            modalities
+                .iter()
+                .any(|modality| modality.as_str() == Some("audio"))
+        })
+        .unwrap_or(false)
+    {
+        return "audio_multimodal".into();
+    }
+
+    if attachments.iter().any(|attachment| {
+        attachment
+            .mime_type
+            .as_deref()
+            .map(|mime| mime.starts_with("image/"))
+            .unwrap_or(false)
+            || attachment.kind.to_ascii_lowercase().contains("image")
+    }) {
+        return "image_multimodal".into();
+    }
+
+    if let Some(route) = state
+        .map(|state| state.agent_profile.response_route_policy.default_route)
+        .filter(|route| !route.is_auto())
+    {
+        return route.as_str().into();
+    }
+
+    "text_only".into()
+}
+
+fn planning_ligand(
+    state: Option<&SessionState>,
+    user_content: &str,
+    tools_for_model: &[ToolDefinition],
+) -> Option<LigandEnvelope> {
+    let state = state?;
+    let plan = state
+        .active_turn
+        .as_ref()
+        .and_then(|turn| turn.active_plan.as_ref());
+    let turn_is_planning = plan.map(|plan| plan.status == "planning").unwrap_or(false)
+        || looks_like_planning_turn(user_content)
+        || state
+            .bindings
+            .effective_skillset
+            .iter()
+            .any(|skill| skill == "planning");
+
+    if !turn_is_planning {
+        return None;
+    }
+
+    let visible_tools = tools_for_model
+        .iter()
+        .map(|tool| tool.tool_name.clone())
+        .collect::<Vec<_>>();
+    let visible_tool_classes = tools_for_model
+        .iter()
+        .filter_map(|tool| tool.class.as_ref().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    Some(LigandEnvelope {
+        signal_type: "tool_planning".into(),
+        purpose: "synchronous planning and tool-selection advisory".into(),
+        preferred_provider: None,
+        preferred_model: None,
+        visible_tools,
+        visible_tool_classes,
+        approval_posture: Some(json!({
+            "mode": "conservative_planning",
+            "preapproved_classes": ["workspace", "utility"]
+        })),
+        rationale: plan.and_then(|plan| {
+            plan.context_1_advisory
+                .as_ref()
+                .and_then(|advisory| advisory.rationale.clone())
+        }),
+    })
+}
+
+fn looks_like_planning_turn(user_content: &str) -> bool {
+    let normalized = user_content.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+
+    [
+        "plan ",
+        "planning",
+        "slice",
+        "roadmap",
+        "strategy",
+        "next step",
+        "next steps",
+        "design",
+        "architecture",
+        "proposal",
+        "help me plan",
+        "let's plan",
+        "lets plan",
+        "map out",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn extract_audio_artifact(model_result: Option<&Value>) -> Option<String> {
+    let artifacts = model_result?.get("artifacts")?.as_array()?;
+    for artifact in artifacts {
+        let kind = artifact.get("kind").and_then(Value::as_str).unwrap_or("");
+        let mime_type = artifact
+            .get("mime_type")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if kind == "audio" || mime_type.starts_with("audio/") {
+            return serde_json::to_string(artifact).ok();
+        }
+    }
+    None
 }
 
 fn resolve_model_execution_target(
@@ -667,6 +878,98 @@ impl AgentRuntime {
         })
     }
 
+    /// At startup, enumerate all session apartments for this agent and purge any
+    /// stale active turns left over from an unclean shutdown. Cleans the DB so
+    /// sessions are not blocked before the first inbound message arrives.
+    async fn sweep_stale_session_turns(&mut self) {
+        let list_key = format!("__session_apartments__:{}", self.agent_id);
+        let memory_types: Vec<String> = match self
+            .ipc_client
+            .send_request(IpcRequest::GetConfig { key: list_key })
+            .await
+        {
+            Ok(IpcResponse::ConfigData {
+                value_json: Some(json),
+                ..
+            }) => serde_json::from_str::<Vec<String>>(&json).unwrap_or_default(),
+            _ => {
+                return;
+            }
+        };
+
+        if memory_types.is_empty() {
+            return;
+        }
+
+        info!(
+            agent_id = %self.agent_id,
+            sessions = memory_types.len(),
+            "Startup stale-turn sweep: checking {} session apartment(s)",
+            memory_types.len()
+        );
+
+        for memory_type in &memory_types {
+            // Derive session_id from memory_type: "short_session:{session_id}"
+            let Some(session_id) = memory_type.strip_prefix("short_session:") else {
+                continue;
+            };
+            let snapshot_key = format!("__session_snapshot__:{session_id}");
+            let checkpoint = match self
+                .ipc_client
+                .send_request(IpcRequest::GetConfig { key: snapshot_key })
+                .await
+            {
+                Ok(IpcResponse::ConfigData {
+                    value_json: Some(json),
+                    ..
+                }) => match serde_json::from_str::<serde_json::Value>(&json) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                },
+                _ => continue,
+            };
+
+            let had_active_turn = checkpoint
+                .get("active_turn")
+                .map(|v| !v.is_null())
+                .unwrap_or(false);
+            if !had_active_turn {
+                continue;
+            }
+
+            let Some(mut state) = SessionState::from_checkpoint(&checkpoint) else {
+                continue;
+            };
+
+            if state.active_turn.is_some() {
+                // Phase is resumable — leave it alone.
+                continue;
+            }
+
+            let stale_phase = checkpoint
+                .get("active_turn")
+                .and_then(|t| t.get("phase"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            warn!(
+                session_id = %session_id,
+                stale_phase = %stale_phase,
+                "Startup sweep: dropping stale active turn — persisting clean checkpoint"
+            );
+            let clean_checkpoint = state.checkpoint_json();
+            if let Err(e) = self
+                .ipc_client
+                .sync_apartment(&self.agent_id, memory_type, clean_checkpoint)
+                .await
+            {
+                warn!(
+                    "Startup sweep: failed to persist clean checkpoint for session {}: {}",
+                    session_id, e
+                );
+            }
+        }
+    }
+
     /// Test-only: inspect session state by id.
     #[doc(hidden)]
     pub fn session(&self, session_id: &str) -> Option<&crate::session::SessionState> {
@@ -703,6 +1006,11 @@ impl AgentRuntime {
                 Err(e) => warn!("Failed to publish command manifest: {}", e),
             }
         }
+
+        // Sweep all session apartments for stale active turns left over from a prior
+        // crash or unclean shutdown. This runs once at startup so callers don't have
+        // to wait for the next inbound message to get a clean checkpoint.
+        self.sweep_stale_session_turns().await;
 
         loop {
             // Dispatch any tasks that were dequeued from a session's pending_user_tasks
@@ -1135,7 +1443,10 @@ impl AgentRuntime {
                     .as_deref()
                     .map(|k| matches!(k, "voice" | "audio"))
                     .unwrap_or(false)
-                    || task.attachments.iter().any(|a| matches!(a.kind.as_str(), "voice" | "audio"));
+                    || task
+                        .attachments
+                        .iter()
+                        .any(|a| matches!(a.kind.as_str(), "voice" | "audio"));
 
                 // Safety valve: route TEXT tasks through the queue arbiter if one is
                 // configured. The arbiter evaluates priority and may call delegate.merge
@@ -1167,7 +1478,9 @@ impl AgentRuntime {
                             prompt: arbiter_prompt,
                             context: None,
                             paracrine_id: None,
-                            response_routing: Some(philotic_client::ParacrineRouting::PriorityReEntry),
+                            response_routing: Some(
+                                philotic_client::ParacrineRouting::PriorityReEntry,
+                            ),
                             source_session_id: Some(task_session_id),
                             source_chat_id: Some(task_chat_id),
                         };
@@ -1432,6 +1745,12 @@ impl AgentRuntime {
                     "text.generate",
                 )
             };
+        let (response_contract, provider_options) = voice_delivery_envelope(
+            self.sessions.get(&session_id),
+            Some(serde_json::json!({
+                "channels": ["spoken_text", "memory_candidate", "active_plan", "memory_concept"]
+            })),
+        );
         let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
             self.sessions.get(&session_id),
             capability,
@@ -1467,6 +1786,13 @@ impl AgentRuntime {
             );
         }
 
+        let response_route = Some(model_response_route(
+            self.sessions.get(&session_id),
+            response_contract.as_ref(),
+            &provider_options,
+            &attachments,
+        ));
+        let ligand = planning_ligand(self.sessions.get(&session_id), &content, &tools_for_model);
         let model_req = ModelRequestPayload {
             action,
             request_class: Some(
@@ -1485,9 +1811,10 @@ impl AgentRuntime {
             context_projection: Some(context_projection),
             attachments,
             tools_for_model,
-            response_contract: Some(
-                serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan", "memory_concept"] }),
-            ),
+            response_contract,
+            response_route,
+            ligand,
+            provider_options,
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
@@ -1671,6 +1998,7 @@ impl AgentRuntime {
             .map(str::to_string);
         let memory_candidate =
             parse_memory_candidate(model_result.and_then(|r| r.get("memory_candidate")));
+        let audio_artifact = extract_audio_artifact(model_result);
 
         // Capture active_plan from the model response and store it on the turn.
         // Present whenever the model outputs a structured plan — optional on all turns.
@@ -1756,6 +2084,7 @@ impl AgentRuntime {
                     turn_id,
                     content,
                     spoken_text,
+                    audio_artifact,
                     memory_concept,
                     memory_candidate,
                 )
@@ -1897,6 +2226,7 @@ impl AgentRuntime {
                 content: approval.approved_response.clone(),
                 audio_artifact: None,
                 send_text_caption: false,
+                reply_markup: None,
             };
 
             self.ipc_client
@@ -1920,6 +2250,7 @@ impl AgentRuntime {
                     session_id,
                     turn_id,
                     approval.approved_response,
+                    None,
                     None,
                     None,
                     None,
@@ -1965,6 +2296,7 @@ impl AgentRuntime {
             ),
             audio_artifact: None,
             send_text_caption: false,
+            reply_markup: None,
         };
 
         self.ipc_client
@@ -2452,6 +2784,17 @@ impl AgentRuntime {
                     .emit_turn_event(&session_id, "waiting_tool", None)
                     .await;
 
+                let response_contract = Some(
+                    serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan"] }),
+                );
+                let response_route = Some(model_response_route(
+                    self.sessions.get(&session_id),
+                    response_contract.as_ref(),
+                    &Map::new(),
+                    &Vec::new(),
+                ));
+                let ligand =
+                    planning_ligand(self.sessions.get(&session_id), &prompt, &tools_for_model);
                 let model_req = ModelRequestPayload {
                     action: "generate_text".to_string(),
                     request_class: Some("cognitive".to_string()),
@@ -2463,9 +2806,10 @@ impl AgentRuntime {
                     context_projection: Some(context_projection),
                     attachments: Vec::new(),
                     tools_for_model,
-                    response_contract: Some(
-                        serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan"] }),
-                    ),
+                    response_contract,
+                    response_route,
+                    ligand,
+                    provider_options: Map::new(),
                     chat_id,
                     reply_to: local_node_id(),
                     reply_role: "agent".into(),
@@ -2569,6 +2913,16 @@ impl AgentRuntime {
             .emit_turn_event(&session_id, "loop_recovering", None)
             .await;
 
+        let response_contract = Some(
+            serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan"] }),
+        );
+        let response_route = Some(model_response_route(
+            self.sessions.get(&session_id),
+            response_contract.as_ref(),
+            &Map::new(),
+            &Vec::new(),
+        ));
+        let ligand = planning_ligand(self.sessions.get(&session_id), &prompt, &tools_for_model);
         let model_req = ModelRequestPayload {
             action: "generate_text".to_string(),
             request_class: Some("cognitive".to_string()),
@@ -2580,9 +2934,10 @@ impl AgentRuntime {
             context_projection: Some(context_projection),
             attachments: Vec::new(),
             tools_for_model,
-            response_contract: Some(
-                serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan"] }),
-            ),
+            response_contract,
+            response_route,
+            ligand,
+            provider_options: serde_json::Map::new(),
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
@@ -2701,6 +3056,20 @@ impl AgentRuntime {
             state.clear_handoff_summary();
         }
 
+        let response_contract = Some(
+            serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan", "memory_concept"] }),
+        );
+        let response_route = Some(model_response_route(
+            self.sessions.get(&session_id),
+            response_contract.as_ref(),
+            &Map::new(),
+            &Vec::new(),
+        ));
+        let ligand = planning_ligand(
+            self.sessions.get(&session_id),
+            &reentry.user_content,
+            &reentry.tools_for_model,
+        );
         let model_req = ModelRequestPayload {
             action: "generate_text".to_string(),
             request_class: Some("cognitive".to_string()),
@@ -2712,9 +3081,10 @@ impl AgentRuntime {
             context_projection,
             attachments: Vec::new(),
             tools_for_model: reentry.tools_for_model,
-            response_contract: Some(
-                serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan", "memory_concept"] }),
-            ),
+            response_contract,
+            response_route,
+            ligand,
+            provider_options: serde_json::Map::new(),
             chat_id: reentry.chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
@@ -2780,6 +3150,7 @@ impl AgentRuntime {
             content,
             audio_artifact: None,
             send_text_caption: false,
+            reply_markup: None,
         };
 
         self.ipc_client
@@ -2999,6 +3370,7 @@ impl AgentRuntime {
         turn_id: String,
         content: String,
         spoken_text: Option<String>,
+        audio_artifact: Option<String>,
         memory_concept: Option<String>,
         memory_candidate: Option<MemoryCandidate>,
     ) -> Result<()> {
@@ -3016,6 +3388,30 @@ impl AgentRuntime {
             .unwrap_or(false);
 
         if voice_policy.is_active(had_voice_input) {
+            if voice_policy.delivery_mode.is_native_audio() {
+                if audio_artifact.is_none() && !voice_policy.fallback_to_text {
+                    return self
+                        .fail_active_turn(
+                            session_id,
+                            turn_id,
+                            "Provider-native audio response was requested but no audio artifact was returned.".into(),
+                        )
+                        .await;
+                }
+
+                return self
+                    .deliver_text_reply(
+                        session_id,
+                        turn_id,
+                        content,
+                        audio_artifact,
+                        voice_policy.caption_enabled(),
+                        memory_concept,
+                        memory_candidate,
+                    )
+                    .await;
+            }
+
             return self
                 .start_voice_synthesis(session_id, turn_id, content, spoken_text, voice_policy)
                 .await;
@@ -3397,6 +3793,7 @@ impl AgentRuntime {
                 content,
                 audio_artifact,
                 send_text_caption,
+                reply_markup: None,
             };
             serde_json::to_string(&reply_payload)?
         };
@@ -3512,6 +3909,7 @@ impl AgentRuntime {
             content: message,
             audio_artifact: None,
             send_text_caption: false,
+            reply_markup: None,
         };
 
         self.ipc_client
@@ -3712,6 +4110,7 @@ impl AgentRuntime {
                         turn_id,
                         content,
                         spoken_text,
+                        None,
                         memory_concept,
                         memory_candidate,
                     )
@@ -3807,6 +4206,16 @@ impl AgentRuntime {
             .await?;
         self.sync_session_index(&index_state).await?;
 
+        let response_contract = Some(
+            serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan"] }),
+        );
+        let response_route = Some(model_response_route(
+            self.sessions.get(&session_id),
+            response_contract.as_ref(),
+            &Map::new(),
+            &Vec::new(),
+        ));
+        let ligand = planning_ligand(self.sessions.get(&session_id), &prompt, &tools);
         let model_req = ModelRequestPayload {
             action: "generate_text".to_string(),
             request_class: Some("cognitive".to_string()),
@@ -3818,9 +4227,10 @@ impl AgentRuntime {
             context_projection: Some(context_projection),
             attachments: Vec::new(),
             tools_for_model: tools,
-            response_contract: Some(
-                serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan"] }),
-            ),
+            response_contract,
+            response_route,
+            ligand,
+            provider_options: Map::new(),
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
@@ -3970,6 +4380,7 @@ impl AgentRuntime {
                 content: "No approval pending.".into(),
                 audio_artifact: None,
                 send_text_caption: false,
+                reply_markup: None,
             };
             self.ipc_client
                 .send_request(IpcRequest::EmitTask {
@@ -4098,6 +4509,7 @@ impl AgentRuntime {
                     content: approval.approved_response.clone(),
                     audio_artifact: None,
                     send_text_caption: false,
+                    reply_markup: None,
                 };
 
                 self.ipc_client
@@ -4189,6 +4601,7 @@ impl AgentRuntime {
                     content: format!("Denied: {}", approval.reason),
                     audio_artifact: None,
                     send_text_caption: false,
+                    reply_markup: None,
                 };
 
                 self.ipc_client
@@ -4373,6 +4786,9 @@ impl AgentRuntime {
         command_chat_id: String,
         command: SlashCommand,
     ) -> Result<()> {
+        // Set by the Roles arm of the match below to carry the inline keyboard to the reply.
+        let mut roles_keyboard_holder: Option<serde_json::Value> = None;
+
         let response = match &command {
             SlashCommand::Role { role_name } => {
                 let handoff_bundle = self
@@ -4486,8 +4902,35 @@ impl AgentRuntime {
                     .sessions
                     .get(&session_id)
                     .and_then(|state| state.active_incarnation_id.clone());
+                // Build an inline keyboard with one button per role so the user can
+                // tap directly in Telegram to fire `/role <name>`.
+                let keyboard_rows: Vec<Vec<serde_json::Value>> = roles
+                    .iter()
+                    .filter_map(|r| {
+                        let role_name = r.get("role_name")?.as_str()?;
+                        Some(vec![serde_json::json!({
+                            "text": format!("🎭 {role_name}"),
+                            "callback_data": format!("/role {role_name}"),
+                        })])
+                    })
+                    .collect();
+                let roles_keyboard = if keyboard_rows.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::json!({ "inline_keyboard": keyboard_rows }))
+                };
+                roles_keyboard_holder = roles_keyboard;
+                let active_role_name = active_incarnation_id
+                    .as_deref()
+                    .and_then(|id| id.rsplit(':').next())
+                    .unwrap_or("orchestrator");
+                let reply_text = if roles.is_empty() {
+                    format!("Active: {active_role_name}. No configured roles.")
+                } else {
+                    format!("Active: {active_role_name}")
+                };
                 (
-                    format_roles_report(active_incarnation_id.as_deref(), &roles),
+                    reply_text,
                     "role_list_reported",
                     serde_json::json!({
                         "session_id": session_id,
@@ -4573,8 +5016,13 @@ impl AgentRuntime {
             })
             .await?;
 
-        self.complete_local_command(session_id, command_turn_id, reply_content)
-            .await
+        self.complete_local_command_with_markup(
+            session_id,
+            command_turn_id,
+            reply_content,
+            roles_keyboard_holder,
+        )
+        .await
     }
 
     async fn resume_turn_with_steering(
@@ -4681,6 +5129,8 @@ impl AgentRuntime {
             state.clear_handoff_summary();
         }
 
+        let response_route = Some(model_response_route(None, None, &Map::new(), &Vec::new()));
+        let ligand = None;
         let model_req = ModelRequestPayload {
             action: "generate_text".to_string(),
             request_class: Some("cognitive".to_string()),
@@ -4693,6 +5143,9 @@ impl AgentRuntime {
             attachments: Vec::new(),
             tools_for_model,
             response_contract: None,
+            response_route,
+            ligand,
+            provider_options: Map::new(),
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
@@ -5218,6 +5671,7 @@ impl AgentRuntime {
             content: reply_content,
             audio_artifact: None,
             send_text_caption: false,
+            reply_markup: None,
         };
 
         self.ipc_client
@@ -7180,7 +7634,14 @@ impl AgentRuntime {
                 };
 
                 // Capture routing info from the active turn before muting it.
-                let (paracrine_id, reply_session_id, reply_chat_id, final_reply_to, final_reply_role, final_reply_guest_id) = {
+                let (
+                    paracrine_id,
+                    reply_session_id,
+                    reply_chat_id,
+                    final_reply_to,
+                    final_reply_role,
+                    final_reply_guest_id,
+                ) = {
                     let Some(state) = self.sessions.get_mut(&session_id) else {
                         warn!("delegate.merge: unknown session {}", session_id);
                         return Ok(());
@@ -7216,7 +7677,8 @@ impl AgentRuntime {
                 };
 
                 // Append role attribution tag (same as deliver_text_reply does).
-                let attributed_content = if let Ok(role_name) = std::env::var("PHILOTIC_ROLE_NAME") {
+                let attributed_content = if let Ok(role_name) = std::env::var("PHILOTIC_ROLE_NAME")
+                {
                     if !role_name.is_empty() {
                         format!("{}\n\n@agent:{}", content, role_name)
                     } else {
@@ -7316,6 +7778,17 @@ impl AgentRuntime {
         turn_id: String,
         reply_content: String,
     ) -> Result<()> {
+        self.complete_local_command_with_markup(session_id, turn_id, reply_content, None)
+            .await
+    }
+
+    async fn complete_local_command_with_markup(
+        &mut self,
+        session_id: String,
+        turn_id: String,
+        reply_content: String,
+        reply_markup: Option<serde_json::Value>,
+    ) -> Result<()> {
         let (completed_turn, checkpoint_memory_type, checkpoint_json, index_state) = {
             let Some(state) = self.sessions.get_mut(&session_id) else {
                 warn!(
@@ -7367,6 +7840,7 @@ impl AgentRuntime {
             content: reply_content,
             audio_artifact: None,
             send_text_caption: false,
+            reply_markup,
         };
 
         self.ipc_client
@@ -7492,6 +7966,40 @@ impl AgentRuntime {
                             &mut state,
                         )
                         .await;
+
+                        // If the checkpoint had a stale active turn that from_checkpoint
+                        // dropped (e.g. WaitingModel after a crash), immediately re-save
+                        // the clean checkpoint so the stale turn is purged from storage
+                        // rather than lingering until the next turn completes.
+                        let checkpoint_had_active_turn = checkpoint
+                            .get("active_turn")
+                            .map(|v| !v.is_null())
+                            .unwrap_or(false);
+                        if checkpoint_had_active_turn && state.active_turn.is_none() {
+                            let stale_phase = checkpoint
+                                .get("active_turn")
+                                .and_then(|t| t.get("phase"))
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("unknown");
+                            warn!(
+                                session_id = %session_id,
+                                stale_phase = %stale_phase,
+                                "Dropped stale active turn on checkpoint restore — persisting clean checkpoint"
+                            );
+                            let mem_type = state.checkpoint_memory_type();
+                            let clean_checkpoint = state.checkpoint_json();
+                            if let Err(e) = self
+                                .ipc_client
+                                .sync_apartment(&self.agent_id, &mem_type, clean_checkpoint)
+                                .await
+                            {
+                                warn!(
+                                    "Failed to persist clean checkpoint after stale turn drop: {}",
+                                    e
+                                );
+                            }
+                        }
+
                         self.sessions.insert(session_id.to_string(), state);
                         return Ok(());
                     }
@@ -7633,7 +8141,7 @@ mod tests {
     };
     use crate::session::{
         ApprovalPolicy, ComponentExecutionRoute, ComponentRouteAssembly, ComponentRouteBinding,
-        SessionState, WorkingTurn,
+        ResponseRouteMode, SessionState, WorkingTurn,
     };
     use philotic_client::TaskErrorPayload;
     use uuid::Uuid;
@@ -7656,6 +8164,9 @@ mod tests {
             attachments: Vec::new(),
             tools_for_model: Vec::new(),
             response_contract: None,
+            response_route: Some("text_only".into()),
+            ligand: None,
+            provider_options: serde_json::Map::new(),
             chat_id: "123".into(),
             reply_to: LOCAL_NODE.into(),
             reply_role: "agent".into(),
@@ -7668,6 +8179,7 @@ mod tests {
         assert_eq!(json["reply_role"], "agent");
         assert_eq!(json["final_reply_role"], "membrane");
         assert_eq!(json["request_class"], "cognitive");
+        assert_eq!(json["response_route"], "text_only");
         assert_eq!(json["context"]["active_turn"]["text"], "hello");
         assert_eq!(
             json["context_projection"]["conversation_turn"]["conversation_turn_id"],
@@ -7678,6 +8190,17 @@ mod tests {
     #[test]
     fn default_text_model_role_targets_gemini_controller() {
         assert_eq!(DEFAULT_TEXT_MODEL_ROLE, "model");
+    }
+
+    #[test]
+    fn response_route_prefers_agent_profile_default_route() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.agent_profile.response_route_policy.default_route =
+            ResponseRouteMode::RealtimeWebsocket;
+
+        let route = super::model_response_route(Some(&state), None, &serde_json::Map::new(), &[]);
+        assert_eq!(route, "realtime_websocket");
     }
 
     #[test]
@@ -7786,6 +8309,7 @@ mod tests {
             content: "done".into(),
             audio_artifact: None,
             send_text_caption: false,
+            reply_markup: None,
         };
 
         let json = serde_json::to_value(&payload).expect("serialize payload");
