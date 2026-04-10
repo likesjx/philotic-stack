@@ -22,6 +22,18 @@
 
 Stable seam refs live in [SEAM_REGISTRY.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SEAM_REGISTRY.md).
 
+### Primitives Refactor
+
+- [x] Extract mesh envelope primitives into `philotic-primitives-mesh`.
+- [x] Extract hotel/runtime capability and registry primitives into `philotic-primitives-hotel` behind compatibility shims.
+- [x] Extract graph/storage primitives into `philotic-primitives-data` behind compatibility shims.
+- [x] Extract agent/session/memory primitives into `philotic-primitives-agent` behind compatibility shims.
+- [x] Extract tool/skill primitives into `philotic-primitives-tool` behind compatibility shims.
+- [x] Extract tool execution route/config envelopes into `philotic-primitives-tool` where they are shared by session shaping and tool routing.
+- [x] Extract model-routing DTOs into `philotic-primitives-model` behind compatibility shims.
+- [x] Extract the `ModelManagerInvoker` wiring out of `ansible-mesh-core`.
+- [ ] Migrate downstream crates off the remaining `ansible-mesh-core` compatibility imports where direct primitive crates are now clearer.
+
 ### WI 1: Session Management
 
 Seam IDs: `session-leases`
@@ -1369,6 +1381,7 @@ Seam IDs: `wider-client-adoption`, `philotic-native-memory-integration`
 - [ ] A2A membrane investigation (`a2a-membrane-contract`): evaluate `A2A` as an external agent interoperability membrane with explicit peer trust records, bounded capability exposure, approval semantics for privileged actions, and no inheritance of internal mesh trust.
 - [ ] Tool runner lifecycle policy (`runner-materialization-policy`): define idle retention, sleep/teardown timing, wake-up thresholds, and environment-specific materialization rules for routed tools.
 - [ ] Runner artifact plane: define builder trust, sandboxing, testing, signing, release, and distribution policy for executable tool runners.
+  - [x] Expose shell execution through the `tool-runner` `bash.exec` surface and back it with `philotic-sandbox` when sandbox mode is configured; a UDS smoke test proved the delegation path.
 - [ ] Memory consolidation / dreaming: define how short-term session state becomes long-term memory, including sleep/dream cycles, compaction, and candidate memory backends such as `scryper/miniminddb`.
 
 ## MVP 1: Single-Node Mesh & Basic Tools
