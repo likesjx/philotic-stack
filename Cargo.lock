@@ -101,6 +101,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2",
  "tokio",
  "tower-http 0.5.2",
@@ -2302,12 +2303,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "media-prep"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "membrane"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "membrane-telegram",
+ "clap",
+ "media-prep",
+ "philotic-client",
+ "pulldown-cmark",
+ "reqwest",
+ "serde_json",
+ "sha2",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2460,6 +2480,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "futures",
+ "media-prep",
  "mlx-runner",
  "onnx-runner",
  "philotic-client",
@@ -2467,6 +2488,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
  "ulid",
@@ -2876,6 +2898,7 @@ dependencies = [
  "ansible-mesh-core",
  "anyhow",
  "clap",
+ "media-prep",
  "memory-core",
  "philotic-client",
  "serde",
@@ -4375,6 +4398,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tungstenite",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

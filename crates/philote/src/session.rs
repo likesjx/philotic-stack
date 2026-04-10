@@ -1,5 +1,6 @@
 use crate::catalog::{tool_catalog, tool_class, tool_requires_approval};
 use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
+use ansible_mesh_core::catalog_rights::{has_right, tool_right};
 use crate::protocol::InboundTaskPayload;
 use crate::reflex::{
     IngressAction, MaterializationContext, PolicyAssertion, ReflexEngine, ReflexEvent,
@@ -292,6 +293,173 @@ pub struct RecalledMemoryRecord {
     pub tags: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnRoutingStageKind {
+    Ingress,
+    Cognition,
+    Egress,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnContextEnvelopeKind {
+    Ingress,
+    Cognitive,
+    Egress,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnCapabilityCompositionKind {
+    StageLocal,
+    CollapsibleIngressCognition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnRoutedCapabilitySpecies {
+    TextGenerate,
+    MediaAnalyze,
+    VoiceTranscribe,
+    VoiceSynthesize,
+    ImageDescribe,
+    DocumentSummarize,
+    ResponseGenerate,
+    VoiceDialogue,
+    SoundGenerate,
+    MusicGenerate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnRoutedCapabilityProfile {
+    pub species: TurnRoutedCapabilitySpecies,
+    pub capability: &'static str,
+    pub request_class: &'static str,
+    pub default_stage_kind: TurnRoutingStageKind,
+    pub default_context_envelope: TurnContextEnvelopeKind,
+    pub composition: TurnCapabilityCompositionKind,
+    pub default_streaming: bool,
+}
+
+pub fn turn_routed_capability_profile(capability: &str) -> Option<TurnRoutedCapabilityProfile> {
+    let profile = match capability {
+        "text.generate" => TurnRoutedCapabilityProfile {
+            species: TurnRoutedCapabilitySpecies::TextGenerate,
+            capability: "text.generate",
+            request_class: "cognitive",
+            default_stage_kind: TurnRoutingStageKind::Cognition,
+            default_context_envelope: TurnContextEnvelopeKind::Cognitive,
+            composition: TurnCapabilityCompositionKind::StageLocal,
+            default_streaming: true,
+        },
+        "media.analyze" => TurnRoutedCapabilityProfile {
+            species: TurnRoutedCapabilitySpecies::MediaAnalyze,
+            capability: "media.analyze",
+            request_class: "transform",
+            default_stage_kind: TurnRoutingStageKind::Ingress,
+            default_context_envelope: TurnContextEnvelopeKind::Ingress,
+            composition: TurnCapabilityCompositionKind::StageLocal,
+            default_streaming: false,
+        },
+        "voice.transcribe" => TurnRoutedCapabilityProfile {
+            species: TurnRoutedCapabilitySpecies::VoiceTranscribe,
+            capability: "voice.transcribe",
+            request_class: "transform",
+            default_stage_kind: TurnRoutingStageKind::Ingress,
+            default_context_envelope: TurnContextEnvelopeKind::Ingress,
+            composition: TurnCapabilityCompositionKind::StageLocal,
+            default_streaming: true,
+        },
+        "voice.synthesize" => TurnRoutedCapabilityProfile {
+            species: TurnRoutedCapabilitySpecies::VoiceSynthesize,
+            capability: "voice.synthesize",
+            request_class: "synthesis",
+            default_stage_kind: TurnRoutingStageKind::Egress,
+            default_context_envelope: TurnContextEnvelopeKind::Egress,
+            composition: TurnCapabilityCompositionKind::StageLocal,
+            default_streaming: true,
+        },
+        "image.describe" => TurnRoutedCapabilityProfile {
+            species: TurnRoutedCapabilitySpecies::ImageDescribe,
+            capability: "image.describe",
+            request_class: "transform",
+            default_stage_kind: TurnRoutingStageKind::Ingress,
+            default_context_envelope: TurnContextEnvelopeKind::Ingress,
+            composition: TurnCapabilityCompositionKind::StageLocal,
+            default_streaming: false,
+        },
+        "document.summarize" => TurnRoutedCapabilityProfile {
+            species: TurnRoutedCapabilitySpecies::DocumentSummarize,
+            capability: "document.summarize",
+            request_class: "transform",
+            default_stage_kind: TurnRoutingStageKind::Ingress,
+            default_context_envelope: TurnContextEnvelopeKind::Ingress,
+            composition: TurnCapabilityCompositionKind::StageLocal,
+            default_streaming: false,
+        },
+        "response.generate" => TurnRoutedCapabilityProfile {
+            species: TurnRoutedCapabilitySpecies::ResponseGenerate,
+            capability: "response.generate",
+            request_class: "cognitive",
+            default_stage_kind: TurnRoutingStageKind::Cognition,
+            default_context_envelope: TurnContextEnvelopeKind::Cognitive,
+            composition: TurnCapabilityCompositionKind::CollapsibleIngressCognition,
+            default_streaming: true,
+        },
+        "voice.dialogue" => TurnRoutedCapabilityProfile {
+            species: TurnRoutedCapabilitySpecies::VoiceDialogue,
+            capability: "voice.dialogue",
+            request_class: "cognitive",
+            default_stage_kind: TurnRoutingStageKind::Cognition,
+            default_context_envelope: TurnContextEnvelopeKind::Cognitive,
+            composition: TurnCapabilityCompositionKind::CollapsibleIngressCognition,
+            default_streaming: true,
+        },
+        "sound.generate" => TurnRoutedCapabilityProfile {
+            species: TurnRoutedCapabilitySpecies::SoundGenerate,
+            capability: "sound.generate",
+            request_class: "synthesis",
+            default_stage_kind: TurnRoutingStageKind::Egress,
+            default_context_envelope: TurnContextEnvelopeKind::Egress,
+            composition: TurnCapabilityCompositionKind::StageLocal,
+            default_streaming: true,
+        },
+        "music.generate" => TurnRoutedCapabilityProfile {
+            species: TurnRoutedCapabilitySpecies::MusicGenerate,
+            capability: "music.generate",
+            request_class: "synthesis",
+            default_stage_kind: TurnRoutingStageKind::Egress,
+            default_context_envelope: TurnContextEnvelopeKind::Egress,
+            composition: TurnCapabilityCompositionKind::StageLocal,
+            default_streaming: false,
+        },
+        _ => return None,
+    };
+    Some(profile)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnRoutingStagePlan {
+    pub kind: TurnRoutingStageKind,
+    pub capability: String,
+    pub request_class: String,
+    pub context_envelope: TurnContextEnvelopeKind,
+    pub controller_role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_ref: Option<String>,
+    #[serde(default)]
+    pub streaming: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnRoutingPlan {
+    pub trigger: String,
+    pub stages: Vec<TurnRoutingStagePlan>,
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkingTurn {
     pub task_id: Uuid,
@@ -327,6 +495,9 @@ pub struct WorkingTurn {
     /// Stashed text content while waiting for voice synthesis to complete.
     pub pending_text_reply: Option<String>,
     pub had_voice_input: bool,
+    /// Compiled stage-by-stage routing plan for the active turn. This is the
+    /// turn-local execution contract, not a second routing authority.
+    pub turn_routing_plan: Option<TurnRoutingPlan>,
     /// True when a voice transcription result should be routed back into the
     /// normal reasoning loop instead of finalized as the assistant reply.
     pub awaiting_transcription_reentry: bool,
@@ -366,6 +537,13 @@ pub struct ModelReentryPlan {
     pub final_reply_role: String,
     pub final_reply_guest_id: Option<String>,
     pub tools_for_model: Vec<ToolDefinition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalInterruptDisposition {
+    Allow,
+    RedirectToDirectResponse { note: String },
+    RejectAsInvalidStage { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -410,6 +588,10 @@ pub struct MediaRoutingPolicy {
     /// When false, all attachments are stripped and the turn is treated as text-only.
     #[serde(default = "default_true")]
     pub forward_media_to_model: bool,
+    /// When true, tool definitions are stripped from the model call when media attachments
+    /// are present. Useful for models that don't support simultaneous tool use and vision.
+    #[serde(default)]
+    pub strip_tools_on_media: bool,
     /// Action to use for voice/audio attachments. None = "analyze_media".
     #[serde(default)]
     pub voice_action: Option<String>,
@@ -419,19 +601,16 @@ pub struct MediaRoutingPolicy {
     /// Action to use for document attachments. None = "analyze_media".
     #[serde(default)]
     pub document_action: Option<String>,
-    /// When true (default), tools are stripped from the model request on media turns.
-    #[serde(default = "default_true")]
-    pub strip_tools_on_media: bool,
 }
 
 impl Default for MediaRoutingPolicy {
     fn default() -> Self {
         Self {
             forward_media_to_model: true,
+            strip_tools_on_media: false,
             voice_action: None,
             image_action: None,
             document_action: None,
-            strip_tools_on_media: true,
         }
     }
 }
@@ -649,9 +828,30 @@ pub struct AgentProfile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RoutingPreferenceBinding {
+    pub preference_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_ref: Option<String>,
+    #[serde(default)]
+    pub preference_level: i32,
+    #[serde(default)]
+    pub weight: i32,
+    #[serde(default)]
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SessionBindings {
     #[serde(default)]
     pub effective_toolset: Vec<String>,
+    #[serde(default)]
+    pub effective_rights: Vec<String>,
     #[serde(default)]
     pub effective_skillset: Vec<String>,
     #[serde(default)]
@@ -675,7 +875,50 @@ pub struct SessionBindings {
     #[serde(default)]
     pub preferred_environment_id: Option<String>,
     #[serde(default)]
+    pub routing_preferences: Vec<RoutingPreferenceBinding>,
+    #[serde(default)]
+    pub effective_reflexes: serde_json::Value,
+    #[serde(default)]
+    pub reflex_policy_agent_layers: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub reflex_policy_agent_rewards: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub reflex_policy_agent_suppressions: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub shared_model_markers: Vec<serde_json::Value>,
+    #[serde(default)]
     pub allowed_tool_runner_incarnations: Vec<ToolRunnerIncarnationBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TargetRoleLens {
+    pub role_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolset_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolset_description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_identity_addendum: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_manifest: Option<String>,
+    #[serde(default)]
+    pub allowed_skills: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RememberedRoleHandoffReflex {
+    target_role: String,
+    legacy_trigger_class: Option<String>,
+    preference_key: Option<String>,
+    success_count: u64,
+    reinforced: bool,
+    toolset_profile: Option<String>,
+    role_identity_addendum: Option<String>,
+    role_manifest_excerpt: Option<String>,
+    allowed_skills: Vec<String>,
+    manifest_markers: Vec<String>,
+    skill_markers: Vec<String>,
+    toolset_markers: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -858,6 +1101,9 @@ pub struct SessionState {
     pub tool_assembly: ToolAssembly,
     pub recent_turns: Vec<TurnRecord>,
     pub active_turn: Option<WorkingTurn>,
+    /// Pending Gemini/other native-live function call id that should receive the next
+    /// tool response over the same live session rather than restarting cognition.
+    pub pending_native_live_function_call_id: Option<String>,
     /// Subagents spawned during this session that have not yet been released or aborted.
     pub active_subagents: Vec<SpawnedSubagentRef>,
     /// Working summary carried in from the most recent inbound handoff bundle.
@@ -906,6 +1152,7 @@ impl SessionState {
             bindings,
             recent_turns: Vec::new(),
             active_turn: None,
+            pending_native_live_function_call_id: None,
             last_handoff_summary: None,
             active_subagents: Vec::new(),
             rules: Vec::new(),
@@ -917,6 +1164,7 @@ impl SessionState {
 
     pub fn start_turn(&mut self, turn: WorkingTurn) {
         self.active_turn = Some(turn);
+        self.pending_native_live_function_call_id = None;
     }
 
     /// Returns true if a turn is currently active (any phase except Completed/Failed).
@@ -966,6 +1214,14 @@ impl SessionState {
         if let Some(turn) = self.active_turn.as_mut() {
             turn.pending_tool_call = None;
         }
+    }
+
+    pub fn set_pending_native_live_function_call_id(&mut self, function_call_id: String) {
+        self.pending_native_live_function_call_id = Some(function_call_id);
+    }
+
+    pub fn take_pending_native_live_function_call_id(&mut self) -> Option<String> {
+        self.pending_native_live_function_call_id.take()
     }
 
     pub fn set_pending_approval(&mut self, approval: ApprovalRequest) {
@@ -1029,6 +1285,18 @@ impl SessionState {
         if let Some(turn) = self.active_turn.as_mut() {
             turn.pending_text_reply = Some(text);
         }
+    }
+
+    pub fn set_active_turn_routing_plan(&mut self, plan: TurnRoutingPlan) {
+        if let Some(turn) = self.active_turn.as_mut() {
+            turn.turn_routing_plan = Some(plan);
+        }
+    }
+
+    pub fn active_turn_routing_plan(&self) -> Option<&TurnRoutingPlan> {
+        self.active_turn
+            .as_ref()
+            .and_then(|turn| turn.turn_routing_plan.as_ref())
     }
 
     pub fn take_pending_text_reply(&mut self) -> Option<String> {
@@ -1167,6 +1435,67 @@ impl SessionState {
             }
         }
         false
+    }
+
+    fn active_turn_stage_for_approval(&self) -> Option<TurnRoutingStageKind> {
+        let turn = self.active_turn.as_ref()?;
+        if turn.awaiting_transcription_reentry {
+            return Some(TurnRoutingStageKind::Ingress);
+        }
+        if turn.pending_text_reply.is_some() {
+            return Some(TurnRoutingStageKind::Egress);
+        }
+        Some(TurnRoutingStageKind::Cognition)
+    }
+
+    pub fn approval_interrupt_disposition(
+        &self,
+        approval: &ApprovalRequest,
+        always_require_human: bool,
+    ) -> ApprovalInterruptDisposition {
+        if always_require_human {
+            return ApprovalInterruptDisposition::Allow;
+        }
+
+        let Some(turn) = self.active_turn.as_ref() else {
+            return ApprovalInterruptDisposition::Allow;
+        };
+
+        if turn.pending_tool_call.is_some() {
+            return ApprovalInterruptDisposition::Allow;
+        }
+
+        if approval
+            .approval_id
+            .as_deref()
+            .map(|id| id.starts_with("scripted_gate:"))
+            .unwrap_or(false)
+        {
+            return ApprovalInterruptDisposition::Allow;
+        }
+
+        match self.active_turn_stage_for_approval() {
+            Some(TurnRoutingStageKind::Ingress) | Some(TurnRoutingStageKind::Egress) => {
+                let stage = match self.active_turn_stage_for_approval() {
+                    Some(TurnRoutingStageKind::Ingress) => "ingress",
+                    Some(TurnRoutingStageKind::Egress) => "egress",
+                    _ => "non-cognitive",
+                };
+                ApprovalInterruptDisposition::RejectAsInvalidStage {
+                    reason: format!(
+                        "Approval interrupts are not valid during the {stage} stage. \
+                         This stage should complete its transform/synthesis contract without \
+                         surfacing an operator approval request."
+                    ),
+                }
+            }
+            _ if Self::low_intent_turn(&turn.user_content) => {
+                ApprovalInterruptDisposition::RedirectToDirectResponse {
+                    note: "Approval interrupts are not appropriate for this low-intent turn. Do not ask for approval or propose side-effecting actions here. Reply directly to the user unless they explicitly request an action.".into(),
+                }
+            }
+            _ => ApprovalInterruptDisposition::Allow,
+        }
     }
 
     pub fn set_preapprove_this_session(&mut self) {
@@ -1823,14 +2152,20 @@ impl SessionState {
     /// Unlike `build_reentry_prompt`, this produces the complete structured envelope
     /// so that model-router receives identity, instructions, memory, dialogue_window,
     /// active_turn, and tool_history on every cognitive re-entry — not just a flat prompt.
+    /// Re-entry still respects cognitive tool-projection policy rather than replaying
+    /// the raw bound toolset unconditionally.
     pub fn build_reentry_context_envelope(
         &self,
     ) -> Option<(String, Value, Value, Vec<ToolDefinition>)> {
         let turn = self.active_turn.as_ref()?;
         let user_content = turn.user_content.clone();
-        let tools = self.tool_assembly.tools_for_model.clone();
-        let (prompt, context, context_projection) =
-            self.model_request_payloads(&user_content, &tools);
+        let tools =
+            self.project_tools_for_envelope(&user_content, TurnContextEnvelopeKind::Cognitive);
+        let (prompt, context, context_projection) = self.model_request_payloads_for_envelope(
+            &user_content,
+            &tools,
+            TurnContextEnvelopeKind::Cognitive,
+        );
         Some((prompt, context, context_projection, tools))
     }
 
@@ -2065,11 +2400,234 @@ impl SessionState {
             return explicitly_named;
         }
 
+        if looks_like_role_return_goal(&normalized) {
+            let projected = all_tools
+                .iter()
+                .filter(|tool| tool.tool_name == "handoff.back")
+                .cloned()
+                .collect::<Vec<_>>();
+            if !projected.is_empty() {
+                return projected;
+            }
+        }
+
+        if looks_like_role_handoff_goal(&normalized) {
+            let projected = all_tools
+                .iter()
+                .filter(|tool| tool.tool_name == "handoff.to_role")
+                .cloned()
+                .collect::<Vec<_>>();
+            if !projected.is_empty() {
+                return projected;
+            }
+        }
+
+        if self.remembered_role_handoff_target(&normalized).is_some() {
+            let projected = all_tools
+                .iter()
+                .filter(|tool| tool.tool_name == "handoff.to_role")
+                .cloned()
+                .collect::<Vec<_>>();
+            if !projected.is_empty() {
+                return projected;
+            }
+        }
+
         if looks_like_conversational_goal(&normalized) {
             return Vec::new();
         }
 
         all_tools
+            .into_iter()
+            .filter(|tool| {
+                if is_role_reflex_tool(&tool.tool_name) {
+                    return false;
+                }
+                !self
+                    .tool_assembly
+                    .policy_annotations
+                    .get(&tool.tool_name)
+                    .map(|annotation| annotation.approval_required)
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    pub fn project_tools_for_envelope(
+        &self,
+        user_content: &str,
+        envelope_kind: TurnContextEnvelopeKind,
+    ) -> Vec<ToolDefinition> {
+        match envelope_kind {
+            TurnContextEnvelopeKind::Cognitive => self.project_tools_for_turn(user_content),
+            TurnContextEnvelopeKind::Ingress | TurnContextEnvelopeKind::Egress => Vec::new(),
+        }
+    }
+
+    fn remembered_role_handoff_reflexes(&self) -> Vec<RememberedRoleHandoffReflex> {
+        self.bindings
+            .reflex_policy_agent_layers
+            .iter()
+            .filter_map(|layer| {
+                let reflex = layer.get("reflexes")?.get("role_handoff_reflex")?;
+                let target_role = reflex.get("target_role")?.as_str()?.trim();
+                let legacy_trigger_class = reflex
+                    .get("trigger_class")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+                let manifest_markers = layer
+                    .get("config")
+                    .and_then(|config| config.get("manifest_markers"))
+                    .and_then(serde_json::Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let skill_markers = layer
+                    .get("config")
+                    .and_then(|config| config.get("skill_markers"))
+                    .and_then(serde_json::Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let toolset_markers = layer
+                    .get("config")
+                    .and_then(|config| config.get("toolset_markers"))
+                    .and_then(serde_json::Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                if target_role.is_empty()
+                    || (legacy_trigger_class.is_none()
+                        && manifest_markers.is_empty()
+                        && skill_markers.is_empty()
+                        && toolset_markers.is_empty())
+                {
+                    return None;
+                }
+                Some(RememberedRoleHandoffReflex {
+                    target_role: target_role.to_string(),
+                    legacy_trigger_class,
+                    preference_key: layer
+                        .get("preference_key")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    success_count: layer
+                        .get("config")
+                        .and_then(|config| config.get("success_count"))
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                    reinforced: layer
+                        .get("config")
+                        .and_then(|config| config.get("habit_state"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(|state| state == "reinforced")
+                        .unwrap_or(false),
+                    toolset_profile: layer
+                        .get("config")
+                        .and_then(|config| config.get("toolset_profile"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    role_identity_addendum: layer
+                        .get("config")
+                        .and_then(|config| config.get("role_identity_addendum"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    role_manifest_excerpt: layer
+                        .get("config")
+                        .and_then(|config| config.get("role_manifest_excerpt"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    allowed_skills: layer
+                        .get("config")
+                        .and_then(|config| config.get("allowed_skills"))
+                        .and_then(serde_json::Value::as_array)
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(serde_json::Value::as_str)
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    manifest_markers,
+                    skill_markers,
+                    toolset_markers,
+                })
+            })
+            .collect()
+    }
+
+    fn remembered_role_handoff_target(&self, normalized: &str) -> Option<String> {
+        self.remembered_role_handoff_reflexes()
+            .into_iter()
+            .find(|reflex| {
+                if self
+                    .role_activation
+                    .as_ref()
+                    .map(|role| role.role_name.eq_ignore_ascii_case(&reflex.target_role))
+                    .unwrap_or(false)
+                {
+                    return false;
+                }
+                if !self.role_handoff_reflex_is_expressed(reflex) {
+                    return false;
+                }
+                role_handoff_reflex_matches_goal(reflex, normalized)
+            })
+            .map(|reflex| reflex.target_role)
+    }
+
+    fn role_handoff_reflex_is_expressed(&self, reflex: &RememberedRoleHandoffReflex) -> bool {
+        if reflex.reinforced || reflex.success_count >= 2 {
+            return true;
+        }
+        self.bindings
+            .reflex_policy_agent_rewards
+            .iter()
+            .any(|reward| {
+                reward
+                    .get("preference_key")
+                    .and_then(serde_json::Value::as_str)
+                    == reflex.preference_key.as_deref()
+            })
+    }
+
+    pub fn cognitive_response_contract(
+        &self,
+        user_content: &str,
+        include_spoken_text: bool,
+    ) -> Value {
+        let normalized = normalized_turn_text(user_content);
+        let low_intent = normalized.is_empty() || looks_like_conversational_goal(&normalized);
+        let mut channels = Vec::new();
+        if include_spoken_text {
+            channels.push("spoken_text");
+        }
+        if !low_intent {
+            channels.push("memory_candidate");
+            channels.push("active_plan");
+            channels.push("memory_concept");
+        }
+        json!({
+            "channels": channels,
+        })
     }
 
     pub fn build_prompt(&self, user_content: &str) -> String {
@@ -2082,7 +2640,11 @@ impl SessionState {
         user_content: &str,
         projected_tools: &[ToolDefinition],
     ) -> String {
-        let projection = self.build_context_projection_with_tools(user_content, projected_tools);
+        let projection = self.build_context_projection_for_envelope(
+            user_content,
+            projected_tools,
+            TurnContextEnvelopeKind::Cognitive,
+        );
         self.render_prompt_from_projection(&projection)
     }
 
@@ -2095,6 +2657,19 @@ impl SessionState {
         &self,
         user_content: &str,
         projected_tools: &[ToolDefinition],
+    ) -> ContextProjection {
+        self.build_context_projection_for_envelope(
+            user_content,
+            projected_tools,
+            TurnContextEnvelopeKind::Cognitive,
+        )
+    }
+
+    fn build_context_projection_for_envelope(
+        &self,
+        user_content: &str,
+        projected_tools: &[ToolDefinition],
+        envelope_kind: TurnContextEnvelopeKind,
     ) -> ContextProjection {
         let turn_id = self
             .active_turn
@@ -2110,9 +2685,10 @@ impl SessionState {
             started_at: None,
         });
 
-        let identity = self.project_agent_self();
+        let identity = self.project_agent_self_for_envelope(user_content, envelope_kind);
         let relationship = self.project_user(user_content);
-        let knowledge = self.project_knowledge(user_content, projected_tools);
+        let knowledge =
+            self.project_knowledge_for_envelope(user_content, projected_tools, envelope_kind);
         let recalled_memory = self.project_recalled_memory();
         let working = self.project_working_state();
         let session = self.project_session_context(projected_tools);
@@ -2457,7 +3033,36 @@ impl SessionState {
         });
     }
 
+    fn low_intent_turn(user_content: &str) -> bool {
+        let normalized = normalized_turn_text(user_content);
+        normalized.is_empty() || looks_like_conversational_goal(&normalized)
+    }
+
+    fn should_project_skill_affordances(
+        user_content: &str,
+        envelope_kind: TurnContextEnvelopeKind,
+    ) -> bool {
+        matches!(envelope_kind, TurnContextEnvelopeKind::Cognitive)
+            && !Self::low_intent_turn(user_content)
+    }
+
+    fn should_project_approval_policy_details(
+        user_content: &str,
+        envelope_kind: TurnContextEnvelopeKind,
+    ) -> bool {
+        matches!(envelope_kind, TurnContextEnvelopeKind::Cognitive)
+            && !Self::low_intent_turn(user_content)
+    }
+
     pub fn project_agent_self(&self) -> String {
+        self.project_agent_self_for_envelope("", TurnContextEnvelopeKind::Cognitive)
+    }
+
+    fn project_agent_self_for_envelope(
+        &self,
+        user_content: &str,
+        envelope_kind: TurnContextEnvelopeKind,
+    ) -> String {
         let mut lines = Vec::new();
 
         if let Some(identity) = self
@@ -2487,16 +3092,62 @@ impl SessionState {
             );
         }
 
-        if !self.bindings.effective_skillset.is_empty() {
+        if Self::should_project_skill_affordances(user_content, envelope_kind)
+            && !self.bindings.effective_skillset.is_empty()
+        {
             lines.push(format!(
                 "Current skill posture: {}.",
                 self.bindings.effective_skillset.join(", ")
             ));
         }
-        if !self.bindings.effective_skill_guidance.is_empty() {
+        if Self::should_project_skill_affordances(user_content, envelope_kind)
+            && !self.bindings.effective_skill_guidance.is_empty()
+        {
             lines.push(format!(
                 "\n[Skill guidance]\n{}",
                 self.bindings.effective_skill_guidance.join("\n\n")
+            ));
+        }
+
+        let remembered_role_reflexes = self.remembered_role_handoff_reflexes();
+        if Self::should_project_skill_affordances(user_content, envelope_kind)
+            && !remembered_role_reflexes.is_empty()
+        {
+            let descriptions = remembered_role_reflexes
+                .into_iter()
+                .map(|reflex| {
+                    if self.role_handoff_reflex_is_expressed(&reflex) {
+                        let marker_summary = remembered_role_receptor_summary(&reflex);
+                        format!(
+                            "{} often hands off to role '{}'{} (evidence={})",
+                            marker_summary,
+                            reflex.target_role,
+                            reflex
+                                .toolset_profile
+                                .as_deref()
+                                .map(|profile| format!(" via toolset {}", profile))
+                                .unwrap_or_default(),
+                            reflex.success_count
+                        )
+                    } else {
+                        let marker_summary = remembered_role_receptor_summary(&reflex);
+                        format!(
+                            "{} may want handoff to role '{}'{} (evidence={})",
+                            marker_summary,
+                            reflex.target_role,
+                            reflex
+                                .role_manifest_excerpt
+                                .as_deref()
+                                .map(|excerpt| format!(" because {}", excerpt))
+                                .unwrap_or_default(),
+                            reflex.success_count
+                        )
+                    }
+                })
+                .collect::<Vec<_>>();
+            lines.push(format!(
+                "Remembered role-shift reflexes: {}.",
+                descriptions.join("; ")
             ));
         }
 
@@ -2574,8 +3225,21 @@ impl SessionState {
 
     pub fn project_knowledge(
         &self,
+        user_content: &str,
+        projected_tools: &[ToolDefinition],
+    ) -> String {
+        self.project_knowledge_for_envelope(
+            user_content,
+            projected_tools,
+            TurnContextEnvelopeKind::Cognitive,
+        )
+    }
+
+    fn project_knowledge_for_envelope(
+        &self,
         _user_content: &str,
         _projected_tools: &[ToolDefinition],
+        envelope_kind: TurnContextEnvelopeKind,
     ) -> String {
         let mut sections = Vec::new();
 
@@ -2591,33 +3255,41 @@ impl SessionState {
             sections.push(recent.trim_end().to_string());
         }
 
-        let mut policy = String::from("[Approval policy]\n");
-        if self.approval_policy.auto_approve_all {
-            policy.push_str(
-                "This session is pre-approved. Do not ask for approval for actions in this session unless the action is explicitly forbidden.\n",
-            );
-        } else if !self.approval_policy.preapproved_tools.is_empty()
-            || !self.approval_policy.preapproved_classes.is_empty()
-        {
-            if !self.approval_policy.preapproved_tools.is_empty() {
-                policy.push_str(&format!(
-                    "Pre-approved tools: {}.\n",
-                    self.approval_policy.preapproved_tools.join(", ")
-                ));
+        if Self::should_project_approval_policy_details(_user_content, envelope_kind) {
+            let mut policy = String::from("[Approval policy]\n");
+            if self.approval_policy.auto_approve_all {
+                policy.push_str(
+                    "This session is pre-approved. Do not ask for approval for actions in this session unless the action is explicitly forbidden.\n",
+                );
+            } else if !self.approval_policy.preapproved_tools.is_empty()
+                || !self.approval_policy.preapproved_classes.is_empty()
+            {
+                if !self.approval_policy.preapproved_tools.is_empty() {
+                    policy.push_str(&format!(
+                        "Pre-approved tools: {}.\n",
+                        self.approval_policy.preapproved_tools.join(", ")
+                    ));
+                }
+                if !self.approval_policy.preapproved_classes.is_empty() {
+                    policy.push_str(&format!(
+                        "Pre-approved classes: {}.\n",
+                        self.approval_policy.preapproved_classes.join(", ")
+                    ));
+                }
+                policy.push_str("Do not request approval for pre-approved actions.\n");
+            } else {
+                policy.push_str(
+                    "No pre-approvals are configured. Request approval before side-effecting actions.\n",
+                );
             }
-            if !self.approval_policy.preapproved_classes.is_empty() {
-                policy.push_str(&format!(
-                    "Pre-approved classes: {}.\n",
-                    self.approval_policy.preapproved_classes.join(", ")
-                ));
-            }
-            policy.push_str("Do not request approval for pre-approved actions.\n");
-        } else {
-            policy.push_str(
-                "No pre-approvals are configured. Request approval before side-effecting actions.\n",
+            sections.push(policy.trim_end().to_string());
+        } else if matches!(envelope_kind, TurnContextEnvelopeKind::Cognitive) {
+            sections.push(
+                "[Turn policy]\nThis appears to be a low-intent conversational turn. Prefer a direct reply over tool use or approval-seeking unless the user explicitly asks for an action."
+                    .to_string(),
             );
         }
-        sections.push(policy.trim_end().to_string());
+
         if !self.summary_text().is_empty() {
             sections.push(format!("[Recent summary]\n{}.", self.summary_text()));
         }
@@ -2817,6 +3489,7 @@ impl SessionState {
         initiating_turn_id: &str,
         handoff_reason: &str,
         return_to: Option<String>,
+        target_role_lens: Option<&TargetRoleLens>,
     ) -> HandoffBundle {
         let active_goal = self
             .active_turn
@@ -2847,6 +3520,20 @@ impl SessionState {
         if self.approval_policy.auto_approve_all {
             relevant_session_facts.push("approval=preapproved".into());
         }
+        if let Some(lens) = target_role_lens {
+            if let Some(toolset_profile) = lens.toolset_profile.as_deref() {
+                relevant_session_facts.push(format!("target_toolset_profile={toolset_profile}"));
+            }
+            if !lens.allowed_skills.is_empty() {
+                relevant_session_facts.push(format!(
+                    "target_allowed_skills={}",
+                    lens.allowed_skills.join(",")
+                ));
+            }
+            if lens.role_manifest.is_some() {
+                relevant_session_facts.push("target_role_manifest=present".into());
+            }
+        }
 
         let from_role = self
             .role_activation
@@ -2854,11 +3541,46 @@ impl SessionState {
             .map(|r| r.role_name.clone())
             .or_else(|| Some("orchestrator".into()));
 
+        let role_lens_summary = target_role_lens
+            .map(|lens| {
+                let mut parts = Vec::new();
+                if let Some(toolset_profile) = lens.toolset_profile.as_deref() {
+                    parts.push(format!("toolset={toolset_profile}"));
+                }
+                if let Some(addendum) = lens.role_identity_addendum.as_deref() {
+                    parts.push(format!("identity_addendum={addendum}"));
+                }
+                if let Some(manifest) = lens
+                    .role_manifest
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                {
+                    let excerpt: String = manifest.chars().take(180).collect();
+                    parts.push(format!("manifest_excerpt={excerpt}"));
+                }
+                if !lens.allowed_skills.is_empty() {
+                    parts.push(format!("allowed_skills={}", lens.allowed_skills.join(",")));
+                }
+                (!parts.is_empty()).then_some(parts.join(" | "))
+            })
+            .flatten();
+
         HandoffBundle {
-            goal: format!("Switch active role to {target_role} for this session."),
+            goal: format!(
+                "Switch active role to {target_role} for this session{}.",
+                role_lens_summary
+                    .as_deref()
+                    .map(|summary| format!(" using role lens [{summary}]"))
+                    .unwrap_or_default()
+            ),
             context_excerpt: format!(
-                "Same-identity role handoff requested. Current summary: {}",
-                self.summary_text()
+                "Same-identity role handoff requested. Current summary: {}{}",
+                self.summary_text(),
+                role_lens_summary
+                    .as_deref()
+                    .map(|summary| format!("\nTarget role lens: {summary}"))
+                    .unwrap_or_default()
             ),
             session_id: self.session_id.clone(),
             initiating_turn_id: initiating_turn_id.to_string(),
@@ -2870,6 +3592,10 @@ impl SessionState {
             active_constraints: vec![
                 format!("transport_source={}", self.source),
                 "same_identity_role_handoff".into(),
+                target_role_lens
+                    .and_then(|lens| lens.toolset_profile.as_deref())
+                    .map(|profile| format!("target_toolset_profile={profile}"))
+                    .unwrap_or_else(|| "target_toolset_profile=unknown".into()),
             ],
             relevant_session_facts,
             working_summary,
@@ -2956,12 +3682,79 @@ impl SessionState {
         user_content: &str,
         projected_tools: &[ToolDefinition],
     ) -> (String, Value, Value) {
-        let projection = self.build_context_projection_with_tools(user_content, projected_tools);
+        self.model_request_payloads_for_envelope(
+            user_content,
+            projected_tools,
+            TurnContextEnvelopeKind::Cognitive,
+        )
+    }
+
+    pub fn model_request_payloads_for_envelope(
+        &self,
+        user_content: &str,
+        projected_tools: &[ToolDefinition],
+        envelope_kind: TurnContextEnvelopeKind,
+    ) -> (String, Value, Value) {
+        let projection = self.build_context_projection_for_envelope(
+            user_content,
+            projected_tools,
+            envelope_kind,
+        );
         let prompt = self.render_prompt_from_projection(&projection);
-        let context = self.model_context_from_projection(&projection);
+        let full_context = self.model_context_from_projection(&projection);
+        let context = self.context_for_envelope(&full_context, envelope_kind);
         let context_projection =
             serde_json::to_value(&projection).expect("context projection should serialize");
         (prompt, context, context_projection)
+    }
+
+    fn context_for_envelope(
+        &self,
+        full_context: &Value,
+        envelope_kind: TurnContextEnvelopeKind,
+    ) -> Value {
+        match envelope_kind {
+            TurnContextEnvelopeKind::Cognitive => full_context.clone(),
+            TurnContextEnvelopeKind::Ingress => {
+                let instructions =
+                    filter_projection_items(full_context.get("instructions"), &["session"]);
+                let identity = clone_array_field(full_context, "identity");
+                let dialogue_window = tail_turn_window(full_context.get("dialogue_window"), 2);
+                let active_turn = full_context
+                    .get("active_turn")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                json!({
+                    "instructions": instructions,
+                    "identity": identity,
+                    "memory": Vec::<Value>::new(),
+                    "recalled_memory": Vec::<Value>::new(),
+                    "dialogue_window": dialogue_window,
+                    "active_turn": active_turn,
+                    "tool_history": Vec::<Value>::new(),
+                    "active_plan": Value::Null,
+                })
+            }
+            TurnContextEnvelopeKind::Egress => {
+                let instructions =
+                    filter_projection_items(full_context.get("instructions"), &["session"]);
+                let identity = clone_array_field(full_context, "identity");
+                let active_turn = full_context
+                    .get("active_turn")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                json!({
+                    "instructions": instructions,
+                    "identity": identity,
+                    "memory": Vec::<Value>::new(),
+                    "recalled_memory": Vec::<Value>::new(),
+                    "dialogue_window": Vec::<Value>::new(),
+                    "active_turn": active_turn,
+                    "tool_history": Vec::<Value>::new(),
+                    "active_plan": Value::Null,
+                })
+            }
+        }
     }
 
     pub fn checkpoint_json(&self) -> serde_json::Value {
@@ -2988,6 +3781,7 @@ impl SessionState {
                 "provider_repair_attempts": turn.provider_repair_attempts,
                 "pending_text_reply": turn.pending_text_reply,
                 "had_voice_input": turn.had_voice_input,
+                "turn_routing_plan": turn.turn_routing_plan,
                 "awaiting_transcription_reentry": turn.awaiting_transcription_reentry,
                 "scripted_loop_context": turn.scripted_loop_context,
                 "paracrine_origin": turn.paracrine_origin,
@@ -3010,6 +3804,7 @@ impl SessionState {
             "status": self.status,
             "approval_policy": self.approval_policy,
             "bindings": self.bindings,
+            "pending_native_live_function_call_id": self.pending_native_live_function_call_id,
             "active_turn": active_turn,
             "recent_turns": self.recent_turns.iter().map(|turn| {
                 json!({
@@ -3232,6 +4027,10 @@ impl SessionState {
                     .get("had_voice_input")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
+                turn_routing_plan: turn
+                    .get("turn_routing_plan")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<TurnRoutingPlan>(value).ok()),
                 awaiting_transcription_reentry: turn
                     .get("awaiting_transcription_reentry")
                     .and_then(serde_json::Value::as_bool)
@@ -3283,6 +4082,10 @@ impl SessionState {
             tool_assembly,
             recent_turns,
             active_turn,
+            pending_native_live_function_call_id: checkpoint
+                .get("pending_native_live_function_call_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
             active_subagents: Vec::new(),
             last_handoff_summary: None,
             rules: checkpoint
@@ -3340,6 +4143,147 @@ fn looks_like_conversational_goal(normalized: &str) -> bool {
         ]
         .iter()
         .any(|prefix| normalized.starts_with(prefix))
+}
+
+fn is_role_reflex_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "handoff.to_role" | "handoff.back")
+}
+
+fn remembered_role_receptor_summary(reflex: &RememberedRoleHandoffReflex) -> String {
+    if !reflex.manifest_markers.is_empty() {
+        return format!(
+            "manifest-shaped work ({})",
+            reflex
+                .manifest_markers
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if !reflex.skill_markers.is_empty() {
+        return format!(
+            "skill-shaped work ({})",
+            reflex
+                .skill_markers
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if !reflex.toolset_markers.is_empty() {
+        return format!(
+            "toolset-shaped work ({})",
+            reflex
+                .toolset_markers
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    reflex
+        .legacy_trigger_class
+        .as_deref()
+        .map(|class| format!("{class}-shaped work"))
+        .unwrap_or_else(|| "role-shaped work".into())
+}
+
+fn role_handoff_reflex_matches_goal(
+    reflex: &RememberedRoleHandoffReflex,
+    normalized: &str,
+) -> bool {
+    let goal_tokens = normalized
+        .split_whitespace()
+        .filter(|token| token.len() >= 4)
+        .collect::<Vec<_>>();
+    let has_declared_receptors = !reflex.manifest_markers.is_empty()
+        || !reflex.skill_markers.is_empty()
+        || !reflex.toolset_markers.is_empty();
+    if has_declared_receptors {
+        return reflex
+            .manifest_markers
+            .iter()
+            .chain(reflex.skill_markers.iter())
+            .chain(reflex.toolset_markers.iter())
+            .any(|marker| {
+                normalized.contains(marker)
+                    || goal_tokens.iter().any(|token| {
+                        let min_prefix = token.len().min(marker.len()).min(6);
+                        min_prefix >= 5
+                            && token[..min_prefix].eq_ignore_ascii_case(&marker[..min_prefix])
+                    })
+            });
+    }
+    reflex
+        .legacy_trigger_class
+        .as_deref()
+        .map(|trigger_class| trigger_class_matches_goal(trigger_class, normalized))
+        .unwrap_or(false)
+}
+
+fn trigger_class_matches_goal(trigger_class: &str, normalized: &str) -> bool {
+    match trigger_class {
+        "implementation" => [
+            "implement",
+            "implementation",
+            "code",
+            "patch",
+            "fix",
+            "refactor",
+            "wire",
+            "build",
+            "debug",
+        ]
+        .iter()
+        .any(|needle| normalized.contains(needle)),
+        "research" => [
+            "research",
+            "investigate",
+            "look into",
+            "explore",
+            "compare",
+            "survey",
+        ]
+        .iter()
+        .any(|needle| normalized.contains(needle)),
+        "analysis" => ["analy", "assess", "inspect", "review", "evaluate", "audit"]
+            .iter()
+            .any(|needle| normalized.contains(needle)),
+        _ => false,
+    }
+}
+
+fn looks_like_role_handoff_goal(normalized: &str) -> bool {
+    [
+        "switch to ",
+        "switch into ",
+        "hand off to ",
+        "handoff to ",
+        "shift to ",
+        "move to role ",
+        "use role ",
+        "activate role ",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
+}
+
+fn looks_like_role_return_goal(normalized: &str) -> bool {
+    [
+        "switch back",
+        "go back",
+        "return to orchestrator",
+        "back to orchestrator",
+        "handoff back",
+        "hand back",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
 }
 
 fn normalized_turn_text(user_content: &str) -> String {
@@ -3517,7 +4461,18 @@ fn default_visible_toolset(bindings: &SessionBindings) -> Vec<String> {
         }
     }
 
+    if toolset.iter().any(|t| t == "role.create_or_update") {
+        toolset.retain(|t| t != "role.configure");
+    }
+
+    if bindings.effective_rights.is_empty() {
+        return toolset;
+    }
+
     toolset
+        .into_iter()
+        .filter(|tool_name| has_right(&bindings.effective_rights, &tool_right(tool_name)))
+        .collect()
 }
 
 fn is_local_agent_tool(tool_name: &str) -> bool {
@@ -3528,11 +4483,13 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
             | "memory.recall"
             | "memory.remember"
             | "rule.propose"
+            | "routing.policy.propose"
             | "skill.register"
             | "skill.list"
             | "skill.assign"
             | "skill.revoke"
             | "subagent.spawn"
+            | "role.create_or_update"
             | "role.configure"
             | "handoff.to_role"
             | "handoff.back"
@@ -3594,7 +4551,7 @@ fn task_runner_base_config_for_tool(
 }
 
 fn tool_assembly_from_allowed_incarnations(bindings: &SessionBindings) -> ToolAssembly {
-    let visible_tools = if bindings.effective_toolset.is_empty() {
+    let mut visible_tools = if bindings.effective_toolset.is_empty() {
         bindings
             .allowed_tool_runner_incarnations
             .iter()
@@ -3605,6 +4562,10 @@ fn tool_assembly_from_allowed_incarnations(bindings: &SessionBindings) -> ToolAs
     } else {
         bindings.effective_toolset.clone()
     };
+    if !bindings.effective_rights.is_empty() {
+        visible_tools
+            .retain(|tool_name| has_right(&bindings.effective_rights, &tool_right(tool_name)));
+    }
 
     let catalog = tool_catalog();
     let tools_for_model = visible_tools
@@ -3782,6 +4743,42 @@ fn projection_item(text: &str, source_ref: &str, projection_kind: &str) -> Value
     })
 }
 
+fn clone_array_field(object: &Value, field: &str) -> Vec<Value> {
+    object
+        .get(field)
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn filter_projection_items(object: Option<&Value>, allowed_kinds: &[&str]) -> Vec<Value> {
+    object
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| {
+                    item.get("projection_kind")
+                        .and_then(Value::as_str)
+                        .map(|kind| allowed_kinds.contains(&kind))
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn tail_turn_window(object: Option<&Value>, max_items: usize) -> Vec<Value> {
+    object
+        .and_then(Value::as_array)
+        .map(|items| {
+            let keep_from = items.len().saturating_sub(max_items);
+            items.iter().skip(keep_from).cloned().collect()
+        })
+        .unwrap_or_default()
+}
+
 fn current_unix_ts() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3843,14 +4840,17 @@ fn apply_string_list_op(list: &mut Vec<String>, item: &str, operation: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        ApprovalPolicy, ComponentExecutionRoute, ComponentRouteAssembly, ComponentRouteBinding,
-        ContextAuthority, ContextLayerId, ContextMutability, HookRequest, HookResult,
-        PromotionAction, RecalledMemoryRecord, RefreshRequest, RoleActivation, SessionBindings,
-        SessionState, TaskRunnerBaseConfig, ToolRunnerIncarnationBinding,
-        TransportReplyTargetBinding, TtsMode, VoiceResponsePolicy, WorkingTurn,
-        default_tool_assembly_for_bindings, merge_session_index, session_checkpoint_memory_type,
+        ApprovalInterruptDisposition, ApprovalPolicy, ComponentExecutionRoute,
+        ComponentRouteAssembly, ComponentRouteBinding, ContextAuthority, ContextLayerId,
+        ContextMutability, HookRequest, HookResult, PromotionAction, RecalledMemoryRecord,
+        RefreshRequest, RoleActivation, SessionBindings, SessionState, TaskRunnerBaseConfig,
+        ToolRunnerIncarnationBinding, TransportReplyTargetBinding, TtsMode,
+        TurnContextEnvelopeKind, TurnRecord, TurnRoutingPlan, TurnRoutingStageKind,
+        TurnRoutingStagePlan, VoiceResponsePolicy, WorkingTurn, default_tool_assembly_for_bindings,
+        merge_session_index, session_checkpoint_memory_type,
     };
     use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
+    use ansible_mesh_core::catalog_rights::tool_right;
     use uuid::Uuid;
 
     #[test]
@@ -3877,6 +4877,31 @@ mod tests {
             provider_repair_attempts: 0,
             pending_text_reply: Some("hello back".into()),
             had_voice_input: true,
+            turn_routing_plan: Some(TurnRoutingPlan {
+                trigger: "voice_input".into(),
+                stages: vec![
+                    TurnRoutingStagePlan {
+                        kind: TurnRoutingStageKind::Ingress,
+                        capability: "voice.transcribe".into(),
+                        request_class: "transform".into(),
+                        context_envelope: TurnContextEnvelopeKind::Ingress,
+                        controller_role: "model.elevenlabs".into(),
+                        provider_hint: Some("elevenlabs".into()),
+                        model_ref: None,
+                        streaming: true,
+                    },
+                    TurnRoutingStagePlan {
+                        kind: TurnRoutingStageKind::Cognition,
+                        capability: "text.generate".into(),
+                        request_class: "cognitive".into(),
+                        context_envelope: TurnContextEnvelopeKind::Cognitive,
+                        controller_role: "model".into(),
+                        provider_hint: None,
+                        model_ref: None,
+                        streaming: true,
+                    },
+                ],
+            }),
             awaiting_transcription_reentry: true,
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
@@ -3896,6 +4921,10 @@ mod tests {
             "hello back"
         );
         assert_eq!(checkpoint["active_turn"]["had_voice_input"], true);
+        assert_eq!(
+            checkpoint["active_turn"]["turn_routing_plan"]["trigger"],
+            "voice_input"
+        );
         assert_eq!(
             checkpoint["active_turn"]["awaiting_transcription_reentry"],
             true
@@ -3990,6 +5019,7 @@ mod tests {
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
+            turn_routing_plan: None,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
@@ -4033,6 +5063,7 @@ mod tests {
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
+            turn_routing_plan: None,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
@@ -4078,6 +5109,80 @@ mod tests {
         assert!(
             knowledge.contains("[voice message]"),
             "placeholder must appear in context"
+        );
+    }
+
+    #[test]
+    fn low_intent_cognitive_prompt_omits_skill_guidance_and_detailed_approval_policy() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.bindings.effective_skillset = vec!["planning".into()];
+        state.bindings.effective_skill_guidance =
+            vec!["Use the planning skill to build multi-step execution plans.".into()];
+        state.approval_policy.preapproved_tools = vec!["workspace.read".into()];
+        state.approval_policy.preapproved_classes = vec!["workspace".into()];
+
+        let (prompt, context, _) = state.model_request_payloads_for_envelope(
+            "Thanks, that solved it.",
+            &[],
+            TurnContextEnvelopeKind::Cognitive,
+        );
+
+        assert!(
+            !prompt.contains("Current skill posture:"),
+            "low-intent prompt should not advertise skill posture"
+        );
+        assert!(
+            !prompt.contains("[Skill guidance]"),
+            "low-intent prompt should not include skill guidance"
+        );
+        assert!(
+            !prompt.contains("Pre-approved tools:"),
+            "low-intent prompt should not dump detailed approval posture"
+        );
+        assert!(
+            prompt.contains("[Turn policy]"),
+            "low-intent prompt should carry the simpler turn-policy steer"
+        );
+        let memory_text = context["memory"]
+            .as_array()
+            .expect("memory array")
+            .iter()
+            .filter_map(|item| item.get("text").and_then(|v| v.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !memory_text.contains("Pre-approved tools:"),
+            "low-intent context should not include detailed approval posture"
+        );
+    }
+
+    #[test]
+    fn ingress_prompt_omits_skill_guidance_and_approval_policy_details() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.bindings.effective_skillset = vec!["planning".into()];
+        state.bindings.effective_skill_guidance =
+            vec!["Use the planning skill to build multi-step execution plans.".into()];
+        state.approval_policy.preapproved_tools = vec!["workspace.read".into()];
+
+        let (prompt, _, _) = state.model_request_payloads_for_envelope(
+            "Please transcribe this voice note.",
+            &[],
+            TurnContextEnvelopeKind::Ingress,
+        );
+
+        assert!(
+            !prompt.contains("Current skill posture:"),
+            "ingress prompt should not advertise skill posture"
+        );
+        assert!(
+            !prompt.contains("[Skill guidance]"),
+            "ingress prompt should not include skill guidance"
+        );
+        assert!(
+            !prompt.contains("[Approval policy]"),
+            "ingress prompt should not include approval policy details"
         );
     }
 
@@ -4173,6 +5278,7 @@ mod tests {
             state.bindings,
             SessionBindings {
                 effective_toolset: vec!["echo".into(), "workspace.read".into()],
+                effective_rights: Vec::new(),
                 effective_skillset: vec!["planning".into()],
                 effective_skill_guidance: Vec::new(),
                 effective_workspace_ref: Some("workspace://main".into()),
@@ -4188,6 +5294,12 @@ mod tests {
                 preferred_tool_runner: None,
                 preferred_hotel_id: None,
                 preferred_environment_id: None,
+                routing_preferences: Vec::new(),
+                effective_reflexes: serde_json::Value::Null,
+                reflex_policy_agent_layers: Vec::new(),
+                reflex_policy_agent_rewards: Vec::new(),
+                reflex_policy_agent_suppressions: Vec::new(),
+                shared_model_markers: Vec::new(),
                 allowed_tool_runner_incarnations: Vec::new(),
             }
         );
@@ -4299,12 +5411,143 @@ mod tests {
     }
 
     #[test]
+    fn low_intent_freeform_approval_interrupts_redirect_to_direct_response() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.start_turn(WorkingTurn {
+            task_id: Uuid::nil(),
+            turn_id: "turn-1".into(),
+            chat_id: "123".into(),
+            user_content: "Thanks, that solved it.".into(),
+            final_reply_to: "local-aiua-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase: TurnPhase::WaitingModel,
+            iteration: 1,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
+            active_plan: None,
+            consecutive_step_failures: 0,
+            provider_repair_note: None,
+            provider_repair_attempts: 0,
+            pending_text_reply: None,
+            had_voice_input: false,
+            turn_routing_plan: None,
+            awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
+        });
+
+        let disposition = state.approval_interrupt_disposition(
+            &ApprovalRequest {
+                approval_id: None,
+                reason: "Approval required".into(),
+                approved_response: "Approved.".into(),
+            },
+            false,
+        );
+
+        assert!(matches!(
+            disposition,
+            ApprovalInterruptDisposition::RedirectToDirectResponse { .. }
+        ));
+    }
+
+    #[test]
+    fn ingress_approval_interrupts_are_rejected() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.start_turn(WorkingTurn {
+            task_id: Uuid::nil(),
+            turn_id: "turn-voice".into(),
+            chat_id: "123".into(),
+            user_content: "Please transcribe this voice note.".into(),
+            final_reply_to: "local-aiua-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase: TurnPhase::WaitingModel,
+            iteration: 1,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
+            active_plan: None,
+            consecutive_step_failures: 0,
+            provider_repair_note: None,
+            provider_repair_attempts: 0,
+            pending_text_reply: None,
+            had_voice_input: true,
+            turn_routing_plan: None,
+            awaiting_transcription_reentry: true,
+            scripted_loop_context: None,
+        });
+
+        let disposition = state.approval_interrupt_disposition(
+            &ApprovalRequest {
+                approval_id: None,
+                reason: "Approval required".into(),
+                approved_response: "Approved.".into(),
+            },
+            false,
+        );
+
+        assert!(matches!(
+            disposition,
+            ApprovalInterruptDisposition::RejectAsInvalidStage { .. }
+        ));
+    }
+
+    #[test]
+    fn scripted_gate_approval_interrupts_remain_allowed() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.start_turn(WorkingTurn {
+            task_id: Uuid::nil(),
+            turn_id: "turn-1".into(),
+            chat_id: "123".into(),
+            user_content: "Build a plan for this migration.".into(),
+            final_reply_to: "local-aiua-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase: TurnPhase::WaitingModel,
+            iteration: 1,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
+            active_plan: None,
+            consecutive_step_failures: 0,
+            provider_repair_note: None,
+            provider_repair_attempts: 0,
+            pending_text_reply: None,
+            had_voice_input: false,
+            turn_routing_plan: None,
+            awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
+        });
+
+        let disposition = state.approval_interrupt_disposition(
+            &ApprovalRequest {
+                approval_id: Some("scripted_gate:review".into()),
+                reason: "Plan ready for review.".into(),
+                approved_response: "Plan approved.".into(),
+            },
+            false,
+        );
+
+        assert_eq!(disposition, ApprovalInterruptDisposition::Allow);
+    }
+
+    #[test]
     fn agent_configure_requires_approval_and_is_in_config_class() {
         use crate::catalog::{tool_class, tool_requires_approval};
         assert_eq!(tool_class("agent.configure"), Some("config"));
         assert!(tool_requires_approval("agent.configure"));
         assert!(!tool_requires_approval("echo"));
         assert!(!tool_requires_approval("workspace.read"));
+        assert!(!tool_requires_approval("handoff.to_role"));
+        assert!(!tool_requires_approval("handoff.back"));
     }
 
     #[test]
@@ -4341,6 +5584,33 @@ mod tests {
         assert!(props.contains_key("command"));
         assert!(props.contains_key("working_dir"));
         assert!(props.contains_key("timeout_secs"));
+    }
+
+    #[test]
+    fn routing_policy_propose_requires_approval_and_routing_refinement_implies_it() {
+        use crate::catalog::{skill_implied_tools, tool_class, tool_requires_approval};
+
+        assert_eq!(tool_class("routing.policy.propose"), Some("config"));
+        assert!(tool_requires_approval("routing.policy.propose"));
+        assert_eq!(
+            skill_implied_tools("routing.refinement"),
+            &[
+                "session.status",
+                "agent.graph.read",
+                "agent.graph.write",
+                "routing.policy.propose",
+            ]
+        );
+    }
+
+    #[test]
+    fn role_governance_implies_role_create_workflow_surface() {
+        use crate::catalog::skill_implied_tools;
+
+        assert_eq!(
+            skill_implied_tools("role.governance"),
+            &["session.status", "agent.configure", "role.create_or_update"]
+        );
     }
 
     #[test]
@@ -4596,6 +5866,43 @@ mod tests {
     }
 
     #[test]
+    fn default_tool_assembly_does_not_widen_beyond_effective_rights() {
+        let state = SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        let mut bindings = state.bindings.clone();
+        bindings.effective_toolset = vec!["agent.configure".into(), "echo".into()];
+        bindings.effective_rights = vec![tool_right("echo")];
+
+        let assembly = default_tool_assembly_for_bindings(&bindings);
+
+        assert!(!assembly.policy_annotations.contains_key("agent.configure"));
+        assert!(assembly.policy_annotations.contains_key("echo"));
+        assert_eq!(assembly.tools_for_model.len(), 1);
+        assert_eq!(assembly.tools_for_model[0].tool_name, "echo");
+    }
+
+    #[test]
+    fn allowed_incarnation_tool_assembly_respects_effective_rights() {
+        let state = SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        let mut bindings = state.bindings.clone();
+        bindings.effective_rights = vec![tool_right("workspace.read")];
+        bindings.allowed_tool_runner_incarnations = vec![ToolRunnerIncarnationBinding {
+            incarnation_id: "runner-1".into(),
+            runner_id: Some("runner-1".into()),
+            target_node: Some("local-aiua-01".into()),
+            target_role: Some("tool.workspace".into()),
+            supported_tools: vec!["workspace.read".into(), "workspace.list".into()],
+            ..Default::default()
+        }];
+
+        let assembly = default_tool_assembly_for_bindings(&bindings);
+
+        assert!(assembly.execution_routes.contains_key("workspace.read"));
+        assert!(!assembly.execution_routes.contains_key("workspace.list"));
+        assert_eq!(assembly.tools_for_model.len(), 1);
+        assert_eq!(assembly.tools_for_model[0].tool_name, "workspace.read");
+    }
+
+    #[test]
     fn prompt_reflects_session_preapproval() {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
@@ -4612,6 +5919,7 @@ mod tests {
         state.status = "paused".into();
         state.bindings = SessionBindings {
             effective_toolset: vec!["echo".into()],
+            effective_rights: Vec::new(),
             effective_skillset: vec!["planning".into()],
             effective_skill_guidance: Vec::new(),
             effective_workspace_ref: Some("workspace://main".into()),
@@ -4627,6 +5935,12 @@ mod tests {
             preferred_tool_runner: None,
             preferred_hotel_id: None,
             preferred_environment_id: None,
+            routing_preferences: Vec::new(),
+            effective_reflexes: serde_json::Value::Null,
+            reflex_policy_agent_layers: Vec::new(),
+            reflex_policy_agent_rewards: Vec::new(),
+            reflex_policy_agent_suppressions: Vec::new(),
+            shared_model_markers: Vec::new(),
             allowed_tool_runner_incarnations: Vec::new(),
         };
 
@@ -4709,6 +6023,7 @@ mod tests {
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
+            turn_routing_plan: None,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
@@ -4795,6 +6110,7 @@ mod tests {
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
+            turn_routing_plan: None,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
@@ -4875,6 +6191,7 @@ mod tests {
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
+            turn_routing_plan: None,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
@@ -4889,6 +6206,7 @@ mod tests {
             "turn-handoff-1",
             "manual_role_switch",
             Some("orchestrator".into()),
+            None,
         );
 
         assert_eq!(bundle.handoff_reason.as_deref(), Some("manual_role_switch"));
@@ -4910,6 +6228,70 @@ mod tests {
             bundle
                 .cleanup_actions
                 .contains(&"persist_role_local_working_state".to_string())
+        );
+    }
+
+    #[test]
+    fn same_identity_handoff_bundle_includes_target_role_lens_context() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.start_turn(WorkingTurn {
+            task_id: Uuid::nil(),
+            turn_id: "turn-handoff-2".into(),
+            chat_id: "123".into(),
+            user_content: "implement the fix".into(),
+            final_reply_to: "local-aiua-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase: TurnPhase::WaitingModel,
+            iteration: 1,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
+            active_plan: None,
+            consecutive_step_failures: 0,
+            provider_repair_note: None,
+            provider_repair_attempts: 0,
+            pending_text_reply: None,
+            had_voice_input: false,
+            turn_routing_plan: None,
+            awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
+        });
+
+        let bundle = state.build_same_identity_handoff_bundle(
+            "developer",
+            "turn-handoff-2",
+            "manual_role_switch",
+            Some("orchestrator".into()),
+            Some(&crate::session::TargetRoleLens {
+                role_name: "developer".into(),
+                toolset_profile: Some("codex".into()),
+                toolset_description: Some(
+                    "Codex specialist role profile — workspace read access.".into(),
+                ),
+                role_identity_addendum: Some("Focus on implementation and code changes.".into()),
+                role_manifest: Some(
+                    "Developer role: focus on implementation, code changes, and concrete patches."
+                        .into(),
+                ),
+                allowed_skills: vec!["handoff.back".into()],
+            }),
+        );
+
+        assert!(bundle.goal.contains("toolset=codex"));
+        assert!(bundle.context_excerpt.contains("Target role lens:"));
+        assert!(bundle.context_excerpt.contains("manifest_excerpt="));
+        assert!(
+            bundle
+                .relevant_session_facts
+                .contains(&"target_toolset_profile=codex".to_string())
+        );
+        assert!(
+            bundle
+                .relevant_session_facts
+                .contains(&"target_allowed_skills=handoff.back".to_string())
         );
     }
 
@@ -4952,6 +6334,7 @@ mod tests {
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
+            turn_routing_plan: None,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
@@ -5384,6 +6767,348 @@ mod tests {
     }
 
     #[test]
+    fn generic_cognitive_turn_suppresses_approval_gated_tools() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("echo");
+        state.add_tool_binding("handoff.to_role");
+
+        let projected = state.project_tools_for_turn("Please help me think through this design.");
+
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].tool_name, "echo");
+    }
+
+    #[test]
+    fn role_create_workflow_surface_suppresses_legacy_role_configure_projection() {
+        let mut bindings = SessionBindings::default();
+        bindings.effective_toolset = vec![
+            "role.configure".into(),
+            "role.create_or_update".into(),
+            "echo".into(),
+        ];
+
+        let assembly = default_tool_assembly_for_bindings(&bindings);
+        let tool_names: Vec<&str> = assembly
+            .tools_for_model
+            .iter()
+            .map(|tool| tool.tool_name.as_str())
+            .collect();
+
+        assert!(tool_names.contains(&"role.create_or_update"));
+        assert!(!tool_names.contains(&"role.configure"));
+    }
+
+    #[test]
+    fn role_shift_intent_projects_handoff_to_role_naturally() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("echo");
+        state.add_tool_binding("handoff.to_role");
+
+        let projected = state.project_tools_for_turn("Switch to developer for this task.");
+
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].tool_name, "handoff.to_role");
+    }
+
+    #[test]
+    fn role_return_intent_projects_handoff_back_naturally() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("handoff.back");
+        state.role_activation = Some(make_role_activation("developer"));
+
+        let projected = state.project_tools_for_turn("Switch back to orchestrator.");
+
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].tool_name, "handoff.back");
+    }
+
+    #[test]
+    fn reinforced_role_handoff_reflex_projects_handoff_to_role_for_matching_work() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("handoff.to_role");
+        state.bindings.reflex_policy_agent_layers = vec![serde_json::json!({
+            "policy_scope": "agent_learned",
+            "policy_source": "agent_graph",
+            "origin_class": "agent_learned",
+            "precedence": 70,
+            "preference_key": "same-self-role-handoff:developer",
+            "config": {
+                "reason": "remembered successful same-self handoff to developer",
+                "role_name": "developer",
+                "trigger_class": "implementation",
+                "manifest_markers": ["implementation", "debugging", "code"],
+                "success_count": 2,
+                "habit_state": "reinforced"
+            },
+            "reflexes": {
+                "role_handoff_reflex": {
+                    "target_role": "developer",
+                    "trigger_class": "implementation"
+                }
+            }
+        })];
+
+        let projected =
+            state.project_tools_for_turn("Please implement the patch and wire the fix.");
+
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].tool_name, "handoff.to_role");
+    }
+
+    #[test]
+    fn candidate_role_handoff_reflex_does_not_auto_project_for_matching_work() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("handoff.to_role");
+        state.bindings.reflex_policy_agent_layers = vec![serde_json::json!({
+            "policy_scope": "agent_learned",
+            "policy_source": "agent_graph",
+            "origin_class": "agent_learned",
+            "precedence": 70,
+            "preference_key": "same-self-role-handoff:developer",
+            "config": {
+                "reason": "remembered successful same-self handoff to developer",
+                "role_name": "developer",
+                "trigger_class": "implementation",
+                "manifest_markers": ["implementation", "debugging", "code"],
+                "success_count": 1,
+                "habit_state": "candidate"
+            },
+            "reflexes": {
+                "role_handoff_reflex": {
+                    "target_role": "developer",
+                    "trigger_class": "implementation"
+                }
+            }
+        })];
+
+        let projected =
+            state.project_tools_for_turn("Please implement the patch and wire the fix.");
+
+        assert!(projected.is_empty());
+    }
+
+    #[test]
+    fn rewarded_candidate_role_handoff_reflex_projects_handoff_to_role() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("handoff.to_role");
+        state.bindings.reflex_policy_agent_layers = vec![serde_json::json!({
+            "policy_scope": "agent_learned",
+            "policy_source": "agent_graph",
+            "origin_class": "agent_learned",
+            "precedence": 70,
+            "preference_key": "same-self-role-handoff:developer",
+            "config": {
+                "reason": "remembered successful same-self handoff to developer",
+                "role_name": "developer",
+                "trigger_class": "implementation",
+                "manifest_markers": ["implementation", "debugging", "code"],
+                "success_count": 1,
+                "habit_state": "candidate"
+            },
+            "reflexes": {
+                "role_handoff_reflex": {
+                    "target_role": "developer",
+                    "trigger_class": "implementation"
+                }
+            }
+        })];
+        state.bindings.reflex_policy_agent_rewards = vec![serde_json::json!({
+            "preference_key": "same-self-role-handoff:developer",
+            "reason": "reinforced_by_approved_routing_policy"
+        })];
+
+        let projected =
+            state.project_tools_for_turn("Please implement the patch and wire the fix.");
+
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].tool_name, "handoff.to_role");
+    }
+
+    #[test]
+    fn remembered_role_handoff_reflex_is_rendered_in_prompt() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.bindings.reflex_policy_agent_layers = vec![serde_json::json!({
+            "policy_scope": "agent_learned",
+            "policy_source": "agent_graph",
+            "origin_class": "agent_learned",
+            "precedence": 70,
+            "preference_key": "same-self-role-handoff:developer",
+            "config": {
+                "reason": "remembered successful same-self handoff to developer",
+                "role_name": "developer",
+                "trigger_class": "implementation",
+                "manifest_markers": ["implementation", "debugging", "code"],
+                "toolset_profile": "codex",
+                "success_count": 1,
+                "habit_state": "candidate"
+            },
+            "reflexes": {
+                "role_handoff_reflex": {
+                    "target_role": "developer",
+                    "trigger_class": "implementation"
+                }
+            }
+        })];
+
+        let prompt = state.project_agent_self_for_envelope(
+            "Please implement the patch and wire the fix.",
+            TurnContextEnvelopeKind::Cognitive,
+        );
+
+        assert!(prompt.contains(
+            "Remembered role-shift reflexes: manifest-shaped work (implementation, debugging, code) may want handoff to role 'developer' (evidence=1)."
+        ));
+    }
+
+    #[test]
+    fn manifest_marker_role_handoff_reflex_projects_handoff_without_trigger_class() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("handoff.to_role");
+        state.bindings.reflex_policy_agent_layers = vec![serde_json::json!({
+            "policy_scope": "agent_learned",
+            "policy_source": "agent_graph",
+            "origin_class": "agent_learned",
+            "precedence": 70,
+            "preference_key": "same-self-role-handoff:developer",
+            "config": {
+                "reason": "remembered successful same-self handoff to developer",
+                "role_name": "developer",
+                "manifest_markers": ["implementation", "debugging", "code"],
+                "success_count": 2,
+                "habit_state": "reinforced"
+            },
+            "reflexes": {
+                "role_handoff_reflex": {
+                    "target_role": "developer"
+                }
+            }
+        })];
+
+        let projected =
+            state.project_tools_for_turn("Please implement the patch and wire the fix.");
+
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].tool_name, "handoff.to_role");
+    }
+
+    #[test]
+    fn toolset_marker_role_handoff_reflex_projects_handoff_for_named_toolset_work() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("handoff.to_role");
+        state.bindings.reflex_policy_agent_layers = vec![serde_json::json!({
+            "policy_scope": "agent_learned",
+            "policy_source": "agent_graph",
+            "origin_class": "agent_learned",
+            "precedence": 70,
+            "preference_key": "same-self-role-handoff:developer",
+            "config": {
+                "reason": "remembered successful same-self handoff to developer",
+                "role_name": "developer",
+                "toolset_markers": ["codex"],
+                "success_count": 2,
+                "habit_state": "reinforced"
+            },
+            "reflexes": {
+                "role_handoff_reflex": {
+                    "target_role": "developer"
+                }
+            }
+        })];
+
+        let projected =
+            state.project_tools_for_turn("Use the codex developer posture for this change.");
+
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].tool_name, "handoff.to_role");
+    }
+
+    #[test]
+    fn ingress_envelope_projects_no_tools() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.add_tool_binding("echo");
+        state.add_tool_binding("workspace.read");
+
+        let projected = state.project_tools_for_envelope(
+            "Please transcribe this voice note.",
+            TurnContextEnvelopeKind::Ingress,
+        );
+        assert!(projected.is_empty());
+    }
+
+    #[test]
+    fn low_intent_cognitive_response_contract_skips_plan_and_memory_channels() {
+        let state = SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+
+        let response_contract =
+            state.cognitive_response_contract("Thanks, that was exactly what I needed.", true);
+        let channels = response_contract["channels"]
+            .as_array()
+            .expect("channels array");
+
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0].as_str(), Some("spoken_text"));
+    }
+
+    #[test]
+    fn low_intent_reentry_context_respects_tool_projection_policy() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.add_tool_binding("echo");
+        state.add_tool_binding("workspace.read");
+        state.start_turn(WorkingTurn {
+            task_id: Uuid::nil(),
+            turn_id: "turn-thanks".into(),
+            chat_id: "123".into(),
+            user_content: "Thanks, that helped a lot.".into(),
+            final_reply_to: "local-aiua-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase: TurnPhase::WaitingModel,
+            iteration: 1,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
+            active_plan: None,
+            consecutive_step_failures: 0,
+            provider_repair_note: None,
+            provider_repair_attempts: 0,
+            pending_text_reply: None,
+            had_voice_input: false,
+            turn_routing_plan: None,
+            awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
+        });
+
+        let (_, _, _, projected_tools) = state
+            .build_reentry_context_envelope()
+            .expect("reentry envelope should exist");
+
+        assert!(
+            projected_tools.is_empty(),
+            "low-intent reentry should not re-expose the full bound toolset"
+        );
+    }
+
+    #[test]
     fn skill_and_workspace_bindings_can_be_mutated() {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
@@ -5433,6 +7158,7 @@ mod tests {
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
+            turn_routing_plan: None,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
@@ -5483,6 +7209,7 @@ mod tests {
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
+            turn_routing_plan: None,
             awaiting_transcription_reentry: true,
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
@@ -5548,6 +7275,7 @@ mod tests {
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
+            turn_routing_plan: None,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
@@ -5614,6 +7342,7 @@ mod tests {
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: true,
+            turn_routing_plan: None,
             awaiting_transcription_reentry: true,
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
@@ -5646,6 +7375,90 @@ mod tests {
         assert_eq!(active_turn.phase, TurnPhase::WaitingModel);
         assert_eq!(active_turn.iteration, 2);
         assert!(!active_turn.awaiting_transcription_reentry);
+    }
+
+    #[test]
+    fn ingress_context_envelope_trims_memory_and_tool_history() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.recent_turns.push(TurnRecord {
+            turn_id: "turn-prev".into(),
+            user_content: "Previous question".into(),
+            assistant_content: Some("Previous answer".into()),
+            created_at: 0,
+        });
+        state.start_turn(WorkingTurn {
+            task_id: Uuid::nil(),
+            turn_id: "turn-voice-2".into(),
+            chat_id: "123".into(),
+            user_content: "Please transcribe this voice note.".into(),
+            final_reply_to: "local-aiua-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase: TurnPhase::WaitingModel,
+            iteration: 1,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: vec![(
+                ToolCall {
+                    tool_name: "workspace.read".into(),
+                    arguments: serde_json::json!({"path":"README.md"}),
+                },
+                ToolResult {
+                    tool_name: "workspace.read".into(),
+                    content: "# Philotic".into(),
+                },
+            )],
+            recalled_memories: vec![RecalledMemoryRecord {
+                concept: "voice policy".into(),
+                content: "Mirror voice turns back as audio.".into(),
+                tags: vec!["voice".into()],
+            }],
+            active_plan: None,
+            consecutive_step_failures: 0,
+            provider_repair_note: None,
+            provider_repair_attempts: 0,
+            pending_text_reply: None,
+            had_voice_input: true,
+            turn_routing_plan: None,
+            awaiting_transcription_reentry: true,
+            scripted_loop_context: None,
+        });
+
+        let (_, context, _) = state.model_request_payloads_for_envelope(
+            "Please transcribe this voice note.",
+            &[],
+            TurnContextEnvelopeKind::Ingress,
+        );
+
+        assert_eq!(
+            context["memory"].as_array().map(|items| items.len()),
+            Some(0),
+            "ingress envelope should not carry long-form memory"
+        );
+        assert_eq!(
+            context["recalled_memory"]
+                .as_array()
+                .map(|items| items.len()),
+            Some(0),
+            "ingress envelope should not carry recalled memory"
+        );
+        assert_eq!(
+            context["tool_history"].as_array().map(|items| items.len()),
+            Some(0),
+            "ingress envelope should not carry tool history"
+        );
+        assert_eq!(
+            context["dialogue_window"]
+                .as_array()
+                .map(|items| items.len()),
+            Some(2),
+            "ingress envelope should keep only a minimal recent dialogue window"
+        );
+        assert_eq!(
+            context["active_turn"]["text"].as_str(),
+            Some("Please transcribe this voice note.")
+        );
     }
 
     // ── Role handoff full-cycle smoke tests ──────────────────────────────────
@@ -5888,6 +7701,7 @@ mod tests {
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
+            turn_routing_plan: None,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),

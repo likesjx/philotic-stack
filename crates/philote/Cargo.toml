@@ -18,6 +18,7 @@ path = "src/bin/agent_worker.rs"
 [dependencies]
 anyhow = "1.0"
 ansible-mesh-core = { path = "../ansible-mesh-core" }
+media-prep = { path = "../media-prep" }
 memory-core = { path = "../memory-core" }
 clap = { version = "4.5", features = ["derive"] }
 philotic-client = { path = "../philotic-client" }

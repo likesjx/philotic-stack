@@ -1872,6 +1872,7 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                 .into(),
             input_schema: serde_json::json!({ "type": "object", "properties": {} }),
             class: "session".into(),
+            tool_markers: Vec::new(),
         },
         AbstractToolRecord {
             tool_name: "echo".into(),
@@ -1886,6 +1887,7 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                 "required": ["text"]
             }),
             class: "utility".into(),
+            tool_markers: Vec::new(),
         },
         AbstractToolRecord {
             tool_name: "workspace.list".into(),
@@ -1902,6 +1904,7 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                 }
             }),
             class: "workspace".into(),
+            tool_markers: Vec::new(),
         },
         AbstractToolRecord {
             tool_name: "workspace.read".into(),
@@ -1927,6 +1930,7 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                 "required": ["path"]
             }),
             class: "workspace".into(),
+            tool_markers: Vec::new(),
         },
         AbstractToolRecord {
             tool_name: "agent.configure".into(),
@@ -1947,6 +1951,7 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                 "required": ["config_path", "value"]
             }),
             class: "config".into(),
+            tool_markers: Vec::new(),
         },
     ];
 
@@ -2132,6 +2137,7 @@ fn seed_skill_crafting(graph: &GraphDomain) -> anyhow::Result<()> {
             "subagent.spawn".into(),
             "role.configure".into(),
         ],
+        skill_markers: Vec::new(),
         validation_state: SkillValidationState::Validated,
         source_snapshot: None,
         field_sources: serde_json::json!({}),
@@ -2182,6 +2188,7 @@ fn seed_orchestrator_roles(graph: &GraphDomain, profiles: &[AgentProfile]) -> an
             role_identity_addendum: None,
             role_manifest: Some(ORCHESTRATOR_MANIFEST.into()),
             is_admin: false,
+            readiness_state: ansible_mesh_core::graph::RoleReadinessState::Configured,
             inactive_ttl_seconds: None,
             turn_loop_config: ansible_mesh_core::graph::TurnLoopConfig::default(),
         };

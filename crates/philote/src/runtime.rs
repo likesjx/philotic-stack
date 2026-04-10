@@ -8,11 +8,15 @@ use crate::protocol::{
 };
 use crate::reflex::{IngressAction, ReflexEvent};
 use crate::session::{
-    ActivePlan, AgentProfile, ComponentRouteAssembly, MediaRoutingPolicy, RecalledMemoryRecord,
-    SessionState, ToolExecutionRoute, TtsMode, VoiceResponsePolicy, WorkingTurn,
-    merge_session_index,
+    ActivePlan, AgentProfile, ApprovalInterruptDisposition, ComponentRouteAssembly,
+    MediaRoutingPolicy, RecalledMemoryRecord, RoleActivation, RoutingPreferenceBinding,
+    SessionBindings, SessionState, TargetRoleLens, ToolExecutionRoute, TtsMode,
+    TurnCapabilityCompositionKind, TurnContextEnvelopeKind, TurnRoutedCapabilityProfile,
+    TurnRoutedCapabilitySpecies, TurnRoutingPlan, TurnRoutingStageKind, TurnRoutingStagePlan,
+    VoiceResponsePolicy, WorkingTurn, merge_session_index, turn_routed_capability_profile,
 };
 use anyhow::Result;
+use media_prep::{extract_audio_artifact_json, parse_audio_artifact_json};
 use memory_core::{
     MemoryScope, MuninnConfig, MuninnRestEngine, RecallContext, RecallTrigger, VaultResolver,
 };
@@ -31,6 +35,13 @@ const DEFAULT_REPLY_ROLE: &str = "membrane";
 const DEFAULT_TEXT_MODEL_ROLE: &str = "model";
 const DEFAULT_VOICE_MODEL_ROLE: &str = "model.elevenlabs";
 
+#[derive(Debug, Clone)]
+struct LearnedReflexWriteback {
+    preference_key: String,
+    precedence: i32,
+    reflexes_json: serde_json::Value,
+}
+
 fn local_node_id() -> String {
     std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string())
 }
@@ -42,6 +53,39 @@ fn debug_model_requests_enabled() -> bool {
             .as_deref(),
         Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
     )
+}
+
+fn parse_learned_reflex_writeback(
+    args: &serde_json::Value,
+) -> std::result::Result<Option<LearnedReflexWriteback>, String> {
+    let Some(learned_reflex) = args.get("learned_reflex") else {
+        return Ok(None);
+    };
+    let Some(obj) = learned_reflex.as_object() else {
+        return Err("routing.policy.propose: 'learned_reflex' must be an object.".into());
+    };
+    let preference_key = obj
+        .get("preference_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if preference_key.is_empty() {
+        return Err("routing.policy.propose: learned_reflex.preference_key is required.".into());
+    }
+    let precedence = obj.get("precedence").and_then(|v| v.as_i64()).unwrap_or(70) as i32;
+    let reflexes_json = obj
+        .get("reflexes")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if !reflexes_json.is_object() {
+        return Err("routing.policy.propose: learned_reflex.reflexes must be an object.".into());
+    }
+    Ok(Some(LearnedReflexWriteback {
+        preference_key,
+        precedence,
+        reflexes_json,
+    }))
 }
 
 #[cfg(test)]
@@ -63,6 +107,26 @@ fn extract_model_error_payload(task: &InboundTaskPayload) -> Option<TaskErrorPay
 fn extract_model_error(task: &InboundTaskPayload) -> Option<String> {
     let payload = extract_model_error_payload(task)?;
     Some(payload.display_message())
+}
+
+fn extract_model_audio_artifact(model_result: Option<&Value>) -> Option<String> {
+    extract_audio_artifact_json(model_result)
+}
+
+fn extract_native_live_pending_function_call_id(task: &InboundTaskPayload) -> Option<String> {
+    task.agent_action
+        .as_ref()
+        .and_then(|action| action.get("model_result"))
+        .and_then(|model_result| model_result.get("native_live"))
+        .and_then(|native_live| native_live.get("pending_function_call_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+fn parse_native_live_tool_response_content(content: &str) -> Value {
+    serde_json::from_str::<Value>(content).unwrap_or_else(|_| Value::String(content.to_string()))
 }
 
 fn should_attempt_provider_repair(error: &TaskErrorPayload, state: Option<&SessionState>) -> bool {
@@ -158,6 +222,13 @@ fn resolve_model_execution_target(
         .unwrap_or_else(|| fallback_role.into());
 
     (local_node_id(), target_role, None)
+}
+
+fn resolve_stage_execution_target(
+    state: Option<&SessionState>,
+    stage: &TurnRoutingStagePlan,
+) -> (String, String, Option<String>) {
+    resolve_model_execution_target(state, stage.capability.as_str(), &stage.controller_role)
 }
 
 fn normalized_user_content(task: &InboundTaskPayload) -> Option<String> {
@@ -383,11 +454,549 @@ fn action_to_capability(action: &str) -> &'static str {
     }
 }
 
+fn role_to_provider_hint(role: &str) -> Option<String> {
+    let provider = role
+        .strip_prefix("model.")
+        .filter(|provider| !provider.is_empty())?;
+    Some(provider.to_string())
+}
+
+fn cognitive_controller_role(capability: &str) -> &'static str {
+    match capability {
+        "voice.dialogue" => DEFAULT_TEXT_MODEL_ROLE,
+        "response.generate" => DEFAULT_TEXT_MODEL_ROLE,
+        _ => DEFAULT_TEXT_MODEL_ROLE,
+    }
+}
+
+fn cognitive_stage_plan(capability: &str) -> TurnRoutingStagePlan {
+    let profile =
+        turn_routed_capability_profile(capability).unwrap_or(TurnRoutedCapabilityProfile {
+            species: TurnRoutedCapabilitySpecies::TextGenerate,
+            capability: "text.generate",
+            request_class: "cognitive",
+            default_stage_kind: TurnRoutingStageKind::Cognition,
+            default_context_envelope: TurnContextEnvelopeKind::Cognitive,
+            composition: TurnCapabilityCompositionKind::StageLocal,
+            default_streaming: true,
+        });
+    let controller_role = cognitive_controller_role(profile.capability);
+    TurnRoutingStagePlan {
+        kind: profile.default_stage_kind,
+        capability: profile.capability.into(),
+        request_class: profile.request_class.into(),
+        context_envelope: profile.default_context_envelope,
+        controller_role: controller_role.into(),
+        provider_hint: role_to_provider_hint(controller_role),
+        model_ref: None,
+        streaming: profile.default_streaming,
+    }
+}
+
+fn voice_turn_supports_native_live(
+    media_routing: Option<&MediaRouting>,
+    had_voice_input: bool,
+) -> bool {
+    had_voice_input
+        || media_routing
+            .map(|routing| routing.capability == "voice.transcribe")
+            .unwrap_or(false)
+}
+
+fn routing_preference_matches_stage(
+    preference: &RoutingPreferenceBinding,
+    stage: &TurnRoutingStagePlan,
+) -> bool {
+    preference
+        .stage_kind
+        .as_deref()
+        .map(|kind| kind == stage_kind_name(stage.kind))
+        .unwrap_or(true)
+        && preference
+            .capability
+            .as_deref()
+            .map(|capability| capability == stage.capability)
+            .unwrap_or(true)
+}
+
+fn shared_model_ligand_signal(stage: &TurnRoutingStagePlan, bindings: &SessionBindings) -> i32 {
+    bindings
+        .shared_model_markers
+        .iter()
+        .map(|marker| model_marker_stage_signal(marker, stage))
+        .max()
+        .unwrap_or(0)
+}
+
+fn cognitive_receptor_baseline(stage: &TurnRoutingStagePlan, _voice_turn: bool) -> i32 {
+    match stage.capability.as_str() {
+        "text.generate" => 1,
+        _ => 0,
+    }
+}
+
+fn cognitive_receptor_score(
+    stage: &TurnRoutingStagePlan,
+    routing_preferences: &[RoutingPreferenceBinding],
+    bindings: &SessionBindings,
+    voice_turn: bool,
+) -> i32 {
+    let preference_signal = routing_preferences
+        .iter()
+        .filter(|pref| pref.preference_level >= 0)
+        .filter(|pref| pref.provider_hint.is_some() || pref.model_ref.is_some())
+        .filter(|pref| routing_preference_matches_stage(pref, stage))
+        .map(|pref| routing_preference_score(pref, stage, bindings))
+        .max()
+        .unwrap_or(0);
+
+    cognitive_receptor_baseline(stage, voice_turn)
+        + preference_signal
+        + shared_model_ligand_signal(stage, bindings)
+}
+
+fn select_cognitive_receptor_stage(
+    media_routing: Option<&MediaRouting>,
+    had_voice_input: bool,
+    routing_preferences: &[RoutingPreferenceBinding],
+    bindings: &SessionBindings,
+) -> TurnRoutingStagePlan {
+    let voice_turn = voice_turn_supports_native_live(media_routing, had_voice_input);
+    let mut candidates = vec![cognitive_stage_plan("text.generate")];
+    if voice_turn {
+        candidates.push(cognitive_stage_plan("response.generate"));
+        candidates.push(cognitive_stage_plan("voice.dialogue"));
+    }
+
+    candidates
+        .into_iter()
+        .max_by(|left, right| {
+            cognitive_receptor_score(left, routing_preferences, bindings, voice_turn)
+                .cmp(&cognitive_receptor_score(
+                    right,
+                    routing_preferences,
+                    bindings,
+                    voice_turn,
+                ))
+                .then_with(|| left.capability.cmp(&right.capability))
+        })
+        .unwrap_or_else(|| cognitive_stage_plan("text.generate"))
+}
+
+fn active_or_default_cognitive_stage(state: Option<&SessionState>) -> TurnRoutingStagePlan {
+    state
+        .and_then(|session| session.active_turn_routing_plan())
+        .and_then(|plan| stage_plan(plan, TurnRoutingStageKind::Cognition))
+        .cloned()
+        .unwrap_or_else(|| cognitive_stage_plan("text.generate"))
+}
+
+fn native_live_voice_prompt(content: &str, capability: &str) -> String {
+    let context = content.trim();
+    match capability {
+        "voice.dialogue" => {
+            if context.is_empty() {
+                "Respond helpfully to the user's attached voice input as a native streaming voice dialogue turn.".to_string()
+            } else {
+                format!(
+                    "Respond helpfully to the user's attached voice input as a native streaming voice dialogue turn. User context: {}.",
+                    context
+                )
+            }
+        }
+        "response.generate" => {
+            if context.is_empty() {
+                "Generate the best response for the user's attached voice input, using native multimodal response behavior when supported.".to_string()
+            } else {
+                format!(
+                    "Generate the best response for the user's attached voice input, using native multimodal response behavior when supported. User context: {}.",
+                    context
+                )
+            }
+        }
+        _ => transcription_prompt(content),
+    }
+}
+
+fn compile_turn_routing_plan(
+    media_routing: Option<&MediaRouting>,
+    voice_policy: Option<&VoiceResponsePolicy>,
+    had_voice_input: bool,
+    routing_preferences: &[RoutingPreferenceBinding],
+    bindings: &SessionBindings,
+) -> TurnRoutingPlan {
+    let mut stages = Vec::new();
+    let cognition_stage = select_cognitive_receptor_stage(
+        media_routing,
+        had_voice_input,
+        routing_preferences,
+        bindings,
+    );
+    let collapses_ingress = media_routing
+        .map(|routing| routing.capability == "voice.transcribe")
+        .unwrap_or(false)
+        && turn_routed_capability_profile(&cognition_stage.capability)
+            .map(|profile| {
+                profile.composition == TurnCapabilityCompositionKind::CollapsibleIngressCognition
+            })
+            .unwrap_or(false);
+
+    if let Some(routing) = media_routing {
+        if !collapses_ingress {
+            let profile = turn_routed_capability_profile(routing.capability).unwrap_or(
+                TurnRoutedCapabilityProfile {
+                    species: TurnRoutedCapabilitySpecies::MediaAnalyze,
+                    capability: "media.analyze",
+                    request_class: "transform",
+                    default_stage_kind: TurnRoutingStageKind::Ingress,
+                    default_context_envelope: TurnContextEnvelopeKind::Ingress,
+                    composition: TurnCapabilityCompositionKind::StageLocal,
+                    default_streaming: false,
+                },
+            );
+            let controller_role = match routing.capability {
+                "voice.transcribe" => DEFAULT_VOICE_MODEL_ROLE,
+                _ => DEFAULT_TEXT_MODEL_ROLE,
+            };
+            stages.push(TurnRoutingStagePlan {
+                kind: profile.default_stage_kind,
+                capability: routing.capability.to_string(),
+                request_class: profile.request_class.into(),
+                context_envelope: profile.default_context_envelope,
+                controller_role: controller_role.into(),
+                provider_hint: role_to_provider_hint(controller_role),
+                model_ref: None,
+                streaming: profile.default_streaming,
+            });
+        }
+    }
+
+    stages.push(cognition_stage.clone());
+
+    let tts_mode_enabled = voice_policy
+        .map(|policy| match policy.mode {
+            TtsMode::Off => false,
+            TtsMode::Auto => had_voice_input,
+            TtsMode::On => true,
+        })
+        .unwrap_or(false);
+    if tts_mode_enabled {
+        let controller_role = DEFAULT_VOICE_MODEL_ROLE;
+        let egress_profile = turn_routed_capability_profile("voice.synthesize").unwrap_or(
+            TurnRoutedCapabilityProfile {
+                species: TurnRoutedCapabilitySpecies::VoiceSynthesize,
+                capability: "voice.synthesize",
+                request_class: "synthesis",
+                default_stage_kind: TurnRoutingStageKind::Egress,
+                default_context_envelope: TurnContextEnvelopeKind::Egress,
+                composition: TurnCapabilityCompositionKind::StageLocal,
+                default_streaming: true,
+            },
+        );
+        stages.push(TurnRoutingStagePlan {
+            kind: egress_profile.default_stage_kind,
+            capability: egress_profile.capability.into(),
+            request_class: egress_profile.request_class.into(),
+            context_envelope: egress_profile.default_context_envelope,
+            controller_role: controller_role.into(),
+            provider_hint: role_to_provider_hint(controller_role),
+            model_ref: None,
+            streaming: egress_profile.default_streaming,
+        });
+    }
+
+    let mut plan = TurnRoutingPlan {
+        trigger: if collapses_ingress {
+            "voice_input_native_live".into()
+        } else if media_routing
+            .map(|routing| routing.capability == "voice.transcribe")
+            .unwrap_or(false)
+        {
+            "voice_input".into()
+        } else if had_voice_input {
+            "voice_input_no_transform".into()
+        } else {
+            "text_input".into()
+        },
+        stages,
+    };
+    apply_routing_preferences(&mut plan, routing_preferences, bindings);
+    plan
+}
+
+fn stage_kind_name(kind: TurnRoutingStageKind) -> &'static str {
+    match kind {
+        TurnRoutingStageKind::Ingress => "ingress",
+        TurnRoutingStageKind::Cognition => "cognition",
+        TurnRoutingStageKind::Egress => "egress",
+    }
+}
+
+fn select_stage_routing_preference<'a>(
+    stage: &TurnRoutingStagePlan,
+    routing_preferences: &'a [RoutingPreferenceBinding],
+    bindings: &SessionBindings,
+) -> Option<&'a RoutingPreferenceBinding> {
+    routing_preferences
+        .iter()
+        .filter(|pref| pref.preference_level >= 0)
+        .filter(|pref| pref.provider_hint.is_some() || pref.model_ref.is_some())
+        .filter(|pref| routing_preference_matches_stage(pref, stage))
+        .max_by(|left, right| {
+            routing_preference_score(left, stage, bindings)
+                .cmp(&routing_preference_score(right, stage, bindings))
+                .then_with(|| left.updated_at.cmp(&right.updated_at))
+                .then_with(|| left.preference_key.cmp(&right.preference_key))
+        })
+}
+
+fn routing_preference_score(
+    preference: &RoutingPreferenceBinding,
+    stage: &TurnRoutingStagePlan,
+    bindings: &SessionBindings,
+) -> i32 {
+    preference.preference_level * 100
+        + preference.weight
+        + routing_preference_catalog_signal(preference, stage, bindings)
+        + routing_preference_reflex_adjustment(preference, stage, bindings)
+}
+
+fn routing_preference_catalog_signal(
+    preference: &RoutingPreferenceBinding,
+    stage: &TurnRoutingStagePlan,
+    bindings: &SessionBindings,
+) -> i32 {
+    bindings
+        .shared_model_markers
+        .iter()
+        .filter(|marker| model_marker_matches_preference(marker, preference))
+        .map(|marker| model_marker_stage_signal(marker, stage))
+        .max()
+        .unwrap_or(0)
+}
+
+fn routing_preference_reflex_adjustment(
+    preference: &RoutingPreferenceBinding,
+    stage: &TurnRoutingStagePlan,
+    bindings: &SessionBindings,
+) -> i32 {
+    let touches_explicit_route =
+        preference.provider_hint.is_some() || preference.model_ref.is_some();
+    if !touches_explicit_route || stage.kind == TurnRoutingStageKind::Ingress {
+        return 0;
+    }
+
+    let remote_component_reflex = bindings
+        .effective_reflexes
+        .get("remote_component_reflex")
+        .and_then(|value| value.as_str());
+    let reward_bonus = bindings
+        .reflex_policy_agent_rewards
+        .iter()
+        .filter(|marker| reflex_marker_matches_preference(marker, preference))
+        .count() as i32
+        * 5;
+    let immune_penalty = bindings
+        .reflex_policy_agent_suppressions
+        .iter()
+        .filter(|marker| reflex_marker_matches_preference(marker, preference))
+        .count() as i32
+        * 5;
+
+    match remote_component_reflex {
+        Some("allow") => reward_bonus,
+        Some("deny") => -immune_penalty,
+        _ => 0,
+    }
+}
+
+fn reflex_marker_matches_preference(
+    marker: &serde_json::Value,
+    preference: &RoutingPreferenceBinding,
+) -> bool {
+    let Some(obj) = marker.as_object() else {
+        return false;
+    };
+
+    let preference_key = obj
+        .get("preference_key")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(preference_key) = preference_key {
+        return preference_key == preference.preference_key;
+    }
+
+    let provider_hint = obj
+        .get("provider_hint")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(provider_hint) = provider_hint {
+        if preference.provider_hint.as_deref() == Some(provider_hint) {
+            return true;
+        }
+    }
+
+    let model_ref = obj
+        .get("model_ref")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(model_ref) = model_ref {
+        if preference.model_ref.as_deref() == Some(model_ref) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn model_marker_matches_preference(
+    marker: &serde_json::Value,
+    preference: &RoutingPreferenceBinding,
+) -> bool {
+    let Some(obj) = marker.as_object() else {
+        return false;
+    };
+    let marker_model_ref = obj
+        .get("model_ref")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let (Some(marker_model_ref), Some(preference_model_ref)) =
+        (marker_model_ref, preference.model_ref.as_deref())
+    {
+        return marker_model_ref == preference_model_ref;
+    }
+
+    let marker_provider_hint = obj
+        .get("provider_hint")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let (Some(marker_provider_hint), Some(preference_provider_hint)) =
+        (marker_provider_hint, preference.provider_hint.as_deref())
+    {
+        return marker_provider_hint == preference_provider_hint;
+    }
+
+    false
+}
+
+fn model_marker_stage_signal(marker: &serde_json::Value, stage: &TurnRoutingStagePlan) -> i32 {
+    let Some(obj) = marker.as_object() else {
+        return 0;
+    };
+    let capability_markers = obj
+        .get("capability_markers")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let stage_capability_match = capability_markers
+        .iter()
+        .filter_map(|value| value.as_str())
+        .any(|capability| capability == stage.capability);
+    if !stage_capability_match {
+        return 0;
+    }
+
+    let speed_marker = obj
+        .get("speed_marker")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0) as i32;
+    let thinking_marker = obj
+        .get("thinking_marker")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0) as i32;
+    let tool_use_marker = obj
+        .get("tool_use_marker")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0) as i32;
+    let audio_native_marker = obj
+        .get("audio_native_marker")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0) as i32;
+
+    match stage.kind {
+        TurnRoutingStageKind::Ingress => speed_marker + audio_native_marker,
+        TurnRoutingStageKind::Cognition => {
+            let native_live_bonus = match stage.capability.as_str() {
+                "response.generate" => audio_native_marker,
+                "voice.dialogue" => audio_native_marker * 2,
+                _ => 0,
+            };
+            speed_marker / 3 + thinking_marker / 2 + tool_use_marker / 2 + native_live_bonus
+        }
+        TurnRoutingStageKind::Egress => speed_marker + audio_native_marker,
+    }
+}
+
+fn apply_routing_preferences(
+    plan: &mut TurnRoutingPlan,
+    routing_preferences: &[RoutingPreferenceBinding],
+    bindings: &SessionBindings,
+) {
+    for stage in &mut plan.stages {
+        if let Some(preference) =
+            select_stage_routing_preference(stage, routing_preferences, bindings)
+        {
+            if preference.provider_hint.is_some() {
+                stage.provider_hint = preference.provider_hint.clone();
+                stage.controller_role = implementation_to_model_role(
+                    preference.provider_hint.as_deref().unwrap_or_default(),
+                );
+            }
+            if preference.model_ref.is_some() {
+                stage.model_ref = preference.model_ref.clone();
+            }
+        }
+    }
+}
+
+fn stage_plan(
+    turn_routing_plan: &TurnRoutingPlan,
+    kind: TurnRoutingStageKind,
+) -> Option<&TurnRoutingStagePlan> {
+    turn_routing_plan
+        .stages
+        .iter()
+        .find(|stage| stage.kind == kind)
+}
+
+fn stage_routing_hints(stage: &TurnRoutingStagePlan) -> serde_json::Value {
+    serde_json::json!({
+        "implementation": stage.provider_hint,
+        "model_ref": stage.model_ref,
+        "controller_role": stage.controller_role,
+        "capability": stage.capability,
+        "context_envelope": match stage.context_envelope {
+            TurnContextEnvelopeKind::Ingress => "ingress",
+            TurnContextEnvelopeKind::Cognitive => "cognitive",
+            TurnContextEnvelopeKind::Egress => "egress",
+        },
+        "stage": match stage.kind {
+            TurnRoutingStageKind::Ingress => "ingress",
+            TurnRoutingStageKind::Cognition => "cognition",
+            TurnRoutingStageKind::Egress => "egress",
+        },
+        "streaming": stage.streaming,
+    })
+}
+
+fn active_turn_stage_routing_hints(
+    state: Option<&SessionState>,
+    kind: TurnRoutingStageKind,
+) -> Option<serde_json::Value> {
+    let turn_routing_plan = state?.active_turn_routing_plan()?;
+    let stage = stage_plan(turn_routing_plan, kind)?;
+    Some(stage_routing_hints(stage))
+}
+
 struct MediaRouting {
     action: String,
     capability: &'static str,
     attachments: Vec<TransportAttachment>,
-    strip_tools: bool,
 }
 
 /// Applies the agent's `MediaRoutingPolicy` to the candidate blob-backed attachments and returns
@@ -426,7 +1035,6 @@ fn resolve_media_routing(
         action: action_str.to_string(),
         capability: action_to_capability(action_str),
         attachments: candidate_attachments,
-        strip_tools: policy.strip_tools_on_media,
     })
 }
 
@@ -448,6 +1056,37 @@ fn format_role_command_reply(command: &SlashCommand, became_active: bool) -> Str
         }
         _ => "Role command completed.".into(),
     }
+}
+
+const ROLE_HANDOFF_MAX_ATTEMPTS: usize = 8;
+const DEFAULT_ROLE_HANDOFF_RETRY_MS: u64 = 250;
+
+fn is_specific_same_self_role_governance(tool_call: &ToolCall) -> bool {
+    matches!(
+        tool_call.tool_name.as_str(),
+        "role.configure" | "role.create_or_update"
+    ) && !tool_call
+        .arguments
+        .get("is_admin")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        && tool_call
+            .arguments
+            .get("role_name")
+            .and_then(|v| v.as_str())
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+        && tool_call
+            .arguments
+            .get("toolset_profile")
+            .and_then(|v| v.as_str())
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+        && tool_call
+            .arguments
+            .get("reasoning")
+            .and_then(|v| v.as_object())
+            .is_some()
 }
 
 fn command_bypasses_turn_start(command: &SlashCommand) -> bool {
@@ -489,8 +1128,10 @@ fn format_roles_report(active_incarnation_id: Option<&str>, roles: &[serde_json:
     lines.join("\n")
 }
 
-/// Locally cached role configuration, populated when `role.configure` succeeds.
-/// Used to reconstruct `RoleActivation` on inbound handoff without an IPC round-trip.
+/// Locally cached role configuration, populated when role configuration succeeds via
+/// the prompt-facing `role.create_or_update` workflow surface or the legacy
+/// `role.configure` compatibility alias. Used to reconstruct `RoleActivation`
+/// on inbound handoff without an IPC round-trip.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct CachedRoleConfig {
@@ -505,10 +1146,12 @@ struct CachedRoleConfig {
 pub struct AgentRuntime {
     ipc_client: PhiloticClient,
     agent_id: String,
+    guest_id: String,
     sessions: HashMap<String, SessionState>,
     /// MuninnDB config fetched from hotel at startup. None = NullMemoryEngine.
     muninn_config: Option<MuninnConfig>,
-    /// Role configurations registered via `role.configure`, keyed by role_name.
+    /// Role configurations registered via role configuration workflow/tool execution,
+    /// keyed by role_name.
     configured_roles: HashMap<String, CachedRoleConfig>,
     /// Agent profile (identity_text, soul_text, etc.) fetched from hotel at startup.
     /// Applied to every new session so the correct persona is used from the first turn.
@@ -519,16 +1162,65 @@ pub struct AgentRuntime {
 }
 
 impl AgentRuntime {
-    pub fn new(ipc_client: PhiloticClient, agent_id: impl Into<String>) -> Self {
+    pub fn new(
+        ipc_client: PhiloticClient,
+        agent_id: impl Into<String>,
+        guest_id: impl Into<String>,
+    ) -> Self {
         Self {
             ipc_client,
             agent_id: agent_id.into(),
+            guest_id: guest_id.into(),
             sessions: HashMap::new(),
             muninn_config: None,
             configured_roles: HashMap::new(),
             default_agent_profile: AgentProfile::default(),
             pending_drains: std::collections::VecDeque::new(),
         }
+    }
+
+    async fn request_role_handoff_with_backoff(
+        &mut self,
+        session_id: String,
+        role_name: String,
+        handoff_bundle: HandoffBundle,
+    ) -> Result<IpcResponse> {
+        for attempt in 0..ROLE_HANDOFF_MAX_ATTEMPTS {
+            let response = self
+                .ipc_client
+                .send_request(IpcRequest::HandoffToRole {
+                    session_id: session_id.clone(),
+                    role_name: role_name.clone(),
+                    handoff_bundle: handoff_bundle.clone(),
+                })
+                .await?;
+            match response {
+                IpcResponse::HandoffPending {
+                    role_name,
+                    readiness,
+                    retry_after_ms,
+                } if attempt + 1 < ROLE_HANDOFF_MAX_ATTEMPTS => {
+                    let retry_after_ms = retry_after_ms
+                        .unwrap_or(DEFAULT_ROLE_HANDOFF_RETRY_MS)
+                        .max(25);
+                    info!(
+                        role_name = %role_name,
+                        readiness = %readiness,
+                        retry_after_ms,
+                        attempt = attempt + 1,
+                        "Role handoff still materializing; retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(retry_after_ms)).await;
+                }
+                other => return Ok(other),
+            }
+        }
+
+        Ok(IpcResponse::HandoffPending {
+            role_name,
+            readiness: "materializing".into(),
+            retry_after_ms: Some(DEFAULT_ROLE_HANDOFF_RETRY_MS),
+        })
     }
 
     /// Fetch this agent's identity bundle from the hotel and store it as the default profile.
@@ -727,6 +1419,15 @@ impl AgentRuntime {
 
                     match serde_json::from_str::<InboundTaskPayload>(&task_json) {
                         Ok(task) if task.is_model_response() => {
+                            info!(
+                                session_id = task.session_id.as_deref().unwrap_or(""),
+                                turn_id = task.turn_id.as_deref().unwrap_or(""),
+                                final_reply_guest_id =
+                                    task.final_reply_guest_id.as_deref().unwrap_or(""),
+                                "Agent [{}] picked up model_response envelope [{}]",
+                                self.agent_id,
+                                task_id
+                            );
                             let task_ref = task.clone();
                             if let Err(err) = self.handle_model_response(task).await {
                                 error!("Failed to handle model response: {}", err);
@@ -1232,6 +1933,7 @@ impl AgentRuntime {
                 provider_repair_attempts: 0,
                 pending_text_reply: None,
                 had_voice_input,
+                turn_routing_plan: None,
                 awaiting_transcription_reentry: false,
                 scripted_loop_context: None,
                 associated_paracrine_ids: Vec::new(),
@@ -1263,30 +1965,15 @@ impl AgentRuntime {
 
         self.maybe_auto_recall_turn_memory(&session_id).await?;
 
-        let (
-            checkpoint_memory_type,
-            checkpoint_json,
-            index_state,
-            model_prompt,
-            model_context,
-            context_projection,
-            tools_for_model,
-        ) = {
+        let (checkpoint_memory_type, checkpoint_json, index_state) = {
             let state = self
                 .sessions
                 .get_mut(&session_id)
                 .expect("session should exist after ensuring and binding transport target");
-            let tools_for_model = state.project_tools_for_turn(&content);
-            let (model_prompt, model_context, context_projection) =
-                state.model_request_payloads(&content, &tools_for_model);
             (
                 state.checkpoint_memory_type(),
                 state.checkpoint_json(),
                 state.clone(),
-                model_prompt,
-                model_context,
-                context_projection,
-                tools_for_model,
             )
         };
 
@@ -1363,12 +2050,50 @@ impl AgentRuntime {
             .get(&session_id)
             .map(|s| s.agent_profile.media_routing_policy.clone())
             .unwrap_or_default();
+        let voice_policy = self
+            .sessions
+            .get(&session_id)
+            .map(|s| s.agent_profile.voice_response_policy.clone())
+            .unwrap_or_default();
+        let routing_preferences = self
+            .sessions
+            .get(&session_id)
+            .map(|s| s.bindings.routing_preferences.clone())
+            .unwrap_or_default();
+        let routing_bindings = self
+            .sessions
+            .get(&session_id)
+            .map(|s| s.bindings.clone())
+            .unwrap_or_default();
         let media_attachments = media_analysis_attachments(&task);
         let media_routing = resolve_media_routing(&media_policy, media_attachments);
+        let turn_routing_plan = compile_turn_routing_plan(
+            media_routing.as_ref(),
+            Some(&voice_policy),
+            had_voice_input,
+            &routing_preferences,
+            &routing_bindings,
+        );
         let awaiting_transcription_reentry = media_routing
             .as_ref()
             .map(|routing| routing.action == "transcribe")
             .unwrap_or(false);
+
+        let (checkpoint_memory_type, checkpoint_json, index_state) = {
+            let state = self
+                .sessions
+                .get_mut(&session_id)
+                .expect("active turn should still exist after context build");
+            state.bump_active_turn_iteration();
+            state.set_active_turn_phase(TurnPhase::WaitingModel);
+            state.set_active_turn_routing_plan(turn_routing_plan.clone());
+            state.set_active_turn_awaiting_transcription_reentry(awaiting_transcription_reentry);
+            (
+                state.checkpoint_memory_type(),
+                state.checkpoint_json(),
+                state.clone(),
+            )
+        };
 
         let _ = self
             .ipc_client
@@ -1380,63 +2105,115 @@ impl AgentRuntime {
                     "turn_id": turn_id,
                     "chat_id": chat_id,
                     "content": content,
+                    "turn_routing_plan": turn_routing_plan,
                 }),
             })
             .await?;
-
-        let (checkpoint_memory_type, checkpoint_json, index_state) = {
-            let state = self
-                .sessions
-                .get_mut(&session_id)
-                .expect("active turn should still exist after context build");
-            state.bump_active_turn_iteration();
-            state.set_active_turn_phase(TurnPhase::WaitingModel);
-            state.set_active_turn_awaiting_transcription_reentry(awaiting_transcription_reentry);
-            (
-                state.checkpoint_memory_type(),
-                state.checkpoint_json(),
-                state.clone(),
-            )
-        };
 
         self.ipc_client
             .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
             .await?;
         self.sync_session_index(&index_state).await?;
 
-        let (action, prompt, attachments, tools_for_model, capability) =
+        let (action, prompt, context, context_projection, attachments, tools_for_model, stage) =
             if let Some(routing) = media_routing {
-                let prompt = if routing.action == "transcribe" {
-                    transcription_prompt(&content)
+                if let Some(stage) =
+                    stage_plan(&turn_routing_plan, TurnRoutingStageKind::Ingress).cloned()
+                {
+                    let effective_tools = self
+                        .sessions
+                        .get(&session_id)
+                        .expect("session should exist while preparing model request")
+                        .project_tools_for_envelope(&content, stage.context_envelope);
+                    let (_, context, context_projection) = self
+                        .sessions
+                        .get(&session_id)
+                        .expect("session should exist while preparing model request")
+                        .model_request_payloads_for_envelope(
+                            &content,
+                            &effective_tools,
+                            stage.context_envelope,
+                        );
+                    let prompt = if routing.action == "transcribe" {
+                        transcription_prompt(&content)
+                    } else {
+                        media_analysis_prompt(&content, &routing.attachments)
+                    };
+                    (
+                        routing.action,
+                        prompt,
+                        context,
+                        context_projection,
+                        routing.attachments,
+                        effective_tools,
+                        stage,
+                    )
                 } else {
-                    media_analysis_prompt(&content, &routing.attachments)
-                };
-                let effective_tools = if routing.strip_tools {
-                    Vec::new()
-                } else {
-                    tools_for_model
-                };
-                (
-                    routing.action,
-                    prompt,
-                    routing.attachments,
-                    effective_tools,
-                    routing.capability,
-                )
+                    let stage = stage_plan(&turn_routing_plan, TurnRoutingStageKind::Cognition)
+                        .expect("cognition stage should exist for native-live media turns")
+                        .clone();
+                    let effective_tools = self
+                        .sessions
+                        .get(&session_id)
+                        .expect("session should exist while preparing model request")
+                        .project_tools_for_envelope(&content, stage.context_envelope);
+                    let (default_prompt, context, context_projection) = self
+                        .sessions
+                        .get(&session_id)
+                        .expect("session should exist while preparing model request")
+                        .model_request_payloads_for_envelope(
+                            &content,
+                            &effective_tools,
+                            stage.context_envelope,
+                        );
+                    let prompt = if matches!(
+                        stage.capability.as_str(),
+                        "response.generate" | "voice.dialogue"
+                    ) {
+                        native_live_voice_prompt(&content, &stage.capability)
+                    } else {
+                        default_prompt
+                    };
+                    (
+                        stage.capability.clone(),
+                        prompt,
+                        context,
+                        context_projection,
+                        routing.attachments,
+                        effective_tools,
+                        stage,
+                    )
+                }
             } else {
+                let stage = stage_plan(&turn_routing_plan, TurnRoutingStageKind::Cognition)
+                    .expect("cognition stage should exist for every turn")
+                    .clone();
+                let effective_tools = self
+                    .sessions
+                    .get(&session_id)
+                    .expect("session should exist while preparing model request")
+                    .project_tools_for_envelope(&content, stage.context_envelope);
+                let (prompt, context, context_projection) = self
+                    .sessions
+                    .get(&session_id)
+                    .expect("session should exist while preparing model request")
+                    .model_request_payloads_for_envelope(
+                        &content,
+                        &effective_tools,
+                        stage.context_envelope,
+                    );
                 (
-                    "generate_text".to_string(),
-                    model_prompt,
+                    stage.capability.clone(),
+                    prompt,
+                    context,
+                    context_projection,
                     Vec::new(),
-                    tools_for_model,
-                    "text.generate",
+                    effective_tools,
+                    stage,
                 )
             };
-        let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
-            self.sessions.get(&session_id),
-            capability,
-            DEFAULT_TEXT_MODEL_ROLE,
-        );
+        let (target_node, target_role, target_guest_id) =
+            resolve_stage_execution_target(self.sessions.get(&session_id), &stage);
 
         let attachment_kinds: Vec<&str> = attachments
             .iter()
@@ -1466,28 +2243,48 @@ impl AgentRuntime {
                 attachment.transport_error.as_deref()
             );
         }
+        let stage_summary = turn_routing_plan
+            .stages
+            .iter()
+            .map(|stage| format!("{:?}:{}", stage.kind, stage.capability))
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        info!(
+            "Session [{}] compiled turn routing plan trigger [{}]: {}",
+            session_id, turn_routing_plan.trigger, stage_summary
+        );
 
         let model_req = ModelRequestPayload {
             action,
-            request_class: Some(
-                if capability == "text.generate" {
-                    "cognitive"
-                } else {
-                    "transform"
-                }
-                .to_string(),
-            ),
+            request_class: Some(stage.request_class.clone()),
             session_id: session_id.clone(),
             turn_id,
             prompt,
-            user_content: content,
-            context: Some(model_context),
+            user_content: content.clone(),
+            context: Some(context),
             context_projection: Some(context_projection),
             attachments,
             tools_for_model,
-            response_contract: Some(
-                serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan", "memory_concept"] }),
-            ),
+            effective_rights: self
+                .sessions
+                .get(&session_id)
+                .expect("session should exist while preparing model request")
+                .bindings
+                .effective_rights
+                .clone(),
+            response_contract: Some(if stage.kind == TurnRoutingStageKind::Cognition {
+                self.sessions
+                    .get(&session_id)
+                    .expect("session should exist while preparing response contract")
+                    .cognitive_response_contract(
+                        &content,
+                        stage_plan(&turn_routing_plan, TurnRoutingStageKind::Egress).is_some(),
+                    )
+            } else {
+                serde_json::json!({})
+            }),
+            routing_hints: Some(stage_routing_hints(&stage)),
+            provider_options: None,
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
@@ -1496,7 +2293,7 @@ impl AgentRuntime {
             final_reply_guest_id,
         };
 
-        if debug_model_requests_enabled() && capability == "text.generate" {
+        if debug_model_requests_enabled() && stage.kind == TurnRoutingStageKind::Cognition {
             match serde_json::to_string_pretty(&model_req) {
                 Ok(json) => info!(
                     "PHILOTIC_DEBUG_MODEL_REQUESTS philote outbound model request session={} turn={}:\n{}",
@@ -1532,6 +2329,13 @@ impl AgentRuntime {
             None => return Ok(()),
         };
         self.ensure_session_loaded(&session_id, "unknown").await?;
+        let _ = self
+            .emit_turn_event(
+                &session_id,
+                "model_response_received",
+                Some(format!("Received model_response for turn {}", turn_id)),
+            )
+            .await;
 
         // Guard: if the active turn's turn_id doesn't match the incoming response, drop it.
         // This prevents stale model or synthesis responses from corrupting a newer active turn
@@ -1562,6 +2366,13 @@ impl AgentRuntime {
             .unwrap_or(false);
 
         if waiting_voice {
+            let _ = self
+                .emit_turn_event(
+                    &session_id,
+                    "voice_response_received",
+                    Some("Received voice synthesis response".into()),
+                )
+                .await;
             if let Some(model_error) = extract_model_error(&task) {
                 warn!(
                     "Session [{}] voice synthesis failed before audio delivery: {}",
@@ -1649,6 +2460,7 @@ impl AgentRuntime {
             .and_then(serde_json::Value::as_str)
             .filter(|s| !s.trim().is_empty())
             .map(str::to_string);
+        let audio_artifact = extract_model_audio_artifact(model_result);
 
         let partial_replies = model_result
             .and_then(|r| r.get("partial_replies"))
@@ -1698,6 +2510,13 @@ impl AgentRuntime {
 
         let action = interpret_model_payload(task.agent_action.as_ref(), task.content.as_deref());
         if awaiting_transcription_reentry {
+            let _ = self
+                .emit_turn_event(
+                    &session_id,
+                    "transcription_reentry_received",
+                    Some("Received transcription response for re-entry".into()),
+                )
+                .await;
             return match action {
                 AgentAction::Respond { content } => {
                     self.reenter_turn_after_transcription(session_id, turn_id, content)
@@ -1748,6 +2567,16 @@ impl AgentRuntime {
 
         match action {
             AgentAction::Respond { content } => {
+                let _ = self
+                    .emit_turn_event(
+                        &session_id,
+                        "model_response_classified_respond",
+                        Some(format!(
+                            "Model response classified as respond ({} chars)",
+                            content.chars().count()
+                        )),
+                    )
+                    .await;
                 for partial in partial_replies {
                     self.emit_partial_reply(&session_id, partial).await?;
                 }
@@ -1756,19 +2585,47 @@ impl AgentRuntime {
                     turn_id,
                     content,
                     spoken_text,
+                    audio_artifact,
                     memory_concept,
                     memory_candidate,
                 )
                 .await
             }
             AgentAction::ToolCall(tool_call) => {
+                let _ = self
+                    .emit_turn_event(
+                        &session_id,
+                        "model_response_classified_tool_call",
+                        Some(format!("Model requested tool {}", tool_call.tool_name)),
+                    )
+                    .await;
+                if let Some(function_call_id) = extract_native_live_pending_function_call_id(&task)
+                {
+                    if let Some(state) = self.sessions.get_mut(&session_id) {
+                        state.set_pending_native_live_function_call_id(function_call_id);
+                    }
+                }
                 self.handle_tool_call(session_id, turn_id, tool_call).await
             }
             AgentAction::RequestApproval(approval) => {
+                let _ = self
+                    .emit_turn_event(
+                        &session_id,
+                        "model_response_classified_approval",
+                        Some(format!("Model requested approval: {}", approval.reason)),
+                    )
+                    .await;
                 self.handle_approval_request(session_id, turn_id, approval, false)
                     .await
             }
             AgentAction::Fail { message } => {
+                let _ = self
+                    .emit_turn_event(
+                        &session_id,
+                        "model_response_classified_fail",
+                        Some(message.clone()),
+                    )
+                    .await;
                 self.fail_active_turn(session_id, turn_id, message).await
             }
         }
@@ -1782,6 +2639,61 @@ impl AgentRuntime {
         always_require_human: bool,
     ) -> Result<()> {
         let approval = Self::normalize_approval_request(approval);
+        let disposition = self
+            .sessions
+            .get(&session_id)
+            .map(|state| state.approval_interrupt_disposition(&approval, always_require_human))
+            .unwrap_or(ApprovalInterruptDisposition::Allow);
+
+        match disposition {
+            ApprovalInterruptDisposition::Allow => {}
+            ApprovalInterruptDisposition::RedirectToDirectResponse { note } => {
+                let chat_id = self
+                    .sessions
+                    .get(&session_id)
+                    .and_then(|state| state.active_turn.as_ref())
+                    .map(|turn| turn.chat_id.clone())
+                    .unwrap_or_default();
+                let task_id = self
+                    .sessions
+                    .get(&session_id)
+                    .and_then(|state| state.active_turn.as_ref())
+                    .map(|turn| turn.task_id);
+                if let Some(task_id) = task_id {
+                    let _ = self
+                        .ipc_client
+                        .send_request(IpcRequest::UpdateTask {
+                            task_id,
+                            state: "approval_redirected".into(),
+                            payload: serde_json::json!({
+                                "session_id": session_id,
+                                "turn_id": turn_id,
+                                "chat_id": chat_id,
+                                "approval_request": {
+                                    "approval_id": approval.approval_id,
+                                    "reason": approval.reason,
+                                },
+                                "policy_action": "redirect_to_direct_response"
+                            }),
+                        })
+                        .await;
+                }
+                return self
+                    .resume_turn_with_steering(
+                        session_id,
+                        turn_id,
+                        chat_id,
+                        note,
+                        "approval_redirected",
+                        "[Turn policy correction]",
+                    )
+                    .await;
+            }
+            ApprovalInterruptDisposition::RejectAsInvalidStage { reason } => {
+                return self.fail_active_turn(session_id, turn_id, reason).await;
+            }
+        }
+
         // `always_require_human` bypasses the approval policy entirely — the human operator
         // must approve in this session. Used for admin role creation, which cannot be
         // preapproved or bypassed by `auto_approve_all`.
@@ -1806,6 +2718,7 @@ impl AgentRuntime {
             final_reply_to,
             final_reply_role,
             final_reply_guest_id,
+            turn_routing_plan,
             checkpoint_memory_type,
             checkpoint_json,
             index_state,
@@ -1846,6 +2759,7 @@ impl AgentRuntime {
                 final_reply_to,
                 final_reply_role,
                 final_reply_guest_id,
+                state.active_turn_routing_plan().cloned(),
                 state.checkpoint_memory_type(),
                 state.checkpoint_json(),
                 state.clone(),
@@ -1874,6 +2788,7 @@ impl AgentRuntime {
                         "session_id": session_id,
                         "turn_id": turn_id,
                         "chat_id": chat_id,
+                        "turn_routing_plan": turn_routing_plan,
                         "approval_request": {
                             "approval_id": approval.approval_id,
                             "reason": approval.reason,
@@ -1923,6 +2838,7 @@ impl AgentRuntime {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await;
         }
@@ -1936,6 +2852,7 @@ impl AgentRuntime {
                     "session_id": session_id,
                     "turn_id": turn_id,
                     "chat_id": chat_id,
+                    "turn_routing_plan": turn_routing_plan,
                     "approval_request": {
                         "approval_id": approval.approval_id,
                         "reason": approval.reason,
@@ -2031,7 +2948,10 @@ impl AgentRuntime {
             // synthesize an ApprovalRequest before executing. This runs independently of
             // whether the model itself requested approval — it is the agent's safety gate.
             // Skipped when bypass_approval is true (i.e. we are resuming after a resolution).
-            let force_approval = if bypass_approval {
+            let is_specific_same_self_role_governance =
+                !bypass_approval && is_specific_same_self_role_governance(&tool_call);
+
+            let force_approval = if bypass_approval || is_specific_same_self_role_governance {
                 false
             } else {
                 self.sessions
@@ -2064,19 +2984,26 @@ impl AgentRuntime {
             // This check runs before the normal force_approval gate so it can set always_require_human.
             // Bypassed when bypass_approval is true (already resolved by the operator).
             let is_admin_role_creation = !bypass_approval
-                && tool_call.tool_name == "role.configure"
+                && matches!(
+                    tool_call.tool_name.as_str(),
+                    "role.configure" | "role.create_or_update"
+                )
                 && tool_call
                     .arguments
                     .get("is_admin")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
 
-            // rule.propose always requires live operator approval — cannot be preapproved or bypassed.
-            // Rules are durable and permanently affect agent behavior, so human confirmation is required.
-            // (bypass_approval does NOT bypass rule.propose — that one is unconditional.)
-            let is_rule_propose = !bypass_approval && tool_call.tool_name == "rule.propose";
+            // Durable self-governance proposals always require live operator approval — cannot be
+            // preapproved or bypassed. This currently covers both general rules and routing-policy
+            // refinements, since either one changes future agent behavior.
+            let is_durable_governance_proposal = !bypass_approval
+                && matches!(
+                    tool_call.tool_name.as_str(),
+                    "rule.propose" | "routing.policy.propose"
+                );
 
-            if is_admin_role_creation || is_rule_propose || force_approval {
+            if is_admin_role_creation || is_durable_governance_proposal || force_approval {
                 // Set pending_tool_call so the approval handler can read it for class lookup.
                 if let Some(state) = self.sessions.get_mut(&session_id) {
                     state.set_pending_tool_call(tool_call.clone());
@@ -2100,11 +3027,21 @@ impl AgentRuntime {
                         ),
                         format!("Admin role '{}' approved.", role_name_hint),
                     )
-                } else if is_rule_propose {
-                    (
-                        "Rule proposal requires your explicit live approval.".to_string(),
-                        "Rule proposal approved.".to_string(),
-                    )
+                } else if is_durable_governance_proposal {
+                    let (reason, approved_response) =
+                        if tool_call.tool_name == "routing.policy.propose" {
+                            (
+                                "Routing policy proposal requires your explicit live approval."
+                                    .to_string(),
+                                "Routing policy proposal approved.".to_string(),
+                            )
+                        } else {
+                            (
+                                "Rule proposal requires your explicit live approval.".to_string(),
+                                "Rule proposal approved.".to_string(),
+                            )
+                        };
+                    (reason, approved_response)
                 } else {
                     (
                         format!(
@@ -2124,7 +3061,7 @@ impl AgentRuntime {
                         session_id,
                         turn_id,
                         synthetic,
-                        is_admin_role_creation || is_rule_propose,
+                        is_admin_role_creation || is_durable_governance_proposal,
                     )
                     .await;
             }
@@ -2345,6 +3282,8 @@ impl AgentRuntime {
                     tool_name: tool_result.tool_name.clone(),
                     arguments: serde_json::json!({}),
                 });
+            let pending_native_live_function_call_id =
+                state.take_pending_native_live_function_call_id();
 
             state.push_tool_history(tool_call, tool_result.clone());
             state.clear_pending_tool_call();
@@ -2396,6 +3335,17 @@ impl AgentRuntime {
                             active_turn.final_reply_role.clone(),
                             active_turn.final_reply_guest_id.clone(),
                             tools,
+                            pending_native_live_function_call_id.map(|function_call_id| {
+                                serde_json::json!({
+                                    "live_tool_response": {
+                                        "function_call_id": function_call_id,
+                                        "tool_name": tool_result.tool_name,
+                                        "tool_response": parse_native_live_tool_response_content(
+                                            &tool_result.content,
+                                        ),
+                                    }
+                                })
+                            }),
                             state.checkpoint_memory_type(),
                             state.checkpoint_json(),
                             state.clone(),
@@ -2439,6 +3389,7 @@ impl AgentRuntime {
                 final_reply_role,
                 final_reply_guest_id,
                 tools_for_model,
+                provider_options,
                 checkpoint_memory_type,
                 checkpoint_json,
                 index_state,
@@ -2452,20 +3403,44 @@ impl AgentRuntime {
                     .emit_turn_event(&session_id, "waiting_tool", None)
                     .await;
 
+                let cognitive_stage =
+                    active_or_default_cognitive_stage(self.sessions.get(&session_id));
                 let model_req = ModelRequestPayload {
-                    action: "generate_text".to_string(),
-                    request_class: Some("cognitive".to_string()),
+                    action: cognitive_stage.capability.clone(),
+                    request_class: Some(cognitive_stage.request_class.clone()),
                     session_id: session_id.clone(),
                     turn_id,
                     prompt,
-                    user_content,
+                    user_content: user_content.clone(),
                     context: Some(context),
                     context_projection: Some(context_projection),
                     attachments: Vec::new(),
                     tools_for_model,
+                    effective_rights: self
+                        .sessions
+                        .get(&session_id)
+                        .expect("session should exist while preparing model request")
+                        .bindings
+                        .effective_rights
+                        .clone(),
                     response_contract: Some(
-                        serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan"] }),
+                        self.sessions
+                            .get(&session_id)
+                            .expect("session should exist while preparing response contract")
+                            .cognitive_response_contract(
+                                &user_content,
+                                active_turn_stage_routing_hints(
+                                    self.sessions.get(&session_id),
+                                    TurnRoutingStageKind::Egress,
+                                )
+                                .is_some(),
+                            ),
                     ),
+                    routing_hints: active_turn_stage_routing_hints(
+                        self.sessions.get(&session_id),
+                        TurnRoutingStageKind::Cognition,
+                    ),
+                    provider_options,
                     chat_id,
                     reply_to: local_node_id(),
                     reply_role: "agent".into(),
@@ -2474,10 +3449,9 @@ impl AgentRuntime {
                     final_reply_guest_id,
                 };
 
-                let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
+                let (target_node, target_role, target_guest_id) = resolve_stage_execution_target(
                     self.sessions.get(&session_id),
-                    "text.generate",
-                    DEFAULT_TEXT_MODEL_ROLE,
+                    &cognitive_stage,
                 );
 
                 info!(
@@ -2569,20 +3543,43 @@ impl AgentRuntime {
             .emit_turn_event(&session_id, "loop_recovering", None)
             .await;
 
+        let cognitive_stage = active_or_default_cognitive_stage(self.sessions.get(&session_id));
         let model_req = ModelRequestPayload {
-            action: "generate_text".to_string(),
-            request_class: Some("cognitive".to_string()),
+            action: cognitive_stage.capability.clone(),
+            request_class: Some(cognitive_stage.request_class.clone()),
             session_id: session_id.clone(),
             turn_id,
             prompt,
-            user_content,
+            user_content: user_content.clone(),
             context: Some(context),
             context_projection: Some(context_projection),
             attachments: Vec::new(),
             tools_for_model,
+            effective_rights: self
+                .sessions
+                .get(&session_id)
+                .expect("session should exist while preparing model request")
+                .bindings
+                .effective_rights
+                .clone(),
             response_contract: Some(
-                serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan"] }),
+                self.sessions
+                    .get(&session_id)
+                    .expect("session should exist while preparing response contract")
+                    .cognitive_response_contract(
+                        &user_content,
+                        active_turn_stage_routing_hints(
+                            self.sessions.get(&session_id),
+                            TurnRoutingStageKind::Egress,
+                        )
+                        .is_some(),
+                    ),
             ),
+            routing_hints: active_turn_stage_routing_hints(
+                self.sessions.get(&session_id),
+                TurnRoutingStageKind::Cognition,
+            ),
+            provider_options: None,
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
@@ -2604,11 +3601,8 @@ impl AgentRuntime {
             }
         }
 
-        let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
-            self.sessions.get(&session_id),
-            "text.generate",
-            DEFAULT_TEXT_MODEL_ROLE,
-        );
+        let (target_node, target_role, target_guest_id) =
+            resolve_stage_execution_target(self.sessions.get(&session_id), &cognitive_stage);
 
         self.ipc_client
             .send_request(IpcRequest::EmitTask {
@@ -2669,6 +3663,11 @@ impl AgentRuntime {
             .await?;
         self.sync_session_index(&index_state).await?;
 
+        let turn_routing_plan = self
+            .sessions
+            .get(&session_id)
+            .and_then(|state| state.active_turn_routing_plan().cloned());
+
         let _ = self
             .ipc_client
             .send_request(IpcRequest::UpdateTask {
@@ -2679,6 +3678,7 @@ impl AgentRuntime {
                     "turn_id": turn_id,
                     "chat_id": reentry.chat_id,
                     "content": reentry.user_content,
+                    "turn_routing_plan": turn_routing_plan,
                 }),
             })
             .await?;
@@ -2687,23 +3687,22 @@ impl AgentRuntime {
             .sessions
             .get(&session_id)
             .map(|state| {
-                let projection = state.build_context_projection(&reentry.user_content);
-                (
-                    Some(state.model_context_from_projection(&projection)),
-                    Some(
-                        serde_json::to_value(&projection)
-                            .expect("context projection should serialize"),
-                    ),
-                )
+                let (_, context, context_projection) = state.model_request_payloads_for_envelope(
+                    &reentry.user_content,
+                    &reentry.tools_for_model,
+                    TurnContextEnvelopeKind::Cognitive,
+                );
+                (Some(context), Some(context_projection))
             })
             .unwrap_or((None, None));
         if let Some(state) = self.sessions.get_mut(&session_id) {
             state.clear_handoff_summary();
         }
 
+        let cognitive_stage = active_or_default_cognitive_stage(self.sessions.get(&session_id));
         let model_req = ModelRequestPayload {
-            action: "generate_text".to_string(),
-            request_class: Some("cognitive".to_string()),
+            action: cognitive_stage.capability.clone(),
+            request_class: Some(cognitive_stage.request_class.clone()),
             session_id: session_id.clone(),
             turn_id,
             prompt: reentry.prompt,
@@ -2712,9 +3711,31 @@ impl AgentRuntime {
             context_projection,
             attachments: Vec::new(),
             tools_for_model: reentry.tools_for_model,
+            effective_rights: self
+                .sessions
+                .get(&session_id)
+                .expect("session should exist while preparing model request")
+                .bindings
+                .effective_rights
+                .clone(),
             response_contract: Some(
-                serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan", "memory_concept"] }),
+                self.sessions
+                    .get(&session_id)
+                    .expect("session should exist while preparing response contract")
+                    .cognitive_response_contract(
+                        &reentry.user_content,
+                        active_turn_stage_routing_hints(
+                            self.sessions.get(&session_id),
+                            TurnRoutingStageKind::Egress,
+                        )
+                        .is_some(),
+                    ),
             ),
+            routing_hints: active_turn_stage_routing_hints(
+                self.sessions.get(&session_id),
+                TurnRoutingStageKind::Cognition,
+            ),
+            provider_options: None,
             chat_id: reentry.chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
@@ -2725,7 +3746,7 @@ impl AgentRuntime {
 
         let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
             self.sessions.get(&session_id),
-            "text.generate",
+            cognitive_stage.capability.as_str(),
             DEFAULT_TEXT_MODEL_ROLE,
         );
 
@@ -2830,6 +3851,38 @@ impl AgentRuntime {
                 target_node: final_reply_to,
                 target_role: final_reply_role,
                 target_guest_id: final_reply_guest_id,
+                task_json: serde_json::to_string(&event_payload)?,
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    async fn emit_turn_event_to(
+        &mut self,
+        session_id: String,
+        turn_id: String,
+        chat_id: String,
+        target_node: String,
+        target_role: String,
+        target_guest_id: Option<String>,
+        event: &str,
+        partial_content: Option<String>,
+    ) -> Result<()> {
+        let event_payload = TurnEventPayload {
+            action: "turn_event",
+            event: event.to_string(),
+            session_id,
+            turn_id,
+            chat_id,
+            partial_content,
+        };
+
+        self.ipc_client
+            .send_request(IpcRequest::EmitTask {
+                target_node,
+                target_role,
+                target_guest_id,
                 task_json: serde_json::to_string(&event_payload)?,
             })
             .await?;
@@ -2999,6 +4052,7 @@ impl AgentRuntime {
         turn_id: String,
         content: String,
         spoken_text: Option<String>,
+        audio_artifact: Option<String>,
         memory_concept: Option<String>,
         memory_candidate: Option<MemoryCandidate>,
     ) -> Result<()> {
@@ -3015,12 +4069,67 @@ impl AgentRuntime {
             .map(|t| t.had_voice_input)
             .unwrap_or(false);
 
+        let _ = self
+            .emit_turn_event(
+                &session_id,
+                "agent_response_finalizing",
+                Some(format!(
+                    "Finalizing response voice_input={} audio_artifact={} spoken_text={}",
+                    had_voice_input,
+                    audio_artifact.is_some(),
+                    spoken_text.is_some()
+                )),
+            )
+            .await;
+
+        if let Some(audio_artifact) = audio_artifact {
+            if voice_policy.is_active(had_voice_input) || had_voice_input {
+                let _ = self
+                    .emit_turn_event(
+                        &session_id,
+                        "reply_delivery_started",
+                        Some("Delivering cognitive audio artifact directly".into()),
+                    )
+                    .await;
+                return self
+                    .deliver_text_reply(
+                        session_id,
+                        turn_id,
+                        content,
+                        Some(audio_artifact),
+                        voice_policy.caption_enabled(),
+                        memory_concept,
+                        memory_candidate,
+                    )
+                    .await;
+            }
+
+            warn!(
+                "Session [{}] model returned an audio artifact on a non-voice turn; delivering text only and ignoring the unexpected artifact",
+                session_id
+            );
+        }
+
         if voice_policy.is_active(had_voice_input) {
+            let _ = self
+                .emit_turn_event(
+                    &session_id,
+                    "voice_synthesis_started",
+                    Some("Starting voice synthesis for final reply".into()),
+                )
+                .await;
             return self
                 .start_voice_synthesis(session_id, turn_id, content, spoken_text, voice_policy)
                 .await;
         }
 
+        let _ = self
+            .emit_turn_event(
+                &session_id,
+                "reply_delivery_started",
+                Some("Delivering final text reply".into()),
+            )
+            .await;
         self.deliver_text_reply(
             session_id,
             turn_id,
@@ -3048,6 +4157,7 @@ impl AgentRuntime {
             final_reply_to,
             final_reply_role,
             final_reply_guest_id,
+            turn_routing_plan,
             checkpoint_memory_type,
             checkpoint_json,
             index_state,
@@ -3076,6 +4186,7 @@ impl AgentRuntime {
                 final_reply_to,
                 final_reply_role,
                 final_reply_guest_id,
+                state.active_turn_routing_plan().cloned(),
                 state.checkpoint_memory_type(),
                 state.checkpoint_json(),
                 state.clone(),
@@ -3096,6 +4207,7 @@ impl AgentRuntime {
                     "session_id": session_id,
                     "turn_id": turn_id,
                     "chat_id": chat_id,
+                    "turn_routing_plan": turn_routing_plan,
                 }),
             })
             .await?;
@@ -3129,6 +4241,10 @@ impl AgentRuntime {
             "kind": "voice.synthesize",
             "request_class": "synthesis",
             "provider": policy.provider,
+            "routing_hints": turn_routing_plan
+                .as_ref()
+                .and_then(|plan| stage_plan(plan, TurnRoutingStageKind::Egress))
+                .map(stage_routing_hints),
             "spoken_text": spoken_text.unwrap_or_else(|| strip_markup(&display_text)),
             "voice_id": policy.voice_id,
             "model": policy.model,
@@ -3169,7 +4285,7 @@ impl AgentRuntime {
             .unwrap_or_default();
 
         // Validate the audio content — if it doesn't look like a valid audio artifact, fall back.
-        let audio_artifact = if raw_audio_content.trim_start().starts_with('{') {
+        let audio_artifact = if parse_audio_artifact_json(&raw_audio_content).is_ok() {
             Some(raw_audio_content.clone())
         } else {
             warn!(
@@ -3282,14 +4398,17 @@ impl AgentRuntime {
     ) -> Result<()> {
         let (completed_turn, checkpoint_memory_type, checkpoint_json, index_state) = {
             let Some(state) = self.sessions.get_mut(&session_id) else {
-                warn!("deliver_text_reply: unknown session {}", session_id);
+                warn!(
+                    "deliver_text_reply: unknown session {} while delivering turn {}",
+                    session_id, turn_id
+                );
                 return Ok(());
             };
 
             let Some(completed_turn) = state.complete_active_turn(content.clone()) else {
                 warn!(
-                    "deliver_text_reply: no active turn for session {}",
-                    session_id
+                    "deliver_text_reply: no active turn for session {} while delivering response turn {}",
+                    session_id, turn_id
                 );
                 return Ok(());
             };
@@ -3347,6 +4466,12 @@ impl AgentRuntime {
             content
         };
 
+        // Capture fields needed after the task_json if-else (values may be moved into the else branch).
+        let emit_session_id = session_id.clone();
+        let emit_turn_id = turn_id.clone();
+        let emit_chat_id = completed_turn.chat_id.clone();
+        let emit_audio_has_artifact = audio_artifact.is_some();
+
         // If this turn was triggered by a paracrine_request, reply as a
         // `paracrine_response` so A's routing reflex handles it correctly.
         // Use source_session_id / source_chat_id from the exosome (stored on the turn)
@@ -3400,18 +4525,35 @@ impl AgentRuntime {
             };
             serde_json::to_string(&reply_payload)?
         };
+        let final_reply_to = completed_turn.final_reply_to.clone();
+        let final_reply_role = completed_turn.final_reply_role.clone();
+        let final_reply_guest_id = completed_turn.final_reply_guest_id.clone();
 
         self.ipc_client
             .send_request(IpcRequest::EmitTask {
-                target_node: completed_turn.final_reply_to,
-                target_role: completed_turn.final_reply_role,
-                target_guest_id: completed_turn.final_reply_guest_id,
+                target_node: final_reply_to.clone(),
+                target_role: final_reply_role.clone(),
+                target_guest_id: final_reply_guest_id.clone(),
                 task_json,
             })
             .await?;
 
-        // After completing this turn, schedule the next pending user task for dispatch.
-        self.drain_next_user_task(&attend_session_id);
+        let _ = self
+            .emit_turn_event_to(
+                emit_session_id,
+                emit_turn_id,
+                emit_chat_id,
+                final_reply_to,
+                final_reply_role,
+                final_reply_guest_id,
+                "reply_delivery_emitted",
+                Some(format!(
+                    "Reply emitted to membrane audio_artifact={} text_caption={}",
+                    emit_audio_has_artifact,
+                    send_text_caption
+                )),
+            )
+            .await;
 
         // Attend hook (Slice E): fire-and-forget autobiographical memory write.
         if let Some(engine) = self.memory_engine_for(&self.agent_id, &self.agent_id) {
@@ -3740,6 +4882,7 @@ impl AgentRuntime {
                         turn_id,
                         content,
                         spoken_text,
+                        None,
                         memory_concept,
                         memory_candidate,
                     )
@@ -3835,20 +4978,43 @@ impl AgentRuntime {
             .await?;
         self.sync_session_index(&index_state).await?;
 
+        let cognitive_stage = active_or_default_cognitive_stage(self.sessions.get(&session_id));
         let model_req = ModelRequestPayload {
-            action: "generate_text".to_string(),
-            request_class: Some("cognitive".to_string()),
+            action: cognitive_stage.capability.clone(),
+            request_class: Some(cognitive_stage.request_class.clone()),
             session_id: session_id.clone(),
             turn_id,
             prompt,
-            user_content,
+            user_content: user_content.clone(),
             context: Some(context),
             context_projection: Some(context_projection),
             attachments: Vec::new(),
             tools_for_model: tools,
+            effective_rights: self
+                .sessions
+                .get(&session_id)
+                .expect("session should exist while preparing model request")
+                .bindings
+                .effective_rights
+                .clone(),
             response_contract: Some(
-                serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan"] }),
+                self.sessions
+                    .get(&session_id)
+                    .expect("session should exist while preparing response contract")
+                    .cognitive_response_contract(
+                        &user_content,
+                        active_turn_stage_routing_hints(
+                            self.sessions.get(&session_id),
+                            TurnRoutingStageKind::Egress,
+                        )
+                        .is_some(),
+                    ),
             ),
+            routing_hints: active_turn_stage_routing_hints(
+                self.sessions.get(&session_id),
+                TurnRoutingStageKind::Cognition,
+            ),
+            provider_options: None,
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
@@ -3859,7 +5025,7 @@ impl AgentRuntime {
 
         let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
             self.sessions.get(&session_id),
-            "text.generate",
+            cognitive_stage.capability.as_str(),
             DEFAULT_TEXT_MODEL_ROLE,
         );
 
@@ -4315,10 +5481,11 @@ impl AgentRuntime {
             let state = self.sessions.entry(session_id.clone()).or_insert_with(|| {
                 SessionState::new(session_id.clone(), self.agent_id.clone(), "handoff".into())
             });
+            state.active_incarnation_id = Some(self.guest_id.clone());
 
             let activation = crate::session::RoleActivation {
                 role_name: to_role.clone(),
-                active_incarnation_id: None,
+                active_incarnation_id: Some(self.guest_id.clone()),
                 activation_reason: bundle
                     .handoff_reason
                     .clone()
@@ -4403,6 +5570,8 @@ impl AgentRuntime {
     ) -> Result<()> {
         let response = match &command {
             SlashCommand::Role { role_name } => {
+                let target_role_lens =
+                    resolve_target_role_lens(&mut self.ipc_client, &self.agent_id, role_name).await;
                 let handoff_bundle = self
                     .sessions
                     .get(&session_id)
@@ -4412,6 +5581,7 @@ impl AgentRuntime {
                             &command_turn_id,
                             "manual_role_switch",
                             Some("orchestrator".into()),
+                            target_role_lens.as_ref(),
                         )
                     })
                     .unwrap_or_else(|| HandoffBundle {
@@ -4432,13 +5602,12 @@ impl AgentRuntime {
                         expected_return_mode: Some("required".into()),
                         cleanup_actions: vec!["switch_active_role".into()],
                     });
-                self.ipc_client
-                    .send_request(IpcRequest::HandoffToRole {
-                        session_id: session_id.clone(),
-                        role_name: role_name.clone(),
-                        handoff_bundle,
-                    })
-                    .await?
+                self.request_role_handoff_with_backoff(
+                    session_id.clone(),
+                    role_name.clone(),
+                    handoff_bundle,
+                )
+                .await?
             }
             SlashCommand::Back => {
                 self.ipc_client
@@ -4480,6 +5649,18 @@ impl AgentRuntime {
                     "became_active": became_active,
                 }),
                 became_active.then_some(handoff_guest_id),
+            ),
+            IpcResponse::HandoffPending { .. } => (
+                format_role_command_reply(&command, false),
+                "role_handoff_materializing",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "turn_id": command_turn_id,
+                    "chat_id": command_chat_id,
+                    "role_command": "handoff_to_role",
+                    "became_active": false,
+                }),
+                None,
             ),
             IpcResponse::HandoffBackAck {
                 handoff_guest_id,
@@ -4688,39 +5869,64 @@ impl AgentRuntime {
         let tools_for_model = self
             .sessions
             .get(&session_id)
-            .map(|state| state.tool_assembly.tools_for_model.clone())
+            .map(|state| {
+                state.project_tools_for_envelope(&user_content, TurnContextEnvelopeKind::Cognitive)
+            })
             .unwrap_or_default();
 
         let (context, context_projection) = self
             .sessions
             .get(&session_id)
             .map(|state| {
-                let projection = state.build_context_projection(&user_content);
-                (
-                    Some(state.model_context_from_projection(&projection)),
-                    Some(
-                        serde_json::to_value(&projection)
-                            .expect("context projection should serialize"),
-                    ),
-                )
+                let (_, context, context_projection) = state.model_request_payloads_for_envelope(
+                    &user_content,
+                    &tools_for_model,
+                    TurnContextEnvelopeKind::Cognitive,
+                );
+                (Some(context), Some(context_projection))
             })
             .unwrap_or((None, None));
         if let Some(state) = self.sessions.get_mut(&session_id) {
             state.clear_handoff_summary();
         }
 
+        let cognitive_stage = active_or_default_cognitive_stage(self.sessions.get(&session_id));
         let model_req = ModelRequestPayload {
-            action: "generate_text".to_string(),
-            request_class: Some("cognitive".to_string()),
+            action: cognitive_stage.capability.clone(),
+            request_class: Some(cognitive_stage.request_class.clone()),
             session_id: session_id.clone(),
             turn_id,
             prompt,
-            user_content,
+            user_content: user_content.clone(),
             context,
             context_projection,
             attachments: Vec::new(),
             tools_for_model,
-            response_contract: None,
+            effective_rights: self
+                .sessions
+                .get(&session_id)
+                .expect("session should exist while preparing model request")
+                .bindings
+                .effective_rights
+                .clone(),
+            response_contract: Some(
+                self.sessions
+                    .get(&session_id)
+                    .expect("session should exist while preparing response contract")
+                    .cognitive_response_contract(
+                        &user_content,
+                        active_turn_stage_routing_hints(
+                            self.sessions.get(&session_id),
+                            TurnRoutingStageKind::Egress,
+                        )
+                        .is_some(),
+                    ),
+            ),
+            routing_hints: active_turn_stage_routing_hints(
+                self.sessions.get(&session_id),
+                TurnRoutingStageKind::Cognition,
+            ),
+            provider_options: None,
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
@@ -4731,7 +5937,7 @@ impl AgentRuntime {
 
         let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
             self.sessions.get(&session_id),
-            "text.generate",
+            cognitive_stage.capability.as_str(),
             DEFAULT_TEXT_MODEL_ROLE,
         );
 
@@ -5510,8 +6716,9 @@ impl AgentRuntime {
                 })
                 .await
             }
-            "role.configure" => {
+            "role.configure" | "role.create_or_update" => {
                 let args = &payload.arguments;
+                let tool_surface = payload.tool_name.as_str();
 
                 macro_rules! require_str_arg {
                     ($key:literal) => {
@@ -5523,8 +6730,8 @@ impl AgentRuntime {
                                         payload.session_id,
                                         payload.turn_id,
                                         format!(
-                                            "role.configure: missing required argument '{}'",
-                                            $key
+                                            "{}: missing required argument '{}'",
+                                            tool_surface, $key
                                         ),
                                     )
                                     .await;
@@ -5541,7 +6748,10 @@ impl AgentRuntime {
                         .fail_active_turn(
                             payload.session_id,
                             payload.turn_id,
-                            "role.configure: missing required object argument 'reasoning'".into(),
+                            format!(
+                                "{}: missing required object argument 'reasoning'",
+                                tool_surface
+                            ),
                         )
                         .await;
                 }
@@ -5586,24 +6796,95 @@ impl AgentRuntime {
                     .map(|r| r.role_name.clone())
                     .unwrap_or_else(|| "orchestrator".to_string());
 
-                let req = IpcRequest::ConfigureRole {
-                    agent_id: self.agent_id.clone(),
-                    role_name: role_name.clone(),
-                    guest_id: format!("{}:{}", self.agent_id, role_name),
-                    calling_role,
-                    toolset_profile,
-                    role_identity_addendum,
-                    role_manifest,
-                    is_admin,
-                    inactive_ttl_seconds,
-                    iteration_cap,
-                    approval_policy,
-                    model_profile,
-                    context_window_policy,
+                let req = if tool_surface == "role.create_or_update" {
+                    IpcRequest::ExecuteWorkflow {
+                        workflow_name: "role.create_or_update".into(),
+                        agent_id: self.agent_id.clone(),
+                        calling_role,
+                        arguments: serde_json::json!({
+                            "role_name": role_name.clone(),
+                            "guest_id": format!("{}:{}", self.agent_id, role_name),
+                            "toolset_profile": toolset_profile,
+                            "role_identity_addendum": role_identity_addendum,
+                            "role_manifest": role_manifest,
+                            "is_admin": is_admin,
+                            "inactive_ttl_seconds": inactive_ttl_seconds,
+                            "iteration_cap": iteration_cap,
+                            "approval_policy": approval_policy,
+                            "model_profile": model_profile,
+                            "context_window_policy": context_window_policy,
+                            "reasoning": args.get("reasoning").cloned().unwrap_or(serde_json::json!({}))
+                        }),
+                    }
+                } else {
+                    IpcRequest::ConfigureRole {
+                        agent_id: self.agent_id.clone(),
+                        role_name: role_name.clone(),
+                        guest_id: format!("{}:{}", self.agent_id, role_name),
+                        calling_role,
+                        toolset_profile,
+                        role_identity_addendum,
+                        role_manifest,
+                        is_admin,
+                        inactive_ttl_seconds,
+                        iteration_cap,
+                        approval_policy,
+                        model_profile,
+                        context_window_policy,
+                    }
                 };
 
                 let (content, tool_err) = match self.ipc_client.send_request(req).await {
                     Ok(IpcResponse::ConfigureRoleOk { role_name: name }) => {
+                        self.configured_roles.insert(
+                            name.clone(),
+                            CachedRoleConfig {
+                                toolset_profile: args
+                                    .get("toolset_profile")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("default")
+                                    .to_string(),
+                                role_identity_addendum: args
+                                    .get("role_identity_addendum")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string),
+                                role_manifest: args
+                                    .get("role_manifest")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string),
+                                iteration_cap: args
+                                    .get("iteration_cap")
+                                    .and_then(|v| v.as_u64())
+                                    .map(|v| v as u32),
+                                approval_policy: args
+                                    .get("approval_policy")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string),
+                                turn_loop_config: args
+                                    .get("turn_loop_config")
+                                    .and_then(|v| {
+                                        serde_json::from_value::<
+                                            ansible_mesh_core::graph::TurnLoopConfig,
+                                        >(v.clone())
+                                        .ok()
+                                    })
+                                    .unwrap_or_default(),
+                            },
+                        );
+                        (
+                            format!("Successfully configured role incarnation for '{}'.", name),
+                            None,
+                        )
+                    }
+                    Ok(IpcResponse::WorkflowExecutionOk {
+                        workflow_name: _,
+                        result,
+                    }) => {
+                        let name = result
+                            .get("role_name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(&role_name)
+                            .to_string();
                         self.configured_roles.insert(
                             name.clone(),
                             CachedRoleConfig {
@@ -5661,14 +6942,14 @@ impl AgentRuntime {
                         let e = TaskErrorPayload::ipc_failure(
                             "aiua",
                             "UNEXPECTED_RESPONSE",
-                            "role.configure: unexpected hotel response",
+                            format!("{tool_surface}: unexpected hotel response"),
                         );
                         (e.display_message(), Some(e))
                     }
                     Err(e) => {
                         let err = TaskErrorPayload::transport_error(
                             "philote",
-                            format!("role.configure: IPC transport error — {e}"),
+                            format!("{tool_surface}: IPC transport error — {e}"),
                         );
                         (err.display_message(), Some(err))
                     }
@@ -6264,9 +7545,42 @@ impl AgentRuntime {
                     .map(|r| r.role_name.clone())
                     .or_else(|| Some("orchestrator".into()));
 
+                let target_role_lens =
+                    resolve_target_role_lens(&mut self.ipc_client, &self.agent_id, &role_name)
+                        .await;
+
                 let handoff_bundle = HandoffBundle {
                     goal: active_goal.clone().unwrap_or_else(|| reason.clone()),
-                    context_excerpt: context_summary,
+                    context_excerpt: if let Some(lens) = target_role_lens.as_ref() {
+                        let mut context = context_summary.clone();
+                        if let Some(toolset_profile) = lens.toolset_profile.as_deref() {
+                            context.push_str(&format!(
+                                "\nTarget role toolset profile: {toolset_profile}."
+                            ));
+                        }
+                        if let Some(addendum) = lens.role_identity_addendum.as_deref() {
+                            context
+                                .push_str(&format!("\nTarget role identity addendum: {addendum}"));
+                        }
+                        if let Some(manifest) = lens
+                            .role_manifest
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|text| !text.is_empty())
+                        {
+                            let excerpt: String = manifest.chars().take(240).collect();
+                            context.push_str(&format!("\nTarget role manifest excerpt: {excerpt}"));
+                        }
+                        if !lens.allowed_skills.is_empty() {
+                            context.push_str(&format!(
+                                "\nTarget role allowed skills: {}",
+                                lens.allowed_skills.join(", ")
+                            ));
+                        }
+                        context
+                    } else {
+                        context_summary
+                    },
                     session_id: payload.session_id.clone(),
                     initiating_turn_id: payload.turn_id.clone(),
                     handoff_reason: Some(reason),
@@ -6279,18 +7593,39 @@ impl AgentRuntime {
                 };
 
                 let (content, tool_err) = match self
-                    .ipc_client
-                    .send_request(IpcRequest::HandoffToRole {
-                        session_id: payload.session_id.clone(),
-                        role_name: role_name.clone(),
+                    .request_role_handoff_with_backoff(
+                        payload.session_id.clone(),
+                        role_name.clone(),
                         handoff_bundle,
-                    })
+                    )
                     .await
                 {
                     Ok(IpcResponse::HandoffAck {
                         handoff_guest_id, ..
-                    }) => (
-                        format!("Handed off to role '{role_name}' (guest {handoff_guest_id})."),
+                    }) => {
+                        if let Err(err) = self
+                            .ipc_client
+                            .send_request(IpcRequest::RecordRoleHandoffReflexEvidence {
+                                agent_id: self.agent_id.clone(),
+                                role_name: role_name.clone(),
+                                legacy_trigger_class: None,
+                                source_turn: Some(payload.turn_id.clone()),
+                            })
+                            .await
+                        {
+                            warn!(
+                                role_name = %role_name,
+                                error = %err,
+                                "Failed to record successful same-self role handoff evidence"
+                            );
+                        }
+                        (
+                            format!("Handed off to role '{role_name}' (guest {handoff_guest_id})."),
+                            None,
+                        )
+                    }
+                    Ok(IpcResponse::HandoffPending { .. }) => (
+                        format!("Switching to role '{role_name}' once it finishes materializing."),
                         None,
                     ),
                     Ok(IpcResponse::Error(msg)) => {
@@ -7317,6 +8652,256 @@ impl AgentRuntime {
                 .await
             }
 
+            "routing.policy.propose" => {
+                let problem = payload
+                    .arguments
+                    .get("problem")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let proposed_change = payload
+                    .arguments
+                    .get("proposed_change")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let evidence = payload
+                    .arguments
+                    .get("evidence")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let affected_stage = payload
+                    .arguments
+                    .get("affected_stage")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let affected_capability = payload
+                    .arguments
+                    .get("affected_capability")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let learned_reflex = match parse_learned_reflex_writeback(&payload.arguments) {
+                    Ok(value) => value,
+                    Err(message) => {
+                        return self
+                            .fail_active_turn(payload.session_id, payload.turn_id, message)
+                            .await;
+                    }
+                };
+
+                if problem.is_empty() || proposed_change.is_empty() || evidence.is_empty() {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "routing.policy.propose: 'problem', 'proposed_change', and 'evidence' are required.".into(),
+                        )
+                        .await;
+                }
+
+                let agent_id = self.agent_id.clone();
+                let result_text = match self
+                    .ipc_client
+                    .send_request(IpcRequest::RecordRoutingPolicyProposal {
+                        agent_id: agent_id.clone(),
+                        problem: problem.clone(),
+                        proposed_change: proposed_change.clone(),
+                        evidence: evidence.clone(),
+                        affected_stage: if affected_stage.is_empty() {
+                            None
+                        } else {
+                            Some(affected_stage.clone())
+                        },
+                        affected_capability: if affected_capability.is_empty() {
+                            None
+                        } else {
+                            Some(affected_capability.clone())
+                        },
+                        learned_reflex_preference_key: learned_reflex
+                            .as_ref()
+                            .map(|reflex| reflex.preference_key.clone()),
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::RoutingPolicyRecorded { proposal_id }) => {
+                        let mut writeback_note = None;
+                        if let Some(reflex) = learned_reflex.as_ref() {
+                            let config_json = serde_json::json!({
+                                "reason": format!("approved write-back from routing policy proposal {}", proposal_id),
+                                "problem": problem.clone(),
+                                "proposed_change": proposed_change.clone(),
+                                "evidence": evidence.clone(),
+                                "affected_stage": affected_stage.clone(),
+                                "affected_capability": affected_capability.clone(),
+                                "proposal_id": proposal_id.clone(),
+                                "source_tool": "routing.policy.propose",
+                            });
+                            match self
+                                .ipc_client
+                                .send_request(IpcRequest::UpsertAgentReflexPreference {
+                                    agent_id: agent_id.clone(),
+                                    preference_key: reflex.preference_key.clone(),
+                                    precedence: reflex.precedence,
+                                    reflexes_json: reflex.reflexes_json.clone(),
+                                    config_json,
+                                })
+                                .await
+                            {
+                                Ok(IpcResponse::Standard { ok: true, .. }) => {
+                                    let _ = self
+                                        .ipc_client
+                                        .send_request(IpcRequest::AppendRoutingPolicyEvaluation {
+                                            proposal_id: proposal_id.clone(),
+                                            evaluation_kind: "learned_reflex_writeback".into(),
+                                            decision: "approved_writeback".into(),
+                                            reason: format!(
+                                                "Learned reflex '{}' was written into the agent graph.",
+                                                reflex.preference_key
+                                            ),
+                                            source_tool: Some("routing.policy.propose".into()),
+                                        })
+                                        .await;
+                                    let _ = self
+                                        .ipc_client
+                                        .send_request(IpcRequest::UpdateTask {
+                                            task_id: Uuid::new_v4(),
+                                            state: "routing_reflex_writeback".into(),
+                                            payload: serde_json::json!({
+                                                "session_id": payload.session_id,
+                                                "turn_id": payload.turn_id,
+                                                "chat_id": payload.chat_id,
+                                                "reflex_evaluations": [{
+                                                    "reflex_name": reflex.preference_key,
+                                                    "decision": "approved_writeback",
+                                                    "reason": format!("approved learned reflex write-back from routing policy proposal {}", proposal_id),
+                                                    "source_tool": "routing.policy.propose"
+                                                }]
+                                            }),
+                                        })
+                                        .await;
+                                    writeback_note = Some(format!(
+                                        " Learned reflex '{}' was written into the agent graph.",
+                                        reflex.preference_key
+                                    ));
+                                }
+                                Ok(IpcResponse::Standard {
+                                    ok: false, message, ..
+                                }) => {
+                                    let _ = self
+                                        .ipc_client
+                                        .send_request(IpcRequest::AppendRoutingPolicyEvaluation {
+                                            proposal_id: proposal_id.clone(),
+                                            evaluation_kind: "learned_reflex_writeback".into(),
+                                            decision: "rejected".into(),
+                                            reason: format!(
+                                                "Hotel rejected learned reflex write-back: {}",
+                                                message
+                                            ),
+                                            source_tool: Some("routing.policy.propose".into()),
+                                        })
+                                        .await;
+                                    writeback_note = Some(format!(
+                                        " Routing policy recorded, but learned reflex write-back was rejected — {}.",
+                                        message
+                                    ));
+                                }
+                                Ok(other) => {
+                                    let _ = self
+                                        .ipc_client
+                                        .send_request(IpcRequest::AppendRoutingPolicyEvaluation {
+                                            proposal_id: proposal_id.clone(),
+                                            evaluation_kind: "learned_reflex_writeback".into(),
+                                            decision: "unexpected_response".into(),
+                                            reason: format!(
+                                                "Unexpected response while writing learned reflex: {:?}",
+                                                other
+                                            ),
+                                            source_tool: Some("routing.policy.propose".into()),
+                                        })
+                                        .await;
+                                    writeback_note = Some(format!(
+                                        " Routing policy recorded, but learned reflex write-back returned an unexpected response: {:?}.",
+                                        other
+                                    ));
+                                }
+                                Err(err) => {
+                                    let _ = self
+                                        .ipc_client
+                                        .send_request(IpcRequest::AppendRoutingPolicyEvaluation {
+                                            proposal_id: proposal_id.clone(),
+                                            evaluation_kind: "learned_reflex_writeback".into(),
+                                            decision: "ipc_error".into(),
+                                            reason: format!(
+                                                "IPC error while writing learned reflex: {}",
+                                                err
+                                            ),
+                                            source_tool: Some("routing.policy.propose".into()),
+                                        })
+                                        .await;
+                                    writeback_note = Some(format!(
+                                        " Routing policy recorded, but learned reflex write-back failed — {}.",
+                                        err
+                                    ));
+                                }
+                            }
+                        }
+                        let mut message = format!(
+                            "Routing policy proposal recorded as a first-class routing policy artifact (id: {proposal_id}). Operator disposition is stored as approved, and future reflex outcomes will append to its evaluation history."
+                        );
+                        if let Some(note) = writeback_note {
+                            message.push_str(&note);
+                        }
+                        message
+                    }
+                    Ok(IpcResponse::Standard {
+                        ok: true, message, ..
+                    }) => message,
+                    Ok(IpcResponse::Standard {
+                        ok: false, message, ..
+                    }) => {
+                        format!("routing.policy.propose: hotel rejected — {message}")
+                    }
+                    Ok(_) => "routing.policy.propose: unexpected response from hotel.".into(),
+                    Err(e) => format!("routing.policy.propose: IPC error — {e}"),
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    handoff_bundle: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(result_text),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: None,
+                    tool_name: Some(payload.tool_name),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
             other => {
                 self.fail_active_turn(
                     payload.session_id,
@@ -7443,9 +9028,35 @@ impl AgentRuntime {
         let new_toolset: Option<Vec<String>> = bindings
             .get("effective_toolset")
             .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let new_rights: Option<Vec<String>> = bindings
+            .get("effective_rights")
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
         let new_skillset: Option<Vec<String>> = bindings
             .get("effective_skillset")
             .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let new_routing_preferences = bindings
+            .get("routing_preferences")
+            .and_then(|v| serde_json::from_value::<Vec<RoutingPreferenceBinding>>(v.clone()).ok());
+        let new_effective_reflexes = bindings.get("effective_reflexes").cloned();
+        let new_reflex_policy_agent_layers = bindings
+            .get("reflex_policy_agent_layers")
+            .and_then(|v| serde_json::from_value::<Vec<serde_json::Value>>(v.clone()).ok());
+        let new_reflex_policy_agent_rewards = bindings
+            .get("reflex_policy_agent_rewards")
+            .and_then(|v| serde_json::from_value::<Vec<serde_json::Value>>(v.clone()).ok());
+        let new_reflex_policy_agent_suppressions = bindings
+            .get("reflex_policy_agent_suppressions")
+            .and_then(|v| serde_json::from_value::<Vec<serde_json::Value>>(v.clone()).ok());
+        let new_shared_model_markers = bindings
+            .get("shared_model_markers")
+            .and_then(|v| serde_json::from_value::<Vec<serde_json::Value>>(v.clone()).ok());
+        let new_active_incarnation_id = snapshot
+            .get("active_incarnation_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let new_role_activation = snapshot
+            .get("role_activation")
+            .and_then(|v| serde_json::from_value::<RoleActivation>(v.clone()).ok());
         let new_component_routes = snapshot
             .get("component_route_assembly")
             .cloned()
@@ -7458,11 +9069,61 @@ impl AgentRuntime {
                 changed = true;
             }
         }
+        if let Some(rights) = new_rights {
+            if rights != state.bindings.effective_rights {
+                state.bindings.effective_rights = rights;
+                changed = true;
+            }
+        }
         if let Some(skillset) = new_skillset {
             if skillset != state.bindings.effective_skillset {
                 state.bindings.effective_skillset = skillset;
                 changed = true;
             }
+        }
+        if let Some(routing_preferences) = new_routing_preferences {
+            if routing_preferences != state.bindings.routing_preferences {
+                state.bindings.routing_preferences = routing_preferences;
+                changed = true;
+            }
+        }
+        if let Some(effective_reflexes) = new_effective_reflexes {
+            if effective_reflexes != state.bindings.effective_reflexes {
+                state.bindings.effective_reflexes = effective_reflexes;
+                changed = true;
+            }
+        }
+        if let Some(layers) = new_reflex_policy_agent_layers {
+            if layers != state.bindings.reflex_policy_agent_layers {
+                state.bindings.reflex_policy_agent_layers = layers;
+                changed = true;
+            }
+        }
+        if let Some(rewards) = new_reflex_policy_agent_rewards {
+            if rewards != state.bindings.reflex_policy_agent_rewards {
+                state.bindings.reflex_policy_agent_rewards = rewards;
+                changed = true;
+            }
+        }
+        if let Some(suppressions) = new_reflex_policy_agent_suppressions {
+            if suppressions != state.bindings.reflex_policy_agent_suppressions {
+                state.bindings.reflex_policy_agent_suppressions = suppressions;
+                changed = true;
+            }
+        }
+        if let Some(shared_model_markers) = new_shared_model_markers {
+            if shared_model_markers != state.bindings.shared_model_markers {
+                state.bindings.shared_model_markers = shared_model_markers;
+                changed = true;
+            }
+        }
+        if new_active_incarnation_id != state.active_incarnation_id {
+            state.active_incarnation_id = new_active_incarnation_id;
+            changed = true;
+        }
+        if new_role_activation != state.role_activation {
+            state.role_activation = new_role_activation;
+            changed = true;
         }
         if let Some(component_routes) = new_component_routes {
             if component_routes != state.component_route_assembly {
@@ -7646,11 +9307,72 @@ async fn run_bash_command(
     }))
 }
 
+async fn resolve_target_role_lens(
+    ipc_client: &mut PhiloticClient,
+    agent_id: &str,
+    role_name: &str,
+) -> Option<TargetRoleLens> {
+    let roles = match ipc_client
+        .send_request(IpcRequest::ListRoleIncarnations {
+            agent_id: agent_id.to_string(),
+        })
+        .await
+    {
+        Ok(IpcResponse::Standard {
+            ok: true,
+            data: Some(data),
+            ..
+        }) => data
+            .get("roles")
+            .cloned()
+            .and_then(|value| {
+                serde_json::from_value::<Vec<ansible_mesh_core::graph::RoleIncarnationRecord>>(
+                    value,
+                )
+                .ok()
+            })
+            .unwrap_or_default(),
+        _ => return None,
+    };
+
+    let role = roles
+        .into_iter()
+        .find(|role| role.role_name.eq_ignore_ascii_case(role_name))?;
+    let toolset_profile = role.toolset_profile.clone();
+    let toolset = match ipc_client
+        .send_request(IpcRequest::GetToolsetProfile {
+            profile_name: toolset_profile.clone(),
+        })
+        .await
+    {
+        Ok(IpcResponse::Standard {
+            ok: true,
+            data: Some(data),
+            ..
+        }) => serde_json::from_value::<ansible_mesh_core::graph::ToolsetProfileRecord>(data).ok(),
+        _ => None,
+    };
+
+    Some(TargetRoleLens {
+        role_name: role.role_name,
+        toolset_profile: Some(toolset_profile),
+        toolset_description: toolset
+            .as_ref()
+            .and_then(|profile| profile.description.clone()),
+        role_identity_addendum: role.role_identity_addendum,
+        role_manifest: role.role_manifest,
+        allowed_skills: toolset
+            .map(|profile| profile.allowed_skills)
+            .unwrap_or_default(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentRuntime, DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE, extract_model_error,
-        extract_model_error_payload, format_role_command_reply, format_roles_report,
+        AgentRuntime, DEFAULT_TEXT_MODEL_ROLE, DEFAULT_VOICE_MODEL_ROLE, LOCAL_NODE, MediaRouting,
+        compile_turn_routing_plan, extract_model_error, extract_model_error_payload,
+        format_role_command_reply, format_roles_report, is_specific_same_self_role_governance,
         media_analysis_attachments, normalized_user_content, parse_memory_candidate,
         resolve_media_routing, resolve_model_execution_target, should_attempt_provider_repair,
     };
@@ -7661,7 +9383,9 @@ mod tests {
     };
     use crate::session::{
         ApprovalPolicy, ComponentExecutionRoute, ComponentRouteAssembly, ComponentRouteBinding,
-        SessionState, WorkingTurn,
+        RoleActivation, SessionState, TtsMode, TurnCapabilityCompositionKind,
+        TurnRoutedCapabilitySpecies, TurnRoutingStageKind, VoiceResponsePolicy, WorkingTurn,
+        turn_routed_capability_profile,
     };
     use philotic_client::TaskErrorPayload;
     use uuid::Uuid;
@@ -7683,7 +9407,10 @@ mod tests {
             })),
             attachments: Vec::new(),
             tools_for_model: Vec::new(),
+            effective_rights: Vec::new(),
             response_contract: None,
+            routing_hints: None,
+            provider_options: None,
             chat_id: "123".into(),
             reply_to: LOCAL_NODE.into(),
             reply_role: "agent".into(),
@@ -7775,6 +9502,7 @@ mod tests {
         let snapshot = serde_json::json!({
             "bindings": {
                 "effective_toolset": ["echo"],
+                "effective_rights": ["component.media.analyze", "component.text.generate", "tool.echo"],
                 "effective_skillset": ["planning"]
             },
             "component_route_assembly": {
@@ -7801,6 +9529,14 @@ mod tests {
         assert_eq!(route.target_node, "default-aiua-01");
         assert_eq!(route.hotel_id.as_deref(), Some("default"));
         assert_eq!(state.bindings.effective_toolset, vec!["echo"]);
+        assert_eq!(
+            state.bindings.effective_rights,
+            vec![
+                "component.media.analyze".to_string(),
+                "component.text.generate".to_string(),
+                "tool.echo".to_string(),
+            ]
+        );
         assert_eq!(state.bindings.effective_skillset, vec!["planning"]);
     }
 
@@ -7957,6 +9693,7 @@ mod tests {
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
+            turn_routing_plan: None,
             awaiting_transcription_reentry: false,
             scripted_loop_context: None,
             associated_paracrine_ids: Vec::new(),
@@ -8049,6 +9786,75 @@ mod tests {
         )
         .expect_err("tool should be blocked");
         assert!(err.to_string().contains("not enabled"));
+    }
+
+    #[test]
+    fn parse_learned_reflex_writeback_accepts_valid_payload() {
+        let parsed = super::parse_learned_reflex_writeback(&serde_json::json!({
+            "learned_reflex": {
+                "preference_key": "operator-mesh-trust",
+                "precedence": 72,
+                "reflexes": {
+                    "remote_tool_reflex": "allow",
+                    "credential_scope_reflex": "mesh_scoped"
+                }
+            }
+        }))
+        .expect("parse should succeed")
+        .expect("writeback should be present");
+
+        assert_eq!(parsed.preference_key, "operator-mesh-trust");
+        assert_eq!(parsed.precedence, 72);
+        assert_eq!(parsed.reflexes_json["remote_tool_reflex"], "allow");
+    }
+
+    #[test]
+    fn parse_learned_reflex_writeback_rejects_non_object_reflexes() {
+        let err = super::parse_learned_reflex_writeback(&serde_json::json!({
+            "learned_reflex": {
+                "preference_key": "operator-mesh-trust",
+                "reflexes": "allow"
+            }
+        }))
+        .expect_err("parse should fail");
+
+        assert!(err.contains("learned_reflex.reflexes must be an object"));
+    }
+
+    #[test]
+    fn merge_snapshot_bindings_updates_agent_reflex_layers() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        let snapshot = serde_json::json!({
+            "bindings": {
+                "reflex_policy_agent_layers": [{
+                    "policy_scope": "agent_learned",
+                    "policy_source": "agent_graph",
+                    "origin_class": "agent_learned",
+                    "precedence": 70,
+                    "preference_key": "same-self-role-handoff:developer",
+                    "config": {
+                        "reason": "remembered successful same-self handoff to developer",
+                        "role_name": "developer",
+                        "trigger_class": "implementation"
+                    },
+                    "reflexes": {
+                        "role_handoff_reflex": {
+                            "target_role": "developer",
+                            "trigger_class": "implementation"
+                        }
+                    }
+                }]
+            }
+        });
+
+        AgentRuntime::merge_snapshot_bindings(&mut state, &snapshot);
+
+        assert_eq!(state.bindings.reflex_policy_agent_layers.len(), 1);
+        assert_eq!(
+            state.bindings.reflex_policy_agent_layers[0]["preference_key"],
+            serde_json::json!("same-self-role-handoff:developer")
+        );
     }
 
     #[test]
@@ -8296,7 +10102,6 @@ mod tests {
         let r = routing.expect("should produce routing for blob-backed voice");
         assert_eq!(r.action, "analyze_media");
         assert_eq!(r.capability, "media.analyze");
-        assert!(r.strip_tools);
     }
 
     #[test]
@@ -8363,16 +10168,550 @@ mod tests {
     }
 
     #[test]
-    fn strip_tools_false_preserved_in_routing() {
-        use crate::session::MediaRoutingPolicy;
+    fn compile_turn_routing_plan_for_voice_turn_has_three_stages() {
+        use crate::session::{MediaRoutingPolicy, SessionBindings};
 
         let policy = MediaRoutingPolicy {
-            strip_tools_on_media: false,
+            voice_action: Some("transcribe".into()),
             ..Default::default()
         };
-        let atts = vec![blob_backed_attachment("photo")];
-        let r = resolve_media_routing(&policy, atts).unwrap();
-        assert!(!r.strip_tools);
+        let media_routing =
+            resolve_media_routing(&policy, vec![blob_backed_attachment("voice")]).unwrap();
+        let voice_policy = VoiceResponsePolicy {
+            mode: TtsMode::Auto,
+            ..Default::default()
+        };
+
+        let plan = compile_turn_routing_plan(
+            Some(&media_routing),
+            Some(&voice_policy),
+            true,
+            &[],
+            &SessionBindings::default(),
+        );
+
+        assert_eq!(plan.trigger, "voice_input");
+        assert_eq!(plan.stages.len(), 3);
+        assert_eq!(plan.stages[0].kind, TurnRoutingStageKind::Ingress);
+        assert_eq!(plan.stages[0].capability, "voice.transcribe");
+        assert_eq!(plan.stages[0].controller_role, DEFAULT_VOICE_MODEL_ROLE);
+        assert_eq!(plan.stages[0].model_ref, None);
+        assert_eq!(plan.stages[1].kind, TurnRoutingStageKind::Cognition);
+        assert_eq!(plan.stages[1].capability, "text.generate");
+        assert_eq!(plan.stages[1].controller_role, DEFAULT_TEXT_MODEL_ROLE);
+        assert_eq!(plan.stages[2].kind, TurnRoutingStageKind::Egress);
+        assert_eq!(plan.stages[2].capability, "voice.synthesize");
+    }
+
+    #[test]
+    fn compile_turn_routing_plan_for_text_turn_only_has_cognition() {
+        use crate::session::SessionBindings;
+
+        let plan = compile_turn_routing_plan(None, None, false, &[], &SessionBindings::default());
+
+        assert_eq!(plan.trigger, "text_input");
+        assert_eq!(plan.stages.len(), 1);
+        assert_eq!(plan.stages[0].kind, TurnRoutingStageKind::Cognition);
+        assert_eq!(plan.stages[0].capability, "text.generate");
+    }
+
+    #[test]
+    fn compile_turn_routing_plan_applies_agent_graph_routing_preferences() {
+        use crate::session::{RoutingPreferenceBinding, SessionBindings};
+
+        let routing_preferences = vec![RoutingPreferenceBinding {
+            preference_key: "voice-ingress-elevenlabs-scribe".into(),
+            stage_kind: Some("ingress".into()),
+            capability: Some("voice.transcribe".into()),
+            provider_hint: Some("elevenlabs".into()),
+            model_ref: Some("scribe_v1".into()),
+            preference_level: 1,
+            weight: 90,
+            updated_at: 123,
+        }];
+        let media_routing = MediaRouting {
+            action: "transcribe".into(),
+            capability: "voice.transcribe",
+            attachments: vec![blob_backed_attachment("voice")],
+        };
+
+        let plan = compile_turn_routing_plan(
+            Some(&media_routing),
+            None,
+            true,
+            &routing_preferences,
+            &SessionBindings::default(),
+        );
+
+        assert_eq!(plan.stages[0].provider_hint.as_deref(), Some("elevenlabs"));
+        assert_eq!(plan.stages[0].model_ref.as_deref(), Some("scribe_v1"));
+        assert_eq!(plan.stages[0].controller_role, DEFAULT_VOICE_MODEL_ROLE);
+    }
+
+    #[test]
+    fn stage_preference_promotes_dispatch_to_provider_specific_controller_role() {
+        use crate::session::{RoutingPreferenceBinding, SessionBindings};
+
+        let routing_preferences = vec![RoutingPreferenceBinding {
+            preference_key: "voice-ingress-elevenlabs-scribe".into(),
+            stage_kind: Some("ingress".into()),
+            capability: Some("voice.transcribe".into()),
+            provider_hint: Some("elevenlabs".into()),
+            model_ref: Some("scribe_v1".into()),
+            preference_level: 1,
+            weight: 90,
+            updated_at: 123,
+        }];
+        let media_routing = MediaRouting {
+            action: "transcribe".into(),
+            capability: "voice.transcribe",
+            attachments: vec![blob_backed_attachment("voice")],
+        };
+
+        let plan = compile_turn_routing_plan(
+            Some(&media_routing),
+            None,
+            true,
+            &routing_preferences,
+            &SessionBindings::default(),
+        );
+        let target = super::resolve_stage_execution_target(None, &plan.stages[0]);
+
+        assert_eq!(target.0, super::local_node_id());
+        assert_eq!(target.1, DEFAULT_VOICE_MODEL_ROLE);
+        assert!(target.2.is_none());
+    }
+
+    #[test]
+    fn compile_turn_routing_plan_rewards_approved_agent_reflexes_for_cognition_selection() {
+        use crate::session::{RoutingPreferenceBinding, SessionBindings};
+
+        let routing_preferences = vec![
+            RoutingPreferenceBinding {
+                preference_key: "cognition-local".into(),
+                stage_kind: Some("cognition".into()),
+                capability: Some("text.generate".into()),
+                provider_hint: Some("mlx".into()),
+                model_ref: Some("mlx/qwen".into()),
+                preference_level: 1,
+                weight: 89,
+                updated_at: 10,
+            },
+            RoutingPreferenceBinding {
+                preference_key: "cognition-remote".into(),
+                stage_kind: Some("cognition".into()),
+                capability: Some("text.generate".into()),
+                provider_hint: Some("gemini".into()),
+                model_ref: Some("gemini-3.1-flash".into()),
+                preference_level: 1,
+                weight: 90,
+                updated_at: 9,
+            },
+        ];
+        let bindings = SessionBindings {
+            effective_reflexes: serde_json::json!({
+                "remote_component_reflex": "allow"
+            }),
+            reflex_policy_agent_rewards: vec![serde_json::json!({
+                "preference_key": "cognition-remote",
+                "regulatory_system": "reward"
+            })],
+            ..Default::default()
+        };
+
+        let plan = compile_turn_routing_plan(None, None, false, &routing_preferences, &bindings);
+
+        assert_eq!(plan.stages[0].provider_hint.as_deref(), Some("gemini"));
+        assert_eq!(
+            plan.stages[0].model_ref.as_deref(),
+            Some("gemini-3.1-flash")
+        );
+    }
+
+    #[test]
+    fn compile_turn_routing_plan_immune_system_dampens_remote_cognition_selection() {
+        use crate::session::{RoutingPreferenceBinding, SessionBindings};
+
+        let routing_preferences = vec![
+            RoutingPreferenceBinding {
+                preference_key: "cognition-local".into(),
+                stage_kind: Some("cognition".into()),
+                capability: Some("text.generate".into()),
+                provider_hint: Some("mlx".into()),
+                model_ref: Some("mlx/qwen".into()),
+                preference_level: 1,
+                weight: 89,
+                updated_at: 10,
+            },
+            RoutingPreferenceBinding {
+                preference_key: "cognition-remote".into(),
+                stage_kind: Some("cognition".into()),
+                capability: Some("text.generate".into()),
+                provider_hint: Some("gemini".into()),
+                model_ref: Some("gemini-3.1-flash".into()),
+                preference_level: 1,
+                weight: 90,
+                updated_at: 9,
+            },
+        ];
+        let bindings = SessionBindings {
+            effective_reflexes: serde_json::json!({
+                "remote_component_reflex": "deny"
+            }),
+            reflex_policy_agent_suppressions: vec![serde_json::json!({
+                "preference_key": "cognition-remote",
+                "regulatory_system": "immune"
+            })],
+            ..Default::default()
+        };
+
+        let plan = compile_turn_routing_plan(None, None, false, &routing_preferences, &bindings);
+
+        assert_eq!(plan.stages[0].provider_hint.as_deref(), Some("mlx"));
+        assert_eq!(plan.stages[0].model_ref.as_deref(), Some("mlx/qwen"));
+    }
+
+    #[test]
+    fn compile_turn_routing_plan_uses_shared_model_markers_to_bias_cognition_selection() {
+        use crate::session::{RoutingPreferenceBinding, SessionBindings};
+
+        let routing_preferences = vec![
+            RoutingPreferenceBinding {
+                preference_key: "cognition-local".into(),
+                stage_kind: Some("cognition".into()),
+                capability: Some("text.generate".into()),
+                provider_hint: Some("mlx".into()),
+                model_ref: Some("mlx/qwen".into()),
+                preference_level: 1,
+                weight: 90,
+                updated_at: 10,
+            },
+            RoutingPreferenceBinding {
+                preference_key: "cognition-remote".into(),
+                stage_kind: Some("cognition".into()),
+                capability: Some("text.generate".into()),
+                provider_hint: Some("gemini".into()),
+                model_ref: Some("gemini-3.1-flash".into()),
+                preference_level: 1,
+                weight: 90,
+                updated_at: 9,
+            },
+        ];
+        let bindings = SessionBindings {
+            shared_model_markers: vec![
+                serde_json::json!({
+                    "model_ref": "mlx/qwen",
+                    "provider_hint": "mlx",
+                    "capability_markers": ["text.generate"],
+                    "speed_marker": 55,
+                    "thinking_marker": 55,
+                    "tool_use_marker": 45,
+                    "audio_native_marker": 0
+                }),
+                serde_json::json!({
+                    "model_ref": "gemini-3.1-flash",
+                    "provider_hint": "gemini",
+                    "capability_markers": ["text.generate"],
+                    "speed_marker": 90,
+                    "thinking_marker": 75,
+                    "tool_use_marker": 80,
+                    "audio_native_marker": 0
+                }),
+            ],
+            ..Default::default()
+        };
+
+        let plan = compile_turn_routing_plan(None, None, false, &routing_preferences, &bindings);
+
+        assert_eq!(plan.stages[0].provider_hint.as_deref(), Some("gemini"));
+        assert_eq!(
+            plan.stages[0].model_ref.as_deref(),
+            Some("gemini-3.1-flash")
+        );
+    }
+
+    #[test]
+    fn compile_turn_routing_plan_selects_native_live_voice_dialogue_when_ligands_are_expressed() {
+        use crate::session::{RoutingPreferenceBinding, SessionBindings};
+
+        let routing_preferences = vec![
+            RoutingPreferenceBinding {
+                preference_key: "cognition-text-gemini".into(),
+                stage_kind: Some("cognition".into()),
+                capability: Some("text.generate".into()),
+                provider_hint: Some("gemini".into()),
+                model_ref: Some("gemini-3.1-flash".into()),
+                preference_level: 1,
+                weight: 90,
+                updated_at: 10,
+            },
+            RoutingPreferenceBinding {
+                preference_key: "cognition-live-gemini".into(),
+                stage_kind: Some("cognition".into()),
+                capability: Some("voice.dialogue".into()),
+                provider_hint: Some("gemini".into()),
+                model_ref: Some("gemini-3.1-flash-live".into()),
+                preference_level: 1,
+                weight: 90,
+                updated_at: 11,
+            },
+        ];
+        let bindings = SessionBindings {
+            shared_model_markers: vec![
+                serde_json::json!({
+                    "model_ref": "gemini-3.1-flash",
+                    "provider_hint": "gemini",
+                    "capability_markers": ["text.generate"],
+                    "speed_marker": 70,
+                    "thinking_marker": 72,
+                    "tool_use_marker": 75,
+                    "audio_native_marker": 0
+                }),
+                serde_json::json!({
+                    "model_ref": "gemini-3.1-flash-live",
+                    "provider_hint": "gemini",
+                    "capability_markers": ["voice.dialogue", "response.generate"],
+                    "speed_marker": 92,
+                    "thinking_marker": 74,
+                    "tool_use_marker": 78,
+                    "audio_native_marker": 95
+                }),
+            ],
+            ..Default::default()
+        };
+        let media_routing = MediaRouting {
+            action: "transcribe".into(),
+            capability: "voice.transcribe",
+            attachments: vec![blob_backed_attachment("voice")],
+        };
+        let voice_policy = VoiceResponsePolicy {
+            mode: TtsMode::Auto,
+            ..Default::default()
+        };
+
+        let plan = compile_turn_routing_plan(
+            Some(&media_routing),
+            Some(&voice_policy),
+            true,
+            &routing_preferences,
+            &bindings,
+        );
+
+        assert_eq!(plan.trigger, "voice_input_native_live");
+        assert_eq!(plan.stages.len(), 2);
+        assert_eq!(plan.stages[0].kind, TurnRoutingStageKind::Cognition);
+        assert_eq!(plan.stages[0].capability, "voice.dialogue");
+        assert_eq!(plan.stages[0].provider_hint.as_deref(), Some("gemini"));
+        assert_eq!(
+            plan.stages[0].model_ref.as_deref(),
+            Some("gemini-3.1-flash-live")
+        );
+        assert_eq!(plan.stages[1].kind, TurnRoutingStageKind::Egress);
+        assert_eq!(plan.stages[1].capability, "voice.synthesize");
+    }
+
+    #[test]
+    fn compile_turn_routing_plan_keeps_three_stage_voice_path_without_native_live_ligands() {
+        use crate::session::{RoutingPreferenceBinding, SessionBindings};
+
+        let routing_preferences = vec![RoutingPreferenceBinding {
+            preference_key: "cognition-text-gemini".into(),
+            stage_kind: Some("cognition".into()),
+            capability: Some("text.generate".into()),
+            provider_hint: Some("gemini".into()),
+            model_ref: Some("gemini-3.1-flash".into()),
+            preference_level: 1,
+            weight: 90,
+            updated_at: 10,
+        }];
+        let bindings = SessionBindings {
+            shared_model_markers: vec![serde_json::json!({
+                "model_ref": "gemini-3.1-flash",
+                "provider_hint": "gemini",
+                "capability_markers": ["text.generate"],
+                "speed_marker": 90,
+                "thinking_marker": 75,
+                "tool_use_marker": 80,
+                "audio_native_marker": 0
+            })],
+            ..Default::default()
+        };
+        let media_routing = MediaRouting {
+            action: "transcribe".into(),
+            capability: "voice.transcribe",
+            attachments: vec![blob_backed_attachment("voice")],
+        };
+        let voice_policy = VoiceResponsePolicy {
+            mode: TtsMode::Auto,
+            ..Default::default()
+        };
+
+        let plan = compile_turn_routing_plan(
+            Some(&media_routing),
+            Some(&voice_policy),
+            true,
+            &routing_preferences,
+            &bindings,
+        );
+
+        assert_eq!(plan.trigger, "voice_input");
+        assert_eq!(plan.stages.len(), 3);
+        assert_eq!(plan.stages[0].kind, TurnRoutingStageKind::Ingress);
+        assert_eq!(plan.stages[0].capability, "voice.transcribe");
+        assert_eq!(plan.stages[1].kind, TurnRoutingStageKind::Cognition);
+        assert_eq!(plan.stages[1].capability, "text.generate");
+    }
+
+    #[test]
+    fn merge_snapshot_bindings_updates_routing_preferences() {
+        use crate::session::RoutingPreferenceBinding;
+
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        let snapshot = serde_json::json!({
+            "bindings": {
+                "effective_rights": ["tool.echo"],
+                "routing_preferences": [{
+                    "preference_key": "cognition-gemini-flash",
+                    "stage_kind": "cognition",
+                    "capability": "text.generate",
+                    "provider_hint": "gemini",
+                    "model_ref": "gemini-flash",
+                    "preference_level": 1,
+                    "weight": 80,
+                    "updated_at": 42
+                }]
+            }
+        });
+
+        AgentRuntime::merge_snapshot_bindings(&mut state, &snapshot);
+
+        assert_eq!(
+            state.bindings.effective_rights,
+            vec!["tool.echo".to_string()]
+        );
+        assert_eq!(
+            state.bindings.routing_preferences,
+            vec![RoutingPreferenceBinding {
+                preference_key: "cognition-gemini-flash".into(),
+                stage_kind: Some("cognition".into()),
+                capability: Some("text.generate".into()),
+                provider_hint: Some("gemini".into()),
+                model_ref: Some("gemini-flash".into()),
+                preference_level: 1,
+                weight: 80,
+                updated_at: 42,
+            }]
+        );
+    }
+
+    #[test]
+    fn merge_snapshot_bindings_updates_shared_model_markers() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        let snapshot = serde_json::json!({
+            "bindings": {
+                "shared_model_markers": [{
+                    "model_ref": "gemini-3.1-flash",
+                    "provider_hint": "gemini",
+                    "capability_markers": ["text.generate", "media.analyze"],
+                    "speed_marker": 90,
+                    "thinking_marker": 72,
+                    "tool_use_marker": 84,
+                    "audio_native_marker": 20
+                }]
+            }
+        });
+
+        AgentRuntime::merge_snapshot_bindings(&mut state, &snapshot);
+
+        assert_eq!(state.bindings.shared_model_markers.len(), 1);
+        assert_eq!(
+            state.bindings.shared_model_markers[0]["model_ref"],
+            serde_json::json!("gemini-3.1-flash")
+        );
+    }
+
+    #[test]
+    fn merge_snapshot_bindings_updates_active_role_state_from_snapshot() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.active_incarnation_id = Some("agent-jane:orchestrator".into());
+        state.role_activation = Some(RoleActivation {
+            role_name: "orchestrator".into(),
+            active_incarnation_id: Some("agent-jane:orchestrator".into()),
+            activation_reason: "default_identity_posture".into(),
+            ..Default::default()
+        });
+
+        let snapshot = serde_json::json!({
+            "active_incarnation_id": "agent-jane:systems-architect",
+            "role_activation": {
+                "role_name": "systems-architect",
+                "active_incarnation_id": "agent-jane:systems-architect",
+                "activation_reason": "session_active_incarnation"
+            },
+            "bindings": {}
+        });
+
+        AgentRuntime::merge_snapshot_bindings(&mut state, &snapshot);
+
+        assert_eq!(
+            state.active_incarnation_id.as_deref(),
+            Some("agent-jane:systems-architect")
+        );
+        assert_eq!(
+            state
+                .role_activation
+                .as_ref()
+                .map(|role| role.role_name.as_str()),
+            Some("systems-architect")
+        );
+        assert_eq!(
+            state
+                .role_activation
+                .as_ref()
+                .and_then(|role| role.active_incarnation_id.as_deref()),
+            Some("agent-jane:systems-architect")
+        );
+    }
+
+    #[test]
+    fn turn_routed_capability_taxonomy_marks_native_live_species_as_collapsible() {
+        let response_generate =
+            turn_routed_capability_profile("response.generate").expect("profile");
+        assert_eq!(
+            response_generate.species,
+            TurnRoutedCapabilitySpecies::ResponseGenerate
+        );
+        assert_eq!(
+            response_generate.composition,
+            TurnCapabilityCompositionKind::CollapsibleIngressCognition
+        );
+
+        let voice_dialogue = turn_routed_capability_profile("voice.dialogue").expect("profile");
+        assert_eq!(
+            voice_dialogue.species,
+            TurnRoutedCapabilitySpecies::VoiceDialogue
+        );
+        assert_eq!(
+            voice_dialogue.composition,
+            TurnCapabilityCompositionKind::CollapsibleIngressCognition
+        );
+    }
+
+    #[test]
+    fn turn_routed_capability_taxonomy_keeps_transcribe_and_synthesize_stage_local() {
+        let transcribe = turn_routed_capability_profile("voice.transcribe").expect("profile");
+        assert_eq!(transcribe.default_stage_kind, TurnRoutingStageKind::Ingress);
+        assert_eq!(
+            transcribe.composition,
+            TurnCapabilityCompositionKind::StageLocal
+        );
+
+        let synth = turn_routed_capability_profile("voice.synthesize").expect("profile");
+        assert_eq!(synth.default_stage_kind, TurnRoutingStageKind::Egress);
+        assert_eq!(synth.composition, TurnCapabilityCompositionKind::StageLocal);
     }
 
     #[test]
@@ -8406,6 +10745,43 @@ mod tests {
     }
 
     #[test]
+    fn explicit_same_self_role_governance_counts_as_specificity_not_pending_approval() {
+        let tool_call = ToolCall {
+            tool_name: "role.create_or_update".into(),
+            arguments: serde_json::json!({
+                "role_name": "virtuosa",
+                "toolset_profile": "voice",
+                "reasoning": {
+                    "purpose": "specialize in performance and voice delivery",
+                    "toolset_rationale": "voice tools and performance posture",
+                    "handoff_posture_and_limits": "same-self voice specialization only"
+                }
+            }),
+        };
+
+        assert!(is_specific_same_self_role_governance(&tool_call));
+    }
+
+    #[test]
+    fn admin_role_governance_still_requires_live_operator_gate() {
+        let tool_call = ToolCall {
+            tool_name: "role.create_or_update".into(),
+            arguments: serde_json::json!({
+                "role_name": "root-operator",
+                "toolset_profile": "admin",
+                "is_admin": true,
+                "reasoning": {
+                    "purpose": "admin mutation",
+                    "toolset_rationale": "admin tooling",
+                    "handoff_posture_and_limits": "sensitive"
+                }
+            }),
+        };
+
+        assert!(!is_specific_same_self_role_governance(&tool_call));
+    }
+
+    #[test]
     fn roles_report_marks_active_role() {
         let roles = vec![
             serde_json::json!({
@@ -8432,6 +10808,66 @@ mod tests {
         assert!(!super::command_bypasses_turn_start(
             &SlashCommand::Approve { note: None }
         ));
+    }
+
+    #[test]
+    fn extract_model_audio_artifact_reads_audio_payload_from_artifacts() {
+        let model_result = serde_json::json!({
+            "artifacts": [{
+                "kind": "audio",
+                "mime_type": "audio/wav",
+                "payload": {
+                    "kind": "audio_artifact",
+                    "mime_type": "audio/wav",
+                    "output_format": "wav",
+                    "voice_id": "gemini-live",
+                    "model": "gemini-3.1-flash-live",
+                    "audio_base64": "AQID"
+                }
+            }]
+        });
+
+        let artifact = super::extract_model_audio_artifact(Some(&model_result))
+            .expect("audio artifact should extract");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&artifact).expect("artifact should stay serialized json");
+        assert_eq!(parsed["kind"], "audio_artifact");
+        assert_eq!(parsed["mime_type"], "audio/wav");
+    }
+
+    #[test]
+    fn extract_model_audio_artifact_ignores_non_audio_artifacts() {
+        let model_result = serde_json::json!({
+            "artifacts": [{
+                "kind": "embedding",
+                "payload": { "vector": [1, 2, 3] }
+            }]
+        });
+
+        assert!(super::extract_model_audio_artifact(Some(&model_result)).is_none());
+    }
+
+    #[test]
+    fn extracts_native_live_pending_function_call_id_from_model_result() {
+        let task: InboundTaskPayload = serde_json::from_value(serde_json::json!({
+            "action": "model_response",
+            "agent_action": {
+                "kind": "tool_call",
+                "tool_name": "session.status",
+                "arguments": {},
+                "model_result": {
+                    "native_live": {
+                        "pending_function_call_id": "call-1"
+                    }
+                }
+            }
+        }))
+        .expect("payload should parse");
+
+        assert_eq!(
+            super::extract_native_live_pending_function_call_id(&task).as_deref(),
+            Some("call-1")
+        );
     }
 
     // ── bash.exec tests ──────────────────────────────────────────────────────

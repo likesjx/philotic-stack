@@ -1,41 +1,37 @@
 ---
-title: Model Controller Proposal
+title: "Model Controller Proposal"
 doc_type: proposal
 domain: tooling-execution
 status: accepted-current-slice
-last_updated: 2026-04-09
+last_updated: 2026-03-27
 tags:
-- model-controller
-- models
-- oauth
-- api-key
-- voice
-- openai-compatible
-- openrouter
-- ollama
-- active-seam
+  - model-controller
+  - models
+  - oauth
+  - voice
+  - active-seam
 related_docs:
-- ARCHITECTURE_STATUS.md
-- TASK_RUNNER_PROPOSAL.md
-- VOICE_MACHINE_PROPOSAL.md
-- KEY_VAULT_PROPOSAL.md
+  - ARCHITECTURE_STATUS.md
+  - TASK_RUNNER_PROPOSAL.md
+  - VOICE_MACHINE_PROPOSAL.md
+  - KEY_VAULT_PROPOSAL.md
 task_refs:
-- docs/task.md
+  - docs/task.md
 proposal_id: model-controller
 implements: []
 implemented_by:
-- structured-model-envelope-slice
-- gemini-oauth-guest-path-slice
-- voice-synthesize-envelope-slice
+  - structured-model-envelope-slice
+  - gemini-oauth-guest-path-slice
+  - voice-synthesize-envelope-slice
 active_seams:
-- structured-model-envelope
-- hotel-gemini-oauth-flow
-- openai-provider-contract
-- hotel-openai-oauth-flow
-- provider-capability-overrides
+  - structured-model-envelope
+  - hotel-gemini-oauth-flow
+  - openai-provider-contract
+  - hotel-openai-oauth-flow
+  - provider-capability-overrides
 source_of_truth_targets:
-- ARCHITECTURE_STATUS.md
-- ARCHITECTURE.md
+  - ARCHITECTURE_STATUS.md
+  - ARCHITECTURE.md
 ---
 
 # Model Controller Proposal
@@ -47,7 +43,7 @@ Define a capability-addressed model-controller boundary for Philotic that can:
 - route text generation, voice synthesis, and future multimodal response work through separate materialized model-controller guests
 - support richer ElevenLabs audio capabilities beyond basic TTS
 - support Gemini authentication via hotel-managed OAuth with API key fallback
-- support OpenAI authentication via hotel-managed API keys for the canonical OpenAI path and bearer-compatible credentials for OpenAI-shaped endpoints
+- support OpenAI authentication via hotel-managed OAuth or API key, depending on provider path
 - support OpenAI-standard model features without forcing Philotic to adopt OpenAI-specific worldview as its canonical schema
 - keep provider invocation separate from higher-level delivery and transport concerns
 
@@ -67,6 +63,7 @@ For the current direction:
 - treat native multimodal voice-capable models as a separate response path, not as disguised ElevenLabs TTS
 - let the hotel own OAuth UX, token storage, and token refresh
 - let model-controller guests consume short-lived auth material from the hotel/config path
+- let the hotel and session binding path project the effective rights and scoped execution posture; model-router may consume that posture, but must not inject new rights or widen the capability surface on its own
 - keep API key support as the operational fallback for Gemini
 - keep OpenAI-specific advanced features in explicit provider extensions until they prove they belong in the shared contract
 
@@ -88,9 +85,8 @@ Pin and prove the first design contract for:
 - a structured model request envelope that separates context layers from routing hints and provider options
 - a structured model response envelope with explicit response channels for optimization-oriented outputs
 - a first `request_class` split so cognitive calls can carry agent context and affordances without forcing every model call to pretend it is part of the reasoning loop
-- a proposal-backed OpenAI provider slice covering standard text/tool/structured-output support, hotel-owned key management, and model-specific capability overrides
-- an explicit compatibility strategy for OpenAI-shaped endpoints such as OpenRouter and Ollama so they are treated as provider/endpoint modes unless a materially different lifecycle forces a new guest boundary
-- a first provider-option override slice for OpenAI reasoning effort, verbosity, background mode, and explicit built-in tool passthrough
+- a proposal-backed OpenAI provider slice covering standard text/tool/structured-output support, hotel-owned OAuth, and model-specific capability overrides
+- a first honest Gemini Live provider slice on the native-live seam: websocket setup, text-native `response.generate`, PCM-gated `voice.dialogue`, dedicated live tool-call parsing, and resumable-session markers without pretending classic one-shot invocation already had the right physiology
 
 Current confidence for the implemented structured-envelope slice:
 
@@ -103,6 +99,38 @@ Current confidence for the implemented structured-envelope slice:
 
 Linked task surface: [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md)
 
+## Gemini Live Pressure
+
+Gemini 3.1 Flash Live is now important design pressure on this boundary because it is not a
+fancier `generateContent` POST. It is a stateful Live API session with websocket setup,
+realtime input, dedicated tool-call messages, and session-resumption updates.
+
+The first honest controller slice should therefore:
+
+- use the native-live provider seam rather than overextending `ModelProvider::invoke`
+- treat `response.generate` and `voice.dialogue` as native-live capability species
+- keep tool calls surfaced back into the canonical controller envelope rather than letting the provider become turn owner
+- keep voice input requirements explicit: Gemini Live expects raw PCM audio on the realtime input path, so upstream transport conversion is a separate seam rather than something the provider should fake
+
+Current implemented truth for this seam is still transitional:
+
+- `response.generate` now uses the Live websocket seam and returns canonical text output
+- `voice.dialogue` now uses the Live websocket seam and prepares non-PCM blob-backed audio through the first shared `media-prep` enzyme, which currently uses a transitional ffmpeg-backed PCM path before sending Gemini realtime input
+- `philote` now treats cognitive-stage audio artifacts as first-class enough to short-circuit duplicate voice synthesis on voice turns, delivering the native-live artifact directly instead of reflexively asking another synth to repeat it
+- the first shared artifact-interception path now also lives in `media-prep` via a shared `audio_artifact` envelope, so `model-router`, `philote`, and `membrane` stop independently serializing, guessing at, and re-decoding the same payload shape
+- Gemini Live tool calls now preserve the live websocket session inside `model-router` across the tool round-trip, with `philote` carrying the pending function-call id back into the next cognitive request so the actual `toolResponse` returns over the same live receptor instead of restarting the turn from scratch
+- a startup-driven `smoke-gemini-live` path now proves the binary-level `response.generate -> tool_call -> toolResponse -> final reply` continuity against a fake local Live websocket receptor, so the complete-turn seam is smoke-green at the model-controller boundary rather than only test-green in crates
+- audio output currently re-enters Philotic through output transcription text rather than a first-class cognitive audio artifact
+- live tool-response continuation is now wired for the Gemini path, though broader native-live lifecycle governance and cleanup policy are still transitional
+
+Interception boundary note:
+
+- the codec pressure now has a first narrow shared home in `media-prep`, while interception still happens at the provider receptor (`model-router` native-live seam), because that is the first layer that knows Gemini Live specifically requires realtime PCM input
+- artifact-envelope pressure now has a first shared home there too, because outbound audio artifacts were already crossing `model-router` -> `philote` -> `membrane` with duplicated local decoding logic
+- this is still transitional, not the permanent final anatomy
+- a cleaner long-term shape is to let `media-prep` grow into a broader shared interception substrate between `philote` and provider invocation, but moving all adaptation pressure earlier before more artifact paths are properly metabolized would just spread provider-specific physiology upstream
+- similarly, live-session continuity is currently kept inside the long-lived `model-router` process as a provider-local pool keyed by session/turn rather than a fully generalized hotel-level substrate, because the pressure is proven for Gemini Live function-calling turns but not yet broad enough to justify a larger authority shift
+
 ## OpenAI Provider Recommendation
 
 Philotic should add OpenAI support as the next provider on the existing `model-router` seam, not as a new orchestration layer.
@@ -113,14 +141,6 @@ That means:
 - add an OpenAI provider adapter that renders that contract into the OpenAI API surface
 - map OpenAI outputs back into Philotic `ProviderOutput` variants
 - keep advanced OpenAI-only behavior in explicit provider extensions rather than leaking it into every call path
-
-OpenAI-compatible services such as OpenRouter should usually be treated as the same provider family with different endpoint, auth, or routing settings. Ollama is slightly more nuanced: if Philotic is talking to an Ollama-shaped HTTP surface, it belongs in the same compatibility family; if the local runtime requires a distinct lifecycle or protocol, that is the point to split a dedicated provider adapter or guest boundary.
-
-The rule of thumb is simple enough to survive contact with reality:
-
-- shared request/response contract stays canonical
-- provider adapter changes cover endpoint shape, auth shape, or small protocol gaps
-- separate controller guests only when lifecycle, streaming, or runtime ownership is actually different
 
 The current code seam is already shaped for this:
 
@@ -191,12 +211,17 @@ These should live in `provider_options` until multiple providers justify promoti
 
 This is the important guardrail: provider-aware does not mean provider-owned. Philotic should learn from OpenAI's capabilities without letting one vendor's convenience surface become the canonical worldview.
 
+Related guardrail: execution-aware does not mean rights-aware. `model-router`
+may honor routing hints, model hints, and short-lived provider auth material,
+but it must not become the place where new session rights appear because a
+provider makes them easy to expose.
+
 ## OpenAI Auth Recommendation
 
 OpenAI auth should support:
 
-- hotel-managed endpoint-scoped API keys for the canonical OpenAI API path
-- bearer-compatible credentials for OpenAI-shaped endpoints when needed
+- hotel-managed OAuth where the OpenAI product/API path supports it
+- API key fallback
 
 Recommended auth modes:
 
@@ -206,16 +231,15 @@ Recommended auth modes:
 
 Recommended boundary rule:
 
-- the hotel owns key onboarding, refresh, storage, and validation UX
-- browser login only applies when a provider path genuinely exposes OAuth
+- the hotel owns browser login, token exchange, refresh, storage, and validation UX
 - the guest consumes short-lived usable runtime auth material
-- the guest must not become the owner of long-lived provider credentials
+- the guest must not become the owner of long-lived OAuth credentials
 
 Acceptance criteria for this seam:
 
 - hotel can start and validate an OpenAI auth flow without requiring guest restarts for every credential refresh
-- model-router/provider config can prefer vaulted auth material over raw config values
-- failure is visible before fallback logic quietly masks a broken endpoint-specific credential path
+- model-router/provider config can prefer OAuth auth material over API key fallback when present
+- failure is visible before API-key fallback quietly masks a broken OAuth path
 - refreshable credentials live behind vault references rather than raw config values
 
 ## OpenAI Capability Override Recommendation
@@ -234,7 +258,6 @@ Recommendation:
 - keep the default OpenAI path focused on the standard shared contract
 - add explicit feature gates and provider options for specialized models
 - promote an OpenAI-specific feature into the shared Philotic contract only after at least one more provider or a clearly reusable internal surface wants the same thing
-- wire the first specialized controls through `provider_options` rather than minting a new request envelope field for each vendor-specific knob
 
 That keeps us from mistaking “OpenAI happens to expose this nicely” for “Philotic should now be this.”
 
@@ -253,6 +276,84 @@ The model-controller API should be structured around capabilities such as:
 `response.generate` is the important escape hatch for multimodal models that can emit text and audio directly. It should not be forced through the `voice.synthesize` path, because that would collapse native model audio into a fake TTS abstraction.
 
 Capability names alone are not enough to express what kind of execution contract a task needs. A `text.generate` request used for agent reasoning is not the same species of work as an embedding request or a narrow transform request, even when all of them happen to call a model.
+
+For staged turns, the model-controller should remain the executor per stage, not the owner of the whole turn. A voice turn may legitimately traverse:
+
+- `voice.transcribe` as `transform`
+- `text.generate` as `cognitive`
+- `voice.synthesize` as `synthesis`
+
+with the session/agent still owning continuity, tools, approvals, and final response policy across the whole turn.
+
+The next honest refinement is to make the capability species explicit instead of
+leaving them as scattered strings. Current known turn-routed species should be
+treated as:
+
+- stage-local transform species:
+  - `media.analyze`
+  - `image.describe`
+  - `document.summarize`
+  - `voice.transcribe`
+- stage-local cognitive species:
+  - `text.generate`
+- stage-local synthesis species:
+  - `voice.synthesize`
+  - `sound.generate`
+  - `music.generate`
+- collapsible native-live species:
+  - `response.generate`
+  - `voice.dialogue`
+
+`response.generate` and `voice.dialogue` are the important native-live species.
+They are allowed to collapse `ingress + cognition` under policy, but they
+should not automatically become whole-turn owners. They still need explicit
+envelope, approval, tool, and routing rules before they are allowed to bypass
+the simpler staged pipeline.
+
+Current implemented truth for this seam:
+
+- `philote` now lets shared model markers plus routing preferences influence
+  whether eligible voice turns keep the classic
+  `voice.transcribe -> text.generate -> voice.synthesize` path or collapse into
+  a native-live cognition species like `voice.dialogue`
+- that chosen cognition species now flows through initial outbound request
+  assembly and cognitive re-entry paths instead of being confined to plan
+  metadata
+- `model-router` now has a separate native-live provider seam alongside the
+  classic one-shot `ModelProvider::invoke` path, so session-shaped providers
+  have a real home instead of being smuggled through the request/response seam
+- Gemini is now bound to that native-live seam explicitly, but still returns an
+  honest not-yet-wired failure until the WebSocket session substrate lands
+
+### Gemini 3.1 Flash Live provider pressure
+
+As of March 27, 2026, the official Gemini Live API docs and the Gemini 3.1
+Flash Live model card make the next boundary pressure explicit:
+
+- Gemini 3.1 Flash Live is a stateful Live API session, not a plain
+  `generateContent` request/response call
+- Live API audio input is raw PCM streamed with `send_realtime_input`
+- audio output is returned as chunked model-turn parts
+- Gemini 3.1 Flash Live uses sequential function calling, not non-blocking tool
+  execution
+- session management includes explicit lifecycle concerns like generation
+  completion and session resumption
+
+That means the current `ModelProvider::invoke(&ControllerTask) ->
+ProviderOutput` seam is insufficient for a first-class Gemini Live provider on
+its own. The smallest honest implementation path is:
+
+1. keep `response.generate` / `voice.dialogue` as the routed capability species
+2. add a session-shaped provider runtime under `model-router` for Live API work
+3. let `philote` remain turn owner while the Gemini Live session acts as a
+   stage-local execution enzyme
+4. surface tool calls, partial replies, audio chunks, and turn-complete signals
+   back through the canonical controller response/event contracts instead of
+   letting the provider become a hidden parallel loop
+
+The important guardrail is that Gemini Live should arrive as a session-shaped
+execution substrate below the agent, not as a magical realtime exception that
+quietly becomes the real orchestrator.
 
 ## Request Classes
 
@@ -326,6 +427,7 @@ This gives the system a stable capability-facing request while preserving struct
 - prompt projection
 - context trimming
 - cache reuse
+- per-stage routing hints without pretending the controller owns the entire multi-hop turn
 - provider-specific rendering
 - routing decisions
 
@@ -553,6 +655,19 @@ This allows a caller to say:
 - text plus suggested next questions
 
 without pretending every turn needs every output.
+
+Policy note:
+
+- transform stages should usually request narrow output, not planning/memory channels
+- low-intent cognitive turns should be allowed to request a slimmer channel set than active problem-solving turns
+- cognitive re-entry should reuse the same tool-projection policy as initial turns rather than bypassing it with a raw bound-tool replay
+- stage-aware projection should also narrow prompt/context affordance cues such as skill guidance and approval posture, not just the explicit tool list
+- approval interrupts should be stage-aware too: valid for real tool/workflow gates, redirected on low-intent conversational turns, and rejected on non-cognitive transform/synthesis stages
+- routing self-improvement should be governed: the first `routing.policy.propose` path should surface a durable operator-reviewed proposal, not silently mutate controller choice or stage policy at runtime
+- agent-local routing preferences can now flow in as advisory `routing_hints` from the active session binding path; model-controller may use those hints to honor provider/model bias, but it still must not become the authority for turn ownership or mutable routing policy
+- model requests now also carry the projected `effective_rights` envelope so
+  model-controller can validate that any surfaced tool contract is still inside
+  the hotel's key ring, rather than trusting upstream assembly blindly
 
 ## Optimization-Oriented Response Channels
 
@@ -881,7 +996,7 @@ Important boundary:
 
 The hotel is the better authority because it already owns local runtime coordination and canonical configuration.
 
-## Auth UX Recommendation
+## OAuth UX Recommendation
 
 Target operator experience:
 
@@ -889,12 +1004,12 @@ Target operator experience:
 - `ansible auth google validate --provider gemini`
 - `ansible auth openai start`
 - `ansible auth openai validate`
-- Gemini browser UX opens automatically when OAuth is selected
-- OpenAI stores an endpoint-scoped API key in the hotel vault and validates against the configured endpoint
+- browser opens automatically
+- hotel captures callback on localhost
 - hotel confirms success
 - Gemini model-controller begins using OAuth
-- OpenAI model-controller begins using endpoint-scoped vaulted keys or bearer material when the configured path supports it
-- if a provider path requires OAuth, the hotel can still own that flow as a separate path
+- OpenAI model-controller begins using OAuth when the configured path supports it
+- if OAuth is unavailable or expires irrecoverably, API key remains the fallback path
 
 Operationally, the hotel should vend short-lived access tokens to the guest rather than permanently copying the long-lived credential into every model process.
 
@@ -921,5 +1036,5 @@ Implement the next slice in this order:
 5. add Gemini auth abstraction with OAuth-capable config shape and API key fallback
 6. add hotel-side OAuth trigger and token handoff design before full implementation
 7. add `OpenAIProvider` on the existing `ModelProvider` seam for text/tool/structured-output support
-8. add hotel-side OpenAI auth trigger, key handoff design, and validation path before full implementation
+8. add hotel-side OpenAI auth trigger, token handoff design, and validation path before full implementation
 9. add provider capability-overrides for reasoning effort and the first specialized OpenAI controls without broadening the shared contract prematurely

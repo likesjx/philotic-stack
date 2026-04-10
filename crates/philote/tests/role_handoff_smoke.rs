@@ -106,7 +106,7 @@ async fn connect_runtime(socket_path: &str, agent_id: &str) -> AgentRuntime {
     let client = philotic_client::PhiloticClient::connect_at(socket_path, identity)
         .await
         .expect("connect to stub hotel");
-    AgentRuntime::new(client, agent_id)
+    AgentRuntime::new(client, agent_id, agent_id)
 }
 
 fn handoff_bundle_task(

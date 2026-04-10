@@ -274,6 +274,7 @@ async fn post_mempalace_turn(
 
     // Trigger mempalace mine in the background so we don't block the agent
     let convos_path = convos_dir.clone();
+    let agent_id_for_log = body.agent_id.clone();
     tokio::spawn(async move {
         tracing::info!("Executing mempalace mine on {:?}", convos_path);
         match tokio::process::Command::new("mempalace")
@@ -290,7 +291,7 @@ async fn post_mempalace_turn(
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     tracing::error!("Mempalace mine failed: {}", stderr);
                 } else {
-                    tracing::info!("Mempalace mine complete for Wing [{}]", body.agent_id);
+                    tracing::info!("Mempalace mine complete for Wing [{}]", agent_id_for_log);
                 }
             }
             Err(e) => tracing::error!("Failed to spawn mempalace: {}", e),

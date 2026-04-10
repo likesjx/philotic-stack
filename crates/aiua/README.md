@@ -42,11 +42,14 @@ Source-of-truth note: this README is a convenience overview. For current impleme
 ## Running
 
 ```bash
-# Standard start
-cargo run -p aiua
+# Standard start from the existing hotel DB
+cargo run -p aiua -- --hotel default
 
-# Load initial config
-cargo run -p aiua -- --load-config path/to/config.json
+# Bootstrap or reseed a hotel from config (guests, identities, and config graph)
+cargo run -p aiua -- load --file path/to/config.json --hotel default
+
+# Apply config deltas to a long-running hotel's graph without reseeding guests
+cargo run -p aiua -- import-config --file path/to/config.json --hotel default
 
 # Start the transitional Gemini OAuth flow
 cargo run -p aiua -- auth google start --provider gemini --client-id YOUR_CLIENT_ID --project-id YOUR_GCP_PROJECT
@@ -55,7 +58,7 @@ cargo run -p aiua -- auth google start --provider gemini --client-id YOUR_CLIENT
 cargo run -p aiua -- auth google validate --provider gemini
 
 # Run the startup text model-controller smoke through the hotel
-cargo run -p aiua -- --hotel startup-test-hotel --load-config mesh-config.json --test text-roundtrip --test-text "hello model controller"
+cargo run -p aiua -- --hotel startup-test-hotel --test text-roundtrip --test-text "hello model controller"
 
 # Run the startup Gemini OAuth smoke through the materialized model-controller guest.
 # This harness seeds a temporary vaulted bearer token and talks to a local fake Gemini endpoint,
@@ -63,7 +66,7 @@ cargo run -p aiua -- --hotel startup-test-hotel --load-config mesh-config.json -
 cargo run -p aiua -- --hotel startup-test-hotel --test gemini-oauth-roundtrip --test-text "oauth-guest-ok"
 
 # Run the startup voice sample through the hotel
-cargo run -p aiua -- --hotel startup-test-hotel --load-config mesh-config.json --test voice-sample --test-output /tmp/aiua-startup-voice-sample.mp3 --test-text "Hello from the startup voice test."
+cargo run -p aiua -- --hotel startup-test-hotel --test voice-sample --test-output /tmp/aiua-startup-voice-sample.mp3 --test-text "Hello from the startup voice test."
 
 # Run the startup Telegram controller smoke through the hotel
 cargo run -p aiua -- --hotel startup-test-hotel --test telegram-roundtrip --test-text "hello telegram controller"
@@ -71,7 +74,7 @@ cargo run -p aiua -- --hotel startup-test-hotel --test telegram-roundtrip --test
 
 On macOS, the hotel now uses a Keychain-backed vault root key automatically and creates one on first use if needed. `PHILOTIC_VAULT_MASTER_KEY` remains a bootstrap fallback for non-macOS environments or explicit operator override. `PHILOTIC_VAULT_KEY_ID` can scope the Keychain item label when you want separate local vault roots.
 
-`mesh-config.json` can be a flat object, a top-level `context_graph` object, or a hotel-structured object. The preferred shape is `hotels.<hotel>.agents.<agent>.telegram` plus optional agent-scoped `model`, `context_graph`, and `import_workspace` sections. On startup, Ansible merges top-level shared keys, then `hotels.default`, then the selected hotel's overlay, flattens nested agent telegram/model settings into the current runtime config keys, and uses `import_workspace` to seed the selected agent identity bundle from an OpenClaw-style workspace.
+`mesh-config.json` can be a flat object, a top-level `context_graph` object, or a hotel-structured object. The preferred shape is `hotels.<hotel>.agents.<agent>.telegram` plus optional agent-scoped `model`, `context_graph`, and `import_workspace` sections. `aiua load --file ... --hotel ...` is the bootstrap/provisioning path: it merges shared keys plus the selected hotel's overlay, seeds guest/runtime records, and writes agent identity bundles. `aiua import-config --file ... --hotel ...` is the stable delta path for a long-running hotel: it updates graph config keys and agent identity bundles without reseeding guests or treating startup like configuration management.
 
 Some log/help text and comments still say `Ansible` for historical reasons. The runtime/component naming in the current repo is Philotic, with `aiua` as the hotel authority.
 

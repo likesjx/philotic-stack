@@ -11,6 +11,8 @@
 //!   GET  /api/agents
 //!   GET  /api/agents/:agent_id/roles
 //!   GET  /api/agents/:agent_id/rules
+//!   GET  /api/agents/:agent_id/routing-policies
+//!   POST /api/routing-policies/:proposal_id/disposition
 //!   PATCH /api/agents/:agent_id/roles/:role_name
 //!   GET  /api/skills
 //!   GET  /api/mesh/targets
@@ -120,6 +122,11 @@ struct OperatorChatAcceptedView {
     delivery_kind: String,
 }
 
+#[derive(serde::Deserialize)]
+struct SetRoutingPolicyDispositionBody {
+    state: String,
+    reason: String,
+}
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct ComponentInventoryEntry {
     guest_id: String,
@@ -268,6 +275,14 @@ pub async fn run(
             axum::routing::patch(handle_role_patch),
         )
         .route("/api/agents/:agent_id/rules", get(handle_agent_rules))
+        .route(
+            "/api/agents/:agent_id/routing-policies",
+            get(handle_agent_routing_policies),
+        )
+        .route(
+            "/api/routing-policies/:proposal_id/disposition",
+            post(handle_routing_policy_disposition),
+        )
         .route("/api/skills", get(handle_skills))
         .route("/api/toolsets", get(handle_toolsets))
         .route("/api/config", get(handle_config))
@@ -1289,6 +1304,45 @@ async fn handle_agent_rules(
     }
     match ipc_list_rules(&state.socket, &agent_id).await {
         Ok(rules) => Json(rules).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn handle_agent_routing_policies(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_list_routing_policies(&state.socket, &agent_id).await {
+        Ok(policies) => Json(policies).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn handle_routing_policy_disposition(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(proposal_id): Path<String>,
+    Json(body): Json<SetRoutingPolicyDispositionBody>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_set_routing_policy_disposition(&state.socket, &proposal_id, &body.state, &body.reason)
+        .await
+    {
+        Ok(value) => Json(value).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
@@ -2541,6 +2595,49 @@ async fn ipc_list_rules(socket: &str, agent_id: &str) -> Result<Vec<Value>> {
         IpcResponse::RuleList { rules } => Ok(rules),
         IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected rules response: {other:?}")),
+    }
+}
+
+async fn ipc_list_routing_policies(socket: &str, agent_id: &str) -> Result<Vec<Value>> {
+    let mut client = connect_management_client(socket, "philotic-web-routing-policies").await?;
+    match client
+        .send_request(IpcRequest::ListRoutingPolicies {
+            agent_id: agent_id.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::RoutingPolicyList { policies } => Ok(policies),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected routing policies response: {other:?}")),
+    }
+}
+
+async fn ipc_set_routing_policy_disposition(
+    socket: &str,
+    proposal_id: &str,
+    state: &str,
+    reason: &str,
+) -> Result<Value> {
+    let mut client =
+        connect_management_client(socket, "philotic-web-routing-policy-disposition").await?;
+    match client
+        .send_request(IpcRequest::SetRoutingPolicyDisposition {
+            proposal_id: proposal_id.to_string(),
+            state: state.to_string(),
+            reason: reason.to_string(),
+            source_tool: Some("philotic-web".to_string()),
+        })
+        .await?
+    {
+        IpcResponse::Standard {
+            ok: true,
+            data: Some(value),
+            ..
+        } => Ok(value),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected routing policy disposition response: {other:?}"
+        )),
     }
 }
 
