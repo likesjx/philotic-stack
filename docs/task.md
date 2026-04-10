@@ -12,6 +12,12 @@
 - [x] Review code for communication and split points.
 - [x] Create an implementation plan for the new services architecture.
 
+## New Project: Primitives Crate Split
+
+- [ ] Review [PHILOTIC_PRIMITIVES_CRATE_STRUCTURE.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PHILOTIC_PRIMITIVES_CRATE_STRUCTURE.md).
+- [ ] Map the current `ansible-mesh-core` modules to the target primitive crates and identify the first extraction boundary.
+- [ ] Extract the smallest safe primitive crate boundary once the interface map is stable.
+
 ## Current Work Item Split
 
 Stable seam refs live in [SEAM_REGISTRY.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SEAM_REGISTRY.md).
@@ -736,7 +742,44 @@ Seam IDs: `structured-model-envelope`, `hotel-gemini-oauth-flow`
 - [ ] Add `spoken_text` / expressive speech projection alongside user-visible text.
 - [ ] Define ElevenLabs default-voice pinning plus upstream voice override behavior.
 - [ ] Add Eleven v3 model selection and expressive-tag support without pretending it is the same as the low-latency conversational path.
+
+### Workstream: Model Graph Decision Layer
+
+Seam IDs: `model-graph-decision-layer`, `context-1-lookup`, `capability-aware-tool-approval`
+
+- [ ] Review [MODEL_GRAPH_AND_CONTEXT_1_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MODEL_GRAPH_AND_CONTEXT_1_PROPOSAL.md).
+- [ ] Map the current provider-selection and approval paths that this layer will sit on top of:
+  - `crates/model-router/src/controller.rs` `ProviderRegistry::resolve`
+  - `crates/model-router/src/controller.rs` `ControllerTask`
+  - `crates/philote/src/session.rs` `approval_policy_allows`
+  - `crates/philote/src/runtime.rs` `handle_approval_request`
+- [ ] Define the first graph record shape for models, benchmark observations, and task-fit edges.
+- [ ] Define the first `context-1` lookup request/response contract:
+  - task type
+  - request class
+  - tool/class risk
+  - context budget
+  - latency budget
+  - provider hint
+  - ranked candidates
+  - reason codes
+- [ ] Thread lookup results into model selection before provider fallback.
+- [ ] Use model capability as an advisory input for tool-call approval while keeping `philote` policy enforcement as the final authority.
+- [ ] Seed the first model facts from `llm-stats.com` plus local runtime observations.
+
+### Workstream: Provider-Native Response-Mode Routing
+
+This workstream includes a quick look at the OpenAI websocket/realtime API because it informs the same routing seam, not a separate auth story.
+
+- [x] Add the first OpenAI realtime websocket transport slice behind `response_mode=realtime_websocket`.
+- [x] Add an explicit shared response-route bucket for `text_only`, `image_multimodal`, `audio_multimodal`, and `realtime_websocket`.
+- [x] Add an explicit canonical `response_route` field to the model-call envelope and populate it from the runtime before routing.
+- [x] Add an agent-configurable `response_route_policy.default_route` surface so the runtime default can be set from `agent.configure` and the desktop onboarding/config projection.
+- [x] Expose `response_route_policy.default_route` in the desktop agent editor so it can be changed after onboarding, not just during config generation.
+- [ ] Define the provider-native response-mode routing seam so reflex routing can choose between `text_only`, `image_multimodal`, `audio_multimodal`, and `realtime_websocket` without leaking provider shape into the agent loop.
 - [ ] Define how native-audio multimodal models emit text plus audio without being forced through TTS.
+- [ ] Decide whether Ollama needs a native adapter boundary or stays in the OpenAI-compatible adapter family.
+
 - [ ] Define Gemini auth modes:
   - hotel-managed OAuth
   - API key fallback
@@ -1192,7 +1235,7 @@ Seam IDs: `wider-client-adoption`, `philotic-native-memory-integration`
 - [x] Port 9 specialized skills from `~/.codex/skills` to `skills/` and make them repo-local.
 - [x] Establish mandatory session bootstrap in `CLAUDE.md` and `AGENTS.md`.
 - [x] Implement `just engine-check` for one-command verification of Muninn, repo-local bootstrap assets, and the cargo check/test baseline.
-- [x] Implement `just session-start` as the mandatory Muninn bootstrap gate for meaningful sessions.
+- [x] Implement `just session-start` as the mandatory Muninn bootstrap gate for meaningful sessions and the graph-board claim path when the graph server is reachable.
 - [x] Require explicit user/operator approval before continuing without Muninn when the bootstrap gate fails.
 - [ ] Deploy Muninn "Truth Cache" to `vps-jane` with automated sync from local.
 - [ ] Formalize semantic "Optimization Loop" to update `AGENTS.md` rules based on recurring "Reality Gaps."

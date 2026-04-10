@@ -59,8 +59,15 @@ pub struct OperatorAgentView {
     pub default_toolset: Vec<String>,
     #[serde(default)]
     pub default_skillset: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_route_policy: Option<ResponseRoutePolicyView>,
     #[serde(default)]
     pub active_session: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponseRoutePolicyView {
+    pub default_route: String,
 }
 
 pub type DesktopMembraneAgentView = OperatorAgentView;
@@ -821,6 +828,8 @@ pub enum IpcRequest {
         default_toolset: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         default_skillset: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_route_policy: Option<ResponseRoutePolicyView>,
     },
     /// List all registered skills with their validation states.
     ListSkills {},

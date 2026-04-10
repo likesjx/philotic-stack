@@ -27,7 +27,8 @@ use philotic_client::{
     OPERATOR_CHAT_REPLY_ROLE, OPERATOR_SURFACE_QUERY_HANDOFF_KIND,
     OPERATOR_SURFACE_QUERY_REPLY_ROLE, OPERATOR_SURFACE_QUERY_ROLE, OperatorAgentView,
     OperatorChatTurnReply, OperatorSurfaceQueryHandoff, OperatorTargetAgentInventoryView,
-    OperatorTargetGuestInventoryView, OperatorTargetStatusView, PhiloticClient, SubagentDelegation,
+    OperatorTargetGuestInventoryView, OperatorTargetStatusView, PhiloticClient,
+    ResponseRoutePolicyView, SubagentDelegation,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -1099,6 +1100,15 @@ impl IpcServer {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string)
         };
+        let response_route_policy = identity
+            .bundle_json
+            .get("response_route_policy")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|policy| policy.get("default_route"))
+            .and_then(serde_json::Value::as_str)
+            .map(|default_route| ResponseRoutePolicyView {
+                default_route: default_route.to_string(),
+            });
 
         OperatorAgentView {
             agent_id: identity.agent_id,
@@ -1111,6 +1121,7 @@ impl IpcServer {
             toolset_tags: str_vec("toolset_tags"),
             default_toolset: str_vec("default_toolset"),
             default_skillset: str_vec("default_skillset"),
+            response_route_policy,
             active_session: false,
         }
     }
@@ -2403,6 +2414,23 @@ impl IpcServer {
                         value_json: Some(snapshot.to_string()),
                     };
                 }
+                // Returns a JSON array of memory_type strings for all session apartments
+                // belonging to the given agent — used by philote at startup for stale-turn sweep.
+                // Key format: `__session_apartments__:{agent_id}`
+                if let Some(agent_id) = key.strip_prefix("__session_apartments__:") {
+                    let memory_types: Vec<String> = graph
+                        .list_apartments(agent_id)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|mt| mt.starts_with("short_session:"))
+                        .collect();
+                    let json = serde_json::to_string(&memory_types).unwrap_or_else(|_| "[]".into());
+                    return IpcResponse::ConfigData {
+                        key,
+                        value_json: Some(json),
+                    };
+                }
+
                 if let Some(rest) = key.strip_prefix("__session_snapshot__:") {
                     // Format: `{session_id}` (orchestrator) or `{session_id}@{role_name}` (role process)
                     let (session_id, role_name) = match rest.split_once('@') {
@@ -4525,7 +4553,23 @@ impl IpcServer {
                 system_prompt,
                 default_toolset,
                 default_skillset,
+                response_route_policy,
             } => {
+                let response_route_policy = match response_route_policy {
+                    Some(policy) => match serde_json::to_value(policy) {
+                        Ok(value) => Some(value),
+                        Err(err) => {
+                            return IpcResponse::Standard {
+                                ok: false,
+                                code: "serialize_error".into(),
+                                message: err.to_string(),
+                                corr_id: String::new(),
+                                data: None,
+                            };
+                        }
+                    },
+                    None => None,
+                };
                 match Self::handle_patch_agent_bundle(
                     graph,
                     local_node_id,
@@ -4537,6 +4581,7 @@ impl IpcServer {
                     system_prompt,
                     default_toolset,
                     default_skillset,
+                    response_route_policy,
                 ) {
                     Ok(agent) => IpcResponse::AgentUpdated { agent },
                     Err(err) => IpcResponse::error(
@@ -5361,6 +5406,7 @@ impl IpcServer {
         system_prompt: Option<String>,
         default_toolset: Option<Vec<String>>,
         default_skillset: Option<Vec<String>>,
+        response_route_policy: Option<serde_json::Value>,
     ) -> anyhow::Result<DesktopMembraneAgentView> {
         let mut identity = graph
             .get_agent_identity(agent_id)?
@@ -5393,6 +5439,9 @@ impl IpcServer {
         }
         if let Some(skillset) = default_skillset {
             identity.bundle_json["default_skillset"] = serde_json::json!(skillset);
+        }
+        if let Some(policy) = response_route_policy {
+            identity.bundle_json["response_route_policy"] = policy;
         }
 
         graph.upsert_agent_identity(&identity)?;

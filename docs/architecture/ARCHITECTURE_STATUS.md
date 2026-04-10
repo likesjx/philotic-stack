@@ -3,7 +3,7 @@ title: Philotic Architecture Status
 doc_type: status
 domain: runtime-sessions
 status: active
-last_updated: 2026-04-09
+last_updated: 2026-04-10
 tags:
 - source-of-truth
 - current-state
@@ -129,6 +129,8 @@ Primary references:
 - an `OpenAIProvider` adapter and dedicated `model-controller-openai` guest now exist on that seam, with OpenRouter/Ollama treated as compatibility modes unless their runtime lifecycle forces a different boundary
 - OpenAI auth now has hotel-side key management and validation commands, with endpoint-scoped secret refs, explicit base URL/default model settings, and optional project header support; the first real startup smoke is now green
 - OpenAI capability overrides for reasoning effort, verbosity, background mode, and explicit built-in tool passthrough now flow through `provider_options` on the OpenAI provider
+- route preference is now agent-configurable via `profile.response_route_policy.default_route`, is projected from the desktop onboarding/config path, and is also editable in the desktop agent editor, while the runtime still carries the canonical per-turn `response_route`
+- native-audio and realtime-style response modes are still deferred behind a future routing-reflex seam that will choose between provider-native `response.generate` audio, OpenAI websocket/realtime handling, and the `voice.synthesize` pipeline; the shared route bucket now distinguishes `text_only`, `image_multimodal`, `audio_multimodal`, and `realtime_websocket`, the provider-side websocket slice exists behind `response_mode=realtime_websocket`, and Ollama has not been split into a separate native boundary yet
 
 Primary references:
 - [TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md)

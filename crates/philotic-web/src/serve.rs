@@ -67,7 +67,7 @@ use philotic_client::{
     ComponentManifest, CronJob, CronJobSource, DesktopMembraneAgentView, DesktopMembraneGuestView,
     DesktopMembraneStatusView, GuestIdentity, IpcRequest, IpcResponse, LeaseEnvelope,
     OperatorTargetAgentInventoryView, OperatorTargetGuestInventoryView, OperatorTargetStatusView,
-    OperatorTargetView, PhiloticClient, OPERATOR_CHAT_REPLY_ROLE,
+    OperatorTargetView, PhiloticClient, ResponseRoutePolicyView, OPERATOR_CHAT_REPLY_ROLE,
 };
 
 // ── Embedded UI assets ────────────────────────────────────────────────────────
@@ -1874,6 +1874,14 @@ struct PatchAgentBody {
     default_toolset: Option<Vec<String>>,
     #[serde(default)]
     default_skillset: Option<Vec<String>>,
+    #[serde(default)]
+    response_route_policy: Option<ResponseRoutePolicyBody>,
+}
+
+#[derive(serde::Deserialize)]
+struct ResponseRoutePolicyBody {
+    #[serde(default)]
+    default_route: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1919,6 +1927,11 @@ async fn handle_agent_patch(
         body.system_prompt,
         body.default_toolset,
         body.default_skillset,
+        body.response_route_policy.and_then(|policy| {
+            policy
+                .default_route
+                .map(|default_route| ResponseRoutePolicyView { default_route })
+        }),
     )
     .await
     {
@@ -1987,6 +2000,7 @@ async fn ipc_patch_agent_bundle(
     system_prompt: Option<String>,
     default_toolset: Option<Vec<String>>,
     default_skillset: Option<Vec<String>>,
+    response_route_policy: Option<ResponseRoutePolicyView>,
 ) -> Result<Value> {
     let mut client = connect_management_client(socket, "philotic-web-patch-agent").await?;
     match client
@@ -1999,6 +2013,7 @@ async fn ipc_patch_agent_bundle(
             system_prompt,
             default_toolset,
             default_skillset,
+            response_route_policy,
         })
         .await?
     {
