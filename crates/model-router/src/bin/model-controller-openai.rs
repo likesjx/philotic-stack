@@ -21,6 +21,7 @@ async fn main() -> Result<()> {
                 configs.openai_default_embedding_model.clone(),
             ))]
         }),
+        live_providers: Box::new(|_http_client, _configs| Vec::new()),
     })
     .await
 }

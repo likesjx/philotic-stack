@@ -103,6 +103,7 @@ async fn main() -> Result<()> {
             providers: Box::new(move |_http_client, _configs| {
                 vec![Arc::clone(&provider_for_factory) as Arc<dyn ModelProvider>]
             }),
+            live_providers: Box::new(|_http_client, _configs| Vec::new()),
         });
 
         let sidecar_task = run_sidecar(&args.sidecar_addr, shared_embeddings, shared_whisper);

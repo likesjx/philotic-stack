@@ -101,6 +101,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2",
  "tokio",
  "tower-http 0.5.2",
@@ -2317,8 +2318,16 @@ name = "membrane"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "membrane-telegram",
+ "clap",
+ "media-prep",
+ "philotic-client",
+ "pulldown-cmark",
+ "reqwest",
+ "serde_json",
+ "sha2",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2889,6 +2898,7 @@ dependencies = [
  "ansible-mesh-core",
  "anyhow",
  "clap",
+ "media-prep",
  "memory-core",
  "philotic-client",
  "serde",

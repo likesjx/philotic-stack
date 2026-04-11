@@ -18,6 +18,7 @@ async fn main() -> Result<()> {
                 configs.elevenlabs_default_voice_id.clone(),
             ))]
         }),
+        live_providers: Box::new(|_http_client, _configs| Vec::new()),
     })
     .await
 }
