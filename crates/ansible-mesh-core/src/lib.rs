@@ -6,6 +6,7 @@ pub mod agent;
 pub mod agent_graph_storage;
 pub mod authz;
 pub mod beacon;
+pub mod catalog_rights;
 pub mod cron;
 pub mod cursor;
 pub mod domain;

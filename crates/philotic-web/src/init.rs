@@ -163,6 +163,9 @@ static CONFIG_TEMPLATE: &str = r#"{
           "model": {
             "default_model": "gemini-2.0-flash-exp"
           },
+          "response_route_policy": {
+            "default_route": "auto"
+          },
           "approval_policy": {
             "require_approval": true,
             "preapproved_classes": ["utility", "session"],
@@ -186,6 +189,9 @@ static CONFIG_TEMPLATE: &str = r#"{
           },
           "model": {
             "default_model": "gemini-2.0-flash-exp"
+          },
+          "response_route_policy": {
+            "default_route": "auto"
           },
           "toolset_tags": ["admin-required"],
           "approval_policy": {
@@ -212,6 +218,9 @@ static CONFIG_TEMPLATE: &str = r#"{
           "model": {
             "default_model": "gemini-2.0-flash-exp"
           },
+          "response_route_policy": {
+            "default_route": "auto"
+          },
           "approval_policy": {
             "require_approval": true,
             "preapproved_classes": ["utility", "session"],
@@ -236,6 +245,9 @@ static CONFIG_TEMPLATE: &str = r#"{
           "model": {
             "default_model": "gemini-2.0-flash-exp"
           },
+          "response_route_policy": {
+            "default_route": "auto"
+          },
           "approval_policy": {
             "require_approval": true,
             "preapproved_classes": ["utility", "session"],
@@ -259,6 +271,9 @@ static CONFIG_TEMPLATE: &str = r#"{
           },
           "model": {
             "default_model": "gemini-2.0-flash-exp"
+          },
+          "response_route_policy": {
+            "default_route": "auto"
           },
           "approval_policy": {
             "require_approval": true,

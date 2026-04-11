@@ -31,6 +31,7 @@ use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
 mod auth;
+mod dream;
 mod graph;
 mod memory;
 mod muninn_provision;
@@ -1871,6 +1872,7 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                 .into(),
             input_schema: serde_json::json!({ "type": "object", "properties": {} }),
             class: "session".into(),
+            tool_markers: Vec::new(),
         },
         AbstractToolRecord {
             tool_name: "echo".into(),
@@ -1885,6 +1887,7 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                 "required": ["text"]
             }),
             class: "utility".into(),
+            tool_markers: Vec::new(),
         },
         AbstractToolRecord {
             tool_name: "workspace.list".into(),
@@ -1901,6 +1904,7 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                 }
             }),
             class: "workspace".into(),
+            tool_markers: Vec::new(),
         },
         AbstractToolRecord {
             tool_name: "workspace.read".into(),
@@ -1926,6 +1930,7 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                 "required": ["path"]
             }),
             class: "workspace".into(),
+            tool_markers: Vec::new(),
         },
         AbstractToolRecord {
             tool_name: "agent.configure".into(),
@@ -1946,6 +1951,7 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                 "required": ["config_path", "value"]
             }),
             class: "config".into(),
+            tool_markers: Vec::new(),
         },
     ];
 
@@ -2131,6 +2137,7 @@ fn seed_skill_crafting(graph: &GraphDomain) -> anyhow::Result<()> {
             "subagent.spawn".into(),
             "role.configure".into(),
         ],
+        skill_markers: Vec::new(),
         validation_state: SkillValidationState::Validated,
         source_snapshot: None,
         field_sources: serde_json::json!({}),
@@ -2181,6 +2188,7 @@ fn seed_orchestrator_roles(graph: &GraphDomain, profiles: &[AgentProfile]) -> an
             role_identity_addendum: None,
             role_manifest: Some(ORCHESTRATOR_MANIFEST.into()),
             is_admin: false,
+            readiness_state: ansible_mesh_core::graph::RoleReadinessState::Configured,
             inactive_ttl_seconds: None,
             turn_loop_config: ansible_mesh_core::graph::TurnLoopConfig::default(),
         };
@@ -4720,7 +4728,7 @@ async fn main() -> Result<()> {
         dispatcher_tx.clone(),
         graph_domain_arc.clone(),
     )
-    .with_memory_config(muninn_config_arc)
+    .with_memory_config(muninn_config_arc.clone())
     .with_materialization_requester(guest_manager.clone())
     .with_registry(registry.clone());
     let ipc_inboxes = ipc_server.inboxes();
@@ -4981,6 +4989,13 @@ async fn main() -> Result<()> {
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     }
     info!("All guest subscribers drained (or drain window elapsed). Shutting down hotel.");
+
+    // DreamsPhase: semantic consolidation + Hebbian sweep across all agent vaults.
+    // Runs after guests drain, before the internal shutdown broadcast.
+    // Uses direct HTTP to ONNX sidecar (:11435) and Ollama (:11434) — no IPC needed.
+    if let Some(ref cfg) = muninn_config_arc {
+        dream::dream_sweep(cfg, &graph_domain_arc, &hotel_name).await;
+    }
 
     let _ = shutdown_tx.send(());
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;

@@ -3,7 +3,7 @@ title: Philotic Seam Registry
 doc_type: workflow
 domain: '`tooling-execution`'
 status: active
-last_updated: 2026-03-31
+last_updated: 2026-04-10
 tags:
 - seams
 - ids
@@ -95,6 +95,10 @@ This registry makes the seam layer explicit without forcing every task bullet to
 | `openai-provider-contract` | `tooling-execution` | [MODEL_CONTROLLER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MODEL_CONTROLLER_PROPOSAL.md) | `docs/task.md` → `New Project: Model Controller` |
 | `hotel-openai-oauth-flow` | `tooling-execution` | [MODEL_CONTROLLER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MODEL_CONTROLLER_PROPOSAL.md) | `docs/task.md` → `New Project: Model Controller` |
 | `provider-capability-overrides` | `tooling-execution` | [MODEL_CONTROLLER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MODEL_CONTROLLER_PROPOSAL.md) | `docs/task.md` → `New Project: Model Controller` |
+| `provider-native-response-mode-routing` | `tooling-execution` | [MODEL_CONTROLLER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MODEL_CONTROLLER_PROPOSAL.md) | `docs/task.md` → `New Project: Model Controller` |
+| `model-graph-decision-layer` | `tooling-execution` | [MODEL_GRAPH_AND_CONTEXT_1_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MODEL_GRAPH_AND_CONTEXT_1_PROPOSAL.md) | `docs/task.md` → `New Project: Model Controller / Model Graph Decision Layer` |
+| `context-1-lookup` | `tooling-execution` | [MODEL_GRAPH_AND_CONTEXT_1_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MODEL_GRAPH_AND_CONTEXT_1_PROPOSAL.md) | `docs/task.md` → `New Project: Model Controller / Model Graph Decision Layer` |
+| `capability-aware-tool-approval` | `runtime-sessions` | [MODEL_GRAPH_AND_CONTEXT_1_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MODEL_GRAPH_AND_CONTEXT_1_PROPOSAL.md) | `docs/task.md` → `New Project: Model Controller / Model Graph Decision Layer` |
 | `context-engine-contract` | `memory-context` | [PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md) | `docs/task.md` → `New Project: Context And Memory Engines` |
 | `deterministic-context-assembly` | `memory-context` | [PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md) | `docs/task.md` → `New Project: Context And Memory Engines` |
 | `embeddinggemma-swap-validation` | `memory-context` | [EMBEDDINGGEMMA_SWAP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/EMBEDDINGGEMMA_SWAP_PROPOSAL.md) | `docs/task.md` → `New Project: EmbeddingGemma Swap` |
@@ -112,6 +116,7 @@ This registry makes the seam layer explicit without forcing every task bullet to
 | `watched-live-recipe` | `workflow-docs` | [AGENT_WORKFLOW_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/AGENT_WORKFLOW_PROPOSAL.md) | `docs/task.md` → watched-live recipe follow-ons |
 | `engine-bootstrap-routine` | `workflow-docs` | [DEV_ENGINE_OPTIMIZATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DEV_ENGINE_OPTIMIZATION_PROPOSAL.md) | `docs/task.md` → `New Project: Dev Engine Optimization` |
 | `reality-gap-consolidation` | `workflow-docs` | [DEV_ENGINE_OPTIMIZATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DEV_ENGINE_OPTIMIZATION_PROPOSAL.md) | `docs/task.md` → `New Project: Dev Engine Optimization` |
+| `session-start-bootstrap-slice` | `workflow-docs` | [DEV_ENGINE_OPTIMIZATION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DEV_ENGINE_OPTIMIZATION_PROPOSAL.md) | `docs/task.md` → `New Project: Dev Engine Optimization` |
 | `admin-posture-model` | `operator-control-plane` | [ROLE_POSTURE_AND_ADMIN_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ROLE_POSTURE_AND_ADMIN_PROPOSAL.md) | `docs/task.md` → `New Project: Admin Role And Surfaces` |
 | `session-admin-elevation` | `operator-control-plane` | [ROLE_POSTURE_AND_ADMIN_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ROLE_POSTURE_AND_ADMIN_PROPOSAL.md) | `docs/task.md` → `New Project: Admin Role And Surfaces` |
 | `cli-tui-admin-surface` | `operator-control-plane` | [CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md) | `docs/task.md` → `New Project: Admin Role And Surfaces` |

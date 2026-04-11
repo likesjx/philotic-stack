@@ -23,7 +23,8 @@ install-git-hooks:
 # Mandatory Muninn bootstrap gate for meaningful sessions.
 session-start:
     python3 scripts/muninn_mcp.py bootstrap
-    @just harness-drift 2>/dev/null || true
+    just harness-drift 2>/dev/null || true
+    bash scripts/session-start.sh
 
 # Show drift status for all managed harnesses.
 harness-drift:
@@ -44,22 +45,42 @@ harness-trial-start seam harness="claude-local" profile="philotic-operator":
     echo "$SESSION" > /tmp/philotic-harness-trial-session
 
 # Report activity against the current harness trial.
-# Usage: just harness-trial-report <activity-type> [tokens_in] [tokens_out]
-harness-trial-report activity tokens_in="0" tokens_out="0":
+# Usage: just harness-trial-report <activity-type> [phase] [tokens_in] [tokens_out] [elapsed_ms] [lines_changed] [files] [note]
+harness-trial-report activity phase="" tokens_in="0" tokens_out="0" elapsed_ms="0" lines_changed="0" files="" note="":
     #!/usr/bin/env bash
+    set -euo pipefail
     SESSION=$(cat /tmp/philotic-harness-trial-session 2>/dev/null || echo "")
     if [ -z "$SESSION" ]; then echo "No active trial session (run harness-trial-start first)"; exit 1; fi
-    phil graph harness trials report "$SESSION" {{activity}} \
-      --tokens-input {{tokens_in}} --tokens-output {{tokens_out}}
+    ARGS=("$SESSION" "{{activity}}")
+    HAS_SIGNAL=0
+    if [ -n "{{phase}}" ]; then ARGS+=(--phase "{{phase}}"); HAS_SIGNAL=1; fi
+    if [ "{{tokens_in}}" != "0" ]; then ARGS+=(--tokens-input "{{tokens_in}}"); HAS_SIGNAL=1; fi
+    if [ "{{tokens_out}}" != "0" ]; then ARGS+=(--tokens-output "{{tokens_out}}"); HAS_SIGNAL=1; fi
+    if [ "{{elapsed_ms}}" != "0" ]; then ARGS+=(--elapsed-ms "{{elapsed_ms}}"); HAS_SIGNAL=1; fi
+    if [ "{{lines_changed}}" != "0" ]; then ARGS+=(--lines-changed "{{lines_changed}}"); HAS_SIGNAL=1; fi
+    if [ -n "{{files}}" ]; then ARGS+=(--files "{{files}}"); HAS_SIGNAL=1; fi
+    if [ -n "{{note}}" ]; then ARGS+=(--note "{{note}}"); HAS_SIGNAL=1; fi
+    if [ "$HAS_SIGNAL" -eq 0 ]; then
+        echo "No telemetry supplied; report at least one signal (phase, tokens, elapsed_ms, lines_changed, files, or note)"
+        exit 1
+    fi
+    phil graph harness trials report "${ARGS[@]}"
 
 # Close the current harness trial.
-# Usage: just harness-trial-close [status] [summary]
-harness-trial-close status="completed" summary="":
+# Usage: just harness-trial-close [status] [verified] [summary]
+harness-trial-close status="completed" verified="" summary="":
     #!/usr/bin/env bash
+    set -euo pipefail
     SESSION=$(cat /tmp/philotic-harness-trial-session 2>/dev/null || echo "")
     if [ -z "$SESSION" ]; then echo "No active trial session found"; exit 1; fi
-    phil graph harness trials close "$SESSION" --status {{status}} \
-      $([ -n "{{summary}}" ] && echo "--summary '{{summary}}'")
+    if [ "{{status}}" = "completed" ] && [ -z "{{verified}}" ]; then
+        echo "Completed harness trials must include a verification level (for example, test-green)"
+        exit 1
+    fi
+    ARGS=("$SESSION" --status "{{status}}")
+    if [ -n "{{verified}}" ]; then ARGS+=(--verified "{{verified}}"); fi
+    if [ -n "{{summary}}" ]; then ARGS+=(--summary "{{summary}}"); fi
+    phil graph harness trials close "${ARGS[@]}"
     rm -f /tmp/philotic-harness-trial-session
     echo "Trial closed: $SESSION"
 
@@ -702,7 +723,11 @@ close-workstream:
     DISPOSITION=${DISPOSITION:-completed}
     
     read -p "Verification level (none/test-green/smoke-green/watched-live-green): " VERIFIED
-    VERIFIED=${VERIFIED:-test-green}
+    if [ "$DISPOSITION" = "completed" ] && [ -z "$VERIFIED" ]; then
+        echo "Completed workstreams must include a verification level"
+        exit 1
+    fi
+    VERIFIED=${VERIFIED:-none}
     
     read -p "Summary of work: " SUMMARY
     

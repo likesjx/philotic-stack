@@ -1977,6 +1977,20 @@ fn report_harness_trial_activity(
     files: &[String],
     note: Option<&str>,
 ) -> Result<()> {
+    if !trial_activity_has_signal(
+        phase,
+        tokens_input,
+        tokens_output,
+        elapsed_ms,
+        lines_changed,
+        files,
+        note,
+    ) {
+        bail!(
+            "Harness trial activity must include at least one signal (phase, tokens, elapsed_ms, lines_changed, files, or note)"
+        );
+    }
+
     let mut session = engine
         .get_node(session_id)?
         .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
@@ -2093,6 +2107,12 @@ fn close_harness_trial(
     tokens_total: Option<i64>,
     quota_remaining: Option<i64>,
 ) -> Result<()> {
+    if !trial_close_has_verified(status, verified) {
+        bail!(
+            "Completed harness trials must include a verification level (for example, test-green)"
+        );
+    }
+
     let mut session = engine
         .get_node(session_id)?
         .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
@@ -2673,6 +2693,31 @@ fn compute_elapsed_ms(start_time: Option<&str>, now: DateTime<Utc>) -> Option<i6
     Some((now - started.with_timezone(&Utc)).num_milliseconds())
 }
 
+fn trial_activity_has_signal(
+    phase: Option<&str>,
+    tokens_input: Option<i64>,
+    tokens_output: Option<i64>,
+    elapsed_ms: Option<i64>,
+    lines_changed: Option<i64>,
+    files: &[String],
+    note: Option<&str>,
+) -> bool {
+    phase.map(|value| !value.trim().is_empty()).unwrap_or(false)
+        || tokens_input.unwrap_or(0) != 0
+        || tokens_output.unwrap_or(0) != 0
+        || elapsed_ms.unwrap_or(0) != 0
+        || lines_changed.unwrap_or(0) != 0
+        || !files.is_empty()
+        || note.map(|value| !value.trim().is_empty()).unwrap_or(false)
+}
+
+fn trial_close_has_verified(status: &str, verified: Option<&str>) -> bool {
+    status != "completed"
+        || verified
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+}
+
 fn scrub_nulls(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
@@ -2880,4 +2925,50 @@ fn parse_csv_list(value: &str) -> Vec<String> {
     items.sort();
     items.dedup();
     items
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trial_activity_requires_at_least_one_signal() {
+        assert!(!trial_activity_has_signal(
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None
+        ));
+
+        assert!(trial_activity_has_signal(
+            Some("coding"),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None
+        ));
+
+        assert!(trial_activity_has_signal(
+            None,
+            None,
+            None,
+            None,
+            None,
+            &["src/lib.rs".to_string()],
+            None
+        ));
+    }
+
+    #[test]
+    fn completed_trials_must_carry_verification() {
+        assert!(!trial_close_has_verified("completed", None));
+        assert!(!trial_close_has_verified("completed", Some("")));
+        assert!(trial_close_has_verified("completed", Some("test-green")));
+        assert!(trial_close_has_verified("blocked", None));
+    }
 }

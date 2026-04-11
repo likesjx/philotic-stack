@@ -55,6 +55,19 @@ pub async fn run_interactive(config_path: &Path, force: bool) -> Result<()> {
         .with_help_message("Model ID for the primary LLM provider")
         .prompt()?;
 
+    let response_route = Select::new(
+        "Default response route:",
+        vec![
+            "auto".to_string(),
+            "text_only".to_string(),
+            "image_multimodal".to_string(),
+            "audio_multimodal".to_string(),
+            "realtime_websocket".to_string(),
+        ],
+    )
+    .with_help_message("Preferred route for model turns; auto lets the runtime infer per turn")
+    .prompt()?;
+
     println!();
     println!("  ── First Agent ──");
     println!();
@@ -201,6 +214,7 @@ pub async fn run_interactive(config_path: &Path, force: bool) -> Result<()> {
         first_tg_token.as_deref(),
         first_tg_username.as_deref(),
         &default_model,
+        &response_route,
     );
     agents.insert(agent_name.clone(), first_agent);
 
@@ -285,6 +299,7 @@ fn build_agent_entry(
     telegram_token: Option<&str>,
     telegram_username: Option<&str>,
     model: &str,
+    response_route: &str,
 ) -> Value {
     let mut entry = json!({
         "agent_id": format!("agent-{name}"),
@@ -293,6 +308,9 @@ fn build_agent_entry(
         "import_workspace": "",
         "model": {
             "default_model": model,
+        },
+        "response_route_policy": {
+            "default_route": response_route,
         },
         "approval_policy": {
             "require_approval": approval_policy.require_approval,

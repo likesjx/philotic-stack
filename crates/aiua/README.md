@@ -54,6 +54,10 @@ cargo run -p aiua -- auth google start --provider gemini --client-id YOUR_CLIENT
 # Validate the stored Gemini OAuth path with a real Gemini call
 cargo run -p aiua -- auth google validate --provider gemini
 
+# Store an OpenAI API key in the hotel vault and validate the configured endpoint
+cargo run -p aiua -- auth openai start --provider openai --api-key YOUR_OPENAI_KEY --project-id YOUR_OPENAI_PROJECT
+cargo run -p aiua -- auth openai validate --provider openai
+
 # Run the startup text model-controller smoke through the hotel
 cargo run -p aiua -- --hotel startup-test-hotel --load-config mesh-config.json --test text-roundtrip --test-text "hello model controller"
 
@@ -61,6 +65,11 @@ cargo run -p aiua -- --hotel startup-test-hotel --load-config mesh-config.json -
 # This harness seeds a temporary vaulted bearer token and talks to a local fake Gemini endpoint,
 # so it proves the guest-path OAuth contract without depending on live Google.
 cargo run -p aiua -- --hotel startup-test-hotel --test gemini-oauth-roundtrip --test-text "oauth-guest-ok"
+
+# Run the startup OpenAI key smoke through the materialized model-controller guest.
+# This harness seeds a temporary vaulted OpenAI API key and talks to a local fake OpenAI endpoint,
+# so it proves the guest-path key-management contract without depending on live OpenAI.
+cargo run -p aiua -- --hotel startup-test-hotel --test openai-roundtrip --test-text "openai-guest-ok"
 
 # Run the startup voice sample through the hotel
 cargo run -p aiua -- --hotel startup-test-hotel --load-config mesh-config.json --test voice-sample --test-output /tmp/aiua-startup-voice-sample.mp3 --test-text "Hello from the startup voice test."

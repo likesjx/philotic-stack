@@ -317,69 +317,6 @@ impl TaskErrorPayload {
     }
 }
 
-/// Routing hint declared by the emitting philote at dispatch time.
-/// Carried in the [`Exosome`] and echoed back in the `paracrine_response`,
-/// so the routing reflex in the receiving philote knows how to handle the result
-/// without inspecting content.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum ParacrineRouting {
-    /// Feed the response into a model cognitive re-entry. If an active turn
-    /// exists, inject as enriched context; otherwise start a synthesis turn.
-    #[default]
-    CognitiveReEntry,
-    /// Replace the "paracrine dispatched" placeholder tool result with the real
-    /// response and re-enter the model as if the tool call completed normally.
-    EnrichedToolResult,
-    /// Structured retrieval payload — inject into a named context slot on the
-    /// session. No model invocation unless explicitly requested.
-    DatasourceInjection,
-    /// Memory recall result — push into the session's memory window.
-    MemoryEnrichment,
-    /// Mid-turn progress note — emit partial content to membrane without
-    /// interrupting or closing the active turn.
-    ProgressUpdate,
-    /// Lightweight status ping. No model involvement; just ACK and update
-    /// pending lookaside state.
-    Heartbeat,
-    /// Forward the response content directly to membrane. No model loop.
-    RawForward,
-    /// Arbiter-promoted re-entry: queue at the FRONT of pending_user_tasks so the
-    /// orchestrator processes it next, ahead of any already-queued messages.
-    PriorityReEntry,
-}
-
-/// Paracrine message envelope — the vesicle a philote secretes when performing a
-/// paracrine dispatch. Carries the prompt and optional context to the receiving
-/// philote, which endocytoses it as a `paracrine_request` inbound task.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Exosome {
-    /// The prompt or model-request content for the specialist.
-    pub prompt: String,
-    /// Optional structured context (e.g. session excerpt, tool results).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context: Option<serde_json::Value>,
-    /// Runtime-assigned correlation ID. Ties the `paracrine_response` back to
-    /// the originating turn and threads through the full thought graph for
-    /// cross-mesh provenance. Always set by the emitting philote; never dropped.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub paracrine_id: Option<String>,
-    /// How the receiving philote's response should be handled when it arrives
-    /// back at the emitter. Declared at dispatch time by the caller.
-    /// Defaults to [`ParacrineRouting::CognitiveReEntry`] if absent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub response_routing: Option<ParacrineRouting>,
-    /// The session_id of the conversation that triggered this paracrine.
-    /// Carried through so the specialist's response can be routed back to the
-    /// correct session (e.g. a Telegram session rather than an ephemeral one).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_session_id: Option<String>,
-    /// The chat_id (Telegram / membrane channel) of the originating conversation.
-    /// Used by the routing reflex to deliver the specialist's reply to the right channel.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_chat_id: Option<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct HandoffBundle {
     pub goal: String,
@@ -593,6 +530,67 @@ impl LeaseEnvelope {
     pub fn is_active(&self) -> bool {
         matches!(self.status, LeaseStatus::Active)
     }
+}
+
+/// How the receiving philote's response should be handled when it arrives
+/// back at the emitter. Declared at dispatch time by the caller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ParacrineRouting {
+    /// Feed the response into a model cognitive re-entry. If an active turn
+    /// exists, inject as enriched context; otherwise start a synthesis turn.
+    #[default]
+    CognitiveReEntry,
+    /// Replace the "paracrine dispatched" placeholder tool result with the real
+    /// response and re-enter the model as if the tool call completed normally.
+    EnrichedToolResult,
+    /// Structured retrieval payload — inject into a named context slot on the
+    /// session. No model invocation unless explicitly requested.
+    DatasourceInjection,
+    /// Memory recall result — push into the session's memory window.
+    MemoryEnrichment,
+    /// Mid-turn progress note — emit partial content to membrane without
+    /// interrupting or closing the active turn.
+    ProgressUpdate,
+    /// Lightweight status ping. No model involvement; just ACK and update
+    /// pending lookaside state.
+    Heartbeat,
+    /// Forward the response content directly to membrane. No model loop.
+    RawForward,
+    /// Arbiter-promoted re-entry: queue at the FRONT of pending_user_tasks so the
+    /// orchestrator processes it next, ahead of any already-queued messages.
+    PriorityReEntry,
+}
+
+/// Paracrine message envelope — the vesicle a philote secretes when performing a
+/// paracrine dispatch. Carries the prompt and optional context to the receiving
+/// philote, which endocytoses it as a `paracrine_request` inbound task.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Exosome {
+    /// The prompt or model-request content for the specialist.
+    pub prompt: String,
+    /// Optional structured context (e.g. session excerpt, tool results).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<serde_json::Value>,
+    /// Runtime-assigned correlation ID. Ties the `paracrine_response` back to
+    /// the originating turn and threads through the full thought graph for
+    /// cross-mesh provenance. Always set by the emitting philote; never dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paracrine_id: Option<String>,
+    /// How the receiving philote's response should be handled when it arrives
+    /// back at the emitter. Declared at dispatch time by the caller.
+    /// Defaults to [`ParacrineRouting::CognitiveReEntry`] if absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_routing: Option<ParacrineRouting>,
+    /// The session_id of the conversation that triggered this paracrine.
+    /// Carried through so the specialist's response can be routed back to the
+    /// correct session (e.g. a Telegram session rather than an ephemeral one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_session_id: Option<String>,
+    /// The chat_id (Telegram / membrane channel) of the originating conversation.
+    /// Used by the routing reflex to deliver the specialist's reply to the right channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_chat_id: Option<String>,
 }
 
 /// Represents the types of operations a Guest can perform locally over IPC to the Ansible Hotel.
@@ -889,6 +887,14 @@ pub enum IpcRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context_window_policy: Option<String>,
     },
+    /// Execute a governed workflow through the hotel's workflow plane.
+    ExecuteWorkflow {
+        workflow_name: String,
+        agent_id: String,
+        /// The active persona role of the calling agent (e.g. "orchestrator").
+        calling_role: String,
+        arguments: serde_json::Value,
+    },
     /// Write a config value to the hotel's context graph (operator/management only).
     SetConfig {
         key: String,
@@ -924,11 +930,64 @@ pub enum IpcRequest {
         description: String,
         rationale: String,
     },
+    RecordRoutingPolicyProposal {
+        agent_id: String,
+        problem: String,
+        proposed_change: String,
+        evidence: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        affected_stage: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        affected_capability: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        learned_reflex_preference_key: Option<String>,
+    },
+    ListRoutingPolicies {
+        agent_id: String,
+    },
     /// List all durable rules owned by the given agent.
     ///
     /// Responds with [`IpcResponse::RuleList`].
     ListRules {
         agent_id: String,
+    },
+    /// Upsert one learned reflex preference into the agent graph.
+    ///
+    /// Used by approved routing/reflex refinement flows to write durable
+    /// adaptive posture into agent-owned state without turning rule records
+    /// into stealth policy storage.
+    UpsertAgentReflexPreference {
+        agent_id: String,
+        preference_key: String,
+        precedence: i32,
+        reflexes_json: serde_json::Value,
+        config_json: serde_json::Value,
+    },
+    /// Record one successful same-self role handoff observation and let the hotel
+    /// fold it into agent-owned reflex posture without making philote read/modify/write
+    /// the agent graph directly.
+    RecordRoleHandoffReflexEvidence {
+        agent_id: String,
+        role_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        legacy_trigger_class: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_turn: Option<String>,
+    },
+    AppendRoutingPolicyEvaluation {
+        proposal_id: String,
+        evaluation_kind: String,
+        decision: String,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_tool: Option<String>,
+    },
+    SetRoutingPolicyDisposition {
+        proposal_id: String,
+        state: String,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_tool: Option<String>,
     },
     /// Agent declares a need for a resource; hotel responds with
     /// [`IpcResponse::ResourceGranted`], [`IpcResponse::ResourceDenied`], or
@@ -1030,12 +1089,12 @@ pub enum IpcRequest {
     DisableCronJob {
         job_id: CronJobId,
     },
-    /// Fire-and-forget paracrine dispatch: a philote secretes an [`Exosome`] payload
-    /// envelope to a target role without blocking its own turn. The hotel delivers to
-    /// the target's inbox (materialising via the parking lot if needed) and returns
-    /// `Standard { ok: true }` immediately. The target's response arrives at
-    /// `reply_to_node`/`reply_to_role` as a normal inbound task
-    /// (action: `"paracrine_response"`).
+    /// Hotel-to-guest graceful shutdown signal. Guests do not send this to the hotel;
+    /// the no-op handler in ipc.rs covers the case where one arrives unexpectedly.
+    GracefulShutdown {
+        drain_timeout_secs: u64,
+    },
+    /// Fire-and-forget paracrine dispatch from one agent to a specialist role.
     ParacrineEmit {
         /// Target role name (e.g. "theoretician").
         role: String,
@@ -1048,13 +1107,6 @@ pub enum IpcRequest {
         /// Materialisation timeout for the target role. `None` uses the hotel default.
         #[serde(default)]
         timeout_secs: Option<u64>,
-    },
-    /// Sent by the hotel to all registered guests when it is preparing to shut down.
-    /// The guest should finish any in-flight work, release held leases, and exit.
-    /// The hotel waits for all guest PIDs to stop before exiting itself.
-    GracefulShutdown {
-        /// Maximum seconds the guest should take to drain before the hotel force-kills it.
-        drain_timeout_secs: u64,
     },
 }
 
@@ -1088,14 +1140,6 @@ pub enum IpcResponse {
     DesktopMembraneLeaseStatus {
         desktop_active: bool,
         desktop_lease: Option<LeaseEnvelope>,
-    },
-    DiscordGatewayLease {
-        granted: bool,
-        lease: Option<LeaseEnvelope>,
-    },
-    DiscordGatewayLeaseStatus {
-        active: bool,
-        lease: Option<LeaseEnvelope>,
     },
     DesktopMembraneStatusView {
         membrane_status: DesktopMembraneStatusView,
@@ -1133,6 +1177,12 @@ pub enum IpcResponse {
     HandoffAck {
         handoff_guest_id: String,
         became_active: bool,
+    },
+    HandoffPending {
+        role_name: String,
+        readiness: String,
+        #[serde(default)]
+        retry_after_ms: Option<u64>,
     },
     HandoffBackAck {
         handoff_guest_id: String,
@@ -1188,6 +1238,12 @@ pub enum IpcResponse {
     ConfigureRoleOk {
         role_name: String,
     },
+    /// Response to [`IpcRequest::ExecuteWorkflow`].
+    WorkflowExecutionOk {
+        workflow_name: String,
+        #[serde(default)]
+        result: serde_json::Value,
+    },
     Error(String),
     Standard {
         ok: bool,
@@ -1209,6 +1265,12 @@ pub enum IpcResponse {
     /// Response to [`IpcRequest::ProposeRule`].
     RuleProposed {
         rule_id: String,
+    },
+    RoutingPolicyRecorded {
+        proposal_id: String,
+    },
+    RoutingPolicyList {
+        policies: Vec<serde_json::Value>,
     },
     /// Response to [`IpcRequest::ListRules`].
     RuleList {
@@ -1253,11 +1315,16 @@ pub enum IpcResponse {
     CronJobList {
         jobs: Vec<CronJob>,
     },
-    /// Response to [`IpcRequest::FetchMemoryConfig`].
-    /// `config_json` is `None` if MuninnDB is not configured on this hotel.
-    ///
-    /// Sent by the hotel to a guest asking it to drain in-flight work and exit cleanly.
-    /// The guest should finish any active turn within `drain_timeout_secs`, then exit.
+    DiscordGatewayLease {
+        granted: bool,
+        lease: Option<LeaseEnvelope>,
+    },
+    DiscordGatewayLeaseStatus {
+        active: bool,
+        lease: Option<LeaseEnvelope>,
+    },
+    /// Sent from hotel to guests during graceful shutdown. Guests should drain
+    /// in-flight work and exit within `drain_timeout_secs`.
     GracefulShutdown {
         drain_timeout_secs: u64,
     },
@@ -1267,6 +1334,9 @@ pub enum IpcResponse {
     NetworkState {
         online: bool,
     },
+    /// Response to [`IpcRequest::FetchMemoryConfig`].
+    /// `config_json` is `None` if MuninnDB is not configured on this hotel.
+    ///
     /// NOTE: This variant MUST remain at the end of the enum. It has an all-optional
     /// field (`config_json: Option<String>`), which with `#[serde(untagged)]` means it
     /// will match ANY JSON object that serde hasn't already matched to an earlier variant.
@@ -1462,9 +1532,7 @@ impl PhiloticClient {
     fn is_push_message(response: &IpcResponse) -> bool {
         matches!(
             response,
-            IpcResponse::InboundTask { .. }
-                | IpcResponse::ApartmentUpdate { .. }
-                | IpcResponse::NetworkState { .. }
+            IpcResponse::InboundTask { .. } | IpcResponse::ApartmentUpdate { .. }
         )
     }
 

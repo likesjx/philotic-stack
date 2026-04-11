@@ -238,7 +238,9 @@ async fn post_mempalace_turn(
     );
 
     // Write transcript to a persistent file for mempalace to mine
-    let convos_dir = Path::new(&state.repo_root).join(".mempalace_convos").join(&body.agent_id);
+    let convos_dir = Path::new(&state.repo_root)
+        .join(".mempalace_convos")
+        .join(&body.agent_id);
     if let Err(e) = tokio::fs::create_dir_all(&convos_dir).await {
         tracing::error!("Failed to create convos directory: {}", e);
         return Err(internal_error(anyhow::anyhow!("Create dir failed: {}", e)));
@@ -246,7 +248,7 @@ async fn post_mempalace_turn(
 
     let file_path = convos_dir.join(format!("{}.md", body.session_id));
     use tokio::io::AsyncWriteExt;
-    
+
     // Append the turn to the session file
     let mut file = match tokio::fs::OpenOptions::new()
         .create(true)
@@ -274,6 +276,7 @@ async fn post_mempalace_turn(
 
     // Trigger mempalace mine in the background so we don't block the agent
     let convos_path = convos_dir.clone();
+    let agent_id_for_log = body.agent_id.clone();
     tokio::spawn(async move {
         tracing::info!("Executing mempalace mine on {:?}", convos_path);
         match tokio::process::Command::new("mempalace")
@@ -290,7 +293,7 @@ async fn post_mempalace_turn(
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     tracing::error!("Mempalace mine failed: {}", stderr);
                 } else {
-                    tracing::info!("Mempalace mine complete for Wing [{}]", body.agent_id);
+                    tracing::info!("Mempalace mine complete for Wing [{}]", agent_id_for_log);
                 }
             }
             Err(e) => tracing::error!("Failed to spawn mempalace: {}", e),

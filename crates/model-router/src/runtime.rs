@@ -168,14 +168,15 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                 let provider = match providers.resolve(&controller_task) {
                     Ok(provider) => provider,
                     Err(err) => {
-                        emit_failure(
-                            &mut ipc_client,
-                            &reply,
-                            Some(controller_task.kind.as_str()),
-                            None,
-                            format!("No model provider available for task: {}", err),
-                        )
-                        .await?;
+                        // This controller has no provider for this task kind. Skip silently —
+                        // another controller on the same role inbox may support it. Only emit
+                        // a failure when a matched provider actually fails during invocation.
+                        info!(
+                            "Controller [{}] skipping {} task: {}",
+                            config.guest_id,
+                            controller_task.kind.as_str(),
+                            err
+                        );
                         continue;
                     }
                 };

@@ -1823,6 +1823,37 @@ async fn run_seat_impl(
                                                 envelope.content
                                             );
 
+                                            // Promote callback_data that looks like a slash command
+                                            // (e.g. "/role bjork" from an inline keyboard button)
+                                            // so it routes through handle_membrane_command and the
+                                            // agent's command dispatch identically to a typed command.
+                                            // Also ack the callback so Telegram removes the spinner.
+                                            if envelope.command.is_none() {
+                                                if let Some(data) = envelope.callback_data.as_deref() {
+                                                    if data.starts_with('/') {
+                                                        // Parse: first token is the command, rest are args.
+                                                        let cmd = data.split_whitespace().next().unwrap_or(data);
+                                                        envelope.command = Some(cmd.to_string());
+                                                        // Re-surface as a text message with the full command string.
+                                                        envelope.content = data.to_string();
+                                                        // Ack the callback query to dismiss Telegram's loading indicator.
+                                                        if let Some(callback_id) = envelope
+                                                            .raw_transport_event
+                                                            .get("callback_query")
+                                                            .and_then(|q| q.get("id"))
+                                                            .and_then(Value::as_str)
+                                                        {
+                                                            let ack_url = format!("{tg_base}answerCallbackQuery");
+                                                            let _ = http_client
+                                                                .post(&ack_url)
+                                                                .json(&json!({"callback_query_id": callback_id}))
+                                                                .send()
+                                                                .await;
+                                                        }
+                                                    }
+                                                }
+                                            }
+
                                             // Elevation: handle deterministic commands in membrane
                                             // before they reach agent-core.
                                             if handle_membrane_command(
@@ -2001,9 +2032,13 @@ async fn run_seat_impl(
                                 let raw_content = task.get("content").and_then(|c| c.as_str()).unwrap_or_default().to_string();
                                 // Interceptor: strip @agent:<role> attribution tag and
                                 // build an inline button so the user can switch to that role.
+                                // reply_markup from the agent (e.g. roles keyboard) takes
+                                // priority over the per-reply role_switch_button.
                                 let (content, role_button) = {
+                                    let explicit_markup = task.get("reply_markup").cloned();
                                     let (clean, role) = strip_attribution_tag(&raw_content);
-                                    let markup = role.as_deref().map(role_switch_button);
+                                    let markup = explicit_markup
+                                        .or_else(|| role.as_deref().map(role_switch_button));
                                     (clean, markup)
                                 };
                                 let thread_id = task.get("thread_id").and_then(|v| v.as_str()).map(str::to_string).or(active_thread_id);

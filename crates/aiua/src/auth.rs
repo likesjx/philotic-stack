@@ -1,5 +1,4 @@
-use crate::vault::{SecretAccess, resolve_secret};
-use crate::vault::{SecretInput, store_secret};
+use crate::vault::{SecretAccess, SecretInput, resolve_secret, store_secret};
 use ansible_mesh_core::domain::GraphDomain;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -19,6 +18,9 @@ use uuid::Uuid;
 
 const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com";
+const DEFAULT_OPENAI_MODEL: &str = "gpt-4.1-mini";
+const DEFAULT_OPENAI_EMBEDDING_MODEL: &str = "text-embedding-3-small";
 const DEFAULT_SCOPES: [&str; 2] = [
     "https://www.googleapis.com/auth/cloud-platform",
     "https://www.googleapis.com/auth/generative-language.retriever",
@@ -27,12 +29,61 @@ const DEFAULT_SCOPES: [&str; 2] = [
 #[derive(Debug, Subcommand)]
 pub enum AuthCommand {
     Google(AuthGoogleArgs),
+    OpenAI(AuthOpenAIArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct AuthGoogleArgs {
     #[command(subcommand)]
     command: GoogleAuthCommand,
+}
+
+#[derive(Debug, Args)]
+pub struct AuthOpenAIArgs {
+    #[command(subcommand)]
+    command: OpenAIAuthCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum OpenAIAuthCommand {
+    Start(OpenAIStartArgs),
+    Validate(OpenAIValidateArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct OpenAIStartArgs {
+    #[arg(long, default_value = "openai")]
+    pub provider: String,
+
+    #[arg(long, default_value = DEFAULT_OPENAI_BASE_URL)]
+    pub base_url: String,
+
+    #[arg(long)]
+    pub api_key: Option<String>,
+
+    #[arg(long)]
+    pub project_id: Option<String>,
+
+    #[arg(long, default_value = DEFAULT_OPENAI_MODEL)]
+    pub model: String,
+
+    #[arg(long, default_value = DEFAULT_OPENAI_EMBEDDING_MODEL)]
+    pub embedding_model: String,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct OpenAIValidateArgs {
+    #[arg(long, default_value = "openai")]
+    pub provider: String,
+
+    #[arg(long, default_value = DEFAULT_OPENAI_BASE_URL)]
+    pub base_url: String,
+
+    #[arg(long, default_value = DEFAULT_OPENAI_MODEL)]
+    pub model: String,
+
+    #[arg(long, default_value = "Reply with exactly: openai-ok")]
+    pub prompt: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -102,7 +153,118 @@ pub async fn run_auth_command(command: AuthCommand) -> Result<()> {
         AuthCommand::Google(AuthGoogleArgs {
             command: GoogleAuthCommand::Validate(args),
         }) => run_google_auth_validate(args).await,
+        AuthCommand::OpenAI(AuthOpenAIArgs {
+            command: OpenAIAuthCommand::Start(args),
+        }) => run_openai_auth_start(args).await,
+        AuthCommand::OpenAI(AuthOpenAIArgs {
+            command: OpenAIAuthCommand::Validate(args),
+        }) => run_openai_auth_validate(args).await,
     }
+}
+
+async fn run_openai_auth_start(args: OpenAIStartArgs) -> Result<()> {
+    if args.provider.trim().is_empty() {
+        bail!("provider cannot be empty");
+    }
+
+    let base_url = resolve_openai_base_url(&args.base_url);
+    let model = resolve_openai_model(&args.model);
+    let embedding_model = resolve_openai_embedding_model(&args.embedding_model);
+    let project_id = resolve_openai_project_id(&args.project_id);
+    let api_key = resolve_openai_api_key(&args)
+        .context("OpenAI API key is required; set --api-key or PHILOTIC_OPENAI_API_KEY")?;
+    let graph = openai_graph()?;
+    let domain = GraphDomain::new(Arc::new(graph.adapter()));
+    let secret_kind = openai_secret_kind(&base_url, &args.provider);
+    let secret_ref = store_secret(
+        &domain,
+        SecretInput {
+            secret_kind,
+            scope: "hotel".into(),
+            allowed_roles: vec!["model".into(), "model.openai".into()],
+            allowed_guests: Vec::new(),
+            plaintext: api_key,
+        },
+    )?;
+
+    domain.set_config_value("openai_api_key_ref", &serde_json::to_string(&secret_ref)?)?;
+    domain.set_config_value("openai_base_url", &serde_json::to_string(&base_url)?)?;
+    domain.set_config_value("openai_model", &serde_json::to_string(&model)?)?;
+    domain.set_config_value(
+        "openai_embedding_model",
+        &serde_json::to_string(&embedding_model)?,
+    )?;
+    if let Some(project_id) = project_id.as_deref() {
+        domain.set_config_value("openai_project_id", &serde_json::to_string(project_id)?)?;
+    }
+
+    println!("OpenAI API key stored in the hotel vault.");
+    println!("Provider: {}", args.provider);
+    println!("Base URL: {}", base_url);
+    println!("Secret ref: {}", secret_ref);
+    Ok(())
+}
+
+async fn run_openai_auth_validate(args: OpenAIValidateArgs) -> Result<()> {
+    if args.provider.trim().is_empty() {
+        bail!("provider cannot be empty");
+    }
+
+    let base_url = resolve_openai_base_url(&args.base_url);
+    let model = resolve_openai_model(&args.model);
+    let graph = openai_graph()?;
+    let domain = GraphDomain::new(Arc::new(graph.adapter()));
+    let api_key = load_openai_api_key(&domain)?;
+    let project_id = load_openai_project_id(&domain)?;
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/chat/completions",
+            base_url.trim_end_matches('/')
+        ))
+        .bearer_auth(&api_key)
+        .header("Content-Type", "application/json")
+        .header(
+            "OpenAI-Project",
+            project_id
+                .as_deref()
+                .context("openai_project_id is required for OpenAI validation")?,
+        )
+        .json(&serde_json::json!({
+            "model": model,
+            "messages": [{
+                "role": "user",
+                "content": args.prompt
+            }]
+        }))
+        .send()
+        .await
+        .context("failed to call OpenAI validation request")?;
+
+    let status = response.status();
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .context("failed to decode OpenAI validation response")?;
+
+    if !status.is_success() {
+        bail!("OpenAI validation failed ({}): {}", status.as_u16(), body);
+    }
+
+    let content = body
+        .get("choices")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    println!("OpenAI validation succeeded.");
+    println!("Provider: {}", args.provider);
+    println!("Base URL: {}", base_url);
+    println!("Response: {}", content);
+    Ok(())
 }
 
 async fn run_google_auth_start(args: GoogleStartArgs) -> Result<()> {
@@ -478,6 +640,108 @@ fn persist_gemini_oauth_config(args: &GoogleStartArgs, token: &GoogleTokenRespon
 
     info!("Persisted Gemini OAuth secret refs into the hotel vault/context graph.");
     Ok(())
+}
+
+fn openai_graph() -> Result<ansible_mesh_core::sqlite_storage::SqliteGraphStorage> {
+    ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open("aiua_context.db")
+}
+
+fn openai_secret_kind(base_url: &str, provider: &str) -> String {
+    let host = reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown-endpoint".into())
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    format!(
+        "{}-api-key-{}",
+        provider.trim(),
+        if host.is_empty() { "endpoint" } else { &host }
+    )
+}
+
+fn resolve_openai_api_key(args: &OpenAIStartArgs) -> Option<String> {
+    args.api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var("PHILOTIC_OPENAI_API_KEY")
+                .ok()
+                .map(|key| key.trim().to_string())
+                .filter(|key| !key.is_empty())
+        })
+}
+
+fn resolve_openai_base_url(base_url: &str) -> String {
+    std::env::var("PHILOTIC_OPENAI_BASE_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| base_url.trim().to_string())
+}
+
+fn resolve_openai_model(model: &str) -> String {
+    std::env::var("PHILOTIC_OPENAI_MODEL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| model.trim().to_string())
+}
+
+fn resolve_openai_embedding_model(model: &str) -> String {
+    std::env::var("PHILOTIC_OPENAI_EMBEDDING_MODEL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| model.trim().to_string())
+}
+
+fn resolve_openai_project_id(project_id: &Option<String>) -> Option<String> {
+    project_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var("PHILOTIC_OPENAI_PROJECT_ID")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn load_openai_api_key(graph: &GraphDomain) -> Result<String> {
+    if let Some(value_json) = graph.get_config_value("openai_api_key")? {
+        return serde_json::from_str::<String>(&value_json)
+            .context("failed to decode legacy openai_api_key");
+    }
+
+    let secret_ref = graph
+        .get_config_value("openai_api_key_ref")?
+        .and_then(|value_json| serde_json::from_str::<String>(&value_json).ok())
+        .context("openai_api_key_ref is not configured")?;
+
+    resolve_secret(
+        graph,
+        &secret_ref,
+        &SecretAccess {
+            role: "model".into(),
+            guest_id: "ansible-auth-validator".into(),
+        },
+    )?
+    .context("OpenAI API key secret could not be resolved")
+}
+
+fn load_openai_project_id(graph: &GraphDomain) -> Result<Option<String>> {
+    Ok(graph
+        .get_config_value("openai_project_id")?
+        .and_then(|value_json| serde_json::from_str::<String>(&value_json).ok())
+        .filter(|value| !value.trim().is_empty()))
 }
 
 fn load_gemini_access_token(graph: &GraphDomain) -> Result<String> {

@@ -2302,6 +2302,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "media-prep"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "membrane"
 version = "0.1.0"
 dependencies = [
@@ -2460,6 +2471,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "futures",
+ "media-prep",
  "mlx-runner",
  "onnx-runner",
  "philotic-client",
@@ -2467,6 +2479,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
  "ulid",
@@ -4375,6 +4388,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tungstenite",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

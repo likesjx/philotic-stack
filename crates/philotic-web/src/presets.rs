@@ -14,7 +14,15 @@ pub struct AgentPreset {
     #[serde(default)]
     pub toolset_tags: Vec<String>,
     pub approval_policy: ApprovalPolicy,
+    #[serde(default)]
+    pub response_route_policy: ResponseRoutePolicy,
     pub media_routing_policy: MediaRoutingPolicy,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ResponseRoutePolicy {
+    #[serde(default = "default_response_route")]
+    pub default_route: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +87,10 @@ fn default_media_policy() -> MediaRoutingPolicy {
     }
 }
 
+fn default_response_route() -> String {
+    "auto".into()
+}
+
 // ── Built-in agent definitions ───────────────────────────────────────────────
 
 fn jane() -> AgentPreset {
@@ -88,6 +100,9 @@ fn jane() -> AgentPreset {
         system_prompt: "You are Jane, a warm and capable conversational assistant. You are the operator's right-hand agent — attentive, thoughtful, and direct. You handle a wide range of requests and are the primary point of contact. You have access to bash for running commands when needed.".into(),
         toolset_tags: vec![],
         approval_policy: ApprovalPolicy::ask_first(),
+        response_route_policy: ResponseRoutePolicy {
+            default_route: default_response_route(),
+        },
         media_routing_policy: default_media_policy(),
     }
 }
@@ -99,6 +114,9 @@ fn aria() -> AgentPreset {
         system_prompt: "You are Aria the Architect, a development specialist and technical lead. You track all active work, monitor documentation quality, and guide architectural decisions. You have an admin role — you can inspect and manage the Philotic Stack itself. You are precise, systematic, and think in systems. You use bash for development tasks.".into(),
         toolset_tags: vec!["admin-required".into()],
         approval_policy: ApprovalPolicy::preapprove_safe(),
+        response_route_policy: ResponseRoutePolicy {
+            default_route: default_response_route(),
+        },
         media_routing_policy: default_media_policy(),
     }
 }
@@ -110,6 +128,9 @@ fn beacon() -> AgentPreset {
         system_prompt: "You are Beacon, Chief of Staff. You are the keeper of goals, roles, events, projects, and ongoing efforts. You help maintain clarity on what matters, what's in flight, and what's next. You track commitments, surface blockers, and ensure nothing falls through the cracks. You are organized, proactive, and operate at a strategic level.".into(),
         toolset_tags: vec![],
         approval_policy: ApprovalPolicy::ask_first(),
+        response_route_policy: ResponseRoutePolicy {
+            default_route: default_response_route(),
+        },
         media_routing_policy: default_media_policy(),
     }
 }
@@ -121,6 +142,9 @@ fn hermes() -> AgentPreset {
         system_prompt: "You are Hermes, Communications Specialist. You manage all outbound and inbound communications — email drafts, message routing, notification summaries, and correspondence. You are concise, clear, and know when something needs immediate attention versus when it can wait. You can use bash to interact with mail and messaging tools.".into(),
         toolset_tags: vec![],
         approval_policy: ApprovalPolicy::ask_first(),
+        response_route_policy: ResponseRoutePolicy {
+            default_route: default_response_route(),
+        },
         media_routing_policy: default_media_policy(),
     }
 }
@@ -132,6 +156,9 @@ fn astrid() -> AgentPreset {
         system_prompt: "You are Astrid the Librarian, keeper of the Obsidian vault and documentation systems. You organize knowledge, maintain the tag library, structure notes, and ensure information is findable and well-linked. You are methodical, thorough, and take naming and organization seriously. You use bash to interact with the vault and documentation tools.".into(),
         toolset_tags: vec![],
         approval_policy: ApprovalPolicy::preapprove_safe(),
+        response_route_policy: ResponseRoutePolicy {
+            default_route: default_response_route(),
+        },
         media_routing_policy: default_media_policy(),
     }
 }
@@ -224,6 +251,9 @@ pub fn preset_to_config_value(
         "approval_policy": {
             "require_approval": agent.approval_policy.require_approval,
             "preapproved_classes": agent.approval_policy.preapproved_classes,
+        },
+        "response_route_policy": {
+            "default_route": agent.response_route_policy.default_route,
         },
         "media_routing_policy": {
             "forward_media_to_model": agent.media_routing_policy.forward_media_to_model,

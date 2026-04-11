@@ -13,9 +13,11 @@ LOG_DIR="${DATA_DIR}/logs"
 GRAPH_DB="${DATA_DIR}/graph.db"
 ONNX_PORT=11435
 GRAPH_PORT=8900
+CARGO_BIN="${CARGO_BIN:-$(command -v cargo)}"
 
 # Embedding model configuration
-# Options: 384 (default, fast), 768 (higher quality)
+# Default: MiniLM for the live intel graph path.
+# EmbeddingGemma remains a deferred experimental option.
 # Or set PHILOTIC_EMBED_MODEL to a custom HuggingFace repo
 EMBED_DIM="${PHILOTIC_EMBED_DIM:-384}"
 
@@ -28,7 +30,7 @@ case "$EMBED_DIM" in
         ;;
     *)
         EMBED_MODEL="${PHILOTIC_EMBED_MODEL:-sentence-transformers/all-MiniLM-L6-v2}"
-        warn "Unknown PHILOTIC_EMBED_DIM=$EMBED_DIM, using default 384-dim model"
+        warn "Unknown PHILOTIC_EMBED_DIM=$EMBED_DIM, using default MiniLM model"
         ;;
 esac
 
@@ -100,11 +102,11 @@ download_model() {
     # The model will be downloaded automatically by the onnx-runner on first use
     # via HuggingFace Hub. We just verify the cache directory is ready.
     
-    if [[ ! -d "$MODEL_CACHE/${PHILOTIC_ONNX_EMBED_REPO:-"nomic-ai/nomic-embed-text-v1.5"}" ]]; then
+    if [[ ! -d "$MODEL_CACHE/${EMBED_MODEL}" ]]; then
         warn "Model not cached. Will download on first startup (~600MB)"
         warn "This may take a few minutes on first run."
     else
-        success "Model cached: nomic-embed-text-v1.5"
+        success "Model cached: $EMBED_MODEL"
     fi
 }
 
@@ -150,7 +152,7 @@ start_onnx() {
     log "Embedding model: $EMBED_MODEL (${EMBED_DIM}-dim)"
     
     cd "$PHILOTIC_ROOT"
-    nohup ~/.cargo/bin/cargo run --release -p model-router --bin model-controller-onnx -- \
+    nohup "$CARGO_BIN" run --release -p model-router --bin model-controller-onnx -- \
         --sidecar-only \
         --embed-repo "$EMBED_MODEL" \
         > "$LOG_DIR/onnx.log" 2>&1 &
@@ -186,7 +188,7 @@ start_graph() {
     cd "$PHILOTIC_ROOT"
     export PHILOTIC_GRAPH_DB="$GRAPH_DB"
     
-    nohup ~/.cargo/bin/cargo run --release -p graph-intelligence -- \
+    nohup "$CARGO_BIN" run --release -p graph-intelligence -- \
         --port $GRAPH_PORT \
         --mcp-port $((GRAPH_PORT + 1)) \
         --db "$GRAPH_DB" \

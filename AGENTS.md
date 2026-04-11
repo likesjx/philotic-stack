@@ -545,6 +545,7 @@ The repository contains specialized skills in `skills/` to standardize common wo
 | `verification-ladder` | Deciding and reporting the honest validation level |
 | `proposal-maintainer` | Architecture/process proposal and spec hygiene |
 | `architecture-docs-maintainer` | Keeping architecture truth, domains, frontmatter, and cross-links aligned |
+| `sver-harness` | Harness trial mechanics, telemetry hygiene, explicit verification on close |
 | `muninn-memory-habit` | Establishing consistent retrieval/write-back habits |
 | `subagent-delegation` | Splitting large tasks into bounded sub-tasks |
 | `runtime-debugger` | Diagnosing live multi-process/multimodal stack failures |
