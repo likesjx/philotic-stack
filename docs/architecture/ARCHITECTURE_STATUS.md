@@ -3,7 +3,7 @@ title: Philotic Architecture Status
 doc_type: status
 domain: runtime-sessions
 status: active
-last_updated: 2026-04-10
+last_updated: 2026-04-11
 tags:
 - source-of-truth
 - current-state
@@ -69,6 +69,7 @@ Philotic currently operates as a hotel-centered runtime:
 - canonical session state now lives in the context graph, while apartment-style checkpoints remain derived recovery projections rather than a competing source of truth.
 - Telegram ingress is session-aware and guarded by hotel-owned poll-lease authority, with explicit delegated remote polling available as a transitional exception; Telegram hotels should now materialize `membrane-telegram` directly while the bare `membrane` binary remains a transitional compatibility wrapper.
 - local and remote execution routing both exist, but several placement, delegation, and admin/control-plane seams are still under active development.
+- `phil` now owns the launchd service lifecycle surface for `aiua` on macOS through `phil service install`, `start`, `stop`, `restart`, `uninstall`, and `status`; interactive onboarding can optionally hand off to service install immediately after config generation.
 
 ## Implemented Foundations
 

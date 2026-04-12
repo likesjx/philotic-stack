@@ -8,6 +8,8 @@ use inquire::{Confirm, Password, Select, Text};
 use serde_json::{json, Map, Value};
 use std::path::Path;
 
+#[cfg(target_os = "macos")]
+use crate::service;
 use crate::presets::{self, ApprovalPolicy};
 
 /// Run the interactive onboarding wizard.
@@ -242,7 +244,7 @@ pub async fn run_interactive(config_path: &Path, force: bool) -> Result<()> {
             "default_model": default_model,
         },
         "hotels": {
-            hotel_name: {
+            hotel_name.clone(): {
                 "agents": Value::Object(agents),
             }
         }
@@ -255,6 +257,24 @@ pub async fn run_interactive(config_path: &Path, force: bool) -> Result<()> {
     }
     std::fs::write(config_path, &pretty)
         .with_context(|| format!("write {}", config_path.display()))?;
+
+    #[cfg(target_os = "macos")]
+    {
+        println!();
+        let install_service = Confirm::new("Install and start the aiua launchd service now?")
+            .with_default(true)
+            .with_help_message("Uses `phil service install` so this hotel starts on login and can be managed later.")
+            .prompt()?;
+        if install_service {
+            service::install(hotel_name.clone()).await?;
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        println!();
+        println!("  launchd service management is macOS-only; use `phil start` on this platform.");
+    }
 
     // ── Summary ──────────────────────────────────────────────────────────────
 
@@ -284,6 +304,7 @@ pub async fn run_interactive(config_path: &Path, force: bool) -> Result<()> {
     println!();
     println!("  Next steps:");
     println!("    phil start        start the hotel daemon");
+    println!("    phil service status  inspect the launchd service");
     println!("    phil serve        open the management UI");
     println!();
 

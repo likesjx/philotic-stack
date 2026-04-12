@@ -104,7 +104,7 @@ enum Command {
         hotel: String,
     },
 
-    /// Manage the aiua launchd service (macOS only)
+    /// Manage the aiua launchd service lifecycle (macOS only)
     Service {
         #[command(subcommand)]
         action: ServiceAction,
@@ -233,6 +233,24 @@ enum ServiceAction {
         #[arg(long, default_value = "default")]
         hotel: String,
     },
+    /// Start the aiua launchd service
+    Start {
+        /// Hotel to run (default: "default")
+        #[arg(long, default_value = "default")]
+        hotel: String,
+    },
+    /// Stop the aiua launchd service without removing the plist
+    Stop {
+        /// Hotel to run (default: "default")
+        #[arg(long, default_value = "default")]
+        hotel: String,
+    },
+    /// Stop and then start the aiua launchd service
+    Restart {
+        /// Hotel to run (default: "default")
+        #[arg(long, default_value = "default")]
+        hotel: String,
+    },
     /// Stop and uninstall the aiua launchd service
     Uninstall {
         /// Hotel to uninstall (default: "default")
@@ -307,6 +325,9 @@ async fn main() -> Result<()> {
         Command::Reset { keep_identity } => reset::run(keep_identity).await,
         Command::Service { action } => match action {
             ServiceAction::Install { hotel } => service::install(hotel).await,
+            ServiceAction::Start { hotel } => service::start(hotel).await,
+            ServiceAction::Stop { hotel } => service::stop(hotel).await,
+            ServiceAction::Restart { hotel } => service::restart(hotel).await,
             ServiceAction::Uninstall { hotel } => service::uninstall(hotel).await,
             ServiceAction::Status { hotel } => service::status(hotel).await,
         },

@@ -1069,7 +1069,7 @@ Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membra
 - [x] Replace websocket query-string token auth with a bounded same-session attach mechanism.
 - [x] Stop persisting injected desktop session credentials by default.
 - [ ] Replace direct SQLite/config reads in `serve` with the first hotel-owned read models for:
-  - [x] service status
+  - [x] service lifecycle commands (`install`, `start`, `stop`, `restart`, `status`)
   - [x] guests
   - [x] redacted agents
 - [x] Decide that apartment inspection does not belong in the default desktop membrane surface; if it returns later, it should come back only as a shaped hotel-owned diagnostic view.
@@ -1326,6 +1326,7 @@ Seam IDs: `wider-client-adoption`, `philotic-native-memory-integration`
 - [x] Add executable workflow commands for the trusted vertical slice and operator checklist.
 - [ ] Command Center / architect continuity: define how architecture-impact work should be surfaced to Aria once the new home is ready.
 - [ ] Fresh onboarding flow: design repo/bootstrap onboarding from scratch for a new operator or agent entering Philotic.
+  - [x] Hand the interactive onboarding flow off to `phil service install` on macOS so first-run setup can root the daemon immediately.
 - [ ] `openclaw.json` ingestion: define a migration/import path that can consume legacy agent manifests and materialize Philotic agents.
 - [ ] Context graph deployment model: decide local-first vs cloud-backed vs hybrid graph ownership, sync, and operational model.
 - [ ] Context graph decentralization: decide how much of the graph can be replicated/federated across hotels versus kept locally authoritative.
