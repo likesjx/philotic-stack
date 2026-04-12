@@ -130,7 +130,9 @@ dependencies = [
  "bincode",
  "chrono",
  "cron",
+ "ed25519-dalek",
  "hex",
+ "hkdf",
  "hmac",
  "log",
  "philotic-client",
@@ -144,6 +146,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "x25519-dalek",
 ]
 
 [[package]]

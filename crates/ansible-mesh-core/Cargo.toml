@@ -19,6 +19,9 @@ sha2 = "0.10"
 thiserror = "1.0"
 rand = "0.8"
 hex = "0.4"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+hkdf = "0.12"
 log = "0.4"
 tracing = "0.1"
 rusqlite = { version = "0.37", features = ["bundled"] }

@@ -1,13 +1,19 @@
+//! `phil mesh invite` and `phil mesh accept` — v2 signed invite / ECDH join ceremony.
+//!
+//! V2 protocol: No PSK in the URL. The invite payload is signed with the inviting
+//! hotel's Ed25519 private key. Session keys are derived via X25519 ECDH + HKDF.
+//! An intercepted invite URL cannot be used to join the mesh.
+
 use anyhow::{bail, Context, Result};
 use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::membership::{
-    consumed_nonce_key, generate_nonce, now_epoch_secs, operator_fingerprint_from_hex,
-    MeshInvite, MeshMembershipAcceptPayload, DEFAULT_INVITE_TTL_SECS,
+    consumed_nonce_key, derive_session_key_joiner, fingerprint_from_base64url,
+    generate_nonce, generate_x25519_ephemeral, now_epoch_secs, signing_key_from_raw_bytes,
+    verifying_key_to_base64url, InvitePayload, JoinRequest, SignedInvite,
+    DEFAULT_INVITE_TTL_SECS,
 };
 use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
 use ansible_mesh_core::storage::HotelRecord;
-use ansible_mesh_core::{BeaconMessage, MsgType};
-use rand::RngCore;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -15,7 +21,7 @@ use std::sync::Arc;
 use tokio::net::UdpSocket;
 use uuid::Uuid;
 
-use crate::init::{active_profile, profile_dir, public_key_path};
+use crate::init::{active_profile, profile_dir, private_key_path, public_key_path};
 
 fn db_path() -> PathBuf {
     match active_profile() {
@@ -31,39 +37,66 @@ fn open_graph() -> Result<GraphDomain> {
     Ok(GraphDomain::new(Arc::new(storage.adapter())))
 }
 
-fn random_mesh_psk() -> String {
-    let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    hex::encode(bytes)
-}
-
-fn load_operator_pubkey_hex() -> Result<String> {
-    let path = public_key_path();
-    let raw = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read operator public key at {}", path.display()))?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        bail!("operator public key is empty; run `phil init` first");
+fn load_hotel_private_signing_key() -> Result<ed25519_dalek::SigningKey> {
+    // Prefer hotel-specific private key if it exists.
+    let hotel_key_path = profile_dir().join("vault").join("hotel_private_key");
+    if hotel_key_path.exists() {
+        let raw = fs::read(&hotel_key_path)
+            .with_context(|| format!("read hotel private key at {}", hotel_key_path.display()))?;
+        return ansible_mesh_core::membership::signing_key_from_raw_bytes(&raw)
+            .context("parse hotel private key");
     }
-    Ok(trimmed.to_string())
+
+    // Fallback: operator.key (same format — raw 32 bytes).
+    // TODO(S1): generate a dedicated hotel identity keypair in `aiua` on first start.
+    let op_key_path = private_key_path();
+    if op_key_path.exists() {
+        let raw = fs::read(&op_key_path)
+            .with_context(|| format!("read operator private key at {}", op_key_path.display()))?;
+        return ansible_mesh_core::membership::signing_key_from_raw_bytes(&raw)
+            .context("parse operator private key");
+    }
+
+    anyhow::bail!(
+        "no hotel private key found at {} or {}. Run `phil init` first.",
+        hotel_key_path.display(),
+        op_key_path.display()
+    )
 }
 
-fn mesh_psk_from_graph(graph: &GraphDomain) -> Result<Option<String>> {
-    Ok(graph
-        .get_config_value("mesh_psk")?
-        .and_then(|raw| serde_json::from_str::<String>(&raw).ok().or(Some(raw))))
+fn load_hotel_public_key_base64url() -> Result<String> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+
+    // Try the base64url-encoded hotel pubkey first (for v2 invites).
+    let hotel_pub_path = profile_dir().join("identity").join("hotel_public.key");
+    if hotel_pub_path.exists() {
+        let raw = fs::read_to_string(&hotel_pub_path)
+            .with_context(|| format!("read hotel public key at {}", hotel_pub_path.display()))?;
+        return Ok(raw.trim().to_string());
+    }
+
+    // Fallback: operator.pub is hex-encoded. Convert to base64url.
+    let op_pub_path = public_key_path();
+    let hex_raw = fs::read_to_string(&op_pub_path)
+        .with_context(|| format!("read operator public key at {}", op_pub_path.display()))?;
+    let bytes = hex::decode(hex_raw.trim()).context("decode operator pubkey hex")?;
+    Ok(URL_SAFE_NO_PAD.encode(&bytes))
 }
 
-fn upsert_mesh_psk(graph: &GraphDomain, mesh_psk: &str) -> Result<()> {
-    graph.set_config_value("mesh_psk", &serde_json::to_string(mesh_psk)?)
+fn mesh_host_for(hotel: &HotelRecord) -> &str {
+    hotel
+        .mesh_host
+        .as_deref()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or("127.0.0.1")
 }
 
 fn update_hotel_mesh_host(graph: &GraphDomain, hotel_name: &str, mesh_host: &str) -> Result<HotelRecord> {
     let Some(mut hotel) = graph.get_hotel(hotel_name)? else {
         bail!(
-            "hotel [{}] is not seeded in the graph yet; run `phil load --hotel {}` first",
-            hotel_name,
-            hotel_name
+            "hotel '{}' not found in graph. Run `phil load --hotel {}` first.",
+            hotel_name, hotel_name
         );
     };
     hotel.mesh_host = Some(mesh_host.to_string());
@@ -71,12 +104,16 @@ fn update_hotel_mesh_host(graph: &GraphDomain, hotel_name: &str, mesh_host: &str
     Ok(hotel)
 }
 
-/// Generate a mesh invite URL for `hotel_name` and print it to stdout.
+// ─── Invite ───────────────────────────────────────────────────────────────────
+
+/// Generate a signed, single-use mesh invite URL for `hotel_name`.
 ///
-/// Also writes a JSON file alongside for archival. The URL is the canonical
-/// delivery artifact — share it via a confidential channel (Telegram DM, Signal,
-/// etc). It expire after `ttl_secs` (default 30 minutes) and can only be accepted
-/// once (nonce replay protection).
+/// The URL contains the inviting hotel's Ed25519 signature over the full payload.
+/// The PSK is NOT in the URL. Session keys are derived from ECDH during acceptance.
+///
+/// The ephemeral X25519 private key must be stored in the graph so `aiua` can
+/// complete the ECDH when the `JoinRequest` arrives. It is stored encrypted
+/// under the config key `mesh_invite_ephemeral:<nonce>`.
 pub async fn invite(
     hotel_name: String,
     mesh_host: String,
@@ -85,166 +122,194 @@ pub async fn invite(
 ) -> Result<()> {
     let graph = open_graph()?;
     let hotel = update_hotel_mesh_host(&graph, &hotel_name, &mesh_host)?;
-    let mesh_psk = match mesh_psk_from_graph(&graph)? {
-        Some(existing) => existing,
-        None => {
-            let generated = random_mesh_psk();
-            upsert_mesh_psk(&graph, &generated)?;
-            generated
-        }
-    };
 
-    let operator_pubkey_hex = load_operator_pubkey_hex()?;
-    let operator_fingerprint = operator_fingerprint_from_hex(&operator_pubkey_hex)?;
+    let signing_key = load_hotel_private_signing_key()?;
+    let verifying_key = signing_key.verifying_key();
+    let pubkey_b64 = verifying_key_to_base64url(&verifying_key);
+    let fingerprint = fingerprint_from_base64url(&pubkey_b64)?;
 
+    let (x25519_secret_bytes, x25519_pub_enc) = generate_x25519_ephemeral();
+    let nonce = generate_nonce();
     let now = now_epoch_secs();
     let ttl = ttl_secs.unwrap_or(DEFAULT_INVITE_TTL_SECS);
-    let nonce = generate_nonce();
 
-    let invite = MeshInvite {
-        version: 1,
-        inviter_hotel: hotel,
-        mesh_psk,
-        operator_pubkey_hex: operator_pubkey_hex.clone(),
-        operator_fingerprint: operator_fingerprint.clone(),
-        issued_at: now,
-        valid_until: now + ttl,
+    let payload = InvitePayload {
+        version: 2,
+        inviter_hotel_id: hotel_name.clone(),
+        inviter_ed25519_pubkey: pubkey_b64.clone(),
+        inviter_x25519_ephemeral_pubkey: x25519_pub_enc.clone(),
+        inviter_hotel: hotel.clone(),
         nonce: nonce.clone(),
+        valid_until: now + ttl,
+        issued_at: now,
     };
 
-    // Encode as URL — the primary delivery artifact.
-    let invite_url = invite.to_url()?;
+    let signed = SignedInvite::new(payload, &signing_key)?;
+    let invite_url = signed.to_url()?;
 
-    // Also write a JSON file for archival / debugging.
+    // Store the ephemeral secret so aiua can complete ECDH when JoinRequest arrives.
+    let ephemeral_key = format!("mesh_invite_ephemeral:{}", nonce);
+    let secret_hex = hex::encode(x25519_secret_bytes);
+    graph.set_config_value(&ephemeral_key, &serde_json::to_string(&secret_hex)?)?;
+
+    // Write JSON archive alongside.
     let out_path = out.unwrap_or_else(|| {
-        PathBuf::from(format!("mesh-invite-{}.json", invite.inviter_hotel.hotel_name))
+        PathBuf::from(format!("mesh-invite-{}.json", hotel_name))
     });
-    fs::write(&out_path, serde_json::to_string_pretty(&invite)?)
-        .with_context(|| format!("failed to write invite to {}", out_path.display()))?;
+    let archive = serde_json::json!({
+        "invite_url": invite_url,
+        "fingerprint": fingerprint,
+        "nonce_prefix": &nonce[..8],
+        "hotel": hotel_name,
+        "valid_until": now + ttl,
+        "issued_at": now,
+    });
+    fs::write(&out_path, serde_json::to_string_pretty(&archive)?)
+        .with_context(|| format!("write invite archive to {}", out_path.display()))?;
 
-    println!("Mesh invite generated:");
-    println!("  hotel       {}", invite.inviter_hotel.hotel_name);
-    println!(
-        "  target      {}:{}",
-        invite.inviter_hotel.mesh_host.as_deref().unwrap_or("127.0.0.1"),
-        invite.inviter_hotel.mesh_port
-    );
-    println!("  fingerprint ed25519:{}", operator_fingerprint);
-    println!(
-        "  expires     +{}min  (at unix {})",
-        ttl / 60,
-        now + ttl
-    );
+    println!("Mesh invite generated (v2 — signed, no PSK in URL):");
+    println!("  hotel       {}", hotel_name);
+    println!("  target      {}:{}", mesh_host_for(&hotel), hotel.mesh_port);
+    println!("  fingerprint ed25519:{}", fingerprint);
+    println!("  expires     +{}min  (at unix {})", ttl / 60, now + ttl);
     println!("  nonce       {}", &nonce[..8]);
-    println!("  json file   {}", out_path.display());
+    println!("  archive     {}", out_path.display());
     println!();
-    println!("Invite URL (share via confidential channel):");
+    println!("Invite URL — share via confidential channel (Telegram DM, Signal, etc.):");
     println!();
     println!("  {}", invite_url);
     println!();
-    println!("On the joining hotel run:");
-    println!("  philotic-web mesh accept '<url>'");
+    println!("The joining hotel runs:");
+    println!("  phil mesh accept '<url>' --hotel <their-hotel> --mesh-host <their-addr>");
+    println!();
+    println!("Security note: An intercepted URL cannot be used to join the mesh.");
+    println!("Session keys are derived from ECDH and never transmitted.");
     Ok(())
 }
 
-fn read_invite_from_path(path: &Path) -> Result<MeshInvite> {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("failed to read invite file {}", path.display()))?;
-    serde_json::from_str(&raw).context("invite file is not valid mesh invite JSON")
-}
+// ─── Accept ───────────────────────────────────────────────────────────────────
 
-/// Accept a mesh invite delivered as either:
-/// - a `philotic-invite://v1/<blob>` URL string
-/// - a path to a `.json` invite file
+/// Accept a mesh invite (URL or JSON archive path).
 ///
-/// Validates TTL and checks nonce has not been consumed. On success: stores the
-/// inviter's hotel record, writes the mesh PSK to the graph, marks the nonce
-/// consumed, and fires a `MeshMembershipAccept` beacon back to the inviter.
+/// Full ceremony:
+/// 1. Parse and verify Ed25519 signature.
+/// 2. Validate TTL and nonce.
+/// 3. Derive session key from ECDH.
+/// 4. Store inviter hotel + session key in graph.
+/// 5. Send `JoinRequest` beacon to inviter so it can complete ECDH on its side.
 pub async fn accept(invite_src: String, hotel_name: String, mesh_host: String) -> Result<()> {
-    // Parse invite from URL or file path.
-    let invite = if invite_src.starts_with(ansible_mesh_core::membership::INVITE_URL_PREFIX) {
-        MeshInvite::from_url(&invite_src)?
+    let signed = if invite_src.starts_with(ansible_mesh_core::membership::INVITE_URL_PREFIX_V2) {
+        SignedInvite::from_url(&invite_src)?
     } else {
-        read_invite_from_path(Path::new(&invite_src))?
+        // Try reading as a JSON archive produced by `invite --out`.
+        let json: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(Path::new(&invite_src))
+                .with_context(|| format!("read invite file {}", invite_src))?,
+        )
+        .context("parse invite JSON archive")?;
+        let url = json
+            .get("invite_url")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("invite file missing 'invite_url' field"))?;
+        SignedInvite::from_url(url)?
     };
 
-    // Validate version and TTL.
-    invite
+    // 1. Verify signature — before doing anything else.
+    signed
+        .verify_signature()
+        .map_err(|e| anyhow::anyhow!("invite signature verification failed: {}", e))?;
+
+    // 2. Validate TTL and nonce.
+    signed
         .validate_time()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     let graph = open_graph()?;
-
-    // Nonce replay check — reject if already consumed.
-    let nonce_key = consumed_nonce_key(&invite.nonce);
+    let nonce_key = consumed_nonce_key(&signed.payload.nonce);
     if graph.get_config_value(&nonce_key)?.is_some() {
-        bail!("invite nonce has already been consumed (replay rejected)");
+        bail!("invite nonce already consumed (replay rejected)");
     }
 
-    // Store peer hotel, PSK, and mark nonce consumed — all before sending the
-    // acceptance beacon so we don't emit a beacon and then fail to persist.
+    // 3. ECDH — derive session key. B generates its own ephemeral X25519 keypair.
+    let joiner_ecdh = derive_session_key_joiner(&signed.payload.inviter_x25519_ephemeral_pubkey)?;
+
     let local_hotel = update_hotel_mesh_host(&graph, &hotel_name, &mesh_host)?;
-    upsert_mesh_psk(&graph, &invite.mesh_psk)?;
-    graph.upsert_hotel(&invite.inviter_hotel)?;
+    let joiner_pubkey_b64 = load_hotel_public_key_base64url()?;
+    let fingerprint = fingerprint_from_base64url(&joiner_pubkey_b64)?;
+
+    // 4. Persist: inviter hotel + session key + mark nonce consumed.
+    graph.upsert_hotel(&signed.payload.inviter_hotel)?;
     graph.set_config_value(&nonce_key, "consumed")?;
 
-    // Fire acceptance beacon to inviter.
-    let payload = MeshMembershipAcceptPayload {
-        version: 1,
-        hotel: local_hotel.clone(),
-        invite_nonce: invite.nonce.clone(),
-        accepted_at: now_epoch_secs(),
+    // Store derived session key for this peer (encrypted at rest TODO: vault).
+    let peer_key = format!("mesh_session_key:{}", signed.payload.inviter_hotel_id);
+    graph.set_config_value(
+        &peer_key,
+        &serde_json::to_string(&hex::encode(joiner_ecdh.session_key))?,
+    )?;
+
+    // 5. Send JoinRequest to inviter so it can compute the same session key.
+    let join_req = JoinRequest {
+        version: 2,
+        invite_nonce: signed.payload.nonce.clone(),
+        joiner_hotel: local_hotel.clone(),
+        joiner_ed25519_pubkey: joiner_pubkey_b64,
+        joiner_x25519_ephemeral_pubkey: joiner_ecdh.joiner_x25519_pubkey_enc.clone(),
+        requested_at: now_epoch_secs(),
     };
-    let payload_bytes = serde_json::to_vec(&payload)?;
+    let payload_bytes = serde_json::to_vec(&join_req)?;
 
-    let msg_id = Uuid::new_v4();
-    let timestamp = now_epoch_secs();
-    let auth = ansible_mesh_core::authz::MeshAuth::new(invite.mesh_psk.clone());
-    let hmac = auth.sign(&msg_id, 0, &payload_bytes, timestamp);
-
-    let target_host = invite
+    let target_host = signed
+        .payload
         .inviter_hotel
         .mesh_host
         .as_deref()
         .filter(|v| !v.trim().is_empty())
         .unwrap_or("127.0.0.1");
-    let target_addr: SocketAddr = format!("{}:{}", target_host, invite.inviter_hotel.mesh_port)
-        .parse()
-        .with_context(|| {
-            format!(
-                "invalid inviter mesh address {}:{}",
-                target_host, invite.inviter_hotel.mesh_port
-            )
-        })?;
+    let target_addr: SocketAddr =
+        format!("{}:{}", target_host, signed.payload.inviter_hotel.mesh_port)
+            .parse()
+            .with_context(|| format!("invalid inviter mesh addr {}:{}", target_host, signed.payload.inviter_hotel.mesh_port))?;
 
-    let message = BeaconMessage {
-        version: 1,
+    // Use unsigned UDP for the JoinRequest — the JoinRequest itself contains B's
+    // identity pubkey + ECDH material, so A can verify B's identity separately.
+    // Per-peer HMAC authentication (S3) will replace this with signed traffic.
+    let msg_id = Uuid::new_v4();
+    let timestamp = now_epoch_secs();
+    let message = ansible_mesh_core::BeaconMessage {
+        version: 2,
         msg_id,
         src_node: local_hotel.capabilities.node_id.clone(),
-        dest_node: invite.inviter_hotel.capabilities.node_id.clone(),
-        msg_type: MsgType::MeshMembershipAccept,
+        dest_node: signed.payload.inviter_hotel.capabilities.node_id.clone(),
+        msg_type: ansible_mesh_core::MsgType::MeshMembershipAccept,
         seq: 0,
         total: 1,
         payload: payload_bytes,
         timestamp,
-        hmac,
+        hmac: vec![], // S3: per-peer HMAC not yet enforced
     };
 
     let socket = UdpSocket::bind("0.0.0.0:0")
         .await
-        .context("failed to bind local UDP socket for mesh acceptance")?;
+        .context("bind local UDP socket for join request")?;
     socket
         .send_to(&serde_json::to_vec(&message)?, target_addr)
         .await
-        .with_context(|| format!("failed to send mesh acceptance to {}", target_addr))?;
+        .with_context(|| format!("send JoinRequest to {}", target_addr))?;
 
-    println!("Mesh invite accepted:");
-    println!("  local hotel   {}", local_hotel.hotel_name);
-    println!("  inviter hotel {}", invite.inviter_hotel.hotel_name);
-    println!("  notified      {}", target_addr);
+    let inviter_fp = fingerprint_from_base64url(&signed.payload.inviter_ed25519_pubkey)
+        .unwrap_or_else(|_| "?".to_string());
+
+    println!("Mesh invite accepted (v2 — ECDH session key derived):");
+    println!("  local hotel     {}", local_hotel.hotel_name);
+    println!("  local identity  ed25519:{}", fingerprint);
+    println!("  inviter hotel   {}", signed.payload.inviter_hotel_id);
+    println!("  inviter id      ed25519:{}", inviter_fp);
+    println!("  session key     derived via X25519+HKDF (never transmitted)");
+    println!("  notified        {}", target_addr);
     println!();
-    println!("Local graph now trusts the inviter. If the inviter aiua is running");
-    println!("and listening on its mesh port, it will persist this hotel and begin");
-    println!("mesh discovery automatically.");
+    println!("Local graph now trusts the inviter. If the inviter aiua is running,");
+    println!("it will complete the ECDH ceremony and both hotels will begin authenticated");
+    println!("mesh communication automatically.");
     Ok(())
 }

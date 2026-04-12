@@ -1001,6 +1001,7 @@ mod tests {
         HotelRecord {
             hotel_name: name.to_string(),
             capabilities: caps(),
+            mesh_host: None,
             mesh_port: 8999,
             blob_port: 9001,
             execution_port: 9002,

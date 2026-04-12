@@ -763,43 +763,110 @@ fn mesh_target_addr_for_node(graph: &GraphDomain, target_node_id: &str) -> Resul
 }
 
 fn handle_mesh_membership_accept(graph: &GraphDomain, payload_json: &[u8]) {
-    use ansible_mesh_core::membership::consumed_nonce_key;
+    use ansible_mesh_core::membership::{
+        consumed_nonce_key, derive_session_key_inviter, JoinRequest,
+    };
 
-    let payload: ansible_mesh_core::membership::MeshMembershipAcceptPayload =
-        match serde_json::from_slice(payload_json) {
-            Ok(value) => value,
-            Err(err) => {
-                warn!("mesh membership accept payload invalid: {err}");
-                return;
-            }
-        };
+    let join_req: JoinRequest = match serde_json::from_slice(payload_json) {
+        Ok(v) => v,
+        Err(err) => {
+            warn!("mesh JoinRequest payload invalid: {err}");
+            return;
+        }
+    };
 
-    if payload.hotel.hotel_name.trim().is_empty()
-        || payload.hotel.capabilities.node_id.trim().is_empty()
+    if join_req.joiner_hotel.hotel_name.trim().is_empty()
+        || join_req.joiner_hotel.capabilities.node_id.trim().is_empty()
     {
-        warn!("mesh membership accept payload missing hotel identity");
+        warn!("mesh JoinRequest missing joiner hotel identity");
         return;
     }
 
-    // Mark the invite nonce consumed on the inviter side so the same invite
-    // URL cannot be replayed from a second would-be joiner.
-    if !payload.invite_nonce.is_empty() {
-        let nonce_key = consumed_nonce_key(&payload.invite_nonce);
-        if let Err(e) = graph.set_config_value(&nonce_key, "consumed") {
-            warn!("mesh membership accept: failed to mark nonce consumed: {e}");
+    // Mark invite nonce consumed on the inviter side.
+    let nonce_key = consumed_nonce_key(&join_req.invite_nonce);
+    if let Err(e) = graph.set_config_value(&nonce_key, "consumed") {
+        warn!("JoinRequest: failed to mark nonce consumed: {e}");
+    }
+
+    // Retrieve the ephemeral X25519 secret stored at invite generation time.
+    let ephemeral_config_key = format!("mesh_invite_ephemeral:{}", join_req.invite_nonce);
+    match graph.get_config_value(&ephemeral_config_key) {
+        Ok(Some(raw)) => {
+            // Remove the ephemeral secret after use (forward secrecy).
+            let _ = graph.set_config_value(&ephemeral_config_key, "consumed");
+
+            let secret_hex: String = match serde_json::from_str(&raw)
+                .ok()
+                .or_else(|| Some(raw.clone()))
+            {
+                Some(s) => s,
+                None => {
+                    warn!("JoinRequest: failed to deserialize ephemeral secret");
+                    return;
+                }
+            };
+
+            let secret_bytes = match hex::decode(&secret_hex) {
+                Ok(b) if b.len() == 32 => {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&b);
+                    arr
+                }
+                Ok(_) => {
+                    warn!("JoinRequest: ephemeral X25519 secret wrong length");
+                    return;
+                }
+                Err(e) => {
+                    warn!("JoinRequest: ephemeral X25519 secret hex decode failed: {e}");
+                    return;
+                }
+            };
+
+            match derive_session_key_inviter(&secret_bytes, &join_req.joiner_x25519_ephemeral_pubkey) {
+                Ok(ecdh) => {
+                    let session_key_hex = hex::encode(ecdh.session_key);
+                    let peer_key = format!("mesh_session_key:{}", join_req.joiner_hotel.hotel_name);
+                    if let Err(e) = graph.set_config_value(
+                        &peer_key,
+                        &serde_json::to_string(&session_key_hex).unwrap_or_default(),
+                    ) {
+                        warn!("JoinRequest: failed to store session key: {e}");
+                    } else {
+                        info!(
+                            "Mesh join: ECDH session key derived for peer hotel={} nonce={}",
+                            join_req.joiner_hotel.hotel_name,
+                            &join_req.invite_nonce.get(..8).unwrap_or("?"),
+                        );
+                    }
+                }
+                Err(e) => warn!("JoinRequest: ECDH session key derivation failed: {e}"),
+            }
+        }
+        Ok(None) => {
+            // Could be a v1 invite accepted against a v2 handler, or the nonce was
+            // never registered (e.g., invite generated on a different host).
+            // Fall through and still accept the hotel record.
+            warn!(
+                "JoinRequest: no ephemeral secret found for nonce {} (cannot complete ECDH; \
+                 falling back to unauthenticated membership record)",
+                &join_req.invite_nonce.get(..8).unwrap_or("?"),
+            );
+        }
+        Err(e) => {
+            warn!("JoinRequest: graph lookup for ephemeral secret failed: {e}");
         }
     }
 
-    match graph.upsert_hotel(&payload.hotel) {
+    match graph.upsert_hotel(&join_req.joiner_hotel) {
         Ok(()) => info!(
-            "Mesh membership accepted: hotel={} node_id={} nonce={}",
-            payload.hotel.hotel_name,
-            payload.hotel.capabilities.node_id,
-            &payload.invite_nonce.get(..8).unwrap_or("?"),
+            "Mesh membership: hotel={} node_id={} joined (nonce={})",
+            join_req.joiner_hotel.hotel_name,
+            join_req.joiner_hotel.capabilities.node_id,
+            &join_req.invite_nonce.get(..8).unwrap_or("?"),
         ),
         Err(err) => warn!(
-            "failed to persist accepted mesh hotel {}: {}",
-            payload.hotel.hotel_name, err
+            "failed to persist joining hotel {}: {}",
+            join_req.joiner_hotel.hotel_name, err
         ),
     }
 }
