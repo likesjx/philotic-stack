@@ -603,12 +603,21 @@ fn default_hotel_record(hotel_name: &str) -> HotelRecord {
             tools: vec![],
             constraints: Default::default(),
         },
+        mesh_host: None,
         mesh_port: base_port,
         blob_port: base_port + 1,
         execution_port: hotel_execution_port(&safe_name),
         ipc_socket_path: hotel_ipc_socket_path(hotel_name),
         active_pid: None,
     }
+}
+
+fn mesh_host_for_hotel(hotel: &HotelRecord) -> &str {
+    hotel
+        .mesh_host
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("127.0.0.1")
 }
 
 fn mesh_targets_for_graph(
@@ -620,10 +629,9 @@ fn mesh_targets_for_graph(
         .into_iter()
         .filter(|hotel| hotel.capabilities.node_id != local_node_id)
         .map(|hotel| {
-            (
-                hotel.capabilities.node_id,
-                format!("127.0.0.1:{}", hotel.mesh_port),
-            )
+            let node_id = hotel.capabilities.node_id.clone();
+            let addr = format!("{}:{}", mesh_host_for_hotel(&hotel), hotel.mesh_port);
+            (node_id, addr)
         })
         .collect())
 }
@@ -751,7 +759,49 @@ fn mesh_target_addr_for_node(graph: &GraphDomain, target_node_id: &str) -> Resul
         .list_hotels()?
         .into_iter()
         .find(|hotel| hotel.capabilities.node_id == target_node_id)
-        .map(|hotel| format!("127.0.0.1:{}", hotel.mesh_port)))
+        .map(|hotel| format!("{}:{}", mesh_host_for_hotel(&hotel), hotel.mesh_port)))
+}
+
+fn handle_mesh_membership_accept(graph: &GraphDomain, payload_json: &[u8]) {
+    use ansible_mesh_core::membership::consumed_nonce_key;
+
+    let payload: ansible_mesh_core::membership::MeshMembershipAcceptPayload =
+        match serde_json::from_slice(payload_json) {
+            Ok(value) => value,
+            Err(err) => {
+                warn!("mesh membership accept payload invalid: {err}");
+                return;
+            }
+        };
+
+    if payload.hotel.hotel_name.trim().is_empty()
+        || payload.hotel.capabilities.node_id.trim().is_empty()
+    {
+        warn!("mesh membership accept payload missing hotel identity");
+        return;
+    }
+
+    // Mark the invite nonce consumed on the inviter side so the same invite
+    // URL cannot be replayed from a second would-be joiner.
+    if !payload.invite_nonce.is_empty() {
+        let nonce_key = consumed_nonce_key(&payload.invite_nonce);
+        if let Err(e) = graph.set_config_value(&nonce_key, "consumed") {
+            warn!("mesh membership accept: failed to mark nonce consumed: {e}");
+        }
+    }
+
+    match graph.upsert_hotel(&payload.hotel) {
+        Ok(()) => info!(
+            "Mesh membership accepted: hotel={} node_id={} nonce={}",
+            payload.hotel.hotel_name,
+            payload.hotel.capabilities.node_id,
+            &payload.invite_nonce.get(..8).unwrap_or("?"),
+        ),
+        Err(err) => warn!(
+            "failed to persist accepted mesh hotel {}: {}",
+            payload.hotel.hotel_name, err
+        ),
+    }
 }
 
 fn execution_reachability_for_hotel(
@@ -1020,9 +1070,12 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
                                         consumer_node_id: msg.src_node.clone(),
                                         acked_seq,
                                     })
-                                    .await;
+                                .await;
                             }
                         }
+                    }
+                    ansible_mesh_core::MsgType::MeshMembershipAccept => {
+                        handle_mesh_membership_accept(inbound_graph.as_ref(), &msg.payload);
                     }
                     ansible_mesh_core::MsgType::WebRtcSignal => {
                         info!("Received WebRTC Signaling Payload from {}", msg.src_node);
@@ -4593,7 +4646,15 @@ async fn main() -> Result<()> {
 
     // PORT-BP-006: Pre-Shared Key for mesh authentication
     let mesh_psk = std::env::var("PHILOTIC_MESH_PSK")
-        .unwrap_or_else(|_| "INSECURE_DEV_DEFAULT_PSK".to_string());
+        .ok()
+        .or_else(|| {
+            graph_domain_arc
+                .get_config_value("mesh_psk")
+                .ok()
+                .flatten()
+                .and_then(|raw| serde_json::from_str::<String>(&raw).ok().or(Some(raw)))
+        })
+        .unwrap_or_else(|| "INSECURE_DEV_DEFAULT_PSK".to_string());
 
     // Channel for pushing generated SDP Answers back out to the mesh
     let (webrtc_signal_tx, webrtc_signal_rx) =

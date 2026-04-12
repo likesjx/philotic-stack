@@ -30,4 +30,5 @@ rust-embed = { version = "8", features = ["mime-guess"] }
 philotic-client = { path = "../philotic-client" }
 philotic-graph = { path = "../philotic-graph" }
 graph-intelligence = { path = "../graph-intelligence" }
+ansible-mesh-core = { path = "../ansible-mesh-core" }
 inquire = "0.7"

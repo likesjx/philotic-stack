@@ -16,6 +16,7 @@ mod serve;
 mod service;
 mod start;
 mod status;
+mod mesh;
 mod stop;
 
 /// philotic-web — operator CLI for the Philotic Web
@@ -156,6 +157,56 @@ enum Command {
         /// Allowed CORS origins, comma-separated (default: http://localhost:5173)
         #[arg(long)]
         allow_origins: Option<String>,
+    },
+
+    /// Mesh join/invite — connect two independent Philotic hotels
+    Mesh {
+        #[command(subcommand)]
+        action: MeshAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum MeshAction {
+    /// Generate a one-time mesh invite URL for a peer hotel to join.
+    ///
+    /// Share the printed URL via a confidential channel (Telegram DM, Signal, etc.).
+    /// The URL expires after --ttl seconds (default: 1800 = 30 min) and can only be
+    /// consumed once. The joining hotel runs `phil mesh accept <url>`.
+    Invite {
+        /// Name of the local hotel to invite from (default: default)
+        #[arg(long, default_value = "default")]
+        hotel: String,
+
+        /// External mesh host address for this hotel (e.g. tailscale MagicDNS name or IP)
+        #[arg(long)]
+        mesh_host: String,
+
+        /// Path to write the invite JSON archive (default: mesh-invite-<hotel>.json)
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+
+        /// Invite TTL in seconds (default: 1800 = 30 min)
+        #[arg(long)]
+        ttl: Option<u64>,
+    },
+
+    /// Accept a mesh invite from a peer hotel.
+    ///
+    /// Pass the invite URL (philotic-invite://v1/...) or the path to an invite JSON file.
+    /// On success, the peer hotel is added to the local context graph and a join notification
+    /// is sent via the mesh beacon so the inviter persists this hotel automatically.
+    Accept {
+        /// Invite URL (philotic-invite://v1/...) or path to invite JSON file
+        invite: String,
+
+        /// Name of the local hotel that is joining (default: default)
+        #[arg(long, default_value = "default")]
+        hotel: String,
+
+        /// External mesh host address for this hotel (e.g. tailscale MagicDNS name or IP)
+        #[arg(long)]
+        mesh_host: String,
     },
 }
 
@@ -448,6 +499,19 @@ async fn main() -> Result<()> {
                 GraphAction::Harness { action } => harness::run(action),
             }
         }
+        Command::Mesh { action } => match action {
+            MeshAction::Invite {
+                hotel,
+                mesh_host,
+                out,
+                ttl,
+            } => mesh::invite(hotel, mesh_host, out, ttl).await,
+            MeshAction::Accept {
+                invite,
+                hotel,
+                mesh_host,
+            } => mesh::accept(invite, hotel, mesh_host).await,
+        },
         Command::Serve {
             port,
             db,

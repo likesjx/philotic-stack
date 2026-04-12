@@ -174,7 +174,10 @@ impl BeaconDaemon {
                     );
                 }
             }
-            MsgType::MeshEventBatch | MsgType::MeshEventAck | MsgType::WebRtcSignal => {
+            MsgType::MeshEventBatch
+            | MsgType::MeshEventAck
+            | MsgType::MeshMembershipAccept
+            | MsgType::WebRtcSignal => {
                 let _ = self.inbox_tx.send(msg).await;
             }
             _ => {

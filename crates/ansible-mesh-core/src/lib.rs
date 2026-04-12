@@ -15,6 +15,7 @@ pub mod graph_tools;
 pub mod heartbeat;
 pub mod ledger;
 pub mod materializer;
+pub mod membership;
 pub mod meshops;
 pub mod model_manager;
 pub mod registry;
@@ -126,6 +127,8 @@ pub enum MsgType {
     MeshEventBatch,
     /// An acknowledgment of durably received mesh events
     MeshEventAck,
+    /// An invited peer accepted membership and sent its hotel record
+    MeshMembershipAccept,
     /// WebRTC Session Description Protocol (SDP) and ICE candidate signaling
     WebRtcSignal,
 }

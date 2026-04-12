@@ -130,14 +130,17 @@ dependencies = [
  "bincode",
  "chrono",
  "cron",
+ "hex",
  "hmac",
  "log",
  "philotic-client",
+ "rand 0.8.5",
  "rusqlite",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
  "uuid",
@@ -2945,6 +2948,7 @@ dependencies = [
 name = "philotic-web"
 version = "0.1.0"
 dependencies = [
+ "ansible-mesh-core",
  "anyhow",
  "axum 0.7.9",
  "chrono",
