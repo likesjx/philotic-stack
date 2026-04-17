@@ -53,6 +53,8 @@ pub enum MsgType {
     MeshEventBatch,
     /// An acknowledgment of durably received mesh events
     MeshEventAck,
+    /// A membership acceptance packet emitted after an invite is accepted
+    MeshMembershipAccept,
     /// WebRTC Session Description Protocol (SDP) and ICE candidate signaling
     WebRtcSignal,
 }
