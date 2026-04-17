@@ -1,3 +1,4 @@
+use ansible_mesh_core::authz::MeshAuth;
 use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::registry::NodeRegistry;
 use ansible_mesh_core::storage::{CursorStorage, EventStorage};
@@ -38,7 +39,7 @@ pub async fn outbound_dispatcher(
                     }
                 };
                 for (target_node_id, target_addr) in &targets {
-                    if let Err(e) = dispatch_for_target(ledger.as_ref(), tracker.as_ref(), &local_node_id, target_node_id, target_addr).await {
+                    if let Err(e) = dispatch_for_target(ledger.as_ref(), tracker.as_ref(), graph.as_ref(), &local_node_id, target_node_id, target_addr).await {
                         error!("Failed to dispatch to {}: {}", target_node_id, e);
                     }
                 }
@@ -77,6 +78,7 @@ async fn execution_targets(
 async fn dispatch_for_target(
     ledger: &dyn EventStorage,
     tracker: &dyn CursorStorage,
+    graph: &GraphDomain,
     local_node_id: &str,
     target_node_id: &str,
     target_addr: &str,
@@ -101,15 +103,23 @@ async fn dispatch_for_target(
     // 3. Prepare the BeaconMessage batch (for now sending one event in the batch)
     for event in unacked_events {
         let payload = serde_json::to_vec(&vec![&event])?;
+        let auth_key = graph
+            .get_config_value(&format!("mesh_auth_key:{target_node_id}"))?
+            .and_then(|value| serde_json::from_str::<String>(&value).ok().or(Some(value)))
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("no mesh auth key for node {target_node_id}"))?;
 
         // Wrap in BeaconMessage
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
+        let msg_id = Uuid::new_v4();
+        let hmac = MeshAuth::new(auth_key).sign(&msg_id, event.seq, &payload, ts);
         let msg = BeaconMessage {
             version: 1,
-            msg_id: Uuid::new_v4(),
+            msg_id,
             src_node: local_node_id.to_string(),
             dest_node: target_node_id.to_string(),
             msg_type: MsgType::MeshEventBatch,
@@ -117,7 +127,7 @@ async fn dispatch_for_target(
             total: 1,
             payload,
             timestamp: ts,
-            hmac: vec![], // Future authz implementation
+            hmac,
         };
 
         match send_execution_message(target_addr, &msg).await {

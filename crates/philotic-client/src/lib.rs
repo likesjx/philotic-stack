@@ -53,6 +53,8 @@ pub struct OperatorAgentView {
     pub user_context_text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_workspace: Option<String>,
     #[serde(default)]
     pub toolset_tags: Vec<String>,
     #[serde(default)]
@@ -560,6 +562,10 @@ pub enum ParacrineRouting {
     /// Arbiter-promoted re-entry: queue at the FRONT of pending_user_tasks so the
     /// orchestrator processes it next, ahead of any already-queued messages.
     PriorityReEntry,
+    /// Operator approval decision for a parked turn. The receiving philote restores
+    /// the parked turn and applies the resolution (approve or deny) without re-entering
+    /// the model loop. Carries `decision` ("approved"/"denied") and optional `note`.
+    ApprovalResolution,
 }
 
 /// Paracrine message envelope — the vesicle a philote secretes when performing a
@@ -823,6 +829,8 @@ pub enum IpcRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         system_prompt: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        import_workspace: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         default_toolset: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         default_skillset: Option<Vec<String>>,
@@ -894,6 +902,19 @@ pub enum IpcRequest {
         /// The active persona role of the calling agent (e.g. "orchestrator").
         calling_role: String,
         arguments: serde_json::Value,
+    },
+    /// Ask the local hotel authority to create a signed mesh invite.
+    CreateMeshInvite {
+        hotel_name: String,
+        mesh_host: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ttl_secs: Option<u64>,
+    },
+    /// Ask the local hotel authority to verify an invite, sign a join request, and dispatch it.
+    AcceptMeshInvite {
+        hotel_name: String,
+        mesh_host: String,
+        invite_json: String,
     },
     /// Write a config value to the hotel's context graph (operator/management only).
     SetConfig {
@@ -1107,6 +1128,13 @@ pub enum IpcRequest {
         /// Materialisation timeout for the target role. `None` uses the hotel default.
         #[serde(default)]
         timeout_secs: Option<u64>,
+    },
+    /// Return a safe view of hotel state: hotel name, active guests, agent identities.
+    /// No secret or credential values are included.
+    GetHotelStatus,
+    /// Return the last `lines` lines from the hotel's log file.
+    GetHotelLogs {
+        lines: u32,
     },
 }
 

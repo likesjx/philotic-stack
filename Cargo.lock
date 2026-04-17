@@ -94,9 +94,11 @@ dependencies = [
  "axum 0.7.9",
  "base64 0.22.1",
  "clap",
+ "ed25519-dalek",
  "hex",
  "memory-core",
  "philotic-client",
+ "rand 0.8.5",
  "reqwest",
  "rusqlite",
  "serde",
@@ -131,9 +133,13 @@ dependencies = [
  "bincode",
  "chrono",
  "cron",
+ "ed25519-dalek",
+ "hex",
+ "hkdf",
  "hmac",
  "log",
  "philotic-client",
+ "rand 0.8.5",
  "rusqlite",
  "serde",
  "serde_json",
@@ -142,6 +148,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "x25519-dalek",
 ]
 
 [[package]]
@@ -2968,6 +2975,7 @@ dependencies = [
 name = "philotic-web"
 version = "0.1.0"
 dependencies = [
+ "ansible-mesh-core",
  "anyhow",
  "axum 0.7.9",
  "chrono",

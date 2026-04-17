@@ -97,6 +97,8 @@ pub enum SlashCommand {
     Preapprove { name: String },
     ApprovalStatus,
     ApprovalReset,
+    /// Explicitly cancel a parked approval turn, unblocking the session and notifying the original chat.
+    ApprovalClear { reason: Option<String> },
     Tts { mode: Option<String> },
 }
 
@@ -123,7 +125,8 @@ impl SlashCommand {
             Self::PreapproveThisSession
             | Self::Preapprove { .. }
             | Self::ApprovalStatus
-            | Self::ApprovalReset => None,
+            | Self::ApprovalReset
+            | Self::ApprovalClear { .. } => None,
             Self::Tts { .. } => None,
         }
     }
@@ -181,6 +184,9 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         }),
         ["/approval", "status", ..] => Some(SlashCommand::ApprovalStatus),
         ["/approval", "reset", ..] => Some(SlashCommand::ApprovalReset),
+        ["/approval", "clear", rest @ ..] => Some(SlashCommand::ApprovalClear {
+            reason: join_command_note(rest),
+        }),
         ["/tts"] => Some(SlashCommand::Tts { mode: None }),
         ["/tts", mode, ..] => Some(SlashCommand::Tts {
             mode: Some((*mode).to_string()),

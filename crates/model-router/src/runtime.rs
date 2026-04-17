@@ -277,14 +277,14 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                     let provider = match providers.resolve(&controller_task) {
                         Ok(provider) => provider,
                         Err(err) => {
-                            emit_failure(
-                                &mut ipc_client,
-                                &reply,
-                                Some(controller_task.kind.as_str()),
-                                None,
-                                format!("No model provider available for task: {}", err),
-                            )
-                            .await?;
+                            // This controller has no provider for this task kind. Skip silently —
+                            // another controller on the same role inbox may support it.
+                            info!(
+                                "Controller [{}] skipping {} task: {}",
+                                config.guest_id,
+                                controller_task.kind.as_str(),
+                                err
+                            );
                             continue;
                         }
                     };
@@ -297,7 +297,60 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                     );
 
                     let provider_id = provider.id().to_string();
-                    match provider.invoke(&controller_task).await {
+
+                    // ── Streaming dispatch ────────────────────────────────────
+                    // When the provider supports streaming for this task, spawn a
+                    // background task that forwards tokens to philote via EmitTask.
+                    // The main await still receives the final ProviderOutput.
+                    let provider_result = if provider.supports_streaming(&controller_task) {
+                        let (token_tx, mut token_rx) =
+                            tokio::sync::mpsc::channel::<String>(128);
+
+                        // Connect the stream IPC client BEFORE starting the SSE fetch so
+                        // the forwarding task is ready to drain tokens the moment they
+                        // arrive.  If we connected lazily (inside the spawned task) there
+                        // is a race where invoke_streaming completes and drops token_tx
+                        // before the task finishes connecting — the channel closes and no
+                        // tokens are ever forwarded.
+                        let stream_identity = GuestIdentity {
+                            guest_id: format!("model-stream-{}", Ulid::new()),
+                            role: config.guest_id.to_string(),
+                            supported_tools: Vec::new(),
+                        };
+                        let stream_ipc_opt = PhiloticClient::connect(stream_identity).await.ok();
+                        let reply_clone = reply.clone();
+                        tokio::spawn(async move {
+                            let Some(mut stream_ipc) = stream_ipc_opt else {
+                                return;
+                            };
+                            while let Some(token) = token_rx.recv().await {
+                                if token.is_empty() {
+                                    continue;
+                                }
+                                let task_json = serde_json::to_string(&json!({
+                                    "action": "streaming_token",
+                                    "session_id": reply_clone.session_id,
+                                    "turn_id": reply_clone.turn_id,
+                                    "chat_id": reply_clone.chat_id,
+                                    "content": token,
+                                }))
+                                .unwrap_or_default();
+                                let _ = stream_ipc
+                                    .send_request(IpcRequest::EmitTask {
+                                        target_node: reply_clone.reply_to.clone(),
+                                        target_role: reply_clone.reply_role.clone(),
+                                        target_guest_id: None,
+                                        task_json,
+                                    })
+                                    .await;
+                            }
+                        });
+                        provider.invoke_streaming(&controller_task, token_tx).await
+                    } else {
+                        provider.invoke(&controller_task).await
+                    };
+
+                    match provider_result {
                         Ok(ProviderOutput::ToolCall {
                             tool_name,
                             arguments,

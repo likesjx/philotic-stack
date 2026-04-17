@@ -14,13 +14,18 @@ uuid = { version = "1.11", features = ["v4", "serde"] }
 tokio = { version = "1.42", features = ["rt", "rt-multi-thread", "net", "sync", "macros"] }
 bincode = "1.3"
 anyhow = "1.0"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+hex = "0.4"
 hmac = "0.12"
+rand = "0.8"
 sha2 = "0.10"
 log = "0.4"
 tracing = "0.1"
 rusqlite = { version = "0.37", features = ["bundled"] }
 cron = "0.12"
 chrono = { version = "0.4", features = ["clock"] }
+hkdf = "0.12"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 [dev-dependencies]
 philotic-client = { path = "../philotic-client" }

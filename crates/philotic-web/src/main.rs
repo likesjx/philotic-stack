@@ -8,6 +8,7 @@ mod footprint;
 mod harness;
 mod init;
 mod load;
+mod mesh;
 mod muninn;
 mod onboard;
 mod presets;
@@ -133,6 +134,12 @@ enum Command {
         action: ComponentAction,
     },
 
+    /// Explicit mesh trust ceremony: create invites and accept memberships
+    Mesh {
+        #[command(subcommand)]
+        action: MeshAction,
+    },
+
     /// Project intelligence graph — scan, query, and serve the codebase graph
     Graph {
         #[command(subcommand)]
@@ -222,6 +229,37 @@ enum ComponentAction {
     Remove {
         /// Guest ID of the component to remove.
         guest_id: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum MeshAction {
+    /// Create an invite file for another hotel to join this mesh
+    Invite {
+        /// Local hotel to invite from
+        #[arg(long, default_value = "default")]
+        hotel: String,
+
+        /// Publicly reachable host or IP for this hotel's mesh UDP listener
+        #[arg(long)]
+        host: String,
+
+        /// Output path for the invite JSON
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+    },
+    /// Accept an invite file and announce membership back to the inviter
+    Accept {
+        /// Path to the invite JSON file
+        invite: PathBuf,
+
+        /// Local hotel accepting the invite
+        #[arg(long, default_value = "default")]
+        hotel: String,
+
+        /// Publicly reachable host or IP for this hotel's mesh UDP listener
+        #[arg(long)]
+        host: String,
     },
 }
 
@@ -337,6 +375,14 @@ async fn main() -> Result<()> {
             ComponentAction::Add { manifest } => component::add(manifest).await,
             ComponentAction::List => component::list().await,
             ComponentAction::Remove { guest_id } => component::remove(guest_id).await,
+        },
+        Command::Mesh { action } => match action {
+            MeshAction::Invite { hotel, host, out } => mesh::invite(hotel, host, out).await,
+            MeshAction::Accept {
+                invite,
+                hotel,
+                host,
+            } => mesh::accept(invite, hotel, host).await,
         },
         Command::Graph { action } => {
             use graph_intelligence::{scanner, GraphEngine};
