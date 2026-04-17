@@ -134,6 +134,7 @@ dependencies = [
  "hmac",
  "log",
  "philotic-client",
+ "philotic-primitives-mesh",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2943,6 +2944,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "philotic-primitives-mesh"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "uuid",
+]
+
+[[package]]
 name = "philotic-sandbox"
 version = "0.1.0"
 dependencies = [
@@ -4463,12 +4472,14 @@ dependencies = [
  "clap",
  "memory-core",
  "philotic-client",
+ "philotic-sandbox",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

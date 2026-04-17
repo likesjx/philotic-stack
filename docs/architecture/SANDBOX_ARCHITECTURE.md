@@ -3,7 +3,7 @@ title: Sandbox Architecture
 doc_type: architecture
 domain: philotic-sandbox
 status: active
-last_updated: 2026-03-31
+last_updated: 2026-04-10
 tags:
 - sandbox
 - security
@@ -20,7 +20,9 @@ related_docs:
 The `philotic-sandbox` crate provides a policy-driven sandbox runtime for executing
 shell commands within the philotic-stack framework. It replaces direct
 `std::process::Command` execution with a separate worker process that enforces
-filesystem, network, and syscall restrictions.
+filesystem, network, and syscall restrictions. The exposed user-facing contract
+still lives at the tool surface: `tool-runner` owns `bash.exec`, and can delegate
+that tool call to the sandbox worker when sandbox mode is configured.
 
 ## Architecture Diagram
 
@@ -63,18 +65,20 @@ The philotic-stack uses a hotel/guest architecture:
 - **Guests** — specialized processes: agent-core, tool-runners, membranes
 - **Tool-runners** — non-cognitive guests that execute tool calls
 
-The sandbox worker is a **companion process** to the tool-runner. When the system
-is configured for sandboxed execution, the tool-runner sends shell commands to the
-sandbox worker over a Unix domain socket instead of executing them directly.
+The sandbox worker is a **backing process** for the tool-runner's shell-execution
+surface. When the system is configured for sandboxed execution, the tool-runner
+sends shell commands to the sandbox worker over a Unix domain socket instead of
+executing them directly.
 
 ### Execution Modes
 
 The `ShellExecutionMode` enum controls how commands are executed:
 
 - **Direct** — `std::process::Command` (development, no OS-level restrictions)
-- **Sandboxed** — IPC to the sandbox worker (production, OS-level enforcement)
+- **Sandboxed** — IPC to the sandbox worker via `PHILOTIC_SANDBOX_SOCKET` (production, OS-level enforcement)
 
 Both modes implement the `ShellExecutor` trait, making the switch transparent.
+From the caller's perspective, both still flow through the `bash.exec` tool path.
 
 ## Security Layers
 
