@@ -2413,6 +2413,43 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             ..Default::default()
         },
         AbstractSkillRecord {
+            skill_name: "skill.authoring".into(),
+            description: "Author a new delegation skill for yourself. Identify a recurring pattern \
+                          in your work, give it a name, write a goal template, declare what tools the \
+                          subagent needs, then register it with skill.register and assign it to your \
+                          current role with skill.assign. Registered skills persist across sessions \
+                          and accumulate as part of your learned delegation vocabulary.".into(),
+            implied_tools: vec![
+                "skill.list".into(),
+                "skill.register".into(),
+                "skill.assign".into(),
+            ],
+            validation_state: ansible_mesh_core::graph::SkillValidationState::Validated,
+            field_sources: serde_json::json!({
+                "required_fields": [
+                    "skill_name",
+                    "description",
+                    "subagent_kind",
+                    "goal"
+                ],
+                "optional_fields": [
+                    "allowed_tools",
+                    "allowed_classes"
+                ],
+                "repo_skill_path": "skills/skill-authoring/SKILL.md",
+                "workflow": "skill.list → skill.register → skill.assign",
+                "format_example": {
+                    "skill_name": "deep-search",
+                    "description": "Delegate a multi-source research task to a focused subagent.",
+                    "subagent_kind": "philote-worker",
+                    "goal": "Research {{topic}} thoroughly using workspace and web tools. Return a structured summary with sources.",
+                    "allowed_tools": ["workspace.read", "workspace.list"],
+                    "allowed_classes": ["workspace", "utility"]
+                }
+            }),
+            ..Default::default()
+        },
+        AbstractSkillRecord {
             skill_name: "delegate.to_peer".into(),
             description: "Cross-agent delegation: hand off a bounded task to another trusted peer agent on the mesh instead of changing roles. Best for leveraging a different identity, rather than shifting internal capabilities.".into(),
             implied_tools: vec!["delegate.to_peer".into()],
@@ -2445,6 +2482,8 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "role.configure".into(),
                 "role.create_or_update".into(),
                 "skill.register".into(),
+                "skill.list".into(),
+                "skill.assign".into(),
                 "subagent.spawn".into(),
                 "workspace.list".into(),
                 "workspace.read".into(),
@@ -2457,6 +2496,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "handoff.back".into(),
                 "role.governance".into(),
                 "role.authoring".into(),
+                "skill.authoring".into(),
                 "delegate.to_peer".into(),
                 "delegate.to_external_cognitive_peer".into(),
             ],
@@ -2569,6 +2609,8 @@ Responsibilities:
 - Delegate sustained specialist work to configured roles via handoff.to_role.
 - Oversee subagents spawned for parallel, bounded tasks.
 - Return delegated work to orchestrator custody when roles complete.
+- Author new delegation skills when you identify recurring patterns in your work.
+- Assign registered skills to your roles to expand your capabilities over time.
 
 Rules:
 - Reason explicitly before creating a role: purpose, toolset, handoff posture, limits.
@@ -2578,6 +2620,8 @@ Rules:
 - Do not bypass the approval gate; if a tool requires operator approval, surface it clearly.
 - Keep soul_text and core identity stable — those changes require operator approval.
 - Use handoff.to_role for sustained specialist work; use subagent.spawn for parallel bounded tasks.
+- When you notice a pattern you have delegated 3 or more times, consider registering it as a named skill.
+- skill.assign only works on your own roles — you cannot grant skills to other agents.
 
 Tool preference:
 - Always prefer Philotic-native tools (hotel.status, hotel.logs, workspace.read, session.status, memory.recall) over shell commands.
@@ -2588,7 +2632,7 @@ Tool preference:
 - If no tool is needed to answer a question, respond directly — do not call a tool just because one is available.
 
 Approval posture:
-- Governance tools (role.create_or_update, skill.register, handoff.to_role, handoff.back) run without per-action approval.
+- Governance tools (role.create_or_update, skill.register, skill.assign, skill.list, handoff.to_role, handoff.back) run without per-action approval.
 - Self-configuration (agent.configure for approval_policy, profile, bindings) runs without approval.
 - Shell execution (bash.exec) and core identity field changes require operator approval.";
 
