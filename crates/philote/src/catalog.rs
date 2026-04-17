@@ -84,11 +84,53 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
     );
 
     m.insert(
+        "hotel.status".into(),
+        ToolDefinition {
+            tool_name: "hotel.status".into(),
+            description: "Returns a safe view of the hotel's current state: hotel name, node ID, \
+                          active and inactive guests (with roles), and registered agent identities. \
+                          No credentials, API keys, or secret values are included. Use this to \
+                          understand what guests are running, which agents are registered, and \
+                          whether the hotel is healthy. Always prefer this over bash.exec for \
+                          hotel introspection."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+            class: Some("session".into()),
+        },
+    );
+
+    m.insert(
+        "hotel.logs".into(),
+        ToolDefinition {
+            tool_name: "hotel.logs".into(),
+            description: "Returns the last N lines from the hotel's log file (aiua.log). Use this \
+                          to tail recent log output, diagnose guest failures, or inspect hotel \
+                          activity. Defaults to 50 lines. Never use bash.exec to tail logs when \
+                          this tool is available."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "lines": {
+                        "type": "integer",
+                        "description": "Number of log lines to return (default 50, max 500)."
+                    }
+                }
+            }),
+            class: Some("session".into()),
+        },
+    );
+
+    m.insert(
         "echo".into(),
         ToolDefinition {
             tool_name: "echo".into(),
-            description: "Echoes a string back unchanged. Use for testing tool routing and \
-                          round-trip connectivity."
+            description: "Echoes a string back unchanged. Only use when explicitly asked to \
+                          test tool connectivity. Do not call during normal conversation or \
+                          reasoning — this tool exists for diagnostics only."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -212,12 +254,13 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         "bash.exec".into(),
         ToolDefinition {
             tool_name: "bash.exec".into(),
-            description: "Runs a shell command and returns stdout, stderr, and exit code. \
-                          Use for scripting, file system queries, or invoking CLI tools. \
-                          Requires operator approval. Commands run under the agent's effective \
-                          working directory unless overridden by working_dir. A timeout (default \
-                          30 s) is enforced; the process is killed and an error returned if it \
-                          exceeds the limit."
+            description: "Last-resort shell execution. Runs a shell command and returns stdout, \
+                          stderr, and exit code. Use ONLY when no Philotic-native tool \
+                          (workspace.read, agent.graph.read, session.status, etc.) can accomplish \
+                          the task. Do not call speculatively or for diagnostic purposes. \
+                          Requires explicit operator approval before execution. Commands run under \
+                          the agent's effective working directory unless overridden by working_dir. \
+                          A timeout (default 30 s) is enforced."
                 .into(),
             input_schema: json!({
                 "type": "object",

@@ -1,0 +1,10 @@
+{
+  "context_graph": {
+    "default_model": "gemini-flash-latest"
+  },
+  "hotels": {
+    "default": {
+      "agents": {}
+    }
+  }
+}

@@ -1925,6 +1925,8 @@ struct PatchAgentBody {
     #[serde(default)]
     system_prompt: Option<String>,
     #[serde(default)]
+    import_workspace: Option<String>,
+    #[serde(default)]
     default_toolset: Option<Vec<String>>,
     #[serde(default)]
     default_skillset: Option<Vec<String>>,
@@ -1979,6 +1981,7 @@ async fn handle_agent_patch(
         body.identity_text,
         body.user_context_text,
         body.system_prompt,
+        body.import_workspace,
         body.default_toolset,
         body.default_skillset,
         body.response_route_policy.and_then(|policy| {
@@ -2052,6 +2055,7 @@ async fn ipc_patch_agent_bundle(
     identity_text: Option<String>,
     user_context_text: Option<String>,
     system_prompt: Option<String>,
+    import_workspace: Option<String>,
     default_toolset: Option<Vec<String>>,
     default_skillset: Option<Vec<String>>,
     response_route_policy: Option<ResponseRoutePolicyView>,
@@ -2065,6 +2069,7 @@ async fn ipc_patch_agent_bundle(
             identity_text,
             user_context_text,
             system_prompt,
+            import_workspace,
             default_toolset,
             default_skillset,
             response_route_policy,

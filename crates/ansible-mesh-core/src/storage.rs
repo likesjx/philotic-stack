@@ -102,6 +102,8 @@ fn default_auto_start() -> bool {
 pub struct HotelRecord {
     pub hotel_name: String,
     pub capabilities: NodeCapabilities,
+    #[serde(default)]
+    pub mesh_host: Option<String>,
     pub mesh_port: u16,
     pub blob_port: u16,
     pub execution_port: u16,

@@ -70,6 +70,22 @@ pub async fn run_interactive(config_path: &Path, force: bool) -> Result<()> {
     .with_help_message("Preferred route for model turns; auto lets the runtime infer per turn")
     .prompt()?;
 
+    let import_workspace = Text::new("Workspace path for tool-runner (optional):")
+        .with_default("")
+        .with_help_message("Seed path for the agent workspace / import bundle")
+        .prompt()?;
+
+    let default_skillset = Text::new("Initial skillset (comma-separated, optional):")
+        .with_default("")
+        .with_help_message("Examples: planning, implementation, research")
+        .prompt()?;
+    let default_skillset: Vec<String> = default_skillset
+        .split(',')
+        .map(str::trim)
+        .filter(|skill| !skill.is_empty())
+        .map(str::to_string)
+        .collect();
+
     println!();
     println!("  ── First Agent ──");
     println!();
@@ -212,6 +228,8 @@ pub async fn run_interactive(config_path: &Path, force: bool) -> Result<()> {
         &capitalize(&agent_name),
         &first_agent_prompt,
         &[],
+        Some(import_workspace.as_str()),
+        &default_skillset,
         &approval_policy,
         first_tg_token.as_deref(),
         first_tg_username.as_deref(),
@@ -316,6 +334,8 @@ fn build_agent_entry(
     display_name: &str,
     system_prompt: &str,
     toolset_tags: &[&str],
+    import_workspace: Option<&str>,
+    default_skillset: &[String],
     approval_policy: &ApprovalPolicy,
     telegram_token: Option<&str>,
     telegram_username: Option<&str>,
@@ -333,6 +353,7 @@ fn build_agent_entry(
         "response_route_policy": {
             "default_route": response_route,
         },
+        "default_skillset": default_skillset,
         "approval_policy": {
             "require_approval": approval_policy.require_approval,
             "preapproved_classes": approval_policy.preapproved_classes,
@@ -348,6 +369,10 @@ fn build_agent_entry(
 
     if !toolset_tags.is_empty() {
         entry["toolset_tags"] = json!(toolset_tags);
+    }
+
+    if let Some(workspace) = import_workspace.filter(|value| !value.trim().is_empty()) {
+        entry["import_workspace"] = json!(workspace);
     }
 
     if let (Some(token), Some(username)) = (telegram_token, telegram_username) {

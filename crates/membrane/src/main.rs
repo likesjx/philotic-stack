@@ -655,6 +655,10 @@ struct ActiveTurn {
     draft_message_id: Option<i64>,
     /// Telegram thread the turn belongs to, if any.
     thread_id: Option<String>,
+    /// Accumulated text from `streaming_token` fragments (LLM SSE stream).
+    streaming_draft: String,
+    /// When we last sent an `editMessageText` for streaming (throttle guard).
+    streaming_last_edit: Option<tokio::time::Instant>,
 }
 
 impl ActiveTurn {
@@ -1256,7 +1260,7 @@ fn normalize_telegram_menu_command_name(command: &str) -> Option<String> {
     (!normalized.is_empty()).then_some(normalized)
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn build_telegram_menu_commands(commands: &[TelegramBotCommand]) -> Vec<Value> {
     let mut normalized_commands = Vec::new();
     let mut seen = HashSet::new();
@@ -1488,12 +1492,23 @@ async fn acquire_telegram_poll_lease(
     }
 }
 
+/// Outcome of a poll lease renewal attempt.
+enum LeaseRenewResult {
+    /// Renewed successfully; new epoch to use for the next renewal.
+    Renewed(u64),
+    /// The lease has no current owner (e.g. after an IPC reconnect reset the
+    /// in-memory lease table). The caller should re-acquire rather than exit.
+    NeedsReacquire,
+    /// Another membrane instance holds the lease; the caller should exit.
+    Lost { owner: String, epoch: u64 },
+}
+
 async fn renew_telegram_poll_lease(
     ipc_client: &mut PhiloticClient,
     lease_key: &str,
     agent_id: &str,
     lease_epoch: u64,
-) -> Result<u64> {
+) -> Result<LeaseRenewResult> {
     match ipc_client
         .send_request(IpcRequest::RenewTelegramPollLease {
             lease_key: lease_key.to_string(),
@@ -1505,14 +1520,24 @@ async fn renew_telegram_poll_lease(
         IpcResponse::TelegramPollLease {
             granted: true,
             lease: Some(lease),
-        } => Ok(lease.lease_epoch),
+        } => Ok(LeaseRenewResult::Renewed(lease.lease_epoch)),
         IpcResponse::TelegramPollLease {
             granted: false,
-            lease,
+            lease: None,
         } => {
-            let owner = lease.as_ref().map(|entry| entry.owner_guest_id.as_str());
-            let epoch = lease.as_ref().map(|entry| entry.lease_epoch).unwrap_or(0);
-            anyhow::bail!("lease lost to {:?} at epoch {}", owner, epoch)
+            // No current owner — lease was reset (e.g. IPC reconnect after a
+            // network state change clears in-memory lease table). Re-acquire.
+            Ok(LeaseRenewResult::NeedsReacquire)
+        }
+        IpcResponse::TelegramPollLease {
+            granted: false,
+            lease: Some(other),
+        } => {
+            // Another seat holds the lease; this seat should yield.
+            Ok(LeaseRenewResult::Lost {
+                owner: other.owner_guest_id.clone(),
+                epoch: other.lease_epoch,
+            })
         }
         other => anyhow::bail!(
             "unexpected Telegram poll lease renew response for [{}]: {:?}",
@@ -1687,7 +1712,12 @@ async fn run_seat_impl(
             // Branch 1: Wait for Telegram Updates (Long Polling)
             // The request runs in an independent tokio task so that the IPC branch
             // (below) never cancels it mid-flight.
-            poll_result = poll_handle.as_mut().unwrap(), if poll_handle.is_some() => {
+            poll_result = async {
+                match poll_handle.as_mut() {
+                    Some(h) => h.await,
+                    None => std::future::pending().await, // unreachable due to if guard
+                }
+            }, if poll_handle.is_some() => {
                 poll_handle = None;
                 let http_result: Result<Value, reqwest::Error> = match poll_result {
                     Ok(r) => r,
@@ -1788,6 +1818,8 @@ async fn run_seat_impl(
                                                             cancel_typing: cancel_tx,
                                                             draft_message_id: None,
                                                             thread_id: envelope.thread_id.clone(),
+                                                            streaming_draft: String::new(),
+                                                            streaming_last_edit: None,
                                                         },
                                                     );
                                                 }
@@ -1886,6 +1918,40 @@ async fn run_seat_impl(
                                         }
                                     }
                                 }
+                            } else if action == "streaming_token" {
+                                // LLM SSE token fragment — accumulate and periodically edit the
+                                // in-progress Telegram message.  Throttled to ≤1 edit/1500ms to
+                                // stay well under Telegram's editMessageText rate limit.
+                                const STREAMING_THROTTLE_MS: u64 = 1500;
+                                let token = task.get("content").and_then(Value::as_str).unwrap_or_default().to_string();
+                                if !chat_id.is_empty() && !token.is_empty() {
+                                    if let Some(active) = active_turns.get_mut(&session_id) {
+                                        active.streaming_draft.push_str(&token);
+                                        let now = tokio::time::Instant::now();
+                                        let elapsed = active
+                                            .streaming_last_edit
+                                            .map(|t| now.duration_since(t).as_millis() as u64)
+                                            .unwrap_or(u64::MAX);
+                                        if elapsed >= STREAMING_THROTTLE_MS {
+                                            let draft_snapshot = active.streaming_draft.clone();
+                                            let thread_id = active.thread_id.clone();
+                                            let draft_message_id = active.draft_message_id;
+                                            if let Some(message_id) = upsert_formatted_text(
+                                                &http_client,
+                                                &tg_base,
+                                                &chat_id,
+                                                thread_id.as_deref(),
+                                                draft_message_id,
+                                                &draft_snapshot,
+                                            ).await {
+                                                if let Some(active2) = active_turns.get_mut(&session_id) {
+                                                    active2.draft_message_id = Some(message_id);
+                                                    active2.streaming_last_edit = Some(now);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             } else {
                                 // send_reply (or any unrecognised action): deliver to Telegram and
                                 // cancel the typing heartbeat for this session.
@@ -1952,6 +2018,19 @@ async fn run_seat_impl(
                                                     draft_message_id,
                                                     &content,
                                                 ).await;
+                                            } else if let Some(msg_id) = draft_message_id {
+                                                // Voice-only response: delete any streaming draft
+                                                // that appeared while Gemini was generating so the
+                                                // chat stays clean (audio only, no leftover text).
+                                                let del_url = format!("{}deleteMessage", tg_base_clone);
+                                                let _ = http_client_clone
+                                                    .post(&del_url)
+                                                    .json(&serde_json::json!({
+                                                        "chat_id": chat_id,
+                                                        "message_id": msg_id,
+                                                    }))
+                                                    .send()
+                                                    .await;
                                             }
                                         } else if !content.is_empty() {
                                             // Text-only path.
@@ -1994,10 +2073,36 @@ async fn run_seat_impl(
             )
             .await
             {
-                Ok(epoch) => {
+                Ok(LeaseRenewResult::Renewed(epoch)) => {
                     poll_lease_epoch = epoch;
                     next_lease_renewal = tokio::time::Instant::now()
                         + Duration::from_secs(TELEGRAM_POLL_LEASE_RENEW_INTERVAL_SECS);
+                }
+                Ok(LeaseRenewResult::NeedsReacquire) => {
+                    // IPC reconnect reset the lease binding; re-acquire and continue polling.
+                    warn!("Poll lease for [{}] lost (no owner after IPC reconnect); re-acquiring...", poll_lease_key);
+                    match acquire_telegram_poll_lease(&mut ipc_client, &poll_lease_key, &target_agent_id).await {
+                        Ok(epoch) => {
+                            poll_lease_epoch = epoch;
+                            next_lease_renewal = tokio::time::Instant::now()
+                                + Duration::from_secs(TELEGRAM_POLL_LEASE_RENEW_INTERVAL_SECS);
+                        }
+                        Err(err) => {
+                            warn!(
+                                "Failed to re-acquire Telegram poll lease [{}]: {}. Seat exiting.",
+                                poll_lease_key, err
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+                Ok(LeaseRenewResult::Lost { owner, epoch }) => {
+                    warn!(
+                        "Telegram poll lease [{}] lost to [{}] at epoch {}. Seat exiting.",
+                        poll_lease_key, owner, epoch
+                    );
+                    let _ = release_telegram_poll_lease(&mut ipc_client, &poll_lease_key).await;
+                    return Ok(());
                 }
                 Err(err) => {
                     warn!(

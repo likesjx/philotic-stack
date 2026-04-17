@@ -4,7 +4,7 @@ use crate::service::lease::{
     LeaseAcquireOutcome, LeaseObserver, LeaseObserverEvent, LeaseObserverEventKind, LeaseProvider,
     LeaseRenewOutcome, RuntimeLeaseRegistry,
 };
-use crate::vault::{SecretAccess, resolve_secret};
+use crate::vault::{SecretAccess, SecretInput, resolve_secret, store_secret};
 use ansible_mesh_core::agent_graph_storage::{
     AgentGraphSnapshot, AgentGraphStorage, SqliteAgentGraphStorage,
 };
@@ -15,6 +15,12 @@ use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
 use ansible_mesh_core::graph::{
     AbstractSkillRecord, RoleIncarnationRecord, RoleReadinessState, SkillValidationState,
+};
+use ansible_mesh_core::membership::{
+    DEFAULT_INVITE_TTL_SECS, MeshInvite, MeshInvitePayload, MeshJoinRequestPayload,
+    derive_transport_session_key, fingerprint_from_base64url, generate_nonce,
+    generate_transport_keypair, now_epoch_secs, sign_invite, sign_join_request,
+    signing_key_from_hex, verify_invite, verifying_key_to_base64url,
 };
 use ansible_mesh_core::registry::{
     CapabilityAdvertisement, ExecutionReachability, NodeRegistry, NodeStatus,
@@ -27,6 +33,8 @@ use ansible_mesh_core::validation::{
     SkillDraft, apply_validation_to_record, validate_skill_layer1,
 };
 use ansible_mesh_core::{NodeCapabilities, NodeConstraints};
+use anyhow::{Context, bail};
+use ed25519_dalek::SigningKey;
 use philotic_client::{
     DesktopMembraneAgentView, DesktopMembraneGuestView, DesktopMembraneStatusView,
     DesktopMembraneTargetGuestInventoryView, DesktopMembraneTargetReachabilityView,
@@ -43,7 +51,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::{UdpSocket, UnixListener, UnixStream};
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -93,6 +101,7 @@ const LOCAL_DELIVERY_PROVENANCE_TTL_SECS: u64 = 900;
 #[cfg(test)]
 const LOCAL_DELIVERY_PROVENANCE_TTL_SECS: u64 = 5;
 
+#[cfg(not(test))]
 const DISCORD_GATEWAY_LEASE_TTL_SECS: u64 = 45;
 #[cfg(test)]
 const DISCORD_GATEWAY_LEASE_TTL_SECS: u64 = 1;
@@ -1814,6 +1823,7 @@ impl IpcServer {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string)
         };
+        let import_workspace = str_opt("import_workspace");
         let response_route_policy = identity
             .bundle_json
             .get("response_route_policy")
@@ -1832,6 +1842,7 @@ impl IpcServer {
             identity_text: str_opt("identity_text"),
             user_context_text: str_opt("user_context_text"),
             system_prompt: str_opt("system_prompt"),
+            import_workspace,
             toolset_tags: str_vec("toolset_tags"),
             default_toolset: str_vec("default_toolset"),
             default_skillset: str_vec("default_skillset"),
@@ -3829,6 +3840,42 @@ impl IpcServer {
                     Err(e) => IpcResponse::error("vault", "VAULT_ERROR", e.to_string()),
                 }
             }
+            IpcRequest::CreateMeshInvite {
+                hotel_name,
+                mesh_host,
+                ttl_secs,
+            } => match Self::handle_create_mesh_invite(
+                graph,
+                local_node_id,
+                hotel_name,
+                mesh_host,
+                ttl_secs,
+            )
+            .await
+            {
+                Ok(data) => IpcResponse::success("mesh_invite", Some(data)),
+                Err(err) => {
+                    IpcResponse::error("mesh_invite", "MESH_INVITE_ERROR", err.to_string())
+                }
+            },
+            IpcRequest::AcceptMeshInvite {
+                hotel_name,
+                mesh_host,
+                invite_json,
+            } => match Self::handle_accept_mesh_invite(
+                graph,
+                local_node_id,
+                hotel_name,
+                mesh_host,
+                invite_json,
+            )
+            .await
+            {
+                Ok(data) => IpcResponse::success("mesh_accept", Some(data)),
+                Err(err) => {
+                    IpcResponse::error("mesh_accept", "MESH_ACCEPT_ERROR", err.to_string())
+                }
+            },
             IpcRequest::PublishMessage {
                 target_role,
                 payload,
@@ -5935,6 +5982,7 @@ impl IpcServer {
                 identity_text,
                 user_context_text,
                 system_prompt,
+                import_workspace,
                 default_toolset,
                 default_skillset,
                 response_route_policy,
@@ -5963,6 +6011,7 @@ impl IpcServer {
                     identity_text,
                     user_context_text,
                     system_prompt,
+                    import_workspace,
                     default_toolset,
                     default_skillset,
                     response_route_policy,
@@ -7055,6 +7104,85 @@ impl IpcServer {
 
                 IpcResponse::success("paracrine_emit", None)
             }
+
+            IpcRequest::GetHotelStatus => {
+                let hotel_name = Self::local_hotel_name(graph, local_node_id)
+                    .unwrap_or_else(|| "unknown".to_string());
+
+                let guests: Vec<serde_json::Value> = graph
+                    .list_guests(&hotel_name, false)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|g| {
+                        serde_json::json!({
+                            "guest_id": g.guest_id,
+                            "role": g.role,
+                            "active": g.is_active,
+                        })
+                    })
+                    .collect();
+
+                let agents: Vec<serde_json::Value> = graph
+                    .list_agent_identities()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|id| {
+                        serde_json::json!({
+                            "agent_id": id.agent_id,
+                            "persona_name": id.persona_name,
+                        })
+                    })
+                    .collect();
+
+                IpcResponse::success(
+                    "hotel_status",
+                    Some(serde_json::json!({
+                        "hotel_name": hotel_name,
+                        "node_id": local_node_id,
+                        "guests": guests,
+                        "agents": agents,
+                    })),
+                )
+            }
+
+            IpcRequest::GetHotelLogs { lines } => {
+                // Compute log path using the same PHILOTIC_PROFILE convention as the DB path.
+                let log_path = std::env::var("PHILOTIC_PROFILE")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .and_then(|profile| {
+                        std::env::var("HOME").ok().map(|home| {
+                            std::path::PathBuf::from(home)
+                                .join(".philotic")
+                                .join(profile)
+                                .join("aiua.log")
+                        })
+                    })
+                    .or_else(|| {
+                        std::env::var("HOME").ok().map(|home| {
+                            std::path::PathBuf::from(home)
+                                .join(".philotic")
+                                .join("aiua.log")
+                        })
+                    });
+
+                match log_path.and_then(|p| std::fs::read_to_string(&p).ok()) {
+                    Some(content) => {
+                        let all_lines: Vec<&str> = content.lines().collect();
+                        let start = all_lines.len().saturating_sub(lines as usize);
+                        let tail = all_lines[start..].join("\n");
+                        IpcResponse::success(
+                            "hotel_logs",
+                            Some(serde_json::json!({ "log": tail })),
+                        )
+                    }
+                    None => IpcResponse::error(
+                        "hotel_logs",
+                        "LOG_NOT_FOUND",
+                        "Hotel log file not found — check ~/.philotic/aiua.log",
+                    ),
+                }
+            }
         }
     }
 
@@ -7199,6 +7327,7 @@ impl IpcServer {
         identity_text: Option<String>,
         user_context_text: Option<String>,
         system_prompt: Option<String>,
+        import_workspace: Option<String>,
         default_toolset: Option<Vec<String>>,
         default_skillset: Option<Vec<String>>,
         response_route_policy: Option<serde_json::Value>,
@@ -7229,6 +7358,9 @@ impl IpcServer {
         if let Some(value) = system_prompt {
             identity.bundle_json["system_prompt"] = serde_json::json!(value);
         }
+        if let Some(value) = import_workspace {
+            identity.bundle_json["import_workspace"] = serde_json::json!(value);
+        }
         if let Some(toolset) = default_toolset {
             identity.bundle_json["default_toolset"] = serde_json::json!(toolset);
         }
@@ -7249,8 +7381,6 @@ impl IpcServer {
         plaintext: String,
         allowed_roles: Vec<String>,
     ) -> anyhow::Result<String> {
-        use crate::vault::{SecretInput, store_secret};
-
         // Store the encrypted secret.
         let secret_ref = store_secret(
             graph,
@@ -7274,6 +7404,302 @@ impl IpcServer {
         graph.set_config_value("vault_registry", &serde_json::to_string(&registry)?)?;
 
         Ok(secret_ref)
+    }
+
+    fn mesh_private_key_ref_config_key(hotel_name: &str) -> String {
+        format!("mesh_identity_private_key_ref:{hotel_name}")
+    }
+
+    fn mesh_public_key_config_key(hotel_name: &str) -> String {
+        format!("mesh_identity_public_key:{hotel_name}")
+    }
+
+    fn mesh_transport_private_key_ref_config_key(hotel_name: &str) -> String {
+        format!("mesh_transport_private_key_ref:{hotel_name}")
+    }
+
+    fn mesh_transport_public_key_config_key(hotel_name: &str) -> String {
+        format!("mesh_transport_public_key:{hotel_name}")
+    }
+
+    fn mesh_pending_invite_config_key(nonce: &str) -> String {
+        format!("mesh_pending_invite:{nonce}")
+    }
+
+    fn mesh_auth_key_config_key(node_id: &str) -> String {
+        format!("mesh_auth_key:{node_id}")
+    }
+
+    fn read_string_config(graph: &GraphDomain, key: &str) -> anyhow::Result<Option<String>> {
+        Ok(graph
+            .get_config_value(key)?
+            .and_then(|value| serde_json::from_str::<String>(&value).ok().or(Some(value)))
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()))
+    }
+
+    fn resolve_internal_secret(graph: &GraphDomain, secret_ref: &str) -> anyhow::Result<String> {
+        resolve_secret(
+            graph,
+            secret_ref,
+            &SecretAccess {
+                role: "hotel.internal".into(),
+                guest_id: "aiua".into(),
+            },
+        )?
+        .ok_or_else(|| anyhow::anyhow!("vault secret not found: {secret_ref}"))
+    }
+
+    fn ensure_mesh_identity(
+        graph: &GraphDomain,
+        hotel_name: &str,
+    ) -> anyhow::Result<(SigningKey, String, String)> {
+        let private_ref_key = Self::mesh_private_key_ref_config_key(hotel_name);
+        let public_key_key = Self::mesh_public_key_config_key(hotel_name);
+
+        if let (Some(secret_ref), Some(public_key_b64)) = (
+            Self::read_string_config(graph, &private_ref_key)?,
+            Self::read_string_config(graph, &public_key_key)?,
+        ) {
+            let private_key_hex = Self::resolve_internal_secret(graph, &secret_ref)?;
+            let signing_key = signing_key_from_hex(&private_key_hex)?;
+            let fingerprint = fingerprint_from_base64url(&public_key_b64)?;
+            return Ok((signing_key, public_key_b64, fingerprint));
+        }
+
+        let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let public_key_b64 = verifying_key_to_base64url(&signing_key.verifying_key());
+        let fingerprint = fingerprint_from_base64url(&public_key_b64)?;
+        let secret_ref = store_secret(
+            graph,
+            SecretInput {
+                secret_kind: "mesh-hotel-ed25519-private-key".into(),
+                scope: format!("hotel:{hotel_name}"),
+                allowed_roles: vec!["hotel.internal".into()],
+                allowed_guests: Vec::new(),
+                plaintext: hex::encode(signing_key.to_bytes()),
+            },
+        )?;
+        graph.set_config_value(&private_ref_key, &serde_json::to_string(&secret_ref)?)?;
+        graph.set_config_value(&public_key_key, &serde_json::to_string(&public_key_b64)?)?;
+        Ok((signing_key, public_key_b64, fingerprint))
+    }
+
+    fn ensure_mesh_transport_identity(
+        graph: &GraphDomain,
+        hotel_name: &str,
+    ) -> anyhow::Result<(String, String)> {
+        let private_ref_key = Self::mesh_transport_private_key_ref_config_key(hotel_name);
+        let public_key_key = Self::mesh_transport_public_key_config_key(hotel_name);
+
+        if let (Some(secret_ref), Some(public_key_b64)) = (
+            Self::read_string_config(graph, &private_ref_key)?,
+            Self::read_string_config(graph, &public_key_key)?,
+        ) {
+            let private_key_hex = Self::resolve_internal_secret(graph, &secret_ref)?;
+            return Ok((private_key_hex, public_key_b64));
+        }
+
+        let (private_key_hex, public_key_b64) = generate_transport_keypair();
+        let secret_ref = store_secret(
+            graph,
+            SecretInput {
+                secret_kind: "mesh-hotel-x25519-private-key".into(),
+                scope: format!("hotel:{hotel_name}"),
+                allowed_roles: vec!["hotel.internal".into()],
+                allowed_guests: Vec::new(),
+                plaintext: private_key_hex.clone(),
+            },
+        )?;
+        graph.set_config_value(&private_ref_key, &serde_json::to_string(&secret_ref)?)?;
+        graph.set_config_value(&public_key_key, &serde_json::to_string(&public_key_b64)?)?;
+        Ok((private_key_hex, public_key_b64))
+    }
+
+    fn local_hotel_record(graph: &GraphDomain, local_node_id: &str) -> anyhow::Result<HotelRecord> {
+        let hotel_name = Self::local_hotel_name(graph, local_node_id)
+            .ok_or_else(|| anyhow::anyhow!("local hotel record missing for node [{local_node_id}]"))?;
+        graph
+            .get_hotel(&hotel_name)?
+            .ok_or_else(|| anyhow::anyhow!("hotel record missing for hotel [{hotel_name}]"))
+    }
+
+    fn persist_hotel_mesh_host(
+        graph: &GraphDomain,
+        hotel_name: &str,
+        mesh_host: &str,
+    ) -> anyhow::Result<HotelRecord> {
+        let mut hotel = graph
+            .get_hotel(hotel_name)?
+            .ok_or_else(|| anyhow::anyhow!("hotel '{hotel_name}' not found"))?;
+        hotel.mesh_host = Some(mesh_host.to_string());
+        graph.upsert_hotel(&hotel)?;
+        Ok(hotel)
+    }
+
+    async fn handle_create_mesh_invite(
+        graph: &GraphDomain,
+        local_node_id: &str,
+        hotel_name: String,
+        mesh_host: String,
+        ttl_secs: Option<u64>,
+    ) -> anyhow::Result<serde_json::Value> {
+        let local_hotel = Self::local_hotel_record(graph, local_node_id)?;
+        if local_hotel.hotel_name != hotel_name {
+            bail!(
+                "mesh invites may only be created by the active local hotel [{}], not [{}]",
+                local_hotel.hotel_name,
+                hotel_name
+            );
+        }
+
+        let hotel = Self::persist_hotel_mesh_host(graph, &hotel_name, &mesh_host)?;
+        let (signing_key, public_key_b64, fingerprint) =
+            Self::ensure_mesh_identity(graph, &hotel_name)?;
+        let (_transport_private_key_hex, transport_public_key_b64) =
+            Self::ensure_mesh_transport_identity(graph, &hotel_name)?;
+        let now = now_epoch_secs();
+        let nonce = generate_nonce();
+        let expires_at = now + ttl_secs.unwrap_or(DEFAULT_INVITE_TTL_SECS);
+
+        let invite = sign_invite(
+            MeshInvitePayload {
+                version: ansible_mesh_core::membership::MESH_INVITE_VERSION,
+                hotel_name: hotel.hotel_name.clone(),
+                capabilities: hotel.capabilities.clone(),
+                mesh_host: hotel
+                    .mesh_host
+                    .clone()
+                    .unwrap_or_else(|| "127.0.0.1".into()),
+                mesh_port: hotel.mesh_port,
+                blob_port: hotel.blob_port,
+                execution_port: hotel.execution_port,
+                inviter_pubkey_b64: public_key_b64,
+                inviter_fingerprint: fingerprint.clone(),
+                inviter_transport_pubkey_b64: transport_public_key_b64,
+                nonce: nonce.clone(),
+                created_at: now,
+                expires_at,
+            },
+            &signing_key,
+        )?;
+
+        graph.set_config_value(
+            &Self::mesh_pending_invite_config_key(&nonce),
+            &serde_json::json!({
+                "hotel_name": hotel.hotel_name,
+                "created_at": now,
+                "expires_at": expires_at,
+                "status": "pending"
+            })
+            .to_string(),
+        )?;
+
+        Ok(serde_json::json!({
+            "invite_json": serde_json::to_string_pretty(&invite)?,
+            "fingerprint": fingerprint,
+            "expires_at": expires_at,
+            "nonce": nonce
+        }))
+    }
+
+    async fn handle_accept_mesh_invite(
+        graph: &GraphDomain,
+        local_node_id: &str,
+        hotel_name: String,
+        mesh_host: String,
+        invite_json: String,
+    ) -> anyhow::Result<serde_json::Value> {
+        let local_hotel = Self::local_hotel_record(graph, local_node_id)?;
+        if local_hotel.hotel_name != hotel_name {
+            bail!(
+                "mesh invites may only be accepted by the active local hotel [{}], not [{}]",
+                local_hotel.hotel_name,
+                hotel_name
+            );
+        }
+
+        let invite: MeshInvite =
+            serde_json::from_str(&invite_json).context("parse signed mesh invite JSON")?;
+        verify_invite(&invite, now_epoch_secs())?;
+
+        let persisted_local_hotel = Self::persist_hotel_mesh_host(graph, &hotel_name, &mesh_host)?;
+        let inviter_hotel = HotelRecord {
+            hotel_name: invite.payload.hotel_name.clone(),
+            capabilities: invite.payload.capabilities.clone(),
+            mesh_host: Some(invite.payload.mesh_host.clone()),
+            mesh_port: invite.payload.mesh_port,
+            blob_port: invite.payload.blob_port,
+            execution_port: invite.payload.execution_port,
+            ipc_socket_path: String::new(),
+            active_pid: None,
+        };
+        graph.upsert_hotel(&inviter_hotel)?;
+
+        let (signing_key, public_key_b64, fingerprint) =
+            Self::ensure_mesh_identity(graph, &hotel_name)?;
+        let (transport_private_key_hex, transport_public_key_b64) =
+            Self::ensure_mesh_transport_identity(graph, &hotel_name)?;
+        let session_key = derive_transport_session_key(
+            &invite.payload.nonce,
+            &transport_private_key_hex,
+            &invite.payload.inviter_transport_pubkey_b64,
+        )?;
+        graph.set_config_value(
+            &Self::mesh_auth_key_config_key(&invite.payload.capabilities.node_id),
+            &serde_json::to_string(&session_key)?,
+        )?;
+        let join_request = sign_join_request(
+            MeshJoinRequestPayload {
+                version: ansible_mesh_core::membership::MESH_INVITE_VERSION,
+                invite_nonce: invite.payload.nonce.clone(),
+                hotel_name: persisted_local_hotel.hotel_name.clone(),
+                capabilities: persisted_local_hotel.capabilities.clone(),
+                mesh_host: persisted_local_hotel
+                    .mesh_host
+                    .clone()
+                    .unwrap_or_else(|| "127.0.0.1".into()),
+                mesh_port: persisted_local_hotel.mesh_port,
+                blob_port: persisted_local_hotel.blob_port,
+                execution_port: persisted_local_hotel.execution_port,
+                joiner_pubkey_b64: public_key_b64,
+                joiner_fingerprint: fingerprint,
+                joiner_transport_pubkey_b64: transport_public_key_b64,
+                requested_at: now_epoch_secs(),
+            },
+            &signing_key,
+        )?;
+
+        let payload = serde_json::to_vec(&join_request)?;
+        let msg_id = Uuid::new_v4();
+        let timestamp = now_epoch_secs();
+        let packet = ansible_mesh_core::BeaconMessage {
+            version: ansible_mesh_core::membership::MESH_INVITE_VERSION,
+            msg_id,
+            src_node: persisted_local_hotel.capabilities.node_id.clone(),
+            dest_node: invite.payload.capabilities.node_id.clone(),
+            msg_type: ansible_mesh_core::MsgType::MeshMembershipAccept,
+            seq: 0,
+            total: 1,
+            payload,
+            timestamp,
+            hmac: Vec::new(),
+        };
+
+        let target_addr = format!("{}:{}", invite.payload.mesh_host, invite.payload.mesh_port);
+        let socket = UdpSocket::bind("0.0.0.0:0")
+            .await
+            .context("bind local UDP socket for mesh join request")?;
+        socket
+            .send_to(&serde_json::to_vec(&packet)?, &target_addr)
+            .await
+            .with_context(|| format!("send mesh join request to {target_addr}"))?;
+
+        Ok(serde_json::json!({
+            "inviter_hotel": invite.payload.hotel_name,
+            "target_addr": target_addr,
+            "nonce": invite.payload.nonce
+        }))
     }
 
     fn handle_list_components(graph: &GraphDomain, local_node_id: &str) -> IpcResponse {
