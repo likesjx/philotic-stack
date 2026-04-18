@@ -1216,8 +1216,24 @@ impl GeminiProvider {
                             return tokens;
                         }
                         ch => {
+                            // Decode JSON escape sequences when preceded by a backslash.
+                            // The backslash was consumed without being pushed; we handle
+                            // the escape character here so \n → newline, \t → tab, etc.
+                            let actual = if escaping {
+                                match ch {
+                                    'n' => '\n',
+                                    'r' => '\r',
+                                    't' => '\t',
+                                    '\\' => '\\',
+                                    '"' => '"',
+                                    '/' => '/',
+                                    _ => ch,
+                                }
+                            } else {
+                                ch
+                            };
                             escaping = false;
-                            new_text.push(ch);
+                            new_text.push(actual);
                         }
                     }
                 }

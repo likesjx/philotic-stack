@@ -763,7 +763,30 @@ async fn edit_telegram_text(
     });
 
     match http_client.post(&edit_url).json(&payload).send().await {
-        Ok(res) => res.status().is_success(),
+        Ok(res) if res.status().is_success() => true,
+        Ok(res) if res.status().as_u16() == 400 => {
+            // A 400 "message is not modified" means the content is already identical to
+            // what's displayed — treat it as success so we don't send a duplicate message.
+            let body = res.json::<Value>().await.unwrap_or_default();
+            let not_modified = body
+                .get("description")
+                .and_then(Value::as_str)
+                .map(|d| d.contains("message is not modified"))
+                .unwrap_or(false);
+            if not_modified {
+                true
+            } else {
+                warn!(
+                    "editMessageText 400: {}",
+                    body.get("description").and_then(|v| v.as_str()).unwrap_or("unknown")
+                );
+                false
+            }
+        }
+        Ok(res) => {
+            warn!("editMessageText returned status {}", res.status());
+            false
+        }
         Err(e) => {
             error!("editMessageText failed: {}", e);
             false
@@ -1679,6 +1702,35 @@ async fn run_seat_impl(
         return Ok(());
     }
 
+    // Derive the allowed-users config key from the token key:
+    // "telegram_bot_token_{agent_key}" → "telegram_allowed_users_{agent_key}"
+    // "telegram_bot_token" (global fallback) → "telegram_allowed_users"
+    let allowed_users_key = if let Some(suffix) = telegram_token_key.strip_prefix("telegram_bot_token_") {
+        format!("telegram_allowed_users_{suffix}")
+    } else {
+        "telegram_allowed_users".to_string()
+    };
+    let operator_usernames: HashSet<String> = {
+        let config_req = IpcRequest::GetConfig { key: allowed_users_key.clone() };
+        match ipc_client.send_request(config_req).await.ok() {
+            Some(IpcResponse::ConfigData { value_json: Some(json_str), .. }) => {
+                serde_json::from_str::<Vec<String>>(&json_str)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|s| s.to_lowercase())
+                    .collect()
+            }
+            _ => HashSet::new(),
+        }
+    };
+    if !operator_usernames.is_empty() {
+        info!(
+            "Loaded {} operator username(s) for group chat gating from key [{}]",
+            operator_usernames.len(),
+            allowed_users_key
+        );
+    }
+
     let poll_lease_key = telegram_poll_lease_key(&telegram_token_key, &bot_token);
     let mut poll_lease_epoch = match acquire_telegram_poll_lease(
         &mut ipc_client,
@@ -1839,6 +1891,48 @@ async fn run_seat_impl(
                                                         envelope.content = cmd.to_string();
                                                         envelope.command = Some(cmd.to_string());
                                                         // Do NOT modify callback_data — philote reads it to detect trust.
+                                                    }
+                                                }
+                                            }
+
+                                            // Group chat operator gate: only operators may issue
+                                            // commands or approval callbacks. Non-operators in group
+                                            // chats have their slash commands stripped so the message
+                                            // is forwarded as context-only text.
+                                            let is_group_chat = matches!(
+                                                envelope.chat_type.as_deref(),
+                                                Some("group") | Some("supergroup")
+                                            ) || envelope.chat_id.starts_with('-');
+                                            if is_group_chat && !operator_usernames.is_empty() {
+                                                let sender_lower = envelope
+                                                    .sender_username
+                                                    .as_deref()
+                                                    .map(|u| u.to_lowercase());
+                                                let is_operator = sender_lower
+                                                    .as_deref()
+                                                    .map(|u| operator_usernames.contains(u))
+                                                    .unwrap_or(false);
+                                                if !is_operator {
+                                                    if envelope.message_kind == "callback" {
+                                                        // Silently ignore approval callbacks from
+                                                        // non-operators — already answered above.
+                                                        info!(
+                                                            "Group chat: dropping callback from non-operator {:?}",
+                                                            envelope.sender_username
+                                                        );
+                                                        continue;
+                                                    }
+                                                    // Strip any slash command so the message reaches
+                                                    // the agent as plain context, not a command.
+                                                    if envelope.command.is_some() {
+                                                        info!(
+                                                            "Group chat: stripping command from non-operator {:?}",
+                                                            envelope.sender_username
+                                                        );
+                                                        envelope.command = None;
+                                                        // Restore content to the original user text
+                                                        // (the command text is in content already —
+                                                        // just let it flow as a plain message).
                                                     }
                                                 }
                                             }
