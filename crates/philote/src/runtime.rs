@@ -371,14 +371,45 @@ fn resolve_model_execution_target(
     (local_node_id(), target_role, None)
 }
 
+/// Returns true if the task is from a Telegram group or supergroup.
+/// Used to prefix user content with the sender's name for group attribution.
+fn is_group_chat_task(task: &InboundTaskPayload) -> bool {
+    match task.chat_type.as_deref() {
+        Some("group") | Some("supergroup") => return true,
+        Some(_) => return false,
+        None => {}
+    }
+    // Fallback: Telegram group chats have negative chat_ids.
+    task.chat_id
+        .as_deref()
+        .map(|id| id.starts_with('-'))
+        .unwrap_or(false)
+}
+
 fn normalized_user_content(task: &InboundTaskPayload) -> Option<String> {
+    let is_group = is_group_chat_task(task);
+
+    // For group chats, prefix content with the sender's display name so the
+    // model knows who is speaking.
+    let sender_prefix: Option<String> = if is_group {
+        task.sender_first_name
+            .as_deref()
+            .or(task.sender_username.as_deref())
+            .map(|name| format!("[{name}]: "))
+    } else {
+        None
+    };
+
     if let Some(content) = task
         .content
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        return Some(content.to_string());
+        return Some(match &sender_prefix {
+            Some(prefix) => format!("{prefix}{content}"),
+            None => content.to_string(),
+        });
     }
 
     if let Some(callback_data) = task
@@ -1631,6 +1662,23 @@ impl AgentRuntime {
                 | SlashCommand::WorkspaceSet { .. }
                 | SlashCommand::WorkspaceClear => {}
                 SlashCommand::Approve { .. } | SlashCommand::Deny { .. } => {
+                    // "Trust for session" button sends callback_data="trust" which membrane
+                    // translates to /approve + preserves the original callback_data.
+                    // Pre-approve the session before resolving the parked turn, and
+                    // immediately checkpoint so the policy survives process restarts
+                    // and the next refresh_bindings_from_snapshot call.
+                    if task.callback_data.as_deref() == Some("trust") {
+                        let checkpoint_info = self.sessions.get_mut(&session_id).map(|state| {
+                            state.set_preapprove_this_session();
+                            (state.checkpoint_memory_type(), state.checkpoint_json())
+                        });
+                        if let Some((mem_type, checkpoint)) = checkpoint_info {
+                            let _ = self
+                                .ipc_client
+                                .sync_apartment(&self.agent_id, &mem_type, checkpoint)
+                                .await;
+                        }
+                    }
                     return self
                         .handle_approval_command(
                             task_id,
@@ -2547,6 +2595,18 @@ impl AgentRuntime {
             )
             .await;
 
+        let approval_keyboard = serde_json::json!({
+            "inline_keyboard": [
+                [
+                    {"text": "✅ Approve", "callback_data": "approve"},
+                    {"text": "❌ Deny", "callback_data": "deny"}
+                ],
+                [
+                    {"text": "🔓 Trust for session", "callback_data": "trust"}
+                ]
+            ]
+        });
+
         let reply_payload = FinalReplyPayload {
             action: "send_reply",
             session_id,
@@ -2559,7 +2619,7 @@ impl AgentRuntime {
             ),
             audio_artifact: None,
             send_text_caption: false,
-            reply_markup: None,
+            reply_markup: Some(approval_keyboard),
         };
 
         self.ipc_client
@@ -6235,7 +6295,6 @@ impl AgentRuntime {
         }
 
         lines.push(approval.reason.clone());
-        lines.push("Reply /approve or /deny.".to_string());
         lines.join("\n")
     }
 

@@ -41,6 +41,10 @@ struct TelegramMessageEnvelope {
     thread_id: Option<String>,
     sender_id: Option<String>,
     sender_username: Option<String>,
+    /// The chat type: "private", "group", "supergroup", or "channel".
+    chat_type: Option<String>,
+    /// The sender's first name (display name, always present for real users).
+    sender_first_name: Option<String>,
     message_kind: &'static str,
     content: String,
     attachments: Vec<Value>,
@@ -699,6 +703,17 @@ async fn send_telegram_text(
     thread_id: Option<&str>,
     text: &str,
 ) -> Option<i64> {
+    send_telegram_text_with_markup(http_client, tg_base, chat_id, thread_id, text, None).await
+}
+
+async fn send_telegram_text_with_markup(
+    http_client: &reqwest::Client,
+    tg_base: &str,
+    chat_id: &str,
+    thread_id: Option<&str>,
+    text: &str,
+    reply_markup: Option<&serde_json::Value>,
+) -> Option<i64> {
     let formatted = telegram_format_text(text);
     let send_url = format!("{tg_base}sendMessage");
     let mut payload = json!({
@@ -709,6 +724,9 @@ async fn send_telegram_text(
     });
     if let Some(tid) = thread_id {
         payload["message_thread_id"] = Value::String(tid.to_string());
+    }
+    if let Some(markup) = reply_markup {
+        payload["reply_markup"] = markup.clone();
     }
     match http_client.post(&send_url).json(&payload).send().await {
         Ok(res) => {
@@ -915,6 +933,17 @@ fn telegram_message_envelope(
         .and_then(Value::as_str)
         .map(str::to_string)
         .filter(|name| !name.is_empty());
+    let chat_type = message
+        .get("chat")
+        .and_then(|chat| chat.get("type"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let sender_first_name = message
+        .get("from")
+        .and_then(|from| from.get("first_name"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|name| !name.is_empty());
     let attachments = telegram_message_attachments(message);
     let message_kind = telegram_message_kind(message);
     let explicit_text = message
@@ -939,6 +968,8 @@ fn telegram_message_envelope(
         thread_id,
         sender_id,
         sender_username,
+        chat_type,
+        sender_first_name,
         message_kind,
         content: content.clone(),
         attachments,
@@ -980,6 +1011,17 @@ fn telegram_callback_envelope(
         .and_then(Value::as_str)
         .map(str::to_string)
         .filter(|name| !name.is_empty());
+    let chat_type = message
+        .get("chat")
+        .and_then(|chat| chat.get("type"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let sender_first_name = callback
+        .get("from")
+        .and_then(|from| from.get("first_name"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|name| !name.is_empty());
 
     Some(TelegramMessageEnvelope {
         session_id: telegram_session_id(&chat_id, thread_id.as_deref(), agent_id),
@@ -988,6 +1030,8 @@ fn telegram_callback_envelope(
         thread_id,
         sender_id,
         sender_username,
+        chat_type,
+        sender_first_name,
         message_kind: "callback",
         content: format!("Telegram callback action: {callback_data}"),
         attachments: Vec::new(),
@@ -1763,6 +1807,42 @@ async fn run_seat_impl(
                                                 envelope.content
                                             );
 
+                                            // Translate approval button callbacks to slash commands
+                                            // so philote handles them deterministically.
+                                            if envelope.message_kind == "callback" {
+                                                if let Some(data) = envelope.callback_data.as_deref() {
+                                                    // "trust" translates to /approve but keeps callback_data="trust"
+                                                    // so philote can also set session-level preapproval.
+                                                    let slash_cmd = if data == "approve" || data.starts_with("approve:") {
+                                                        Some("/approve")
+                                                    } else if data == "deny" || data.starts_with("deny:") {
+                                                        Some("/deny")
+                                                    } else if data == "trust" || data.starts_with("trust:") {
+                                                        Some("/approve")
+                                                    } else {
+                                                        None
+                                                    };
+                                                    if let Some(cmd) = slash_cmd {
+                                                        // Answer the callback query to dismiss the loading spinner.
+                                                        if let Some(cq_id) = envelope.raw_transport_event
+                                                            .get("callback_query")
+                                                            .and_then(|cq| cq.get("id"))
+                                                            .and_then(Value::as_str)
+                                                        {
+                                                            let answer_url = format!("{}answerCallbackQuery", tg_base);
+                                                            let _ = http_client
+                                                                .post(&answer_url)
+                                                                .json(&json!({"callback_query_id": cq_id}))
+                                                                .send()
+                                                                .await;
+                                                        }
+                                                        envelope.content = cmd.to_string();
+                                                        envelope.command = Some(cmd.to_string());
+                                                        // Do NOT modify callback_data — philote reads it to detect trust.
+                                                    }
+                                                }
+                                            }
+
                                             // Elevation: handle deterministic commands in membrane
                                             // before they reach agent-core.
                                             if handle_membrane_command(
@@ -1792,6 +1872,8 @@ async fn run_seat_impl(
                                                     "thread_id": envelope.thread_id,
                                                     "sender_id": envelope.sender_id,
                                                     "sender_username": envelope.sender_username,
+                                                    "chat_type": envelope.chat_type,
+                                                    "sender_first_name": envelope.sender_first_name,
                                                     "message_kind": envelope.message_kind,
                                                     "content": envelope.content,
                                                     "attachments": envelope.attachments,
@@ -1968,6 +2050,7 @@ async fn run_seat_impl(
                                 let thread_id = task.get("thread_id").and_then(|v| v.as_str()).map(str::to_string).or(active_thread_id);
                                 let audio_artifact_json = task.get("audio_artifact").and_then(|a| a.as_str()).map(str::to_string);
                                 let send_text_caption = task.get("send_text_caption").and_then(|v| v.as_bool()).unwrap_or(false);
+                                let reply_markup = task.get("reply_markup").cloned();
 
                                 if !chat_id.is_empty() {
                                     let http_client_clone = http_client.clone();
@@ -2035,14 +2118,26 @@ async fn run_seat_impl(
                                         } else if !content.is_empty() {
                                             // Text-only path.
                                             info!("Sending final response back to Telegram Chat [{}]...", chat_id);
-                                            let _ = upsert_formatted_text(
-                                                &http_client_clone,
-                                                &tg_base_clone,
-                                                &chat_id,
-                                                thread_id_clone.as_deref(),
-                                                draft_message_id,
-                                                &content,
-                                            ).await;
+                                            if let Some(ref markup) = reply_markup {
+                                                // Message includes an inline keyboard (e.g. approval buttons).
+                                                send_telegram_text_with_markup(
+                                                    &http_client_clone,
+                                                    &tg_base_clone,
+                                                    &chat_id,
+                                                    thread_id_clone.as_deref(),
+                                                    &content,
+                                                    Some(markup),
+                                                ).await;
+                                            } else {
+                                                let _ = upsert_formatted_text(
+                                                    &http_client_clone,
+                                                    &tg_base_clone,
+                                                    &chat_id,
+                                                    thread_id_clone.as_deref(),
+                                                    draft_message_id,
+                                                    &content,
+                                                ).await;
+                                            }
                                         }
                                     });
                                 } else {

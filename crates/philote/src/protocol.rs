@@ -52,6 +52,12 @@ pub struct InboundTaskPayload {
     pub sender_id: Option<String>,
     #[serde(default)]
     pub sender_username: Option<String>,
+    /// The Telegram chat type: "private", "group", "supergroup", or "channel".
+    #[serde(default)]
+    pub chat_type: Option<String>,
+    /// The sender's first name (display name for group chat attribution).
+    #[serde(default)]
+    pub sender_first_name: Option<String>,
     #[serde(default)]
     pub message_kind: Option<String>,
     #[serde(default)]
