@@ -195,3 +195,94 @@ impl Default for ModelCache {
         Self::new().expect("failed to initialise ModelCache")
     }
 }
+
+// ── Kokoro ────────────────────────────────────────────────────────────────────
+
+/// Resolved local paths for a Kokoro ONNX TTS model downloaded from HF Hub.
+#[derive(Debug, Clone)]
+pub struct KokoroHandle {
+    /// Local path to the Kokoro ONNX model file.
+    pub model_path: PathBuf,
+    /// Local path to `config.json` (contains the phoneme vocab map).
+    pub config_path: PathBuf,
+    /// Local directory containing `{voice}.bin` style embedding files.
+    pub voices_dir: PathBuf,
+    /// Provenance token: `"{repo}@{sha8}"`.
+    pub model_gen: String,
+}
+
+impl ModelCache {
+    /// Download (or serve from cache) the Kokoro-82M ONNX model.
+    ///
+    /// Downloads:
+    /// - `onnx/model_quantized.onnx` (int8, ~92 MB) or `onnx/model.onnx`
+    /// - `config.json` (phoneme vocabulary)
+    /// - `voices/{voice}.bin` for each name in `voices_to_prefetch`
+    pub fn pull_kokoro(
+        &self,
+        repo_id: &str,
+        prefer_quantized: bool,
+        voices_to_prefetch: &[&str],
+    ) -> Result<KokoroHandle> {
+        let repo = self.api.model(repo_id.to_string());
+
+        // ── Model ────────────────────────────────────────────────────────────
+        let model_path = if prefer_quantized {
+            repo.get("onnx/model_quantized.onnx")
+                .or_else(|_| repo.get("onnx/model.onnx"))
+        } else {
+            repo.get("onnx/model.onnx")
+                .or_else(|_| repo.get("onnx/model_quantized.onnx"))
+        }
+        .with_context(|| format!("download Kokoro model from {repo_id}"))?;
+
+        // ── Config (vocab) ───────────────────────────────────────────────────
+        let config_path = repo
+            .get("config.json")
+            .with_context(|| format!("download config.json from {repo_id}"))?;
+
+        // ── Voices ───────────────────────────────────────────────────────────
+        // Download the requested voices; derive the voices_dir from the first hit.
+        let mut voices_dir: Option<PathBuf> = None;
+        for voice in voices_to_prefetch {
+            let filename = format!("voices/{voice}.bin");
+            match repo.get(&filename) {
+                Ok(p) => {
+                    if voices_dir.is_none() {
+                        voices_dir = p.parent().map(|d| d.to_path_buf());
+                    }
+                    tracing::info!(voice, "Kokoro voice cached");
+                }
+                Err(e) => tracing::warn!(voice, err = %e, "could not prefetch Kokoro voice"),
+            }
+        }
+
+        let voices_dir = voices_dir.with_context(|| {
+            format!("none of the requested voices could be downloaded from {repo_id}")
+        })?;
+
+        let sha8 = model_path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .map(|s| s.chars().take(8).collect::<String>())
+            .unwrap_or_else(|| "unknown".into());
+
+        let model_gen = format!("{repo_id}@{sha8}");
+
+        tracing::info!(
+            repo_id,
+            model_gen,
+            ?model_path,
+            ?voices_dir,
+            "Kokoro model resolved from hub cache"
+        );
+
+        Ok(KokoroHandle {
+            model_path,
+            config_path,
+            voices_dir,
+            model_gen,
+        })
+    }
+}

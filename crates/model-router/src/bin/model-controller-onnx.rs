@@ -5,12 +5,14 @@ use model_router::providers::OnnxProvider;
 use model_router::providers::onnx::OnnxProviderConfig;
 use model_router::runtime::{ControllerGuestConfig, run_model_controller};
 use model_router::sidecar::run_sidecar;
-use onnx_runner::{EmbeddingsConfig, TranscribeConfig};
+use onnx_runner::{EmbeddingsConfig, KokoroConfig, TranscribeConfig};
 use std::sync::Arc;
 
 const DEFAULT_SIDECAR_ADDR: &str = "127.0.0.1:11435";
 const DEFAULT_EMBED_REPO: &str = "onnx-community/embeddinggemma-300m-ONNX";
 const DEFAULT_WHISPER_REPO: &str = "onnx-community/whisper-small";
+const DEFAULT_KOKORO_REPO: &str = "onnx-community/Kokoro-82M-v1.0-ONNX";
+const DEFAULT_KOKORO_VOICE: &str = "af_heart";
 const DEFAULT_GUEST_ID: &str = "model-onnx-01";
 const DEFAULT_ROLE: &str = "model.local";
 
@@ -37,6 +39,14 @@ struct Args {
     /// HuggingFace repo id for the Whisper transcription model (overrides PHILOTIC_ONNX_WHISPER_REPO).
     #[arg(long, env = "PHILOTIC_ONNX_WHISPER_REPO", default_value = DEFAULT_WHISPER_REPO)]
     whisper_repo: String,
+
+    /// HuggingFace repo id for the Kokoro TTS model.
+    #[arg(long, env = "PHILOTIC_ONNX_KOKORO_REPO", default_value = DEFAULT_KOKORO_REPO)]
+    kokoro_repo: String,
+
+    /// Default Kokoro voice name (e.g. af_heart, bm_george, bf_emma).
+    #[arg(long, env = "PHILOTIC_ONNX_KOKORO_VOICE", default_value = DEFAULT_KOKORO_VOICE)]
+    kokoro_voice: String,
 
     /// Prefer the quantized ONNX variant (set to "0" to use fp32).
     #[arg(long, env = "PHILOTIC_ONNX_PREFER_QUANTIZED", default_value = "true")]
@@ -67,6 +77,12 @@ async fn main() -> Result<()> {
             repo_id: args.whisper_repo.clone(),
             prefer_quantized: args.prefer_quantized,
             max_new_tokens: 448,
+        },
+        kokoro: KokoroConfig {
+            repo_id: args.kokoro_repo.clone(),
+            default_voice: args.kokoro_voice.clone(),
+            prefer_quantized: args.prefer_quantized,
+            ..KokoroConfig::default()
         },
         prefer_quantized: args.prefer_quantized,
     };
