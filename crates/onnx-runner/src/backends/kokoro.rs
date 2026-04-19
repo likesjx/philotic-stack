@@ -18,9 +18,49 @@ use ort::session::{Session, builder::GraphOptimizationLevel};
 use ort::value::Tensor;
 use std::collections::HashMap;
 use std::io::Cursor;
+#[allow(unused_imports)]
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+
+// ── Kokoro phoneme vocabulary ─────────────────────────────────────────────────
+// Stable mapping from Kokoro-82M config.json (hexgrad/Kokoro-82M).
+// Embedded as a constant so we don't need to download config.json separately.
+static KOKORO_VOCAB: OnceLock<HashMap<String, i64>> = OnceLock::new();
+
+fn vocab() -> &'static HashMap<String, i64> {
+    KOKORO_VOCAB.get_or_init(|| {
+        [
+            (";", 1i64), (":", 2), (",", 3), (".", 4), ("!", 5), ("?", 6),
+            ("—", 9), ("…", 10), ("\"", 11), ("(", 12), (")", 13),
+            ("\u{201C}", 14), ("\u{201D}", 15), (" ", 16), ("\u{0303}", 17),
+            ("ʣ", 18), ("ʥ", 19), ("ʦ", 20), ("ʨ", 21), ("ᵝ", 22),
+            ("\u{AB67}", 23),
+            ("A", 24), ("I", 25), ("O", 31), ("Q", 33), ("S", 35),
+            ("T", 36), ("W", 39), ("Y", 41), ("ᵊ", 42),
+            ("a", 43), ("b", 44), ("c", 45), ("d", 46), ("e", 47),
+            ("f", 48), ("h", 50), ("i", 51), ("j", 52), ("k", 53),
+            ("l", 54), ("m", 55), ("n", 56), ("o", 57), ("p", 58),
+            ("q", 59), ("r", 60), ("s", 61), ("t", 62), ("u", 63),
+            ("v", 64), ("w", 65), ("x", 66), ("y", 67), ("z", 68),
+            ("ɑ", 69), ("ɐ", 70), ("ɒ", 71), ("æ", 72), ("β", 75),
+            ("ɔ", 76), ("ɕ", 77), ("ç", 78), ("ɖ", 80), ("ð", 81),
+            ("ʤ", 82), ("ə", 83), ("ɚ", 85), ("ɛ", 86), ("ɜ", 87),
+            ("ɟ", 90), ("ɡ", 92), ("ɥ", 99), ("ɨ", 101), ("ɪ", 102),
+            ("ʝ", 103), ("ɯ", 110), ("ɰ", 111), ("ŋ", 112), ("ɳ", 113),
+            ("ɲ", 114), ("ɴ", 115), ("ø", 116), ("ɸ", 118), ("θ", 119),
+            ("œ", 120), ("ɹ", 123), ("ɾ", 125), ("ɻ", 126), ("ʁ", 128),
+            ("ɽ", 129), ("ʂ", 130), ("ʃ", 131), ("ʈ", 132), ("ʧ", 133),
+            ("ʊ", 135), ("ʋ", 136), ("ʌ", 138), ("ɣ", 139), ("ɤ", 140),
+            ("χ", 142), ("ʎ", 143), ("ʒ", 147), ("ʔ", 148),
+            ("ˈ", 156), ("ˌ", 157), ("ː", 158), ("ʰ", 162), ("ʲ", 164),
+            ("↓", 169), ("→", 171), ("↗", 172), ("↘", 173), ("ᵻ", 177),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
+    })
+}
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -76,8 +116,6 @@ pub struct SynthesizeOutput {
 /// Local Kokoro ONNX TTS backend.
 pub struct KokoroBackend {
     session: Arc<Mutex<Session>>,
-    /// Phoneme character → Kokoro token ID.
-    vocab: HashMap<String, i64>,
     voices_dir: PathBuf,
     default_voice: String,
     default_speed: f32,
@@ -96,30 +134,15 @@ impl KokoroBackend {
                 format!("load Kokoro ONNX from {}", handle.model_path.display())
             })?;
 
-        // Parse phoneme vocab from config.json.
-        let config_str = std::fs::read_to_string(&handle.config_path)
-            .context("read Kokoro config.json")?;
-        let config_json: serde_json::Value =
-            serde_json::from_str(&config_str).context("parse Kokoro config.json")?;
-        let vocab_obj = config_json
-            .get("vocab")
-            .and_then(|v| v.as_object())
-            .context("Kokoro config.json missing 'vocab' object")?;
-        let vocab: HashMap<String, i64> = vocab_obj
-            .iter()
-            .filter_map(|(k, v)| v.as_i64().map(|id| (k.clone(), id)))
-            .collect();
-
         tracing::info!(
             model_gen = %handle.model_gen,
-            vocab_size = vocab.len(),
+            vocab_size = vocab().len(),
             voices_dir = %handle.voices_dir.display(),
             "KokoroBackend loaded"
         );
 
         Ok(Self {
             session: Arc::new(Mutex::new(session)),
-            vocab,
             voices_dir: handle.voices_dir.clone(),
             default_voice: config.default_voice.clone(),
             default_speed: config.default_speed,
@@ -143,10 +166,11 @@ impl KokoroBackend {
         tracing::debug!(text, ipa, "Kokoro IPA phonemes");
 
         // ── Step 2: IPA → token ID sequence ──────────────────────────────────
+        let vocab = vocab();
         let mut tokens: Vec<i64> = vec![0]; // leading pad
         for ch in ipa.chars() {
             let key = ch.to_string();
-            if let Some(&id) = self.vocab.get(&key) {
+            if let Some(&id) = vocab.get(&key) {
                 tokens.push(id);
             }
             // Unknown characters (e.g. unsupported diacritics) are silently skipped.
@@ -275,21 +299,27 @@ impl KokoroBackend {
 /// - macOS: `brew install espeak`
 /// - Linux: `apt install espeak-ng`
 fn phonemize_espeak(text: &str) -> Result<String> {
+    // Try espeak-ng first (Linux), fall back to espeak (macOS Homebrew installs as "espeak").
     let output = Command::new("espeak-ng")
         .args(["--ipa", "-q", "-v", "en-us", text])
         .output()
+        .or_else(|_| {
+            Command::new("espeak")
+                .args(["--ipa", "-q", "-v", "en-us", text])
+                .output()
+        })
         .context(
-            "failed to run espeak-ng — install it with `brew install espeak` (macOS) \
+            "failed to run espeak-ng or espeak — install with `brew install espeak` (macOS) \
              or `apt install espeak-ng` (Linux)",
         )?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("espeak-ng exited with error: {stderr}");
+        bail!("espeak exited with error: {stderr}");
     }
 
     let raw = String::from_utf8(output.stdout)
-        .context("espeak-ng output was not valid UTF-8")?;
+        .context("espeak output was not valid UTF-8")?;
 
     // espeak-ng adds a leading space per word and trailing newline(s).
     // Trim to get a clean IPA string.

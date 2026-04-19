@@ -101,10 +101,11 @@ async fn main() -> Result<()> {
     let provider = Arc::new(OnnxProvider::load(config)?);
     let shared_embeddings = provider.shared_embeddings();
     let shared_whisper = provider.shared_whisper();
+    let shared_kokoro = provider.shared_kokoro();
 
     if args.sidecar_only {
         tracing::info!("sidecar-only mode: skipping hotel IPC registration");
-        run_sidecar(&args.sidecar_addr, shared_embeddings, shared_whisper).await
+        run_sidecar(&args.sidecar_addr, shared_embeddings, shared_whisper, shared_kokoro).await
     } else {
         // Leak the strings into 'static so the ControllerGuestConfig closure
         // can hold them without lifetime issues.
@@ -122,7 +123,7 @@ async fn main() -> Result<()> {
             live_providers: Box::new(|_http_client, _configs| Vec::new()),
         });
 
-        let sidecar_task = run_sidecar(&args.sidecar_addr, shared_embeddings, shared_whisper);
+        let sidecar_task = run_sidecar(&args.sidecar_addr, shared_embeddings, shared_whisper, shared_kokoro);
 
         tokio::select! {
             res = ipc_task => {

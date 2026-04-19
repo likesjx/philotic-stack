@@ -203,8 +203,6 @@ impl Default for ModelCache {
 pub struct KokoroHandle {
     /// Local path to the Kokoro ONNX model file.
     pub model_path: PathBuf,
-    /// Local path to `config.json` (contains the phoneme vocab map).
-    pub config_path: PathBuf,
     /// Local directory containing `{voice}.bin` style embedding files.
     pub voices_dir: PathBuf,
     /// Provenance token: `"{repo}@{sha8}"`.
@@ -235,11 +233,6 @@ impl ModelCache {
                 .or_else(|_| repo.get("onnx/model_quantized.onnx"))
         }
         .with_context(|| format!("download Kokoro model from {repo_id}"))?;
-
-        // ── Config (vocab) ───────────────────────────────────────────────────
-        let config_path = repo
-            .get("config.json")
-            .with_context(|| format!("download config.json from {repo_id}"))?;
 
         // ── Voices ───────────────────────────────────────────────────────────
         // Download the requested voices; derive the voices_dir from the first hit.
@@ -280,7 +273,6 @@ impl ModelCache {
 
         Ok(KokoroHandle {
             model_path,
-            config_path,
             voices_dir,
             model_gen,
         })

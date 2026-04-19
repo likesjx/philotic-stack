@@ -51,27 +51,20 @@ impl OnnxProvider {
         let cache = ModelCache::new().context("failed to initialise HF Hub model cache")?;
 
         // ── Embeddings ──────────────────────────────────────────────────────
-        let emb_handle = cache
+        let emb_backend = cache
             .pull(&config.embeddings.repo_id, config.prefer_quantized)
-            .with_context(|| {
-                format!(
-                    "failed to pull embedding model {}",
-                    config.embeddings.repo_id
-                )
-            })?;
-        let emb_backend = EmbeddingsBackend::load(&emb_handle, config.embeddings.max_seq_len)
-            .context("failed to load EmbeddingsBackend")?;
-        info!(model_gen = %emb_backend.model_gen(), "OnnxProvider embeddings loaded");
+            .and_then(|h| EmbeddingsBackend::load(&h, config.embeddings.max_seq_len))
+            .map(|b| { info!(model_gen = %b.model_gen(), "OnnxProvider embeddings loaded"); b })
+            .map_err(|e| tracing::warn!(err = %e, "EmbeddingsBackend failed to load — Embed will be unavailable"))
+            .ok();
 
         // ── Whisper ─────────────────────────────────────────────────────────
-        let whisper_handle = cache
+        let whisper_backend = cache
             .pull_whisper(&config.transcribe.repo_id, config.prefer_quantized)
-            .with_context(|| {
-                format!("failed to pull Whisper model {}", config.transcribe.repo_id)
-            })?;
-        let whisper_backend = WhisperBackend::load(&whisper_handle, &config.transcribe)
-            .context("failed to load WhisperBackend")?;
-        info!(model_gen = %whisper_backend.model_gen(), "OnnxProvider Whisper loaded");
+            .and_then(|h| WhisperBackend::load(&h, &config.transcribe))
+            .map(|b| { info!(model_gen = %b.model_gen(), "OnnxProvider Whisper loaded"); b })
+            .map_err(|e| tracing::warn!(err = %e, "WhisperBackend failed to load — AudioTranscribe will be unavailable"))
+            .ok();
 
         // ── Kokoro TTS ──────────────────────────────────────────────────────
         let kokoro_voices: Vec<&str> = {
@@ -101,8 +94,8 @@ impl OnnxProvider {
         };
 
         Ok(Self {
-            embeddings: Arc::new(RwLock::new(Some(emb_backend))),
-            whisper: Arc::new(RwLock::new(Some(whisper_backend))),
+            embeddings: Arc::new(RwLock::new(emb_backend)),
+            whisper: Arc::new(RwLock::new(whisper_backend)),
             kokoro: Arc::new(RwLock::new(kokoro_backend)),
             config,
             http_client: reqwest::Client::new(),
