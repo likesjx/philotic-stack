@@ -134,6 +134,8 @@ fn implementation_to_model_role(implementation: &str) -> String {
 
     if normalized == "elevenlabs" {
         "model.elevenlabs".into()
+    } else if matches!(normalized, "onnx" | "kokoro" | "local") {
+        "model.local".into()
     } else {
         "model".into()
     }
