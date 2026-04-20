@@ -9,13 +9,14 @@ use ansible_mesh_core::mcp_route::McpRouteRecord;
 use async_trait::async_trait;
 use auth::{AllotmentTracker, VaultHashCache, VaultResolver};
 use clap::Parser;
-use dispatch::StubDispatcher;
 use membrane::{LeaseRenewResult, MembraneGuest, OutboundReply};
 use philotic_client::{IpcRequest, IpcResponse, PhiloticClient};
 use routing::new_shared_table;
 use server::{MembraneState, build_router};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::sync::{Mutex, mpsc};
 use tracing::{error, info, warn};
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
@@ -118,18 +119,34 @@ impl MembraneGuest for McpMembrane {
     }
 
     async fn deliver(&mut self, reply: OutboundReply) -> Result<()> {
-        // For MCP, delivery completes a pending HTTP response via the
-        // pending_responses map in MembraneState. Slice 2 wires this.
-        warn!(
-            turn_id = reply.turn_id(),
-            "MCP deliver stub — Slice 2 wires pending response completion"
-        );
+        let turn_id = reply.turn_id().to_string();
+
+        let sender = {
+            let mut pending = self.state.pending_responses.lock().await;
+            pending.remove(&turn_id)
+        };
+
+        match (reply, sender) {
+            (OutboundReply::Text { content, .. }, Some(tx)) => {
+                let _ = tx.send(content);
+            }
+            (OutboundReply::Error { message, .. }, Some(tx)) => {
+                // Deliver error text so the MCP caller gets a meaningful response.
+                let _ = tx.send(format!("{{\"error\": {}}}", serde_json::to_string(&message).unwrap_or_default()));
+            }
+            (reply, None) => {
+                warn!(turn_id, kind = ?std::mem::discriminant(&reply), "deliver: no pending receiver for turn");
+            }
+            (reply, Some(_)) => {
+                // StreamingToken / ApprovalRequired — not yet handled for MCP.
+                warn!(turn_id, kind = ?std::mem::discriminant(&reply), "deliver: unhandled reply variant for MCP");
+            }
+        }
+
         Ok(())
     }
 
     async fn renew(&mut self, client: &mut PhiloticClient) -> Result<LeaseRenewResult> {
-        // Slice 1: no lease epoch tracking yet — just re-acquire.
-        // Slice 2 stores the epoch from setup and passes it here.
         let req = IpcRequest::AcquireMcpMembraneLease {
             lease_key: self.lease_key_value.clone(),
             port: self.port,
@@ -172,7 +189,7 @@ async fn main() -> Result<()> {
 
     let table = new_shared_table();
 
-    // Seed from static config file (Slice 1 testing path).
+    // Seed from static config file (testing path).
     if let Some(path) = &args.static_routes {
         let raw = std::fs::read_to_string(path)?;
         let records: Vec<McpRouteRecord> = serde_json::from_str(&raw)?;
@@ -188,22 +205,29 @@ async fn main() -> Result<()> {
         info!(path = %path.display(), "loaded static routes");
     }
 
+    // Create the inbound channel shared between HTTP handlers and the IPC runtime.
+    let (inbound_tx, inbound_rx) = mpsc::channel(128);
+    let pending_responses = Arc::new(Mutex::new(HashMap::new()));
+
     let state = Arc::new(MembraneState {
         routing_table: table,
         vault_cache: VaultHashCache::new(),
         allotment: AllotmentTracker::new(),
-        dispatcher: Box::new(StubDispatcher),
         vault: Box::new(IpcVaultResolver),
+        inbound_tx,
+        pending_responses,
     });
 
     let guest = McpMembrane::new(args.port, &args.node_id, state);
 
     if let Some(socket) = &args.ipc_socket {
         membrane::MembraneRuntime::new(socket, &args.guest_id, &args.node_id)
+            .with_inbound_rx(inbound_rx)
             .run(guest)
             .await
     } else {
         // No IPC socket — run HTTP server directly (static-only mode).
+        // Inbound envelopes go nowhere in this mode; pending responses will time out.
         info!("running in static-only mode (no IPC socket)");
         let addr = SocketAddr::from(([0, 0, 0, 0], args.port));
         let router = build_router(guest.state.clone())

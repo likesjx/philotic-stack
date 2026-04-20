@@ -7,14 +7,17 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
+use membrane::envelope::{InboundEnvelope, SenderInfo};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::auth::{AllotmentTracker, VaultHashCache, VaultResolver, authorize_call};
-use crate::dispatch::Dispatcher;
 use crate::protocol::{
     InitializeParams, InitializeResult, JsonRpcRequest, JsonRpcResponse, McpToolDescriptor,
     ServerCapabilities, ServerInfo, ToolCallParams, ToolCallResult, ToolsCapability,
@@ -22,14 +25,22 @@ use crate::protocol::{
 };
 use crate::routing::SharedRoutingTable;
 
+const DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
+
 // ── Application state ─────────────────────────────────────────────────────────
 
 pub struct MembraneState {
     pub routing_table: SharedRoutingTable,
     pub vault_cache: VaultHashCache,
     pub allotment: AllotmentTracker,
-    pub dispatcher: Box<dyn Dispatcher>,
     pub vault: Box<dyn VaultResolver>,
+    /// Channel into the runtime's IPC dispatch loop; HTTP handlers send
+    /// envelopes here which the runtime forwards to the hotel as CreateTask.
+    pub inbound_tx: mpsc::Sender<InboundEnvelope>,
+    /// Pending tool-call responses keyed by turn_id. The HTTP handler parks
+    /// a oneshot sender here; `McpMembrane::deliver` fires it when the hotel
+    /// pushes back the philote reply.
+    pub pending_responses: Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>,
 }
 
 impl std::fmt::Debug for MembraneState {
@@ -187,22 +198,68 @@ async fn handle_tools_call(
         );
     }
 
-    // Dispatch.
-    let correlation_id = Uuid::new_v4().to_string();
-    info!(tool = tool_name, caller_id = %caller.token_id, %correlation_id, "dispatching");
+    // Generate correlation IDs.
+    let session_id = format!("mcp-{}", caller.token_id);
+    let turn_id = Uuid::new_v4().to_string();
 
-    match state
-        .dispatcher
-        .dispatch(&route, args, &caller, &correlation_id)
-        .await
+    info!(tool = tool_name, caller_id = %caller.token_id, %turn_id, "dispatching via IPC");
+
+    // Build the inbound envelope that philote will receive.
+    let envelope = InboundEnvelope {
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+        sender: SenderInfo {
+            id: Some(caller.token_id.clone()),
+            display_name: None,
+            username: None,
+            is_operator: false,
+        },
+        content: serde_json::to_string(&json!({
+            "tool": tool_name,
+            "args": args,
+        }))
+        .unwrap_or_default(),
+        attachments: vec![],
+        command: Some(tool_name.clone()),
+        reply_to: Some(turn_id.clone()),
+        raw_transport: json!({ "transport": "mcp", "tool": tool_name }),
+    };
+
+    // Park a oneshot waiting for the philote reply.
+    let (tx, rx) = oneshot::channel::<String>();
     {
-        Ok(result) => JsonRpcResponse::ok(
+        let mut pending = state.pending_responses.lock().await;
+        pending.insert(turn_id.clone(), tx);
+    }
+
+    // Forward to the hotel via the runtime's IPC dispatch loop.
+    if let Err(e) = state.inbound_tx.send(envelope).await {
+        let mut pending = state.pending_responses.lock().await;
+        pending.remove(&turn_id);
+        warn!(tool = tool_name, err = %e, "inbound_tx send failed");
+        return JsonRpcResponse::err(id, error_code::DISPATCH_ERROR, "IPC send failed");
+    }
+
+    // Await the reply with a timeout.
+    match tokio::time::timeout(DISPATCH_TIMEOUT, rx).await {
+        Ok(Ok(content)) => JsonRpcResponse::ok(
             id,
-            serde_json::to_value(ToolCallResult::json(result)).unwrap(),
+            serde_json::to_value(ToolCallResult::json(serde_json::from_str(&content).unwrap_or(
+                json!({ "text": content }),
+            )))
+            .unwrap(),
         ),
-        Err(e) => {
-            warn!(tool = tool_name, err = %e, "dispatch error");
-            JsonRpcResponse::err(id, error_code::DISPATCH_ERROR, e.to_string())
+        Ok(Err(_)) => {
+            // Sender dropped — runtime disconnected mid-call.
+            warn!(tool = tool_name, %turn_id, "pending oneshot sender dropped");
+            JsonRpcResponse::err(id, error_code::DISPATCH_ERROR, "IPC connection lost")
+        }
+        Err(_) => {
+            // Timeout — clean up pending entry.
+            let mut pending = state.pending_responses.lock().await;
+            pending.remove(&turn_id);
+            warn!(tool = tool_name, %turn_id, "dispatch timed out");
+            JsonRpcResponse::err(id, error_code::DISPATCH_ERROR, "tool call timed out")
         }
     }
 }

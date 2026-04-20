@@ -37,6 +37,10 @@ pub struct MembraneRuntime {
     pub guest_id: String,
     pub node_id: String,
     pub ipc_socket: String,
+    /// External inbound channel receiver. When provided, the runtime reads
+    /// from this channel instead of creating its own. The caller retains
+    /// the sender and feeds it directly (e.g. from HTTP handlers).
+    inbound_rx: Option<mpsc::Receiver<InboundEnvelope>>,
 }
 
 impl MembraneRuntime {
@@ -49,16 +53,34 @@ impl MembraneRuntime {
             ipc_socket: ipc_socket.into(),
             guest_id: guest_id.into(),
             node_id: node_id.into(),
+            inbound_rx: None,
         }
+    }
+
+    /// Provide an external inbound channel receiver. The caller creates the
+    /// channel, keeps the sender (e.g. in `MembraneState`), and hands the
+    /// receiver to the runtime here. Useful for HTTP-facing membrane variants
+    /// where request handlers send envelopes instead of a listener task.
+    pub fn with_inbound_rx(mut self, rx: mpsc::Receiver<InboundEnvelope>) -> Self {
+        self.inbound_rx = Some(rx);
+        self
     }
 
     /// Run the membrane runtime loop until shutdown.
     ///
     /// Internally: registers with hotel, calls `guest.setup()`, dispatches
     /// inbound/outbound, renews lease, and reconnects on IPC disconnect.
-    pub async fn run<G: MembraneGuest>(&self, mut guest: G) -> Result<()> {
+    pub async fn run<G: MembraneGuest>(mut self, mut guest: G) -> Result<()> {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundEnvelope>(64);
+
+        // If an external channel was wired (e.g. membrane-mcp HTTP handlers),
+        // use it; otherwise create an internal one for listener-based variants.
+        let (default_tx, default_rx) = mpsc::channel::<InboundEnvelope>(64);
+        let (inbound_tx, mut inbound_rx) = if let Some(rx) = self.inbound_rx.take() {
+            (default_tx, rx) // external rx; default_tx passed to ctx but unused
+        } else {
+            (default_tx, default_rx)
+        };
 
         // Signal handler: clean shutdown on SIGTERM/SIGINT.
         let shutdown_tx_sig = shutdown_tx.clone();
