@@ -2242,11 +2242,13 @@ name = "membrane"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64 0.22.1",
  "clap",
  "philotic-client",
  "pulldown-cmark",
  "reqwest",
+ "serde",
  "serde_json",
  "sha2",
  "tokio",
@@ -2264,6 +2266,7 @@ dependencies = [
  "axum 0.7.9",
  "blake3",
  "clap",
+ "membrane",
  "philotic-client",
  "serde",
  "serde_json",
