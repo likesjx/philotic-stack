@@ -918,6 +918,35 @@ pub enum IpcRequest {
     DisableCronJob {
         job_id: CronJobId,
     },
+    // ── MCP membrane IPC ──────────────────────────────────────────────────────
+    /// Acquire the singleton MCP membrane lease for a given port.
+    ///
+    /// Responds with [`IpcResponse::McpMembraneLease`].
+    AcquireMcpMembraneLease {
+        lease_key: String,
+        port: u16,
+    },
+    /// Renew an active MCP membrane lease.
+    RenewMcpMembraneLease {
+        lease_key: String,
+        lease_epoch: u64,
+    },
+    /// Release the MCP membrane lease.
+    ReleaseMcpMembraneLease {
+        lease_key: String,
+    },
+    /// Push an updated route set for one agent to the membrane.
+    ///
+    /// The membrane replaces all routes owned by `agent_id` with `routes` (LWW).
+    /// Responds with [`IpcResponse::McpRoutesAccepted`].
+    UpdateMcpRoutes {
+        agent_id: String,
+        routes: Vec<ansible_mesh_core::mcp_route::McpRouteRecord>,
+    },
+    /// Remove all routes owned by an agent from the membrane.
+    RevokeMcpRoutes {
+        agent_id: String,
+    },
 }
 
 /// Represents the canonical response from the local Ansible back to the Guest via IPC.
@@ -1106,6 +1135,18 @@ pub enum IpcResponse {
     /// Response to [`IpcRequest::ListCronJobs`].
     CronJobList {
         jobs: Vec<CronJob>,
+    },
+    // ── MCP membrane IPC responses ────────────────────────────────────────────
+    /// Response to [`IpcRequest::AcquireMcpMembraneLease`] /
+    /// [`IpcRequest::RenewMcpMembraneLease`].
+    McpMembraneLease {
+        mcp_granted: bool,
+        mcp_lease: Option<LeaseEnvelope>,
+    },
+    /// Response to [`IpcRequest::UpdateMcpRoutes`].
+    McpRoutesAccepted {
+        mcp_routes_agent_id: String,
+        mcp_route_count: usize,
     },
     /// Response to [`IpcRequest::FetchMemoryConfig`].
     /// `config_json` is `None` if MuninnDB is not configured on this hotel.
