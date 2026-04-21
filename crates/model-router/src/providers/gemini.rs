@@ -20,7 +20,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
-use tracing::info;
+use tracing::{info, warn};
 
 const GEMINI_LIVE_DEFAULT_MODEL: &str = "gemini-3.1-flash-live-preview";
 const GEMINI_AUDIO_TRANSCRIBE_DEFAULT_MODEL: &str = "gemini-3-flash-preview";
@@ -1113,6 +1113,152 @@ impl GeminiProvider {
             turn_complete: acc.turn_complete || task.kind == TaskKind::ResponseGenerate,
         })
     }
+    // ── Streaming helpers ──────────────────────────────────────────────────────
+
+    fn streaming_endpoint_url(&self, model: Option<&str>) -> Result<String> {
+        let model = model.unwrap_or(&self.default_model);
+        match self
+            .auth
+            .as_ref()
+            .context("Gemini auth missing from config; expected OAuth bearer or API key")?
+        {
+            GeminiAuth::ApiKey(api_key) => Ok(format!(
+                "{}/v1beta/models/{}:streamGenerateContent?key={}&alt=sse",
+                self.base_url, model, api_key
+            )),
+            GeminiAuth::OAuthBearer { .. } => Ok(format!(
+                "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
+                self.base_url, model
+            )),
+        }
+    }
+
+    /// Parse one SSE line (`data: {...}`) and extract the text fragment from
+    /// `candidates[0].content.parts[0].text`. Returns `None` for non-data lines
+    /// or lines with no text part (e.g. finish-reason-only chunks).
+    fn parse_sse_text_chunk(line: &str) -> Option<String> {
+        let json_str = if let Some(rest) = line.strip_prefix("data: ") {
+            rest
+        } else if let Some(rest) = line.strip_prefix("data:") {
+            rest
+        } else {
+            return None;
+        };
+        if json_str.trim() == "[DONE]" {
+            return None;
+        }
+        let chunk: Value = serde_json::from_str(json_str).ok()?;
+        chunk
+            .get("candidates")
+            .and_then(Value::as_array)
+            .and_then(|c| c.first())
+            .and_then(|c| c.get("content"))
+            .and_then(|c| c.get("parts"))
+            .and_then(Value::as_array)
+            .and_then(|p| p.first())
+            .and_then(|p| p.get("text"))
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+    }
+
+    /// Scan `accumulated` for the display_text JSON string value, starting where we left off.
+    /// Appends any newly revealed display_text characters to `out` and calls `on_token`.
+    /// Returns the updated extraction cursor.
+    ///
+    /// The function handles the three phases:
+    /// 1. Searching for `"display_text":` key + opening quote
+    /// 2. Inside the display_text value (until unescaped closing `"`)
+    /// 3. Done (returns immediately)
+    fn extract_display_text_tokens(
+        accumulated: &str,
+        cursor: &mut DisplayTextCursor,
+        out: &mut String,
+    ) -> Vec<String> {
+        let mut tokens = Vec::new();
+        match cursor {
+            DisplayTextCursor::Done => {}
+            DisplayTextCursor::Searching => {
+                // Find `"display_text":` then skip optional whitespace to the opening `"`.
+                // Gemini's structured-JSON output uses `"display_text": "` (space after
+                // colon), so we cannot anchor on the quote directly.
+                const KEY: &str = "\"display_text\":";
+                if let Some(key_pos) = accumulated.find(KEY) {
+                    let after_colon = key_pos + KEY.len();
+                    // Skip any whitespace between `:` and the opening `"`.
+                    if let Some(quote_offset) = accumulated[after_colon..].find('"') {
+                        let value_start = after_colon + quote_offset + 1; // +1 past the `"`
+                        *cursor = DisplayTextCursor::InValue { pos: value_start };
+                        return Self::extract_display_text_tokens(accumulated, cursor, out);
+                    }
+                    // Key found but opening quote not yet in buffer — stay Searching.
+                }
+            }
+            DisplayTextCursor::InValue { pos } => {
+                let s = &accumulated[*pos..];
+                let mut new_text = String::new();
+                let mut escaping = false;
+                let mut bytes_consumed = 0usize;
+                for ch in s.chars() {
+                    bytes_consumed += ch.len_utf8();
+                    match ch {
+                        '\\' if !escaping => {
+                            escaping = true;
+                            // Skip the backslash — we'll include the next char literally.
+                        }
+                        '"' if !escaping => {
+                            // Closing quote — extraction complete.
+                            out.push_str(&new_text);
+                            *cursor = DisplayTextCursor::Done;
+                            if !new_text.is_empty() {
+                                tokens.push(new_text);
+                            }
+                            return tokens;
+                        }
+                        ch => {
+                            // Decode JSON escape sequences when preceded by a backslash.
+                            // The backslash was consumed without being pushed; we handle
+                            // the escape character here so \n → newline, \t → tab, etc.
+                            let actual = if escaping {
+                                match ch {
+                                    'n' => '\n',
+                                    'r' => '\r',
+                                    't' => '\t',
+                                    '\\' => '\\',
+                                    '"' => '"',
+                                    '/' => '/',
+                                    _ => ch,
+                                }
+                            } else {
+                                ch
+                            };
+                            escaping = false;
+                            new_text.push(actual);
+                        }
+                    }
+                }
+                // Stream not complete yet — emit what we found and advance the cursor.
+                *pos += bytes_consumed;
+                if !new_text.is_empty() {
+                    out.push_str(&new_text);
+                    tokens.push(new_text);
+                }
+            }
+        }
+        tokens
+    }
+}
+
+/// Cursor tracking state for display_text extraction during Gemini SSE streaming.
+#[derive(Debug)]
+enum DisplayTextCursor {
+    /// Still searching for the `"display_text":"` key in the accumulated buffer.
+    Searching,
+    /// Inside the display_text value; `pos` is the byte offset in `accumulated` of the
+    /// next unread character.
+    InValue { pos: usize },
+    /// Extraction complete (closing `"` was found).
+    Done,
 }
 
 #[async_trait]
@@ -1235,6 +1381,189 @@ impl ModelProvider for GeminiProvider {
             Ok(ProviderOutput::Text {
                 display_text: Some(content.clone()),
                 content,
+                spoken_text: None,
+                partial_replies: Vec::new(),
+                working_memory_delta: None,
+                follow_up_questions: Vec::new(),
+                intent_summary: None,
+                memory_concept: None,
+                memory_candidate: None,
+                active_plan: None,
+            })
+        }
+    }
+
+    fn supports_streaming(&self, task: &ControllerTask) -> bool {
+        // Only stream TextGenerate — MediaAnalyze/AudioTranscribe are batch by nature.
+        task.kind == TaskKind::TextGenerate
+    }
+
+    async fn invoke_streaming(
+        &self,
+        task: &ControllerTask,
+        token_tx: tokio::sync::mpsc::Sender<String>,
+    ) -> Result<ProviderOutput> {
+        use futures::StreamExt;
+
+        if task.kind != TaskKind::TextGenerate {
+            // Non-text kinds fall back to batch invoke (no tokens emitted).
+            return self.invoke(task).await;
+        }
+
+        let has_tools = !task.tools.is_empty();
+        let wants_concept = task.wants_channel("memory_concept");
+        let wants_plan = task.wants_channel("active_plan");
+        let use_structured = has_tools
+            || task.wants_channel("spoken_text")
+            || wants_concept
+            || wants_plan;
+
+        let payload = {
+            let prompt = task
+                .composed_prompt_text()
+                .context("Gemini streaming text task missing prompt")?;
+            if has_tools {
+                Self::tool_aware_request_payload(&prompt, &task.tools, wants_concept, wants_plan)
+            } else if use_structured {
+                Self::structured_text_request_payload(&prompt, wants_concept, wants_plan)
+            } else {
+                Self::request_payload(&prompt)
+            }
+        };
+
+        let url = self.streaming_endpoint_url(Some(self.request_model(task)))?;
+        let req = self.http_client.post(url).json(&payload);
+        let response = self.apply_auth_headers(req)?.send().await?;
+        let status = response.status();
+
+        if !status.is_success() {
+            // On HTTP error, read the full body and return an error response.
+            let body = response.json::<Value>().await.unwrap_or_default();
+            let content = Self::parse_response_text(status, body);
+            return Ok(ProviderOutput::Text {
+                display_text: Some(content.clone()),
+                content,
+                spoken_text: None,
+                partial_replies: Vec::new(),
+                working_memory_delta: None,
+                follow_up_questions: Vec::new(),
+                intent_summary: None,
+                memory_concept: None,
+                memory_candidate: None,
+                active_plan: None,
+            });
+        }
+
+        // Read the SSE byte stream, splitting on newlines.
+        // IMPORTANT: accumulate raw bytes and decode as UTF-8 at line boundaries.
+        // Using `*byte as char` would corrupt multi-byte UTF-8 sequences (any
+        // non-ASCII character in the model response), producing garbled text.
+        let mut byte_stream = response.bytes_stream();
+        let mut full_text = String::new();
+        let mut line_buf: Vec<u8> = Vec::new();
+        let is_structured = use_structured;
+        let mut cursor = if is_structured {
+            DisplayTextCursor::Searching
+        } else {
+            DisplayTextCursor::Done
+        };
+        let mut _display_text_out = String::new();
+
+        while let Some(chunk_result) = byte_stream.next().await {
+            let bytes = chunk_result.context("Gemini SSE stream read error")?;
+            for &byte in bytes.iter() {
+                if byte == b'\n' {
+                    let line = String::from_utf8_lossy(&line_buf).trim().to_string();
+                    line_buf.clear();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if let Some(text_chunk) = Self::parse_sse_text_chunk(&line) {
+                        full_text.push_str(&text_chunk);
+                        if is_structured {
+                            // Extract display_text field content progressively.
+                            let tokens = Self::extract_display_text_tokens(
+                                &full_text,
+                                &mut cursor,
+                                &mut _display_text_out,
+                            );
+                            for token in tokens {
+                                let _ = token_tx.send(token).await;
+                            }
+                        } else {
+                            // Plain text: forward the raw chunk directly.
+                            let _ = token_tx.send(text_chunk).await;
+                        }
+                    }
+                } else {
+                    line_buf.push(byte);
+                }
+            }
+        }
+        // Process any remaining buffered line.
+        if !line_buf.is_empty() {
+            let line = String::from_utf8_lossy(&line_buf).trim().to_string();
+            if !line.is_empty() {
+                if let Some(text_chunk) = Self::parse_sse_text_chunk(&line) {
+                    full_text.push_str(&text_chunk);
+                }
+            }
+        }
+        // Close the channel — token consumer will see this as end of stream.
+        drop(token_tx);
+
+        if full_text.trim().is_empty() {
+            // Streaming returned no content — Gemini sometimes returns SSE chunks with
+            // finishReason but no text (safety block, quota, structured-JSON returned
+            // outside SSE format, etc.). Fall back to the batch endpoint which surfaces
+            // the actual error or returns the real response.
+            warn!("Gemini streaming returned no content; retrying with batch invoke");
+            return self.invoke(task).await;
+        }
+
+        // Parse the accumulated full_text into a ProviderOutput the same way invoke() does.
+        if is_structured {
+            // full_text is the complete JSON string; wrap it in the expected Gemini body shape
+            // so parse_structured_response can process it.
+            let body = json!({
+                "candidates": [{
+                    "content": {
+                        "parts": [{ "text": full_text }]
+                    }
+                }]
+            });
+            if has_tools {
+                // Check for a function-call response.
+                if let Some(tool_call) = Self::parse_native_function_call(task, &body)? {
+                    return Ok(tool_call);
+                }
+            }
+            let (content, spoken_text, memory_concept, memory_candidate, active_plan) =
+                Self::parse_structured_response(reqwest::StatusCode::OK, body.clone());
+            if let Ok(parsed) = serde_json::from_str::<Value>(&content) {
+                if let Some(tool_call) = Self::parse_tool_call_candidate(task, &parsed)? {
+                    return Ok(tool_call);
+                }
+            }
+            if content.trim().is_empty() {
+                bail!("Gemini streaming returned an empty structured response");
+            }
+            Ok(ProviderOutput::Text {
+                display_text: Some(content.clone()),
+                content,
+                spoken_text,
+                partial_replies: Vec::new(),
+                working_memory_delta: None,
+                follow_up_questions: Vec::new(),
+                intent_summary: None,
+                memory_concept,
+                memory_candidate,
+                active_plan,
+            })
+        } else {
+            Ok(ProviderOutput::Text {
+                display_text: Some(full_text.clone()),
+                content: full_text,
                 spoken_text: None,
                 partial_replies: Vec::new(),
                 working_memory_delta: None,

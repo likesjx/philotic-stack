@@ -52,6 +52,12 @@ pub struct InboundTaskPayload {
     pub sender_id: Option<String>,
     #[serde(default)]
     pub sender_username: Option<String>,
+    /// The Telegram chat type: "private", "group", "supergroup", or "channel".
+    #[serde(default)]
+    pub chat_type: Option<String>,
+    /// The sender's first name (display name for group chat attribution).
+    #[serde(default)]
+    pub sender_first_name: Option<String>,
     #[serde(default)]
     pub message_kind: Option<String>,
     #[serde(default)]
@@ -90,6 +96,11 @@ pub struct InboundTaskPayload {
     /// `paracrine_response` tasks. Carries the paracrine_id and routing hint.
     #[serde(default)]
     pub exosome: Option<serde_json::Value>,
+    /// When true (set by membrane variants with per-route approval gates,
+    /// e.g. membrane-mcp), the philote must park this turn as WaitingApproval
+    /// before model invocation and emit `approval_required` back to the sender.
+    #[serde(default)]
+    pub requires_approval: bool,
 }
 
 // Transitional note: older emitters may still carry failures in

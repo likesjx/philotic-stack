@@ -1467,6 +1467,25 @@ pub trait ModelProvider: Send + Sync {
     fn id(&self) -> &'static str;
     fn supports(&self, task: &ControllerTask) -> bool;
     async fn invoke(&self, task: &ControllerTask) -> Result<ProviderOutput>;
+
+    /// Whether this provider supports streaming token delivery for the given task.
+    /// When true, the runtime may call `invoke_streaming` instead of `invoke`.
+    fn supports_streaming(&self, _task: &ControllerTask) -> bool {
+        false
+    }
+
+    /// Invoke the model, streaming display-text tokens via `token_tx` as they arrive.
+    /// The channel is closed (dropped) when the method returns. Callers should drain the
+    /// channel concurrently while awaiting this future.
+    ///
+    /// Default implementation: ignores the channel and delegates to `invoke`.
+    async fn invoke_streaming(
+        &self,
+        task: &ControllerTask,
+        _token_tx: tokio::sync::mpsc::Sender<String>,
+    ) -> Result<ProviderOutput> {
+        self.invoke(task).await
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

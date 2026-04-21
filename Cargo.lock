@@ -94,9 +94,11 @@ dependencies = [
  "axum 0.7.9",
  "base64 0.22.1",
  "clap",
+ "ed25519-dalek",
  "hex",
  "memory-core",
  "philotic-client",
+ "rand 0.8.5",
  "reqwest",
  "rusqlite",
  "serde",
@@ -131,9 +133,14 @@ dependencies = [
  "bincode",
  "chrono",
  "cron",
+ "ed25519-dalek",
+ "hex",
+ "hkdf",
  "hmac",
  "log",
  "philotic-client",
+ "philotic-primitives-mesh",
+ "rand 0.8.5",
  "rusqlite",
  "serde",
  "serde_json",
@@ -142,6 +149,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "x25519-dalek",
 ]
 
 [[package]]
@@ -974,6 +982,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7a1e2f27636f116493b8b860f5546edb47c8d8f8ea73e1d2a20be88e28d1fea"
 
 [[package]]
+name = "datasource"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "philotic-client",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "der"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1555,6 +1577,17 @@ name = "glob"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
+
+[[package]]
+name = "graph-datasource"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "datasource",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "graph-intelligence"
@@ -2943,6 +2976,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "philotic-primitives-mesh"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "uuid",
+]
+
+[[package]]
 name = "philotic-sandbox"
 version = "0.1.0"
 dependencies = [
@@ -2968,6 +3009,7 @@ dependencies = [
 name = "philotic-web"
 version = "0.1.0"
 dependencies = [
+ "ansible-mesh-core",
  "anyhow",
  "axum 0.7.9",
  "chrono",
@@ -4463,12 +4505,14 @@ dependencies = [
  "clap",
  "memory-core",
  "philotic-client",
+ "philotic-sandbox",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

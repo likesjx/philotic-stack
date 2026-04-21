@@ -48,6 +48,7 @@ Treat environment isolation as a path-namespacing problem solved once by `PHILOT
 
 - `phil service install`, `start`, `stop`, `restart`, `uninstall`, and `status`
 - interactive onboarding optionally hands off to `phil service install` on macOS so first-run setup can root the daemon immediately
+- interactive onboarding now captures the agent workspace/import path and initial skillset so the seeded agent bundle has the right execution root and posture from the start, and the desktop agent editor can revise the same fields later without re-running bootstrap
 
 ---
 

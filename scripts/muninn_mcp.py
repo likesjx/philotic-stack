@@ -8,6 +8,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+from typing import List, Optional
 
 
 DEFAULT_BASE_URL = "http://localhost:8750/mcp"
@@ -148,12 +149,12 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def extract_tool_names(result: dict) -> list[str]:
+def extract_tool_names(result: dict) -> List[str]:
     tools = (
         result.get("result", {})
         .get("tools", [])
     )
-    names: list[str] = []
+    names: List[str] = []
     for tool in tools:
         name = tool.get("name")
         if isinstance(name, str) and name:
@@ -203,7 +204,7 @@ def emit_approval_required(payload: dict) -> int:
     return APPROVAL_REQUIRED_EXIT
 
 
-def resolve_local_server_dir() -> pathlib.Path | None:
+def resolve_local_server_dir() -> Optional[pathlib.Path]:
     env_dir = os.environ.get("MUNINN_SERVER_DIR")
     candidates = []
     if env_dir:

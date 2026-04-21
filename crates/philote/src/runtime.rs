@@ -134,6 +134,8 @@ fn implementation_to_model_role(implementation: &str) -> String {
 
     if normalized == "elevenlabs" {
         "model.elevenlabs".into()
+    } else if matches!(normalized, "onnx" | "kokoro" | "local") {
+        "model.local".into()
     } else {
         "model".into()
     }
@@ -371,14 +373,45 @@ fn resolve_model_execution_target(
     (local_node_id(), target_role, None)
 }
 
+/// Returns true if the task is from a Telegram group or supergroup.
+/// Used to prefix user content with the sender's name for group attribution.
+fn is_group_chat_task(task: &InboundTaskPayload) -> bool {
+    match task.chat_type.as_deref() {
+        Some("group") | Some("supergroup") => return true,
+        Some(_) => return false,
+        None => {}
+    }
+    // Fallback: Telegram group chats have negative chat_ids.
+    task.chat_id
+        .as_deref()
+        .map(|id| id.starts_with('-'))
+        .unwrap_or(false)
+}
+
 fn normalized_user_content(task: &InboundTaskPayload) -> Option<String> {
+    let is_group = is_group_chat_task(task);
+
+    // For group chats, prefix content with the sender's display name so the
+    // model knows who is speaking.
+    let sender_prefix: Option<String> = if is_group {
+        task.sender_first_name
+            .as_deref()
+            .or(task.sender_username.as_deref())
+            .map(|name| format!("[{name}]: "))
+    } else {
+        None
+    };
+
     if let Some(content) = task
         .content
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        return Some(content.to_string());
+        return Some(match &sender_prefix {
+            Some(prefix) => format!("{prefix}{content}"),
+            None => content.to_string(),
+        });
     }
 
     if let Some(callback_data) = task
@@ -727,6 +760,10 @@ pub struct AgentRuntime {
     /// Tasks dequeued from a session's pending_user_tasks after a turn completed.
     /// Dispatched at the top of the main event loop to avoid async recursion.
     pending_drains: std::collections::VecDeque<(Uuid, InboundTaskPayload)>,
+    /// Tracks when a stuck-waiting turn was first observed per session.
+    /// Reconciled on every watchdog tick — entries are added on first observation
+    /// and removed when the session is no longer in a waiting phase.
+    stuck_turn_first_seen: HashMap<String, std::time::Instant>,
 }
 
 impl AgentRuntime {
@@ -739,6 +776,7 @@ impl AgentRuntime {
             configured_roles: HashMap::new(),
             default_agent_profile: AgentProfile::default(),
             pending_drains: std::collections::VecDeque::new(),
+            stuck_turn_first_seen: HashMap::new(),
         }
     }
 
@@ -835,6 +873,42 @@ impl AgentRuntime {
                     "Failed to fetch role incarnation for default activation."
                 );
                 None
+            }
+        }
+    }
+
+    /// Fetch all role incarnation names for this agent from the hotel and store them
+    /// on the default agent profile. Called once at startup so every session gets
+    /// the authoritative list injected into its system prompt.
+    async fn fetch_role_names(&mut self) {
+        match self
+            .ipc_client
+            .send_request(IpcRequest::ListRoleIncarnations {
+                agent_id: self.agent_id.clone(),
+            })
+            .await
+        {
+            Ok(IpcResponse::Standard {
+                ok: true,
+                data: Some(data),
+                ..
+            }) => {
+                if let Some(roles) = data.get("roles").and_then(|v| v.as_array()) {
+                    let names: Vec<String> = roles
+                        .iter()
+                        .filter_map(|r| r.get("role_name").and_then(|n| n.as_str()).map(str::to_string))
+                        .collect();
+                    info!(
+                        agent_id = %self.agent_id,
+                        count = names.len(),
+                        roles = %names.join(", "),
+                        "Delegation roster loaded from agent graph."
+                    );
+                    self.default_agent_profile.agent_role_names = names;
+                }
+            }
+            _ => {
+                info!(agent_id = %self.agent_id, "No role incarnations found for delegation roster.");
             }
         }
     }
@@ -970,6 +1044,139 @@ impl AgentRuntime {
         }
     }
 
+    /// Scan all active sessions and evict any turn stuck in a waiting phase past its
+    /// deadline. Deadlines:
+    ///   WaitingModel  — 120 s  (accounts for slow/retriable model calls)
+    ///   WaitingTool   — 90 s   (tool runners should be fast)
+    ///   WaitingVoice  — 60 s   (ElevenLabs is normally < 10 s)
+    ///
+    /// Uses `stuck_turn_first_seen` to track when a waiting-phase turn was first
+    /// observed. This map is reconciled each tick — entries are added on first
+    /// observation and cleared when the session leaves the waiting phase or has no
+    /// active turn. This approach works regardless of which code path set the phase.
+    ///
+    /// On eviction: clear the active turn, persist a clean checkpoint, and send the
+    /// user a brief notice so they know the session is unblocked.
+    async fn evict_timed_out_turns(&mut self) {
+        const WAITING_MODEL_SECS: u64 = 120;
+        const WAITING_TOOL_SECS: u64 = 90;
+        const WAITING_VOICE_SECS: u64 = 60;
+        const WAITING_APPROVAL_SECS: u64 = 300; // 5 min — operator may be slow
+
+        let now = std::time::Instant::now();
+
+        // Step 1: reconcile stuck_turn_first_seen against current session state.
+        // Add sessions newly in a waiting phase; remove those that are no longer waiting.
+        // Parked approval turns count as waiting (they live in parked_approval_turn, not active_turn).
+        let session_ids: Vec<String> = self.sessions.keys().cloned().collect();
+        for session_id in &session_ids {
+            let is_waiting = self.sessions.get(session_id).map(|s| {
+                let active_waiting = s.active_turn.as_ref().map(|t| {
+                    matches!(t.phase, TurnPhase::WaitingModel | TurnPhase::WaitingTool | TurnPhase::WaitingVoice)
+                }).unwrap_or(false);
+                active_waiting || s.has_parked_approval_turn()
+            }).unwrap_or(false);
+
+            if is_waiting {
+                self.stuck_turn_first_seen.entry(session_id.clone()).or_insert(now);
+            } else {
+                self.stuck_turn_first_seen.remove(session_id);
+            }
+        }
+        // Also remove entries for sessions that no longer exist.
+        self.stuck_turn_first_seen.retain(|id, _| self.sessions.contains_key(id));
+
+        // Step 2: collect sessions whose waiting turn has exceeded the deadline.
+        // Parked approval turns (in parked_approval_turn) use WAITING_APPROVAL_SECS.
+        let timed_out: Vec<(String, String, String, Option<String>, String, u64)> = self
+            .sessions
+            .iter()
+            .filter_map(|(session_id, state)| {
+                let first_seen = *self.stuck_turn_first_seen.get(session_id)?;
+                let elapsed = first_seen.elapsed().as_secs();
+                // Parked approval turn: check it first, since active_turn is None when parked.
+                if let Some(turn) = state.parked_approval_turn.as_ref() {
+                    if elapsed >= WAITING_APPROVAL_SECS {
+                        return Some((
+                            session_id.clone(),
+                            turn.final_reply_to.clone(),
+                            turn.final_reply_role.clone(),
+                            turn.final_reply_guest_id.clone(),
+                            "WaitingApproval(parked)".into(),
+                            elapsed,
+                        ));
+                    }
+                    return None;
+                }
+                let turn = state.active_turn.as_ref()?;
+                let limit = match turn.phase {
+                    TurnPhase::WaitingModel => WAITING_MODEL_SECS,
+                    TurnPhase::WaitingTool => WAITING_TOOL_SECS,
+                    TurnPhase::WaitingVoice => WAITING_VOICE_SECS,
+                    _ => return None,
+                };
+                if elapsed < limit {
+                    return None;
+                }
+                Some((
+                    session_id.clone(),
+                    turn.final_reply_to.clone(),
+                    turn.final_reply_role.clone(),
+                    turn.final_reply_guest_id.clone(),
+                    format!("{:?}", turn.phase),
+                    elapsed,
+                ))
+            })
+            .collect();
+
+        // Step 3: evict.
+        for (session_id, reply_to, reply_role, reply_guest_id, phase, elapsed_secs) in timed_out {
+            warn!(
+                session_id = %session_id,
+                phase = %phase,
+                elapsed_secs = %elapsed_secs,
+                "Turn watchdog: evicting stuck turn"
+            );
+
+            self.stuck_turn_first_seen.remove(&session_id);
+
+            if let Some(state) = self.sessions.get_mut(&session_id) {
+                state.active_turn = None;
+                state.parked_approval_turn = None;
+                state.parked_approval_since = None;
+                state.turn_waiting_since = None;
+
+                // Persist clean checkpoint so a restart also starts unblocked.
+                let mem_type = state.checkpoint_memory_type();
+                let clean_checkpoint = state.checkpoint_json();
+                if let Err(e) = self
+                    .ipc_client
+                    .sync_apartment(&self.agent_id, &mem_type, clean_checkpoint)
+                    .await
+                {
+                    warn!("Turn watchdog: failed to persist clean checkpoint: {}", e);
+                }
+            }
+
+            // Notify the user that the session is unblocked.
+            let notify_req = IpcRequest::EmitTask {
+                target_node: reply_to,
+                target_role: reply_role,
+                target_guest_id: reply_guest_id,
+                task_json: serde_json::json!({
+                    "action": "send_reply",
+                    "session_id": session_id,
+                    "content": "*(I seem to have gotten stuck waiting for a response. The session is unblocked — please try again.)*",
+                    "final": true,
+                })
+                .to_string(),
+            };
+            if let Err(e) = self.ipc_client.send_request(notify_req).await {
+                warn!("Turn watchdog: failed to send unblock notification: {}", e);
+            }
+        }
+    }
+
     /// Test-only: inspect session state by id.
     #[doc(hidden)]
     pub fn session(&self, session_id: &str) -> Option<&crate::session::SessionState> {
@@ -988,6 +1195,7 @@ impl AgentRuntime {
     pub async fn run(&mut self) -> Result<()> {
         info!("Listening for inbound Persona tasks from the Philotic Web...");
         self.fetch_agent_profile().await;
+        self.fetch_role_names().await;
         self.fetch_memory_config().await;
 
         // Publish command manifest to the hotel so membrane can discover it.
@@ -1095,6 +1303,13 @@ impl AgentRuntime {
                                 let _ = self.emit_error_reply(&task_ref, task_id, err).await;
                             }
                         }
+                        Ok(task) if task.action.as_deref() == Some("streaming_token") => {
+                            // LLM token fragment emitted by model-router during a streaming
+                            // response. Forward immediately to membrane for progressive display.
+                            if let Err(err) = self.handle_streaming_token(task).await {
+                                warn!("Failed to forward streaming_token: {}", err);
+                            }
+                        }
                         Ok(task) => {
                             let task_ref = task.clone();
                             if let Err(err) = self.handle_user_message(task, task_id).await {
@@ -1135,7 +1350,10 @@ impl AgentRuntime {
                     }
                     warn!("IPC Recv error: {}", err);
                 }
-                Err(_) => {}
+                Err(_) => {
+                    // 5-second tick — no task arrived. Check for stuck turns.
+                    self.evict_timed_out_turns().await;
+                }
             }
         }
     }
@@ -1294,6 +1512,58 @@ impl AgentRuntime {
                     }
                 }
             }
+
+            ParacrineRouting::ApprovalResolution => {
+                // The operator role (e.g. membrane + human) has sent an approval decision
+                // for a parked turn. Extract `decision` and optional `note` from the content
+                // field (parsed as JSON), then synthesize a SlashCommand to reuse the existing
+                // approval resolution path.
+                let session_id = session_id.unwrap_or_else(|| task.session_id_or_default(&self.agent_id));
+                // The sender encodes the decision as JSON in `content`, e.g.:
+                //   {"decision": "approved", "note": "looks good"}
+                let parsed_content = task
+                    .content
+                    .as_deref()
+                    .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok());
+                let decision = parsed_content
+                    .as_ref()
+                    .and_then(|p| p.get("decision"))
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("approved");
+                let note = parsed_content
+                    .as_ref()
+                    .and_then(|p| p.get("note"))
+                    .and_then(|n| n.as_str())
+                    .map(str::to_string);
+                let command = if decision == "denied" {
+                    SlashCommand::Deny { note }
+                } else {
+                    SlashCommand::Approve { note }
+                };
+                // Use inbound routing fields for the command reply; handle_approval_command
+                // extracts the real turn values from the restored parked turn.
+                let local_node = local_node_id();
+                let cmd_chat_id = task.chat_id.clone().unwrap_or_default();
+                let cmd_reply_to = task.final_reply_to.clone().unwrap_or(local_node);
+                let cmd_reply_role = task.final_reply_role.clone().unwrap_or_else(|| "membrane".into());
+                let cmd_reply_guest_id = task.final_reply_guest_id.clone();
+                info!(
+                    session_id = %session_id,
+                    decision = %decision,
+                    "paracrine ApprovalResolution: applying operator decision to parked turn"
+                );
+                self.handle_approval_command(
+                    task_id,
+                    session_id,
+                    task.turn_id.clone().unwrap_or_default(),
+                    cmd_chat_id,
+                    cmd_reply_to,
+                    cmd_reply_role,
+                    cmd_reply_guest_id,
+                    command,
+                )
+                .await?;
+            }
         }
 
         Ok(())
@@ -1394,8 +1664,39 @@ impl AgentRuntime {
                 | SlashCommand::WorkspaceSet { .. }
                 | SlashCommand::WorkspaceClear => {}
                 SlashCommand::Approve { .. } | SlashCommand::Deny { .. } => {
+                    // "Trust for session" button sends callback_data="trust" which membrane
+                    // translates to /approve + preserves the original callback_data.
+                    // Pre-approve the session before resolving the parked turn, and
+                    // immediately checkpoint so the policy survives process restarts
+                    // and the next refresh_bindings_from_snapshot call.
+                    if task.callback_data.as_deref() == Some("trust") {
+                        let checkpoint_info = self.sessions.get_mut(&session_id).map(|state| {
+                            state.set_preapprove_this_session();
+                            (state.checkpoint_memory_type(), state.checkpoint_json())
+                        });
+                        if let Some((mem_type, checkpoint)) = checkpoint_info {
+                            let _ = self
+                                .ipc_client
+                                .sync_apartment(&self.agent_id, &mem_type, checkpoint)
+                                .await;
+                        }
+                    }
                     return self
                         .handle_approval_command(
+                            task_id,
+                            session_id,
+                            turn_id,
+                            chat_id,
+                            final_reply_to,
+                            final_reply_role,
+                            final_reply_guest_id,
+                            command,
+                        )
+                        .await;
+                }
+                SlashCommand::ApprovalClear { .. } => {
+                    return self
+                        .handle_approval_clear(
                             task_id,
                             session_id,
                             turn_id,
@@ -1574,6 +1875,63 @@ impl AgentRuntime {
             }
         }
 
+        // MCP approval gate: if the inbound task requires operator approval
+        // before model invocation, park the turn and notify the sender.
+        // The membrane keeps the HTTP connection open; the Text reply fires
+        // the oneshot when the operator resolves via paracrine pipe.
+        if task.requires_approval {
+            let (checkpoint_memory_type, checkpoint_json, index_state) = {
+                let state = self
+                    .sessions
+                    .get_mut(&session_id)
+                    .ok_or_else(|| anyhow::anyhow!("session missing after start_turn"))?;
+
+                // Build a synthetic approval so handle_approval_command can resolve it.
+                let tool_name = task
+                    .command
+                    .as_deref()
+                    .unwrap_or("unknown tool");
+                let approval = ApprovalRequest {
+                    approval_id: Some(format!("mcp-gate:{}", turn_id)),
+                    reason: format!("MCP tool call '{}' requires operator approval.", tool_name),
+                    approved_response: format!("Executing '{}'.", tool_name),
+                };
+                state.set_pending_approval(approval);
+                state.set_active_turn_phase(TurnPhase::WaitingApproval);
+                state.park_active_turn_for_approval();
+                (
+                    state.checkpoint_memory_type(),
+                    state.checkpoint_json(),
+                    state.clone(),
+                )
+            };
+
+            self.ipc_client
+                .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
+                .await?;
+            self.sync_session_index(&index_state).await?;
+
+            // Tell the membrane to keep the HTTP response parked.
+            let notify = serde_json::json!({
+                "action":      "approval_required",
+                "session_id":  session_id,
+                "turn_id":     turn_id,
+                "description": "This tool call requires operator approval before execution.",
+                "options":     ["approve", "deny"],
+            });
+            let _ = self
+                .ipc_client
+                .send_request(IpcRequest::EmitTask {
+                    target_node: final_reply_to.clone(),
+                    target_role: final_reply_role.clone(),
+                    target_guest_id: final_reply_guest_id.clone(),
+                    task_json: serde_json::to_string(&notify)?,
+                })
+                .await;
+
+            return Ok(());
+        }
+
         self.maybe_auto_recall_turn_memory(&session_id).await?;
 
         let (
@@ -1638,6 +1996,8 @@ impl AgentRuntime {
                     )
                     .await
                 }
+                // ApprovalClear always returns from the pre-turn gate above; unreachable here.
+                SlashCommand::ApprovalClear { .. } => Ok(()),
                 SlashCommand::Tts { .. } => {
                     self.handle_session_control_command(
                         task_id, session_id, turn_id, chat_id, command,
@@ -1869,14 +2229,21 @@ impl AgentRuntime {
             .and_then(|s| s.active_turn.as_ref())
             .map(|t| t.turn_id.clone());
 
-        if let Some(ref active_id) = active_turn_id {
-            if active_id != &turn_id {
+        match active_turn_id {
+            None => {
+                // No active turn — the turn may have already completed (e.g. a duplicate
+                // response from a second controller on the same role inbox arriving after
+                // the first one already resolved the turn). Drop silently.
+                return Ok(());
+            }
+            Some(ref active_id) if active_id != &turn_id => {
                 warn!(
                     "handle_model_response: dropping stale response for turn {} (active turn is {})",
                     turn_id, active_id
                 );
                 return Ok(());
             }
+            Some(_) => {}
         }
 
         // If the turn is waiting for voice synthesis, this is the audio response — route it
@@ -2168,6 +2535,9 @@ impl AgentRuntime {
             } else {
                 state.set_pending_approval(approval.clone());
                 state.set_active_turn_phase(TurnPhase::WaitingApproval);
+                // Park the turn so this session can accept new work while the operator
+                // decides. active_turn becomes None; parked_approval_turn holds the state.
+                state.park_active_turn_for_approval();
             }
             (
                 task_id,
@@ -2284,6 +2654,18 @@ impl AgentRuntime {
             )
             .await;
 
+        let approval_keyboard = serde_json::json!({
+            "inline_keyboard": [
+                [
+                    {"text": "✅ Approve", "callback_data": "approve"},
+                    {"text": "❌ Deny", "callback_data": "deny"}
+                ],
+                [
+                    {"text": "🔓 Trust for session", "callback_data": "trust"}
+                ]
+            ]
+        });
+
         let reply_payload = FinalReplyPayload {
             action: "send_reply",
             session_id,
@@ -2296,7 +2678,7 @@ impl AgentRuntime {
             ),
             audio_artifact: None,
             send_text_caption: false,
-            reply_markup: None,
+            reply_markup: Some(approval_keyboard),
         };
 
         self.ipc_client
@@ -3874,11 +4256,20 @@ impl AgentRuntime {
             let final_reply_role = active_turn.final_reply_role.clone();
             let final_reply_guest_id = active_turn.final_reply_guest_id.clone();
             state.set_active_turn_phase(TurnPhase::Failed);
+            let checkpoint_memory_type = state.checkpoint_memory_type();
+            let checkpoint_json = state.checkpoint_json();
+            let index_state = state.clone();
+            // Clear the active turn NOW so is_turn_active() returns false before the
+            // drain runs. Without this, drain_next_user_task moves the next queued task
+            // into pending_drains, then handle_user_message sees an active turn and
+            // re-queues it — creating an infinite queue/drain loop.
+            state.active_turn = None;
+            state.turn_waiting_since = None;
             (
                 task_id,
-                state.checkpoint_memory_type(),
-                state.checkpoint_json(),
-                state.clone(),
+                checkpoint_memory_type,
+                checkpoint_json,
+                index_state,
                 chat_id,
                 final_reply_to,
                 final_reply_role,
@@ -4326,6 +4717,14 @@ impl AgentRuntime {
         command_reply_guest_id: Option<String>,
         command: SlashCommand,
     ) -> Result<()> {
+        // Approval turns are parked in `parked_approval_turn` while the session stays free.
+        // Restore the parked turn into active_turn so the resolution logic proceeds normally.
+        if let Some(state) = self.sessions.get_mut(&session_id) {
+            if state.has_parked_approval_turn() && !state.is_turn_active() {
+                state.restore_parked_approval_turn();
+            }
+        }
+
         let pending = self
             .sessions
             .get(&session_id)
@@ -4427,6 +4826,7 @@ impl AgentRuntime {
                 | SlashCommand::Preapprove { .. }
                 | SlashCommand::ApprovalStatus
                 | SlashCommand::ApprovalReset
+                | SlashCommand::ApprovalClear { .. }
                 | SlashCommand::Abandon { .. }
                 | SlashCommand::Tts { .. } => {}
             }
@@ -4647,11 +5047,210 @@ impl AgentRuntime {
             | SlashCommand::Preapprove { .. }
             | SlashCommand::ApprovalStatus
             | SlashCommand::ApprovalReset
+            | SlashCommand::ApprovalClear { .. }
             | SlashCommand::Abandon { .. }
             | SlashCommand::Tts { .. } => {}
         }
 
         Ok(())
+    }
+
+    /// Forward a streaming LLM token fragment to membrane for progressive display.
+    ///
+    /// model-router emits `action = "streaming_token"` tasks as the Gemini SSE stream
+    /// produces tokens.  We look up the session's active turn to find the membrane
+    /// routing (final_reply_to / final_reply_role) and re-emit to membrane.  If there is
+    /// no active turn for the session the token is silently dropped — the turn already
+    /// completed or was abandoned.
+    async fn handle_streaming_token(&mut self, task: InboundTaskPayload) -> Result<()> {
+        let session_id = match &task.session_id {
+            Some(s) => s.clone(),
+            None => return Ok(()),
+        };
+        let token = match &task.content {
+            Some(c) if !c.is_empty() => c.clone(),
+            _ => return Ok(()),
+        };
+
+        // Resolve routing from the active turn of the session.
+        let routing = self
+            .sessions
+            .get(&session_id)
+            .and_then(|s| s.active_turn.as_ref())
+            .map(|t| {
+                (
+                    t.final_reply_to.clone(),
+                    t.final_reply_role.clone(),
+                    t.final_reply_guest_id.clone(),
+                    t.turn_id.clone(),
+                    t.chat_id.clone(),
+                )
+            });
+
+        let Some((reply_to, reply_role, reply_guest_id, turn_id, chat_id)) = routing else {
+            // No active turn — token arrived after turn completed; drop silently.
+            return Ok(());
+        };
+
+        let task_json = serde_json::to_string(&serde_json::json!({
+            "action": "streaming_token",
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "chat_id": chat_id,
+            "content": token,
+        }))?;
+
+        self.ipc_client
+            .send_request(IpcRequest::EmitTask {
+                target_node: reply_to,
+                target_role: reply_role,
+                target_guest_id: reply_guest_id,
+                task_json,
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    /// Handle `/approval clear [reason]` — explicitly cancel and drop a parked approval
+    /// turn, unblocking the session. Sends a cancellation notice to the original chat so
+    /// the user sees it instead of "typing" forever, then acks the operator's command.
+    async fn handle_approval_clear(
+        &mut self,
+        command_task_id: Uuid,
+        session_id: String,
+        command_turn_id: String,
+        command_chat_id: String,
+        command_reply_to: String,
+        command_reply_role: String,
+        command_reply_guest_id: Option<String>,
+        command: SlashCommand,
+    ) -> Result<()> {
+        let reason = if let SlashCommand::ApprovalClear { reason } = &command {
+            reason.clone()
+        } else {
+            None
+        };
+
+        // Snapshot the parked turn's routing info before we clear it.
+        let parked_info = self.sessions.get(&session_id).and_then(|state| {
+            state.parked_approval_turn.as_ref().map(|turn| {
+                (
+                    turn.task_id,
+                    turn.turn_id.clone(),
+                    turn.chat_id.clone(),
+                    turn.final_reply_to.clone(),
+                    turn.final_reply_role.clone(),
+                    turn.final_reply_guest_id.clone(),
+                )
+            })
+        });
+
+        let Some((
+            original_task_id,
+            original_turn_id,
+            original_chat_id,
+            original_reply_to,
+            original_reply_role,
+            original_reply_guest_id,
+        )) = parked_info
+        else {
+            // Nothing parked — ack the command and bail.
+            return self
+                .complete_command_without_turn(
+                    command_task_id,
+                    session_id,
+                    command_turn_id,
+                    command_chat_id,
+                    command_reply_to,
+                    command_reply_role,
+                    command_reply_guest_id,
+                    "No parked approval to clear.".into(),
+                    None,
+                    None,
+                )
+                .await;
+        };
+
+        // Clear the parked turn and write a clean checkpoint.
+        let (checkpoint_memory_type, checkpoint_json, index_state) = {
+            let state = self
+                .sessions
+                .get_mut(&session_id)
+                .expect("session should exist while clearing parked approval");
+            state.parked_approval_turn = None;
+            state.parked_approval_since = None;
+            (
+                state.checkpoint_memory_type(),
+                state.checkpoint_json(),
+                state.clone(),
+            )
+        };
+
+        self.ipc_client
+            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
+            .await?;
+        self.sync_session_index(&index_state).await?;
+
+        // Fail the original task so the task ledger is closed.
+        let cancel_reason = reason
+            .as_deref()
+            .unwrap_or("operator cancelled approval request");
+        let _ = self
+            .ipc_client
+            .send_request(IpcRequest::FailTask {
+                task_id: original_task_id,
+                error_code: "APPROVAL_CANCELLED".into(),
+                reason: cancel_reason.to_string(),
+            })
+            .await?;
+
+        // Notify the original chat that the approval request was cancelled.
+        let original_notice = if let Some(r) = reason.as_deref() {
+            format!("Approval request cancelled: {r}")
+        } else {
+            "Approval request cancelled by operator.".into()
+        };
+        let notice_payload = FinalReplyPayload {
+            action: "send_reply",
+            session_id: session_id.clone(),
+            turn_id: original_turn_id,
+            chat_id: original_chat_id,
+            content: original_notice,
+            audio_artifact: None,
+            send_text_caption: false,
+            reply_markup: None,
+        };
+        let _ = self
+            .ipc_client
+            .send_request(IpcRequest::EmitTask {
+                target_node: original_reply_to,
+                target_role: original_reply_role,
+                target_guest_id: original_reply_guest_id,
+                task_json: serde_json::to_string(&notice_payload)?,
+            })
+            .await?;
+
+        info!(
+            session_id = %session_id,
+            original_task_id = %original_task_id,
+            "Parked approval turn cleared by operator."
+        );
+
+        // Ack the operator's command turn.
+        self.complete_command_without_turn(
+            command_task_id,
+            session_id,
+            command_turn_id,
+            command_chat_id,
+            command_reply_to,
+            command_reply_role,
+            command_reply_guest_id,
+            "Parked approval cleared.".into(),
+            None,
+            None,
+        )
+        .await
     }
 
     /// Receive an inbound `handoff_bundle` task — the hotel is asking this philote
@@ -5518,6 +6117,7 @@ impl AgentRuntime {
                 | SlashCommand::Back
                 | SlashCommand::Approve { .. }
                 | SlashCommand::Deny { .. }
+                | SlashCommand::ApprovalClear { .. }
                 | SlashCommand::Abandon { .. } => (
                     "Unsupported session control command.".to_string(),
                     "session_control_unsupported",
@@ -5754,7 +6354,6 @@ impl AgentRuntime {
         }
 
         lines.push(approval.reason.clone());
-        lines.push("Reply /approve or /deny.".to_string());
         lines.join("\n")
     }
 
@@ -5833,6 +6432,103 @@ impl AgentRuntime {
                     error: None,
                     tool_name: Some(payload.tool_name),
                     arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+            "hotel.status" => {
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::GetHotelStatus)
+                    .await
+                {
+                    Ok(IpcResponse::Standard {
+                        ok: true, data: Some(data), ..
+                    }) => {
+                        let text = serde_json::to_string_pretty(&data)
+                            .unwrap_or_else(|_| data.to_string());
+                        (text, None)
+                    }
+                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => {
+                        ("Hotel status unavailable.".into(), None)
+                    }
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("hotel.status: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+            "hotel.logs" => {
+                let lines = payload
+                    .arguments
+                    .get("lines")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v.min(500) as u32)
+                    .unwrap_or(50);
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::GetHotelLogs { lines })
+                    .await
+                {
+                    Ok(IpcResponse::Standard {
+                        ok: true, data: Some(data), ..
+                    }) => {
+                        let log = data
+                            .get("log")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        (log, None)
+                    }
+                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => {
+                        ("Hotel logs unavailable.".into(), None)
+                    }
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("hotel.logs: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,
@@ -6065,6 +6761,9 @@ impl AgentRuntime {
                                     .unwrap_or_default(),
                             },
                         );
+                        // Refresh the delegation roster so new/updated roles appear
+                        // in the system prompt for subsequent sessions without a restart.
+                        self.fetch_role_names().await;
                         (
                             format!("Successfully configured role incarnation for '{}'.", name),
                             None,
@@ -6095,6 +6794,196 @@ impl AgentRuntime {
                         let err = TaskErrorPayload::transport_error(
                             "philote",
                             format!("role.configure: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    handoff_bundle: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(content),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+            // role.create_or_update is the governed workflow surface for role authoring.
+            // It validates the same required fields as role.configure and resolves through
+            // the same IpcRequest::ConfigureRole hotel path — no external subscriber needed.
+            "role.create_or_update" => {
+                let args = &payload.arguments;
+
+                macro_rules! require_str_arg {
+                    ($key:literal) => {
+                        match args.get($key).and_then(|v| v.as_str()) {
+                            Some(s) => s.to_string(),
+                            None => {
+                                return self
+                                    .fail_active_turn(
+                                        payload.session_id,
+                                        payload.turn_id,
+                                        format!(
+                                            "role.create_or_update: missing required argument '{}'",
+                                            $key
+                                        ),
+                                    )
+                                    .await;
+                            }
+                        }
+                    };
+                }
+
+                let role_name = require_str_arg!("role_name");
+                let toolset_profile = require_str_arg!("toolset_profile");
+
+                if args.get("reasoning").and_then(|v| v.as_object()).is_none() {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "role.create_or_update: missing required object argument 'reasoning'".into(),
+                        )
+                        .await;
+                }
+
+                let role_identity_addendum = args
+                    .get("role_identity_addendum")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let role_manifest = args
+                    .get("role_manifest")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let is_admin = args.get("is_admin").and_then(|v| v.as_bool()).unwrap_or(false);
+                let inactive_ttl_seconds = args.get("inactive_ttl_seconds").and_then(|v| v.as_u64());
+                let iteration_cap = args
+                    .get("iteration_cap")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32);
+                let approval_policy = args
+                    .get("approval_policy")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let model_profile = args
+                    .get("model_profile")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let context_window_policy = args
+                    .get("context_window_policy")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+
+                let calling_role = self
+                    .sessions
+                    .get(&payload.session_id)
+                    .and_then(|s| s.role_activation.as_ref())
+                    .map(|r| r.role_name.clone())
+                    .unwrap_or_else(|| "orchestrator".to_string());
+
+                let req = IpcRequest::ConfigureRole {
+                    agent_id: self.agent_id.clone(),
+                    role_name: role_name.clone(),
+                    guest_id: format!("{}:{}", self.agent_id, role_name),
+                    calling_role,
+                    toolset_profile,
+                    role_identity_addendum,
+                    role_manifest,
+                    is_admin,
+                    inactive_ttl_seconds,
+                    iteration_cap,
+                    approval_policy,
+                    model_profile,
+                    context_window_policy,
+                };
+
+                let (content, tool_err) = match self.ipc_client.send_request(req).await {
+                    Ok(IpcResponse::ConfigureRoleOk { role_name: name }) => {
+                        self.configured_roles.insert(
+                            name.clone(),
+                            CachedRoleConfig {
+                                toolset_profile: args
+                                    .get("toolset_profile")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("default")
+                                    .to_string(),
+                                role_identity_addendum: args
+                                    .get("role_identity_addendum")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string),
+                                role_manifest: args
+                                    .get("role_manifest")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string),
+                                iteration_cap: args
+                                    .get("iteration_cap")
+                                    .and_then(|v| v.as_u64())
+                                    .map(|v| v as u32),
+                                approval_policy: args
+                                    .get("approval_policy")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string),
+                                turn_loop_config: args
+                                    .get("turn_loop_config")
+                                    .and_then(|v| {
+                                        serde_json::from_value::<
+                                            ansible_mesh_core::graph::TurnLoopConfig,
+                                        >(v.clone())
+                                        .ok()
+                                    })
+                                    .unwrap_or_default(),
+                            },
+                        );
+                        self.fetch_role_names().await;
+                        (
+                            format!("Role '{}' created/updated successfully.", name),
+                            None,
+                        )
+                    }
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(IpcResponse::Error(msg)) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", "IPC_ERROR", msg);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => {
+                        let e = TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            "role.create_or_update: unexpected hotel response",
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("role.create_or_update: IPC transport error — {e}"),
                         );
                         (err.display_message(), Some(err))
                     }

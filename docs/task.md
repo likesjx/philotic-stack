@@ -22,6 +22,18 @@
 
 Stable seam refs live in [SEAM_REGISTRY.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SEAM_REGISTRY.md).
 
+### Primitives Refactor
+
+- [x] Extract mesh envelope primitives into `philotic-primitives-mesh`.
+- [x] Extract hotel/runtime capability and registry primitives into `philotic-primitives-hotel` behind compatibility shims.
+- [x] Extract graph/storage primitives into `philotic-primitives-data` behind compatibility shims.
+- [x] Extract agent/session/memory primitives into `philotic-primitives-agent` behind compatibility shims.
+- [x] Extract tool/skill primitives into `philotic-primitives-tool` behind compatibility shims.
+- [x] Extract tool execution route/config envelopes into `philotic-primitives-tool` where they are shared by session shaping and tool routing.
+- [x] Extract model-routing DTOs into `philotic-primitives-model` behind compatibility shims.
+- [x] Extract the `ModelManagerInvoker` wiring out of `ansible-mesh-core`.
+- [ ] Migrate downstream crates off the remaining `ansible-mesh-core` compatibility imports where direct primitive crates are now clearer.
+
 ### WI 1: Session Management
 
 Seam IDs: `session-leases`
@@ -606,9 +618,12 @@ Seam IDs: `secret-handling-hardening`, `watched-live-vps-smoke`, `artifact-distr
 ## New Project: Hotel Perimeter Trust
 
 - [ ] Review [HOTEL_PERIMETER_TRUST_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/HOTEL_PERIMETER_TRUST_PROPOSAL.md).
-- [ ] Define hotel membership records so “inside the perimeter” is explicit rather than implied by peer discovery.
+- [x] Define hotel membership records so “inside the perimeter” is explicit rather than implied by peer discovery.
 - [ ] Define hotel identity/auth material beyond transitional dev PSK assumptions.
-- [ ] Define join / invite / revoke lifecycle for hotel membership.
+- [ ] Finish hotel identity/auth material beyond transitional mesh PSK:
+  current slice ships `phil mesh invite` / `phil mesh accept` with graph-backed membership records and HMAC-signed acceptance, but not per-hotel PKI.
+- [ ] Finish join / invite / revoke lifecycle for hotel membership:
+  invite/accept now exists; revoke, rotation, and deny-list behavior are still open.
 - [ ] Require authenticated control-plane traffic outside explicit dev mode.
 - [ ] Define authorization scope for which trusted hotels may receive which routed capability classes.
 
@@ -1327,6 +1342,8 @@ Seam IDs: `wider-client-adoption`, `philotic-native-memory-integration`
 - [ ] Command Center / architect continuity: define how architecture-impact work should be surfaced to Aria once the new home is ready.
 - [ ] Fresh onboarding flow: design repo/bootstrap onboarding from scratch for a new operator or agent entering Philotic.
   - [x] Hand the interactive onboarding flow off to `phil service install` on macOS so first-run setup can root the daemon immediately.
+  - [x] Capture the agent workspace/import path and initial skillset during onboarding so tool-runner roots and skill posture start out correct.
+  - [x] Expose the agent workspace/import path in the desktop agent editor so existing agents can be retargeted to a new working directory without re-running bootstrap.
 - [ ] `openclaw.json` ingestion: define a migration/import path that can consume legacy agent manifests and materialize Philotic agents.
 - [ ] Context graph deployment model: decide local-first vs cloud-backed vs hybrid graph ownership, sync, and operational model.
 - [ ] Context graph decentralization: decide how much of the graph can be replicated/federated across hotels versus kept locally authoritative.
@@ -1369,6 +1386,7 @@ Seam IDs: `wider-client-adoption`, `philotic-native-memory-integration`
 - [ ] A2A membrane investigation (`a2a-membrane-contract`): evaluate `A2A` as an external agent interoperability membrane with explicit peer trust records, bounded capability exposure, approval semantics for privileged actions, and no inheritance of internal mesh trust.
 - [ ] Tool runner lifecycle policy (`runner-materialization-policy`): define idle retention, sleep/teardown timing, wake-up thresholds, and environment-specific materialization rules for routed tools.
 - [ ] Runner artifact plane: define builder trust, sandboxing, testing, signing, release, and distribution policy for executable tool runners.
+  - [x] Expose shell execution through the `tool-runner` `bash.exec` surface and back it with `philotic-sandbox` when sandbox mode is configured; a UDS smoke test proved the delegation path.
 - [ ] Memory consolidation / dreaming: define how short-term session state becomes long-term memory, including sleep/dream cycles, compaction, and candidate memory backends such as `scryper/miniminddb`.
 
 ## MVP 1: Single-Node Mesh & Basic Tools

@@ -484,13 +484,14 @@ jane-push:
     #!/usr/bin/env bash
     set -euo pipefail
     REMOTE=mbp-jane
-    REMOTE_CELLAR=/opt/homebrew/Cellar/aiua/0.1.0-alpha/bin
-    BINS="aiua philote membrane membrane-telegram model-router model-controller-gemini model-controller-elevenlabs model-controller-mlx philote-worker tool-runner graph-runner philotic-web"
+    REMOTE_CELLAR="$(ssh "${REMOTE}" "ls -d /opt/homebrew/Cellar/aiua/*/bin 2>/dev/null | head -1")"
+    BINS="aiua philote membrane membrane-telegram model-router model-controller-gemini model-controller-elevenlabs model-controller-mlx philote-worker tool-runner graph-runner"
+    PHIL_CELLAR="$(ssh "${REMOTE}" "ls -d /opt/homebrew/Cellar/philotic-web/*/bin 2>/dev/null | head -1")"
     # Safety guard: verify we are actually talking to mbp-jane before touching anything.
     # mbp-jane's system hostname is "MacBookPro" — the SSH alias is just our local label.
     ACTUAL_HOST="$(ssh "${REMOTE}" hostname -s 2>/dev/null)"
-    if [ "${ACTUAL_HOST}" != "MacBookPro" ]; then
-        echo "❌ Aborting: remote hostname is '${ACTUAL_HOST}', expected 'MacBookPro' (mbp-jane)."
+    if [[ "${ACTUAL_HOST}" != "MacBookPro" && "${ACTUAL_HOST}" != "Jareds-MacBook-Pro" ]]; then
+        echo "❌ Aborting: remote hostname is '${ACTUAL_HOST}', expected mbp-jane."
         exit 1
     fi
     echo "▶ Building release binaries (local)..."
@@ -503,19 +504,36 @@ jane-push:
             echo "  – $bin (not built locally, skipping)"
             continue
         fi
+        NEW=false
         if ! ssh "${REMOTE}" "test -f '${REMOTE_CELLAR}/$bin'"; then
-            echo "  – $bin (not in remote Cellar, skipping)"
-            continue
+            NEW=true
         fi
-        ssh "${REMOTE}" "chmod u+w '${REMOTE_CELLAR}/$bin'"
+        ssh "${REMOTE}" "chmod u+w '${REMOTE_CELLAR}/$bin' 2>/dev/null || true"
         scp -q "target/release/$bin" "${REMOTE}:${REMOTE_CELLAR}/$bin"
-        ssh "${REMOTE}" "chmod u-w '${REMOTE_CELLAR}/$bin'"
-        echo "  ✓ $bin"
+        ssh "${REMOTE}" "chmod +x '${REMOTE_CELLAR}/$bin'"
+        ssh "${REMOTE}" "xattr -d com.apple.quarantine '${REMOTE_CELLAR}/$bin' 2>/dev/null || true"
+        if [ "$NEW" = "true" ]; then
+            ssh "${REMOTE}" "ln -sf '${REMOTE_CELLAR}/$bin' '/opt/homebrew/bin/$bin' && echo '  ✓ $bin (new — symlinked)'" || echo "  ✓ $bin (new)"
+        else
+            ssh "${REMOTE}" "chmod u-w '${REMOTE_CELLAR}/$bin' 2>/dev/null || true"
+            echo "  ✓ $bin"
+        fi
     done
+    if [ -n "${PHIL_CELLAR}" ]; then
+        ssh "${REMOTE}" "chmod u+w '${PHIL_CELLAR}/phil' '${PHIL_CELLAR}/philotic-web' 2>/dev/null || true"
+        scp -q "target/release/philotic-web" "${REMOTE}:${PHIL_CELLAR}/phil"
+        scp -q "target/release/philotic-web" "${REMOTE}:${PHIL_CELLAR}/philotic-web"
+        ssh "${REMOTE}" "chmod u-w '${PHIL_CELLAR}/phil' '${PHIL_CELLAR}/philotic-web' 2>/dev/null || true"
+        echo "  ✓ phil / philotic-web"
+    else
+        echo "  – phil / philotic-web (philotic-web Cellar not found on remote, skipping)"
+    fi
+    echo "▶ Clearing Gatekeeper quarantine on pushed binaries..."
+    ssh "${REMOTE}" "xattr -d com.apple.quarantine ${REMOTE_CELLAR}/* /opt/homebrew/Cellar/philotic-web/*/bin/* 2>/dev/null || true"
     echo "▶ Applying config on ${REMOTE}..."
-    ssh "${REMOTE}" "/opt/homebrew/bin/aiua load --file ~/mesh-config.json --hotel default"
+    ssh "${REMOTE}" "/opt/homebrew/bin/aiua load --file ~/mesh-config.json --hotel mbp-jane"
     echo "▶ Starting Jane on ${REMOTE}..."
-    ssh "${REMOTE}" "nohup /opt/homebrew/bin/aiua --hotel default >> ~/.philotic/aiua.log 2>&1 & echo \$! > ~/.philotic/aiua.pid && echo 'aiua started pid '\$(cat ~/.philotic/aiua.pid)"
+    ssh "${REMOTE}" "nohup /opt/homebrew/bin/aiua --hotel mbp-jane >> ~/.philotic/aiua.log 2>&1 & echo \$! > ~/.philotic/aiua.pid && echo 'aiua started pid '\$(cat ~/.philotic/aiua.pid)"
     echo "✅ Jane updated and running on ${REMOTE}."
 
 # Stop Jane on mbp-jane without pushing new binaries.
@@ -526,7 +544,7 @@ jane-stop:
 # Start Jane on mbp-jane (without pushing — uses whatever binary is already installed).
 jane-start:
     #!/usr/bin/env bash
-    ssh mbp-jane "nohup /opt/homebrew/bin/aiua --hotel default >> ~/.philotic/aiua.log 2>&1 & echo \$! > ~/.philotic/aiua.pid && echo 'aiua started pid '\$(cat ~/.philotic/aiua.pid)"
+    ssh mbp-jane "nohup /opt/homebrew/bin/aiua --hotel mbp-jane >> ~/.philotic/aiua.log 2>&1 & echo \$! > ~/.philotic/aiua.pid && echo 'aiua started pid '\$(cat ~/.philotic/aiua.pid)"
 
 # Check whether Jane (aiua) is running on mbp-jane.
 jane-status:

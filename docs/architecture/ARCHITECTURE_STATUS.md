@@ -3,7 +3,7 @@ title: Philotic Architecture Status
 doc_type: status
 domain: runtime-sessions
 status: active
-last_updated: 2026-04-11
+last_updated: 2026-04-13
 tags:
 - source-of-truth
 - current-state
@@ -37,7 +37,7 @@ tracks_domains:
 
 # Philotic Architecture Status
 
-> **Status:** Transitional Snapshot | **Last Updated:** 2026-04-09
+> **Status:** Transitional Snapshot | **Last Updated:** 2026-04-13
 
 This document is a legacy human-readable projection of current architecture state.
 The SQLite graph is the canonical source of truth; this file exists for review,
@@ -69,7 +69,9 @@ Philotic currently operates as a hotel-centered runtime:
 - canonical session state now lives in the context graph, while apartment-style checkpoints remain derived recovery projections rather than a competing source of truth.
 - Telegram ingress is session-aware and guarded by hotel-owned poll-lease authority, with explicit delegated remote polling available as a transitional exception; Telegram hotels should now materialize `membrane-telegram` directly while the bare `membrane` binary remains a transitional compatibility wrapper.
 - local and remote execution routing both exist, but several placement, delegation, and admin/control-plane seams are still under active development.
-- `phil` now owns the launchd service lifecycle surface for `aiua` on macOS through `phil service install`, `start`, `stop`, `restart`, `uninstall`, and `status`; interactive onboarding can optionally hand off to service install immediately after config generation.
+- `phil` now owns the launchd service lifecycle surface for `aiua` on macOS through `phil service install`, `start`, `stop`, `restart`, `uninstall`, and `status`; interactive onboarding can optionally hand off to service install immediately after config generation and now captures the agent workspace/import path plus initial skillset for runner setup.
+- the primitives split is now implemented in repo truth: `philotic-primitives-mesh` owns envelope and node identity types, `philotic-primitives-hotel` owns hotel/runtime capability records, `philotic-primitives-data` owns generic graph/storage primitives, `philotic-primitives-agent` owns agent/session/memory primitives, `philotic-primitives-tool` owns tool/skill governance and tool runner route/config envelopes, and `philotic-primitives-model` owns model-routing DTOs while `ansible-mesh-core` remains a transitional compatibility shim for reexports and legacy module paths; `model-router` now owns the `model_manager` runtime wiring.
+- the hotel perimeter now has a first explicit mesh membership ceremony through `phil mesh invite` and `phil mesh accept`, with accepted peers persisted in the graph; this is still transitional trust because revocation, scoped authorization, and non-PSK hotel identity are not finished.
 
 ## Implemented Foundations
 
@@ -125,12 +127,12 @@ Primary references:
 
 - abstract tool catalog seeding exists in the context graph
 - tool assembly uses catalog-backed metadata and approval annotations
-- local workspace tooling exists through `tool-runner`, although broader routed error-envelope and management-plane work remains incomplete
+- local workspace tooling exists through `tool-runner`, and its shell path (`bash.exec`) can now delegate to `philotic-sandbox` as the backing enforcement worker when sandbox mode is configured, although broader routed error-envelope and management-plane work remains incomplete
 - `model-router` is the shared model execution boundary for current providers
 - an `OpenAIProvider` adapter and dedicated `model-controller-openai` guest now exist on that seam, with OpenRouter/Ollama treated as compatibility modes unless their runtime lifecycle forces a different boundary
 - OpenAI auth now has hotel-side key management and validation commands, with endpoint-scoped secret refs, explicit base URL/default model settings, and optional project header support; the first real startup smoke is now green
 - OpenAI capability overrides for reasoning effort, verbosity, background mode, and explicit built-in tool passthrough now flow through `provider_options` on the OpenAI provider
-- route preference is now agent-configurable via `profile.response_route_policy.default_route`, is projected from the desktop onboarding/config path, and is also editable in the desktop agent editor, while the runtime still carries the canonical per-turn `response_route`
+- route preference is now agent-configurable via `profile.response_route_policy.default_route`, is projected from the desktop onboarding/config path, and is also editable in the desktop agent editor; the agent workspace/import path now follows the same pattern, so onboarding seeds a working directory and the desktop editor can revise it later, while the runtime still carries the canonical per-turn `response_route`
 - native-audio and realtime-style response modes are still deferred behind a future routing-reflex seam that will choose between provider-native `response.generate` audio, OpenAI websocket/realtime handling, and the `voice.synthesize` pipeline; the shared route bucket now distinguishes `text_only`, `image_multimodal`, `audio_multimodal`, and `realtime_websocket`, the provider-side websocket slice exists behind `response_mode=realtime_websocket`, and Ollama has not been split into a separate native boundary yet
 
 Primary references:
