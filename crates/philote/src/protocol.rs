@@ -96,6 +96,11 @@ pub struct InboundTaskPayload {
     /// `paracrine_response` tasks. Carries the paracrine_id and routing hint.
     #[serde(default)]
     pub exosome: Option<serde_json::Value>,
+    /// When true (set by membrane variants with per-route approval gates,
+    /// e.g. membrane-mcp), the philote must park this turn as WaitingApproval
+    /// before model invocation and emit `approval_required` back to the sender.
+    #[serde(default)]
+    pub requires_approval: bool,
 }
 
 // Transitional note: older emitters may still carry failures in

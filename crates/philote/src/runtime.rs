@@ -1875,6 +1875,63 @@ impl AgentRuntime {
             }
         }
 
+        // MCP approval gate: if the inbound task requires operator approval
+        // before model invocation, park the turn and notify the sender.
+        // The membrane keeps the HTTP connection open; the Text reply fires
+        // the oneshot when the operator resolves via paracrine pipe.
+        if task.requires_approval {
+            let (checkpoint_memory_type, checkpoint_json, index_state) = {
+                let state = self
+                    .sessions
+                    .get_mut(&session_id)
+                    .ok_or_else(|| anyhow::anyhow!("session missing after start_turn"))?;
+
+                // Build a synthetic approval so handle_approval_command can resolve it.
+                let tool_name = task
+                    .command
+                    .as_deref()
+                    .unwrap_or("unknown tool");
+                let approval = ApprovalRequest {
+                    approval_id: Some(format!("mcp-gate:{}", turn_id)),
+                    reason: format!("MCP tool call '{}' requires operator approval.", tool_name),
+                    approved_response: format!("Executing '{}'.", tool_name),
+                };
+                state.set_pending_approval(approval);
+                state.set_active_turn_phase(TurnPhase::WaitingApproval);
+                state.park_active_turn_for_approval();
+                (
+                    state.checkpoint_memory_type(),
+                    state.checkpoint_json(),
+                    state.clone(),
+                )
+            };
+
+            self.ipc_client
+                .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
+                .await?;
+            self.sync_session_index(&index_state).await?;
+
+            // Tell the membrane to keep the HTTP response parked.
+            let notify = serde_json::json!({
+                "action":      "approval_required",
+                "session_id":  session_id,
+                "turn_id":     turn_id,
+                "description": "This tool call requires operator approval before execution.",
+                "options":     ["approve", "deny"],
+            });
+            let _ = self
+                .ipc_client
+                .send_request(IpcRequest::EmitTask {
+                    target_node: final_reply_to.clone(),
+                    target_role: final_reply_role.clone(),
+                    target_guest_id: final_reply_guest_id.clone(),
+                    task_json: serde_json::to_string(&notify)?,
+                })
+                .await;
+
+            return Ok(());
+        }
+
         self.maybe_auto_recall_turn_memory(&session_id).await?;
 
         let (
