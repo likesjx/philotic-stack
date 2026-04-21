@@ -26,6 +26,8 @@ use crate::protocol::{
 use crate::routing::SharedRoutingTable;
 
 const DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
+/// Approval-required routes park the HTTP connection for up to 5 minutes.
+const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 
 // ── Application state ─────────────────────────────────────────────────────────
 
@@ -188,21 +190,19 @@ async fn handle_tools_call(
         }
     };
 
-    // Check require_approval flag.
-    if route.record.security.require_approval {
-        info!(tool = tool_name, caller_id = %caller.token_id, "call requires operator approval");
-        return JsonRpcResponse::err(
-            id,
-            error_code::APPROVAL_REQUIRED,
-            "this tool requires operator approval before execution",
-        );
-    }
+    // Determine if operator approval is required for this route.
+    let requires_approval = route.record.security.require_approval;
+    let timeout = if requires_approval { APPROVAL_TIMEOUT } else { DISPATCH_TIMEOUT };
 
     // Generate correlation IDs.
     let session_id = format!("mcp-{}", caller.token_id);
     let turn_id = Uuid::new_v4().to_string();
 
-    info!(tool = tool_name, caller_id = %caller.token_id, %turn_id, "dispatching via IPC");
+    if requires_approval {
+        info!(tool = tool_name, caller_id = %caller.token_id, %turn_id, "dispatching with approval gate — waiting up to {}s", timeout.as_secs());
+    } else {
+        info!(tool = tool_name, caller_id = %caller.token_id, %turn_id, "dispatching via IPC");
+    }
 
     // Build the inbound envelope that philote will receive.
     let envelope = InboundEnvelope {
@@ -223,6 +223,7 @@ async fn handle_tools_call(
         command: Some(tool_name.clone()),
         reply_to: Some(turn_id.clone()),
         raw_transport: json!({ "transport": "mcp", "tool": tool_name }),
+        requires_approval,
     };
 
     // Park a oneshot waiting for the philote reply.
@@ -240,8 +241,8 @@ async fn handle_tools_call(
         return JsonRpcResponse::err(id, error_code::DISPATCH_ERROR, "IPC send failed");
     }
 
-    // Await the reply with a timeout.
-    match tokio::time::timeout(DISPATCH_TIMEOUT, rx).await {
+    // Await the reply with a timeout (longer for approval-gated routes).
+    match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(content)) => JsonRpcResponse::ok(
             id,
             serde_json::to_value(ToolCallResult::json(serde_json::from_str(&content).unwrap_or(

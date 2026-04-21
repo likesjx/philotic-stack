@@ -32,6 +32,11 @@ pub struct InboundEnvelope {
     pub reply_to: Option<String>,
     /// Raw transport event — preserved for audit / debugging. Not forwarded to philote.
     pub raw_transport: serde_json::Value,
+    /// When true, the receiving philote must park the turn as WaitingApproval
+    /// before processing. Set by membrane variants that have per-route
+    /// `require_approval` gates (e.g. membrane-mcp route security config).
+    #[serde(default)]
+    pub requires_approval: bool,
 }
 
 /// Identifies the sender of an inbound message.

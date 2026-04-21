@@ -145,6 +145,7 @@ pub struct IpcServer {
     materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
     telegram_poll_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
     desktop_membrane_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
+    mcp_membrane_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
     subagent_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
     subagent_hooks: SubagentHookRegistry,
     registry: Arc<RwLock<NodeRegistry>>,
@@ -214,6 +215,39 @@ impl LeaseObserver for LoggingSubagentLeaseObserver {
             ),
             LeaseObserverEventKind::Revoked => info!(
                 "Subagent lease [{}] revoked for guest [{}].",
+                event.lease.lease_scope, event.lease.owner_guest_id
+            ),
+        }
+    }
+}
+
+struct LoggingMcpMembraneLeaseObserver;
+
+impl LeaseObserver for LoggingMcpMembraneLeaseObserver {
+    fn on_event(&mut self, event: &LeaseObserverEvent) {
+        match event.kind {
+            LeaseObserverEventKind::Granted => info!(
+                "MCP membrane lease [{}] granted to guest [{}] epoch {}.",
+                event.lease.lease_scope, event.lease.owner_guest_id, event.lease.lease_epoch
+            ),
+            LeaseObserverEventKind::Released => info!(
+                "MCP membrane lease [{}] released by guest [{}].",
+                event.lease.lease_scope, event.lease.owner_guest_id
+            ),
+            LeaseObserverEventKind::Renewed => info!(
+                "MCP membrane lease [{}] renewed by guest [{}] epoch {}.",
+                event.lease.lease_scope, event.lease.owner_guest_id, event.lease.lease_epoch
+            ),
+            LeaseObserverEventKind::Expired => info!(
+                "Dropping expired MCP membrane lease [{}] for guest [{}].",
+                event.lease.lease_scope, event.lease.owner_guest_id
+            ),
+            LeaseObserverEventKind::StaleOwnerDropped => info!(
+                "Dropping stale MCP membrane lease [{}] for guest [{}].",
+                event.lease.lease_scope, event.lease.owner_guest_id
+            ),
+            LeaseObserverEventKind::Revoked => info!(
+                "MCP membrane lease [{}] revoked for guest [{}].",
                 event.lease.lease_scope, event.lease.owner_guest_id
             ),
         }
@@ -1326,6 +1360,7 @@ impl IpcServer {
             materialization_requester: None,
             telegram_poll_leases: Arc::new(Mutex::new(RuntimeLeaseRegistry::default())),
             desktop_membrane_leases: Arc::new(Mutex::new(RuntimeLeaseRegistry::default())),
+            mcp_membrane_leases: Arc::new(Mutex::new(RuntimeLeaseRegistry::default())),
             subagent_leases: Arc::new(Mutex::new(RuntimeLeaseRegistry::default())),
             subagent_hooks: Arc::new(Mutex::new(HashMap::new())),
             registry: Arc::new(RwLock::new(NodeRegistry::new())),
@@ -1377,6 +1412,7 @@ impl IpcServer {
                     let materialization_requester = self.materialization_requester.clone();
                     let telegram_poll_leases = self.telegram_poll_leases.clone();
                     let desktop_membrane_leases = self.desktop_membrane_leases.clone();
+                    let mcp_membrane_leases = self.mcp_membrane_leases.clone();
                     let subagent_leases = self.subagent_leases.clone();
                     let subagent_hooks = self.subagent_hooks.clone();
                     let registry = self.registry.clone();
@@ -1393,6 +1429,7 @@ impl IpcServer {
                             materialization_requester,
                             telegram_poll_leases,
                             desktop_membrane_leases,
+                            mcp_membrane_leases,
                             subagent_leases,
                             subagent_hooks,
                             registry,
@@ -1422,6 +1459,7 @@ impl IpcServer {
         materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
         telegram_poll_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
         desktop_membrane_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
+        mcp_membrane_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
         subagent_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
         subagent_hooks: SubagentHookRegistry,
         registry: Arc<RwLock<NodeRegistry>>,
@@ -1455,6 +1493,7 @@ impl IpcServer {
                     Self::remove_subscriptions(&inboxes, conn_id, &subscribed_roles).await;
                     Self::remove_telegram_poll_leases(&telegram_poll_leases, conn_id).await;
                     Self::remove_desktop_membrane_leases(&desktop_membrane_leases, conn_id).await;
+                    Self::remove_mcp_membrane_leases(&mcp_membrane_leases, conn_id).await;
                     let _ = write_task.await;
                     return Ok(());
                 }
@@ -1481,6 +1520,7 @@ impl IpcServer {
                             materialization_requester.as_deref(),
                             &telegram_poll_leases,
                             &desktop_membrane_leases,
+                            &mcp_membrane_leases,
                             &subagent_leases,
                             &subagent_hooks,
                             &registry,
@@ -1582,6 +1622,52 @@ impl IpcServer {
             .map(|lease| lease.lease_scope)
             .collect();
         let mut observer = LoggingDesktopMembraneLeaseObserver;
+        for scope in scopes {
+            let _ = guard.release(&scope, conn_id, &mut observer);
+        }
+    }
+
+    // ── MCP membrane lease helpers ─────────────────────────────────────────
+
+    fn mcp_membrane_lease(
+        lease_key: &str,
+        authority_hotel: &str,
+        local_node_id: &str,
+        owner_guest_id: &str,
+        port: u16,
+    ) -> LeaseEnvelope {
+        LeaseEnvelope {
+            lease_type: "mcp_membrane".into(),
+            lease_scope: lease_key.to_string(),
+            authority_hotel: authority_hotel.to_string(),
+            authority_component: Some("aiua".into()),
+            owner_guest_id: owner_guest_id.to_string(),
+            owner_hotel: Some(authority_hotel.to_string()),
+            owner_component_type: Some("membrane.mcp".into()),
+            lease_epoch: 0,
+            lease_expires_at: 0,
+            last_heartbeat_at: 0,
+            status: LeaseStatus::Active,
+            delegated_from: None,
+            metadata: serde_json::json!({
+                "authority_node_id": local_node_id,
+                "port": port,
+                "surface": "mcp",
+            }),
+        }
+    }
+
+    async fn remove_mcp_membrane_leases(
+        mcp_membrane_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
+        conn_id: Uuid,
+    ) {
+        let mut guard = mcp_membrane_leases.lock().await;
+        let scopes: Vec<String> = guard
+            .active_leases_for_connection(conn_id)
+            .into_iter()
+            .map(|lease| lease.lease_scope)
+            .collect();
+        let mut observer = LoggingMcpMembraneLeaseObserver;
         for scope in scopes {
             let _ = guard.release(&scope, conn_id, &mut observer);
         }
@@ -2139,6 +2225,7 @@ impl IpcServer {
         materialization_requester: Option<&dyn GuestMaterializationRequester>,
         telegram_poll_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
         desktop_membrane_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
+        mcp_membrane_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
         subagent_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
         subagent_hooks: &SubagentHookRegistry,
         registry: &Arc<RwLock<NodeRegistry>>,
@@ -4528,6 +4615,139 @@ impl IpcServer {
                     }
                     Ok(None) => IpcResponse::Error(format!("cron job not found: {job_id}")),
                     Err(e) => IpcResponse::Error(format!("DisableCronJob failed: {e}")),
+                }
+            }
+
+            // ── MCP membrane lease ─────────────────────────────────────────
+
+            IpcRequest::AcquireMcpMembraneLease { lease_key, port } => {
+                let Some(identity) = current_identity.as_ref() else {
+                    return IpcResponse::error(
+                        "mcp_membrane_lease",
+                        "LEASE_UNREGISTERED",
+                        "guest must register before acquiring an MCP membrane lease",
+                    );
+                };
+                let Some(local_hotel_name) = Self::local_hotel_name(graph, local_node_id) else {
+                    return IpcResponse::error(
+                        "mcp_membrane_lease",
+                        "LEASE_AUTHORITY_UNKNOWN",
+                        format!(
+                            "current hotel authority could not be resolved for node [{}]",
+                            local_node_id
+                        ),
+                    );
+                };
+
+                let candidate = Self::mcp_membrane_lease(
+                    &lease_key,
+                    &local_hotel_name,
+                    local_node_id,
+                    &identity.guest_id,
+                    port,
+                );
+                let mut guard = mcp_membrane_leases.lock().await;
+                let mut observer = LoggingMcpMembraneLeaseObserver;
+                match guard.acquire(
+                    conn_id,
+                    candidate,
+                    DESKTOP_MEMBRANE_LEASE_TTL_SECS,
+                    unix_ts(),
+                    &mut observer,
+                ) {
+                    LeaseAcquireOutcome::Granted(lease) => IpcResponse::McpMembraneLease {
+                        mcp_granted: true,
+                        mcp_lease: Some(lease),
+                    },
+                    LeaseAcquireOutcome::Denied(lease) => {
+                        info!(
+                            "MCP membrane lease [{}] denied for guest [{}]; held by [{}] epoch {}.",
+                            lease.lease_scope,
+                            identity.guest_id,
+                            lease.owner_guest_id,
+                            lease.lease_epoch
+                        );
+                        IpcResponse::McpMembraneLease {
+                            mcp_granted: false,
+                            mcp_lease: Some(lease),
+                        }
+                    }
+                }
+            }
+
+            IpcRequest::RenewMcpMembraneLease { lease_key, lease_epoch } => {
+                let mut guard = mcp_membrane_leases.lock().await;
+                let mut observer = LoggingMcpMembraneLeaseObserver;
+                match guard.renew(
+                    &lease_key,
+                    conn_id,
+                    lease_epoch,
+                    DESKTOP_MEMBRANE_LEASE_TTL_SECS,
+                    unix_ts(),
+                    &mut observer,
+                ) {
+                    LeaseRenewOutcome::Renewed(lease) => IpcResponse::McpMembraneLease {
+                        mcp_granted: true,
+                        mcp_lease: Some(lease),
+                    },
+                    LeaseRenewOutcome::Lost(lease) => IpcResponse::McpMembraneLease {
+                        mcp_granted: false,
+                        mcp_lease: lease,
+                    },
+                }
+            }
+
+            IpcRequest::ReleaseMcpMembraneLease { lease_key } => {
+                let mut guard = mcp_membrane_leases.lock().await;
+                let mut observer = LoggingMcpMembraneLeaseObserver;
+                let _ = guard.release(&lease_key, conn_id, &mut observer);
+                IpcResponse::success("release_mcp_membrane_lease", None)
+            }
+
+            // ── MCP route table management ────────────────────────────────
+
+            IpcRequest::UpdateMcpRoutes { agent_id, routes } => {
+                let route_count = routes.len();
+                // Serialize and push to any active MCP membrane subscriber.
+                let task_json = serde_json::json!({
+                    "action": "update_mcp_routes",
+                    "agent_id": agent_id,
+                    "routes": routes,
+                })
+                .to_string();
+                Self::deliver_inbound_task(
+                    inboxes,
+                    local_node_id,
+                    "mcp-membrane",
+                    None,
+                    Uuid::new_v4(),
+                    task_json,
+                )
+                .await;
+                IpcResponse::McpRoutesAccepted {
+                    mcp_routes_agent_id: agent_id,
+                    mcp_route_count: route_count,
+                }
+            }
+
+            IpcRequest::RevokeMcpRoutes { agent_id } => {
+                let task_json = serde_json::json!({
+                    "action": "revoke_mcp_routes",
+                    "agent_id": agent_id,
+                })
+                .to_string();
+                Self::deliver_inbound_task(
+                    inboxes,
+                    local_node_id,
+                    "mcp-membrane",
+                    None,
+                    Uuid::new_v4(),
+                    task_json,
+                )
+                .await;
+                IpcResponse::McpRoutesAccepted {
+                    mcp_routes_agent_id: agent_id,
+                    mcp_route_count: 0,
                 }
             }
         }

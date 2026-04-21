@@ -19,7 +19,7 @@ pub use runtime::{MembraneContext, MembraneRuntime};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use philotic_client::PhiloticClient;
+use philotic_client::{IpcResponse, PhiloticClient};
 
 // ── Core trait ────────────────────────────────────────────────────────────────
 
@@ -61,4 +61,18 @@ pub trait MembraneGuest: Send + Sync + 'static {
     /// Release the lease and perform any protocol-level teardown.
     /// Called by the runtime on clean shutdown (SIGTERM / SIGINT).
     async fn teardown(&mut self, client: &mut PhiloticClient);
+
+    /// Handle a raw push message from the hotel before the default
+    /// [`OutboundReply`] extraction path runs.
+    ///
+    /// Return `Ok(true)` if the message was fully handled (runtime skips
+    /// `extract_outbound_reply` + `deliver`). Return `Ok(false)` to fall
+    /// through to the default path.
+    ///
+    /// Use this for variant-specific control messages such as route table
+    /// updates pushed by the hotel (e.g. `action=update_mcp_routes`).
+    async fn handle_push(&mut self, msg: &IpcResponse) -> Result<bool> {
+        let _ = msg;
+        Ok(false)
+    }
 }

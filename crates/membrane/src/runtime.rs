@@ -161,10 +161,16 @@ impl MembraneRuntime {
                     push = client.recv_task() => {
                         match push {
                             Ok(msg) => {
-                                if let Some(reply) = extract_outbound_reply(&msg) {
-                                    if let Err(e) = guest.deliver(reply).await {
-                                        error!(err = %e, "deliver error");
+                                match guest.handle_push(&msg).await {
+                                    Ok(true) => {} // handled by variant
+                                    Ok(false) => {
+                                        if let Some(reply) = extract_outbound_reply(&msg) {
+                                            if let Err(e) = guest.deliver(reply).await {
+                                                error!(err = %e, "deliver error");
+                                            }
+                                        }
                                     }
+                                    Err(e) => error!(err = %e, "handle_push error"),
                                 }
                             }
                             Err(e) => {

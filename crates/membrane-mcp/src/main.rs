@@ -11,13 +11,14 @@ use auth::{AllotmentTracker, VaultHashCache, VaultResolver};
 use clap::Parser;
 use membrane::{LeaseRenewResult, MembraneGuest, OutboundReply};
 use philotic_client::{IpcRequest, IpcResponse, PhiloticClient};
+use tracing::info;
 use routing::new_shared_table;
 use server::{MembraneState, build_router};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
-use tracing::{error, info, warn};
+use tracing::{error, warn};
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -121,6 +122,21 @@ impl MembraneGuest for McpMembrane {
     async fn deliver(&mut self, reply: OutboundReply) -> Result<()> {
         let turn_id = reply.turn_id().to_string();
 
+        match &reply {
+            OutboundReply::ApprovalRequired { .. } => {
+                // Philote acknowledged the approval gate — the HTTP caller continues
+                // to wait. The oneshot stays parked; it fires when the operator
+                // resolves and the philote sends the final Text/Error reply.
+                info!(turn_id, "approval required acknowledged — oneshot remains parked");
+                return Ok(());
+            }
+            OutboundReply::StreamingToken { .. } => {
+                // Streaming accumulation over MCP is not yet implemented.
+                return Ok(());
+            }
+            _ => {}
+        }
+
         let sender = {
             let mut pending = self.state.pending_responses.lock().await;
             pending.remove(&turn_id)
@@ -131,19 +147,65 @@ impl MembraneGuest for McpMembrane {
                 let _ = tx.send(content);
             }
             (OutboundReply::Error { message, .. }, Some(tx)) => {
-                // Deliver error text so the MCP caller gets a meaningful response.
-                let _ = tx.send(format!("{{\"error\": {}}}", serde_json::to_string(&message).unwrap_or_default()));
+                let _ = tx.send(
+                    serde_json::json!({ "error": message }).to_string(),
+                );
             }
-            (reply, None) => {
-                warn!(turn_id, kind = ?std::mem::discriminant(&reply), "deliver: no pending receiver for turn");
+            (_, None) => {
+                warn!(turn_id, "deliver: no pending receiver for turn");
             }
-            (reply, Some(_)) => {
-                // StreamingToken / ApprovalRequired — not yet handled for MCP.
-                warn!(turn_id, kind = ?std::mem::discriminant(&reply), "deliver: unhandled reply variant for MCP");
-            }
+            _ => {}
         }
 
         Ok(())
+    }
+
+    async fn handle_push(&mut self, msg: &IpcResponse) -> Result<bool> {
+        let task_json = match msg {
+            IpcResponse::InboundTask { task_json, .. } => task_json,
+            _ => return Ok(false),
+        };
+
+        let payload: serde_json::Value = match serde_json::from_str(task_json) {
+            Ok(v) => v,
+            Err(_) => return Ok(false),
+        };
+
+        let action = match payload.get("action").and_then(|v| v.as_str()) {
+            Some(a) => a,
+            None => return Ok(false),
+        };
+
+        match action {
+            "update_mcp_routes" => {
+                let agent_id = payload
+                    .get("agent_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let records: Vec<McpRouteRecord> = payload
+                    .get("routes")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+                let count = records.len();
+                let mut table = self.state.routing_table.write().await;
+                table.upsert_agent_routes(&agent_id, records);
+                info!(agent_id, count, "route table updated from hotel push");
+                Ok(true)
+            }
+            "revoke_mcp_routes" => {
+                let agent_id = payload
+                    .get("agent_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let mut table = self.state.routing_table.write().await;
+                table.revoke_agent_routes(&agent_id);
+                info!(agent_id, "agent routes revoked from hotel push");
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     async fn renew(&mut self, client: &mut PhiloticClient) -> Result<LeaseRenewResult> {
