@@ -37,6 +37,17 @@ pub struct InboundEnvelope {
     /// `require_approval` gates (e.g. membrane-mcp route security config).
     #[serde(default)]
     pub requires_approval: bool,
+    /// Destination node for outbound replies (hotel `EmitTask` target_node).
+    /// If None, philote defaults to the local node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_reply_to: Option<String>,
+    /// Role the hotel delivers outbound replies to (`EmitTask` target_role).
+    /// If None, philote defaults to the Telegram membrane role.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_reply_role: Option<String>,
+    /// Specific guest_id to target for outbound replies, if applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_reply_guest_id: Option<String>,
 }
 
 /// Identifies the sender of an inbound message.

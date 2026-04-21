@@ -276,6 +276,7 @@ async fn main() -> Result<()> {
         vault_cache: VaultHashCache::new(),
         allotment: AllotmentTracker::new(),
         vault: Box::new(IpcVaultResolver),
+        node_id: args.node_id.clone(),
         inbound_tx,
         pending_responses,
     });

@@ -226,13 +226,40 @@ impl MembraneRuntime {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Forward an inbound envelope to the hotel as a `CreateTask`.
+///
+/// Maps `InboundEnvelope` fields to the field names that philote's
+/// `InboundTaskPayload` expects. The two structs serve different layers
+/// (protocol-agnostic vs. philote-specific) so names don't match directly.
 async fn dispatch_inbound(
     client: &mut PhiloticClient,
     envelope: InboundEnvelope,
 ) -> Result<()> {
     use philotic_client::IpcRequest;
 
-    let payload = serde_json::to_value(&envelope)?;
+    // Extract transport hint from raw_transport metadata.
+    let transport = envelope
+        .raw_transport
+        .get("transport")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    let payload = serde_json::json!({
+        "session_id":             envelope.session_id,
+        "turn_id":                envelope.turn_id,
+        "content":                envelope.content,
+        "command":                envelope.command,
+        "attachments":            envelope.attachments,
+        "transport":              transport,
+        "sender_id":              envelope.sender.id,
+        "sender_username":        envelope.sender.username,
+        "raw_transport_event":    envelope.raw_transport,
+        "requires_approval":      envelope.requires_approval,
+        // Routing: philote uses these to know where to emit replies.
+        "final_reply_to":         envelope.final_reply_to,
+        "final_reply_role":       envelope.final_reply_role,
+        "final_reply_guest_id":   envelope.final_reply_guest_id,
+    });
+
     let req = IpcRequest::CreateTask {
         target_role: "philote".into(),
         payload,

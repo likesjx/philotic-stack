@@ -36,6 +36,9 @@ pub struct MembraneState {
     pub vault_cache: VaultHashCache,
     pub allotment: AllotmentTracker,
     pub vault: Box<dyn VaultResolver>,
+    /// Hotel node ID — used as `final_reply_to` so philote routes replies
+    /// back through the local hotel to the mcp-membrane role.
+    pub node_id: String,
     /// Channel into the runtime's IPC dispatch loop; HTTP handlers send
     /// envelopes here which the runtime forwards to the hotel as CreateTask.
     pub inbound_tx: mpsc::Sender<InboundEnvelope>,
@@ -224,6 +227,10 @@ async fn handle_tools_call(
         reply_to: Some(turn_id.clone()),
         raw_transport: json!({ "transport": "mcp", "tool": tool_name }),
         requires_approval,
+        // Route philote replies back to this hotel node, role=mcp-membrane.
+        final_reply_to: Some(state.node_id.clone()),
+        final_reply_role: Some("mcp-membrane".into()),
+        final_reply_guest_id: None,
     };
 
     // Park a oneshot waiting for the philote reply.
