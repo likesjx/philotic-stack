@@ -1275,7 +1275,7 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
     {
         let heartbeat_socket = daemon.socket();
         let heartbeat_graph = ctx.graph_domain.clone();
-        let heartbeat_hotel_name = ctx.hotel_name.clone();
+        let heartbeat_hotel = ctx.hotel.clone();
         let heartbeat_caps = ctx.caps.clone();
         let mut heartbeat_shutdown = ctx.shutdown_tx.subscribe();
         tokio::spawn(async move {
@@ -1293,17 +1293,6 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
                         if targets.is_empty() {
                             continue;
                         }
-                        let heartbeat_hotel = match heartbeat_graph.get_hotel(&heartbeat_hotel_name) {
-                            Ok(Some(hotel)) => hotel,
-                            Ok(None) => {
-                                warn!("Skipping heartbeat: hotel record [{}] missing", heartbeat_hotel_name);
-                                continue;
-                            }
-                            Err(err) => {
-                                warn!("Failed to load current hotel record [{}] for heartbeat: {}", heartbeat_hotel_name, err);
-                                continue;
-                            }
-                        };
                         let execution_reachability =
                             execution_reachability_for_hotel(heartbeat_graph.as_ref(), &heartbeat_hotel);
                         let node_health =
@@ -1340,7 +1329,7 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
     {
         let capability_socket = daemon.socket();
         let capability_graph = ctx.graph_domain.clone();
-        let capability_hotel_name = ctx.hotel_name.clone();
+        let capability_hotel = ctx.hotel.clone();
         let capability_caps = ctx.caps.clone();
         let mut capability_shutdown = ctx.shutdown_tx.subscribe();
         tokio::spawn(async move {
@@ -1361,24 +1350,6 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
                         if targets.is_empty() {
                             continue;
                         }
-                        let capability_hotel = match capability_graph.get_hotel(&capability_hotel_name) {
-                            Ok(Some(hotel)) => hotel,
-                            Ok(None) => {
-                                warn!(
-                                    "Skipping capability sync: hotel record [{}] missing",
-                                    capability_hotel_name
-                                );
-                                continue;
-                            }
-                            Err(err) => {
-                                warn!(
-                                    "Failed to load current hotel record [{}] for capability sync: {}",
-                                    capability_hotel_name,
-                                    err
-                                );
-                                continue;
-                            }
-                        };
 
                         let advertisements = match local_capability_advertisements(capability_graph.as_ref(), &capability_hotel) {
                             Ok(advertisements) => advertisements,
@@ -1413,7 +1384,6 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
                                 &advertisements,
                                 Some(execution_reachability.clone()),
                                 &auth_key,
-                                None,
                             )
                             .await
                             {

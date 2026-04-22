@@ -885,6 +885,7 @@ struct PendingPipeline {
 
 pub(crate) type PendingPipelineRegistry = Arc<Mutex<HashMap<String, PendingPipeline>>>;
 
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AgentRouteResolution {
     Deliver(Option<String>),
@@ -2323,6 +2324,7 @@ impl IpcServer {
     pub(crate) fn pending_pipelines(&self) -> PendingPipelineRegistry {
         self.pending_pipelines.clone()
     }
+
 
     pub(crate) fn materialization_requester_arc(
         &self,
