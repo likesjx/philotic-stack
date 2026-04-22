@@ -1,6 +1,6 @@
 use crate::registry::{CapabilityAdvertisement, ExecutionReachability};
 use crate::authz::MeshAuth;
-use crate::{BeaconMessage, MsgType, NodeCapabilities};
+use crate::{BeaconMessage, MsgType, NodeCapabilities, NodeHealthSnapshot};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -14,6 +14,9 @@ pub struct HeartbeatPayload {
     pub advertisements: Vec<CapabilityAdvertisement>,
     #[serde(default)]
     pub execution_reachability: Option<ExecutionReachability>,
+    /// Environment vitals sampled at emit time; absent on older nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_health: Option<NodeHealthSnapshot>,
 }
 
 /// Emits heartbeat messages over the given UDP socket to a target address.
@@ -24,11 +27,13 @@ pub async fn emit_heartbeat(
     advertisements: &[CapabilityAdvertisement],
     execution_reachability: Option<ExecutionReachability>,
     auth_key: &str,
+    node_health: Option<NodeHealthSnapshot>,
 ) -> Result<()> {
     let payload = HeartbeatPayload {
         capabilities: capabilities.clone(),
         advertisements: advertisements.to_vec(),
         execution_reachability,
+        node_health,
     };
 
     let msg_id = Uuid::new_v4();

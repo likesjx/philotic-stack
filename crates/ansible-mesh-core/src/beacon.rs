@@ -187,6 +187,7 @@ impl BeaconDaemon {
                         payload.capabilities,
                         payload.advertisements,
                         payload.execution_reachability,
+                        payload.node_health,
                     );
                 }
             }
