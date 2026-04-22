@@ -36,6 +36,26 @@ fn sanitize_turn_content_for_history(content: &str) -> String {
     content.to_string()
 }
 
+fn sanitize_timezone_for_prompt(raw: &str) -> Option<String> {
+    let tz = raw.trim();
+    if tz.is_empty() || tz.len() > 128 {
+        return None;
+    }
+    if tz.chars().any(|ch| ch.is_control()) {
+        return None;
+    }
+    if tz.starts_with('/') || tz.ends_with('/') || tz.contains("//") {
+        return None;
+    }
+    if !tz
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '_' | '-' | '+'))
+    {
+        return None;
+    }
+    Some(tz.to_string())
+}
+
 fn first_line_summary(text: &str) -> String {
     text.lines()
         .find(|line| !line.trim().is_empty())
@@ -1583,6 +1603,7 @@ impl SessionState {
             .agent_profile
             .user_timezone
             .as_deref()
+            .and_then(sanitize_timezone_for_prompt)
             .map(|tz| format!(" (user timezone: {tz})"))
             .unwrap_or_default();
         let persona_line = if let Some(ref name) = self.agent_profile.persona_name {
@@ -2060,7 +2081,8 @@ impl SessionState {
             "[Recalled memory]\n\
              Note: if a memory describes an event (something that happened), \
              it must include a timestamp in its content. \
-             When writing new memories of this kind, always include an ISO 8601 date.\n",
+             When writing new memories of this kind, always include an ISO 8601 timestamp \
+             (date and time).\n",
         );
         for (i, memory) in turn.recalled_memories.iter().enumerate() {
             out.push_str(&format!(

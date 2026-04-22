@@ -89,6 +89,7 @@ const HEADER_CORP: &str = "cross-origin-resource-policy";
 struct AppState {
     token: Arc<String>,
     db_path: PathBuf,
+    hotel: Arc<String>,
     /// IPC socket path for the connected hotel
     socket: Arc<String>,
     /// Broadcast channel for WebSocket push events
@@ -253,6 +254,7 @@ pub async fn run(
     let state = AppState {
         token: Arc::new(token.clone()),
         db_path,
+        hotel: Arc::new(hotel),
         socket: Arc::new(socket),
         tx,
     };
@@ -275,6 +277,10 @@ pub async fn run(
             axum::routing::patch(handle_role_patch),
         )
         .route("/api/agents/:agent_id/rules", get(handle_agent_rules))
+        .route(
+            "/api/user-profile",
+            get(handle_user_profile_get).patch(handle_user_profile_patch),
+        )
         .route(
             "/api/agents/:agent_id/routing-policies",
             get(handle_agent_routing_policies),
@@ -2002,6 +2008,102 @@ async fn handle_agent_patch(
             Json(json!({"error": e.to_string()})),
         )
             .into_response(),
+    }
+}
+
+// ── GET /api/user-profile ─────────────────────────────────────────────────────
+
+async fn handle_user_profile_get(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    let hotel_name = state.hotel.as_ref().clone();
+    match ipc_get_user_profile(&state.socket, &hotel_name).await {
+        Ok(profile) => Json(profile).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// ── PATCH /api/user-profile ───────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct PatchUserProfileBody {
+    #[serde(default)]
+    timezone: Option<String>,
+    #[serde(default)]
+    display_name: Option<String>,
+}
+
+async fn handle_user_profile_patch(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(body): Json<PatchUserProfileBody>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    let hotel_name = state.hotel.as_ref().clone();
+    match ipc_patch_user_profile(&state.socket, &hotel_name, body.timezone, body.display_name)
+        .await
+    {
+        Ok(profile) => {
+            let event = json!({ "type": "user_profile:updated" });
+            let _ = state.tx.send(event.to_string());
+            Json(profile).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn ipc_get_user_profile(socket: &str, hotel_name: &str) -> Result<Value> {
+    let mut client = connect_management_client(socket, "philotic-web-user-profile").await?;
+    match client
+        .send_request(IpcRequest::GetUserProfile {
+            hotel_name: hotel_name.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::UserProfileData {
+            timezone,
+            display_name,
+        } => Ok(json!({ "timezone": timezone, "display_name": display_name })),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected get_user_profile response: {other:?}")),
+    }
+}
+
+async fn ipc_patch_user_profile(
+    socket: &str,
+    hotel_name: &str,
+    timezone: Option<String>,
+    display_name: Option<String>,
+) -> Result<Value> {
+    let mut client = connect_management_client(socket, "philotic-web-user-profile").await?;
+    match client
+        .send_request(IpcRequest::PatchUserProfile {
+            hotel_name: hotel_name.to_string(),
+            timezone,
+            display_name,
+        })
+        .await?
+    {
+        IpcResponse::UserProfileData {
+            timezone,
+            display_name,
+        } => Ok(json!({ "timezone": timezone, "display_name": display_name })),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected patch_user_profile response: {other:?}")),
     }
 }
 

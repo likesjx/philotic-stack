@@ -22,7 +22,7 @@ use crate::graph::{
 use crate::storage::{
     AgentIdentityRecord, GraphAdapter, GraphRunnerInstanceRecord, GuestRecord, HotelRecord,
     SecretRecord, SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,
-    VaultRegistryEntry, CONFIG_GRAPH_RUNNER_REGISTRY, CONFIG_MUNINN_ENDPOINT,
+    UserProfile, VaultRegistryEntry, CONFIG_GRAPH_RUNNER_REGISTRY, CONFIG_MUNINN_ENDPOINT,
     CONFIG_VAULT_REGISTRY,
 };
 use crate::NodeCapabilities;
@@ -913,6 +913,33 @@ impl GraphDomain {
                     .context("GraphDomain::list_toolset_profiles: deserialize ToolsetProfileRecord")
             })
             .collect()
+    }
+
+    // ── User profile ──────────────────────────────────────────────────────────
+
+    fn user_profile_key(hotel_name: &str) -> String {
+        format!("{}:{}", NODE_KIND_USER_PROFILE, hotel_name)
+    }
+
+    pub fn upsert_user_profile(&self, hotel_name: &str, profile: &UserProfile) -> Result<()> {
+        let data = serde_json::to_value(profile)
+            .context("GraphDomain::upsert_user_profile: serialize UserProfile")?;
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::user_profile_key(hotel_name),
+            kind: NODE_KIND_USER_PROFILE.to_string(),
+            label: Some(hotel_name.to_string()),
+            data,
+        })
+    }
+
+    pub fn get_user_profile(&self, hotel_name: &str) -> Result<Option<UserProfile>> {
+        self.adapter
+            .get_node(&Self::user_profile_key(hotel_name))?
+            .map(|n| {
+                serde_json::from_value(n.data)
+                    .context("GraphDomain::get_user_profile: deserialize UserProfile")
+            })
+            .transpose()
     }
 
     // ── Node capabilities ─────────────────────────────────────────────────────

@@ -27,4 +27,4 @@ pub const NODE_KIND_NODE_CAPABILITIES: &str = "node_capabilities";
 pub const NODE_KIND_CONFIG: &str = "config";
 pub const NODE_KIND_APARTMENT: &str = "apartment";
 pub const NODE_KIND_CRON_JOB: &str = "cron_job";
-
+pub const NODE_KIND_USER_PROFILE: &str = "user_profile";

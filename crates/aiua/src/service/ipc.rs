@@ -3205,6 +3205,7 @@ impl IpcServer {
             "PHILOTIC_HOTEL_SOCKET".into(),
             hotel.ipc_socket_path.to_string(),
         );
+        env.insert("PHILOTIC_HOTEL_NAME".into(), hotel_name.clone());
         env.insert("PHILOTIC_NODE_ID".into(), local_node_id.to_string());
         env.insert("PHILOTIC_AGENT_ID".into(), role_record.agent_id.clone());
         env.insert("PHILOTIC_GUEST_ID".into(), role_record.guest_id.clone());
@@ -6108,6 +6109,54 @@ impl IpcServer {
                         "patch_agent_bundle",
                         "PATCH_AGENT_BUNDLE_ERROR",
                         err.to_string(),
+                    ),
+                }
+            }
+            IpcRequest::GetUserProfile { hotel_name } => {
+                match graph.get_user_profile(&hotel_name) {
+                    Ok(Some(p)) => IpcResponse::UserProfileData {
+                        timezone: p.timezone,
+                        display_name: p.display_name,
+                    },
+                    Ok(None) => IpcResponse::UserProfileData {
+                        timezone: None,
+                        display_name: None,
+                    },
+                    Err(e) => IpcResponse::error(
+                        "get_user_profile",
+                        "GET_USER_PROFILE_ERROR",
+                        e.to_string(),
+                    ),
+                }
+            }
+            IpcRequest::PatchUserProfile {
+                hotel_name,
+                timezone,
+                display_name,
+            } => {
+                let existing = match graph.get_user_profile(&hotel_name) {
+                    Ok(profile) => profile.unwrap_or_default(),
+                    Err(e) => {
+                        return IpcResponse::error(
+                            "patch_user_profile",
+                            "PATCH_USER_PROFILE_READ_ERROR",
+                            e.to_string(),
+                        );
+                    }
+                };
+                let updated = ansible_mesh_core::storage::UserProfile {
+                    timezone: timezone.or(existing.timezone),
+                    display_name: display_name.or(existing.display_name),
+                };
+                match graph.upsert_user_profile(&hotel_name, &updated) {
+                    Ok(()) => IpcResponse::UserProfileData {
+                        timezone: updated.timezone,
+                        display_name: updated.display_name,
+                    },
+                    Err(e) => IpcResponse::error(
+                        "patch_user_profile",
+                        "PATCH_USER_PROFILE_ERROR",
+                        e.to_string(),
                     ),
                 }
             }

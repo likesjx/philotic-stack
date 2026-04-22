@@ -1752,6 +1752,7 @@ fn agent_guests_for_profile(hotel_name: &str, profile: &AgentProfile) -> GuestRe
             "command": "philote",
             "args": [],
             "env": {
+                "PHILOTIC_HOTEL_NAME": hotel_name,
                 "PHILOTIC_HOTEL_SOCKET": socket_path,
                 "PHILOTIC_NODE_ID": node_id,
                 "PHILOTIC_AGENT_ID": profile.agent_id

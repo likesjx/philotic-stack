@@ -837,6 +837,18 @@ pub enum IpcRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         response_route_policy: Option<ResponseRoutePolicyView>,
     },
+    /// Get the hotel-scoped user profile.
+    GetUserProfile {
+        hotel_name: String,
+    },
+    /// Patch the hotel-scoped user profile. Only provided fields are updated.
+    PatchUserProfile {
+        hotel_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timezone: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
+    },
     /// List all registered skills with their validation states.
     ListSkills {},
     /// Get a single toolset profile by name.
@@ -1275,6 +1287,11 @@ pub enum IpcResponse {
     /// Response to [`IpcRequest::PatchAgentBundle`].
     AgentUpdated {
         agent: DesktopMembraneAgentView,
+    },
+    /// Response to [`IpcRequest::GetUserProfile`] and [`IpcRequest::PatchUserProfile`].
+    UserProfileData {
+        timezone: Option<String>,
+        display_name: Option<String>,
     },
     /// Response to [`IpcRequest::AssignSkill`] and [`IpcRequest::RevokeSkill`].
     SkillAssigned {

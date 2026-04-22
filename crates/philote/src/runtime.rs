@@ -808,6 +808,33 @@ impl AgentRuntime {
                 warn!("Unexpected response to agent bundle fetch — using default profile.");
             }
         }
+
+        // Fetch hotel-level user profile and inject into agent profile when the
+        // agent-specific profile doesn't already override the field.
+        if let Some(hotel_name) = local_hotel_name() {
+            match self
+                .ipc_client
+                .send_request(IpcRequest::GetUserProfile {
+                    hotel_name: hotel_name.clone(),
+                })
+                .await
+            {
+                Ok(IpcResponse::UserProfileData {
+                    timezone,
+                    display_name: _,
+                }) => {
+                    if self.default_agent_profile.user_timezone.is_none() {
+                        if let Some(tz) = timezone {
+                            info!(hotel = %hotel_name, tz = %tz, "Injecting user timezone from hotel user profile.");
+                            self.default_agent_profile.user_timezone = Some(tz);
+                        }
+                    }
+                }
+                Ok(_) | Err(_) => {
+                    // Non-fatal — hotel may not have a user profile configured yet.
+                }
+            }
+        }
     }
 
     /// Fetch a role incarnation from the hotel and return a `RoleActivation` for it.
@@ -8969,6 +8996,13 @@ impl AgentRuntime {
             .await?;
         Ok(())
     }
+}
+
+fn local_hotel_name() -> Option<String> {
+    std::env::var("PHILOTIC_HOTEL_NAME")
+        .ok()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
 }
 
 /// Executes a shell command via `sh -c`, capturing stdout/stderr and enforcing a timeout.
