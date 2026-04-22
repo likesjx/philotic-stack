@@ -33,7 +33,7 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
     match skill_name {
         "handoff.to_role" => &["session.status", "handoff.to_role", "handoff.back"],
         "handoff.back" => &["session.status", "handoff.back"],
-        "role.governance" => &["session.status", "agent.configure", "role.create_or_update"],
+        "role.governance" => &["session.status", "agent.configure", "role.create_or_update", "role.set_home"],
         "role.authoring" => &["session.status", "role.create_or_update", "handoff.to_role"],
         "memory" => &["memory.recall", "memory.remember"],
         "routing.refinement" => &[
@@ -575,6 +575,42 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                 "required": ["summary"]
             }),
             class: Some("handoff".into()),
+        },
+    );
+
+    m.insert(
+        "role.set_home".into(),
+        ToolDefinition {
+            tool_name: "role.set_home".into(),
+            description: "Pin a role to a specific hotel so its philote process runs there, \
+                          or clear an existing pin to return it to the authority hotel. \
+                          Use this to place specialised roles on the machines where they \
+                          have the right tool access — for example, pin an obsidian-keeper \
+                          role to the machine where the Obsidian vault lives, or move yourself \
+                          to a more capable host. Requires operator approval. \
+                          After pinning, the next handoff.to_role call for that role will \
+                          automatically route across the mesh."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "role_name": {
+                        "type": "string",
+                        "description": "The role to move. Use your current active role name to move yourself."
+                    },
+                    "target_hotel": {
+                        "type": "string",
+                        "description": "The hotel node_id to run the role on (e.g. 'mac-jane'). \
+                                        Omit or pass null to clear the pin and run on the authority hotel."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why this placement is needed. Required for operator visibility."
+                    }
+                },
+                "required": ["role_name", "reason"]
+            }),
+            class: Some("config".into()),
         },
     );
 

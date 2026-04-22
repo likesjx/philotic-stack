@@ -720,6 +720,16 @@ pub enum IpcRequest {
         role_name: String,
         handoff_bundle: HandoffBundle,
     },
+    /// Pin or unpin a role to a specific home hotel.
+    /// `target_hotel: None` clears the pin (role runs on authority hotel).
+    SetRoleHome {
+        agent_id: String,
+        role_name: String,
+        /// The calling role — authority check (orchestrator or admin only).
+        calling_role: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_hotel: Option<String>,
+    },
     HandoffBack {
         session_id: String,
         summary: String,
@@ -1311,6 +1321,12 @@ pub enum IpcResponse {
     /// Response to [`IpcRequest::ConfigureRole`].
     ConfigureRoleOk {
         role_name: String,
+    },
+    /// Response to [`IpcRequest::SetRoleHome`].
+    RoleHomeSet {
+        role_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        home_node: Option<String>,
     },
     /// Response to [`IpcRequest::ExecuteWorkflow`].
     WorkflowExecutionOk {

@@ -62,6 +62,12 @@ pub fn command_manifest(_active_skills: &[String]) -> Vec<CommandManifestEntry> 
             usage_hint: Some("/tts [on|off|auto]".into()),
         },
         CommandManifestEntry {
+            command: "voice".into(),
+            description: "Switch voice provider (and optionally voice ID) for this session."
+                .into(),
+            usage_hint: Some("/voice [kokoro|elevenlabs|openai] [voice_id]".into()),
+        },
+        CommandManifestEntry {
             command: "preapprove".into(),
             description: "Pre-approve a tool or class for this session.".into(),
             usage_hint: Some("/preapprove <tool|class> | this-session".into()),
@@ -100,6 +106,11 @@ pub enum SlashCommand {
     /// Explicitly cancel a parked approval turn, unblocking the session and notifying the original chat.
     ApprovalClear { reason: Option<String> },
     Tts { mode: Option<String> },
+    /// Switch voice provider (and optionally voice ID) for this session.
+    Voice {
+        provider: Option<String>,
+        voice_id: Option<String>,
+    },
 }
 
 impl SlashCommand {
@@ -128,6 +139,7 @@ impl SlashCommand {
             | Self::ApprovalReset
             | Self::ApprovalClear { .. } => None,
             Self::Tts { .. } => None,
+            Self::Voice { .. } => None,
         }
     }
 
@@ -191,7 +203,28 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         ["/tts", mode, ..] => Some(SlashCommand::Tts {
             mode: Some((*mode).to_string()),
         }),
+        ["/voice"] => Some(SlashCommand::Voice {
+            provider: None,
+            voice_id: None,
+        }),
+        ["/voice", provider] => Some(SlashCommand::Voice {
+            provider: Some(normalize_voice_provider(provider)),
+            voice_id: None,
+        }),
+        ["/voice", provider, voice_id, ..] => Some(SlashCommand::Voice {
+            provider: Some(normalize_voice_provider(provider)),
+            voice_id: Some((*voice_id).to_string()),
+        }),
         _ => None,
+    }
+}
+
+fn normalize_voice_provider(raw: &str) -> String {
+    match raw.to_lowercase().as_str() {
+        "kokoro" | "onnx" | "local" => "onnx".into(),
+        "elevenlabs" | "eleven" | "11labs" => "elevenlabs".into(),
+        "openai" | "tts" => "openai".into(),
+        other => other.to_string(),
     }
 }
 

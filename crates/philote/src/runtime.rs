@@ -1740,6 +1740,7 @@ impl AgentRuntime {
                 | SlashCommand::ApprovalStatus
                 | SlashCommand::ApprovalReset => {}
                 SlashCommand::Tts { .. } => {}
+                SlashCommand::Voice { .. } => {}
                 SlashCommand::Abandon { .. } => {}
             }
         }
@@ -2025,7 +2026,7 @@ impl AgentRuntime {
                 }
                 // ApprovalClear always returns from the pre-turn gate above; unreachable here.
                 SlashCommand::ApprovalClear { .. } => Ok(()),
-                SlashCommand::Tts { .. } => {
+                SlashCommand::Tts { .. } | SlashCommand::Voice { .. } => {
                     self.handle_session_control_command(
                         task_id, session_id, turn_id, chat_id, command,
                     )
@@ -4855,7 +4856,8 @@ impl AgentRuntime {
                 | SlashCommand::ApprovalReset
                 | SlashCommand::ApprovalClear { .. }
                 | SlashCommand::Abandon { .. }
-                | SlashCommand::Tts { .. } => {}
+                | SlashCommand::Tts { .. }
+                | SlashCommand::Voice { .. } => {}
             }
             (
                 state.checkpoint_memory_type(),
@@ -5076,7 +5078,8 @@ impl AgentRuntime {
             | SlashCommand::ApprovalReset
             | SlashCommand::ApprovalClear { .. }
             | SlashCommand::Abandon { .. }
-            | SlashCommand::Tts { .. } => {}
+            | SlashCommand::Tts { .. }
+            | SlashCommand::Voice { .. } => {}
         }
 
         Ok(())
@@ -5903,6 +5906,52 @@ impl AgentRuntime {
                 .await;
         }
 
+        // Handle /voice — switches provider and optional voice_id for this session.
+        if let SlashCommand::Voice {
+            ref provider,
+            ref voice_id,
+        } = command
+        {
+            let reply = if let Some(state) = self.sessions.get_mut(&session_id) {
+                let policy = &mut state.agent_profile.voice_response_policy;
+                match provider.as_deref() {
+                    Some(p) => {
+                        policy.provider = Some(p.to_string());
+                        if let Some(vid) = voice_id.as_deref() {
+                            policy.voice_id = Some(vid.to_string());
+                            format!("Switched to {p} voice, using {vid} for this session.")
+                        } else {
+                            format!("Switched to {p} voice for this session.")
+                        }
+                    }
+                    None => {
+                        let current_provider = policy.provider.as_deref().unwrap_or("default");
+                        let current_voice = policy.voice_id.as_deref().unwrap_or("default");
+                        format!(
+                            "Current voice provider: {current_provider}, voice: {current_voice}."
+                        )
+                    }
+                }
+            } else {
+                "No active session.".to_string()
+            };
+            let _ = self
+                .ipc_client
+                .send_request(IpcRequest::UpdateTask {
+                    task_id: command_task_id,
+                    state: "session_policy_updated".into(),
+                    payload: serde_json::json!({
+                        "session_id": session_id,
+                        "turn_id": command_turn_id,
+                        "chat_id": command_chat_id,
+                    }),
+                })
+                .await?;
+            return self
+                .complete_local_command(session_id, command_turn_id, reply)
+                .await;
+        }
+
         let (
             reply_content,
             update_state,
@@ -6139,6 +6188,7 @@ impl AgentRuntime {
                 }
                 SlashCommand::Ping
                 | SlashCommand::Tts { .. }
+                | SlashCommand::Voice { .. }
                 | SlashCommand::Role { .. }
                 | SlashCommand::Roles
                 | SlashCommand::Back
@@ -7524,6 +7574,130 @@ impl AgentRuntime {
                     ..Default::default()
                 })
                 .await
+            }
+
+            "role.set_home" => {
+                let args = payload.arguments.as_object();
+                let role_name = args
+                    .and_then(|a| a.get("role_name"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let target_hotel = args
+                    .and_then(|a| a.get("target_hotel"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty() && s.to_lowercase() != "null")
+                    .map(str::to_string);
+                let reason = args
+                    .and_then(|a| a.get("reason"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+
+                let Some(role_name) = role_name else {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "role.set_home: missing required argument 'role_name'".into(),
+                        )
+                        .await;
+                };
+                let Some(reason) = reason else {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "role.set_home: missing required argument 'reason'".into(),
+                        )
+                        .await;
+                };
+
+                // Resolve the calling role from active session state.
+                let calling_role = self
+                    .sessions
+                    .get(&payload.session_id)
+                    .and_then(|s| s.role_activation.as_ref())
+                    .map(|r| r.role_name.clone())
+                    .unwrap_or_else(|| "orchestrator".into());
+
+                let _ = reason; // recorded for operator visibility in approval surface
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::SetRoleHome {
+                        agent_id: self.agent_id.clone(),
+                        role_name: role_name.clone(),
+                        calling_role,
+                        target_hotel: target_hotel.clone(),
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::RoleHomeSet { role_name: name, home_node }) => {
+                        let msg = match home_node {
+                            Some(ref node) => format!(
+                                "Role '{name}' pinned to hotel '{node}'. Next handoff.to_role will route there."
+                            ),
+                            None => format!(
+                                "Role '{name}' home cleared — will run on authority hotel."
+                            ),
+                        };
+                        (msg, None)
+                    }
+                    Ok(IpcResponse::Error(msg)) => {
+                        let e = TaskErrorPayload::tool_execution(
+                            "role.set_home",
+                            msg,
+                            Some("SET_ROLE_HOME_REJECTED"),
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => {
+                        let e = TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            "role.set_home: unexpected hotel response",
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("role.set_home: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+
+                if let Some(err) = tool_err {
+                    self.handle_tool_result(InboundTaskPayload {
+                        action: Some("tool_result".into()),
+                        agent_action: None,
+                        handoff_bundle: None,
+                        source: Some("agent".into()),
+                        session_id: Some(payload.session_id),
+                        turn_id: Some(payload.turn_id),
+                        transport: None,
+                        chat_id: Some(payload.chat_id),
+                        thread_id: None,
+                        sender_id: None,
+                        sender_username: None,
+                        message_kind: None,
+                        content: Some(content),
+                        attachments: Vec::new(),
+                        command: None,
+                        callback_data: None,
+                        raw_transport_event: None,
+                        error: Some(err),
+                        tool_name: Some(payload.tool_name),
+                        arguments: None,
+                        final_reply_to: Some(payload.final_reply_to),
+                        final_reply_role: Some(payload.final_reply_role),
+                        final_reply_guest_id: payload.final_reply_guest_id,
+                        ..Default::default()
+                    })
+                    .await
+                } else {
+                    self.complete_local_command(payload.session_id, payload.turn_id, content)
+                        .await
+                }
             }
 
             "handoff.to_role" => {

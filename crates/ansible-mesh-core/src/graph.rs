@@ -287,6 +287,11 @@ pub struct RoleIncarnationRecord {
     pub inactive_ttl_seconds: Option<u64>,
     #[serde(default)]
     pub turn_loop_config: TurnLoopConfig,
+    /// The hotel (node_id) where this role's philote guest process should run.
+    /// When set to a remote hotel, `HandoffToRole` routes via the mesh instead of
+    /// materializing locally. When `None`, the role runs on the authority hotel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_node: Option<String>,
 }
 
 impl RoleIncarnationRecord {

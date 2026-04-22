@@ -846,12 +846,15 @@ fn project_effective_rights(bindings: &serde_json::Value) -> Vec<String> {
 }
 
 #[derive(Debug, Clone)]
-struct ParkedInboundTask {
+pub(crate) struct ParkedInboundTask {
     source_node: String,
     task_id: Uuid,
     task_json: String,
     activate_session_id: Option<String>,
 }
+
+pub(crate) type ParkedInboundRegistry =
+    Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AgentRouteResolution {
@@ -2262,6 +2265,16 @@ impl IpcServer {
         self.inboxes.clone()
     }
 
+    pub(crate) fn parked_inbound(&self) -> ParkedInboundRegistry {
+        self.parked_inbound.clone()
+    }
+
+    pub(crate) fn materialization_requester_arc(
+        &self,
+    ) -> Option<Arc<dyn GuestMaterializationRequester>> {
+        self.materialization_requester.clone()
+    }
+
     pub async fn run(&self) -> anyhow::Result<()> {
         let path = Path::new(&self.socket_path);
 
@@ -3467,6 +3480,7 @@ impl IpcServer {
                 context_window_policy,
                 loop_script: None,
             },
+            home_node: None,
         };
 
         if let Err(e) = graph.upsert_role_incarnation(&record) {
@@ -5207,6 +5221,56 @@ impl IpcServer {
                             );
                         }
                     };
+
+                // Remote role: dispatch over mesh to the role's home hotel.
+                if let Some(ref home_node) = target_role.home_node.clone() {
+                    if home_node != local_node_id {
+                        let toolset_record = graph
+                            .get_toolset_profile(&target_role.toolset_profile)
+                            .ok()
+                            .flatten();
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let task_id = Uuid::new_v4();
+                        let event = EventEnvelope {
+                            event_id: task_id,
+                            seq: 0,
+                            source_node_id: local_node_id.to_string(),
+                            target_node_id: Some(home_node.clone()),
+                            source_agent_id: identity.guest_id.clone(),
+                            target_agent_id: Some(target_role.routing_role()),
+                            kind: ansible_mesh_core::event::EventKind::SessionControl,
+                            corr_id: session_id.clone(),
+                            attempt: 0,
+                            created_at: ts,
+                            expires_at: None,
+                            payload: ansible_mesh_core::event::EventPayload::Inline {
+                                data: serde_json::json!({
+                                    "action": "session.handoff",
+                                    "session_id": session_id,
+                                    "role_name": role_name,
+                                    "handoff_bundle": handoff_bundle,
+                                    "role_record": target_role,
+                                    "toolset_record": toolset_record,
+                                })
+                                .to_string(),
+                            },
+                            trace: vec![],
+                        };
+                        let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(event)).await;
+                        info!(
+                            "Dispatched remote handoff for role '{}' to home_node '{}'",
+                            role_name, home_node
+                        );
+                        return IpcResponse::HandoffAck {
+                            handoff_guest_id: target_role.guest_id,
+                            became_active: false,
+                        };
+                    }
+                }
+
                 let readiness = match Self::ensure_role_materialized(
                     graph,
                     inboxes,
@@ -5456,6 +5520,81 @@ impl IpcServer {
                         "HANDOFF_DELIVERY_FAILED",
                         err.to_string(),
                     ),
+                }
+            }
+            IpcRequest::SetRoleHome {
+                agent_id,
+                role_name,
+                calling_role,
+                target_hotel,
+            } => {
+                let Some(identity) = current_identity.as_ref() else {
+                    return IpcResponse::error(
+                        "set_role_home",
+                        "SET_ROLE_HOME_UNREGISTERED",
+                        "guest must register before calling set_role_home",
+                    );
+                };
+                if identity.role != "agent" {
+                    return IpcResponse::error(
+                        "set_role_home",
+                        "SET_ROLE_HOME_FORBIDDEN",
+                        "only agent guests may call set_role_home",
+                    );
+                }
+
+                // Only the orchestrator or admin roles may move roles.
+                let calling_role_record = graph.get_role_incarnation(&agent_id, &calling_role);
+                let is_admin = calling_role_record
+                    .ok()
+                    .flatten()
+                    .map(|r| r.is_admin || r.role_name == "orchestrator")
+                    .unwrap_or(false);
+                if !is_admin {
+                    return IpcResponse::error(
+                        "set_role_home",
+                        "SET_ROLE_HOME_FORBIDDEN",
+                        format!(
+                            "role '{}' does not have authority to set home_node for other roles",
+                            calling_role
+                        ),
+                    );
+                }
+
+                let mut record = match graph.get_role_incarnation(&agent_id, &role_name) {
+                    Ok(Some(r)) => r,
+                    Ok(None) => {
+                        return IpcResponse::error(
+                            "set_role_home",
+                            "SET_ROLE_HOME_UNKNOWN",
+                            format!("role '{}' not found for agent '{}'", role_name, agent_id),
+                        );
+                    }
+                    Err(err) => {
+                        return IpcResponse::error(
+                            "set_role_home",
+                            "SET_ROLE_HOME_DB_ERROR",
+                            err.to_string(),
+                        );
+                    }
+                };
+
+                record.home_node = target_hotel.clone();
+                if let Err(err) = graph.upsert_role_incarnation(&record) {
+                    return IpcResponse::error(
+                        "set_role_home",
+                        "SET_ROLE_HOME_PERSIST_FAILED",
+                        err.to_string(),
+                    );
+                }
+
+                info!(
+                    "Role '{}' (agent '{}') home_node set to {:?} by '{}'",
+                    role_name, agent_id, target_hotel, calling_role
+                );
+                IpcResponse::RoleHomeSet {
+                    role_name,
+                    home_node: target_hotel,
                 }
             }
             IpcRequest::DelegateToPeer {
@@ -6979,7 +7118,7 @@ impl IpcServer {
                     active_jobs: 0,
                     queue_depth: 0,
                 };
-                registry.write().await.update_node(caps, vec![ad], None);
+                registry.write().await.update_node(caps, vec![ad], None, None);
                 if let Some(path) = socket_path {
                     peer_sockets.write().await.insert(node_id, path);
                 }
@@ -9327,6 +9466,148 @@ impl IpcServer {
             })
             .collect::<Vec<_>>();
         serde_json::json!({ "nodes": nodes })
+    }
+
+    /// Handle a `session.handoff` mesh event received from a remote hotel.
+    ///
+    /// The payload carries the `RoleIncarnationRecord` and optional `ToolsetProfileRecord`
+    /// from the authority hotel so the receiving hotel can upsert them if not already present,
+    /// then materialize the role's guest and deliver the handoff bundle.
+    pub(crate) async fn handle_remote_role_handoff(
+        graph: &GraphDomain,
+        inboxes: &InboxRegistry,
+        parked_inbound: &ParkedInboundRegistry,
+        materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
+        local_node_id: &str,
+        data: &str,
+    ) {
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(data) else {
+            warn!("handle_remote_role_handoff: failed to parse payload");
+            return;
+        };
+
+        let Some(session_id) = payload.get("session_id").and_then(|v| v.as_str()) else {
+            warn!("handle_remote_role_handoff: missing session_id");
+            return;
+        };
+        let Some(role_name) = payload.get("role_name").and_then(|v| v.as_str()) else {
+            warn!("handle_remote_role_handoff: missing role_name");
+            return;
+        };
+        let handoff_bundle = payload.get("handoff_bundle").cloned().unwrap_or_default();
+
+        // Upsert role_record into local graph so ensure_role_materialized can find it.
+        if let Some(role_val) = payload.get("role_record") {
+            if let Ok(mut role_record) =
+                serde_json::from_value::<ansible_mesh_core::graph::RoleIncarnationRecord>(
+                    role_val.clone(),
+                )
+            {
+                // Clear readiness — the remote hotel owns that state, not us.
+                role_record.readiness_state =
+                    ansible_mesh_core::graph::RoleReadinessState::Configured;
+                if let Err(err) = graph.upsert_role_incarnation(&role_record) {
+                    warn!(
+                        "handle_remote_role_handoff: failed to upsert role_record for '{}': {}",
+                        role_name, err
+                    );
+                }
+            }
+        }
+
+        // Upsert toolset_record if provided.
+        if let Some(ts_val) = payload.get("toolset_record") {
+            if ts_val.is_object() {
+                if let Ok(profile) =
+                    serde_json::from_value::<ansible_mesh_core::graph::ToolsetProfileRecord>(
+                        ts_val.clone(),
+                    )
+                {
+                    let _ = graph.upsert_toolset_profile(&profile);
+                }
+            }
+        }
+
+        let readiness = match Self::ensure_role_materialized(
+            graph,
+            inboxes,
+            materialization_requester.as_deref(),
+            local_node_id,
+            &payload
+                .get("role_record")
+                .and_then(|v| v.get("agent_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            role_name,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(err) => {
+                warn!(
+                    "handle_remote_role_handoff: ensure_role_materialized failed for '{}': {}",
+                    role_name, err
+                );
+                return;
+            }
+        };
+
+        let agent_id = payload
+            .get("role_record")
+            .and_then(|v| v.get("agent_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let guest_id = payload
+            .get("role_record")
+            .and_then(|v| v.get("guest_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let routing_role = format!("role:{}:{}", agent_id, role_name);
+        let task_id = Uuid::new_v4();
+        let task_json = serde_json::json!({
+            "action": "handoff_bundle",
+            "agent_id": agent_id,
+            "session_id": session_id,
+            "handoff_bundle": handoff_bundle,
+        })
+        .to_string();
+
+        if matches!(
+            readiness,
+            ansible_mesh_core::graph::RoleReadinessState::Configured
+                | ansible_mesh_core::graph::RoleReadinessState::Materializing
+                | ansible_mesh_core::graph::RoleReadinessState::Materialized
+        ) {
+            // Not yet live — park and wait for the guest to start up.
+            let mut guard = parked_inbound.lock().await;
+            guard.entry(guest_id).or_default().push(ParkedInboundTask {
+                source_node: local_node_id.to_string(),
+                task_id,
+                task_json,
+                activate_session_id: Some(session_id.to_string()),
+            });
+            return;
+        }
+
+        if let Err(err) = Self::deliver_live_guest_task(
+            graph,
+            inboxes,
+            local_node_id,
+            &routing_role,
+            &guest_id,
+            task_id,
+            task_json,
+            Some(session_id.to_string()),
+        )
+        .await
+        {
+            warn!(
+                "handle_remote_role_handoff: deliver_live_guest_task failed for '{}': {}",
+                role_name, err
+            );
+        }
     }
 }
 
@@ -13704,6 +13985,7 @@ mod tests {
                 host: "aria-vps".into(),
                 port: 9002,
             }),
+            None,
         );
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph)
             .with_registry(registry);
@@ -15269,6 +15551,7 @@ mod tests {
                 host: "aria-vps".into(),
                 port: 9002,
             }),
+            None,
         );
         let server = IpcServer::new(
             socket_path.clone(),
@@ -15394,6 +15677,7 @@ mod tests {
                 host: "aria-vps".into(),
                 port: 9002,
             }),
+            None,
         );
         let server = IpcServer::new(
             socket_path.clone(),
@@ -15531,6 +15815,7 @@ mod tests {
                 host: "aria-vps".into(),
                 port: 9002,
             }),
+            None,
         );
         let server = IpcServer::new(
             socket_path.clone(),
@@ -15669,6 +15954,7 @@ mod tests {
                 host: "aria-vps".into(),
                 port: 9002,
             }),
+            None,
         );
         let server = IpcServer::new(
             socket_path.clone(),
@@ -16237,6 +16523,7 @@ mod tests {
                 host: "aria-vps".into(),
                 port: 9002,
             }),
+            None,
         );
         let server = IpcServer::new(
             socket_path.clone(),
@@ -20099,6 +20386,7 @@ mod tests {
                 host: "127.0.0.1".into(),
                 port: 0,
             }),
+            None,
         );
         registry.write().await.update_node(
             NodeCapabilities {
@@ -20125,6 +20413,7 @@ mod tests {
                 host: "remote.mesh".into(),
                 port: 9002,
             }),
+            None,
         );
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph)
             .with_registry(registry);
@@ -20252,6 +20541,7 @@ mod tests {
                 host: "remote.mesh".into(),
                 port: 9102,
             }),
+            None,
         );
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph)
             .with_registry(registry);
@@ -20396,6 +20686,7 @@ mod tests {
                 host: "remote.mesh".into(),
                 port: 9102,
             }),
+            None,
         );
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph)
             .with_registry(registry);
@@ -20525,6 +20816,7 @@ mod tests {
                 host: "127.0.0.1".into(),
                 port: 0,
             }),
+            None,
         );
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph)
             .with_registry(registry);
@@ -20844,6 +21136,7 @@ mod tests {
                 host: "remote.mesh".into(),
                 port: 9102,
             }),
+            None,
         );
 
         let remote_graph_store =

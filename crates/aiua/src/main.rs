@@ -1088,11 +1088,11 @@ fn execution_reachability_for_hotel(
 /// Samples local environment vitals for inclusion in the outbound heartbeat.
 /// All fields are best-effort; failures are silently swallowed so a bad sysfs
 /// read never blocks the heartbeat loop.
-fn sample_node_health(graph: &GraphDomain) -> NodeHealthSnapshot {
+fn sample_node_health(graph: &GraphDomain, hotel_name: &str) -> NodeHealthSnapshot {
     let guest_count = graph
-        .list_guests()
+        .list_guests(hotel_name, true)
         .ok()
-        .map(|gs| gs.iter().filter(|g| g.is_active).count() as u32);
+        .map(|gs| gs.len() as u32);
 
     // Disk: percentage free on the filesystem that holds the DB file.
     let disk_free_pct = (|| -> Option<f32> {
@@ -1270,7 +1270,7 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
                         };
                         let execution_reachability =
                             execution_reachability_for_hotel(heartbeat_graph.as_ref(), &heartbeat_hotel);
-                        let node_health = sample_node_health(heartbeat_graph.as_ref());
+                        let node_health = sample_node_health(heartbeat_graph.as_ref(), &heartbeat_hotel.hotel_name);
                         for (_target_node_id, target_addr) in targets {
                             let Ok(target) = target_addr.parse::<SocketAddr>() else {
                                 warn!("Skipping invalid heartbeat target address {}", target_addr);

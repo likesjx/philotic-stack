@@ -1024,12 +1024,10 @@ impl SessionState {
     pub fn preferred_component_implementation(&self, capability: &str) -> Option<&str> {
         self.component_route_for_capability(capability)
             .and_then(|route| route.implementation.as_deref())
-            .or_else(|| {
-                if capability == "text.generate" {
-                    self.bindings.effective_model_controller.as_deref()
-                } else {
-                    None
-                }
+            .or_else(|| match capability {
+                "text.generate" => self.bindings.effective_model_controller.as_deref(),
+                "voice.synthesize" => self.agent_profile.voice_response_policy.provider.as_deref(),
+                _ => None,
             })
     }
 
