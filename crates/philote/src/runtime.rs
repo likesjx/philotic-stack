@@ -952,39 +952,80 @@ impl AgentRuntime {
         })
     }
 
-    /// At startup, read any persisted `McpRouteRecord`s from the agent's apartment
-    /// (key `__mcp_routes__:<agent_id>`) and push them to the hotel so that the
-    /// `membrane-mcp` guest receives an `update_mcp_routes` push and begins
-    /// advertising the philote's tools immediately.
-    async fn register_mcp_routes(&mut self) {
-        use ansible_mesh_core::mcp_route::McpRouteRecord;
+    /// Build `McpRouteRecord`s from the agent's effective toolset.
+    ///
+    /// Operator-stored overrides (key `__mcp_routes__:<agent_id>`) take precedence.
+    /// When no overrides are stored, every tool in `default_toolset` that has a real
+    /// catalog entry is projected as a self-targeting `Philote` route. Tools with no
+    /// catalog entry are skipped — they are model-internal only.
+    async fn mcp_routes_from_profile(
+        &mut self,
+    ) -> Vec<ansible_mesh_core::mcp_route::McpRouteRecord> {
+        use ansible_mesh_core::mcp_route::{
+            McpAuthScheme, McpRouteRecord, McpRouteSecurity, McpRouteTarget,
+        };
 
+        // Operator override takes precedence.
         let key = format!("__mcp_routes__:{}", self.agent_id);
-        let routes: Vec<McpRouteRecord> = match self
+        if let Ok(IpcResponse::ConfigData {
+            value_json: Some(json),
+            ..
+        }) = self
             .ipc_client
             .send_request(IpcRequest::GetConfig { key: key.clone() })
             .await
         {
-            Ok(IpcResponse::ConfigData {
-                value_json: Some(json),
-                ..
-            }) => match serde_json::from_str::<Vec<McpRouteRecord>>(&json) {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!(key = %key, err = %e, "Failed to parse stored MCP routes — skipping registration");
-                    return;
+            match serde_json::from_str::<Vec<McpRouteRecord>>(&json) {
+                Ok(r) if !r.is_empty() => {
+                    info!(agent_id = %self.agent_id, count = r.len(), "Using operator-stored MCP route overrides.");
+                    return r;
                 }
-            },
-            Ok(IpcResponse::ConfigData { value_json: None, .. }) => {
-                info!(agent_id = %self.agent_id, "No MCP routes stored — skipping registration");
-                return;
+                Ok(_) => {}
+                Err(e) => warn!(key = %key, err = %e, "Ignoring malformed operator MCP route override."),
             }
-            Ok(_) | Err(_) => {
-                warn!(agent_id = %self.agent_id, "Unexpected response fetching MCP routes — skipping registration");
-                return;
-            }
-        };
+        }
 
+        // Derive from default_toolset — catalog entries only.
+        let catalog = crate::catalog::tool_catalog();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        self.default_agent_profile
+            .default_toolset
+            .iter()
+            .filter_map(|tool_name| {
+                let def = catalog.get(tool_name.as_str())?;
+                Some(McpRouteRecord {
+                    agent_id: self.agent_id.clone(),
+                    tool_name: tool_name.clone(),
+                    description: def.description.clone(),
+                    input_schema: def.input_schema.clone(),
+                    target: McpRouteTarget::Philote {
+                        agent_id: self.agent_id.clone(),
+                    },
+                    security: McpRouteSecurity {
+                        auth: McpAuthScheme::None,
+                        global_allotment: None,
+                        require_approval: crate::catalog::tool_requires_approval(tool_name),
+                    },
+                    updated_at: now,
+                })
+            })
+            .collect()
+    }
+
+    /// At startup, derive `McpRouteRecord`s from the agent profile and push them to
+    /// the hotel so the `membrane-mcp` guest advertises this philote's tools
+    /// immediately after restart. Operator-stored overrides take precedence over
+    /// the profile-derived set.
+    async fn register_mcp_routes(&mut self) {
+        let routes = self.mcp_routes_from_profile().await;
+        if routes.is_empty() {
+            info!(agent_id = %self.agent_id, "No MCP routes to register (empty default_toolset or no catalog matches).");
+            return;
+        }
         let count = routes.len();
         match self
             .ipc_client
