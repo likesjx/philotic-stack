@@ -3073,6 +3073,7 @@ impl AgentRuntime {
         }
 
         // Pair the result with the pending tool call, push to history, check iteration cap.
+        let mut is_finalizing = false;
         let loop_outcome = {
             let Some(state) = self.sessions.get_mut(&session_id) else {
                 warn!("Tool result returned for unknown session {}", session_id);
@@ -3116,7 +3117,41 @@ impl AgentRuntime {
                     "Stall detected: {consecutive_failures} consecutive step failures \
                      (threshold: {stall_threshold}). Surfacing to user."
                 ))
+            } else if iteration == iteration_cap {
+                // Soft cap: one final no-tool call so the model can wrap up gracefully.
+                warn!(
+                    "Session [{}] reached iteration cap ({}); doing final no-tool wrap-up.",
+                    session_id, iteration_cap
+                );
+                is_finalizing = true;
+                match state.build_reentry_context_envelope() {
+                    Some((mut prompt, context, context_projection, _tools)) => {
+                        prompt.push_str(
+                            "\n\n[You have reached the maximum number of tool calls for this turn. \
+                             Do not call any more tools. Provide your final response to the user now.]",
+                        );
+                        let active_turn = state.active_turn.as_ref().expect("turn exists");
+                        Ok((
+                            prompt,
+                            context,
+                            context_projection,
+                            active_turn.task_id,
+                            active_turn.user_content.clone(),
+                            active_turn.chat_id.clone(),
+                            active_turn.final_reply_to.clone(),
+                            active_turn.final_reply_role.clone(),
+                            active_turn.final_reply_guest_id.clone(),
+                            vec![], // strip tools — forces text-only reply
+                            state.checkpoint_memory_type(),
+                            state.checkpoint_json(),
+                            state.clone(),
+                        ))
+                    }
+                    None => Err("Active turn vanished at iteration cap".into()),
+                }
             } else if iteration > iteration_cap {
+                // Hard cap: finalizing call itself produced another tool call (shouldn't happen
+                // with empty tool list, but guard anyway).
                 Err(format!(
                     "Turn exceeded maximum tool iterations ({iteration_cap}). Aborting."
                 ))
@@ -3160,10 +3195,16 @@ impl AgentRuntime {
             let _ = self.emit_turn_event(&session_id, event, None).await;
         }
 
+        if is_finalizing && stream_events {
+            let _ = self
+                .emit_turn_event(&session_id, "loop_finalizing", None)
+                .await;
+        }
+
         match loop_outcome {
             Err(msg) => {
-                if stream_events && !step_failed {
-                    // stall/cap hit — emit loop_recovering so observers know we stopped
+                if stream_events && !step_failed && !is_finalizing {
+                    // stall/hard-cap hit — emit loop_recovering so observers know we stopped
                     let _ = self
                         .emit_turn_event(&session_id, "loop_recovering", None)
                         .await;
