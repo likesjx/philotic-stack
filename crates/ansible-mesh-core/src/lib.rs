@@ -16,6 +16,7 @@ pub mod graph_tools;
 pub mod heartbeat;
 pub mod ledger;
 pub mod materializer;
+pub mod mcp_route;
 pub mod membership;
 pub mod meshops;
 pub mod model_manager;

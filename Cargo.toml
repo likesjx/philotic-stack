@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/aiua",
+    "crates/membrane-mcp",
     "crates/membrane",
     "crates/membrane-discord",
     "crates/membrane-telegram",
