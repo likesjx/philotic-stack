@@ -1,39 +1,39 @@
 ---
-title: "Agent Incarnation Model Proposal"
+title: Agent Incarnation Model Proposal
 doc_type: proposal
 domain: runtime-sessions
 status: accepted-current-slice
-last_updated: 2026-03-13
+last_updated: 2026-03-31
 tags:
-  - incarnations
-  - roles
-  - routing
-  - active-seam
-  - current-slice
+- incarnations
+- roles
+- routing
+- active-seam
+- current-slice
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - SESSION_LOOP_PROPOSAL.md
-  - AGENT_LOOP_PROPOSAL.md
-  - GOVERNED_WORKFLOW_SKILLS_PROPOSAL.md
-  - ROLE_ACTIVATION_AND_SUBAGENT_CONTRACTS_PROPOSAL.md
-  - ROLE_CONTEXT_SHIFT_AND_DELEGATED_SUBAGENTS_WHITEPAPER.md
-  - TELEGRAM_POLL_LEASE_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- SESSION_LOOP_PROPOSAL.md
+- AGENT_LOOP_PROPOSAL.md
+- GOVERNED_WORKFLOW_SKILLS_PROPOSAL.md
+- ROLE_ACTIVATION_AND_SUBAGENT_CONTRACTS_PROPOSAL.md
+- ROLE_CONTEXT_SHIFT_AND_DELEGATED_SUBAGENTS_WHITEPAPER.md
+- TELEGRAM_POLL_LEASE_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: agent-incarnation
 implements:
-  - session-loop
+- session-loop
 implemented_by:
-  - ../../crates/ansible-mesh-core/src/graph.rs
-  - ../../crates/ansible-mesh-core/src/storage.rs
-  - ../../crates/ansible-mesh-core/src/sqlite_storage.rs
-  - ../../crates/aiua/src/service/ipc.rs
+- ../../crates/ansible-mesh-core/src/graph.rs
+- ../../crates/ansible-mesh-core/src/storage.rs
+- ../../crates/ansible-mesh-core/src/sqlite_storage.rs
+- ../../crates/aiua/src/service/ipc.rs
 active_seams:
-  - role-incarnation-records
-  - active-membrane-routing
-  - handoff-skill
+- role-incarnation-records
+- active-membrane-routing
+- handoff-skill
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
+- ARCHITECTURE_STATUS.md
 ---
 
 # Agent Incarnation Model Proposal

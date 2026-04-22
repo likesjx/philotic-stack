@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - governed-workflow-skills
+
+rectangle "governed-workflow-skills" as governed_workflow_skills #Orange {
+}
+
+
+@enduml

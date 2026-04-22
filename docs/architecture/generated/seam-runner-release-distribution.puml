@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - runner-release-distribution
+
+rectangle "runner-release-distribution" as runner_release_distribution #Orange {
+}
+
+
+@enduml

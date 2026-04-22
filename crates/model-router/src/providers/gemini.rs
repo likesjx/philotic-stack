@@ -1,11 +1,35 @@
-use crate::controller::{AttachmentInput, ControllerTask, ModelProvider, ProviderOutput, TaskKind};
+use crate::controller::{
+    AttachmentInput, ControllerTask, ModelProvider, NativeLiveProvider, NativeLiveTurnOutput,
+    ProviderOutput, TaskKind,
+};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use futures::{SinkExt, StreamExt};
+use media_prep::{PcmPrepPolicy, prepare_audio_ligand_for_pcm};
 use serde_json::{Value, json};
 use std::borrow::Cow;
-use tracing::info;
+use std::collections::HashMap;
+use std::sync::LazyLock;
+use std::time::Duration;
+use tokio::net::TcpStream;
+use tokio::sync::Mutex;
+use tokio::time::timeout;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tracing::{info, warn};
+
+const GEMINI_LIVE_DEFAULT_MODEL: &str = "gemini-3.1-flash-live-preview";
+const GEMINI_AUDIO_TRANSCRIBE_DEFAULT_MODEL: &str = "gemini-3-flash-preview";
+const GEMINI_LIVE_PROTOCOL: &str = "gemini-live-v1beta";
+const GEMINI_LIVE_MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
+type GeminiLiveSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+static GEMINI_LIVE_SESSION_POOL: LazyLock<Mutex<HashMap<String, GeminiLiveSession>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GeminiAuth {
@@ -21,6 +45,24 @@ pub struct GeminiProvider {
     auth: Option<GeminiAuth>,
     default_model: String,
     base_url: String,
+}
+
+#[derive(Debug, Default)]
+struct LiveTurnAccumulator {
+    text_fragments: Vec<String>,
+    transcript_fragments: Vec<String>,
+    generation_complete: bool,
+    turn_complete: bool,
+    session_marker: NativeLiveTurnOutputMarker,
+}
+
+#[derive(Debug, Default)]
+struct NativeLiveTurnOutputMarker {
+    resumption_handle: Option<String>,
+}
+
+struct GeminiLiveSession {
+    ws: GeminiLiveSocket,
 }
 
 impl GeminiProvider {
@@ -89,6 +131,79 @@ impl GeminiProvider {
                 "{}/v1beta/models/{}:generateContent",
                 self.base_url, model
             )),
+        }
+    }
+
+    fn request_model<'a>(&'a self, task: &'a ControllerTask) -> &'a str {
+        task.model.as_deref().unwrap_or_else(|| match task.kind {
+            TaskKind::AudioTranscribe => GEMINI_AUDIO_TRANSCRIBE_DEFAULT_MODEL,
+            _ => &self.default_model,
+        })
+    }
+
+    fn live_endpoint_url(&self) -> Result<reqwest::Url> {
+        let mut url = reqwest::Url::parse(&self.base_url)
+            .with_context(|| format!("invalid Gemini base_url [{}]", self.base_url))?;
+        let live_scheme = match url.scheme() {
+            "https" => "wss",
+            "http" => "ws",
+            other => bail!(
+                "Gemini Live requires http(s) base_url so it can derive ws(s); got [{}]",
+                other
+            ),
+        };
+        url.set_scheme(live_scheme).map_err(|_| {
+            anyhow::anyhow!("failed to convert Gemini base_url to websocket scheme")
+        })?;
+        url.set_path(
+            "/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent",
+        );
+        url.set_query(None);
+        if let Some(GeminiAuth::ApiKey(api_key)) = self.auth.as_ref() {
+            url.query_pairs_mut().append_pair("key", api_key);
+        }
+        Ok(url)
+    }
+
+    fn live_connect_request(&self) -> Result<axum::http::Request<()>> {
+        let mut request = self
+            .live_endpoint_url()?
+            .to_string()
+            .into_client_request()
+            .context("failed to build Gemini Live websocket request")?;
+
+        if let Some(GeminiAuth::OAuthBearer {
+            access_token,
+            project_id,
+        }) = self.auth.as_ref()
+        {
+            request.headers_mut().insert(
+                axum::http::header::AUTHORIZATION,
+                axum::http::HeaderValue::from_str(&format!("Bearer {access_token}"))
+                    .context("invalid Gemini OAuth authorization header")?,
+            );
+            if let Some(project_id) = project_id {
+                request.headers_mut().insert(
+                    "x-goog-user-project",
+                    axum::http::HeaderValue::from_str(project_id)
+                        .context("invalid Gemini OAuth project header")?,
+                );
+            }
+        }
+
+        Ok(request)
+    }
+
+    fn live_model_name(task: &ControllerTask) -> String {
+        let model = task
+            .model
+            .as_deref()
+            .or_else(|| task.routing_hints.model_ref.as_deref())
+            .unwrap_or(GEMINI_LIVE_DEFAULT_MODEL);
+        if model.starts_with("models/") {
+            model.to_string()
+        } else {
+            format!("models/{model}")
         }
     }
 
@@ -485,22 +600,33 @@ impl GeminiProvider {
 
         for attachment in task.media_attachments().iter().filter(|attachment| {
             attachment
-                .url
+                .transport_error
                 .as_deref()
-                .map(|url| !url.trim().is_empty())
-                .unwrap_or(false)
-                && attachment
-                    .transport_error
-                    .as_deref()
-                    .map(|error| error.trim().is_empty())
-                    .unwrap_or(true)
+                .map(|error| error.trim().is_empty())
+                .unwrap_or(true)
         }) {
+            // Inline PCM audio (Discord voice bridge) — convert to WAV and include directly.
+            if let Some(inline_b64) = &attachment.inline_audio_b64 {
+                let sample_rate = attachment.inline_audio_sample_rate.unwrap_or(48_000);
+                let channels = attachment.inline_audio_channels.unwrap_or(2);
+                let wav_bytes = pcm_i16_b64_to_wav(inline_b64, sample_rate, channels)
+                    .context("failed to build WAV from inline PCM audio")?;
+                parts.push(json!({
+                    "inline_data": {
+                        "mime_type": "audio/wav",
+                        "data": BASE64_STANDARD.encode(&wav_bytes)
+                    }
+                }));
+                continue;
+            }
+
+            // Blob-backed attachment — fetch from URL.
+            let url = match attachment.url.as_deref().filter(|u| !u.trim().is_empty()) {
+                Some(u) => u,
+                None => continue,
+            };
             let mime_type = attachment_mime_type(attachment)
                 .with_context(|| format!("attachment {:?} missing mime type", attachment.kind))?;
-            let url = attachment
-                .url
-                .as_deref()
-                .context("media attachment missing download url")?;
             let response = self.http_client.get(url).send().await?;
             let status = response.status();
             if !status.is_success() {
@@ -576,6 +702,563 @@ impl GeminiProvider {
             }
         }
     }
+
+    fn live_response_modalities(task: &ControllerTask) -> Vec<String> {
+        if let Some(items) = task
+            .provider_options
+            .get("response_modalities")
+            .and_then(Value::as_array)
+        {
+            let parsed = items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|item| item.trim().to_ascii_uppercase())
+                .filter(|item| !item.is_empty())
+                .collect::<Vec<_>>();
+            if !parsed.is_empty() {
+                return parsed;
+            }
+        }
+
+        match task.kind {
+            TaskKind::VoiceDialogue => vec!["AUDIO".into()],
+            TaskKind::ResponseGenerate => vec!["TEXT".into()],
+            _ => vec!["TEXT".into()],
+        }
+    }
+
+    fn live_setup_payload(&self, task: &ControllerTask) -> Value {
+        let response_modalities = Self::live_response_modalities(task);
+        let wants_audio_output = response_modalities.iter().any(|item| item == "AUDIO");
+        let mut setup = json!({
+            "model": Self::live_model_name(task),
+            "generationConfig": {
+                "responseModalities": response_modalities
+            },
+            "sessionResumption": {}
+        });
+
+        if let Some(handle) = task
+            .provider_option_str("resumption_handle")
+            .or_else(|| task.provider_option_str("session_resumption_handle"))
+        {
+            setup["sessionResumption"]["handle"] = Value::String(handle.to_string());
+        }
+
+        if !task.tools.is_empty() {
+            setup["tools"] = json!([{
+                "functionDeclarations": Self::function_declarations(&task.tools)
+            }]);
+        }
+
+        if task.kind == TaskKind::VoiceDialogue {
+            setup["realtimeInputConfig"] = json!({
+                "automaticActivityDetection": {
+                    "disabled": true
+                }
+            });
+            setup["inputAudioTranscription"] = json!({});
+        }
+
+        if wants_audio_output {
+            setup["outputAudioTranscription"] = json!({});
+        }
+
+        json!({ "setup": setup })
+    }
+
+    fn live_session_key(task: &ControllerTask) -> Option<String> {
+        Some(format!(
+            "{}:{}",
+            task.session_id.as_deref()?.trim(),
+            task.turn_id.as_deref()?.trim()
+        ))
+        .filter(|key| !key.contains(':') || !key.starts_with(':') && !key.ends_with(':'))
+    }
+
+    async fn store_live_session(task: &ControllerTask, ws: GeminiLiveSocket) {
+        if let Some(key) = Self::live_session_key(task) {
+            GEMINI_LIVE_SESSION_POOL
+                .lock()
+                .await
+                .insert(key, GeminiLiveSession { ws });
+        }
+    }
+
+    async fn take_live_session(task: &ControllerTask) -> Option<GeminiLiveSession> {
+        let key = Self::live_session_key(task)?;
+        GEMINI_LIVE_SESSION_POOL.lock().await.remove(&key)
+    }
+
+    fn live_tool_response_payload(task: &ControllerTask) -> Option<Value> {
+        let live_tool_response = task.provider_options.get("live_tool_response")?;
+        let function_call_id = live_tool_response.get("function_call_id")?.as_str()?.trim();
+        let tool_name = live_tool_response.get("tool_name")?.as_str()?.trim();
+        let tool_response = live_tool_response.get("tool_response")?.clone();
+        if function_call_id.is_empty() || tool_name.is_empty() {
+            return None;
+        }
+
+        let response = match tool_response {
+            Value::Object(_) => tool_response,
+            other => json!({ "result": other }),
+        };
+
+        Some(json!({
+            "toolResponse": {
+                "functionResponses": [{
+                    "id": function_call_id,
+                    "name": tool_name,
+                    "response": response,
+                }]
+            }
+        }))
+    }
+
+    fn live_client_prompt_message(task: &ControllerTask, turn_complete: bool) -> Option<Value> {
+        let prompt = task.composed_prompt_text()?;
+        if prompt.trim().is_empty() {
+            return None;
+        }
+        Some(json!({
+            "clientContent": {
+                "turns": [{
+                    "role": "user",
+                    "parts": [{ "text": prompt }]
+                }],
+                "turnComplete": turn_complete
+            }
+        }))
+    }
+
+    async fn live_audio_chunks(&self, task: &ControllerTask) -> Result<Vec<Value>> {
+        let mut chunks = Vec::new();
+        for attachment in task.media_attachments().iter().filter(|attachment| {
+            attachment
+                .url
+                .as_deref()
+                .map(|url| !url.trim().is_empty())
+                .unwrap_or(false)
+                && attachment
+                    .transport_error
+                    .as_deref()
+                    .map(|error| error.trim().is_empty())
+                    .unwrap_or(true)
+        }) {
+            let mime_type = attachment_mime_type(attachment)
+                .with_context(|| format!("attachment {:?} missing mime type", attachment.kind))?;
+            let url = attachment
+                .url
+                .as_deref()
+                .context("live audio attachment missing download url")?;
+            let response = self.http_client.get(url).send().await?;
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                bail!(
+                    "failed to fetch live audio attachment from {}: HTTP {} {}",
+                    url,
+                    status,
+                    body
+                );
+            }
+            let bytes = response.bytes().await?.to_vec();
+            let prepared =
+                prepare_audio_ligand_for_pcm(mime_type.as_ref(), bytes, &PcmPrepPolicy::default())
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to prepare live audio ligand from [{}] into Gemini PCM input",
+                            mime_type
+                        )
+                    })?;
+            chunks.push(json!({
+                "realtimeInput": {
+                    "audio": {
+                        "mimeType": prepared.mime_type,
+                        "data": BASE64_STANDARD.encode(prepared.bytes)
+                    }
+                }
+            }));
+        }
+
+        if chunks.is_empty() {
+            bail!("voice.dialogue requires at least one blob-backed PCM audio attachment");
+        }
+
+        Ok(chunks)
+    }
+
+    async fn send_live_json<S>(ws: &mut S, payload: &Value) -> Result<()>
+    where
+        S: futures::Sink<WsMessage, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+    {
+        ws.send(WsMessage::Text(
+            serde_json::to_string(payload)
+                .context("failed to serialize Gemini Live websocket payload")?
+                .into(),
+        ))
+        .await
+        .context("failed to send Gemini Live websocket payload")
+    }
+
+    async fn recv_live_json<S>(ws: &mut S) -> Result<Value>
+    where
+        S: futures::Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    {
+        loop {
+            let message = timeout(GEMINI_LIVE_MESSAGE_TIMEOUT, ws.next())
+                .await
+                .context("timed out waiting for Gemini Live websocket message")?
+                .context("Gemini Live websocket closed before completing the turn")?
+                .context("Gemini Live websocket returned an error")?;
+
+            match message {
+                WsMessage::Text(text) => {
+                    return serde_json::from_str(&text)
+                        .context("failed to parse Gemini Live websocket JSON message");
+                }
+                WsMessage::Binary(bytes) => {
+                    return serde_json::from_slice(&bytes)
+                        .context("failed to parse Gemini Live websocket binary JSON message");
+                }
+                WsMessage::Ping(_) | WsMessage::Pong(_) => continue,
+                WsMessage::Close(frame) => {
+                    bail!(
+                        "Gemini Live websocket closed before completing the turn{}",
+                        frame
+                            .as_ref()
+                            .map(|frame| format!(": {}", frame.reason))
+                            .unwrap_or_default()
+                    )
+                }
+                other => bail!("unexpected Gemini Live websocket frame: {:?}", other),
+            }
+        }
+    }
+
+    fn parse_live_tool_call(
+        task: &ControllerTask,
+        body: &Value,
+    ) -> Result<Option<(ProviderOutput, Option<String>)>> {
+        let alias_map = Self::gemini_function_aliases(&task.tools);
+        let Some(function_call) = body
+            .get("toolCall")
+            .and_then(|value| value.get("functionCalls"))
+            .and_then(Value::as_array)
+            .and_then(|calls| calls.first())
+        else {
+            return Ok(None);
+        };
+
+        let alias = function_call
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if alias.is_empty() {
+            return Ok(None);
+        }
+
+        let function_call_id = function_call
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
+
+        let tool_name = alias_map
+            .iter()
+            .find_map(|(gemini_alias, original)| {
+                (gemini_alias == alias).then_some(original.clone())
+            })
+            .unwrap_or_else(|| alias.to_string());
+        let arguments = function_call
+            .get("args")
+            .or_else(|| function_call.get("arguments"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        Self::validate_tool_call(task, &tool_name, &arguments)?;
+
+        Ok(Some((
+            ProviderOutput::ToolCall {
+                tool_name,
+                arguments,
+            },
+            function_call_id,
+        )))
+    }
+
+    fn absorb_live_server_content(acc: &mut LiveTurnAccumulator, body: &Value) {
+        let Some(server_content) = body.get("serverContent") else {
+            return;
+        };
+
+        if server_content
+            .get("generationComplete")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            acc.generation_complete = true;
+        }
+        if server_content
+            .get("turnComplete")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            acc.turn_complete = true;
+        }
+
+        if let Some(text) = server_content
+            .get("outputTranscription")
+            .and_then(|value| value.get("text"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            acc.transcript_fragments.push(text.to_string());
+        }
+
+        if let Some(parts) = server_content
+            .get("modelTurn")
+            .and_then(|value| value.get("parts"))
+            .and_then(Value::as_array)
+        {
+            for part in parts {
+                if let Some(text) = part
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                {
+                    acc.text_fragments.push(text.to_string());
+                }
+            }
+        }
+    }
+
+    fn absorb_live_session_marker(acc: &mut LiveTurnAccumulator, body: &Value) {
+        let Some(update) = body.get("sessionResumptionUpdate") else {
+            return;
+        };
+
+        let resumable = update
+            .get("resumable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let new_handle = update
+            .get("newHandle")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|handle| !handle.is_empty());
+        if resumable {
+            acc.session_marker.resumption_handle = new_handle.map(str::to_string);
+        }
+    }
+
+    fn finalize_live_output(
+        task: &ControllerTask,
+        acc: LiveTurnAccumulator,
+    ) -> Result<NativeLiveTurnOutput> {
+        let display_text = acc
+            .text_fragments
+            .iter()
+            .last()
+            .cloned()
+            .or_else(|| acc.transcript_fragments.iter().last().cloned())
+            .unwrap_or_default();
+
+        if display_text.trim().is_empty() {
+            bail!("Gemini Live returned an empty response");
+        }
+
+        let spoken_text = acc
+            .transcript_fragments
+            .iter()
+            .last()
+            .cloned()
+            .or_else(|| (!display_text.is_empty()).then_some(display_text.clone()));
+
+        let partial_text_deltas = if !acc.text_fragments.is_empty() {
+            acc.text_fragments.clone()
+        } else {
+            acc.transcript_fragments.clone()
+        };
+
+        let session_marker = acc.session_marker.resumption_handle.map(|handle| {
+            crate::controller::NativeLiveSessionMarker {
+                provider_session_id: None,
+                resumption_handle: Some(handle),
+                protocol: Some(GEMINI_LIVE_PROTOCOL.into()),
+            }
+        });
+
+        Ok(NativeLiveTurnOutput {
+            final_output: ProviderOutput::Text {
+                content: display_text.clone(),
+                display_text: Some(display_text),
+                spoken_text,
+                partial_replies: partial_text_deltas.clone(),
+                working_memory_delta: None,
+                follow_up_questions: Vec::new(),
+                intent_summary: None,
+                memory_concept: None,
+                memory_candidate: None,
+                active_plan: None,
+            },
+            partial_text_deltas,
+            session_marker,
+            pending_function_call_id: None,
+            generation_complete: acc.generation_complete,
+            turn_complete: acc.turn_complete || task.kind == TaskKind::ResponseGenerate,
+        })
+    }
+    // ── Streaming helpers ──────────────────────────────────────────────────────
+
+    fn streaming_endpoint_url(&self, model: Option<&str>) -> Result<String> {
+        let model = model.unwrap_or(&self.default_model);
+        match self
+            .auth
+            .as_ref()
+            .context("Gemini auth missing from config; expected OAuth bearer or API key")?
+        {
+            GeminiAuth::ApiKey(api_key) => Ok(format!(
+                "{}/v1beta/models/{}:streamGenerateContent?key={}&alt=sse",
+                self.base_url, model, api_key
+            )),
+            GeminiAuth::OAuthBearer { .. } => Ok(format!(
+                "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
+                self.base_url, model
+            )),
+        }
+    }
+
+    /// Parse one SSE line (`data: {...}`) and extract the text fragment from
+    /// `candidates[0].content.parts[0].text`. Returns `None` for non-data lines
+    /// or lines with no text part (e.g. finish-reason-only chunks).
+    fn parse_sse_text_chunk(line: &str) -> Option<String> {
+        let json_str = if let Some(rest) = line.strip_prefix("data: ") {
+            rest
+        } else if let Some(rest) = line.strip_prefix("data:") {
+            rest
+        } else {
+            return None;
+        };
+        if json_str.trim() == "[DONE]" {
+            return None;
+        }
+        let chunk: Value = serde_json::from_str(json_str).ok()?;
+        chunk
+            .get("candidates")
+            .and_then(Value::as_array)
+            .and_then(|c| c.first())
+            .and_then(|c| c.get("content"))
+            .and_then(|c| c.get("parts"))
+            .and_then(Value::as_array)
+            .and_then(|p| p.first())
+            .and_then(|p| p.get("text"))
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+    }
+
+    /// Scan `accumulated` for the display_text JSON string value, starting where we left off.
+    /// Appends any newly revealed display_text characters to `out` and calls `on_token`.
+    /// Returns the updated extraction cursor.
+    ///
+    /// The function handles the three phases:
+    /// 1. Searching for `"display_text":` key + opening quote
+    /// 2. Inside the display_text value (until unescaped closing `"`)
+    /// 3. Done (returns immediately)
+    fn extract_display_text_tokens(
+        accumulated: &str,
+        cursor: &mut DisplayTextCursor,
+        out: &mut String,
+    ) -> Vec<String> {
+        let mut tokens = Vec::new();
+        match cursor {
+            DisplayTextCursor::Done => {}
+            DisplayTextCursor::Searching => {
+                // Find `"display_text":` then skip optional whitespace to the opening `"`.
+                // Gemini's structured-JSON output uses `"display_text": "` (space after
+                // colon), so we cannot anchor on the quote directly.
+                const KEY: &str = "\"display_text\":";
+                if let Some(key_pos) = accumulated.find(KEY) {
+                    let after_colon = key_pos + KEY.len();
+                    // Skip any whitespace between `:` and the opening `"`.
+                    if let Some(quote_offset) = accumulated[after_colon..].find('"') {
+                        let value_start = after_colon + quote_offset + 1; // +1 past the `"`
+                        *cursor = DisplayTextCursor::InValue { pos: value_start };
+                        return Self::extract_display_text_tokens(accumulated, cursor, out);
+                    }
+                    // Key found but opening quote not yet in buffer — stay Searching.
+                }
+            }
+            DisplayTextCursor::InValue { pos } => {
+                let s = &accumulated[*pos..];
+                let mut new_text = String::new();
+                let mut escaping = false;
+                let mut bytes_consumed = 0usize;
+                for ch in s.chars() {
+                    bytes_consumed += ch.len_utf8();
+                    match ch {
+                        '\\' if !escaping => {
+                            escaping = true;
+                            // Skip the backslash — we'll include the next char literally.
+                        }
+                        '"' if !escaping => {
+                            // Closing quote — extraction complete.
+                            out.push_str(&new_text);
+                            *cursor = DisplayTextCursor::Done;
+                            if !new_text.is_empty() {
+                                tokens.push(new_text);
+                            }
+                            return tokens;
+                        }
+                        ch => {
+                            // Decode JSON escape sequences when preceded by a backslash.
+                            // The backslash was consumed without being pushed; we handle
+                            // the escape character here so \n → newline, \t → tab, etc.
+                            let actual = if escaping {
+                                match ch {
+                                    'n' => '\n',
+                                    'r' => '\r',
+                                    't' => '\t',
+                                    '\\' => '\\',
+                                    '"' => '"',
+                                    '/' => '/',
+                                    _ => ch,
+                                }
+                            } else {
+                                ch
+                            };
+                            escaping = false;
+                            new_text.push(actual);
+                        }
+                    }
+                }
+                // Stream not complete yet — emit what we found and advance the cursor.
+                *pos += bytes_consumed;
+                if !new_text.is_empty() {
+                    out.push_str(&new_text);
+                    tokens.push(new_text);
+                }
+            }
+        }
+        tokens
+    }
+}
+
+/// Cursor tracking state for display_text extraction during Gemini SSE streaming.
+#[derive(Debug)]
+enum DisplayTextCursor {
+    /// Still searching for the `"display_text":"` key in the accumulated buffer.
+    Searching,
+    /// Inside the display_text value; `pos` is the byte offset in `accumulated` of the
+    /// next unread character.
+    InValue { pos: usize },
+    /// Extraction complete (closing `"` was found).
+    Done,
 }
 
 #[async_trait]
@@ -619,6 +1302,12 @@ impl ModelProvider for GeminiProvider {
             TaskKind::MediaAnalyze | TaskKind::AudioTranscribe => {
                 self.media_request_payload(task).await?
             }
+            TaskKind::ResponseGenerate => {
+                bail!("Gemini native response.generate is not wired yet in this provider")
+            }
+            TaskKind::VoiceDialogue => {
+                bail!("Gemini native voice.dialogue is not wired yet in this provider")
+            }
             TaskKind::VoiceSynthesize => bail!("Gemini does not support voice synthesis"),
             TaskKind::Embed => bail!("Gemini does not support local embedding (use OnnxProvider)"),
         };
@@ -629,14 +1318,14 @@ impl ModelProvider for GeminiProvider {
                 .unwrap_or_else(|| "<missing prompt>".into());
             info!(
                 "PHILOTIC_DEBUG_MODEL_REQUESTS gemini composed prompt provider={} model={:?}:\n{}",
-                self.id(),
+                ModelProvider::id(self),
                 task.model,
                 prompt
             );
             match serde_json::to_string_pretty(&payload) {
                 Ok(json) => info!(
                     "PHILOTIC_DEBUG_MODEL_REQUESTS gemini provider payload provider={} model={:?}:\n{}",
-                    self.id(),
+                    ModelProvider::id(self),
                     task.model,
                     json
                 ),
@@ -647,7 +1336,7 @@ impl ModelProvider for GeminiProvider {
             }
         }
 
-        let url = self.endpoint_url(task.model.as_deref())?;
+        let url = self.endpoint_url(Some(self.request_model(task)))?;
         let req = self.http_client.post(url).json(&payload);
         let response = self.apply_auth_headers(req)?.send().await?;
         let status = response.status();
@@ -702,6 +1391,321 @@ impl ModelProvider for GeminiProvider {
                 active_plan: None,
             })
         }
+    }
+
+    fn supports_streaming(&self, task: &ControllerTask) -> bool {
+        // Only stream TextGenerate — MediaAnalyze/AudioTranscribe are batch by nature.
+        task.kind == TaskKind::TextGenerate
+    }
+
+    async fn invoke_streaming(
+        &self,
+        task: &ControllerTask,
+        token_tx: tokio::sync::mpsc::Sender<String>,
+    ) -> Result<ProviderOutput> {
+        use futures::StreamExt;
+
+        if task.kind != TaskKind::TextGenerate {
+            // Non-text kinds fall back to batch invoke (no tokens emitted).
+            return self.invoke(task).await;
+        }
+
+        let has_tools = !task.tools.is_empty();
+        let wants_concept = task.wants_channel("memory_concept");
+        let wants_plan = task.wants_channel("active_plan");
+        let use_structured = has_tools
+            || task.wants_channel("spoken_text")
+            || wants_concept
+            || wants_plan;
+
+        let payload = {
+            let prompt = task
+                .composed_prompt_text()
+                .context("Gemini streaming text task missing prompt")?;
+            if has_tools {
+                Self::tool_aware_request_payload(&prompt, &task.tools, wants_concept, wants_plan)
+            } else if use_structured {
+                Self::structured_text_request_payload(&prompt, wants_concept, wants_plan)
+            } else {
+                Self::request_payload(&prompt)
+            }
+        };
+
+        let url = self.streaming_endpoint_url(Some(self.request_model(task)))?;
+        let req = self.http_client.post(url).json(&payload);
+        let response = self.apply_auth_headers(req)?.send().await?;
+        let status = response.status();
+
+        if !status.is_success() {
+            // On HTTP error, read the full body and return an error response.
+            let body = response.json::<Value>().await.unwrap_or_default();
+            let content = Self::parse_response_text(status, body);
+            return Ok(ProviderOutput::Text {
+                display_text: Some(content.clone()),
+                content,
+                spoken_text: None,
+                partial_replies: Vec::new(),
+                working_memory_delta: None,
+                follow_up_questions: Vec::new(),
+                intent_summary: None,
+                memory_concept: None,
+                memory_candidate: None,
+                active_plan: None,
+            });
+        }
+
+        // Read the SSE byte stream, splitting on newlines.
+        // IMPORTANT: accumulate raw bytes and decode as UTF-8 at line boundaries.
+        // Using `*byte as char` would corrupt multi-byte UTF-8 sequences (any
+        // non-ASCII character in the model response), producing garbled text.
+        let mut byte_stream = response.bytes_stream();
+        let mut full_text = String::new();
+        let mut line_buf: Vec<u8> = Vec::new();
+        let is_structured = use_structured;
+        let mut cursor = if is_structured {
+            DisplayTextCursor::Searching
+        } else {
+            DisplayTextCursor::Done
+        };
+        let mut _display_text_out = String::new();
+
+        while let Some(chunk_result) = byte_stream.next().await {
+            let bytes = chunk_result.context("Gemini SSE stream read error")?;
+            for &byte in bytes.iter() {
+                if byte == b'\n' {
+                    let line = String::from_utf8_lossy(&line_buf).trim().to_string();
+                    line_buf.clear();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if let Some(text_chunk) = Self::parse_sse_text_chunk(&line) {
+                        full_text.push_str(&text_chunk);
+                        if is_structured {
+                            // Extract display_text field content progressively.
+                            let tokens = Self::extract_display_text_tokens(
+                                &full_text,
+                                &mut cursor,
+                                &mut _display_text_out,
+                            );
+                            for token in tokens {
+                                let _ = token_tx.send(token).await;
+                            }
+                        } else {
+                            // Plain text: forward the raw chunk directly.
+                            let _ = token_tx.send(text_chunk).await;
+                        }
+                    }
+                } else {
+                    line_buf.push(byte);
+                }
+            }
+        }
+        // Process any remaining buffered line.
+        if !line_buf.is_empty() {
+            let line = String::from_utf8_lossy(&line_buf).trim().to_string();
+            if !line.is_empty() {
+                if let Some(text_chunk) = Self::parse_sse_text_chunk(&line) {
+                    full_text.push_str(&text_chunk);
+                }
+            }
+        }
+        // Close the channel — token consumer will see this as end of stream.
+        drop(token_tx);
+
+        if full_text.trim().is_empty() {
+            // Streaming returned no content — Gemini sometimes returns SSE chunks with
+            // finishReason but no text (safety block, quota, structured-JSON returned
+            // outside SSE format, etc.). Fall back to the batch endpoint which surfaces
+            // the actual error or returns the real response.
+            warn!("Gemini streaming returned no content; retrying with batch invoke");
+            return self.invoke(task).await;
+        }
+
+        // Parse the accumulated full_text into a ProviderOutput the same way invoke() does.
+        if is_structured {
+            // full_text is the complete JSON string; wrap it in the expected Gemini body shape
+            // so parse_structured_response can process it.
+            let body = json!({
+                "candidates": [{
+                    "content": {
+                        "parts": [{ "text": full_text }]
+                    }
+                }]
+            });
+            if has_tools {
+                // Check for a function-call response.
+                if let Some(tool_call) = Self::parse_native_function_call(task, &body)? {
+                    return Ok(tool_call);
+                }
+            }
+            let (content, spoken_text, memory_concept, memory_candidate, active_plan) =
+                Self::parse_structured_response(reqwest::StatusCode::OK, body.clone());
+            if let Ok(parsed) = serde_json::from_str::<Value>(&content) {
+                if let Some(tool_call) = Self::parse_tool_call_candidate(task, &parsed)? {
+                    return Ok(tool_call);
+                }
+            }
+            if content.trim().is_empty() {
+                bail!("Gemini streaming returned an empty structured response");
+            }
+            Ok(ProviderOutput::Text {
+                display_text: Some(content.clone()),
+                content,
+                spoken_text,
+                partial_replies: Vec::new(),
+                working_memory_delta: None,
+                follow_up_questions: Vec::new(),
+                intent_summary: None,
+                memory_concept,
+                memory_candidate,
+                active_plan,
+            })
+        } else {
+            Ok(ProviderOutput::Text {
+                display_text: Some(full_text.clone()),
+                content: full_text,
+                spoken_text: None,
+                partial_replies: Vec::new(),
+                working_memory_delta: None,
+                follow_up_questions: Vec::new(),
+                intent_summary: None,
+                memory_concept: None,
+                memory_candidate: None,
+                active_plan: None,
+            })
+        }
+    }
+}
+
+#[async_trait]
+impl NativeLiveProvider for GeminiProvider {
+    fn id(&self) -> &'static str {
+        "gemini"
+    }
+
+    fn supports_live(&self, task: &ControllerTask) -> bool {
+        matches!(
+            task.kind,
+            TaskKind::ResponseGenerate | TaskKind::VoiceDialogue
+        )
+    }
+
+    async fn invoke_live(&self, task: &ControllerTask) -> Result<NativeLiveTurnOutput> {
+        let continuing_tool_response = task.provider_options.contains_key("live_tool_response");
+        let mut ws = if let Some(existing_session) = Self::take_live_session(task).await {
+            existing_session.ws
+        } else {
+            if continuing_tool_response {
+                bail!(
+                    "Gemini Live tool-response continuation requested without an active live session"
+                );
+            }
+            let request = self.live_connect_request()?;
+            let (mut ws, _) = connect_async(request)
+                .await
+                .context("failed to connect to Gemini Live websocket endpoint")?;
+
+            Self::send_live_json(&mut ws, &self.live_setup_payload(task)).await?;
+
+            loop {
+                let message = Self::recv_live_json(&mut ws).await?;
+                if message.get("setupComplete").is_some() {
+                    break;
+                }
+                if let Some((tool_call, function_call_id)) =
+                    Self::parse_live_tool_call(task, &message)?
+                {
+                    Self::store_live_session(task, ws).await;
+                    return Ok(NativeLiveTurnOutput {
+                        final_output: tool_call,
+                        partial_text_deltas: Vec::new(),
+                        session_marker: None,
+                        pending_function_call_id: function_call_id,
+                        generation_complete: false,
+                        turn_complete: false,
+                    });
+                }
+            }
+
+            ws
+        };
+
+        if let Some(tool_response_payload) = Self::live_tool_response_payload(task) {
+            Self::send_live_json(&mut ws, &tool_response_payload).await?;
+        }
+
+        match task.kind {
+            TaskKind::ResponseGenerate => {
+                if !continuing_tool_response {
+                    if let Some(message) = Self::live_client_prompt_message(task, true) {
+                        Self::send_live_json(&mut ws, &message).await?;
+                    } else {
+                        bail!("response.generate task missing prompt for Gemini Live");
+                    }
+                }
+            }
+            TaskKind::VoiceDialogue => {
+                if !continuing_tool_response {
+                    if let Some(message) = Self::live_client_prompt_message(task, false) {
+                        Self::send_live_json(&mut ws, &message).await?;
+                    }
+                    Self::send_live_json(
+                        &mut ws,
+                        &json!({ "realtimeInput": { "activityStart": {} } }),
+                    )
+                    .await?;
+                    for chunk in self.live_audio_chunks(task).await? {
+                        Self::send_live_json(&mut ws, &chunk).await?;
+                    }
+                    Self::send_live_json(
+                        &mut ws,
+                        &json!({ "realtimeInput": { "activityEnd": {} } }),
+                    )
+                    .await?;
+                }
+            }
+            other => bail!(
+                "Gemini Live native provider received unsupported live task [{}]",
+                other.as_str()
+            ),
+        }
+
+        let mut acc = LiveTurnAccumulator::default();
+        loop {
+            let message = Self::recv_live_json(&mut ws).await?;
+            Self::absorb_live_session_marker(&mut acc, &message);
+
+            if let Some((tool_call, function_call_id)) = Self::parse_live_tool_call(task, &message)?
+            {
+                Self::store_live_session(task, ws).await;
+                return Ok(NativeLiveTurnOutput {
+                    final_output: tool_call,
+                    partial_text_deltas: if !acc.text_fragments.is_empty() {
+                        acc.text_fragments.clone()
+                    } else {
+                        acc.transcript_fragments.clone()
+                    },
+                    session_marker: acc.session_marker.resumption_handle.map(|handle| {
+                        crate::controller::NativeLiveSessionMarker {
+                            provider_session_id: None,
+                            resumption_handle: Some(handle),
+                            protocol: Some(GEMINI_LIVE_PROTOCOL.into()),
+                        }
+                    }),
+                    pending_function_call_id: function_call_id,
+                    generation_complete: acc.generation_complete,
+                    turn_complete: acc.turn_complete,
+                });
+            }
+
+            Self::absorb_live_server_content(&mut acc, &message);
+
+            if acc.turn_complete {
+                break;
+            }
+        }
+
+        Self::finalize_live_output(task, acc)
     }
 }
 
@@ -865,13 +1869,16 @@ impl GeminiProvider {
 mod tests {
     use super::{GeminiAuth, GeminiProvider};
     use crate::controller::{
-        AttachmentInput, ContextEnvelope, ControllerTask, RequestClass, RoutingHints, TaskKind,
+        AttachmentInput, ContextEnvelope, ControllerTask, NativeLiveProvider, RequestClass,
+        RoutingHints, TaskKind,
     };
 
     fn minimal_text_task_with_tools(tools: Vec<serde_json::Value>) -> ControllerTask {
         ControllerTask {
             kind: TaskKind::TextGenerate,
             request_class: RequestClass::Cognitive,
+            session_id: None,
+            turn_id: None,
             provider: None,
             model: None,
             prompt: Some("test prompt".into()),
@@ -887,7 +1894,9 @@ mod tests {
             context_projection: Default::default(),
             affordances: Default::default(),
             routing_hints: RoutingHints::default(),
+            response_route: None,
             provider_options: Default::default(),
+            effective_rights: Vec::new(),
             tools,
         }
     }
@@ -1001,6 +2010,43 @@ mod tests {
     }
 
     #[test]
+    fn live_api_key_endpoint_uses_ws_path_and_query_key() {
+        let provider = GeminiProvider::new(
+            reqwest::Client::new(),
+            Some(GeminiAuth::ApiKey("api-key".into())),
+            None,
+        );
+
+        let url = provider.live_endpoint_url().unwrap();
+        assert_eq!(
+            url.as_str(),
+            "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=api-key"
+        );
+    }
+
+    #[test]
+    fn live_oauth_request_uses_bearer_headers() {
+        let provider = GeminiProvider::new(
+            reqwest::Client::new(),
+            Some(GeminiAuth::OAuthBearer {
+                access_token: "oauth-token".into(),
+                project_id: Some("proj-123".into()),
+            }),
+            None,
+        );
+
+        let request = provider.live_connect_request().unwrap();
+        assert_eq!(
+            request.headers().get("authorization").unwrap(),
+            "Bearer oauth-token"
+        );
+        assert_eq!(
+            request.headers().get("x-goog-user-project").unwrap(),
+            "proj-123"
+        );
+    }
+
+    #[test]
     fn image_attachment_defaults_to_jpeg() {
         let attachment = AttachmentInput {
             kind: Some("photo".into()),
@@ -1009,6 +2055,7 @@ mod tests {
             url: Some("http://127.0.0.1:9001/download/sha256-1".into()),
             blob_ref: Some("sha256-1".into()),
             transport_error: None,
+            ..Default::default()
         };
 
         assert_eq!(
@@ -1026,6 +2073,7 @@ mod tests {
             url: Some("http://127.0.0.1:9001/download/sha256-doc".into()),
             blob_ref: Some("sha256-doc".into()),
             transport_error: None,
+            ..Default::default()
         };
 
         assert_eq!(
@@ -1044,6 +2092,8 @@ mod tests {
         let task = ControllerTask {
             kind: TaskKind::MediaAnalyze,
             request_class: RequestClass::Transform,
+            session_id: None,
+            turn_id: None,
             provider: None,
             model: None,
             prompt: Some("Describe this media".into()),
@@ -1063,13 +2113,16 @@ mod tests {
                     url: Some("http://127.0.0.1:9001/download/sha256-2".into()),
                     blob_ref: Some("sha256-2".into()),
                     transport_error: None,
+                    ..Default::default()
                 }],
                 ..Default::default()
             },
             context_projection: Default::default(),
             affordances: Default::default(),
             routing_hints: RoutingHints::default(),
+            response_route: None,
             provider_options: Default::default(),
+            effective_rights: Vec::new(),
             tools: vec![],
         };
 
@@ -1086,6 +2139,8 @@ mod tests {
         let task = ControllerTask {
             kind: TaskKind::AudioTranscribe,
             request_class: RequestClass::Transform,
+            session_id: None,
+            turn_id: None,
             provider: None,
             model: None,
             prompt: Some("Transcribe this audio verbatim.".into()),
@@ -1105,17 +2160,190 @@ mod tests {
                     url: Some("http://127.0.0.1:9001/download/sha256-voice-1".into()),
                     blob_ref: Some("sha256-voice-1".into()),
                     transport_error: None,
+                    ..Default::default()
                 }],
                 ..Default::default()
             },
             context_projection: Default::default(),
             affordances: Default::default(),
             routing_hints: RoutingHints::default(),
+            response_route: None,
             provider_options: Default::default(),
+            effective_rights: Vec::new(),
             tools: vec![],
         };
 
         assert!(crate::controller::ModelProvider::supports(&provider, &task));
+    }
+
+    #[test]
+    fn audio_transcribe_defaults_to_gemini_3_flash_preview() {
+        let provider = GeminiProvider::new(
+            reqwest::Client::new(),
+            Some(GeminiAuth::ApiKey("api-key".into())),
+            None,
+        );
+        let task = ControllerTask {
+            kind: TaskKind::AudioTranscribe,
+            request_class: RequestClass::Transform,
+            session_id: None,
+            turn_id: None,
+            provider: None,
+            model: None,
+            prompt: Some("Transcribe this audio verbatim.".into()),
+            text: None,
+            spoken_text: None,
+            display_text: None,
+            voice: None,
+            voice_id: None,
+            output_format: None,
+            language_code: None,
+            response_contract: Default::default(),
+            context: ContextEnvelope::default(),
+            context_projection: Default::default(),
+            affordances: Default::default(),
+            routing_hints: RoutingHints::default(),
+            response_route: None,
+            provider_options: Default::default(),
+            effective_rights: Vec::new(),
+            tools: vec![],
+        };
+
+        assert_eq!(
+            provider.request_model(&task),
+            super::GEMINI_AUDIO_TRANSCRIBE_DEFAULT_MODEL
+        );
+    }
+
+    #[test]
+    fn gemini_supports_native_live_task_kinds_on_live_provider_seam() {
+        let provider = GeminiProvider::new(
+            reqwest::Client::new(),
+            Some(GeminiAuth::ApiKey("api-key".into())),
+            None,
+        );
+        let response_generate = ControllerTask {
+            kind: TaskKind::ResponseGenerate,
+            request_class: RequestClass::Cognitive,
+            session_id: None,
+            turn_id: None,
+            provider: None,
+            model: Some("gemini-3.1-flash-live-preview".into()),
+            prompt: Some("Respond with native audio and text.".into()),
+            text: None,
+            spoken_text: None,
+            display_text: None,
+            voice: None,
+            voice_id: None,
+            output_format: None,
+            language_code: None,
+            response_contract: Default::default(),
+            context: Default::default(),
+            context_projection: Default::default(),
+            affordances: Default::default(),
+            routing_hints: RoutingHints::default(),
+            response_route: None,
+            provider_options: Default::default(),
+            effective_rights: Vec::new(),
+            tools: vec![],
+        };
+        let voice_dialogue = ControllerTask {
+            kind: TaskKind::VoiceDialogue,
+            request_class: RequestClass::Cognitive,
+            session_id: None,
+            turn_id: None,
+            provider: None,
+            model: Some("gemini-3.1-flash-live-preview".into()),
+            prompt: Some("Continue this live conversation.".into()),
+            text: None,
+            spoken_text: None,
+            display_text: None,
+            voice: None,
+            voice_id: None,
+            output_format: None,
+            language_code: None,
+            response_contract: Default::default(),
+            context: ContextEnvelope {
+                attachments: vec![AttachmentInput {
+                    kind: Some("voice".into()),
+                    file_id: Some("voice-1".into()),
+                    mime_type: Some("audio/ogg".into()),
+                    url: Some("http://127.0.0.1:9001/download/sha256-voice-1".into()),
+                    blob_ref: Some("sha256-voice-1".into()),
+                    transport_error: None,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            context_projection: Default::default(),
+            affordances: Default::default(),
+            routing_hints: RoutingHints::default(),
+            response_route: None,
+            provider_options: Default::default(),
+            effective_rights: Vec::new(),
+            tools: vec![],
+        };
+
+        assert!(provider.supports_live(&response_generate));
+        assert!(provider.supports_live(&voice_dialogue));
+    }
+
+    #[test]
+    fn live_setup_payload_enables_audio_transcription_for_voice_dialogue() {
+        let task = ControllerTask {
+            kind: TaskKind::VoiceDialogue,
+            request_class: RequestClass::Cognitive,
+            session_id: None,
+            turn_id: None,
+            provider: None,
+            model: Some("gemini-3.1-flash-live-preview".into()),
+            prompt: Some("Continue this live conversation.".into()),
+            text: None,
+            spoken_text: None,
+            display_text: None,
+            voice: None,
+            voice_id: None,
+            output_format: None,
+            language_code: None,
+            response_contract: Default::default(),
+            context: ContextEnvelope {
+                attachments: vec![AttachmentInput {
+                    kind: Some("voice".into()),
+                    file_id: Some("voice-1".into()),
+                    mime_type: Some("audio/pcm;rate=16000".into()),
+                    url: Some("http://127.0.0.1:9001/download/sha256-voice-1".into()),
+                    blob_ref: Some("sha256-voice-1".into()),
+                    transport_error: None,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            context_projection: Default::default(),
+            affordances: Default::default(),
+            routing_hints: RoutingHints::default(),
+            response_route: None,
+            provider_options: Default::default(),
+            effective_rights: Vec::new(),
+            tools: vec![],
+        };
+
+        let provider = GeminiProvider::new(
+            reqwest::Client::new(),
+            Some(GeminiAuth::ApiKey("api-key".into())),
+            None,
+        );
+        let payload = provider.live_setup_payload(&task);
+
+        assert_eq!(
+            payload["setup"]["generationConfig"]["responseModalities"],
+            serde_json::json!(["AUDIO"])
+        );
+        assert!(payload["setup"]["inputAudioTranscription"].is_object());
+        assert!(payload["setup"]["outputAudioTranscription"].is_object());
+        assert_eq!(
+            payload["setup"]["realtimeInputConfig"]["automaticActivityDetection"]["disabled"],
+            serde_json::json!(true)
+        );
     }
 
     #[test]
@@ -1250,6 +2478,108 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn live_tool_call_maps_alias_back_to_original_tool_name() {
+        let task = minimal_text_task_with_tools(vec![serde_json::json!({
+            "tool_name": "session.status",
+            "description": "Session status",
+            "input_schema": {
+                "type": "object",
+                "properties": {}
+            }
+        })]);
+
+        let body = serde_json::json!({
+            "toolCall": {
+                "functionCalls": [{
+                    "id": "call-1",
+                    "name": "session_status",
+                    "args": {}
+                }]
+            }
+        });
+
+        let output = GeminiProvider::parse_live_tool_call(&task, &body)
+            .expect("live tool call should parse")
+            .expect("tool call should be present");
+        assert_eq!(
+            output.0,
+            crate::controller::ProviderOutput::ToolCall {
+                tool_name: "session.status".into(),
+                arguments: serde_json::json!({})
+            }
+        );
+        assert_eq!(output.1.as_deref(), Some("call-1"));
+    }
+
+    #[test]
+    fn absorb_live_session_marker_captures_latest_resumption_handle() {
+        let mut acc = super::LiveTurnAccumulator::default();
+        GeminiProvider::absorb_live_session_marker(
+            &mut acc,
+            &serde_json::json!({
+                "sessionResumptionUpdate": {
+                    "newHandle": "resume-123",
+                    "resumable": true
+                }
+            }),
+        );
+
+        assert_eq!(
+            acc.session_marker.resumption_handle.as_deref(),
+            Some("resume-123")
+        );
+    }
+
+    #[test]
+    fn live_tool_response_payload_wraps_json_tool_result_for_function_response() {
+        let mut provider_options = serde_json::Map::new();
+        provider_options.insert(
+            "live_tool_response".into(),
+            serde_json::json!({
+                "function_call_id": "call-1",
+                "tool_name": "session.status",
+                "tool_response": { "ok": true }
+            }),
+        );
+        let task = ControllerTask {
+            kind: TaskKind::ResponseGenerate,
+            request_class: RequestClass::Cognitive,
+            session_id: Some("session-1".into()),
+            turn_id: Some("turn-1".into()),
+            provider: None,
+            model: Some("gemini-3.1-flash-live-preview".into()),
+            prompt: Some("Continue.".into()),
+            text: None,
+            spoken_text: None,
+            display_text: None,
+            voice: None,
+            voice_id: None,
+            output_format: None,
+            language_code: None,
+            response_contract: Default::default(),
+            context: Default::default(),
+            context_projection: Default::default(),
+            affordances: Default::default(),
+            routing_hints: RoutingHints::default(),
+            response_route: None,
+            provider_options,
+            effective_rights: Vec::new(),
+            tools: vec![],
+        };
+
+        let payload =
+            GeminiProvider::live_tool_response_payload(&task).expect("payload should exist");
+        assert_eq!(
+            payload["toolResponse"]["functionResponses"][0]["id"],
+            serde_json::json!("call-1")
+        );
+        assert_eq!(
+            payload["toolResponse"]["functionResponses"][0]["response"]["ok"],
+            serde_json::json!(true)
+        );
+    }
 }
 
 fn attachment_mime_type(attachment: &AttachmentInput) -> Option<Cow<'_, str>> {
@@ -1275,4 +2605,50 @@ fn normalize_attachment_mime_type(mime_type: &str) -> Cow<'_, str> {
     } else {
         Cow::Borrowed(normalized)
     }
+}
+
+/// Convert base64-encoded i16 LE PCM audio to a WAV-format byte vector.
+///
+/// Builds a minimal RIFF/WAV header followed by the raw PCM data so that
+/// Gemini (and other providers) can consume it as `audio/wav`.
+fn pcm_i16_b64_to_wav(pcm_b64: &str, sample_rate: u32, channels: u16) -> Result<Vec<u8>> {
+    use base64::Engine;
+    let pcm_bytes = BASE64_STANDARD
+        .decode(pcm_b64)
+        .context("failed to base64-decode inline PCM audio")?;
+
+    // Validate byte alignment (each i16 sample = 2 bytes)
+    if pcm_bytes.len() % 2 != 0 {
+        anyhow::bail!("inline PCM audio has odd byte count ({})", pcm_bytes.len());
+    }
+
+    let bits_per_sample: u16 = 16;
+    let byte_rate = sample_rate * u32::from(channels) * u32::from(bits_per_sample) / 8;
+    let block_align: u16 = channels * bits_per_sample / 8;
+    let data_len = pcm_bytes.len() as u32;
+    let chunk_size = 36 + data_len; // 4-byte RIFF size field = header - 8 + data
+
+    let mut wav = Vec::with_capacity(44 + pcm_bytes.len());
+
+    // RIFF header
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&chunk_size.to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+
+    // fmt sub-chunk
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes()); // sub-chunk size = 16 for PCM
+    wav.extend_from_slice(&1u16.to_le_bytes()); // AudioFormat = PCM
+    wav.extend_from_slice(&channels.to_le_bytes());
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    wav.extend_from_slice(&byte_rate.to_le_bytes());
+    wav.extend_from_slice(&block_align.to_le_bytes());
+    wav.extend_from_slice(&bits_per_sample.to_le_bytes());
+
+    // data sub-chunk
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    wav.extend_from_slice(&pcm_bytes);
+
+    Ok(wav)
 }

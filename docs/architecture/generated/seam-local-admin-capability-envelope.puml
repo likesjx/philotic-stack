@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - local-admin-capability-envelope
+
+rectangle "local-admin-capability-envelope" as local_admin_capability_envelope #Orange {
+}
+
+
+@enduml

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - embeddinggemma-swap-validation
+
+rectangle "embeddinggemma-swap-validation" as embeddinggemma_swap_validation #Orange {
+}
+
+
+@enduml

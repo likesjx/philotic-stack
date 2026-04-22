@@ -187,11 +187,7 @@ impl ResourceRegistry {
     }
 
     /// Build a `ResourceRevoked` for every tenant of an instance (for hotel-initiated revocation).
-    pub fn revoke_instance(
-        &mut self,
-        instance_id: &str,
-        reason: &str,
-    ) -> Vec<ResourceRevoked> {
+    pub fn revoke_instance(&mut self, instance_id: &str, reason: &str) -> Vec<ResourceRevoked> {
         let Some(instance) = self.instances.get(instance_id) else {
             return vec![];
         };
@@ -474,7 +470,10 @@ mod tests {
     fn boot_reconcile_processes_agent_declarations() {
         let mut reg = ResourceRegistry::new();
         let agents = vec![
-            make_agent("aria", &[ResourceType::ModelRouter, ResourceType::ToolRunner]),
+            make_agent(
+                "aria",
+                &[ResourceType::ModelRouter, ResourceType::ToolRunner],
+            ),
             make_agent("bjork", &[ResourceType::ModelRouter]),
         ];
         let results = boot_reconcile(&mut reg, &agents);

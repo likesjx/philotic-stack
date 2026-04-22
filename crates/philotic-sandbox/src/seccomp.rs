@@ -30,10 +30,8 @@ impl SeccompProfile {
 /// Apply a seccomp filter based on the named profile.
 /// Returns Ok(true) if applied, Ok(false) if unavailable.
 pub fn apply_seccomp(profile_name: &str, strict: bool) -> Result<bool> {
-    let profile = SeccompProfile::from_name(profile_name).context(format!(
-        "unknown seccomp profile: '{}'",
-        profile_name
-    ))?;
+    let profile = SeccompProfile::from_name(profile_name)
+        .context(format!("unknown seccomp profile: '{}'", profile_name))?;
 
     let syscalls = allowed_syscalls(profile);
 
@@ -67,8 +65,9 @@ pub fn apply_seccomp(profile_name: &str, strict: bool) -> Result<bool> {
     .context("failed to create seccomp filter")?;
 
     // Compile to BPF program
-    let bpf_prog: seccompiler::BpfProgram =
-        filter.try_into().context("failed to compile seccomp filter to BPF")?;
+    let bpf_prog: seccompiler::BpfProgram = filter
+        .try_into()
+        .context("failed to compile seccomp filter to BPF")?;
 
     if bpf_prog.is_empty() {
         if strict {

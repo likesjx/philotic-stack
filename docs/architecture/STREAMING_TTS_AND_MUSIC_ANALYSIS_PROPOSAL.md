@@ -1,30 +1,30 @@
 ---
-title: "ElevenLabs Streaming TTS and ONNX Music Analysis"
+title: ElevenLabs Streaming TTS and ONNX Music Analysis
 doc_type: proposal
 domain: tooling-execution
 status: proposed
-last_updated: 2026-03-24
+last_updated: 2026-03-31
 tags:
-  - elevenlabs
-  - tts
-  - streaming
-  - onnx
-  - music
-  - midi
-  - model-router
-  - local-inference
+- elevenlabs
+- tts
+- streaming
+- onnx
+- music
+- midi
+- model-router
+- local-inference
 related_docs:
-  - LOCAL_ONNX_INFERENCE_PROPOSAL.md
-  - VOICE_MACHINE_PROPOSAL.md
-  - MODEL_CONTROLLER_PROPOSAL.md
+- LOCAL_ONNX_INFERENCE_PROPOSAL.md
+- VOICE_MACHINE_PROPOSAL.md
+- MODEL_CONTROLLER_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: streaming-tts-and-music-analysis
 active_seams:
-  - elevenlabs-streaming-tts
-  - elevenlabs-stt-surface
-  - onnx-music-analysis-surface
-  - midi-output-artifact
+- elevenlabs-streaming-tts
+- elevenlabs-stt-surface
+- onnx-music-analysis-surface
+- midi-output-artifact
 ---
 
 # ElevenLabs Streaming TTS and ONNX Music Analysis

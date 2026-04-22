@@ -1,38 +1,38 @@
 ---
-title: "Desktop Membrane Proposal"
+title: Desktop Membrane Proposal
 doc_type: proposal
 domain: membrane-transport
 status: proposed
-last_updated: 2026-03-19
+last_updated: 2026-03-31
 tags:
-  - desktop
-  - membrane
-  - philotic-web
-  - localhost
-  - leases
-  - operator-surface
-  - mesh-management
+- desktop
+- membrane
+- philotic-web
+- localhost
+- leases
+- operator-surface
+- mesh-management
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - MEMBRANE_COMPONENT_PROPOSAL.md
-  - OPERATOR_MEMBRANE_PLUGIN_BOUNDARY_PROPOSAL.md
-  - MEMBRANE_EXTERNAL_AGENT_AND_EVENT_TRANSPORT_PROPOSAL.md
-  - PHILOTIC_WEB_PROPOSAL.md
-  - CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md
-  - RUNTIME_AUTHORITY_LEASES_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- MEMBRANE_COMPONENT_PROPOSAL.md
+- OPERATOR_MEMBRANE_PLUGIN_BOUNDARY_PROPOSAL.md
+- MEMBRANE_EXTERNAL_AGENT_AND_EVENT_TRANSPORT_PROPOSAL.md
+- PHILOTIC_WEB_PROPOSAL.md
+- CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md
+- RUNTIME_AUTHORITY_LEASES_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: desktop-membrane
 implements:
-  - runtime-authority-leases
-  - membrane-component
+- runtime-authority-leases
+- membrane-component
 implemented_by: []
 active_seams:
-  - desktop-membrane-boundary
-  - desktop-membrane-lease
-  - desktop-membrane-view-models
+- desktop-membrane-boundary
+- desktop-membrane-lease
+- desktop-membrane-view-models
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
+- ARCHITECTURE_STATUS.md
 ---
 
 # Desktop Membrane Proposal

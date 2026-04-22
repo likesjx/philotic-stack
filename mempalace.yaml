@@ -1,0 +1,50 @@
+wing: philotic_stack
+rooms:
+- name: crates
+  description: Files from crates/
+  keywords:
+  - crates
+  - crates
+- name: target
+  description: Files from target/
+  keywords:
+  - target
+  - target
+- name: documentation
+  description: Files from docs/
+  keywords:
+  - documentation
+  - docs
+- name: policies
+  description: Files from policies/
+  keywords:
+  - policies
+  - policies
+- name: ansible
+  description: Files from ansible/
+  keywords:
+  - ansible
+  - ansible
+- name: blobs
+  description: Files from blobs/
+  keywords:
+  - blobs
+  - blobs
+- name: test_agents
+  description: Files from test-agents/
+  keywords:
+  - test_agents
+  - test-agents
+- name: scripts
+  description: Files from scripts/
+  keywords:
+  - scripts
+  - scripts
+- name: skills
+  description: Files from skills/
+  keywords:
+  - skills
+  - skills
+- name: general
+  description: Files that don't fit other rooms
+  keywords: []

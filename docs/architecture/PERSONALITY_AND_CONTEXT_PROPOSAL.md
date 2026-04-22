@@ -1,32 +1,32 @@
 ---
-title: "Philotic Personality and Context Proposal"
+title: Philotic Personality and Context Proposal
 doc_type: proposal
 domain: memory-context
 status: accepted-current-slice
-last_updated: 2026-03-12
+last_updated: 2026-03-31
 tags:
-  - personality
-  - context
-  - identity
-  - projection
-  - active-seam
+- personality
+- context
+- identity
+- projection
+- active-seam
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md
-  - ZEROCLAW_TO_PHILOTIC_BRIDGE_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- PLUGGABLE_CONTEXT_ENGINE_PROPOSAL.md
+- ZEROCLAW_TO_PHILOTIC_BRIDGE_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: personality-and-context
 implements: []
 implemented_by:
-  - turn-time-projection-slice
-  - imported-jane-profile-slice
+- turn-time-projection-slice
+- imported-jane-profile-slice
 active_seams:
-  - structured-context-layers
-  - legacy-workspace-import
+- structured-context-layers
+- legacy-workspace-import
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
-  - ARCHITECTURE.md
+- ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
 ---
 
 # Philotic Personality and Context Proposal

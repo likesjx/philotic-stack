@@ -1,29 +1,29 @@
 ---
-title: "Proposal Organization Proposal"
+title: Proposal Organization Proposal
 doc_type: proposal
 domain: workflow-docs
 status: accepted-current-slice
-last_updated: 2026-03-12
+last_updated: 2026-03-31
 tags:
-  - docs
-  - proposals
-  - organization
-  - domains
+- docs
+- proposals
+- organization
+- domains
 related_docs:
-  - README.md
-  - DOMAIN_MAP.md
-  - DOC_TAGGING_FRONTMATTER_PROPOSAL.md
-  - AGENT_WORKFLOW_PROPOSAL.md
+- README.md
+- DOMAIN_MAP.md
+- DOC_TAGGING_FRONTMATTER_PROPOSAL.md
+- AGENT_WORKFLOW_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: proposal-organization
 implements: []
 implemented_by:
-  - architecture-hub-and-domain-map-slice
+- architecture-hub-and-domain-map-slice
 active_seams:
-  - active-proposal-frontmatter-rollout
+- active-proposal-frontmatter-rollout
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
+- ARCHITECTURE_STATUS.md
 ---
 
 # Proposal Organization Proposal

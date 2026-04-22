@@ -44,10 +44,7 @@ impl SandboxedShellExecutor {
 
 #[async_trait::async_trait]
 impl ShellExecutor for SandboxedShellExecutor {
-    async fn execute(
-        &self,
-        request: ExecuteCommandRequest,
-    ) -> Result<ExecuteCommandResponse> {
+    async fn execute(&self, request: ExecuteCommandRequest) -> Result<ExecuteCommandResponse> {
         self.send_request(&request).await
     }
 }

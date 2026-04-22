@@ -1,9 +1,11 @@
 use crate::controller::{
-    ControllerResponseEnvelope, ControllerTask, ModelProvider, ProviderConfigs, ProviderOutput,
-    ProviderRegistry, TaskKind,
+    ControllerResponseEnvelope, ControllerTask, ModelProvider, NativeLiveProvider,
+    NativeLiveRegistry, ProviderConfigs, ProviderOutput, ProviderRegistry, TaskKind,
+};
+use ansible_mesh_core::router_trace::{
+    RouterTraceStorage, RouterTrainingRecord, SqliteRouterTraceStorage,
 };
 use anyhow::Result;
-use ansible_mesh_core::router_trace::{RouterTraceStorage, RouterTrainingRecord, SqliteRouterTraceStorage};
 use philotic_client::{
     GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, TaskErrorPayload, is_ipc_disconnect,
 };
@@ -19,6 +21,8 @@ fn local_node_id() -> String {
 
 type ProviderFactory =
     dyn Fn(reqwest::Client, &ProviderConfigs) -> Vec<Arc<dyn ModelProvider>> + Send + Sync;
+type NativeLiveProviderFactory =
+    dyn Fn(reqwest::Client, &ProviderConfigs) -> Vec<Arc<dyn NativeLiveProvider>> + Send + Sync;
 
 pub struct ControllerGuestConfig {
     pub guest_id: &'static str,
@@ -27,6 +31,7 @@ pub struct ControllerGuestConfig {
     /// now handled through the normal model-response artifact path, so this flag is ignored.
     pub allow_inline_audio: bool,
     pub providers: Box<ProviderFactory>,
+    pub live_providers: Box<NativeLiveProviderFactory>,
 }
 
 #[derive(Debug, Clone)]
@@ -162,101 +167,258 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                     http_client.clone(),
                     &provider_configs,
                 ));
-
-                let provider = match providers.resolve(&controller_task) {
-                    Ok(provider) => provider,
-                    Err(err) => {
-                        emit_failure(
-                            &mut ipc_client,
-                            &reply,
-                            Some(controller_task.kind.as_str()),
-                            None,
-                            format!("No model provider available for task: {}", err),
-                        )
-                        .await?;
-                        continue;
-                    }
-                };
-
-                info!(
-                    "Dispatching {} task from role [{}] to provider [{}]",
-                    controller_task.kind.as_str(),
-                    config.role,
-                    provider.id()
-                );
+                let live_providers = NativeLiveRegistry::new((config.live_providers)(
+                    http_client.clone(),
+                    &provider_configs,
+                ));
 
                 let dispatch_start = Instant::now();
-                let provider_id = provider.id().to_string();
                 let task_kind = controller_task.kind.as_str().to_string();
+                if controller_task.kind.is_native_live() {
+                    let provider = match live_providers.resolve(&controller_task) {
+                        Ok(provider) => provider,
+                        Err(err) => {
+                            emit_failure(
+                                &mut ipc_client,
+                                &reply,
+                                Some(controller_task.kind.as_str()),
+                                None,
+                                format!("No native-live provider available for task: {}", err),
+                            )
+                            .await?;
+                            continue;
+                        }
+                    };
 
-                match provider.invoke(&controller_task).await {
-                    Ok(ProviderOutput::ToolCall {
-                        tool_name,
-                        arguments,
-                    }) => {
-                        let latency_ms = dispatch_start.elapsed().as_millis() as u64;
-                        record_routing_trace(
-                            trace_store.as_deref(),
-                            &reply,
-                            &provider_id,
-                            &task_kind,
-                            "tool_call",
-                            None,
-                            latency_ms,
-                        );
-                        emit_tool_call_response(
-                            &mut ipc_client,
-                            &reply,
+                    info!(
+                        "Dispatching {} task from role [{}] to native-live provider [{}]",
+                        controller_task.kind.as_str(),
+                        config.role,
+                        provider.id()
+                    );
+
+                    let provider_id = provider.id().to_string();
+                    match provider.invoke_live(&controller_task).await {
+                        Ok(output) => {
+                            let latency_ms = dispatch_start.elapsed().as_millis() as u64;
+                            let native_live_model_result =
+                                native_live_tool_call_model_result(&output);
+                            match output.final_output {
+                                ProviderOutput::ToolCall {
+                                    tool_name,
+                                    arguments,
+                                } => {
+                                    record_routing_trace(
+                                        trace_store.as_deref(),
+                                        &reply,
+                                        &provider_id,
+                                        &task_kind,
+                                        "tool_call",
+                                        None,
+                                        latency_ms,
+                                    );
+                                    emit_tool_call_response(
+                                        &mut ipc_client,
+                                        &reply,
+                                        tool_name,
+                                        arguments,
+                                        native_live_model_result,
+                                    )
+                                    .await?;
+                                }
+                                output => {
+                                    record_routing_trace(
+                                        trace_store.as_deref(),
+                                        &reply,
+                                        &provider_id,
+                                        &task_kind,
+                                        "success",
+                                        None,
+                                        latency_ms,
+                                    );
+                                    let response = ControllerResponseEnvelope::from_output(
+                                        &controller_task,
+                                        provider.id(),
+                                        output,
+                                    )?;
+                                    emit_text_response(&mut ipc_client, &reply, response).await?;
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            let latency_ms = dispatch_start.elapsed().as_millis() as u64;
+                            let failure_code = classify_provider_failure(
+                                Some(task_kind.as_str()),
+                                Some(provider_id.as_str()),
+                                &err.to_string(),
+                            )
+                            .code;
+                            record_routing_trace(
+                                trace_store.as_deref(),
+                                &reply,
+                                &provider_id,
+                                &task_kind,
+                                "failure",
+                                failure_code.as_deref(),
+                                latency_ms,
+                            );
+                            error!("Native-live provider invocation failed: {}", err);
+                            emit_failure(
+                                &mut ipc_client,
+                                &reply,
+                                Some(controller_task.kind.as_str()),
+                                Some(provider.id()),
+                                format!("Native-live provider invocation failed: {}", err),
+                            )
+                            .await?;
+                        }
+                    }
+                } else {
+                    let provider = match providers.resolve(&controller_task) {
+                        Ok(provider) => provider,
+                        Err(err) => {
+                            // This controller has no provider for this task kind. Skip silently —
+                            // another controller on the same role inbox may support it.
+                            info!(
+                                "Controller [{}] skipping {} task: {}",
+                                config.guest_id,
+                                controller_task.kind.as_str(),
+                                err
+                            );
+                            continue;
+                        }
+                    };
+
+                    info!(
+                        "Dispatching {} task from role [{}] to provider [{}]",
+                        controller_task.kind.as_str(),
+                        config.role,
+                        provider.id()
+                    );
+
+                    let provider_id = provider.id().to_string();
+
+                    // ── Streaming dispatch ────────────────────────────────────
+                    // When the provider supports streaming for this task, spawn a
+                    // background task that forwards tokens to philote via EmitTask.
+                    // The main await still receives the final ProviderOutput.
+                    let provider_result = if provider.supports_streaming(&controller_task) {
+                        let (token_tx, mut token_rx) =
+                            tokio::sync::mpsc::channel::<String>(128);
+
+                        // Connect the stream IPC client BEFORE starting the SSE fetch so
+                        // the forwarding task is ready to drain tokens the moment they
+                        // arrive.  If we connected lazily (inside the spawned task) there
+                        // is a race where invoke_streaming completes and drops token_tx
+                        // before the task finishes connecting — the channel closes and no
+                        // tokens are ever forwarded.
+                        let stream_identity = GuestIdentity {
+                            guest_id: format!("model-stream-{}", Ulid::new()),
+                            role: config.guest_id.to_string(),
+                            supported_tools: Vec::new(),
+                        };
+                        let stream_ipc_opt = PhiloticClient::connect(stream_identity).await.ok();
+                        let reply_clone = reply.clone();
+                        tokio::spawn(async move {
+                            let Some(mut stream_ipc) = stream_ipc_opt else {
+                                return;
+                            };
+                            while let Some(token) = token_rx.recv().await {
+                                if token.is_empty() {
+                                    continue;
+                                }
+                                let task_json = serde_json::to_string(&json!({
+                                    "action": "streaming_token",
+                                    "session_id": reply_clone.session_id,
+                                    "turn_id": reply_clone.turn_id,
+                                    "chat_id": reply_clone.chat_id,
+                                    "content": token,
+                                }))
+                                .unwrap_or_default();
+                                let _ = stream_ipc
+                                    .send_request(IpcRequest::EmitTask {
+                                        target_node: reply_clone.reply_to.clone(),
+                                        target_role: reply_clone.reply_role.clone(),
+                                        target_guest_id: None,
+                                        task_json,
+                                    })
+                                    .await;
+                            }
+                        });
+                        provider.invoke_streaming(&controller_task, token_tx).await
+                    } else {
+                        provider.invoke(&controller_task).await
+                    };
+
+                    match provider_result {
+                        Ok(ProviderOutput::ToolCall {
                             tool_name,
                             arguments,
-                            None,
-                        )
-                        .await?;
-                    }
-                    Ok(output) => {
-                        let latency_ms = dispatch_start.elapsed().as_millis() as u64;
-                        record_routing_trace(
-                            trace_store.as_deref(),
-                            &reply,
-                            &provider_id,
-                            &task_kind,
-                            "success",
-                            None,
-                            latency_ms,
-                        );
-                        let response = ControllerResponseEnvelope::from_output(
-                            &controller_task,
-                            provider.id(),
-                            output,
-                        )?;
-                        emit_text_response(&mut ipc_client, &reply, response).await?;
-                    }
-                    Err(err) => {
-                        let latency_ms = dispatch_start.elapsed().as_millis() as u64;
-                        let failure_code = classify_provider_failure(
-                            Some(task_kind.as_str()),
-                            Some(provider_id.as_str()),
-                            &err.to_string(),
-                        )
-                        .code;
-                        record_routing_trace(
-                            trace_store.as_deref(),
-                            &reply,
-                            &provider_id,
-                            &task_kind,
-                            "failure",
-                            failure_code.as_deref(),
-                            latency_ms,
-                        );
-                        error!("Provider invocation failed: {}", err);
-                        emit_failure(
-                            &mut ipc_client,
-                            &reply,
-                            Some(controller_task.kind.as_str()),
-                            Some(provider.id()),
-                            format!("Provider invocation failed: {}", err),
-                        )
-                        .await?;
+                        }) => {
+                            let latency_ms = dispatch_start.elapsed().as_millis() as u64;
+                            record_routing_trace(
+                                trace_store.as_deref(),
+                                &reply,
+                                &provider_id,
+                                &task_kind,
+                                "tool_call",
+                                None,
+                                latency_ms,
+                            );
+                            emit_tool_call_response(
+                                &mut ipc_client,
+                                &reply,
+                                tool_name,
+                                arguments,
+                                None,
+                            )
+                            .await?;
+                        }
+                        Ok(output) => {
+                            let latency_ms = dispatch_start.elapsed().as_millis() as u64;
+                            record_routing_trace(
+                                trace_store.as_deref(),
+                                &reply,
+                                &provider_id,
+                                &task_kind,
+                                "success",
+                                None,
+                                latency_ms,
+                            );
+                            let response = ControllerResponseEnvelope::from_output(
+                                &controller_task,
+                                provider.id(),
+                                output,
+                            )?;
+                            emit_text_response(&mut ipc_client, &reply, response).await?;
+                        }
+                        Err(err) => {
+                            let latency_ms = dispatch_start.elapsed().as_millis() as u64;
+                            let failure_code = classify_provider_failure(
+                                Some(task_kind.as_str()),
+                                Some(provider_id.as_str()),
+                                &err.to_string(),
+                            )
+                            .code;
+                            record_routing_trace(
+                                trace_store.as_deref(),
+                                &reply,
+                                &provider_id,
+                                &task_kind,
+                                "failure",
+                                failure_code.as_deref(),
+                                latency_ms,
+                            );
+                            error!("Provider invocation failed: {}", err);
+                            emit_failure(
+                                &mut ipc_client,
+                                &reply,
+                                Some(controller_task.kind.as_str()),
+                                Some(provider.id()),
+                                format!("Provider invocation failed: {}", err),
+                            )
+                            .await?;
+                        }
                     }
                 }
             }
@@ -539,6 +701,27 @@ async fn emit_tool_call_response(
     Ok(())
 }
 
+fn native_live_tool_call_model_result(
+    output: &crate::controller::NativeLiveTurnOutput,
+) -> Option<Value> {
+    if output.session_marker.is_none() && output.pending_function_call_id.is_none() {
+        return None;
+    }
+
+    Some(json!({
+        "native_live": {
+            "session_marker": output.session_marker.as_ref().map(|marker| {
+                json!({
+                    "provider_session_id": marker.provider_session_id,
+                    "resumption_handle": marker.resumption_handle,
+                    "protocol": marker.protocol,
+                })
+            }),
+            "pending_function_call_id": output.pending_function_call_id,
+        }
+    }))
+}
+
 async fn emit_failure(
     ipc_client: &mut PhiloticClient,
     reply: &ReplyRoute,
@@ -727,7 +910,11 @@ mod failure_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{StubResponse, parse_stub_response, short_circuit_response, validate_stub_prompt};
+    use super::{
+        StubResponse, native_live_tool_call_model_result, parse_stub_response,
+        short_circuit_response, validate_stub_prompt,
+    };
+    use crate::controller::{NativeLiveSessionMarker, NativeLiveTurnOutput, ProviderOutput};
     use serde_json::json;
 
     #[test]
@@ -796,5 +983,35 @@ mod tests {
         });
 
         validate_stub_prompt(&task, &stub).expect("composed prompt should satisfy stub checks");
+    }
+
+    #[test]
+    fn native_live_tool_call_model_result_carries_function_call_id_and_marker() {
+        let output = NativeLiveTurnOutput {
+            final_output: ProviderOutput::ToolCall {
+                tool_name: "session.status".into(),
+                arguments: json!({}),
+            },
+            partial_text_deltas: Vec::new(),
+            session_marker: Some(NativeLiveSessionMarker {
+                provider_session_id: None,
+                resumption_handle: Some("resume-123".into()),
+                protocol: Some("gemini-live-v1beta".into()),
+            }),
+            pending_function_call_id: Some("call-1".into()),
+            generation_complete: false,
+            turn_complete: false,
+        };
+
+        let model_result =
+            native_live_tool_call_model_result(&output).expect("metadata should be present");
+        assert_eq!(
+            model_result["native_live"]["pending_function_call_id"],
+            json!("call-1")
+        );
+        assert_eq!(
+            model_result["native_live"]["session_marker"]["resumption_handle"],
+            json!("resume-123")
+        );
     }
 }

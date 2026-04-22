@@ -3,10 +3,11 @@ use uuid::Uuid;
 
 pub mod adapter;
 pub mod agent;
-pub mod cron;
 pub mod agent_graph_storage;
 pub mod authz;
 pub mod beacon;
+pub mod catalog_rights;
+pub mod cron;
 pub mod cursor;
 pub mod domain;
 pub mod event;
@@ -16,6 +17,7 @@ pub mod heartbeat;
 pub mod ledger;
 pub mod materializer;
 pub mod mcp_route;
+pub mod membership;
 pub mod meshops;
 pub mod model_manager;
 pub mod registry;
@@ -76,57 +78,4 @@ pub struct NodeConstraints {
     pub trust_level: Option<String>,
 }
 
-/// The core envelope for UDP mesh communication.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BeaconMessage {
-    /// Protocol version (e.g., 1)
-    pub version: u8,
-    /// Unique identifier for this message
-    pub msg_id: Uuid,
-    /// Originating node
-    pub src_node: NodeId,
-    /// Destination node (or "broadcast" / "group:X")
-    pub dest_node: String,
-    /// Message type identifier
-    pub msg_type: MsgType,
-    /// Sequence number for fragmented messages (0 for unfragmented)
-    pub seq: u32,
-    /// Total fragments in this sequence (1 for unfragmented)
-    pub total: u32,
-    /// Encoded payload (JSON, MsgPack, or CBOR)
-    pub payload: Vec<u8>,
-    /// Creation timestamp (Unix epoch secs)
-    pub timestamp: u64,
-    /// HMAC signature for integrity and authenticity
-    pub hmac: Vec<u8>,
-}
-
-/// Identifiers for the types of messages sent over the beacon.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum MsgType {
-    /// Deploy an agent bundle to a remote node
-    DeployAgent,
-    /// Execute a deployed agent with an input
-    RunAgent,
-    /// Invoke a specific tool returning results
-    ToolCall,
-    /// Pull secrets from the authority node
-    SecretPull,
-    /// Mesh presence and health update
-    Heartbeat,
-    /// Asynchronous result delivery
-    Result,
-    /// Streaming execution logs
-    Log,
-    /// Model Manager routing requests
-    ModelManager,
-    /// Reading/writing from the Graph memory apartments
-    MemoryOp,
-    /// A batch of EventEnvelopes dispatched over the durable mesh
-    MeshEventBatch,
-    /// An acknowledgment of durably received mesh events
-    MeshEventAck,
-    /// WebRTC Session Description Protocol (SDP) and ICE candidate signaling
-    WebRtcSignal,
-}
+pub use philotic_primitives_mesh::beacon::*;

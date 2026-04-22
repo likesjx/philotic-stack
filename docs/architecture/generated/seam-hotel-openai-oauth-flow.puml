@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - hotel-openai-oauth-flow
+
+rectangle "hotel-openai-oauth-flow" as hotel_openai_oauth_flow #Orange {
+}
+
+
+@enduml

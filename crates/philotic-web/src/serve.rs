@@ -11,6 +11,9 @@
 //!   GET  /api/agents
 //!   GET  /api/agents/:agent_id/roles
 //!   GET  /api/agents/:agent_id/rules
+//!   GET  /api/agents/:agent_id/routing-policies
+//!   POST /api/routing-policies/:proposal_id/disposition
+//!   PATCH /api/agents/:agent_id/roles/:role_name
 //!   GET  /api/skills
 //!   GET  /api/mesh/targets
 //!   GET  /api/mesh/targets/:target_node_id/status
@@ -21,7 +24,11 @@
 //!   GET  /api/config/telegram
 //!   GET  /api/config/gemini
 //!   GET  /api/components
+//!   GET  /api/component-templates
+//!   POST /api/components
 //!   GET  /api/components/:guest_id
+//!   PATCH /api/components/:guest_id
+//!   DELETE /api/components/:guest_id
 //!   POST /api/components/:guest_id/enable
 //!   POST /api/components/:guest_id/disable
 //!   POST /api/components/:guest_id/restart
@@ -59,12 +66,10 @@ use tokio::sync::{broadcast, watch, Mutex};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use philotic_client::{
-    CronJob, CronJobSource,
-    DesktopMembraneAgentView, DesktopMembraneGuestView, DesktopMembraneStatusView,
-    GuestIdentity, IpcRequest, IpcResponse, LeaseEnvelope,
-    OperatorTargetAgentInventoryView, OperatorTargetGuestInventoryView,
-    OperatorTargetStatusView, OperatorTargetView, PhiloticClient,
-    OPERATOR_CHAT_REPLY_ROLE,
+    ComponentManifest, CronJob, CronJobSource, DesktopMembraneAgentView, DesktopMembraneGuestView,
+    DesktopMembraneStatusView, GuestIdentity, IpcRequest, IpcResponse, LeaseEnvelope,
+    OperatorTargetAgentInventoryView, OperatorTargetGuestInventoryView, OperatorTargetStatusView,
+    OperatorTargetView, PhiloticClient, ResponseRoutePolicyView, OPERATOR_CHAT_REPLY_ROLE,
 };
 
 // ── Embedded UI assets ────────────────────────────────────────────────────────
@@ -117,6 +122,104 @@ struct OperatorChatAcceptedView {
     delivery_kind: String,
 }
 
+#[derive(serde::Deserialize)]
+struct SetRoutingPolicyDispositionBody {
+    state: String,
+    reason: String,
+}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct ComponentInventoryEntry {
+    guest_id: String,
+    role: String,
+    hotel: String,
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    env: HashMap<String, String>,
+    component_type: String,
+    is_active: bool,
+    auto_start: bool,
+    #[serde(default)]
+    active_pid: Option<String>,
+    #[serde(default)]
+    last_active_at: Option<u64>,
+    #[serde(default)]
+    component_config: Value,
+    #[serde(default)]
+    capabilities: Vec<String>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct ComponentTemplateFieldView {
+    key: String,
+    label: String,
+    target: String,
+    input_kind: String,
+    required: bool,
+    #[serde(default)]
+    secret: bool,
+    #[serde(default)]
+    vault_only: bool,
+    #[serde(default)]
+    placeholder: Option<String>,
+    #[serde(default)]
+    help: Option<String>,
+    #[serde(default)]
+    default_value: Option<Value>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct ComponentTemplateDependencyView {
+    key: String,
+    label: String,
+    location: String,
+    required: bool,
+    #[serde(default)]
+    secret: bool,
+    #[serde(default)]
+    vault_only: bool,
+    help: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct ComponentTemplateView {
+    id: String,
+    label: String,
+    description: String,
+    command: String,
+    role: String,
+    #[serde(default)]
+    env_fields: Vec<ComponentTemplateFieldView>,
+    #[serde(default)]
+    component_config_fields: Vec<ComponentTemplateFieldView>,
+    #[serde(default)]
+    dependencies: Vec<ComponentTemplateDependencyView>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct PatchComponentBody {
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    hotel: Option<String>,
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    args: Option<Vec<String>>,
+    #[serde(default)]
+    env: Option<HashMap<String, String>>,
+    #[serde(default)]
+    component_config: Option<Value>,
+    #[serde(default)]
+    auto_start: Option<bool>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct DeleteComponentBody {
+    confirm_guest_id: String,
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 pub async fn run(
@@ -162,24 +265,57 @@ pub async fn run(
         .route("/api/status", get(handle_status))
         .route("/api/guests", get(handle_guests))
         .route("/api/agents", get(handle_agents))
-        .route("/api/agents/:agent_id", axum::routing::patch(handle_agent_patch))
+        .route(
+            "/api/agents/:agent_id",
+            axum::routing::patch(handle_agent_patch),
+        )
         .route("/api/agents/:agent_id/roles", get(handle_agent_roles))
+        .route(
+            "/api/agents/:agent_id/roles/:role_name",
+            axum::routing::patch(handle_role_patch),
+        )
         .route("/api/agents/:agent_id/rules", get(handle_agent_rules))
+        .route(
+            "/api/agents/:agent_id/routing-policies",
+            get(handle_agent_routing_policies),
+        )
+        .route(
+            "/api/routing-policies/:proposal_id/disposition",
+            post(handle_routing_policy_disposition),
+        )
         .route("/api/skills", get(handle_skills))
         .route("/api/toolsets", get(handle_toolsets))
         .route("/api/config", get(handle_config))
         .route("/api/config/telegram", get(handle_config_telegram))
         .route("/api/config/gemini", get(handle_config_gemini))
-        .route("/api/components", get(handle_components))
-        .route("/api/components/:guest_id", get(handle_component_detail))
-        .route("/api/components/:guest_id/enable", post(handle_component_enable))
-        .route("/api/components/:guest_id/disable", post(handle_component_disable))
-        .route("/api/components/:guest_id/restart", post(handle_component_restart))
+        .route(
+            "/api/components",
+            get(handle_components).post(handle_component_create),
+        )
+        .route("/api/component-templates", get(handle_component_templates))
+        .route(
+            "/api/components/:guest_id",
+            get(handle_component_detail)
+                .patch(handle_component_patch)
+                .delete(handle_component_delete),
+        )
+        .route(
+            "/api/components/:guest_id/enable",
+            post(handle_component_enable),
+        )
+        .route(
+            "/api/components/:guest_id/disable",
+            post(handle_component_disable),
+        )
+        .route(
+            "/api/components/:guest_id/restart",
+            post(handle_component_restart),
+        )
         .route("/api/graphs", get(handle_graphs))
         .route("/api/graphs/:graph_id", get(handle_graph_detail))
         .route("/api/cron", get(handle_cron_list).post(handle_cron_create))
         .route("/api/cron/:job_id", delete(handle_cron_delete))
-        .route("/api/cron/:job_id/enable",  post(handle_cron_enable))
+        .route("/api/cron/:job_id/enable", post(handle_cron_enable))
         .route("/api/cron/:job_id/disable", post(handle_cron_disable))
         .route("/api/secrets", get(handle_secrets))
         .route("/api/secrets/rotate", post(handle_secret_rotate))
@@ -837,11 +973,14 @@ async fn stream_operator_chat_turn(
     content: String,
 ) -> Result<()> {
     let reply_guest_id = new_operator_chat_id("operator-chat");
-    let mut client = connect_client_with_identity(&socket, GuestIdentity {
-        guest_id: reply_guest_id.clone(),
-        role: OPERATOR_CHAT_REPLY_ROLE.into(),
-        supported_tools: vec![],
-    })
+    let mut client = connect_client_with_identity(
+        &socket,
+        GuestIdentity {
+            guest_id: reply_guest_id.clone(),
+            role: OPERATOR_CHAT_REPLY_ROLE.into(),
+            supported_tools: vec![],
+        },
+    )
     .await?;
 
     match client
@@ -1117,17 +1256,30 @@ async fn handle_agent_roles(
     // Load role incarnations, then enrich each with its toolset profile data.
     let role_data = match ipc_list_role_incarnations(&state.socket, &agent_id).await {
         Ok(d) => d,
-        Err(e) => return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        ).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
     };
-    let roles_arr = role_data.get("roles").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let roles_arr = role_data
+        .get("roles")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
     let mut enriched_roles = Vec::new();
     for role in roles_arr {
-        let profile_name = role.get("toolset_profile").and_then(|v| v.as_str()).unwrap_or("");
+        let profile_name = role
+            .get("toolset_profile")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let profile = if !profile_name.is_empty() {
-            ipc_get_toolset_profile(&state.socket, profile_name).await.ok().flatten()
+            ipc_get_toolset_profile(&state.socket, profile_name)
+                .await
+                .ok()
+                .flatten()
         } else {
             None
         };
@@ -1152,6 +1304,45 @@ async fn handle_agent_rules(
     }
     match ipc_list_rules(&state.socket, &agent_id).await {
         Ok(rules) => Json(rules).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn handle_agent_routing_policies(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_list_routing_policies(&state.socket, &agent_id).await {
+        Ok(policies) => Json(policies).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn handle_routing_policy_disposition(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(proposal_id): Path<String>,
+    Json(body): Json<SetRoutingPolicyDispositionBody>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_set_routing_policy_disposition(&state.socket, &proposal_id, &body.state, &body.reason)
+        .await
+    {
+        Ok(value) => Json(value).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
@@ -1195,10 +1386,16 @@ async fn handle_toolsets(headers: HeaderMap, State(state): State<AppState>) -> R
 // ── Cron endpoints ────────────────────────────────────────────────────────────
 
 async fn handle_cron_list(headers: HeaderMap, State(state): State<AppState>) -> Response {
-    if !check_auth(&headers, &state) { return unauthorized(); }
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
     match ipc_list_cron_jobs(&state.socket).await {
         Ok(jobs) => Json(jobs).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -1220,7 +1417,9 @@ async fn handle_cron_create(
     State(state): State<AppState>,
     Json(body): Json<CreateCronBody>,
 ) -> Response {
-    if !check_auth(&headers, &state) { return unauthorized(); }
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1244,7 +1443,11 @@ async fn handle_cron_create(
             let _ = state.tx.send(event.to_string());
             Json(json!({"ok": true, "job_id": job.id})).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -1253,14 +1456,20 @@ async fn handle_cron_delete(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
 ) -> Response {
-    if !check_auth(&headers, &state) { return unauthorized(); }
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
     match ipc_remove_cron_job(&state.socket, &job_id).await {
         Ok(()) => {
             let event = json!({ "type": "cron:deleted", "payload": { "job_id": job_id } });
             let _ = state.tx.send(event.to_string());
             Json(json!({"ok": true})).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -1269,14 +1478,21 @@ async fn handle_cron_enable(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
 ) -> Response {
-    if !check_auth(&headers, &state) { return unauthorized(); }
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
     match ipc_set_cron_enabled(&state.socket, &job_id, true).await {
         Ok(()) => {
-            let event = json!({ "type": "cron:updated", "payload": { "job_id": job_id, "enabled": true } });
+            let event =
+                json!({ "type": "cron:updated", "payload": { "job_id": job_id, "enabled": true } });
             let _ = state.tx.send(event.to_string());
             Json(json!({"ok": true})).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -1285,14 +1501,20 @@ async fn handle_cron_disable(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
 ) -> Response {
-    if !check_auth(&headers, &state) { return unauthorized(); }
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
     match ipc_set_cron_enabled(&state.socket, &job_id, false).await {
         Ok(()) => {
             let event = json!({ "type": "cron:updated", "payload": { "job_id": job_id, "enabled": false } });
             let _ = state.tx.send(event.to_string());
             Json(json!({"ok": true})).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -1304,16 +1526,16 @@ async fn handle_config(headers: HeaderMap, State(state): State<AppState>) -> Res
     }
     // Read well-known operator-facing config keys. Values are returned as-is
     // (already JSON-encoded strings in the context graph).
-    let keys = &[
-        "execution_host",
-        "vault_registry",
-        "tool_runner_registry",
-    ];
+    let keys = &["execution_host", "vault_registry", "tool_runner_registry"];
     let mut out = serde_json::Map::new();
     for key in keys {
         match ipc_get_config(&state.socket, key).await {
-            Ok(Some(val)) => { out.insert(key.to_string(), val); }
-            Ok(None) => { out.insert(key.to_string(), Value::Null); }
+            Ok(Some(val)) => {
+                out.insert(key.to_string(), val);
+            }
+            Ok(None) => {
+                out.insert(key.to_string(), Value::Null);
+            }
             Err(e) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1378,7 +1600,9 @@ async fn handle_config_gemini(headers: HeaderMap, State(state): State<AppState>)
     let mut meta = serde_json::Map::new();
     for key in meta_keys {
         match ipc_get_config(&state.socket, key).await {
-            Ok(Some(val)) => { meta.insert(key.to_string(), val); }
+            Ok(Some(val)) => {
+                meta.insert(key.to_string(), val);
+            }
             Ok(None) => {}
             Err(e) => {
                 return (
@@ -1443,7 +1667,11 @@ async fn handle_graph_detail(
                 .find(|g| g.get("graph_id").and_then(|v| v.as_str()) == Some(graph_id.as_str()));
             match found {
                 Some(g) => Json(g).into_response(),
-                None => (StatusCode::NOT_FOUND, Json(json!({"error": "graph instance not found"}))).into_response(),
+                None => (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "graph instance not found"})),
+                )
+                    .into_response(),
             }
         }
         Err(e) => (
@@ -1473,10 +1701,15 @@ async fn handle_secrets(headers: HeaderMap, State(state): State<AppState>) -> Re
     let vault_entries: Vec<Value> = vault_registry
         .into_iter()
         .filter_map(|entry| {
-            let name = entry.get("vault_name").or_else(|| entry.get("name"))
-                .and_then(|v| v.as_str())?.to_string();
-            let secret_ref = entry.get("secret_ref")
-                .and_then(|v| v.as_str())?.to_string();
+            let name = entry
+                .get("vault_name")
+                .or_else(|| entry.get("name"))
+                .and_then(|v| v.as_str())?
+                .to_string();
+            let secret_ref = entry
+                .get("secret_ref")
+                .and_then(|v| v.as_str())?
+                .to_string();
             Some(json!({ "kind": "vault_token", "name": name, "secret_ref": secret_ref }))
         })
         .collect();
@@ -1484,7 +1717,10 @@ async fn handle_secrets(headers: HeaderMap, State(state): State<AppState>) -> Re
     // Named config-key secret refs
     let named_refs = [
         ("gemini_oauth_access_token", "gemini_oauth_access_token_ref"),
-        ("gemini_oauth_refresh_token", "gemini_oauth_refresh_token_ref"),
+        (
+            "gemini_oauth_refresh_token",
+            "gemini_oauth_refresh_token_ref",
+        ),
         ("telegram_bot_token", "telegram_bot_token"),
     ];
     let mut named_entries: Vec<Value> = Vec::new();
@@ -1493,7 +1729,9 @@ async fn handle_secrets(headers: HeaderMap, State(state): State<AppState>) -> Re
             Ok(Some(_)) => true,
             _ => false,
         };
-        named_entries.push(json!({ "kind": "config_ref", "name": label, "key": key, "configured": configured }));
+        named_entries.push(
+            json!({ "kind": "config_ref", "name": label, "key": key, "configured": configured }),
+        );
     }
 
     Json(json!({
@@ -1506,11 +1744,7 @@ async fn handle_secrets(headers: HeaderMap, State(state): State<AppState>) -> Re
 // ── PUT /api/config/:key ──────────────────────────────────────────────────────
 //
 // Allowed keys for operator mutation (prevents arbitrary config overwrites).
-const MUTABLE_CONFIG_KEYS: &[&str] = &[
-    "telegram_bot_token",
-    "execution_host",
-    "vault_registry",
-];
+const MUTABLE_CONFIG_KEYS: &[&str] = &["telegram_bot_token", "execution_host", "vault_registry"];
 
 #[derive(serde::Deserialize)]
 struct SetConfigBody {
@@ -1535,10 +1769,13 @@ async fn handle_config_put(
     }
     let value_json = match serde_json::to_string(&body.value) {
         Ok(s) => s,
-        Err(e) => return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("invalid value: {e}")})),
-        ).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("invalid value: {e}")})),
+            )
+                .into_response()
+        }
     };
     match ipc_set_config(&state.socket, &key, &value_json).await {
         Ok(()) => {
@@ -1598,7 +1835,14 @@ async fn handle_vault_add(
     if !check_auth(&headers, &state) {
         return unauthorized();
     }
-    match ipc_add_vault_entry(&state.socket, &body.vault_name, &body.plaintext, body.allowed_roles).await {
+    match ipc_add_vault_entry(
+        &state.socket,
+        &body.vault_name,
+        &body.plaintext,
+        body.allowed_roles,
+    )
+    .await
+    {
         Ok(secret_ref) => {
             let event = json!({ "type": "vault:entry-added", "payload": { "vault_name": body.vault_name, "secret_ref": secret_ref } });
             let _ = state.tx.send(event.to_string());
@@ -1673,9 +1917,51 @@ struct PatchAgentBody {
     #[serde(default)]
     persona_name: Option<String>,
     #[serde(default)]
+    soul_text: Option<String>,
+    #[serde(default)]
+    identity_text: Option<String>,
+    #[serde(default)]
+    user_context_text: Option<String>,
+    #[serde(default)]
+    system_prompt: Option<String>,
+    #[serde(default)]
+    import_workspace: Option<String>,
+    #[serde(default)]
     default_toolset: Option<Vec<String>>,
     #[serde(default)]
     default_skillset: Option<Vec<String>>,
+    #[serde(default)]
+    response_route_policy: Option<ResponseRoutePolicyBody>,
+}
+
+#[derive(serde::Deserialize)]
+struct ResponseRoutePolicyBody {
+    #[serde(default)]
+    default_route: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct PatchRoleBody {
+    #[serde(default)]
+    guest_id: Option<String>,
+    #[serde(default)]
+    toolset_profile: Option<String>,
+    #[serde(default)]
+    role_identity_addendum: Option<String>,
+    #[serde(default)]
+    role_manifest: Option<String>,
+    #[serde(default)]
+    is_admin: Option<bool>,
+    #[serde(default)]
+    inactive_ttl_seconds: Option<u64>,
+    #[serde(default)]
+    iteration_cap: Option<u32>,
+    #[serde(default)]
+    approval_policy: Option<String>,
+    #[serde(default)]
+    model_profile: Option<String>,
+    #[serde(default)]
+    context_window_policy: Option<String>,
 }
 
 async fn handle_agent_patch(
@@ -1687,7 +1973,25 @@ async fn handle_agent_patch(
     if !check_auth(&headers, &state) {
         return unauthorized();
     }
-    match ipc_patch_agent_bundle(&state.socket, &agent_id, body.persona_name, body.default_toolset, body.default_skillset).await {
+    match ipc_patch_agent_bundle(
+        &state.socket,
+        &agent_id,
+        body.persona_name,
+        body.soul_text,
+        body.identity_text,
+        body.user_context_text,
+        body.system_prompt,
+        body.import_workspace,
+        body.default_toolset,
+        body.default_skillset,
+        body.response_route_policy.and_then(|policy| {
+            policy
+                .default_route
+                .map(|default_route| ResponseRoutePolicyView { default_route })
+        }),
+    )
+    .await
+    {
         Ok(agent) => {
             let event = json!({ "type": "agent:updated", "payload": { "agent_id": agent_id } });
             let _ = state.tx.send(event.to_string());
@@ -1701,26 +2005,205 @@ async fn handle_agent_patch(
     }
 }
 
+async fn handle_role_patch(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path((agent_id, role_name)): Path<(String, String)>,
+    Json(body): Json<PatchRoleBody>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_patch_role(
+        &state.socket,
+        &agent_id,
+        &role_name,
+        body.guest_id,
+        body.toolset_profile,
+        body.role_identity_addendum,
+        body.role_manifest,
+        body.is_admin,
+        body.inactive_ttl_seconds,
+        body.iteration_cap,
+        body.approval_policy,
+        body.model_profile,
+        body.context_window_policy,
+    )
+    .await
+    {
+        Ok(role) => {
+            let event = json!({
+                "type": "role:updated",
+                "payload": { "agent_id": agent_id, "role_name": role_name }
+            });
+            let _ = state.tx.send(event.to_string());
+            Json(role).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 async fn ipc_patch_agent_bundle(
     socket: &str,
     agent_id: &str,
     persona_name: Option<String>,
+    soul_text: Option<String>,
+    identity_text: Option<String>,
+    user_context_text: Option<String>,
+    system_prompt: Option<String>,
+    import_workspace: Option<String>,
     default_toolset: Option<Vec<String>>,
     default_skillset: Option<Vec<String>>,
+    response_route_policy: Option<ResponseRoutePolicyView>,
 ) -> Result<Value> {
     let mut client = connect_management_client(socket, "philotic-web-patch-agent").await?;
     match client
         .send_request(IpcRequest::PatchAgentBundle {
             agent_id: agent_id.to_string(),
             persona_name,
+            soul_text,
+            identity_text,
+            user_context_text,
+            system_prompt,
+            import_workspace,
             default_toolset,
             default_skillset,
+            response_route_policy,
         })
         .await?
     {
         IpcResponse::AgentUpdated { agent } => Ok(serde_json::to_value(agent)?),
         IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected patch_agent_bundle response: {other:?}")),
+    }
+}
+
+async fn ipc_patch_role(
+    socket: &str,
+    agent_id: &str,
+    role_name: &str,
+    guest_id: Option<String>,
+    toolset_profile: Option<String>,
+    role_identity_addendum: Option<String>,
+    role_manifest: Option<String>,
+    is_admin: Option<bool>,
+    inactive_ttl_seconds: Option<u64>,
+    iteration_cap: Option<u32>,
+    approval_policy: Option<String>,
+    model_profile: Option<String>,
+    context_window_policy: Option<String>,
+) -> Result<Value> {
+    let role_data = ipc_list_role_incarnations(socket, agent_id).await?;
+    let existing = role_data
+        .get("roles")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|role| role.get("role_name").and_then(Value::as_str) == Some(role_name))
+        .cloned()
+        .ok_or_else(|| anyhow!("role [{role_name}] not configured for agent [{agent_id}]"))?;
+
+    let existing_guest_id = existing
+        .get("guest_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("role [{role_name}] missing guest_id"))?;
+    let existing_toolset_profile = existing
+        .get("toolset_profile")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("role [{role_name}] missing toolset_profile"))?;
+    let existing_is_admin = existing
+        .get("is_admin")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let existing_inactive_ttl_seconds =
+        existing.get("inactive_ttl_seconds").and_then(Value::as_u64);
+    let turn_loop_config = existing
+        .get("turn_loop_config")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    let mut client = connect_management_client(socket, "philotic-web-patch-role").await?;
+    match client
+        .send_request(IpcRequest::ConfigureRole {
+            agent_id: agent_id.to_string(),
+            role_name: role_name.to_string(),
+            guest_id: guest_id.unwrap_or_else(|| existing_guest_id.to_string()),
+            calling_role: "orchestrator".into(),
+            toolset_profile: toolset_profile
+                .unwrap_or_else(|| existing_toolset_profile.to_string()),
+            role_identity_addendum: Some(role_identity_addendum.unwrap_or_else(|| {
+                existing
+                    .get("role_identity_addendum")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            })),
+            role_manifest: Some(role_manifest.unwrap_or_else(|| {
+                existing
+                    .get("role_manifest")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            })),
+            is_admin: is_admin.unwrap_or(existing_is_admin),
+            inactive_ttl_seconds: Some(
+                inactive_ttl_seconds
+                    .or(existing_inactive_ttl_seconds)
+                    .unwrap_or(0),
+            )
+            .filter(|ttl| *ttl > 0),
+            iteration_cap: Some(iteration_cap.unwrap_or_else(|| {
+                turn_loop_config
+                    .get("iteration_cap")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .unwrap_or(0)
+            }))
+            .filter(|cap| *cap > 0),
+            approval_policy: Some(approval_policy.unwrap_or_else(|| {
+                turn_loop_config
+                    .get("approval_policy")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            }))
+            .filter(|policy| !policy.trim().is_empty()),
+            model_profile: Some(model_profile.unwrap_or_else(|| {
+                turn_loop_config
+                    .get("model_profile")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            }))
+            .filter(|profile| !profile.trim().is_empty()),
+            context_window_policy: Some(context_window_policy.unwrap_or_else(|| {
+                turn_loop_config
+                    .get("context_window_policy")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            }))
+            .filter(|policy| !policy.trim().is_empty()),
+        })
+        .await?
+    {
+        IpcResponse::ConfigureRoleOk { .. } => {
+            let refreshed = ipc_list_role_incarnations(socket, agent_id).await?;
+            refreshed
+                .get("roles")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .find(|role| role.get("role_name").and_then(Value::as_str) == Some(role_name))
+                .cloned()
+                .ok_or_else(|| anyhow!("role [{role_name}] missing after patch"))
+        }
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected patch_role response: {other:?}")),
     }
 }
 
@@ -1740,6 +2223,39 @@ async fn handle_components(headers: HeaderMap, State(state): State<AppState>) ->
     }
 }
 
+// ── GET /api/component-templates ─────────────────────────────────────────────
+
+async fn handle_component_templates(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    Json(component_templates()).into_response()
+}
+
+// ── POST /api/components ──────────────────────────────────────────────────────
+
+async fn handle_component_create(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(manifest): Json<ComponentManifest>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_register_component(&state.socket, manifest).await {
+        Ok(component) => {
+            let event = json!({ "type": "component:created", "payload": { "guest_id": component.guest_id } });
+            let _ = state.tx.send(event.to_string());
+            (StatusCode::CREATED, Json(component)).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 // ── GET /api/components/:guest_id ─────────────────────────────────────────────
 
 async fn handle_component_detail(
@@ -1750,15 +2266,104 @@ async fn handle_component_detail(
     if !check_auth(&headers, &state) {
         return unauthorized();
     }
-    match ipc_list_components(&state.socket).await {
-        Ok(components) => {
-            let found = components
-                .into_iter()
-                .find(|c| c.get("guest_id").and_then(|v| v.as_str()) == Some(guest_id.as_str()));
-            match found {
-                Some(c) => Json(c).into_response(),
-                None => (StatusCode::NOT_FOUND, Json(json!({"error": "component not found"}))).into_response(),
+    match ipc_get_component(&state.socket, &guest_id).await {
+        Ok(component) => Json(component).into_response(),
+        Err(e) if e.to_string().contains("component not found") => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "component not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// ── PATCH /api/components/:guest_id ───────────────────────────────────────────
+
+async fn handle_component_patch(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(guest_id): Path<String>,
+    Json(body): Json<PatchComponentBody>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_get_component(&state.socket, &guest_id).await {
+        Ok(current) => {
+            let manifest = ComponentManifest {
+                guest_id: guest_id.clone(),
+                role: body.role.unwrap_or(current.role),
+                hotel: body.hotel.unwrap_or(current.hotel),
+                command: body.command.unwrap_or(current.command),
+                args: body.args.unwrap_or(current.args),
+                env: body.env.unwrap_or(current.env),
+                component_config: body.component_config.unwrap_or(current.component_config),
+                auto_start: body.auto_start.unwrap_or(current.auto_start),
+            };
+            match ipc_register_component(&state.socket, manifest).await {
+                Ok(component) => {
+                    let event =
+                        json!({ "type": "component:updated", "payload": { "guest_id": guest_id } });
+                    let _ = state.tx.send(event.to_string());
+                    Json(component).into_response()
+                }
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": e.to_string()})),
+                )
+                    .into_response(),
             }
+        }
+        Err(e) if e.to_string().contains("component not found") => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "component not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// ── DELETE /api/components/:guest_id ─────────────────────────────────────────
+
+async fn handle_component_delete(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(guest_id): Path<String>,
+    Json(body): Json<DeleteComponentBody>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    if body.confirm_guest_id != guest_id {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "confirmation text must exactly match guest_id"})),
+        )
+            .into_response();
+    }
+    match ipc_remove_component(&state.socket, &guest_id).await {
+        Ok(_) => {
+            let event = json!({ "type": "component:deleted", "payload": { "guest_id": guest_id } });
+            let _ = state.tx.send(event.to_string());
+            Json(json!({"ok": true, "guest_id": guest_id})).into_response()
+        }
+        Err(e)
+            if e.to_string().contains("GUEST_NOT_FOUND")
+                || e.to_string().contains("component not found") =>
+        {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "component not found"})),
+            )
+                .into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1804,7 +2409,8 @@ async fn handle_component_disable(
     }
     match ipc_set_component_active(&state.socket, &guest_id, false).await {
         Ok(_) => {
-            let event = json!({ "type": "component:disabled", "payload": { "guest_id": guest_id } });
+            let event =
+                json!({ "type": "component:disabled", "payload": { "guest_id": guest_id } });
             let _ = state.tx.send(event.to_string());
             Json(json!({"ok": true, "guest_id": guest_id, "active": false})).into_response()
         }
@@ -1828,7 +2434,8 @@ async fn handle_component_restart(
     }
     match ipc_restart_component(&state.socket, &guest_id).await {
         Ok(_) => {
-            let event = json!({ "type": "component:restarted", "payload": { "guest_id": guest_id } });
+            let event =
+                json!({ "type": "component:restarted", "payload": { "guest_id": guest_id } });
             let _ = state.tx.send(event.to_string());
             Json(json!({"ok": true, "guest_id": guest_id})).into_response()
         }
@@ -1904,7 +2511,10 @@ async fn ipc_desktop_membrane_agents(socket: &str) -> Result<Vec<DesktopMembrane
 
 async fn ipc_desktop_membrane_targets(socket: &str) -> Result<Vec<OperatorTargetView>> {
     let mut client = connect_management_client(socket, "philotic-web-mesh-targets").await?;
-    match client.send_request(IpcRequest::QueryOperatorTargets).await? {
+    match client
+        .send_request(IpcRequest::QueryOperatorTargets)
+        .await?
+    {
         IpcResponse::OperatorTargetsView { operator_targets } => Ok(operator_targets),
         IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
         other => Err(anyhow!(
@@ -2008,6 +2618,49 @@ async fn ipc_list_rules(socket: &str, agent_id: &str) -> Result<Vec<Value>> {
     }
 }
 
+async fn ipc_list_routing_policies(socket: &str, agent_id: &str) -> Result<Vec<Value>> {
+    let mut client = connect_management_client(socket, "philotic-web-routing-policies").await?;
+    match client
+        .send_request(IpcRequest::ListRoutingPolicies {
+            agent_id: agent_id.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::RoutingPolicyList { policies } => Ok(policies),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected routing policies response: {other:?}")),
+    }
+}
+
+async fn ipc_set_routing_policy_disposition(
+    socket: &str,
+    proposal_id: &str,
+    state: &str,
+    reason: &str,
+) -> Result<Value> {
+    let mut client =
+        connect_management_client(socket, "philotic-web-routing-policy-disposition").await?;
+    match client
+        .send_request(IpcRequest::SetRoutingPolicyDisposition {
+            proposal_id: proposal_id.to_string(),
+            state: state.to_string(),
+            reason: reason.to_string(),
+            source_tool: Some("philotic-web".to_string()),
+        })
+        .await?
+    {
+        IpcResponse::Standard {
+            ok: true,
+            data: Some(value),
+            ..
+        } => Ok(value),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected routing policy disposition response: {other:?}"
+        )),
+    }
+}
+
 async fn ipc_list_skills(socket: &str) -> Result<Vec<Value>> {
     let mut client = connect_management_client(socket, "philotic-web-skills").await?;
     match client.send_request(IpcRequest::ListSkills {}).await? {
@@ -2020,11 +2673,15 @@ async fn ipc_list_skills(socket: &str) -> Result<Vec<Value>> {
 async fn ipc_get_toolset_profile(socket: &str, profile_name: &str) -> Result<Option<Value>> {
     let mut client = connect_management_client(socket, "philotic-web-toolsets").await?;
     match client
-        .send_request(IpcRequest::GetToolsetProfile { profile_name: profile_name.to_string() })
+        .send_request(IpcRequest::GetToolsetProfile {
+            profile_name: profile_name.to_string(),
+        })
         .await?
     {
         IpcResponse::Standard { ok: true, data, .. } => Ok(data),
-        IpcResponse::Standard { ok: false, message, .. } => Err(anyhow!(message)),
+        IpcResponse::Standard {
+            ok: false, message, ..
+        } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected toolset_profile response: {other:?}")),
     }
 }
@@ -2035,9 +2692,11 @@ async fn ipc_list_toolset_profiles(socket: &str) -> Result<Vec<Value>> {
         .send_request(IpcRequest::ListToolsetProfiles {})
         .await?
     {
-        IpcResponse::Standard { ok: true, data: Some(d), .. } => {
-            Ok(d.as_array().cloned().unwrap_or_default())
-        }
+        IpcResponse::Standard {
+            ok: true,
+            data: Some(d),
+            ..
+        } => Ok(d.as_array().cloned().unwrap_or_default()),
         IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected toolset_profiles response: {other:?}")),
     }
@@ -2057,7 +2716,10 @@ async fn ipc_list_cron_jobs(socket: &str) -> Result<Vec<Value>> {
 
 async fn ipc_register_cron_job(socket: &str, job: CronJob) -> Result<()> {
     let mut client = connect_management_client(socket, "philotic-web-cron").await?;
-    match client.send_request(IpcRequest::RegisterCronJob { job }).await? {
+    match client
+        .send_request(IpcRequest::RegisterCronJob { job })
+        .await?
+    {
         IpcResponse::Standard { ok: true, .. } => Ok(()),
         IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
         IpcResponse::Error(msg) => Err(anyhow!(msg)),
@@ -2068,7 +2730,9 @@ async fn ipc_register_cron_job(socket: &str, job: CronJob) -> Result<()> {
 async fn ipc_remove_cron_job(socket: &str, job_id: &str) -> Result<()> {
     let mut client = connect_management_client(socket, "philotic-web-cron").await?;
     match client
-        .send_request(IpcRequest::RemoveCronJob { job_id: job_id.to_string() })
+        .send_request(IpcRequest::RemoveCronJob {
+            job_id: job_id.to_string(),
+        })
         .await?
     {
         IpcResponse::Standard { ok: true, .. } => Ok(()),
@@ -2080,16 +2744,22 @@ async fn ipc_remove_cron_job(socket: &str, job_id: &str) -> Result<()> {
 
 async fn ipc_set_cron_enabled(socket: &str, job_id: &str, enabled: bool) -> Result<()> {
     let req = if enabled {
-        IpcRequest::EnableCronJob { job_id: job_id.to_string() }
+        IpcRequest::EnableCronJob {
+            job_id: job_id.to_string(),
+        }
     } else {
-        IpcRequest::DisableCronJob { job_id: job_id.to_string() }
+        IpcRequest::DisableCronJob {
+            job_id: job_id.to_string(),
+        }
     };
     let mut client = connect_management_client(socket, "philotic-web-cron").await?;
     match client.send_request(req).await? {
         IpcResponse::Standard { ok: true, .. } => Ok(()),
         IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
         IpcResponse::Error(msg) => Err(anyhow!(msg)),
-        other => Err(anyhow!("unexpected cron enable/disable response: {other:?}")),
+        other => Err(anyhow!(
+            "unexpected cron enable/disable response: {other:?}"
+        )),
     }
 }
 
@@ -2101,12 +2771,16 @@ async fn ipc_get_config(socket: &str, key: &str) -> Result<Option<Value>> {
         })
         .await?
     {
-        IpcResponse::ConfigData { value_json: Some(raw), .. } => {
-            let parsed: Value = serde_json::from_str(&raw)
-                .unwrap_or_else(|_| Value::String(raw));
+        IpcResponse::ConfigData {
+            value_json: Some(raw),
+            ..
+        } => {
+            let parsed: Value = serde_json::from_str(&raw).unwrap_or_else(|_| Value::String(raw));
             Ok(Some(parsed))
         }
-        IpcResponse::ConfigData { value_json: None, .. } => Ok(None),
+        IpcResponse::ConfigData {
+            value_json: None, ..
+        } => Ok(None),
         IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected config data response: {other:?}")),
     }
@@ -2122,7 +2796,9 @@ async fn ipc_set_config(socket: &str, key: &str, value_json: &str) -> Result<()>
         .await?
     {
         IpcResponse::Standard { ok: true, .. } => Ok(()),
-        IpcResponse::Standard { ok: false, message, .. } => Err(anyhow!(message)),
+        IpcResponse::Standard {
+            ok: false, message, ..
+        } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected set_config response: {other:?}")),
     }
 }
@@ -2137,7 +2813,9 @@ async fn ipc_rotate_secret(socket: &str, secret_ref: &str, plaintext: &str) -> R
         .await?
     {
         IpcResponse::Standard { ok: true, .. } => Ok(()),
-        IpcResponse::Standard { ok: false, message, .. } => Err(anyhow!(message)),
+        IpcResponse::Standard {
+            ok: false, message, ..
+        } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected rotate_secret response: {other:?}")),
     }
 }
@@ -2166,21 +2844,35 @@ async fn ipc_add_vault_entry(
                 .to_string();
             Ok(secret_ref)
         }
-        IpcResponse::Standard { ok: false, message, .. } => Err(anyhow!(message)),
+        IpcResponse::Standard {
+            ok: false, message, ..
+        } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected add_vault_entry response: {other:?}")),
     }
 }
 
 async fn ipc_list_graph_instances(socket: &str) -> Result<Vec<Value>> {
     let mut client = connect_management_client(socket, "philotic-web-graphs").await?;
-    match client.send_request(IpcRequest::ListGraphInstances {}).await? {
+    match client
+        .send_request(IpcRequest::ListGraphInstances {})
+        .await?
+    {
         IpcResponse::GraphInstanceList { instances } => Ok(instances),
-        IpcResponse::Standard { ok: false, message, .. } => Err(anyhow!(message)),
-        other => Err(anyhow!("unexpected list_graph_instances response: {other:?}")),
+        IpcResponse::Standard {
+            ok: false, message, ..
+        } => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected list_graph_instances response: {other:?}"
+        )),
     }
 }
 
-async fn ipc_assign_skill(socket: &str, agent_id: &str, role_name: &str, skill_name: &str) -> Result<Value> {
+async fn ipc_assign_skill(
+    socket: &str,
+    agent_id: &str,
+    role_name: &str,
+    skill_name: &str,
+) -> Result<Value> {
     let mut client = connect_management_client(socket, "philotic-web-skills-mgmt").await?;
     match client
         .send_request(IpcRequest::AssignSkill {
@@ -2190,15 +2882,26 @@ async fn ipc_assign_skill(socket: &str, agent_id: &str, role_name: &str, skill_n
         })
         .await?
     {
-        IpcResponse::SkillAssigned { role_name, skill_name, operation } => {
-            Ok(json!({"ok": true, "role_name": role_name, "skill_name": skill_name, "operation": operation}))
-        }
-        IpcResponse::Standard { ok: false, message, .. } => Err(anyhow!(message)),
+        IpcResponse::SkillAssigned {
+            role_name,
+            skill_name,
+            operation,
+        } => Ok(
+            json!({"ok": true, "role_name": role_name, "skill_name": skill_name, "operation": operation}),
+        ),
+        IpcResponse::Standard {
+            ok: false, message, ..
+        } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected assign_skill response: {other:?}")),
     }
 }
 
-async fn ipc_revoke_skill(socket: &str, agent_id: &str, role_name: &str, skill_name: &str) -> Result<Value> {
+async fn ipc_revoke_skill(
+    socket: &str,
+    agent_id: &str,
+    role_name: &str,
+    skill_name: &str,
+) -> Result<Value> {
     let mut client = connect_management_client(socket, "philotic-web-skills-mgmt").await?;
     match client
         .send_request(IpcRequest::RevokeSkill {
@@ -2208,20 +2911,59 @@ async fn ipc_revoke_skill(socket: &str, agent_id: &str, role_name: &str, skill_n
         })
         .await?
     {
-        IpcResponse::SkillAssigned { role_name, skill_name, operation } => {
-            Ok(json!({"ok": true, "role_name": role_name, "skill_name": skill_name, "operation": operation}))
-        }
-        IpcResponse::Standard { ok: false, message, .. } => Err(anyhow!(message)),
+        IpcResponse::SkillAssigned {
+            role_name,
+            skill_name,
+            operation,
+        } => Ok(
+            json!({"ok": true, "role_name": role_name, "skill_name": skill_name, "operation": operation}),
+        ),
+        IpcResponse::Standard {
+            ok: false, message, ..
+        } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected revoke_skill response: {other:?}")),
     }
 }
 
-async fn ipc_list_components(socket: &str) -> Result<Vec<Value>> {
+async fn ipc_list_components(socket: &str) -> Result<Vec<ComponentInventoryEntry>> {
     let mut client = connect_management_client(socket, "philotic-web-components").await?;
     match client.send_request(IpcRequest::ListComponents {}).await? {
-        IpcResponse::ComponentInventory { components } => Ok(components),
-        IpcResponse::Standard { ok: false, message, .. } => Err(anyhow!(message)),
+        IpcResponse::ComponentInventory { components } => components
+            .into_iter()
+            .map(serde_json::from_value)
+            .collect::<Result<Vec<ComponentInventoryEntry>, _>>()
+            .map_err(Into::into),
+        IpcResponse::Standard {
+            ok: false, message, ..
+        } => Err(anyhow!(message)),
         other => Err(anyhow!("unexpected list_components response: {other:?}")),
+    }
+}
+
+async fn ipc_get_component(socket: &str, guest_id: &str) -> Result<ComponentInventoryEntry> {
+    let components = ipc_list_components(socket).await?;
+    components
+        .into_iter()
+        .find(|component| component.guest_id == guest_id)
+        .ok_or_else(|| anyhow!("component not found"))
+}
+
+async fn ipc_register_component(
+    socket: &str,
+    manifest: ComponentManifest,
+) -> Result<ComponentInventoryEntry> {
+    let guest_id = manifest.guest_id.clone();
+    let mut client = connect_management_client(socket, "philotic-web-components").await?;
+    match client
+        .send_request(IpcRequest::RegisterComponent { manifest })
+        .await?
+    {
+        IpcResponse::ComponentRegistered { .. } => ipc_get_component(socket, &guest_id).await,
+        IpcResponse::Standard {
+            ok: false, message, ..
+        } => Err(anyhow!(message)),
+        IpcResponse::Error(message) => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected register_component response: {other:?}")),
     }
 }
 
@@ -2236,7 +2978,9 @@ async fn ipc_set_component_active(socket: &str, guest_id: &str, active: bool) ->
     {
         IpcResponse::Standard { ok: true, .. } => Ok(()),
         IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
-        other => Err(anyhow!("unexpected set_component_active response: {other:?}")),
+        other => Err(anyhow!(
+            "unexpected set_component_active response: {other:?}"
+        )),
     }
 }
 
@@ -2254,6 +2998,480 @@ async fn ipc_restart_component(socket: &str, guest_id: &str) -> Result<()> {
     }
 }
 
+async fn ipc_remove_component(socket: &str, guest_id: &str) -> Result<()> {
+    let mut client = connect_management_client(socket, "philotic-web-components").await?;
+    match client
+        .send_request(IpcRequest::RemoveComponent {
+            guest_id: guest_id.to_string(),
+        })
+        .await?
+    {
+        IpcResponse::Standard { ok: true, .. } => Ok(()),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        IpcResponse::Error(message) => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected remove_component response: {other:?}")),
+    }
+}
+
+fn component_templates() -> Vec<ComponentTemplateView> {
+    vec![
+        ComponentTemplateView {
+            id: "membrane-telegram".into(),
+            label: "Telegram Provider".into(),
+            description: "Telegram ingress/egress provider. System socket and node env vars are hotel-owned; operator-authored fields should stay focused on agent targeting and token/config references.".into(),
+            command: "membrane-telegram".into(),
+            role: "membrane".into(),
+            env_fields: vec![
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_TARGET_AGENT_ID".into(),
+                    label: "Target Agent ID".into(),
+                    target: "env".into(),
+                    input_kind: "string".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some("agent-bjork-01".into()),
+                    help: Some("Use for a single-agent membrane instance. Hotel-seeded shared membranes may instead rely on PHILOTIC_AGENT_ROSTER.".into()),
+                    default_value: None,
+                },
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_TELEGRAM_BOT_TOKEN_KEY".into(),
+                    label: "Telegram Token Config Key".into(),
+                    target: "env".into(),
+                    input_kind: "string".into(),
+                    required: true,
+                    secret: true,
+                    vault_only: true,
+                    placeholder: Some("telegram_bot_token".into()),
+                    help: Some("Name of the hotel config key that resolves the bot token. Store the actual token in the vault/config surface, not in this component manifest.".into()),
+                    default_value: Some(json!("telegram_bot_token")),
+                },
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_TELEGRAM_API_BASE_URL".into(),
+                    label: "Telegram API Base URL".into(),
+                    target: "env".into(),
+                    input_kind: "string".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some("https://api.telegram.org".into()),
+                    help: Some("Optional override for alternate Telegram API endpoints or local testing.".into()),
+                    default_value: None,
+                },
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_TELEGRAM_FILE_API_BASE_URL".into(),
+                    label: "Telegram File API Base URL".into(),
+                    target: "env".into(),
+                    input_kind: "string".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some("https://api.telegram.org".into()),
+                    help: Some("Optional override for file downloads when the API base differs.".into()),
+                    default_value: None,
+                },
+            ],
+            component_config_fields: vec![],
+            dependencies: vec![
+                ComponentTemplateDependencyView {
+                    key: "telegram_bot_token".into(),
+                    label: "Telegram Bot Token".into(),
+                    location: "hotel-config".into(),
+                    required: true,
+                    secret: true,
+                    vault_only: true,
+                    help: "Create or rotate this through the vault/config surface. The component should reference the config key, not store the token directly.".into(),
+                },
+            ],
+        },
+        ComponentTemplateView {
+            id: "membrane-discord".into(),
+            label: "Discord Provider".into(),
+            description: "Discord provider membrane. Guest identity, hotel socket, and node id are hotel-owned; the operator should provide the target agent plus Discord registration/config references.".into(),
+            command: "membrane-discord".into(),
+            role: "membrane".into(),
+            env_fields: vec![
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_TARGET_AGENT_ID".into(),
+                    label: "Target Agent ID".into(),
+                    target: "env".into(),
+                    input_kind: "string".into(),
+                    required: true,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some("agent-01".into()),
+                    help: Some("Agent served by this Discord provider instance.".into()),
+                    default_value: None,
+                },
+                ComponentTemplateFieldView {
+                    key: "DISCORD_BOT_TOKEN_KEY".into(),
+                    label: "Discord Token Config Key".into(),
+                    target: "env".into(),
+                    input_kind: "string".into(),
+                    required: true,
+                    secret: true,
+                    vault_only: true,
+                    placeholder: Some("discord_bot_token".into()),
+                    help: Some("Hotel config key used to resolve the Discord bot token. Keep the actual token in vault/config, not here.".into()),
+                    default_value: Some(json!("discord_bot_token")),
+                },
+                ComponentTemplateFieldView {
+                    key: "DISCORD_APPLICATION_ID".into(),
+                    label: "Discord Application ID".into(),
+                    target: "env".into(),
+                    input_kind: "string".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some("123456789012345678".into()),
+                    help: Some("Needed for slash command registration and application-scoped Discord features.".into()),
+                    default_value: None,
+                },
+            ],
+            component_config_fields: vec![],
+            dependencies: vec![
+                ComponentTemplateDependencyView {
+                    key: "discord_bot_token".into(),
+                    label: "Discord Bot Token".into(),
+                    location: "hotel-config".into(),
+                    required: true,
+                    secret: true,
+                    vault_only: true,
+                    help: "Store the bot token in the vault/config surface and reference it by config key from the component.".into(),
+                },
+            ],
+        },
+        ComponentTemplateView {
+            id: "model-controller-gemini".into(),
+            label: "Gemini Model Controller".into(),
+            description: "Gemini-backed model controller. The component itself is usually system-light; most meaningful configuration lives in hotel config and secret refs.".into(),
+            command: "model-controller-gemini".into(),
+            role: "model".into(),
+            env_fields: vec![
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_GEMINI_BASE_URL".into(),
+                    label: "Gemini Base URL Override".into(),
+                    target: "env".into(),
+                    input_kind: "string".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some("https://generativelanguage.googleapis.com".into()),
+                    help: Some("Optional per-component override; hotel config usually owns this.".into()),
+                    default_value: None,
+                },
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_GEMINI_OAUTH_ACCESS_TOKEN_REF".into(),
+                    label: "Gemini OAuth Access Token Ref".into(),
+                    target: "env".into(),
+                    input_kind: "secret_ref".into(),
+                    required: false,
+                    secret: true,
+                    vault_only: true,
+                    placeholder: Some("secret://hotel/default/gemini/oauth-access".into()),
+                    help: Some("Optional env override for OAuth token resolution. Prefer secret refs over raw tokens.".into()),
+                    default_value: None,
+                },
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_GEMINI_OAUTH_PROJECT_ID".into(),
+                    label: "Gemini OAuth Project ID".into(),
+                    target: "env".into(),
+                    input_kind: "string".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some("my-gcp-project".into()),
+                    help: Some("Optional OAuth project override.".into()),
+                    default_value: None,
+                },
+            ],
+            component_config_fields: vec![],
+            dependencies: vec![
+                ComponentTemplateDependencyView {
+                    key: "gemini_api_key_ref".into(),
+                    label: "Gemini API Key Ref".into(),
+                    location: "hotel-config".into(),
+                    required: false,
+                    secret: true,
+                    vault_only: true,
+                    help: "Use a secret_ref-backed hotel config entry for API-key auth.".into(),
+                },
+                ComponentTemplateDependencyView {
+                    key: "gemini_oauth_access_token_ref".into(),
+                    label: "Gemini OAuth Access Token Ref".into(),
+                    location: "hotel-config".into(),
+                    required: false,
+                    secret: true,
+                    vault_only: true,
+                    help: "Preferred for refreshable OAuth auth. Store the token in vault and place the secret_ref in hotel config.".into(),
+                },
+                ComponentTemplateDependencyView {
+                    key: "gemini_oauth_project_id".into(),
+                    label: "Gemini OAuth Project ID".into(),
+                    location: "hotel-config".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    help: "Companion config when OAuth auth is used.".into(),
+                },
+            ],
+        },
+        ComponentTemplateView {
+            id: "model-controller-elevenlabs".into(),
+            label: "ElevenLabs Voice Controller".into(),
+            description: "ElevenLabs-backed model controller. The API key should always arrive via secret ref rather than plaintext manifest fields.".into(),
+            command: "model-controller-elevenlabs".into(),
+            role: "model.elevenlabs".into(),
+            env_fields: vec![ComponentTemplateFieldView {
+                key: "PHILOTIC_MODEL_CONTROLLER_INLINE_AUDIO".into(),
+                label: "Allow Inline Audio".into(),
+                target: "env".into(),
+                input_kind: "boolean".into(),
+                required: false,
+                secret: false,
+                vault_only: false,
+                placeholder: None,
+                help: Some("Enable inline PCM audio inputs when the transport supports them.".into()),
+                default_value: Some(json!(false)),
+            }],
+            component_config_fields: vec![],
+            dependencies: vec![
+                ComponentTemplateDependencyView {
+                    key: "elevenlabs_api_key_ref".into(),
+                    label: "ElevenLabs API Key Ref".into(),
+                    location: "hotel-config".into(),
+                    required: true,
+                    secret: true,
+                    vault_only: true,
+                    help: "Store the ElevenLabs key in vault and place the secret_ref in hotel config.".into(),
+                },
+                ComponentTemplateDependencyView {
+                    key: "elevenlabs_voice_id".into(),
+                    label: "Default Voice ID".into(),
+                    location: "hotel-config".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    help: "Optional default voice selection for synthesis tasks.".into(),
+                },
+            ],
+        },
+        ComponentTemplateView {
+            id: "model-controller-mlx".into(),
+            label: "MLX Local Model Controller".into(),
+            description: "Local MLX-backed controller. The important operator-owned shape lives in component_config, especially the model fleet definition.".into(),
+            command: "model-controller-mlx".into(),
+            role: "model.mlx".into(),
+            env_fields: vec![
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_MLX_CONFIG".into(),
+                    label: "Fleet Config File Path".into(),
+                    target: "env".into(),
+                    input_kind: "string".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some("/Users/jaredlikes/.philotic/mlx/fleet.json".into()),
+                    help: Some("Optional file-path override. Prefer component_config for hotel-managed components so the manifest stays self-contained.".into()),
+                    default_value: None,
+                },
+            ],
+            component_config_fields: vec![
+                ComponentTemplateFieldView {
+                    key: "health_check_interval_secs".into(),
+                    label: "Health Check Interval (secs)".into(),
+                    target: "component_config".into(),
+                    input_kind: "integer".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some("300".into()),
+                    help: Some("How often the MLX provider checks fleet health in the background.".into()),
+                    default_value: Some(json!(300)),
+                },
+                ComponentTemplateFieldView {
+                    key: "python_path".into(),
+                    label: "Python Interpreter".into(),
+                    target: "component_config".into(),
+                    input_kind: "string".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some("/opt/homebrew/bin/python3".into()),
+                    help: Some("Required when any fleet model uses managed mode or transcription.".into()),
+                    default_value: None,
+                },
+                ComponentTemplateFieldView {
+                    key: "models".into(),
+                    label: "MLX Models JSON".into(),
+                    target: "component_config".into(),
+                    input_kind: "mlx_models".into(),
+                    required: true,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some(
+                        "[\n  {\n    \"class\": \"text\",\n    \"repo_id\": \"mlx-community/Qwen2.5-7B-Instruct-4bit\",\n    \"mode\": \"attached\",\n    \"host\": \"127.0.0.1\",\n    \"port\": 8091,\n    \"priority\": 100,\n    \"extra_args\": [],\n    \"server_variant\": \"mlx_lm\"\n  }\n]".into(),
+                    ),
+                    help: Some("Fleet definition array for MLX models. This is the real shape the controller consumes, so the structured field stays JSON rather than pretending it is a few flat strings.".into()),
+                    default_value: Some(json!([])),
+                },
+            ],
+            dependencies: vec![],
+        },
+        ComponentTemplateView {
+            id: "model-controller-onnx".into(),
+            label: "ONNX Local Model Controller".into(),
+            description: "Local ONNX-backed controller with an Ollama-compatible sidecar. These knobs are mostly env-driven and do not require raw secret entry.".into(),
+            command: "model-controller-onnx".into(),
+            role: "model.local".into(),
+            env_fields: vec![
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_ONNX_SIDECAR_ONLY".into(),
+                    label: "Sidecar Only".into(),
+                    target: "env".into(),
+                    input_kind: "boolean".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: None,
+                    help: Some("Skip hotel IPC registration and only serve the local HTTP sidecar.".into()),
+                    default_value: Some(json!(false)),
+                },
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_ONNX_SIDECAR_ADDR".into(),
+                    label: "Sidecar Address".into(),
+                    target: "env".into(),
+                    input_kind: "string".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some("127.0.0.1:11435".into()),
+                    help: Some("Bind address for the Ollama-compatible sidecar.".into()),
+                    default_value: Some(json!("127.0.0.1:11435")),
+                },
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_ONNX_EMBED_REPO".into(),
+                    label: "Embedding Repo".into(),
+                    target: "env".into(),
+                    input_kind: "string".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some("onnx-community/embeddinggemma-300m-ONNX".into()),
+                    help: Some("Hugging Face repo id for the embedding model.".into()),
+                    default_value: Some(json!("onnx-community/embeddinggemma-300m-ONNX")),
+                },
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_ONNX_WHISPER_REPO".into(),
+                    label: "Whisper Repo".into(),
+                    target: "env".into(),
+                    input_kind: "string".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some("onnx-community/whisper-small".into()),
+                    help: Some("Hugging Face repo id for the transcription model.".into()),
+                    default_value: Some(json!("onnx-community/whisper-small")),
+                },
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_ONNX_PREFER_QUANTIZED".into(),
+                    label: "Prefer Quantized Models".into(),
+                    target: "env".into(),
+                    input_kind: "boolean".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: None,
+                    help: Some("Use quantized ONNX variants when available.".into()),
+                    default_value: Some(json!(true)),
+                },
+            ],
+            component_config_fields: vec![],
+            dependencies: vec![],
+        },
+        ComponentTemplateView {
+            id: "agent-graph-runner".into(),
+            label: "Agent Graph Runner".into(),
+            description: "Per-agent cognitive graph guest. The agent id is required; the graph DB path is optional unless you want an explicit storage location.".into(),
+            command: "agent-graph-runner".into(),
+            role: "agent-graph".into(),
+            env_fields: vec![
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_AGENT_ID".into(),
+                    label: "Owning Agent ID".into(),
+                    target: "env".into(),
+                    input_kind: "string".into(),
+                    required: true,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some("agent-jane-01".into()),
+                    help: Some("Agent whose cognitive graph this guest serves.".into()),
+                    default_value: None,
+                },
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_GRAPH_RUNNER_ID".into(),
+                    label: "Agent Graph Guest ID".into(),
+                    target: "env".into(),
+                    input_kind: "string".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some("agent-graph-agent-jane-01".into()),
+                    help: Some("Optional override for the guest id used during IPC registration.".into()),
+                    default_value: None,
+                },
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_AGENT_GRAPH_DB".into(),
+                    label: "Agent Graph DB Path".into(),
+                    target: "env".into(),
+                    input_kind: "string".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some("~/.philotic/agent-graph-agent-jane-01.db".into()),
+                    help: Some("Optional explicit SQLite path for the per-agent graph store.".into()),
+                    default_value: None,
+                },
+            ],
+            component_config_fields: vec![],
+            dependencies: vec![],
+        },
+        ComponentTemplateView {
+            id: "tool-runner".into(),
+            label: "Tool Runner".into(),
+            description: "Generic tool execution guest. Most deployments only need the canonical hotel socket and node id, which the hotel should provide.".into(),
+            command: "tool-runner".into(),
+            role: "tool".into(),
+            env_fields: vec![],
+            component_config_fields: vec![],
+            dependencies: vec![],
+        },
+        ComponentTemplateView {
+            id: "graph-runner".into(),
+            label: "Graph Runner".into(),
+            description: "Graph query/tool guest. The hotel usually injects the graph runner id automatically; operator-authored config is minimal.".into(),
+            command: "graph-runner".into(),
+            role: "tool.graph".into(),
+            env_fields: vec![
+                ComponentTemplateFieldView {
+                    key: "PHILOTIC_GRAPH_RUNNER_ID".into(),
+                    label: "Graph Runner ID".into(),
+                    target: "env".into(),
+                    input_kind: "string".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    placeholder: Some("local-telegram:graph-runner".into()),
+                    help: Some("Optional explicit runner id when not hotel-seeded.".into()),
+                    default_value: None,
+                },
+            ],
+            component_config_fields: vec![],
+            dependencies: vec![],
+        },
+    ]
+}
+
 fn new_operator_chat_id(prefix: &str) -> String {
     let mut rng = rand::thread_rng();
     let suffix = format!("{:016x}", rng.r#gen::<u64>());
@@ -2261,15 +3479,21 @@ fn new_operator_chat_id(prefix: &str) -> String {
 }
 
 async fn connect_management_client(socket: &str, guest_id: &str) -> Result<PhiloticClient> {
-    connect_client_with_identity(socket, GuestIdentity {
-        guest_id: guest_id.into(),
-        role: "management".into(),
-        supported_tools: vec![],
-    })
+    connect_client_with_identity(
+        socket,
+        GuestIdentity {
+            guest_id: guest_id.into(),
+            role: "management".into(),
+            supported_tools: vec![],
+        },
+    )
     .await
 }
 
-async fn connect_client_with_identity(socket: &str, identity: GuestIdentity) -> Result<PhiloticClient> {
+async fn connect_client_with_identity(
+    socket: &str,
+    identity: GuestIdentity,
+) -> Result<PhiloticClient> {
     PhiloticClient::connect_at(socket, identity)
         .await
         .map_err(Into::into)

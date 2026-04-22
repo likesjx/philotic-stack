@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - migration-readiness-gates
+
+rectangle "migration-readiness-gates" as migration_readiness_gates #Orange {
+}
+
+
+@enduml

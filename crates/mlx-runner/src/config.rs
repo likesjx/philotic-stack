@@ -18,20 +18,20 @@ pub struct MlxFleetConfig {
 impl MlxFleetConfig {
     /// Return the python interpreter path, or an error if it is required but absent.
     pub fn require_python_path(&self) -> anyhow::Result<&str> {
-        self.python_path
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!(
+        self.python_path.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
                 "fleet config requires `python_path` for managed instances or transcribe, \
                  but it is not set. Add e.g. \"python_path\": \"/usr/local/bin/python3\" \
                  to your fleet config."
-            ))
+            )
+        })
     }
 
     /// True if any configured model requires a Python subprocess.
     pub fn needs_python(&self) -> bool {
-        self.models.iter().any(|m| {
-            m.mode == MlxMode::Managed || m.class == MlxModelClass::Transcribe
-        })
+        self.models
+            .iter()
+            .any(|m| m.mode == MlxMode::Managed || m.class == MlxModelClass::Transcribe)
     }
 }
 
@@ -48,8 +48,9 @@ impl MlxFleetConfig {
     }
 
     pub fn from_env() -> anyhow::Result<Self> {
-        let path = std::env::var("PHILOTIC_MLX_CONFIG")
-            .map_err(|_| anyhow::anyhow!("PHILOTIC_MLX_CONFIG not set; provide a fleet config JSON path"))?;
+        let path = std::env::var("PHILOTIC_MLX_CONFIG").map_err(|_| {
+            anyhow::anyhow!("PHILOTIC_MLX_CONFIG not set; provide a fleet config JSON path")
+        })?;
         Self::from_json_file(&path)
     }
 
@@ -67,12 +68,17 @@ impl MlxFleetConfig {
         let key = format!("component:{guest_id}");
         let resp = client.send_request(IpcRequest::GetConfig { key }).await?;
         match resp {
-            IpcResponse::ConfigData { value_json: Some(json), .. } => {
+            IpcResponse::ConfigData {
+                value_json: Some(json),
+                ..
+            } => {
                 let config: Self = serde_json::from_str(&json)
                     .map_err(|e| anyhow::anyhow!("failed to parse fleet config from hotel: {e}"))?;
                 Ok(Some(config))
             }
-            IpcResponse::ConfigData { value_json: None, .. } => Ok(None),
+            IpcResponse::ConfigData {
+                value_json: None, ..
+            } => Ok(None),
             other => anyhow::bail!("unexpected response from hotel for GetConfig: {:?}", other),
         }
     }

@@ -1,18 +1,18 @@
 ---
-title: "Philotic Stack Universal Materialization Walkthrough"
+title: Philotic Stack Universal Materialization Walkthrough
 doc_type: historical
 domain: migration-parity
 status: historical
-last_updated: 2026-03-12
+last_updated: 2026-03-31
 tags:
-  - historical
-  - walkthrough
-  - materialization
-  - telegram
+- historical
+- walkthrough
+- materialization
+- telegram
 related_docs:
-  - docs/architecture/ARCHITECTURE_STATUS.md
-  - docs/architecture/ARCHITECTURE.md
-  - docs/PHILOTIC-ARCHITECTURE.md
+- docs/architecture/ARCHITECTURE_STATUS.md
+- docs/architecture/ARCHITECTURE.md
+- docs/PHILOTIC-ARCHITECTURE.md
 ---
 
 # Philotic Stack Universal Materialization Walkthrough

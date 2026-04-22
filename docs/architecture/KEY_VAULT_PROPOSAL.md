@@ -1,33 +1,34 @@
 ---
-title: "Key Vault Proposal"
+title: Key Vault Proposal
 doc_type: proposal
 domain: operator-control-plane
 status: accepted-current-slice
-last_updated: 2026-03-12
+last_updated: 2026-04-09
 tags:
-  - vault
-  - secrets
-  - oauth
-  - control-plane
-  - active-seam
+- vault
+- secrets
+- oauth
+- api-key
+- control-plane
+- active-seam
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md
-  - MODEL_CONTROLLER_PROPOSAL.md
-  - PERIMETER_EGRESS_CONTROL_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md
+- MODEL_CONTROLLER_PROPOSAL.md
+- PERIMETER_EGRESS_CONTROL_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: key-vault
 implements: []
 implemented_by:
-  - vault-secret-ref-slice
-  - keychain-root-key-slice
+- vault-secret-ref-slice
+- keychain-root-key-slice
 active_seams:
-  - vault-secret-refs
-  - remote-vault-delegation
+- vault-secret-refs
+- remote-vault-delegation
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
-  - ARCHITECTURE.md
+- ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
 ---
 
 # Key Vault Proposal
@@ -39,6 +40,7 @@ Define a security-first secret-management model for Philotic that:
 - removes raw secrets from the plain context-graph config path
 - gives the hotel one canonical authority for secret storage, access, rotation, and audit
 - supports hotel-managed OAuth refresh tokens safely
+- supports endpoint-scoped provider keys for OpenAI-compatible model endpoints
 - supports operator secret onboarding and rotation with Telegram as a control surface, not a plaintext secret bucket
 
 ## Core Recommendation
@@ -93,6 +95,7 @@ Pin and prove the first design contract for:
 
 - hotel-owned key vault authority
 - vault-backed model-controller auth
+- endpoint-scoped provider secret refs
 - Telegram-safe onboarding and rotation paths
 - encrypted secret storage plus role/guest-gated local secret fetch over hotel IPC
 - macOS Keychain-backed vault root key with env fallback only as a bootstrap path
@@ -111,7 +114,9 @@ The current implementation slice now begins that boundary:
 - config can store `*_ref` values instead of raw secret values
 - guests can request secrets through dedicated hotel IPC instead of generic `GetConfig`
 - Gemini OAuth access tokens now fit that path
+- OpenAI API keys now fit that path with endpoint-scoped secret kinds
 - hotel-side validation can exercise the vaulted Gemini OAuth path directly before guest fallback obscures failures
+- hotel-side validation can exercise the vaulted OpenAI API-key path directly against the configured endpoint
 - on macOS, the hotel can now load or create its vault root key in Keychain instead of requiring the operator to mint one manually in the shell
 
 The next boundary should continue toward:
@@ -658,6 +663,7 @@ Logs must not include:
 - plaintext secret values
 - full bearer/access tokens
 - full refresh tokens
+- endpoint-scoped provider keys
 
 ## Near-Term Slice Recommendation
 
@@ -667,9 +673,10 @@ Implement in this order:
 2. stop storing new raw secrets directly in plain `node_config`
 3. add hotel-side secret fetch API for local guests
 4. move Gemini OAuth refresh tokens and API keys behind vault references
-5. add operator audit log for secret actions
-6. define Telegram Mini App onboarding and rotation flow
-7. only after that, implement Telegram-driven secret add/rotate UX
+5. move OpenAI API keys behind endpoint-scoped vault references
+6. add operator audit log for secret actions
+7. define Telegram Mini App onboarding and rotation flow
+8. only after that, implement Telegram-driven secret add/rotate UX
 
 ## Relationship To Other Proposals
 

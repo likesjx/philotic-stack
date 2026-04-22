@@ -107,7 +107,10 @@ impl MlxClient {
         if !status.is_success() {
             anyhow::bail!("GET /v1/models returned HTTP {status}");
         }
-        let body: ModelsResponse = resp.json().await.context("failed to parse /v1/models response")?;
+        let body: ModelsResponse = resp
+            .json()
+            .await
+            .context("failed to parse /v1/models response")?;
         let model_id = body
             .data
             .into_iter()

@@ -1,0 +1,21 @@
+{
+  "guest_id": "component-01",
+  "role": "component.example",
+  "hotel": "default",
+  "command": "component-binary",
+  "args": [
+    "--guest-id",
+    "component-01",
+    "--role",
+    "component.example"
+  ],
+  "env": {
+    "PHILOTIC_GUEST_ID": "component-01",
+    "PHILOTIC_TARGET_AGENT_ID": "agent-01"
+  },
+  "component_config": {
+    "display_name": "Example Component",
+    "description": "Replace this object with the component-specific config your binary reads via GetConfig."
+  },
+  "auto_start": true
+}

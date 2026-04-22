@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - shell-runner-split
+
+rectangle "shell-runner-split" as shell_runner_split #Orange {
+}
+
+
+@enduml

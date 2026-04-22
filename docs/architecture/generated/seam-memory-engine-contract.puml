@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - memory-engine-contract
+
+rectangle "memory-engine-contract" as memory_engine_contract #Orange {
+}
+
+
+@enduml

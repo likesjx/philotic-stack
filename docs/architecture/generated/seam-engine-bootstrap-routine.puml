@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - engine-bootstrap-routine
+
+rectangle "engine-bootstrap-routine" as engine_bootstrap_routine #Orange {
+}
+
+
+@enduml

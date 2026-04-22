@@ -1,0 +1,7 @@
+@startuml
+!theme plain
+
+title Proposal Architecture - doc:runner-artifact-build-distribution-proposal
+
+
+@enduml

@@ -1,30 +1,30 @@
 ---
-title: "Interactive Onboarding"
+title: Interactive Onboarding
 doc_type: proposal
 domain: operator-experience
 status: proposed
-last_updated: 2026-03-26
+last_updated: 2026-03-31
 tags:
-  - onboarding
-  - setup
-  - philotic-web
-  - config
-  - operator-experience
+- onboarding
+- setup
+- philotic-web
+- config
+- operator-experience
 related_docs:
-  - DESKTOP_MEMBRANE_PROPOSAL.md
-  - PHILOTIC_DEPLOYMENT_PROPOSAL.md
-  - ARCHITECTURE_STATUS.md
+- DESKTOP_MEMBRANE_PROPOSAL.md
+- PHILOTIC_DEPLOYMENT_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: interactive-onboarding
 implements: []
 implemented_by: []
 active_seams:
-  - onboarding-tui-flow
-  - onboarding-web-wizard
-  - agent-preset-library
+- onboarding-tui-flow
+- onboarding-web-wizard
+- agent-preset-library
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
+- ARCHITECTURE_STATUS.md
 ---
 
 # Interactive Onboarding

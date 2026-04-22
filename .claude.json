@@ -1,0 +1,6 @@
+{
+  "$schema": "https://docs.anthropic.com/claude/code/schema.json",
+  "hooks": {
+    "post_session": "bash scripts/mempalace_reflex_hook.sh"
+  }
+}

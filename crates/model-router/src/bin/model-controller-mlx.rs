@@ -126,6 +126,7 @@ async fn main() -> Result<()> {
         providers: Box::new(move |_http_client, _configs| {
             vec![Arc::clone(&provider_for_factory) as Arc<dyn ModelProvider>]
         }),
+        live_providers: Box::new(|_http_client, _configs| Vec::new()),
     })
     .await
 }

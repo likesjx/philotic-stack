@@ -17,6 +17,7 @@ use crate::protocol::McpToolDescriptor;
 /// A route as it lives in the hot-path table: record + owning agent.
 #[derive(Debug, Clone)]
 pub struct ResolvedRoute {
+    pub owner_agent_id: String,
     pub record: McpRouteRecord,
 }
 
@@ -59,15 +60,27 @@ impl RoutingTable {
         // Remove existing routes owned by this agent.
         if let Some(old_tools) = self.agent_index.remove(agent_id) {
             for tool_name in old_tools {
-                self.routes.remove(&tool_name);
+                let should_remove = self
+                    .routes
+                    .get(&tool_name)
+                    .map(|route| route.owner_agent_id == agent_id)
+                    .unwrap_or(false);
+                if should_remove {
+                    self.routes.remove(&tool_name);
+                }
             }
         }
 
         let mut tool_names = Vec::with_capacity(records.len());
         for record in records {
             tool_names.push(record.tool_name.clone());
-            self.routes
-                .insert(record.tool_name.clone(), ResolvedRoute { record });
+            self.routes.insert(
+                record.tool_name.clone(),
+                ResolvedRoute {
+                    owner_agent_id: agent_id.to_string(),
+                    record,
+                },
+            );
         }
         self.agent_index.insert(agent_id.to_string(), tool_names);
 
@@ -82,7 +95,14 @@ impl RoutingTable {
     pub fn revoke_agent_routes(&mut self, agent_id: &str) {
         if let Some(tool_names) = self.agent_index.remove(agent_id) {
             for tool_name in tool_names {
-                self.routes.remove(&tool_name);
+                let should_remove = self
+                    .routes
+                    .get(&tool_name)
+                    .map(|route| route.owner_agent_id == agent_id)
+                    .unwrap_or(false);
+                if should_remove {
+                    self.routes.remove(&tool_name);
+                }
             }
         }
         info!(agent_id, "routes revoked");

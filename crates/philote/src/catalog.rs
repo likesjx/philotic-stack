@@ -33,8 +33,15 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
     match skill_name {
         "handoff.to_role" => &["session.status", "handoff.to_role", "handoff.back"],
         "handoff.back" => &["session.status", "handoff.back"],
-        "role.governance" => &["session.status", "agent.configure", "role.configure"],
+        "role.governance" => &["session.status", "agent.configure", "role.create_or_update"],
+        "role.authoring" => &["session.status", "role.create_or_update", "handoff.to_role"],
         "memory" => &["memory.recall", "memory.remember"],
+        "routing.refinement" => &[
+            "session.status",
+            "agent.graph.read",
+            "agent.graph.write",
+            "routing.policy.propose",
+        ],
         _ => &[],
     }
 }
@@ -48,16 +55,14 @@ pub fn tool_class(tool_name: &str) -> Option<&'static str> {
 }
 
 /// Returns true if the tool requires operator approval before execution, regardless
-/// of what the model requests. Tools in class "config", "handoff", or "shell" require
-/// approval by default; others do not unless explicitly flagged.
+/// of what the model requests. Tools in class "config" or "shell" require
+/// approval by default; same-self handoff tools are governed by projection/reflex
+/// policy instead of per-action approval.
 pub fn tool_requires_approval(tool_name: &str) -> bool {
-    if tool_name == "handoff.back" {
+    if matches!(tool_name, "handoff.to_role" | "handoff.back") {
         return false;
     }
-    matches!(
-        tool_class(tool_name),
-        Some("config") | Some("handoff") | Some("shell")
-    )
+    matches!(tool_class(tool_name), Some("config") | Some("shell"))
 }
 
 fn build_catalog() -> HashMap<String, ToolDefinition> {
@@ -79,11 +84,53 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
     );
 
     m.insert(
+        "hotel.status".into(),
+        ToolDefinition {
+            tool_name: "hotel.status".into(),
+            description: "Returns a safe view of the hotel's current state: hotel name, node ID, \
+                          active and inactive guests (with roles), and registered agent identities. \
+                          No credentials, API keys, or secret values are included. Use this to \
+                          understand what guests are running, which agents are registered, and \
+                          whether the hotel is healthy. Always prefer this over bash.exec for \
+                          hotel introspection."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+            class: Some("session".into()),
+        },
+    );
+
+    m.insert(
+        "hotel.logs".into(),
+        ToolDefinition {
+            tool_name: "hotel.logs".into(),
+            description: "Returns the last N lines from the hotel's log file (aiua.log). Use this \
+                          to tail recent log output, diagnose guest failures, or inspect hotel \
+                          activity. Defaults to 50 lines. Never use bash.exec to tail logs when \
+                          this tool is available."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "lines": {
+                        "type": "integer",
+                        "description": "Number of log lines to return (default 50, max 500)."
+                    }
+                }
+            }),
+            class: Some("session".into()),
+        },
+    );
+
+    m.insert(
         "echo".into(),
         ToolDefinition {
             tool_name: "echo".into(),
-            description: "Echoes a string back unchanged. Use for testing tool routing and \
-                          round-trip connectivity."
+            description: "Echoes a string back unchanged. Only use when explicitly asked to \
+                          test tool connectivity. Do not call during normal conversation or \
+                          reasoning — this tool exists for diagnostics only."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -96,6 +143,61 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                 "required": ["text"]
             }),
             class: Some("utility".into()),
+        },
+    );
+
+    m.insert(
+        "agent.graph.read".into(),
+        ToolDefinition {
+            tool_name: "agent.graph.read".into(),
+            description: "Read structured state from the agent's own graph substrate. Use this \
+                          to inspect agent-local preferences, declarations, and other cognitive \
+                          policy records without reaching into hotel-owned authority."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "entity": {
+                        "type": "string",
+                        "enum": ["resource_grants", "tool_preferences", "routing_preferences", "resource_declarations"],
+                        "description": "The agent-graph entity collection to read."
+                    }
+                },
+                "required": ["entity"]
+            }),
+            class: Some("capability".into()),
+        },
+    );
+
+    m.insert(
+        "agent.graph.write".into(),
+        ToolDefinition {
+            tool_name: "agent.graph.write".into(),
+            description: "Write an agent-local graph preference or configuration record. Use for \
+                          governed self-configuration inside the agent graph, such as tool or \
+                          routing preferences. This does not mutate hotel authority or the shared \
+                          model graph directly."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "entity": {
+                        "type": "string",
+                        "enum": ["tool_preference", "routing_preference"]
+                    },
+                    "tool_name": { "type": "string" },
+                    "preference_key": { "type": "string" },
+                    "stage_kind": { "type": "string" },
+                    "capability": { "type": "string" },
+                    "provider_hint": { "type": "string" },
+                    "model_ref": { "type": "string" },
+                    "preference_level": { "type": "integer" },
+                    "weight": { "type": "integer" },
+                    "config": {}
+                },
+                "required": ["entity"]
+            }),
+            class: Some("capability".into()),
         },
     );
 
@@ -152,12 +254,13 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         "bash.exec".into(),
         ToolDefinition {
             tool_name: "bash.exec".into(),
-            description: "Runs a shell command and returns stdout, stderr, and exit code. \
-                          Use for scripting, file system queries, or invoking CLI tools. \
-                          Requires operator approval. Commands run under the agent's effective \
-                          working directory unless overridden by working_dir. A timeout (default \
-                          30 s) is enforced; the process is killed and an error returned if it \
-                          exceeds the limit."
+            description: "Last-resort shell execution. Runs a shell command and returns stdout, \
+                          stderr, and exit code. Use ONLY when no Philotic-native tool \
+                          (workspace.read, agent.graph.read, session.status, etc.) can accomplish \
+                          the task. Do not call speculatively or for diagnostic purposes. \
+                          Requires explicit operator approval before execution. Commands run under \
+                          the agent's effective working directory unless overridden by working_dir. \
+                          A timeout (default 30 s) is enforced."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -349,7 +452,8 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         ToolDefinition {
             tool_name: "agent.configure".into(),
             description: "Update an agent configuration field. Supports approval_policy, \
-                          profile, and bindings sections. Changes to sensitive fields \
+                          profile, bindings, settings, media_routing_policy, and \
+                          voice_response_policy sections. Changes to sensitive fields \
                           (soul, identity, approval policy) require operator approval unless \
                           preapproved. Use operation 'set' to replace, 'append' to add to \
                           arrays, or 'remove' to delete from arrays."
@@ -368,7 +472,17 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                                         'profile.user_context_text', \
                                         'profile.memory_summary', \
                                         'bindings.effective_toolset', \
-                                        'bindings.effective_skillset'"
+                                        'bindings.effective_skillset', \
+                                        'media_routing_policy.voice_action', \
+                                        'media_routing_policy.image_action', \
+                                        'media_routing_policy.document_action', \
+                                        'media_routing_policy.forward_media_to_model', \
+                                        'media_routing_policy.strip_tools_on_media', \
+                                        'voice_response_policy.mode', \
+                                        'voice_response_policy.provider', \
+                                        'voice_response_policy.voice_id', \
+                                        'voice_response_policy.send_text_caption', \
+                                        'voice_response_policy.fallback_to_text'"
                     },
                     "value": {
                         "description": "The new value. For array fields with 'append'/'remove', \
@@ -542,14 +656,125 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
     );
 
     m.insert(
+        "role.create_or_update".into(),
+        ToolDefinition {
+            tool_name: "role.create_or_update".into(),
+            description: "Governed workflow surface for creating or updating a role incarnation for \
+                          the current agent identity. Use this to validate and apply a role lens \
+                          deliberately, including purpose, toolset, handoff posture, and limits. \
+                          Runtime execution currently resolves through the low-level role.configure \
+                          hotel mutation path for compatibility. Always include role_name, \
+                          toolset_profile, and the full reasoning object with purpose, \
+                          toolset_rationale, and handoff_posture_and_limits."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "role_name": {
+                        "type": "string",
+                        "description": "The name of the role (e.g. 'developer', 'researcher')."
+                    },
+                    "toolset_profile": {
+                        "type": "string",
+                        "description": "The profile name determining default tools/skills (e.g. 'codex', 'research', 'utility')."
+                    },
+                    "role_identity_addendum": {
+                        "type": "string",
+                        "description": "Additive persona/identity instructions for this specific role."
+                    },
+                    "role_manifest": {
+                        "type": "string",
+                        "description": "Governance document for this role — focus, rules, delegation posture, and approval constraints. Written in natural language. The agent sees this as its [Governance] context block when the role is active. Should describe: what this role does, what tools are available and when to use them, what requires approval, and when to hand off."
+                    },
+                    "is_admin": {
+                        "type": "boolean",
+                        "description": "If true, this role has admin authority — it may update operator-owned records such as the orchestrator manifest. Only existing admin roles may create other admin roles. Setting this to true always triggers a live operator approval interrupt that cannot be preapproved or bypassed."
+                    },
+                    "inactive_ttl_seconds": {
+                        "type": "integer",
+                        "description": "Seconds of inactivity before the role is suspended/terminated."
+                    },
+                    "iteration_cap": {
+                        "type": "integer",
+                        "description": "Maximum model-turn iterations allowed for this role before it must return or stop."
+                    },
+                    "approval_policy": {
+                        "type": "string",
+                        "description": "Stringified JSON describing the approval policy structure."
+                    },
+                    "model_profile": {
+                        "type": "string",
+                        "description": "Stringified JSON describing model preferences (provider, temperature)."
+                    },
+                    "context_window_policy": {
+                        "type": "string",
+                        "description": "Stringified JSON describing context packaging rules."
+                    },
+                    "reasoning": {
+                        "type": "object",
+                        "description": "Required reasoning for this role's existence, purpose, and capability posture.",
+                        "properties": {
+                            "purpose": { "type": "string" },
+                            "toolset_rationale": { "type": "string" },
+                            "handoff_posture_and_limits": { "type": "string" }
+                        },
+                        "required": ["purpose", "toolset_rationale", "handoff_posture_and_limits"]
+                    }
+                },
+                "required": ["role_name", "toolset_profile", "reasoning"]
+            }),
+            class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "delegate.whisper".into(),
+        ToolDefinition {
+            tool_name: "delegate.whisper".into(),
+            description: "Fire-and-forget paracrine dispatch — silently consults a specialist \
+                          role without interrupting the current turn. The specialist's response \
+                          arrives back asynchronously as a paracrine_response. Use for quiet \
+                          delegation, mid-turn enrichment, or specialist consultation where the \
+                          user does not need to see the handoff. \
+                          Set reply_to='membrane' to route the specialist's response directly \
+                          to the user with an inline role-switch button."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "role": {
+                        "type": "string",
+                        "description": "The target specialist role name to dispatch the exosome to."
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "The prompt or question for the specialist."
+                    },
+                    "reply_to": {
+                        "type": "string",
+                        "description": "Where the specialist's response should go. 'self' = back to this philote as paracrine_response (default). 'membrane' = directly to the user with a role-switch button. '<node>/<role>' = explicit routing."
+                    },
+                    "routing": {
+                        "type": "string",
+                        "enum": ["cognitive_re_entry", "enriched_tool_result", "datasource_injection", "memory_enrichment", "progress_update", "heartbeat", "raw_forward"],
+                        "description": "How to handle the specialist's response when it arrives. Defaults to cognitive_re_entry."
+                    }
+                },
+                "required": ["role", "prompt"]
+            }),
+            class: Some("delegate".into()),
+        },
+    );
+
+    m.insert(
         "role.configure".into(),
         ToolDefinition {
             tool_name: "role.configure".into(),
-            description: "Create or update a role incarnation for the current agent identity. \
-                          Requires reasoning about: purpose, toolset, skillset, handoff posture, \
-                          and limits (TTL, iteration caps). Only the orchestrator can use this tool. \
-                          Always include role_name, toolset_profile, and the full reasoning object \
-                          with purpose, toolset_rationale, and handoff_posture_and_limits."
+            description: "Low-level compatibility surface for mutating a role incarnation for the \
+                          current agent identity. Prefer the governed role.create_or_update workflow \
+                          surface for prompt-facing role authoring. This tool still executes the \
+                          underlying hotel mutation path and requires the same role_name, \
+                          toolset_profile, and reasoning object."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -639,6 +864,66 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     }
                 },
                 "required": ["description", "rationale"]
+            }),
+            class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "routing.policy.propose".into(),
+        ToolDefinition {
+            tool_name: "routing.policy.propose".into(),
+            description: "Propose a durable routing or cognition policy refinement for the \
+                          agent. Use when repeated evidence suggests a turn stage, provider \
+                          preference, context envelope, or affordance posture should be \
+                          adjusted. Always requires live operator approval and is stored as a \
+                          first-class routing policy artifact with disposition and evaluation \
+                          history."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "problem": {
+                        "type": "string",
+                        "description": "Short description of the recurring routing or cognition problem being observed. Max 512 characters."
+                    },
+                    "proposed_change": {
+                        "type": "string",
+                        "description": "The durable routing or cognition policy update being proposed in the imperative. Max 512 characters."
+                    },
+                    "evidence": {
+                        "type": "string",
+                        "description": "Concrete evidence motivating the change: failed turn shapes, repeated user corrections, latency/cost mismatch, or provider misfit. Max 1024 characters."
+                    },
+                    "affected_stage": {
+                        "type": "string",
+                        "description": "Optional stage hint such as ingress, cognition, or egress."
+                    },
+                    "affected_capability": {
+                        "type": "string",
+                        "description": "Optional capability hint such as voice.transcribe, text.generate, or voice.synthesize."
+                    },
+                    "learned_reflex": {
+                        "type": "object",
+                        "description": "Optional approved reflex write-back to store in the agent graph if this proposal should immediately update durable adaptive posture.",
+                        "properties": {
+                            "preference_key": {
+                                "type": "string",
+                                "description": "Stable key for the learned reflex preference in the agent graph."
+                            },
+                            "precedence": {
+                                "type": "integer",
+                                "description": "Optional precedence for the learned reflex layer. Defaults to 70."
+                            },
+                            "reflexes": {
+                                "type": "object",
+                                "description": "Reflex fields to write, such as remote_tool_reflex, remote_component_reflex, or credential_scope_reflex."
+                            }
+                        },
+                        "required": ["preference_key", "reflexes"]
+                    }
+                },
+                "required": ["problem", "proposed_change", "evidence"]
             }),
             class: Some("config".into()),
         },

@@ -111,8 +111,18 @@ struct AgentConfig {
     persona_name: Option<String>,
     agent_id: Option<String>,
     system_prompt: Option<String>,
+    import_workspace: Option<String>,
+    #[serde(default)]
+    default_skillset: Vec<String>,
+    #[serde(default)]
+    response_route_policy: Option<ResponseRoutePolicyConfig>,
     #[serde(default)]
     toolset_tags: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct ResponseRoutePolicyConfig {
+    default_route: Option<String>,
 }
 
 fn print_agents_from_config(config_path: &PathBuf) {
@@ -158,6 +168,24 @@ fn print_agents_from_config(config_path: &PathBuf) {
             println!("  {name:<16} {id:<24}{tags}");
             if !blurb.is_empty() {
                 println!("    {blurb}.");
+            }
+            if let Some(workspace) = agent
+                .import_workspace
+                .as_deref()
+                .map(str::trim)
+                .filter(|workspace| !workspace.is_empty())
+            {
+                println!("    workspace: {workspace}");
+            }
+            if !agent.default_skillset.is_empty() {
+                println!("    skills: {}", agent.default_skillset.join(", "));
+            }
+            if let Some(route) = agent
+                .response_route_policy
+                .as_ref()
+                .and_then(|policy| policy.default_route.as_deref())
+            {
+                println!("    route: {route}");
             }
         }
     }

@@ -1,27 +1,27 @@
 ---
-title: "Philotic Stack Architecture Reference"
+title: Philotic Stack Architecture Reference
 doc_type: reference
 domain: runtime-sessions
 status: active
-last_updated: 2026-03-12
+last_updated: 2026-03-31
 tags:
-  - runtime
-  - reference
-  - hotel
-  - ipc
-  - mesh
+- runtime
+- reference
+- hotel
+- ipc
+- mesh
 related_docs:
-  - README.md
-  - ARCHITECTURE_STATUS.md
-  - PORT_BLUEPRINT.md
+- README.md
+- ARCHITECTURE_STATUS.md
+- PORT_BLUEPRINT.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 tracks_domains:
-  - runtime-sessions
-  - membrane-transport
-  - mesh-placement
-  - tooling-execution
-  - deployment-distribution
+- runtime-sessions
+- membrane-transport
+- mesh-placement
+- tooling-execution
+- deployment-distribution
 ---
 
 # Philotic Stack — Architecture Reference
@@ -33,8 +33,13 @@ a distributed AI agent operating system built in Rust. It covers the hotel
 model, all crates, all in-process components, the IPC and mesh transports,
 storage abstractions, and state synchronization.
 
-This is a durable reference, not the live work queue. For current implemented
-status and active seams, use [ARCHITECTURE_STATUS.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE_STATUS.md).
+This is a durable hierarchy reference, not the live work queue. The graph is
+canonical for current state, domain ownership, seam ownership, and active
+work. For a legacy/transitional snapshot of current implementation status, use
+[ARCHITECTURE_STATUS.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE_STATUS.md).
+
+Generated UML/PlantUML diagrams for the graph-visible hierarchy live under
+`docs/architecture/generated/` and should be treated as derived views.
 
 ---
 
@@ -236,7 +241,8 @@ the hotel exclusively over the IPC UDS socket using `PhiloticClient`.
 
 | Binary                      | Crate                 | Role identity                    | Purpose                                                    |
 | --------------------------- | --------------------- | -------------------------------- | ---------------------------------------------------------- |
-| `membrane`                   | `crates/membrane`      | `membrane-telegram-01`            | Telegram gateway, ingress/egress for external messages     |
+| `membrane-telegram`         | `crates/membrane-telegram` | `membrane-telegram-01`       | Telegram gateway, ingress/egress for external messages     |
+| `membrane`                 | `crates/membrane`      | compatibility wrapper             | Transitional wrapper over shared membrane runtime during provider extraction |
 | `philote`                | `crates/philote`      | `agent-{persona}-01`             | Persona runtime, long-running reasoning loop               |
 | `model-router`              | `crates/model-router` | `model-router-01`                | Multi-provider LLM/TTS routing guest (Gemini, ElevenLabs)  |
 | `tool-runner`               | `crates/tool-runner`  | `{hotel}:tool-runner`            | Workspace tool executor                                    |

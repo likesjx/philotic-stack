@@ -7,6 +7,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::warn;
 use uuid::Uuid;
 
 const VAULT_ENV_KEY: &str = "PHILOTIC_VAULT_MASTER_KEY";
@@ -142,9 +143,12 @@ fn load_or_create_root_key() -> Result<Vec<u8>> {
         }
 
         if let Ok(from_env) = load_env_root_key() {
-            store_keychain_root_key(&from_env).context(
-                "failed to seed the macOS Keychain with the existing Philotic vault root key",
-            )?;
+            if let Err(err) = store_keychain_root_key(&from_env) {
+                warn!(
+                    error = %err,
+                    "Failed to seed the macOS Keychain with the explicit Philotic vault root key; continuing with the env-provided key for this process"
+                );
+            }
             return Ok(from_env);
         }
 

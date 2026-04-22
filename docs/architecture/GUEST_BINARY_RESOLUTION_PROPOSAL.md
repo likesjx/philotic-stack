@@ -1,28 +1,28 @@
 ---
-title: "Guest Binary Resolution Proposal"
+title: Guest Binary Resolution Proposal
 doc_type: proposal
 domain: deployment-distribution
 status: implemented
-last_updated: 2026-03-12
+last_updated: 2026-03-31
 tags:
-  - binaries
-  - spawn
-  - deployment
-  - runtime
+- binaries
+- spawn
+- deployment
+- runtime
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - RH_ANSIBLE_VPS_DEPLOYMENT_PROPOSAL.md
-  - DOMAIN_MAP.md
+- ARCHITECTURE_STATUS.md
+- RH_ANSIBLE_VPS_DEPLOYMENT_PROPOSAL.md
+- DOMAIN_MAP.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: guest-binary-resolution
 implements: []
 implemented_by:
-  - binary-name-alignment-slice
-  - philotic-bin-dir-resolution-slice
+- binary-name-alignment-slice
+- philotic-bin-dir-resolution-slice
 active_seams: []
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
+- ARCHITECTURE_STATUS.md
 ---
 
 # Guest Binary Resolution Proposal

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - runner-materialization-policy
+
+rectangle "runner-materialization-policy" as runner_materialization_policy #Orange {
+}
+
+
+@enduml

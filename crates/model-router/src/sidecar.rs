@@ -7,14 +7,14 @@
 /// Port: 11435 (leaves Ollama's 11434 free for optional proxy fallback).
 use anyhow::Result;
 use axum::{
+    Json, Router,
     body::Bytes,
     extract::State,
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
 };
-use onnx_runner::{EmbeddingsBackend, ModelCache, WhisperBackend};
+use onnx_runner::{EmbeddingsBackend, KokoroBackend, ModelCache, WhisperBackend};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -26,14 +26,20 @@ use tracing::{error, info};
 pub struct SidecarState {
     embeddings: Arc<RwLock<Option<EmbeddingsBackend>>>,
     whisper: Arc<RwLock<Option<WhisperBackend>>>,
+    kokoro: Arc<RwLock<Option<KokoroBackend>>>,
 }
 
 impl SidecarState {
     pub fn new(
         embeddings: Arc<RwLock<Option<EmbeddingsBackend>>>,
         whisper: Arc<RwLock<Option<WhisperBackend>>>,
+        kokoro: Arc<RwLock<Option<KokoroBackend>>>,
     ) -> Self {
-        Self { embeddings, whisper }
+        Self {
+            embeddings,
+            whisper,
+            kokoro,
+        }
     }
 }
 
@@ -57,6 +63,8 @@ pub struct EmbedRequest {
 pub struct EmbedResponse {
     pub embedding: Vec<f32>,
     /// Non-standard extension: model generation provenance token.
+    /// Serialized as "model" for Ollama API compatibility.
+    #[serde(rename = "model")]
     pub model_gen: String,
 }
 
@@ -103,10 +111,7 @@ pub struct TranscribeResponse {
 
 /// Accept raw WAV bytes in the request body (Content-Type: audio/wav or
 /// application/octet-stream).  Returns the transcript as JSON.
-async fn transcribe(
-    State(state): State<SidecarState>,
-    body: Bytes,
-) -> impl IntoResponse {
+async fn transcribe(State(state): State<SidecarState>, body: Bytes) -> impl IntoResponse {
     let guard = state.whisper.read().await;
     let Some(backend) = guard.as_ref() else {
         error!("sidecar: Whisper backend not loaded");
@@ -153,6 +158,62 @@ async fn transcribe(
     }
 }
 
+// ── /api/synthesize ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct SynthesizeRequest {
+    pub text: String,
+    pub voice: Option<String>,
+    pub speed: Option<f32>,
+}
+
+async fn synthesize(
+    State(state): State<SidecarState>,
+    Json(req): Json<SynthesizeRequest>,
+) -> impl IntoResponse {
+    let guard = state.kokoro.read().await;
+    let Some(backend) = guard.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Kokoro backend not loaded".to_string(),
+        )
+            .into_response();
+    };
+
+    let backend_ptr = backend as *const KokoroBackend as usize;
+    let voice = req.voice.clone();
+    let speed = req.speed;
+    let text = req.text.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let backend = unsafe { &*(backend_ptr as *const KokoroBackend) };
+        backend.synthesize(&text, voice.as_deref(), speed)
+    })
+    .await;
+
+    drop(guard);
+
+    match result {
+        Ok(Ok(output)) => axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "audio/wav")
+            .header("X-Voice", output.voice)
+            .header("X-Model-Gen", output.model_gen)
+            .body(axum::body::Body::from(output.wav_bytes))
+            .unwrap()
+            .into_response(),
+        Ok(Err(e)) => {
+            error!(err = %e, "Kokoro synthesis failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response()
+        }
+        Err(e) => {
+            error!(err = %e, "Kokoro blocking task panicked");
+            (StatusCode::INTERNAL_SERVER_ERROR, "synthesis task panicked".to_string())
+                .into_response()
+        }
+    }
+}
+
 // ── Router & runner ───────────────────────────────────────────────────────────
 
 pub fn router(state: SidecarState) -> Router {
@@ -160,6 +221,7 @@ pub fn router(state: SidecarState) -> Router {
         .route("/api/health", get(health))
         .route("/api/embeddings", post(embed))
         .route("/api/transcribe", post(transcribe))
+        .route("/api/synthesize", post(synthesize))
         .with_state(state)
 }
 
@@ -168,8 +230,9 @@ pub async fn run_sidecar(
     addr: &str,
     embeddings: Arc<RwLock<Option<EmbeddingsBackend>>>,
     whisper: Arc<RwLock<Option<WhisperBackend>>>,
+    kokoro: Arc<RwLock<Option<KokoroBackend>>>,
 ) -> Result<()> {
-    let state = SidecarState::new(embeddings, whisper);
+    let state = SidecarState::new(embeddings, whisper, kokoro);
     let app = router(state);
 
     let listener = tokio::net::TcpListener::bind(addr)

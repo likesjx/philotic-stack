@@ -1,32 +1,32 @@
 ---
-title: "Philotic Session Management and Agent Logic Proposal"
+title: Philotic Session Management and Agent Logic Proposal
 doc_type: proposal
 domain: runtime-sessions
 status: implemented
-last_updated: 2026-03-13
+last_updated: 2026-03-31
 tags:
-  - sessions
-  - approvals
-  - checkpoints
-  - routing
-  - current-slice
+- sessions
+- approvals
+- checkpoints
+- routing
+- current-slice
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - ARCHITECTURE.md
-  - AGENT_LOOP_PROPOSAL.md
-  - APPROVAL_UX_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
+- AGENT_LOOP_PROPOSAL.md
+- APPROVAL_UX_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: session-loop
 implements: []
 implemented_by:
-  - session-checkpoint-approval-slice
+- session-checkpoint-approval-slice
 active_seams:
-  - session-leases
-  - session-compaction
+- session-leases
+- session-compaction
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
-  - ARCHITECTURE.md
+- ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
 ---
 
 # Philotic Session Management and Agent Logic Proposal

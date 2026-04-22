@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - telegram-poll-lease
+
+rectangle "telegram-poll-lease" as telegram_poll_lease #Orange {
+}
+
+
+@enduml

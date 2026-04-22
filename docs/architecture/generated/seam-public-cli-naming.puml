@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - public-cli-naming
+
+rectangle "public-cli-naming" as public_cli_naming #Orange {
+}
+
+
+@enduml

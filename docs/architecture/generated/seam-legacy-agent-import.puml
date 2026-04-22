@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - legacy-agent-import
+
+rectangle "legacy-agent-import" as legacy_agent_import #Orange {
+}
+
+
+@enduml

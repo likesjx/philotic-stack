@@ -1,4 +1,5 @@
 use ansible_mesh_core::authz::{MeshAuth, NonceTracker};
+use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::{BeaconMessage, MsgType, NodeCapabilities};
 use anyhow::{Context, Result};
 use std::sync::Arc;
@@ -11,21 +12,20 @@ pub async fn serve_execution_plane(
     addr: &str,
     local_capabilities: NodeCapabilities,
     inbox_tx: mpsc::Sender<BeaconMessage>,
-    psk: &str,
+    graph: Arc<GraphDomain>,
     db_path: &str,
     enable_rust_auth: bool,
 ) -> Result<()> {
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("Failed to bind execution transport to {}", addr))?;
-    let auth = Arc::new(MeshAuth::new(psk.to_string()));
     let db_path = db_path.to_string();
 
     loop {
         let (mut stream, peer_addr) = listener.accept().await?;
         let inbox_tx = inbox_tx.clone();
         let local_node_id = local_capabilities.node_id.clone();
-        let auth = auth.clone();
+        let graph = graph.clone();
         let db_path = db_path.clone();
 
         tokio::spawn(async move {
@@ -34,7 +34,7 @@ pub async fn serve_execution_plane(
                     if let Err(err) = validate_execution_message(
                         &msg,
                         &local_node_id,
-                        &auth,
+                        graph.as_ref(),
                         &db_path,
                         enable_rust_auth,
                     ) {
@@ -95,7 +95,7 @@ async fn read_execution_message(stream: &mut TcpStream) -> Result<BeaconMessage>
 fn validate_execution_message(
     msg: &BeaconMessage,
     local_node_id: &str,
-    auth: &MeshAuth,
+    graph: &GraphDomain,
     db_path: &str,
     enable_rust_auth: bool,
 ) -> Result<()> {
@@ -104,6 +104,13 @@ fn validate_execution_message(
     }
 
     if enable_rust_auth {
+        let auth_key = graph
+            .get_config_value(&format!("mesh_auth_key:{}", msg.src_node))?
+            .and_then(|value| serde_json::from_str::<String>(&value).ok().or(Some(value)))
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("no mesh auth key for node {}", msg.src_node))?;
+        let auth = MeshAuth::new(auth_key);
         auth.validate(
             &msg.msg_id,
             msg.seq as u64,

@@ -1,7 +1,5 @@
 use anyhow::{Context, Result};
-use philotic_client::{
-    ComponentManifest, GuestIdentity, IpcRequest, IpcResponse, PhiloticClient,
-};
+use philotic_client::{ComponentManifest, GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
 use std::path::PathBuf;
 
 use crate::start::socket_path;
@@ -37,9 +35,14 @@ pub async fn add(manifest_path: PathBuf) -> Result<()> {
             registered_guest_id,
             registered_role,
         } => {
-            println!("\n  OK  guest_id={}  role={}", registered_guest_id, registered_role);
+            println!(
+                "\n  OK  guest_id={}  role={}",
+                registered_guest_id, registered_role
+            );
         }
-        IpcResponse::Standard { ok: false, message, .. } => {
+        IpcResponse::Standard {
+            ok: false, message, ..
+        } => {
             anyhow::bail!("hotel rejected component registration: {message}");
         }
         IpcResponse::Error(msg) => {
@@ -65,7 +68,10 @@ pub async fn list() -> Result<()> {
         .context("IPC request failed")?;
 
     match resp {
-        IpcResponse::ConfigData { value_json: Some(json), .. } => {
+        IpcResponse::ConfigData {
+            value_json: Some(json),
+            ..
+        } => {
             let guests: Vec<serde_json::Value> = serde_json::from_str(&json)
                 .unwrap_or_else(|_| vec![serde_json::json!({"raw": json})]);
             if guests.is_empty() {
@@ -83,7 +89,9 @@ pub async fn list() -> Result<()> {
                 }
             }
         }
-        IpcResponse::ConfigData { value_json: None, .. } => {
+        IpcResponse::ConfigData {
+            value_json: None, ..
+        } => {
             println!("No components registered.");
         }
         other => {
@@ -99,53 +107,19 @@ pub async fn list() -> Result<()> {
 
 /// phil component remove <guest_id>
 pub async fn remove(guest_id: String) -> Result<()> {
-    // Removal is implemented as setting is_active=false via a GetConfig read + RegisterComponent
-    // upsert with auto_start=false. A dedicated RemoveComponent IPC will be added when needed.
     let socket = socket_path("aiua");
     let mut client = ipc_client(&socket).await?;
 
-    // Fetch existing component config to preserve fields.
-    let key = format!("component:{guest_id}");
     let resp = client
-        .send_request(IpcRequest::GetConfig { key })
-        .await
-        .context("failed to fetch component config from hotel")?;
-
-    let component_config = match resp {
-        IpcResponse::ConfigData { value_json: Some(ref json), .. } => {
-            serde_json::from_str(json).unwrap_or(serde_json::Value::Null)
-        }
-        _ => serde_json::Value::Null,
-    };
-
-    // Re-register with auto_start=false to deactivate the guest.
-    let manifest = ComponentManifest {
-        guest_id: guest_id.clone(),
-        role: component_config
-            .get("role")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string(),
-        hotel: "default".to_string(),
-        command: component_config
-            .get("command")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        args: vec![],
-        env: Default::default(),
-        component_config: serde_json::Value::Null,
-        auto_start: false,
-    };
-
-    let resp2 = client
-        .send_request(IpcRequest::RegisterComponent { manifest })
+        .send_request(IpcRequest::RemoveComponent {
+            guest_id: guest_id.clone(),
+        })
         .await
         .context("IPC request failed")?;
 
-    match resp2 {
-        IpcResponse::ComponentRegistered { registered_guest_id, .. } => {
-            println!("Component {} deactivated.", registered_guest_id);
+    match resp {
+        IpcResponse::Standard { ok: true, .. } => {
+            println!("Component {} removed.", guest_id);
         }
         other => {
             anyhow::bail!("unexpected response: {:?}", other);

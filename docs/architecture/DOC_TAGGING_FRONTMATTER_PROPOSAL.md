@@ -1,30 +1,30 @@
 ---
-title: "Documentation Tagging And Frontmatter Proposal"
+title: Documentation Tagging And Frontmatter Proposal
 doc_type: proposal
 domain: workflow-docs
 status: accepted-current-slice
-last_updated: 2026-03-12
+last_updated: 2026-03-31
 tags:
-  - docs
-  - frontmatter
-  - tags
-  - domains
-  - source-of-truth
+- docs
+- frontmatter
+- tags
+- domains
+- source-of-truth
 related_docs:
-  - README.md
-  - ARCHITECTURE_STATUS.md
-  - PROPOSAL_ORGANIZATION_PROPOSAL.md
+- README.md
+- ARCHITECTURE_STATUS.md
+- PROPOSAL_ORGANIZATION_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: docs-tagging-frontmatter
 implements:
-  - proposal-organization
+- proposal-organization
 implemented_by:
-  - docs-frontmatter-pilot
+- docs-frontmatter-pilot
 active_seams:
-  - architecture-doc-metadata-rollout
+- architecture-doc-metadata-rollout
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
+- ARCHITECTURE_STATUS.md
 ---
 
 # Documentation Tagging And Frontmatter Proposal

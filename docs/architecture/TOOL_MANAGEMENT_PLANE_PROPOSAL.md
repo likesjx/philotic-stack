@@ -1,30 +1,30 @@
 ---
-title: "Philotic Tool Management Plane Proposal"
+title: Philotic Tool Management Plane Proposal
 doc_type: proposal
 domain: tooling-execution
 status: accepted-current-slice
-last_updated: 2026-03-12
+last_updated: 2026-03-31
 tags:
-  - tools
-  - management-plane
-  - runners
-  - graph
-  - active-seam
+- tools
+- management-plane
+- runners
+- graph
+- active-seam
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md
-  - TASK_RUNNER_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md
+- TASK_RUNNER_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: tool-management-plane
 implements: []
 implemented_by: []
 active_seams:
-  - tool-management-plane-records
-  - agent-default-toolsets
+- tool-management-plane-records
+- agent-default-toolsets
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
-  - ARCHITECTURE.md
+- ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
 ---
 
 # Philotic Tool Management Plane Proposal

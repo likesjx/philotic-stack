@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - egress-policy-object
+
+rectangle "egress-policy-object" as egress_policy_object #Orange {
+}
+
+
+@enduml

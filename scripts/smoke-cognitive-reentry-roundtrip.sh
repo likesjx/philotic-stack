@@ -46,11 +46,15 @@ trap cleanup EXIT
 
 echo "Building cognitive-reentry smoke binaries..."
 cargo build -p aiua -p philote -p model-router -p tool-runner -p philotic-client --example smoke_driver >/dev/null
+AIUA_BIN="${ROOT_DIR}/target/debug/aiua"
+PHILOTE_BIN="${ROOT_DIR}/target/debug/philote"
+MODEL_ROUTER_BIN="${ROOT_DIR}/target/debug/model-router"
+TOOL_RUNNER_BIN="${ROOT_DIR}/target/debug/tool-runner"
 
 echo "Starting aiua in ${TMP_DIR}..."
 (
   cd "${TMP_DIR}"
-  PHILOTIC_SMOKE_MODE=1 cargo run -q --manifest-path "${ROOT_DIR}/crates/aiua/Cargo.toml" --bin aiua -- --hotel "${HOTEL_NAME}" >"${TMP_DIR}/aiua.log" 2>&1
+  PHILOTIC_SMOKE_MODE=1 "${AIUA_BIN}" --hotel "${HOTEL_NAME}" >"${TMP_DIR}/aiua.log" 2>&1
 ) &
 ANSIBLE_PID=$!
 
@@ -68,17 +72,17 @@ fi
 
 echo "Starting philote..."
 PHILOTIC_HOTEL_SOCKET="${SOCKET_PATH}" \
-  cargo run -q --manifest-path "${ROOT_DIR}/crates/philote/Cargo.toml" --bin philote >"${TMP_DIR}/agent.log" 2>&1 &
+  "${PHILOTE_BIN}" >"${TMP_DIR}/agent.log" 2>&1 &
 AGENT_PID=$!
 
 echo "Starting model-router..."
 PHILOTIC_HOTEL_SOCKET="${SOCKET_PATH}" \
-  cargo run -q --manifest-path "${ROOT_DIR}/crates/model-router/Cargo.toml" --bin model-router >"${TMP_DIR}/model.log" 2>&1 &
+  "${MODEL_ROUTER_BIN}" >"${TMP_DIR}/model.log" 2>&1 &
 MODEL_PID=$!
 
 echo "Starting tool-runner..."
 PHILOTIC_HOTEL_SOCKET="${SOCKET_PATH}" \
-  cargo run -q --manifest-path "${ROOT_DIR}/crates/tool-runner/Cargo.toml" --bin tool-runner >"${TMP_DIR}/tool.log" 2>&1 &
+  "${TOOL_RUNNER_BIN}" >"${TMP_DIR}/tool.log" 2>&1 &
 TOOL_PID=$!
 
 sleep 1

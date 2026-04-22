@@ -1,30 +1,30 @@
 ---
-title: "Mesh Visibility And State Placement Proposal"
+title: Mesh Visibility And State Placement Proposal
 doc_type: proposal
 domain: mesh-placement
 status: proposed
-last_updated: 2026-03-12
+last_updated: 2026-03-31
 tags:
-  - mesh
-  - replication
-  - state
-  - sqlite
-  - active-seam
+- mesh
+- replication
+- state
+- sqlite
+- active-seam
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md
-  - TELEGRAM_POLL_LEASE_PROPOSAL.md
-  - KEY_VAULT_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md
+- TELEGRAM_POLL_LEASE_PROPOSAL.md
+- KEY_VAULT_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: mesh-visibility-state-placement
 implements: []
 implemented_by: []
 active_seams:
-  - mesh-visible-state-contract
+- mesh-visible-state-contract
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
-  - ARCHITECTURE.md
+- ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
 ---
 
 # Mesh Visibility And State Placement Proposal

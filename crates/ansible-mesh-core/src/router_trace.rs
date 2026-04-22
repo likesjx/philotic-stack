@@ -9,7 +9,7 @@
 //! RL pipeline consumption. No mesh sync — traces are node-local by design.
 
 use anyhow::Result;
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -318,7 +318,10 @@ mod tests {
         r.failure_code = Some("MODEL_INVALID_TOOL_CALL".into());
         s.record_trace(&r).unwrap();
         let traces = s.list_traces(1).unwrap();
-        assert_eq!(traces[0].failure_code.as_deref(), Some("MODEL_INVALID_TOOL_CALL"));
+        assert_eq!(
+            traces[0].failure_code.as_deref(),
+            Some("MODEL_INVALID_TOOL_CALL")
+        );
     }
 
     #[test]

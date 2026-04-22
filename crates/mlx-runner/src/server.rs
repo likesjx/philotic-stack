@@ -29,13 +29,27 @@ impl MlxServerHandle {
     }
 
     /// Spawn `<python_path> -m mlx_lm.server --model <repo> --port <port> [extra_args...]`.
-    pub fn spawn(python_path: &str, repo_id: &str, port: u16, extra_args: &[String]) -> Result<Self> {
+    pub fn spawn(
+        python_path: &str,
+        repo_id: &str,
+        port: u16,
+        extra_args: &[String],
+    ) -> Result<Self> {
         info!(repo_id, port, python_path, "spawning mlx_lm.server");
         let child = Command::new(python_path)
-            .args(["-m", "mlx_lm.server", "--model", repo_id, "--port", &port.to_string()])
+            .args([
+                "-m",
+                "mlx_lm.server",
+                "--model",
+                repo_id,
+                "--port",
+                &port.to_string(),
+            ])
             .args(extra_args)
             .spawn()
-            .with_context(|| format!("failed to spawn mlx_lm.server for {repo_id} via {python_path}"))?;
+            .with_context(|| {
+                format!("failed to spawn mlx_lm.server for {repo_id} via {python_path}")
+            })?;
         Ok(Self {
             child,
             port,

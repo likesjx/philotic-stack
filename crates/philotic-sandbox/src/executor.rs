@@ -23,7 +23,10 @@ pub async fn execute(
             duration_ms: start.elapsed().as_millis() as u64,
             error: Some(SandboxError {
                 code: "COMMAND_NOT_ALLOWED".into(),
-                message: format!("command '{}' is not in the policy allowlist", request.command),
+                message: format!(
+                    "command '{}' is not in the policy allowlist",
+                    request.command
+                ),
             }),
         };
     }

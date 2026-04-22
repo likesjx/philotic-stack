@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - cli-tui-admin-surface
+
+rectangle "cli-tui-admin-surface" as cli_tui_admin_surface #Orange {
+}
+
+
+@enduml

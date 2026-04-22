@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - transport-edge-trust-gates
+
+rectangle "transport-edge-trust-gates" as transport_edge_trust_gates #Orange {
+}
+
+
+@enduml

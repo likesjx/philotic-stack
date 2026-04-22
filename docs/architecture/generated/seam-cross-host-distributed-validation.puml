@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - cross-host-distributed-validation
+
+rectangle "cross-host-distributed-validation" as cross_host_distributed_validation #Orange {
+}
+
+
+@enduml

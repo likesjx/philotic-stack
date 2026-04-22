@@ -1,37 +1,44 @@
 ---
-title: "Model Controller Proposal"
+title: Model Controller Proposal
 doc_type: proposal
 domain: tooling-execution
 status: accepted-current-slice
-last_updated: 2026-03-19
+last_updated: 2026-04-10
 tags:
-  - model-controller
-  - models
-  - oauth
-  - voice
-  - active-seam
+- model-controller
+- models
+- oauth
+- api-key
+- voice
+- realtime
+- websocket
+- openai-compatible
+- openrouter
+- ollama
+- active-seam
 related_docs:
-  - ARCHITECTURE_STATUS.md
-  - TASK_RUNNER_PROPOSAL.md
-  - VOICE_MACHINE_PROPOSAL.md
-  - KEY_VAULT_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
+- TASK_RUNNER_PROPOSAL.md
+- VOICE_MACHINE_PROPOSAL.md
+- KEY_VAULT_PROPOSAL.md
 task_refs:
-  - docs/task.md
+- docs/task.md
 proposal_id: model-controller
 implements: []
 implemented_by:
-  - structured-model-envelope-slice
-  - gemini-oauth-guest-path-slice
-  - voice-synthesize-envelope-slice
+- structured-model-envelope-slice
+- gemini-oauth-guest-path-slice
+- voice-synthesize-envelope-slice
 active_seams:
-  - structured-model-envelope
-  - hotel-gemini-oauth-flow
-  - openai-provider-contract
-  - hotel-openai-oauth-flow
-  - provider-capability-overrides
+- structured-model-envelope
+- hotel-gemini-oauth-flow
+- openai-provider-contract
+- hotel-openai-oauth-flow
+- provider-capability-overrides
+- provider-native-response-mode-routing
 source_of_truth_targets:
-  - ARCHITECTURE_STATUS.md
-  - ARCHITECTURE.md
+- ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
 ---
 
 # Model Controller Proposal
@@ -43,7 +50,7 @@ Define a capability-addressed model-controller boundary for Philotic that can:
 - route text generation, voice synthesis, and future multimodal response work through separate materialized model-controller guests
 - support richer ElevenLabs audio capabilities beyond basic TTS
 - support Gemini authentication via hotel-managed OAuth with API key fallback
-- support OpenAI authentication via hotel-managed OAuth or API key, depending on provider path
+- support OpenAI authentication via hotel-managed API keys for the canonical OpenAI path and bearer-compatible credentials for OpenAI-shaped endpoints
 - support OpenAI-standard model features without forcing Philotic to adopt OpenAI-specific worldview as its canonical schema
 - keep provider invocation separate from higher-level delivery and transport concerns
 
@@ -84,7 +91,14 @@ Pin and prove the first design contract for:
 - a structured model request envelope that separates context layers from routing hints and provider options
 - a structured model response envelope with explicit response channels for optimization-oriented outputs
 - a first `request_class` split so cognitive calls can carry agent context and affordances without forcing every model call to pretend it is part of the reasoning loop
-- a proposal-backed OpenAI provider slice covering standard text/tool/structured-output support, hotel-owned OAuth, and model-specific capability overrides
+- a proposal-backed OpenAI provider slice covering standard text/tool/structured-output support, hotel-owned key management, and model-specific capability overrides
+- an explicit compatibility strategy for OpenAI-shaped endpoints such as OpenRouter and Ollama so they are treated as provider/endpoint modes unless a materially different lifecycle forces a new guest boundary
+- a first provider-option override slice for OpenAI reasoning effort, verbosity, background mode, and explicit built-in tool passthrough
+- a first OpenAI realtime websocket transport slice behind `response_mode=realtime_websocket`
+- an explicit shared response-route bucket that separates text-only, image multimodal, audio-capable multimodal, and realtime websocket requests
+- a canonical `response_route` field in the model-call envelope so the reflex can write the route once and providers can render from it
+- an agent-configurable `response_route_policy.default_route` surface so the desktop onboarding/config projection and `agent.configure` can seed the runtime default route without making the provider adapter the policy owner
+- the desktop agent editor now exposes `response_route_policy.default_route` so operators can change the routing preference after onboarding without leaving the management surface
 
 Current confidence for the implemented structured-envelope slice:
 
@@ -107,6 +121,14 @@ That means:
 - add an OpenAI provider adapter that renders that contract into the OpenAI API surface
 - map OpenAI outputs back into Philotic `ProviderOutput` variants
 - keep advanced OpenAI-only behavior in explicit provider extensions rather than leaking it into every call path
+
+OpenAI-compatible services such as OpenRouter should usually be treated as the same provider family with different endpoint, auth, or routing settings. Ollama is slightly more nuanced: if Philotic is talking to an Ollama-shaped HTTP surface, it belongs in the same compatibility family; if the local runtime requires a distinct lifecycle or protocol, that is the point to split a dedicated provider adapter or guest boundary.
+
+The rule of thumb is simple enough to survive contact with reality:
+
+- shared request/response contract stays canonical
+- provider adapter changes cover endpoint shape, auth shape, or small protocol gaps
+- separate controller guests only when lifecycle, streaming, or runtime ownership is actually different
 
 The current code seam is already shaped for this:
 
@@ -181,8 +203,8 @@ This is the important guardrail: provider-aware does not mean provider-owned. Ph
 
 OpenAI auth should support:
 
-- hotel-managed OAuth where the OpenAI product/API path supports it
-- API key fallback
+- hotel-managed endpoint-scoped API keys for the canonical OpenAI API path
+- bearer-compatible credentials for OpenAI-shaped endpoints when needed
 
 Recommended auth modes:
 
@@ -192,15 +214,16 @@ Recommended auth modes:
 
 Recommended boundary rule:
 
-- the hotel owns browser login, token exchange, refresh, storage, and validation UX
+- the hotel owns key onboarding, refresh, storage, and validation UX
+- browser login only applies when a provider path genuinely exposes OAuth
 - the guest consumes short-lived usable runtime auth material
-- the guest must not become the owner of long-lived OAuth credentials
+- the guest must not become the owner of long-lived provider credentials
 
 Acceptance criteria for this seam:
 
 - hotel can start and validate an OpenAI auth flow without requiring guest restarts for every credential refresh
-- model-router/provider config can prefer OAuth auth material over API key fallback when present
-- failure is visible before API-key fallback quietly masks a broken OAuth path
+- model-router/provider config can prefer vaulted auth material over raw config values
+- failure is visible before fallback logic quietly masks a broken endpoint-specific credential path
 - refreshable credentials live behind vault references rather than raw config values
 
 ## OpenAI Capability Override Recommendation
@@ -219,6 +242,7 @@ Recommendation:
 - keep the default OpenAI path focused on the standard shared contract
 - add explicit feature gates and provider options for specialized models
 - promote an OpenAI-specific feature into the shared Philotic contract only after at least one more provider or a clearly reusable internal surface wants the same thing
+- wire the first specialized controls through `provider_options` rather than minting a new request envelope field for each vendor-specific knob
 
 That keeps us from mistaking “OpenAI happens to expose this nicely” for “Philotic should now be this.”
 
@@ -814,6 +838,12 @@ This is distinct from provider-chaining:
 
 Philotic should support both paths explicitly.
 
+Routing note:
+
+- the agent routing reflex should remain the authority that chooses between provider-native `response.generate` audio and the `voice.synthesize` pipeline
+- provider adapters should render whichever path is selected, not decide the routing policy themselves
+- if model capability starts influencing routing decisions, that becomes a separate reflex-routing seam rather than a hidden provider concern
+
 ## Gemini Auth Recommendation
 
 Gemini auth should support:
@@ -865,7 +895,7 @@ Important boundary:
 
 The hotel is the better authority because it already owns local runtime coordination and canonical configuration.
 
-## OAuth UX Recommendation
+## Auth UX Recommendation
 
 Target operator experience:
 
@@ -873,12 +903,12 @@ Target operator experience:
 - `ansible auth google validate --provider gemini`
 - `ansible auth openai start`
 - `ansible auth openai validate`
-- browser opens automatically
-- hotel captures callback on localhost
+- Gemini browser UX opens automatically when OAuth is selected
+- OpenAI stores an endpoint-scoped API key in the hotel vault and validates against the configured endpoint
 - hotel confirms success
 - Gemini model-controller begins using OAuth
-- OpenAI model-controller begins using OAuth when the configured path supports it
-- if OAuth is unavailable or expires irrecoverably, API key remains the fallback path
+- OpenAI model-controller begins using endpoint-scoped vaulted keys or bearer material when the configured path supports it
+- if a provider path requires OAuth, the hotel can still own that flow as a separate path
 
 Operationally, the hotel should vend short-lived access tokens to the guest rather than permanently copying the long-lived credential into every model process.
 
@@ -892,7 +922,9 @@ This proposal intentionally does not yet define:
 - exact context-graph schema for model auth material
 - exact normalized envelope for music and sound-effect artifact metadata
 - the final normalization strategy for OpenAI built-in tools versus Philotic-routed tools
-- whether OpenAI realtime deserves its own materialized guest boundary or remains a provider mode inside the existing controller guest
+- the reflex-routing seam for choosing provider-native response modes versus `voice.synthesize`
+- whether OpenAI realtime websocket handling deserves its own materialized guest boundary or remains a provider mode inside the existing controller guest
+- whether Ollama ever needs a native adapter boundary beyond the OpenAI-compatible family
 
 ## Near-Term Slice Recommendation
 
@@ -905,5 +937,7 @@ Implement the next slice in this order:
 5. add Gemini auth abstraction with OAuth-capable config shape and API key fallback
 6. add hotel-side OAuth trigger and token handoff design before full implementation
 7. add `OpenAIProvider` on the existing `ModelProvider` seam for text/tool/structured-output support
-8. add hotel-side OpenAI auth trigger, token handoff design, and validation path before full implementation
+8. add hotel-side OpenAI auth trigger, key handoff design, and validation path before full implementation
 9. add provider capability-overrides for reasoning effort and the first specialized OpenAI controls without broadening the shared contract prematurely
+10. define the provider-native response-mode routing seam so the agent routing reflex can choose between `response.generate` audio, OpenAI realtime websocket handling, and `voice.synthesize`
+11. decide whether Ollama stays compatibility-only or ever justifies a native adapter boundary

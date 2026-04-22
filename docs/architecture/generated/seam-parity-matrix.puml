@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - parity-matrix
+
+rectangle "parity-matrix" as parity_matrix #Orange {
+}
+
+
+@enduml
