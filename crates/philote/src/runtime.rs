@@ -952,6 +952,53 @@ impl AgentRuntime {
         })
     }
 
+    /// At startup, read any persisted `McpRouteRecord`s from the agent's apartment
+    /// (key `__mcp_routes__:<agent_id>`) and push them to the hotel so that the
+    /// `membrane-mcp` guest receives an `update_mcp_routes` push and begins
+    /// advertising the philote's tools immediately.
+    async fn register_mcp_routes(&mut self) {
+        use ansible_mesh_core::mcp_route::McpRouteRecord;
+
+        let key = format!("__mcp_routes__:{}", self.agent_id);
+        let routes: Vec<McpRouteRecord> = match self
+            .ipc_client
+            .send_request(IpcRequest::GetConfig { key: key.clone() })
+            .await
+        {
+            Ok(IpcResponse::ConfigData {
+                value_json: Some(json),
+                ..
+            }) => match serde_json::from_str::<Vec<McpRouteRecord>>(&json) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(key = %key, err = %e, "Failed to parse stored MCP routes — skipping registration");
+                    return;
+                }
+            },
+            Ok(IpcResponse::ConfigData { value_json: None, .. }) => {
+                info!(agent_id = %self.agent_id, "No MCP routes stored — skipping registration");
+                return;
+            }
+            Ok(_) | Err(_) => {
+                warn!(agent_id = %self.agent_id, "Unexpected response fetching MCP routes — skipping registration");
+                return;
+            }
+        };
+
+        let count = routes.len();
+        match self
+            .ipc_client
+            .send_request(IpcRequest::UpdateMcpRoutes {
+                agent_id: self.agent_id.clone(),
+                routes,
+            })
+            .await
+        {
+            Ok(_) => info!(agent_id = %self.agent_id, count, "MCP routes registered with hotel."),
+            Err(e) => warn!(agent_id = %self.agent_id, err = %e, "Failed to register MCP routes"),
+        }
+    }
+
     /// At startup, enumerate all session apartments for this agent and purge any
     /// stale active turns left over from an unclean shutdown. Cleans the DB so
     /// sessions are not blocked before the first inbound message arrives.
@@ -1219,6 +1266,10 @@ impl AgentRuntime {
         // crash or unclean shutdown. This runs once at startup so callers don't have
         // to wait for the next inbound message to get a clean checkpoint.
         self.sweep_stale_session_turns().await;
+
+        // Re-advertise this philote's MCP tool routes to the hotel so that the
+        // membrane-mcp guest picks them up immediately on restart.
+        self.register_mcp_routes().await;
 
         loop {
             // Dispatch any tasks that were dequeued from a session's pending_user_tasks
