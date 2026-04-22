@@ -1,6 +1,6 @@
 use ansible_mesh_core::beacon::BeaconDaemon;
 use ansible_mesh_core::graph::{AbstractSkillRecord, AbstractToolRecord, ToolsetProfileRecord};
-use ansible_mesh_core::heartbeat::emit_heartbeat;
+use ansible_mesh_core::heartbeat::{emit_capability_sync, emit_heartbeat};
 use ansible_mesh_core::membership::{
     MeshMembershipAcceptPayload, derive_transport_session_key, fingerprint_from_base64url,
     now_epoch_secs, verify_join_request,
@@ -1078,7 +1078,7 @@ fn execution_reachability_for_hotel(
 /// read never blocks the heartbeat loop.
 fn sample_node_health(graph: &GraphDomain, hotel_name: &str) -> NodeHealthSnapshot {
     let guest_count = graph
-        .list_guests(hotel_name, true)
+        .list_guests(hotel_name, false)
         .ok()
         .map(|gs| gs.len() as u32);
 
@@ -1097,11 +1097,15 @@ fn sample_node_health(graph: &GraphDomain, hotel_name: &str) -> NodeHealthSnapsh
             let avail: u64 = cols.get(3)?.parse().ok()?;
             let used: u64 = cols.get(2)?.parse().ok()?;
             let total = used + avail;
-            if total == 0 { return None; }
+            if total == 0 {
+                return None;
+            }
             Some(avail as f32 / total as f32 * 100.0)
         }
         #[cfg(not(target_os = "macos"))]
-        { None }
+        {
+            None
+        }
     })();
 
     // Memory: percentage free from /proc/meminfo (Linux) or vm_stat (macOS).
@@ -1119,19 +1123,25 @@ fn sample_node_health(graph: &GraphDomain, hotel_name: &str) -> NodeHealthSnapsh
             let mut total_pages: u64 = 0;
             for line in stdout.lines() {
                 let parts: Vec<&str> = line.splitn(2, ':').collect();
-                if parts.len() != 2 { continue; }
+                if parts.len() != 2 {
+                    continue;
+                }
                 let val: u64 = parts[1].trim().trim_end_matches('.').parse().unwrap_or(0);
                 total_pages += val;
                 if parts[0].contains("Pages free") || parts[0].contains("Pages speculative") {
                     free_pages += val;
                 }
             }
-            if total_pages == 0 { return None; }
+            if total_pages == 0 {
+                return None;
+            }
             let _ = page_size;
             Some(free_pages as f32 / total_pages as f32 * 100.0)
         }
         #[cfg(not(target_os = "macos"))]
-        { None }
+        {
+            None
+        }
     })();
 
     // Load average from /proc/loadavg (Linux) or sysctl (macOS).
@@ -1249,16 +1259,10 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
                         if targets.is_empty() {
                             continue;
                         }
-                        let advertisements = match local_capability_advertisements(heartbeat_graph.as_ref(), &heartbeat_hotel) {
-                            Ok(advertisements) => advertisements,
-                            Err(err) => {
-                                warn!("Failed to build local capability advertisements: {}", err);
-                                continue;
-                            }
-                        };
                         let execution_reachability =
                             execution_reachability_for_hotel(heartbeat_graph.as_ref(), &heartbeat_hotel);
-                        let node_health = sample_node_health(heartbeat_graph.as_ref(), &heartbeat_hotel.hotel_name);
+                        let node_health =
+                            sample_node_health(heartbeat_graph.as_ref(), &heartbeat_hotel.hotel_name);
                         for (_target_node_id, target_addr) in targets {
                             let Ok(target) = target_addr.parse::<SocketAddr>() else {
                                 warn!("Skipping invalid heartbeat target address {}", target_addr);
@@ -1272,7 +1276,6 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
                                 &heartbeat_socket,
                                 target,
                                 &heartbeat_caps,
-                                &advertisements,
                                 Some(execution_reachability.clone()),
                                 &auth_key,
                                 Some(node_health.clone()),
@@ -1284,6 +1287,80 @@ async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
                         }
                     }
                     _ = heartbeat_shutdown.recv() => break,
+                }
+            }
+        });
+    }
+
+    {
+        let capability_socket = daemon.socket();
+        let capability_graph = ctx.graph_domain.clone();
+        let capability_hotel = ctx.hotel.clone();
+        let capability_caps = ctx.caps.clone();
+        let mut capability_shutdown = ctx.shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+            let mut last_sync_fingerprint: Option<String> = None;
+            let mut last_full_sync =
+                std::time::Instant::now() - std::time::Duration::from_secs(3600);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let targets = match mesh_targets_for_graph(capability_graph.as_ref(), &capability_caps.node_id) {
+                            Ok(targets) => targets,
+                            Err(err) => {
+                                warn!("Failed to resolve mesh capability-sync targets: {}", err);
+                                continue;
+                            }
+                        };
+                        if targets.is_empty() {
+                            continue;
+                        }
+
+                        let advertisements = match local_capability_advertisements(capability_graph.as_ref(), &capability_hotel) {
+                            Ok(advertisements) => advertisements,
+                            Err(err) => {
+                                warn!("Failed to build local capability advertisements: {}", err);
+                                continue;
+                            }
+                        };
+                        let execution_reachability =
+                            execution_reachability_for_hotel(capability_graph.as_ref(), &capability_hotel);
+                        let sync_fingerprint = capability_sync_fingerprint(&advertisements, &execution_reachability);
+                        let should_sync =
+                            last_sync_fingerprint.as_ref() != Some(&sync_fingerprint)
+                            || last_full_sync.elapsed() >= std::time::Duration::from_secs(3600);
+                        if !should_sync {
+                            continue;
+                        }
+
+                        for (target_node_id, target_addr) in targets {
+                            let Ok(target) = target_addr.parse::<SocketAddr>() else {
+                                warn!("Skipping invalid capability-sync target address {}", target_addr);
+                                continue;
+                            };
+                            let Some(auth_key) = mesh_auth_key_for_node(capability_graph.as_ref(), &target_node_id).ok().flatten() else {
+                                debug!("Skipping capability sync to {} until mesh auth key exists", target_node_id);
+                                continue;
+                            };
+                            if let Err(err) = emit_capability_sync(
+                                &capability_socket,
+                                target,
+                                &capability_caps,
+                                &advertisements,
+                                Some(execution_reachability.clone()),
+                                &auth_key,
+                            )
+                            .await
+                            {
+                                warn!("Failed to emit capability sync to {}: {}", target_addr, err);
+                            }
+                        }
+
+                        last_sync_fingerprint = Some(sync_fingerprint);
+                        last_full_sync = std::time::Instant::now();
+                    }
+                    _ = capability_shutdown.recv() => break,
                 }
             }
         });
@@ -1640,6 +1717,19 @@ fn local_capability_advertisements(
         });
     }
     Ok(advertisements)
+}
+
+fn capability_sync_fingerprint(
+    advertisements: &[CapabilityAdvertisement],
+    execution_reachability: &ExecutionReachability,
+) -> String {
+    let payload = serde_json::json!({
+        "advertisements": advertisements,
+        "execution_reachability": execution_reachability,
+    });
+    let encoded = serde_json::to_vec(&payload).unwrap_or_default();
+    let digest = Sha256::digest(encoded);
+    format!("{:x}", digest)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3422,7 +3512,6 @@ fn seed_orchestrator_roles(graph: &GraphDomain, profiles: &[AgentProfile]) -> an
             readiness_state: ansible_mesh_core::graph::RoleReadinessState::Configured,
             inactive_ttl_seconds: None,
             turn_loop_config: ansible_mesh_core::graph::TurnLoopConfig::default(),
-            home_node: None,
         };
         // Always upsert — the hotel seed is the canonical source for the orchestrator manifest.
         // The manifest is institutional (same rules for all agents), not per-agent customizable.

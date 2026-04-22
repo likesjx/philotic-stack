@@ -53,7 +53,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UdpSocket, UnixListener, UnixStream};
 use tokio::sync::{Mutex, RwLock, mpsc};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 pub(crate) type InboxRegistry = Arc<Mutex<HashMap<String, Vec<RoleSubscriber>>>>;
@@ -853,8 +853,7 @@ pub(crate) struct ParkedInboundTask {
     activate_session_id: Option<String>,
 }
 
-pub(crate) type ParkedInboundRegistry =
-    Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>;
+pub(crate) type ParkedInboundRegistry = Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AgentRouteResolution {
@@ -868,7 +867,7 @@ pub struct IpcServer {
     dispatcher_tx: mpsc::Sender<LedgerCommand>,
     graph: Arc<GraphDomain>,
     inboxes: InboxRegistry,
-    parked_inbound: Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
+    parked_inbound: ParkedInboundRegistry,
     materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
     telegram_poll_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
     desktop_membrane_leases: Arc<Mutex<RuntimeLeaseRegistry>>,
@@ -2293,6 +2292,17 @@ impl IpcServer {
         &self,
     ) -> Option<Arc<dyn GuestMaterializationRequester>> {
         self.materialization_requester.clone()
+    }
+
+    pub(crate) async fn handle_remote_role_handoff(
+        _graph: &GraphDomain,
+        _inboxes: &InboxRegistry,
+        _parked_inbound: &ParkedInboundRegistry,
+        _materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
+        _local_node_id: &str,
+        _payload_json: &str,
+    ) {
+        debug!("remote role handoff relay is not wired on this slice; ignoring handoff broadcast");
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
@@ -4061,9 +4071,7 @@ impl IpcServer {
             .await
             {
                 Ok(data) => IpcResponse::success("mesh_invite", Some(data)),
-                Err(err) => {
-                    IpcResponse::error("mesh_invite", "MESH_INVITE_ERROR", err.to_string())
-                }
+                Err(err) => IpcResponse::error("mesh_invite", "MESH_INVITE_ERROR", err.to_string()),
             },
             IpcRequest::AcceptMeshInvite {
                 hotel_name,
@@ -4079,9 +4087,7 @@ impl IpcServer {
             .await
             {
                 Ok(data) => IpcResponse::success("mesh_accept", Some(data)),
-                Err(err) => {
-                    IpcResponse::error("mesh_accept", "MESH_ACCEPT_ERROR", err.to_string())
-                }
+                Err(err) => IpcResponse::error("mesh_accept", "MESH_ACCEPT_ERROR", err.to_string()),
             },
             IpcRequest::PublishMessage {
                 target_role,
@@ -7578,10 +7584,7 @@ impl IpcServer {
                         let all_lines: Vec<&str> = content.lines().collect();
                         let start = all_lines.len().saturating_sub(lines as usize);
                         let tail = all_lines[start..].join("\n");
-                        IpcResponse::success(
-                            "hotel_logs",
-                            Some(serde_json::json!({ "log": tail })),
-                        )
+                        IpcResponse::success("hotel_logs", Some(serde_json::json!({ "log": tail })))
                     }
                     None => IpcResponse::error(
                         "hotel_logs",
@@ -8199,8 +8202,9 @@ impl IpcServer {
     }
 
     fn local_hotel_record(graph: &GraphDomain, local_node_id: &str) -> anyhow::Result<HotelRecord> {
-        let hotel_name = Self::local_hotel_name(graph, local_node_id)
-            .ok_or_else(|| anyhow::anyhow!("local hotel record missing for node [{local_node_id}]"))?;
+        let hotel_name = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
+            anyhow::anyhow!("local hotel record missing for node [{local_node_id}]")
+        })?;
         graph
             .get_hotel(&hotel_name)?
             .ok_or_else(|| anyhow::anyhow!("hotel record missing for hotel [{hotel_name}]"))
@@ -11308,8 +11312,8 @@ mod tests {
     use ansible_mesh_core::registry::{CapabilityAdvertisement, NodeRegistry};
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
     use ansible_mesh_core::storage::{
-        AgentIdentityRecord, GuestRecord, HotelRecord, SecretRecord,
-        SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,
+        AgentIdentityRecord, GuestRecord, HotelRecord, SecretRecord, SessionEventRecord,
+        SessionParticipantRecord, SessionRecord, SessionTurnRecord,
     };
     use base64::Engine;
     use philotic_client::{
@@ -22457,9 +22461,11 @@ mod tests {
             // accept it and verify the inner lease_type is correct.
             IpcResponse::TelegramPollLease { granted, lease } => {
                 if let Some(ref l) = lease {
-                    assert_eq!(l.lease_type, "discord_gateway",
+                    assert_eq!(
+                        l.lease_type, "discord_gateway",
                         "received TelegramPollLease but inner lease_type was '{}', not 'discord_gateway'",
-                        l.lease_type);
+                        l.lease_type
+                    );
                 }
                 (granted, lease)
             }
@@ -22469,9 +22475,9 @@ mod tests {
 
     fn expect_config_data(response: IpcResponse) -> Option<serde_json::Value> {
         match response {
-            IpcResponse::ConfigData { value_json, .. } => {
-                value_json.as_deref().map(|s| serde_json::from_str(s).expect("config data must be valid JSON"))
-            }
+            IpcResponse::ConfigData { value_json, .. } => value_json
+                .as_deref()
+                .map(|s| serde_json::from_str(s).expect("config data must be valid JSON")),
             other => panic!("expected ConfigData, got: {other:?}"),
         }
     }
@@ -22517,10 +22523,17 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _rx) = mpsc::channel(16);
         let graph = make_hotel_graph(&socket_path, "agent-jane-01");
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
         let server_task = tokio::spawn(async move { server.run().await.expect("server run") });
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        unsafe { std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path); }
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
 
         let mut membrane = PhiloticClient::connect(GuestIdentity {
             guest_id: "membrane-telegram-01".into(),
@@ -22555,7 +22568,11 @@ mod tests {
             .and_then(|b| b.as_array())
             .expect("reflex_context.membrane_bindings must be present");
 
-        assert_eq!(bindings.len(), 1, "exactly one binding after one lease grant");
+        assert_eq!(
+            bindings.len(),
+            1,
+            "exactly one binding after one lease grant"
+        );
         assert_eq!(
             bindings[0].get("kind").and_then(|k| k.as_str()),
             Some("telegram"),
@@ -22586,11 +22603,14 @@ mod tests {
             .and_then(|b| b.as_array())
             .expect("bindings after re-acquire");
         assert_eq!(
-            bindings2.len(), 1,
+            bindings2.len(),
+            1,
             "idempotent re-acquire must not duplicate binding (got: {bindings2:?})"
         );
 
-        unsafe { std::env::remove_var("PHILOTIC_HOTEL_SOCKET"); }
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
         server_task.abort();
         let _ = server_task.await;
         if Path::new(&socket_path).exists() {
@@ -22606,10 +22626,17 @@ mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, _rx) = mpsc::channel(16);
         let graph = make_hotel_graph(&socket_path, "agent-jane-01");
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph.clone());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
         let server_task = tokio::spawn(async move { server.run().await.expect("server run") });
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        unsafe { std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path); }
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
 
         let mut membrane = PhiloticClient::connect(GuestIdentity {
             guest_id: "membrane-discord-01".into(),
@@ -22644,7 +22671,11 @@ mod tests {
             .and_then(|b| b.as_array())
             .expect("reflex_context.membrane_bindings must be present");
 
-        assert_eq!(bindings.len(), 1, "exactly one binding after discord lease grant");
+        assert_eq!(
+            bindings.len(),
+            1,
+            "exactly one binding after discord lease grant"
+        );
         assert_eq!(
             bindings[0].get("kind").and_then(|k| k.as_str()),
             Some("discord_text"),
@@ -22675,11 +22706,14 @@ mod tests {
             .and_then(|b| b.as_array())
             .expect("bindings after re-acquire");
         assert_eq!(
-            bindings2.len(), 1,
+            bindings2.len(),
+            1,
             "idempotent re-acquire must not duplicate discord binding (got: {bindings2:?})"
         );
 
-        unsafe { std::env::remove_var("PHILOTIC_HOTEL_SOCKET"); }
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
         server_task.abort();
         let _ = server_task.await;
         if Path::new(&socket_path).exists() {

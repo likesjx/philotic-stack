@@ -1,6 +1,6 @@
+use crate::event::NodeId;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use crate::event::NodeId;
 
 /// Point-in-time environment snapshot self-reported by a hotel in each heartbeat.
 /// All fields are optional so older nodes remain wire-compatible.
@@ -59,6 +59,8 @@ pub enum MsgType {
     SecretPull,
     /// Mesh presence and health update
     Heartbeat,
+    /// A chunk of capability advertisements and reachability metadata.
+    CapabilitySync,
     /// Asynchronous result delivery
     Result,
     /// Streaming execution logs

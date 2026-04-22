@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 pub mod adapter;
 pub mod agent;
@@ -78,6 +77,18 @@ pub struct NodeConstraints {
     pub max_concurrent_jobs: Option<u32>,
     pub latency_hint_ms: Option<u32>,
     pub trust_level: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct NodeHealthSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_free_pct: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_free_pct: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_avg_1m: Option<f32>,
 }
 
 pub use philotic_primitives_mesh::beacon::*;

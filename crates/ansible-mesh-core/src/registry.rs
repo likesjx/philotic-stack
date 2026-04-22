@@ -1,9 +1,11 @@
 use crate::{NodeCapabilities, NodeHealthSnapshot};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 const DEFAULT_NODE_TTL: Duration = Duration::from_secs(15);
+const PENDING_SYNC_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CapabilityAdvertisement {
@@ -32,22 +34,35 @@ pub struct NodeStatus {
     pub capabilities: NodeCapabilities,
     pub advertisements: Vec<CapabilityAdvertisement>,
     pub execution_reachability: Option<ExecutionReachability>,
+    pub node_health: Option<NodeHealthSnapshot>,
     pub last_seen: Instant,
     /// Latest environment vitals reported by this node; None if the node
     /// has never sent health data or is running an older build.
     pub node_health: Option<NodeHealthSnapshot>,
 }
 
+#[derive(Debug, Clone)]
+struct PendingCapabilitySync {
+    capabilities: NodeCapabilities,
+    execution_reachability: Option<ExecutionReachability>,
+    node_health: Option<NodeHealthSnapshot>,
+    chunk_total: u32,
+    received_chunks: BTreeMap<u32, Vec<CapabilityAdvertisement>>,
+    started_at: Instant,
+}
+
 /// Registry for storing and querying known mesh nodes.
 #[derive(Debug, Default)]
 pub struct NodeRegistry {
-    nodes: HashMap<String, NodeStatus>, // Keyed by NodeId
+    nodes: HashMap<String, NodeStatus>,
+    pending_capability_syncs: HashMap<(String, Uuid), PendingCapabilitySync>,
 }
 
 impl NodeRegistry {
     pub fn new() -> Self {
         Self {
             nodes: HashMap::new(),
+            pending_capability_syncs: HashMap::new(),
         }
     }
 
@@ -59,7 +74,35 @@ impl NodeRegistry {
         DEFAULT_NODE_TTL.as_secs()
     }
 
-    /// Register or update a node's capabilities from a heartbeat.
+    pub fn observe_heartbeat(
+        &mut self,
+        capabilities: NodeCapabilities,
+        execution_reachability: Option<ExecutionReachability>,
+        node_health: Option<NodeHealthSnapshot>,
+    ) {
+        let node_id = capabilities.node_id.clone();
+        if let Some(existing) = self.nodes.get_mut(&node_id) {
+            existing.capabilities = capabilities;
+            existing.execution_reachability = execution_reachability;
+            existing.node_health = node_health;
+            existing.last_seen = Instant::now();
+            return;
+        }
+
+        self.nodes.insert(
+            node_id,
+            NodeStatus {
+                capabilities,
+                advertisements: Vec::new(),
+                execution_reachability,
+                node_health,
+                last_seen: Instant::now(),
+            },
+        );
+    }
+
+    /// Transitional compatibility shim for older call sites that still update a whole node in
+    /// one shot. New code should prefer `observe_heartbeat` and `observe_capability_sync_chunk`.
     pub fn update_node(
         &mut self,
         capabilities: NodeCapabilities,
@@ -67,12 +110,72 @@ impl NodeRegistry {
         execution_reachability: Option<ExecutionReachability>,
         node_health: Option<NodeHealthSnapshot>,
     ) {
+        let sync_id = Uuid::new_v4();
+        self.observe_capability_sync_chunk(
+            capabilities,
+            execution_reachability,
+            None,
+            sync_id,
+            0,
+            1,
+            advertisements,
+        );
+    }
+
+    pub fn observe_capability_sync_chunk(
+        &mut self,
+        capabilities: NodeCapabilities,
+        execution_reachability: Option<ExecutionReachability>,
+        node_health: Option<NodeHealthSnapshot>,
+        sync_id: Uuid,
+        chunk_index: u32,
+        chunk_total: u32,
+        advertisements: Vec<CapabilityAdvertisement>,
+    ) {
+        self.prune_pending_syncs();
+        let node_id = capabilities.node_id.clone();
+        let pending = self
+            .pending_capability_syncs
+            .entry((node_id.clone(), sync_id))
+            .or_insert_with(|| PendingCapabilitySync {
+                capabilities: capabilities.clone(),
+                execution_reachability: execution_reachability.clone(),
+                node_health: node_health.clone(),
+                chunk_total,
+                received_chunks: BTreeMap::new(),
+                started_at: Instant::now(),
+            });
+
+        pending.capabilities = capabilities;
+        pending.execution_reachability = execution_reachability;
+        pending.node_health = node_health;
+        pending.chunk_total = chunk_total;
+        pending.received_chunks.insert(chunk_index, advertisements);
+
+        if pending.received_chunks.len() as u32 != pending.chunk_total {
+            return;
+        }
+
+        let mut merged = Vec::new();
+        for index in 0..pending.chunk_total {
+            let Some(chunk) = pending.received_chunks.get(&index) else {
+                return;
+            };
+            merged.extend(chunk.clone());
+        }
+
+        let completed = self
+            .pending_capability_syncs
+            .remove(&(node_id.clone(), sync_id))
+            .expect("pending sync should exist when all chunks were received");
+
         self.nodes.insert(
-            capabilities.node_id.clone(),
+            node_id,
             NodeStatus {
-                capabilities,
-                advertisements,
-                execution_reachability,
+                capabilities: completed.capabilities,
+                advertisements: merged,
+                execution_reachability: completed.execution_reachability,
+                node_health: completed.node_health,
                 last_seen: Instant::now(),
                 node_health,
             },
@@ -90,17 +193,19 @@ impl NodeRegistry {
             && h.load_avg_1m.map_or(true, |v| v < 16.0)
     }
 
-    /// Retrieve capabilities for a specific node.
+    fn prune_pending_syncs(&mut self) {
+        self.pending_capability_syncs
+            .retain(|_, pending| pending.started_at.elapsed() <= PENDING_SYNC_TTL);
+    }
+
     pub fn get_node(&self, node_id: &str) -> Option<&NodeStatus> {
         self.nodes.get(node_id)
     }
 
-    /// Iterator over all known active nodes.
     pub fn active_nodes(&self) -> impl Iterator<Item = &NodeStatus> {
         self.nodes.values().filter(|status| Self::is_fresh(status))
     }
 
-    /// Find nodes matching a specific tool.
     pub fn find_nodes_with_tool<'a>(
         &'a self,
         tool: &'a str,
@@ -111,7 +216,6 @@ impl NodeRegistry {
             .filter(move |status| status.capabilities.tools.iter().any(|t| t == tool))
     }
 
-    /// Find nodes matching a specific role.
     pub fn find_nodes_with_role<'a>(
         &'a self,
         role: &'a crate::NodeRole,
@@ -138,7 +242,7 @@ impl NodeRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{NodeCapabilities, NodeConstraints, NodeRole};
+    use crate::{NodeConstraints, NodeRole};
 
     fn caps(node_id: &str) -> NodeCapabilities {
         NodeCapabilities {
@@ -154,104 +258,146 @@ mod tests {
         }
     }
 
-    #[test]
-    fn update_node_tracks_advertisements() {
-        let mut registry = NodeRegistry::new();
-        let advertisements = vec![CapabilityAdvertisement {
+    fn advertisement(node_id: &str, target_role: &str) -> CapabilityAdvertisement {
+        CapabilityAdvertisement {
             hotel_id: "aria-architect-hotel".into(),
-            node_id: "aria-architect-hotel-ansible-01".into(),
-            incarnation_id: "aria-architect-hotel:model-controller-gemini".into(),
-            target_role: "model".into(),
+            node_id: node_id.into(),
+            incarnation_id: format!("{node_id}:{target_role}"),
+            target_role: target_role.into(),
             availability_state: "live".into(),
             selection_hint: Some("remote_fallback".into()),
             latency_hint_ms: Some(12),
             max_concurrent_jobs: Some(4),
             active_jobs: 1,
             queue_depth: 0,
-        }];
+        }
+    }
 
-        registry.update_node(
-            caps("aria-architect-hotel-ansible-01"),
-            advertisements.clone(),
+    #[test]
+    fn heartbeat_observation_preserves_existing_advertisements() {
+        let mut registry = NodeRegistry::new();
+        let node_id = "aria-architect-hotel-ansible-01";
+        registry.observe_capability_sync_chunk(
+            caps(node_id),
             Some(ExecutionReachability {
                 protocol: "tcp-framed-v1".into(),
                 host: "aria-vps".into(),
                 port: 9002,
             }),
             None,
+            Uuid::new_v4(),
+            0,
+            1,
+            vec![advertisement(node_id, "model")],
         );
 
-        let node = registry
-            .get_node("aria-architect-hotel-ansible-01")
-            .expect("node should exist");
-        assert_eq!(node.advertisements, advertisements);
-        assert_eq!(
-            node.execution_reachability
-                .as_ref()
-                .map(|value| value.host.as_str()),
-            Some("aria-vps")
+        registry.observe_heartbeat(
+            caps(node_id),
+            Some(ExecutionReachability {
+                protocol: "tcp-framed-v1".into(),
+                host: "aria-vps".into(),
+                port: 9002,
+            }),
+            Some(NodeHealthSnapshot {
+                guest_count: Some(3),
+                ..NodeHealthSnapshot::default()
+            }),
         );
+
+        let node = registry.get_node(node_id).expect("node should exist");
+        assert_eq!(node.advertisements.len(), 1);
+        assert_eq!(
+            node.node_health
+                .as_ref()
+                .and_then(|value| value.guest_count),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn capability_sync_reassembles_chunked_advertisements() {
+        let mut registry = NodeRegistry::new();
+        let sync_id = Uuid::new_v4();
+        let node_id = "aria-node";
+
+        registry.observe_capability_sync_chunk(
+            caps(node_id),
+            Some(ExecutionReachability {
+                protocol: "tcp-framed-v1".into(),
+                host: "aria-vps".into(),
+                port: 9002,
+            }),
+            None,
+            sync_id,
+            1,
+            2,
+            vec![advertisement(node_id, "tool.echo")],
+        );
+        assert!(registry.get_node(node_id).is_none());
+
+        registry.observe_capability_sync_chunk(
+            caps(node_id),
+            Some(ExecutionReachability {
+                protocol: "tcp-framed-v1".into(),
+                host: "aria-vps".into(),
+                port: 9002,
+            }),
+            None,
+            sync_id,
+            0,
+            2,
+            vec![advertisement(node_id, "model")],
+        );
+
+        let node = registry.get_node(node_id).expect("node should exist");
+        assert_eq!(node.advertisements.len(), 2);
+        assert_eq!(node.advertisements[0].target_role, "model");
+        assert_eq!(node.advertisements[1].target_role, "tool.echo");
     }
 
     #[test]
     fn advertisements_for_role_filters_across_nodes() {
         let mut registry = NodeRegistry::new();
-        registry.update_node(
+        let first_sync = Uuid::new_v4();
+        registry.observe_capability_sync_chunk(
             caps("jane-node"),
-            vec![CapabilityAdvertisement {
-                hotel_id: "default".into(),
-                node_id: "jane-node".into(),
-                incarnation_id: "default:membrane-gateway-jane".into(),
-                target_role: "membrane".into(),
-                availability_state: "live".into(),
-                selection_hint: Some("local_live_preferred".into()),
-                latency_hint_ms: Some(5),
-                max_concurrent_jobs: Some(4),
-                active_jobs: 0,
-                queue_depth: 0,
-            }],
             Some(ExecutionReachability {
                 protocol: "tcp-framed-v1".into(),
                 host: "jane-vps".into(),
                 port: 9002,
             }),
             None,
+            first_sync,
+            0,
+            1,
+            vec![advertisement("jane-node", "membrane")],
         );
-        registry.update_node(
+
+        let second_sync = Uuid::new_v4();
+        registry.observe_capability_sync_chunk(
             caps("aria-node"),
-            vec![CapabilityAdvertisement {
-                hotel_id: "aria-architect-hotel".into(),
-                node_id: "aria-node".into(),
-                incarnation_id: "aria-architect-hotel:model-controller-gemini".into(),
-                target_role: "model".into(),
-                availability_state: "live".into(),
-                selection_hint: Some("remote_fallback".into()),
-                latency_hint_ms: Some(12),
-                max_concurrent_jobs: Some(4),
-                active_jobs: 1,
-                queue_depth: 0,
-            }],
             Some(ExecutionReachability {
                 protocol: "tcp-framed-v1".into(),
                 host: "aria-vps".into(),
                 port: 9002,
             }),
             None,
+            second_sync,
+            0,
+            1,
+            vec![advertisement("aria-node", "model")],
         );
 
         let model_ads: Vec<_> = registry.advertisements_for_role("model").collect();
         assert_eq!(model_ads.len(), 1);
-        assert_eq!(
-            model_ads[0].incarnation_id,
-            "aria-architect-hotel:model-controller-gemini"
-        );
+        assert_eq!(model_ads[0].incarnation_id, "aria-node:model");
     }
 
     #[test]
     fn active_nodes_filters_stale_entries() {
         let mut registry = NodeRegistry::new();
-        registry.update_node(caps("fresh-node"), vec![], None, None);
-        registry.update_node(caps("stale-node"), vec![], None, None);
+        registry.observe_heartbeat(caps("fresh-node"), None, None);
+        registry.observe_heartbeat(caps("stale-node"), None, None);
 
         registry
             .nodes
@@ -267,39 +413,25 @@ mod tests {
     #[test]
     fn advertisements_for_role_ignores_stale_nodes() {
         let mut registry = NodeRegistry::new();
-        registry.update_node(
+        let fresh_sync = Uuid::new_v4();
+        registry.observe_capability_sync_chunk(
             caps("fresh-node"),
-            vec![CapabilityAdvertisement {
-                hotel_id: "default".into(),
-                node_id: "fresh-node".into(),
-                incarnation_id: "default:model-controller-gemini".into(),
-                target_role: "model".into(),
-                availability_state: "live".into(),
-                selection_hint: Some("local_live_preferred".into()),
-                latency_hint_ms: Some(5),
-                max_concurrent_jobs: Some(4),
-                active_jobs: 0,
-                queue_depth: 0,
-            }],
             None,
             None,
+            fresh_sync,
+            0,
+            1,
+            vec![advertisement("fresh-node", "model")],
         );
-        registry.update_node(
+        let stale_sync = Uuid::new_v4();
+        registry.observe_capability_sync_chunk(
             caps("stale-node"),
-            vec![CapabilityAdvertisement {
-                hotel_id: "stale-hotel".into(),
-                node_id: "stale-node".into(),
-                incarnation_id: "stale-hotel:model-controller-gemini".into(),
-                target_role: "model".into(),
-                availability_state: "live".into(),
-                selection_hint: Some("remote_fallback".into()),
-                latency_hint_ms: Some(50),
-                max_concurrent_jobs: Some(1),
-                active_jobs: 1,
-                queue_depth: 1,
-            }],
             None,
             None,
+            stale_sync,
+            0,
+            1,
+            vec![advertisement("stale-node", "model")],
         );
 
         registry
