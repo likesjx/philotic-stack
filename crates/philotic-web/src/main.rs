@@ -8,6 +8,7 @@ mod footprint;
 mod harness;
 mod init;
 mod load;
+mod mesh;
 mod muninn;
 mod onboard;
 mod presets;
@@ -104,7 +105,7 @@ enum Command {
         hotel: String,
     },
 
-    /// Manage the aiua launchd service (macOS only)
+    /// Manage the aiua launchd service lifecycle (macOS only)
     Service {
         #[command(subcommand)]
         action: ServiceAction,
@@ -131,6 +132,12 @@ enum Command {
     Component {
         #[command(subcommand)]
         action: ComponentAction,
+    },
+
+    /// Explicit mesh trust ceremony: create invites and accept memberships
+    Mesh {
+        #[command(subcommand)]
+        action: MeshAction,
     },
 
     /// Project intelligence graph — scan, query, and serve the codebase graph
@@ -226,9 +233,58 @@ enum ComponentAction {
 }
 
 #[derive(Subcommand, Debug)]
+enum MeshAction {
+    /// Create an invite file for another hotel to join this mesh
+    Invite {
+        /// Local hotel to invite from
+        #[arg(long, default_value = "default")]
+        hotel: String,
+
+        /// Publicly reachable host or IP for this hotel's mesh UDP listener
+        #[arg(long)]
+        host: String,
+
+        /// Output path for the invite JSON
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+    },
+    /// Accept an invite file and announce membership back to the inviter
+    Accept {
+        /// Path to the invite JSON file
+        invite: PathBuf,
+
+        /// Local hotel accepting the invite
+        #[arg(long, default_value = "default")]
+        hotel: String,
+
+        /// Publicly reachable host or IP for this hotel's mesh UDP listener
+        #[arg(long)]
+        host: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum ServiceAction {
     /// Install and start the aiua launchd service
     Install {
+        /// Hotel to run (default: "default")
+        #[arg(long, default_value = "default")]
+        hotel: String,
+    },
+    /// Start the aiua launchd service
+    Start {
+        /// Hotel to run (default: "default")
+        #[arg(long, default_value = "default")]
+        hotel: String,
+    },
+    /// Stop the aiua launchd service without removing the plist
+    Stop {
+        /// Hotel to run (default: "default")
+        #[arg(long, default_value = "default")]
+        hotel: String,
+    },
+    /// Stop and then start the aiua launchd service
+    Restart {
         /// Hotel to run (default: "default")
         #[arg(long, default_value = "default")]
         hotel: String,
@@ -307,6 +363,9 @@ async fn main() -> Result<()> {
         Command::Reset { keep_identity } => reset::run(keep_identity).await,
         Command::Service { action } => match action {
             ServiceAction::Install { hotel } => service::install(hotel).await,
+            ServiceAction::Start { hotel } => service::start(hotel).await,
+            ServiceAction::Stop { hotel } => service::stop(hotel).await,
+            ServiceAction::Restart { hotel } => service::restart(hotel).await,
             ServiceAction::Uninstall { hotel } => service::uninstall(hotel).await,
             ServiceAction::Status { hotel } => service::status(hotel).await,
         },
@@ -316,6 +375,14 @@ async fn main() -> Result<()> {
             ComponentAction::Add { manifest } => component::add(manifest).await,
             ComponentAction::List => component::list().await,
             ComponentAction::Remove { guest_id } => component::remove(guest_id).await,
+        },
+        Command::Mesh { action } => match action {
+            MeshAction::Invite { hotel, host, out } => mesh::invite(hotel, host, out).await,
+            MeshAction::Accept {
+                invite,
+                hotel,
+                host,
+            } => mesh::accept(invite, hotel, host).await,
         },
         Command::Graph { action } => {
             use graph_intelligence::{scanner, GraphEngine};

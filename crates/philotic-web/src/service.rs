@@ -27,6 +27,23 @@ fn launchd_domain() -> String {
     format!("gui/{uid}")
 }
 
+fn service_target(hotel: &str) -> String {
+    format!("{}/{}", launchd_domain(), plist_label(hotel))
+}
+
+fn launchctl_status(args: &[&str]) -> Result<std::process::Output> {
+    std::process::Command::new("launchctl")
+        .args(args)
+        .output()
+        .context("launchctl")
+}
+
+fn service_loaded(hotel: &str) -> bool {
+    launchctl_status(&["print", &service_target(hotel)])
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
 pub async fn install(hotel: String) -> Result<()> {
     let aiua_bin = find_aiua_binary()?;
     let label = plist_label(&hotel);
@@ -106,6 +123,78 @@ pub async fn install(hotel: String) -> Result<()> {
     println!("✓ Service '{label}' installed and started.");
     println!("  Logs: {}", out_log.display());
     println!("  Run `phil service status` to verify.");
+    Ok(())
+}
+
+pub async fn start(hotel: String) -> Result<()> {
+    let label = plist_label(&hotel);
+    let plist = plist_path(&hotel);
+    let domain = launchd_domain();
+    let target = service_target(&hotel);
+
+    if !plist.exists() {
+        bail!("no plist found at {}", plist.display());
+    }
+
+    if service_loaded(&hotel) {
+        let status = std::process::Command::new("launchctl")
+            .args(["kickstart", "-k", &target])
+            .status()
+            .context("launchctl kickstart")?;
+        if !status.success() {
+            bail!("launchctl kickstart failed for {label}");
+        }
+    } else {
+        let status = std::process::Command::new("launchctl")
+            .args(["bootstrap", &domain, plist.to_str().context("plist path")?])
+            .status()
+            .context("launchctl bootstrap")?;
+        if !status.success() {
+            bail!("launchctl bootstrap failed — check plist at {}", plist.display());
+        }
+    }
+
+    println!("Started service '{label}'.");
+    println!("  Run `phil service status` to verify.");
+    Ok(())
+}
+
+pub async fn stop(hotel: String) -> Result<()> {
+    let label = plist_label(&hotel);
+    let target = service_target(&hotel);
+
+    if service_loaded(&hotel) {
+        let status = std::process::Command::new("launchctl")
+            .args(["bootout", &target])
+            .status()
+            .context("launchctl bootout")?;
+        if !status.success() {
+            bail!("launchctl bootout failed for {label}");
+        }
+        println!("Stopped service '{label}'.");
+    } else {
+        println!("Service '{label}' is not loaded.");
+    }
+
+    Ok(())
+}
+
+pub async fn restart(hotel: String) -> Result<()> {
+    let label = plist_label(&hotel);
+    let target = service_target(&hotel);
+
+    if service_loaded(&hotel) {
+        let stop_status = std::process::Command::new("launchctl")
+            .args(["bootout", &target])
+            .status()
+            .context("launchctl bootout")?;
+        if !stop_status.success() {
+            bail!("launchctl bootout failed for {label}");
+        }
+    }
+
+    start(hotel).await?;
+    println!("Restarted service '{label}'.");
     Ok(())
 }
 

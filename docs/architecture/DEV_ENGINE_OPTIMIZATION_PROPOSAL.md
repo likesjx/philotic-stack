@@ -3,7 +3,7 @@ title: Philotic Dev Engine Optimization
 doc_type: proposal
 domain: workflow-docs
 status: accepted-current-slice
-last_updated: 2026-03-31
+last_updated: 2026-04-09
 tags:
 - workflow
 - engine
@@ -24,6 +24,7 @@ implemented_by:
 active_seams:
 - engine-bootstrap-routine
 - reality-gap-consolidation
+- session-start-bootstrap-slice
 source_of_truth_targets:
 - ARCHITECTURE_STATUS.md
 ---
@@ -60,14 +61,14 @@ Use Muninn engrams to drive repository-level improvements.
 
 ## 3. Disposition
 - **Status**: `accepted for current slice`
-- **Current Slice**: `just engine-check` now validates Muninn reachability, repo-local bootstrap assets, and the cargo check/test baseline in one command.
+- **Current Slice**: `just engine-check` now validates Muninn reachability, repo-local bootstrap assets, and the cargo check/test baseline in one command; `just session-start` now also claims a visible graph session/workstream when the graph server is reachable.
 
 ## 4. Backlog / Next Seams
 
 ### 🔴 High Priority: Engine Automation
 - [x] **`just engine-check`**: One-command verification of Muninn, repo-local bootstrap assets, and the cargo check/test baseline.
 - [ ] **`just memory-consolidate`**: Tooling to triage "Reality Gap" engrams and suggest rule updates.
-- [ ] **`just session-start`**: Interactive (or prompt-based) agent bootstrap that runs recall and orientation automatically.
+- [x] **`just session-start`**: Interactive (or prompt-based) agent bootstrap that runs recall and orientation automatically and claims a visible graph session/workstream when the graph is reachable.
 
 ### 🟡 Medium Priority: Infrastructure
 - [ ] **VPS Muninn Deployment**: "Truth Cache" setup on `vps-jane` with automated sync.

@@ -2,8 +2,8 @@
 title: Hotel Perimeter Trust Proposal
 doc_type: proposal
 domain: operator-control-plane
-status: proposed
-last_updated: 2026-03-31
+status: accepted-current-slice
+last_updated: 2026-04-13
 tags:
 - perimeter
 - trust
@@ -36,9 +36,25 @@ Define how Philotic hotels determine which peers are inside the trusted perimete
 
 ## Disposition
 
-`proposed`
+`accepted for current slice`
 
 Track follow-on work in [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md).
+
+## Current Slice
+
+The first explicit membership slice now exists:
+
+- `phil mesh invite` emits an operator-delivered invite file
+- `phil mesh accept` persists the inviter locally and sends an HMAC-signed acceptance packet back
+- `HotelRecord` now carries explicit `mesh_host` addressing instead of assuming localhost-only peer identity
+- `aiua` persists accepted remote hotels into the graph rather than treating discovery alone as trust
+
+This slice intentionally remains transitional:
+
+- the ceremony is still PSK-shaped rather than full per-hotel PKI
+- revocation and deny-list behavior are not implemented yet
+- trust is mesh-membership wide rather than capability-scoped
+- authenticated control-plane traffic is still not mandatory outside explicit dev mode
 
 ## Core Recommendation
 
@@ -69,7 +85,7 @@ But the perimeter is still transitional because:
 
 - auth enforcement is still optional in dev
 - the system is still largely PSK-shaped
-- there is no first-class hotel join/invite lifecycle
+- join/invite exists now, but revocation and scoped authorization do not
 - there is no crisp notion of “this hotel is trusted for these roles/capabilities, but not those”
 
 That is enough for local development and controlled operator setups, but not enough to call the perimeter closed.
@@ -130,6 +146,9 @@ Recommended lifecycle:
 4. active membership
 5. rotation / revocation
 
+Current repo truth only covers the first transition into active membership with an operator-mediated invite/accept ceremony.
+It does not yet cover revocation, rotation, or fine-grained authorization scope.
+
 This should be explicit enough that an operator can answer:
 
 - which hotels are in the perimeter
@@ -168,3 +187,9 @@ Before pushing to broader cross-host routing:
 3. define authorization policy for perimeter membership
 4. require authenticated control-plane traffic outside explicit dev mode
 5. add revocation / deny behavior to the perimeter model
+
+Slice status on 2026-04-13:
+
+- `1` is now implemented in a minimal form through graph-backed hotel membership records plus `phil mesh invite` / `accept`
+- `2` is still transitional because the shipped ceremony reuses a shared mesh PSK rather than per-hotel PKI
+- `3`, `4`, and `5` remain open

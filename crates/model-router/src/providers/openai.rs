@@ -1,7 +1,18 @@
-use crate::controller::{ControllerTask, ModelProvider, ProviderOutput, TaskKind};
+use crate::controller::{
+    ControllerTask, ModelProvider, ProviderOutput, ResponseRouteBucket, TaskKind,
+};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use futures::{SinkExt, StreamExt};
 use serde_json::{Map, Value, json};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{
+        Message,
+        client::IntoClientRequest,
+        http::header::{AUTHORIZATION, HeaderValue},
+    },
+};
 use tracing::info;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +83,13 @@ impl OpenAIProvider {
     }
 
     fn default_model<'a>(&'a self, task: &'a ControllerTask) -> &'a str {
+        if Self::realtime_websocket_requested(task) && task.model.is_none() {
+            return "gpt-realtime";
+        }
+
+        if Self::native_audio_requested(task) && task.model.is_none() {
+            return "gpt-realtime-1.5";
+        }
         task.model.as_deref().unwrap_or(&self.default_model)
     }
 
@@ -79,6 +97,28 @@ impl OpenAIProvider {
         task.model
             .as_deref()
             .unwrap_or(&self.default_embedding_model)
+    }
+
+    fn native_audio_requested(task: &ControllerTask) -> bool {
+        matches!(
+            task.response_route_bucket(),
+            ResponseRouteBucket::AudioMultimodal
+        )
+    }
+
+    fn realtime_websocket_requested(task: &ControllerTask) -> bool {
+        matches!(
+            task.response_route_bucket(),
+            ResponseRouteBucket::RealtimeWebsocket
+        )
+    }
+
+    fn websocket_url(&self, model: &str) -> String {
+        let base = self
+            .base_url
+            .replace("https://", "wss://")
+            .replace("http://", "ws://");
+        format!("{}/v1/realtime?model={}", base.trim_end_matches('/'), model)
     }
 
     fn prompt_text(task: &ControllerTask) -> Result<String> {
@@ -247,6 +287,29 @@ impl OpenAIProvider {
             "messages": [Self::user_message(task)?],
         });
 
+        if Self::native_audio_requested(task) {
+            let modalities = if task.response_contract.modalities.is_empty() {
+                vec!["text", "audio"]
+            } else {
+                task.response_contract
+                    .modalities
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+            };
+            body["modalities"] = json!(modalities);
+
+            let voice = task
+                .provider_option_str("voice_id")
+                .or(task.voice.as_deref())
+                .unwrap_or("alloy");
+            let audio_format = task.provider_option_str("audio_format").unwrap_or("mp3");
+            body["audio"] = json!({
+                "voice": voice,
+                "format": audio_format,
+            });
+        }
+
         if !task.tools.is_empty() {
             body["tools"] = Value::Array(Self::function_declarations(&task.tools));
             body["tool_choice"] = Value::String("auto".into());
@@ -304,6 +367,51 @@ impl OpenAIProvider {
         }
 
         Ok(body)
+    }
+
+    fn realtime_request_body(&self, task: &ControllerTask) -> Result<Value> {
+        let prompt = Self::prompt_text(task)?;
+        let output_modalities = if task.response_contract.modalities.is_empty() {
+            vec!["text".to_string()]
+        } else {
+            task.response_contract.modalities.clone()
+        };
+        let mut response = json!({
+            "conversation": "none",
+            "output_modalities": output_modalities,
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": prompt,
+                }]
+            }],
+        });
+
+        if !task.tools.is_empty() {
+            response["tools"] = Value::Array(Self::function_declarations(&task.tools));
+            response["tool_choice"] = Value::String("auto".into());
+        }
+
+        if let Some(response_format) = Self::response_format(task) {
+            response["response_format"] = response_format;
+        }
+
+        for key in ["reasoning_effort", "verbosity"] {
+            if let Some(value) = Self::string_provider_option(task, key) {
+                response[key] = Value::String(value);
+            }
+        }
+
+        if let Some(background) = Self::bool_provider_option(task, "background") {
+            response["background"] = Value::Bool(background);
+        }
+
+        Ok(json!({
+            "type": "response.create",
+            "response": response,
+        }))
     }
 
     fn parse_message_content(message: &Value) -> Option<String> {
@@ -447,6 +555,240 @@ impl OpenAIProvider {
         }))
     }
 
+    fn parse_realtime_event(
+        task: &ControllerTask,
+        event: &Value,
+        text_fragments: &mut Vec<String>,
+        spoken_fragments: &mut Vec<String>,
+        final_text: &mut Option<String>,
+        final_spoken_text: &mut Option<String>,
+        tool_call: &mut Option<(String, Value)>,
+    ) -> Result<bool> {
+        let Some(event_type) = event.get("type").and_then(Value::as_str) else {
+            return Ok(false);
+        };
+
+        match event_type {
+            "session.created" | "session.updated" => Ok(false),
+            "response.output_text.delta" => {
+                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    let trimmed = delta.trim();
+                    if !trimmed.is_empty() {
+                        text_fragments.push(trimmed.to_string());
+                    }
+                }
+                Ok(false)
+            }
+            "response.output_text.done" => {
+                if let Some(text) = event.get("text").and_then(Value::as_str) {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        *final_text = Some(trimmed.to_string());
+                    }
+                }
+                Ok(false)
+            }
+            "response.output_audio_transcript.delta" => {
+                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    let trimmed = delta.trim();
+                    if !trimmed.is_empty() {
+                        spoken_fragments.push(trimmed.to_string());
+                    }
+                }
+                Ok(false)
+            }
+            "response.output_audio_transcript.done" => {
+                if let Some(transcript) = event.get("transcript").and_then(Value::as_str) {
+                    let trimmed = transcript.trim();
+                    if !trimmed.is_empty() {
+                        *final_spoken_text = Some(trimmed.to_string());
+                    }
+                }
+                Ok(false)
+            }
+            "response.function_call_arguments.done" => {
+                let tool_name = event
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        event
+                            .get("item")
+                            .and_then(|item| item.get("name"))
+                            .and_then(Value::as_str)
+                    })
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if tool_name.is_empty() {
+                    bail!("OpenAI realtime tool_call missing tool name");
+                }
+
+                let arguments = event
+                    .get("arguments")
+                    .cloned()
+                    .or_else(|| {
+                        event
+                            .get("item")
+                            .and_then(|item| item.get("arguments"))
+                            .cloned()
+                    })
+                    .unwrap_or_else(|| Value::Object(Map::new()));
+                let arguments = Self::parse_tool_arguments(Some(&arguments));
+                if !arguments.is_object() {
+                    bail!(
+                        "OpenAI realtime tool_call.arguments for [{}] must be an object",
+                        tool_name
+                    );
+                }
+
+                let allowed = task.tools.iter().any(|tool| {
+                    tool.get("tool_name")
+                        .and_then(Value::as_str)
+                        .map(|name| name == tool_name)
+                        .unwrap_or(false)
+                });
+                if !allowed {
+                    bail!(
+                        "OpenAI realtime returned unsupported tool_call [{}]",
+                        tool_name
+                    );
+                }
+
+                *tool_call = Some((tool_name, arguments));
+                Ok(false)
+            }
+            "response.output_item.done" => {
+                if let Some(item) = event.get("item") {
+                    if let Some(content) = item.get("content").and_then(Value::as_array) {
+                        for part in content {
+                            if let Some(text) = part
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .or_else(|| part.get("transcript").and_then(Value::as_str))
+                            {
+                                let trimmed = text.trim();
+                                if !trimmed.is_empty() {
+                                    text_fragments.push(trimmed.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(false)
+            }
+            "response.done" => Ok(true),
+            "error" => {
+                let message = event
+                    .get("error")
+                    .and_then(|error| error.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("OpenAI realtime websocket returned an error");
+                bail!("{}", message);
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn invoke_realtime_websocket(&self, task: &ControllerTask) -> Result<ProviderOutput> {
+        let model = self.default_model(task).to_string();
+        let mut request = self.websocket_url(&model).into_client_request()?;
+        if let Some(auth_header) = self.auth_header() {
+            request
+                .headers_mut()
+                .insert(AUTHORIZATION, HeaderValue::from_str(&auth_header)?);
+        }
+        if let Some(project_id) = self
+            .project_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            request
+                .headers_mut()
+                .insert("OpenAI-Project", HeaderValue::from_str(project_id)?);
+        }
+
+        let (ws_stream, _) = connect_async(request).await?;
+        let (mut write, mut read) = ws_stream.split();
+
+        let request = self.realtime_request_body(task)?;
+        write
+            .send(Message::Text(serde_json::to_string(&request)?.into()))
+            .await?;
+
+        let mut text_fragments = Vec::new();
+        let mut spoken_fragments = Vec::new();
+        let mut final_text = None;
+        let mut final_spoken_text = None;
+        let mut tool_call = None;
+
+        while let Some(message) = read.next().await {
+            let message = message?;
+            let Message::Text(text) = message else {
+                continue;
+            };
+
+            let event: Value = serde_json::from_str(&text).with_context(|| {
+                format!("OpenAI realtime websocket returned invalid JSON: {}", text)
+            })?;
+            let done = Self::parse_realtime_event(
+                task,
+                &event,
+                &mut text_fragments,
+                &mut spoken_fragments,
+                &mut final_text,
+                &mut final_spoken_text,
+                &mut tool_call,
+            )?;
+            if done {
+                break;
+            }
+        }
+
+        let content = final_text
+            .or_else(|| {
+                if text_fragments.is_empty() {
+                    None
+                } else {
+                    Some(text_fragments.join(""))
+                }
+            })
+            .or_else(|| final_spoken_text.clone())
+            .or_else(|| {
+                if spoken_fragments.is_empty() {
+                    None
+                } else {
+                    Some(spoken_fragments.join(""))
+                }
+            })
+            .context("OpenAI realtime websocket returned no text content")?;
+
+        if let Some((tool_name, arguments)) = tool_call {
+            return Ok(ProviderOutput::ToolCall {
+                tool_name,
+                arguments,
+            });
+        }
+
+        Ok(ProviderOutput::Text {
+            display_text: Some(content.clone()),
+            content,
+            spoken_text: final_spoken_text.or_else(|| {
+                if spoken_fragments.is_empty() {
+                    None
+                } else {
+                    Some(spoken_fragments.join(""))
+                }
+            }),
+            partial_replies: Vec::new(),
+            working_memory_delta: None,
+            follow_up_questions: Vec::new(),
+            intent_summary: None,
+            memory_concept: None,
+            memory_candidate: None,
+            active_plan: None,
+        })
+    }
+
     fn parse_chat_response(task: &ControllerTask, body: &Value) -> Result<ProviderOutput> {
         if let Some(tool_call) = Self::parse_tool_call(task, body)? {
             return Ok(tool_call);
@@ -539,6 +881,12 @@ impl ModelProvider for OpenAIProvider {
     async fn invoke(&self, task: &ControllerTask) -> Result<ProviderOutput> {
         match task.kind {
             TaskKind::TextGenerate | TaskKind::MediaAnalyze => {
+                if Self::realtime_websocket_requested(task)
+                    && matches!(task.kind, TaskKind::TextGenerate)
+                {
+                    return self.invoke_realtime_websocket(task).await;
+                }
+
                 let body = self.chat_request_body(task)?;
                 if std::env::var("PHILOTIC_DEBUG_MODEL_REQUESTS")
                     .ok()
@@ -613,10 +961,12 @@ mod tests {
     use super::{OpenAIAuth, OpenAIProvider};
     use crate::controller::{ControllerTask, ModelProvider, ProviderOutput};
     use axum::{Json, Router, routing::post};
+    use futures::{SinkExt, StreamExt};
     use serde_json::{Value, json};
     use std::sync::Arc;
     use tokio::net::TcpListener;
     use tokio::sync::Mutex;
+    use tokio_tungstenite::{accept_async, tungstenite::Message};
 
     async fn spawn_test_server(handler: Router) -> (String, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -766,6 +1116,196 @@ mod tests {
         assert_eq!(body["verbosity"], "low");
         assert_eq!(body["background"], true);
         assert_eq!(body["tools"][0]["type"], "web_search_preview");
+    }
+
+    #[tokio::test]
+    async fn chat_request_enables_native_audio_response_mode() {
+        let captured = Arc::new(Mutex::new(None::<Value>));
+        let captured_for_handler = Arc::clone(&captured);
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<Value>| {
+                let captured_for_handler = Arc::clone(&captured_for_handler);
+                async move {
+                    *captured_for_handler.lock().await = Some(body);
+                    Json(json!({
+                        "choices": [{
+                            "message": {
+                                "content": "{\"display_text\":\"Hello\",\"spoken_text\":\"Hello there\"}"
+                            }
+                        }]
+                    }))
+                }
+            }),
+        );
+        let (base_url, _handle) = spawn_test_server(app).await;
+
+        let provider = OpenAIProvider::new(
+            reqwest::Client::new(),
+            Some(OpenAIAuth::ApiKey("secret".into())),
+            Some(base_url),
+            None,
+            None,
+            None,
+        );
+        let task = ControllerTask::from_value(&json!({
+            "kind": "text.generate",
+            "prompt": "Say hello",
+            "response_contract": {
+                "modalities": ["text", "audio"]
+            },
+            "provider_options": {
+                "response_mode": "native_audio",
+                "voice_id": "alloy",
+                "audio_format": "mp3"
+            }
+        }))
+        .unwrap();
+
+        let output = provider.invoke(&task).await.unwrap();
+        assert!(matches!(output, ProviderOutput::Text { .. }));
+
+        let body = captured
+            .lock()
+            .await
+            .clone()
+            .expect("request body captured");
+        assert_eq!(body["model"], "gpt-realtime-1.5");
+        assert_eq!(body["modalities"], json!(["text", "audio"]));
+        assert_eq!(body["audio"]["voice"], "alloy");
+        assert_eq!(body["audio"]["format"], "mp3");
+    }
+
+    #[tokio::test]
+    async fn realtime_websocket_request_streams_text_and_audio_transcript() {
+        let captured = Arc::new(Mutex::new(None::<Value>));
+        let captured_for_server = Arc::clone(&captured);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws_stream = accept_async(stream).await.unwrap();
+            let (mut write, mut read) = ws_stream.split();
+
+            write
+                .send(Message::Text(
+                    json!({
+                        "type": "session.created",
+                        "session": {
+                            "model": "gpt-realtime"
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+
+            let first = read.next().await.unwrap().unwrap();
+            let Message::Text(text) = first else {
+                panic!("expected text message from client");
+            };
+            *captured_for_server.lock().await = Some(serde_json::from_str(&text).unwrap());
+
+            write
+                .send(Message::Text(
+                    json!({
+                        "type": "response.output_text.delta",
+                        "delta": "Hello "
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            write
+                .send(Message::Text(
+                    json!({
+                        "type": "response.output_text.done",
+                        "text": "Hello websocket"
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            write
+                .send(Message::Text(
+                    json!({
+                        "type": "response.output_audio_transcript.done",
+                        "transcript": "Hello websocket"
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            write
+                .send(Message::Text(
+                    json!({
+                        "type": "response.done",
+                        "response": {
+                            "status": "completed"
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let provider = OpenAIProvider::new(
+            reqwest::Client::new(),
+            Some(OpenAIAuth::ApiKey("secret".into())),
+            Some(format!("http://{}", addr)),
+            None,
+            None,
+            None,
+        );
+        let task = ControllerTask::from_value(&json!({
+            "kind": "text.generate",
+            "prompt": "Say hello",
+            "response_contract": {
+                "modalities": ["text", "audio"]
+            },
+            "provider_options": {
+                "response_mode": "realtime_websocket"
+            }
+        }))
+        .unwrap();
+
+        let output = provider.invoke(&task).await.unwrap();
+        match output {
+            ProviderOutput::Text {
+                content,
+                display_text,
+                spoken_text,
+                ..
+            } => {
+                assert_eq!(content, "Hello websocket");
+                assert_eq!(display_text.as_deref(), Some("Hello websocket"));
+                assert_eq!(spoken_text.as_deref(), Some("Hello websocket"));
+            }
+            other => panic!("unexpected output: {:?}", other),
+        }
+
+        let body = captured
+            .lock()
+            .await
+            .clone()
+            .expect("request body captured");
+        assert_eq!(body["type"], "response.create");
+        assert_eq!(
+            body["response"]["output_modalities"],
+            json!(["text", "audio"])
+        );
+        assert_eq!(
+            body["response"]["input"][0]["content"][0]["type"],
+            "input_text"
+        );
+
+        server.await.unwrap();
     }
 
     #[tokio::test]

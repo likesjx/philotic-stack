@@ -121,7 +121,7 @@ impl ModelProvider for ElevenLabsProvider {
                 let response = self
                     .http_client
                     .post(format!(
-                        "https://api.elevenlabs.io/v1/text-to-speech/{}",
+                        "https://api.elevenlabs.io/v1/text-to-speech/{}/stream",
                         voice_id
                     ))
                     .header("xi-api-key", api_key)

@@ -1,4 +1,5 @@
 use crate::registry::{CapabilityAdvertisement, ExecutionReachability};
+use crate::authz::MeshAuth;
 use crate::{BeaconMessage, MsgType, NodeCapabilities};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -22,6 +23,7 @@ pub async fn emit_heartbeat(
     capabilities: &NodeCapabilities,
     advertisements: &[CapabilityAdvertisement],
     execution_reachability: Option<ExecutionReachability>,
+    auth_key: &str,
 ) -> Result<()> {
     let payload = HeartbeatPayload {
         capabilities: capabilities.clone(),
@@ -29,17 +31,26 @@ pub async fn emit_heartbeat(
         execution_reachability,
     };
 
+    let msg_id = Uuid::new_v4();
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let payload_bytes = serde_json::to_vec(&payload)?;
+    let auth = MeshAuth::new(auth_key);
+    let hmac = auth.sign(&msg_id, 0, &payload_bytes, timestamp);
+
     let msg = BeaconMessage {
         version: 1,
-        msg_id: Uuid::new_v4(),
+        msg_id,
         src_node: capabilities.node_id.clone(),
         dest_node: "broadcast".to_string(), // In MVP 2, this could be a known orchestrator IP or subnet broadcast
         msg_type: MsgType::Heartbeat,
         seq: 0,
         total: 1,
-        timestamp: 0, // MVP 1/2 ignores signature
-        payload: serde_json::to_vec(&payload)?,
-        hmac: vec![], // MVP 1/2 ignores signature
+        timestamp,
+        payload: payload_bytes,
+        hmac,
     };
 
     let data = serde_json::to_vec(&msg)?;

@@ -46,12 +46,6 @@ pub fn public_key_path() -> PathBuf {
     identity_dir().join("operator.pub")
 }
 
-/// Backward-compatible entry point — runs identity + config template + muninn.
-#[allow(dead_code)]
-pub async fn run(config: Option<PathBuf>, force: bool) -> Result<()> {
-    run_inner(config, force, false).await
-}
-
 /// If `skip_config` is true, identity and muninn are set up but the
 /// mesh-config template is not written (the interactive wizard handles it).
 pub async fn run_inner(config: Option<PathBuf>, force: bool, skip_config: bool) -> Result<()> {
@@ -130,16 +124,6 @@ fn key_fingerprint(key: &VerifyingKey) -> String {
         .join(":")
 }
 
-/// Loads the operator public key from ~/.philotic/identity/operator.pub.
-/// Returns None if not yet initialized.
-#[allow(dead_code)]
-pub fn load_public_key() -> Option<VerifyingKey> {
-    let raw = fs::read(public_key_path()).ok()?;
-    let hex_str = String::from_utf8(raw).ok()?;
-    let bytes = hex::decode(hex_str.trim()).ok()?;
-    let arr: [u8; 32] = bytes.try_into().ok()?;
-    VerifyingKey::from_bytes(&arr).ok()
-}
 
 // ── Config template ────────────────────────────────────────────────────────
 
@@ -162,6 +146,11 @@ static CONFIG_TEMPLATE: &str = r#"{
           },
           "model": {
             "default_model": "gemini-2.0-flash-exp"
+          },
+          "import_workspace": "",
+          "default_skillset": [],
+          "response_route_policy": {
+            "default_route": "auto"
           },
           "approval_policy": {
             "require_approval": true,
@@ -186,6 +175,11 @@ static CONFIG_TEMPLATE: &str = r#"{
           },
           "model": {
             "default_model": "gemini-2.0-flash-exp"
+          },
+          "import_workspace": "",
+          "default_skillset": [],
+          "response_route_policy": {
+            "default_route": "auto"
           },
           "toolset_tags": ["admin-required"],
           "approval_policy": {
@@ -212,6 +206,11 @@ static CONFIG_TEMPLATE: &str = r#"{
           "model": {
             "default_model": "gemini-2.0-flash-exp"
           },
+          "import_workspace": "",
+          "default_skillset": [],
+          "response_route_policy": {
+            "default_route": "auto"
+          },
           "approval_policy": {
             "require_approval": true,
             "preapproved_classes": ["utility", "session"],
@@ -236,6 +235,11 @@ static CONFIG_TEMPLATE: &str = r#"{
           "model": {
             "default_model": "gemini-2.0-flash-exp"
           },
+          "import_workspace": "",
+          "default_skillset": [],
+          "response_route_policy": {
+            "default_route": "auto"
+          },
           "approval_policy": {
             "require_approval": true,
             "preapproved_classes": ["utility", "session"],
@@ -259,6 +263,11 @@ static CONFIG_TEMPLATE: &str = r#"{
           },
           "model": {
             "default_model": "gemini-2.0-flash-exp"
+          },
+          "import_workspace": "",
+          "default_skillset": [],
+          "response_route_policy": {
+            "default_route": "auto"
           },
           "approval_policy": {
             "require_approval": true,

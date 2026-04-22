@@ -94,13 +94,16 @@ dependencies = [
  "axum 0.7.9",
  "base64 0.22.1",
  "clap",
+ "ed25519-dalek",
  "hex",
  "memory-core",
  "philotic-client",
+ "rand 0.8.5",
  "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2",
  "tokio",
  "tower-http 0.5.2",
@@ -130,9 +133,14 @@ dependencies = [
  "bincode",
  "chrono",
  "cron",
+ "ed25519-dalek",
+ "hex",
+ "hkdf",
  "hmac",
  "log",
  "philotic-client",
+ "philotic-primitives-mesh",
+ "rand 0.8.5",
  "rusqlite",
  "serde",
  "serde_json",
@@ -141,6 +149,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "x25519-dalek",
 ]
 
 [[package]]
@@ -2302,12 +2311,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "media-prep"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "membrane"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "membrane-telegram",
+ "clap",
+ "media-prep",
+ "philotic-client",
+ "pulldown-cmark",
+ "reqwest",
+ "serde_json",
+ "sha2",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2460,6 +2488,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "futures",
+ "media-prep",
  "mlx-runner",
  "onnx-runner",
  "philotic-client",
@@ -2467,6 +2496,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
  "ulid",
@@ -2876,6 +2906,7 @@ dependencies = [
  "ansible-mesh-core",
  "anyhow",
  "clap",
+ "media-prep",
  "memory-core",
  "philotic-client",
  "serde",
@@ -2920,6 +2951,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "philotic-primitives-mesh"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "uuid",
+]
+
+[[package]]
 name = "philotic-sandbox"
 version = "0.1.0"
 dependencies = [
@@ -2945,6 +2984,7 @@ dependencies = [
 name = "philotic-web"
 version = "0.1.0"
 dependencies = [
+ "ansible-mesh-core",
  "anyhow",
  "axum 0.7.9",
  "chrono",
@@ -4375,6 +4415,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tungstenite",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -4439,12 +4480,14 @@ dependencies = [
  "clap",
  "memory-core",
  "philotic-client",
+ "philotic-sandbox",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

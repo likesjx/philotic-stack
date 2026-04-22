@@ -15,8 +15,9 @@
 
 use crate::cron::CronJob;
 use crate::graph::{
-    AbstractSkillRecord, AbstractToolRecord, GraphNode, RoleIncarnationRecord, RuleRecord,
-    ToolsetProfileRecord, WorkflowSkillRecord,
+    AbstractModelRecord, AbstractRightRecord, AbstractSkillRecord, AbstractToolRecord, GraphNode,
+    RoleIncarnationRecord, RoleReadinessState, RoutingPolicyEvaluationRecord, RoutingPolicyRecord,
+    RuleRecord, ToolsetProfileRecord, WorkflowSkillRecord,
 };
 use crate::storage::{
     AgentIdentityRecord, GraphAdapter, GraphRunnerInstanceRecord, GuestRecord, HotelRecord,
@@ -28,34 +29,8 @@ use crate::NodeCapabilities;
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
-// ── Kind constants ────────────────────────────────────────────────────────────
-//
-// These are the shared data vocabulary for all graph stores in the system.
-// When a new entity type is added, add its kind constant here first.
-
-// Slice 1
-pub const NODE_KIND_HOTEL: &str = "hotel";
-pub const NODE_KIND_ABSTRACT_TOOL: &str = "abstract_tool";
-pub const NODE_KIND_RULE: &str = "rule";
-
-// Slice 2
-pub const NODE_KIND_GUEST: &str = "guest";
-pub const NODE_KIND_AGENT_IDENTITY: &str = "agent_identity";
-pub const NODE_KIND_SESSION: &str = "session";
-pub const NODE_KIND_SESSION_PARTICIPANT: &str = "session_participant";
-pub const NODE_KIND_SESSION_TURN: &str = "session_turn";
-pub const NODE_KIND_SESSION_EVENT: &str = "session_event";
-pub const NODE_KIND_ROLE_INCARNATION: &str = "role_incarnation";
-pub const NODE_KIND_SECRET: &str = "secret";
-pub const NODE_KIND_ABSTRACT_SKILL: &str = "abstract_skill";
-pub const NODE_KIND_WORKFLOW_SKILL: &str = "workflow_skill";
-pub const NODE_KIND_TOOLSET_PROFILE: &str = "toolset_profile";
-pub const NODE_KIND_NODE_CAPABILITIES: &str = "node_capabilities";
-pub const NODE_KIND_CONFIG: &str = "config";
-pub const NODE_KIND_APARTMENT: &str = "apartment";
-pub const NODE_KIND_CRON_JOB: &str = "cron_job";
-pub const NODE_KIND_USER_PROFILE: &str = "user_profile";
-
+mod kinds;
+pub use kinds::*;
 // ── GraphDomain ───────────────────────────────────────────────────────────────
 
 /// Domain-operation layer over a generic [`GraphAdapter`].
@@ -83,8 +58,20 @@ impl GraphDomain {
         format!("{}:{}", NODE_KIND_ABSTRACT_TOOL, tool_name)
     }
 
+    fn abstract_model_key(model_ref: &str) -> String {
+        format!("{}:{}", NODE_KIND_ABSTRACT_MODEL, model_ref)
+    }
+
+    fn abstract_right_key(right_name: &str) -> String {
+        format!("{}:{}", NODE_KIND_ABSTRACT_RIGHT, right_name)
+    }
+
     fn rule_key(rule_id: &str) -> String {
         format!("{}:{}", NODE_KIND_RULE, rule_id)
+    }
+
+    fn routing_policy_key(proposal_id: &str) -> String {
+        format!("{}:{}", NODE_KIND_ROUTING_POLICY, proposal_id)
     }
 
     // ── Hotel methods ─────────────────────────────────────────────────────────
@@ -163,6 +150,84 @@ impl GraphDomain {
             .collect()
     }
 
+    /// Upsert an abstract model record as a graph node.
+    pub fn upsert_abstract_model(&self, model: &AbstractModelRecord) -> Result<()> {
+        let data = serde_json::to_value(model)
+            .context("GraphDomain::upsert_abstract_model: serialize AbstractModelRecord")?;
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::abstract_model_key(&model.model_ref),
+            kind: NODE_KIND_ABSTRACT_MODEL.to_string(),
+            label: Some(model.model_ref.clone()),
+            data,
+        })
+    }
+
+    /// Load an abstract model record by model_ref.
+    pub fn get_abstract_model(&self, model_ref: &str) -> Result<Option<AbstractModelRecord>> {
+        match self
+            .adapter
+            .get_node(&Self::abstract_model_key(model_ref))?
+        {
+            None => Ok(None),
+            Some(node) => {
+                let record = serde_json::from_value(node.data)
+                    .context("GraphDomain::get_abstract_model: deserialize AbstractModelRecord")?;
+                Ok(Some(record))
+            }
+        }
+    }
+
+    /// List all abstract model records.
+    pub fn list_abstract_models(&self) -> Result<Vec<AbstractModelRecord>> {
+        self.adapter
+            .list_nodes_by_kind(NODE_KIND_ABSTRACT_MODEL)?
+            .into_iter()
+            .map(|n| {
+                serde_json::from_value(n.data)
+                    .context("GraphDomain::list_abstract_models: deserialize AbstractModelRecord")
+            })
+            .collect()
+    }
+
+    /// Upsert an abstract right record as a graph node.
+    pub fn upsert_abstract_right(&self, right: &AbstractRightRecord) -> Result<()> {
+        let data = serde_json::to_value(right)
+            .context("GraphDomain::upsert_abstract_right: serialize AbstractRightRecord")?;
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::abstract_right_key(&right.right_name),
+            kind: NODE_KIND_ABSTRACT_RIGHT.to_string(),
+            label: Some(right.right_name.clone()),
+            data,
+        })
+    }
+
+    /// Load an abstract right record by right name.
+    pub fn get_abstract_right(&self, right_name: &str) -> Result<Option<AbstractRightRecord>> {
+        match self
+            .adapter
+            .get_node(&Self::abstract_right_key(right_name))?
+        {
+            None => Ok(None),
+            Some(node) => {
+                let record = serde_json::from_value(node.data)
+                    .context("GraphDomain::get_abstract_right: deserialize AbstractRightRecord")?;
+                Ok(Some(record))
+            }
+        }
+    }
+
+    /// List all abstract right records.
+    pub fn list_abstract_rights(&self) -> Result<Vec<AbstractRightRecord>> {
+        self.adapter
+            .list_nodes_by_kind(NODE_KIND_ABSTRACT_RIGHT)?
+            .into_iter()
+            .map(|n| {
+                serde_json::from_value(n.data)
+                    .context("GraphDomain::list_abstract_rights: deserialize AbstractRightRecord")
+            })
+            .collect()
+    }
+
     // ── Rule methods ──────────────────────────────────────────────────────────
 
     /// Upsert a rule record as a graph node.
@@ -202,6 +267,83 @@ impl GraphDomain {
             }
         }
         Ok(rules)
+    }
+
+    pub fn upsert_routing_policy(&self, policy: &RoutingPolicyRecord) -> Result<()> {
+        let data = serde_json::to_value(policy)
+            .context("GraphDomain::upsert_routing_policy: serialize RoutingPolicyRecord")?;
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::routing_policy_key(&policy.proposal_id),
+            kind: NODE_KIND_ROUTING_POLICY.to_string(),
+            label: Some(policy.proposal_id.clone()),
+            data,
+        })
+    }
+
+    pub fn get_routing_policy(&self, proposal_id: &str) -> Result<Option<RoutingPolicyRecord>> {
+        match self
+            .adapter
+            .get_node(&Self::routing_policy_key(proposal_id))?
+        {
+            None => Ok(None),
+            Some(node) => {
+                let record = serde_json::from_value(node.data)
+                    .context("GraphDomain::get_routing_policy: deserialize RoutingPolicyRecord")?;
+                Ok(Some(record))
+            }
+        }
+    }
+
+    pub fn list_routing_policies(&self, agent_id: &str) -> Result<Vec<RoutingPolicyRecord>> {
+        let mut policies = Vec::new();
+        for node in self.adapter.list_nodes_by_kind(NODE_KIND_ROUTING_POLICY)? {
+            let record: RoutingPolicyRecord = serde_json::from_value(node.data)
+                .context("GraphDomain::list_routing_policies: deserialize RoutingPolicyRecord")?;
+            if record.agent_id == agent_id {
+                policies.push(record);
+            }
+        }
+        Ok(policies)
+    }
+
+    pub fn append_routing_policy_evaluation(
+        &self,
+        proposal_id: &str,
+        evaluation: RoutingPolicyEvaluationRecord,
+    ) -> Result<bool> {
+        let Some(mut record) = self.get_routing_policy(proposal_id)? else {
+            return Ok(false);
+        };
+        record.evaluations.push(evaluation);
+        self.upsert_routing_policy(&record)?;
+        Ok(true)
+    }
+
+    pub fn set_routing_policy_disposition(
+        &self,
+        proposal_id: &str,
+        state: String,
+        reason: String,
+        decided_at: u64,
+        source_tool: Option<String>,
+    ) -> Result<bool> {
+        let Some(mut record) = self.get_routing_policy(proposal_id)? else {
+            return Ok(false);
+        };
+        record.operator_disposition = crate::graph::RoutingPolicyDispositionRecord {
+            state: state.clone(),
+            reason: reason.clone(),
+            decided_at,
+        };
+        record.evaluations.push(RoutingPolicyEvaluationRecord {
+            evaluation_kind: "operator_disposition".to_string(),
+            decision: state,
+            reason,
+            created_at: decided_at,
+            source_tool,
+        });
+        self.upsert_routing_policy(&record)?;
+        Ok(true)
     }
 
     // ── Guest methods ─────────────────────────────────────────────────────────
@@ -575,6 +717,38 @@ impl GraphDomain {
         Ok(out)
     }
 
+    pub fn list_role_incarnations_by_routing_role(
+        &self,
+        routing_role: &str,
+    ) -> Result<Vec<RoleIncarnationRecord>> {
+        let mut out = Vec::new();
+        for node in self
+            .adapter
+            .list_nodes_by_kind(NODE_KIND_ROLE_INCARNATION)?
+        {
+            let record: RoleIncarnationRecord = serde_json::from_value(node.data).context(
+                "GraphDomain::list_role_incarnations_by_routing_role: deserialize RoleIncarnationRecord",
+            )?;
+            if record.routing_role() == routing_role {
+                out.push(record);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn set_role_incarnation_readiness(
+        &self,
+        agent_id: &str,
+        role_name: &str,
+        readiness_state: RoleReadinessState,
+    ) -> Result<()> {
+        if let Some(mut rec) = self.get_role_incarnation(agent_id, role_name)? {
+            rec.readiness_state = readiness_state;
+            self.upsert_role_incarnation(&rec)?;
+        }
+        Ok(())
+    }
+
     /// Find the first role incarnation record with the given role_name, across all agents.
     pub fn find_role_incarnation_by_name(
         &self,
@@ -937,6 +1111,23 @@ impl GraphDomain {
         }
     }
 
+    /// List apartment memory types for an agent.
+    pub fn list_apartments(&self, agent_id: &str) -> Result<Vec<String>> {
+        let prefix = format!("{}:{}:", NODE_KIND_APARTMENT, agent_id);
+        let mut out = Vec::new();
+        for node in self.adapter.list_nodes_by_kind(NODE_KIND_APARTMENT)? {
+            if !node.node_key.starts_with(&prefix) {
+                continue;
+            }
+            if let Some(memory_type) = node.node_key.rsplit(':').next() {
+                if !memory_type.is_empty() {
+                    out.push(memory_type.to_string());
+                }
+            }
+        }
+        Ok(out)
+    }
+
     // ── Cron job methods ──────────────────────────────────────────────────────
 
     fn cron_job_key(id: &str) -> String {
@@ -1002,7 +1193,10 @@ impl GraphDomain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{AbstractSkillRecord, RoleIncarnationRecord, ToolsetProfileRecord};
+    use crate::graph::{
+        AbstractModelRecord, AbstractRightRecord, AbstractSkillRecord, RoleIncarnationRecord,
+        ToolsetProfileRecord,
+    };
     use crate::sqlite_storage::SqliteGraphStorage;
     use crate::storage::{
         AgentIdentityRecord, GuestRecord, SecretRecord, SessionRecord, VaultRegistryEntry,
@@ -1029,6 +1223,7 @@ mod tests {
         HotelRecord {
             hotel_name: name.to_string(),
             capabilities: caps(),
+            mesh_host: None,
             mesh_port: 8999,
             blob_port: 9001,
             execution_port: 9002,
@@ -1043,6 +1238,37 @@ mod tests {
             description: format!("Description for {}", name),
             input_schema: serde_json::json!({"type": "object"}),
             class: "utility".to_string(),
+            tool_markers: Vec::new(),
+        }
+    }
+
+    fn model(
+        model_ref: &str,
+        provider_hint: &str,
+        capability_markers: &[&str],
+    ) -> AbstractModelRecord {
+        AbstractModelRecord {
+            model_ref: model_ref.to_string(),
+            provider_hint: provider_hint.to_string(),
+            description: format!("Description for {}", model_ref),
+            capability_markers: capability_markers
+                .iter()
+                .map(|v| (*v).to_string())
+                .collect(),
+            endpoint_stem: None,
+            speed_marker: 80,
+            thinking_marker: 70,
+            tool_use_marker: 60,
+            audio_native_marker: 0,
+        }
+    }
+
+    fn right(name: &str, target_kind: &str, target_ref: &str) -> AbstractRightRecord {
+        AbstractRightRecord {
+            right_name: name.to_string(),
+            description: format!("Description for {}", name),
+            target_kind: target_kind.to_string(),
+            target_ref: target_ref.to_string(),
         }
     }
 
@@ -1052,6 +1278,32 @@ mod tests {
             agent_id: agent.to_string(),
             description: "Always ask before deleting files.".to_string(),
             rationale: "Prevents accidental data loss.".to_string(),
+            created_at: 1_700_000_000,
+        }
+    }
+
+    fn routing_policy(id: &str, agent: &str) -> RoutingPolicyRecord {
+        RoutingPolicyRecord {
+            proposal_id: id.to_string(),
+            agent_id: agent.to_string(),
+            problem: "Voice ingress keeps surfacing remote tools too early.".to_string(),
+            proposed_change: "Dampen remote tool reflex during receptor ingress.".to_string(),
+            evidence: "Observed low-intent voice ingress requesting remote tools.".to_string(),
+            affected_stage: Some("ingress".to_string()),
+            affected_capability: Some("voice.transcribe".to_string()),
+            learned_reflex_preference_key: Some("operator-mesh-trust".to_string()),
+            operator_disposition: crate::graph::RoutingPolicyDispositionRecord {
+                state: "approved".to_string(),
+                reason: "Approved via operator-gated routing.policy.propose.".to_string(),
+                decided_at: 1_700_000_001,
+            },
+            evaluations: vec![crate::graph::RoutingPolicyEvaluationRecord {
+                evaluation_kind: "operator_disposition".to_string(),
+                decision: "approved".to_string(),
+                reason: "Approved via operator-gated tool execution.".to_string(),
+                created_at: 1_700_000_001,
+                source_tool: Some("routing.policy.propose".to_string()),
+            }],
             created_at: 1_700_000_000,
         }
     }
@@ -1110,6 +1362,7 @@ mod tests {
         let t = d.get_abstract_tool("bash.exec").unwrap().unwrap();
         assert_eq!(t.tool_name, "bash.exec");
         assert_eq!(t.class, "utility");
+        assert!(t.tool_markers.is_empty());
     }
 
     #[test]
@@ -1127,6 +1380,62 @@ mod tests {
             d.upsert_abstract_tool(&tool(name)).unwrap();
         }
         assert_eq!(d.list_abstract_tools().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn abstract_model_roundtrip() {
+        let d = make_domain();
+        d.upsert_abstract_model(&model(
+            "gemini-3.1-flash",
+            "gemini",
+            &["text.generate", "media.analyze"],
+        ))
+        .unwrap();
+        let record = d.get_abstract_model("gemini-3.1-flash").unwrap().unwrap();
+        assert_eq!(record.provider_hint, "gemini");
+        assert_eq!(
+            record.capability_markers,
+            vec!["text.generate", "media.analyze"]
+        );
+    }
+
+    #[test]
+    fn abstract_model_list() {
+        let d = make_domain();
+        d.upsert_abstract_model(&model("gemini-3.1-flash", "gemini", &["text.generate"]))
+            .unwrap();
+        d.upsert_abstract_model(&model("scribe_v1", "elevenlabs", &["voice.transcribe"]))
+            .unwrap();
+        let models = d.list_abstract_models().unwrap();
+        assert_eq!(models.len(), 2);
+        assert!(models
+            .iter()
+            .any(|record| record.model_ref == "gemini-3.1-flash"));
+        assert!(models.iter().any(|record| record.model_ref == "scribe_v1"));
+    }
+
+    #[test]
+    fn abstract_right_roundtrip() {
+        let d = make_domain();
+        d.upsert_abstract_right(&right("tool.echo", "tool", "echo"))
+            .unwrap();
+        let r = d.get_abstract_right("tool.echo").unwrap().unwrap();
+        assert_eq!(r.right_name, "tool.echo");
+        assert_eq!(r.target_kind, "tool");
+        assert_eq!(r.target_ref, "echo");
+    }
+
+    #[test]
+    fn abstract_right_list() {
+        let d = make_domain();
+        for (name, kind, target) in [
+            ("tool.echo", "tool", "echo"),
+            ("skill.handoff.back", "skill", "handoff.back"),
+            ("component.text.generate", "component", "text.generate"),
+        ] {
+            d.upsert_abstract_right(&right(name, kind, target)).unwrap();
+        }
+        assert_eq!(d.list_abstract_rights().unwrap().len(), 3);
     }
 
     // ── Guest ─────────────────────────────────────────────────────────────────
@@ -1239,6 +1548,7 @@ mod tests {
             role_identity_addendum: None,
             role_manifest: None,
             is_admin: false,
+            readiness_state: RoleReadinessState::Configured,
             inactive_ttl_seconds: None,
             turn_loop_config: TurnLoopConfig::default(),
         };
@@ -1285,6 +1595,7 @@ mod tests {
         let sk = AbstractSkillRecord {
             skill_name: "code-review".to_string(),
             description: "Reviews code.".to_string(),
+            skill_markers: vec!["governed".to_string()],
             ..Default::default()
         };
         d.upsert_abstract_skill(&sk).unwrap();
@@ -1294,6 +1605,13 @@ mod tests {
                 .unwrap()
                 .skill_name,
             "code-review"
+        );
+        assert_eq!(
+            d.get_abstract_skill("code-review")
+                .unwrap()
+                .unwrap()
+                .skill_markers,
+            vec!["governed".to_string()]
         );
         assert_eq!(d.list_abstract_skills().unwrap().len(), 1);
     }
@@ -1309,6 +1627,31 @@ mod tests {
         d.upsert_toolset_profile(&p).unwrap();
         let loaded = d.get_toolset_profile("dev").unwrap().unwrap();
         assert_eq!(loaded.allowed_tools, vec!["bash.exec"]);
+    }
+
+    #[test]
+    fn workflow_skill_roundtrip() {
+        let d = make_domain();
+        let wf = WorkflowSkillRecord {
+            workflow_name: "role.create_or_update".to_string(),
+            workflow_kind: "role.configure".to_string(),
+            owner_scope: "orchestrator".to_string(),
+            target_class: "same_identity_role_definition".to_string(),
+            description: "Governed role creation workflow.".to_string(),
+            target_selection_policy: serde_json::json!({"selection_mode": "same_agent_role_record"}),
+            context_requirements: serde_json::json!({"required_fields": ["role_name", "toolset_profile"]}),
+            return_contract: serde_json::json!({"ack": "ConfigureRoleOk"}),
+            governance: serde_json::json!({"execution_surface": "role.configure"}),
+            rollout_state: "active".to_string(),
+        };
+        d.upsert_workflow_skill(&wf).unwrap();
+        let loaded = d
+            .get_workflow_skill("role.create_or_update")
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.workflow_kind, "role.configure");
+        assert_eq!(loaded.owner_scope, "orchestrator");
+        assert_eq!(d.list_workflow_skills().unwrap().len(), 1);
     }
 
     // ── Config, vault registry, muninn endpoint ───────────────────────────────
@@ -1399,5 +1742,88 @@ mod tests {
 
         assert_eq!(d.list_rules("agent-bob").unwrap().len(), 1);
         assert!(d.list_rules("agent-nobody").unwrap().is_empty());
+    }
+
+    #[test]
+    fn routing_policy_roundtrip() {
+        let d = make_domain();
+        d.upsert_routing_policy(&routing_policy("routing-001", "agent-alice"))
+            .unwrap();
+        let record = d
+            .get_routing_policy("routing-001")
+            .unwrap()
+            .expect("stored routing policy");
+        assert_eq!(record.agent_id, "agent-alice");
+        assert_eq!(record.operator_disposition.state, "approved");
+        assert_eq!(record.evaluations.len(), 1);
+    }
+
+    #[test]
+    fn routing_policy_list_filters_by_agent() {
+        let d = make_domain();
+        d.upsert_routing_policy(&routing_policy("routing-001", "agent-alice"))
+            .unwrap();
+        d.upsert_routing_policy(&routing_policy("routing-002", "agent-bob"))
+            .unwrap();
+        d.upsert_routing_policy(&routing_policy("routing-003", "agent-alice"))
+            .unwrap();
+
+        let alice = d.list_routing_policies("agent-alice").unwrap();
+        assert_eq!(alice.len(), 2);
+        assert_eq!(d.list_routing_policies("agent-bob").unwrap().len(), 1);
+        assert!(d.list_routing_policies("agent-nobody").unwrap().is_empty());
+    }
+
+    #[test]
+    fn append_routing_policy_evaluation_updates_history() {
+        let d = make_domain();
+        d.upsert_routing_policy(&routing_policy("routing-001", "agent-alice"))
+            .unwrap();
+        let appended = d
+            .append_routing_policy_evaluation(
+                "routing-001",
+                crate::graph::RoutingPolicyEvaluationRecord {
+                    evaluation_kind: "learned_reflex_writeback".to_string(),
+                    decision: "approved_writeback".to_string(),
+                    reason: "Learned reflex was persisted into the agent graph.".to_string(),
+                    created_at: 1_700_000_002,
+                    source_tool: Some("routing.policy.propose".to_string()),
+                },
+            )
+            .unwrap();
+        assert!(appended);
+        let record = d
+            .get_routing_policy("routing-001")
+            .unwrap()
+            .expect("stored routing policy");
+        assert_eq!(record.evaluations.len(), 2);
+        assert_eq!(
+            record.evaluations[1].evaluation_kind,
+            "learned_reflex_writeback"
+        );
+    }
+
+    #[test]
+    fn set_routing_policy_disposition_updates_record_and_appends_history() {
+        let d = make_domain();
+        d.upsert_routing_policy(&routing_policy("routing-001", "agent-alice"))
+            .unwrap();
+        let updated = d
+            .set_routing_policy_disposition(
+                "routing-001",
+                "rejected".to_string(),
+                "Operator rejected after later review.".to_string(),
+                1_700_000_003,
+                Some("operator.control".to_string()),
+            )
+            .unwrap();
+        assert!(updated);
+        let record = d
+            .get_routing_policy("routing-001")
+            .unwrap()
+            .expect("stored routing policy");
+        assert_eq!(record.operator_disposition.state, "rejected");
+        assert_eq!(record.evaluations.len(), 2);
+        assert_eq!(record.evaluations[1].decision, "rejected");
     }
 }

@@ -168,6 +168,7 @@ pub enum PolicyAssertion {
     SetTtsMode(String),
     SetTtsProvider(String),
     SetVoiceId(String),
+    SetVoiceDeliveryMode(String),
     SetSendTextCaption(bool),
     SetFallbackToText(bool),
 }
@@ -192,6 +193,9 @@ impl PolicyAssertion {
             Self::SetTtsMode(v) => ("voice_response_policy.mode", serde_json::json!(v)),
             Self::SetTtsProvider(v) => ("voice_response_policy.provider", serde_json::json!(v)),
             Self::SetVoiceId(v) => ("voice_response_policy.voice_id", serde_json::json!(v)),
+            Self::SetVoiceDeliveryMode(v) => {
+                ("voice_response_policy.delivery_mode", serde_json::json!(v))
+            }
             Self::SetSendTextCaption(v) => (
                 "voice_response_policy.send_text_caption",
                 serde_json::json!(v),

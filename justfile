@@ -23,7 +23,8 @@ install-git-hooks:
 # Mandatory Muninn bootstrap gate for meaningful sessions.
 session-start:
     python3 scripts/muninn_mcp.py bootstrap
-    @just harness-drift 2>/dev/null || true
+    just harness-drift 2>/dev/null || true
+    bash scripts/session-start.sh
 
 # Show drift status for all managed harnesses.
 harness-drift:
@@ -44,22 +45,42 @@ harness-trial-start seam harness="claude-local" profile="philotic-operator":
     echo "$SESSION" > /tmp/philotic-harness-trial-session
 
 # Report activity against the current harness trial.
-# Usage: just harness-trial-report <activity-type> [tokens_in] [tokens_out]
-harness-trial-report activity tokens_in="0" tokens_out="0":
+# Usage: just harness-trial-report <activity-type> [phase] [tokens_in] [tokens_out] [elapsed_ms] [lines_changed] [files] [note]
+harness-trial-report activity phase="" tokens_in="0" tokens_out="0" elapsed_ms="0" lines_changed="0" files="" note="":
     #!/usr/bin/env bash
+    set -euo pipefail
     SESSION=$(cat /tmp/philotic-harness-trial-session 2>/dev/null || echo "")
     if [ -z "$SESSION" ]; then echo "No active trial session (run harness-trial-start first)"; exit 1; fi
-    phil graph harness trials report "$SESSION" {{activity}} \
-      --tokens-input {{tokens_in}} --tokens-output {{tokens_out}}
+    ARGS=("$SESSION" "{{activity}}")
+    HAS_SIGNAL=0
+    if [ -n "{{phase}}" ]; then ARGS+=(--phase "{{phase}}"); HAS_SIGNAL=1; fi
+    if [ "{{tokens_in}}" != "0" ]; then ARGS+=(--tokens-input "{{tokens_in}}"); HAS_SIGNAL=1; fi
+    if [ "{{tokens_out}}" != "0" ]; then ARGS+=(--tokens-output "{{tokens_out}}"); HAS_SIGNAL=1; fi
+    if [ "{{elapsed_ms}}" != "0" ]; then ARGS+=(--elapsed-ms "{{elapsed_ms}}"); HAS_SIGNAL=1; fi
+    if [ "{{lines_changed}}" != "0" ]; then ARGS+=(--lines-changed "{{lines_changed}}"); HAS_SIGNAL=1; fi
+    if [ -n "{{files}}" ]; then ARGS+=(--files "{{files}}"); HAS_SIGNAL=1; fi
+    if [ -n "{{note}}" ]; then ARGS+=(--note "{{note}}"); HAS_SIGNAL=1; fi
+    if [ "$HAS_SIGNAL" -eq 0 ]; then
+        echo "No telemetry supplied; report at least one signal (phase, tokens, elapsed_ms, lines_changed, files, or note)"
+        exit 1
+    fi
+    phil graph harness trials report "${ARGS[@]}"
 
 # Close the current harness trial.
-# Usage: just harness-trial-close [status] [summary]
-harness-trial-close status="completed" summary="":
+# Usage: just harness-trial-close [status] [verified] [summary]
+harness-trial-close status="completed" verified="" summary="":
     #!/usr/bin/env bash
+    set -euo pipefail
     SESSION=$(cat /tmp/philotic-harness-trial-session 2>/dev/null || echo "")
     if [ -z "$SESSION" ]; then echo "No active trial session found"; exit 1; fi
-    phil graph harness trials close "$SESSION" --status {{status}} \
-      $([ -n "{{summary}}" ] && echo "--summary '{{summary}}'")
+    if [ "{{status}}" = "completed" ] && [ -z "{{verified}}" ]; then
+        echo "Completed harness trials must include a verification level (for example, test-green)"
+        exit 1
+    fi
+    ARGS=("$SESSION" --status "{{status}}")
+    if [ -n "{{verified}}" ]; then ARGS+=(--verified "{{verified}}"); fi
+    if [ -n "{{summary}}" ]; then ARGS+=(--summary "{{summary}}"); fi
+    phil graph harness trials close "${ARGS[@]}"
     rm -f /tmp/philotic-harness-trial-session
     echo "Trial closed: $SESSION"
 
@@ -341,6 +362,10 @@ smoke-remote-model:
 smoke-gemini-oauth:
     bash scripts/smoke-gemini-oauth-roundtrip.sh
 
+# Run the Gemini Live complete-turn smoke (fake local Live websocket; no external creds)
+smoke-gemini-live:
+    bash scripts/smoke-gemini-live-roundtrip.sh
+
 # Run the MLX model controller smoke (requires mlx_lm installed + Apple Silicon)
 smoke-mlx:
     bash scripts/smoke-mlx-controller.sh
@@ -378,6 +403,7 @@ smoke-suite:
     ./scripts/smoke-subagent-roundtrip.sh
     bash scripts/smoke-cognitive-roundtrip.sh
     bash scripts/smoke-cognitive-reentry-roundtrip.sh
+    bash scripts/smoke-gemini-live-roundtrip.sh
     bash scripts/smoke-graph-runner-roundtrip.sh
     bash scripts/smoke-agent-graph-roundtrip.sh
     bash scripts/smoke-desktop-membrane.sh
@@ -395,6 +421,7 @@ operator-checklist:
     @echo "  just verify-vertical-slice"
     @echo "    = just test-suite  (unit + integration tests)"
     @echo "    + just smoke-suite (binary roundtrip smokes, incl. desktop membrane)"
+    @echo "  just smoke-gemini-live        # fake local Gemini Live complete-turn continuity"
     @echo ""
     @echo "── Tier 2: External credentials required ───────────────────────"
     @echo "  just smoke-model-controller   # mesh-config.json + Gemini key"
@@ -457,13 +484,14 @@ jane-push:
     #!/usr/bin/env bash
     set -euo pipefail
     REMOTE=mbp-jane
-    REMOTE_CELLAR=/opt/homebrew/Cellar/aiua/0.1.0-alpha/bin
-    BINS="aiua philote membrane membrane-telegram model-router model-controller-gemini model-controller-elevenlabs model-controller-mlx philote-worker tool-runner graph-runner philotic-web"
+    REMOTE_CELLAR="$(ssh "${REMOTE}" "ls -d /opt/homebrew/Cellar/aiua/*/bin 2>/dev/null | head -1")"
+    BINS="aiua philote membrane membrane-telegram model-router model-controller-gemini model-controller-elevenlabs model-controller-mlx philote-worker tool-runner graph-runner"
+    PHIL_CELLAR="$(ssh "${REMOTE}" "ls -d /opt/homebrew/Cellar/philotic-web/*/bin 2>/dev/null | head -1")"
     # Safety guard: verify we are actually talking to mbp-jane before touching anything.
     # mbp-jane's system hostname is "MacBookPro" — the SSH alias is just our local label.
     ACTUAL_HOST="$(ssh "${REMOTE}" hostname -s 2>/dev/null)"
-    if [ "${ACTUAL_HOST}" != "MacBookPro" ]; then
-        echo "❌ Aborting: remote hostname is '${ACTUAL_HOST}', expected 'MacBookPro' (mbp-jane)."
+    if [[ "${ACTUAL_HOST}" != "MacBookPro" && "${ACTUAL_HOST}" != "Jareds-MacBook-Pro" ]]; then
+        echo "❌ Aborting: remote hostname is '${ACTUAL_HOST}', expected mbp-jane."
         exit 1
     fi
     echo "▶ Building release binaries (local)..."
@@ -476,19 +504,36 @@ jane-push:
             echo "  – $bin (not built locally, skipping)"
             continue
         fi
+        NEW=false
         if ! ssh "${REMOTE}" "test -f '${REMOTE_CELLAR}/$bin'"; then
-            echo "  – $bin (not in remote Cellar, skipping)"
-            continue
+            NEW=true
         fi
-        ssh "${REMOTE}" "chmod u+w '${REMOTE_CELLAR}/$bin'"
+        ssh "${REMOTE}" "chmod u+w '${REMOTE_CELLAR}/$bin' 2>/dev/null || true"
         scp -q "target/release/$bin" "${REMOTE}:${REMOTE_CELLAR}/$bin"
-        ssh "${REMOTE}" "chmod u-w '${REMOTE_CELLAR}/$bin'"
-        echo "  ✓ $bin"
+        ssh "${REMOTE}" "chmod +x '${REMOTE_CELLAR}/$bin'"
+        ssh "${REMOTE}" "xattr -d com.apple.quarantine '${REMOTE_CELLAR}/$bin' 2>/dev/null || true"
+        if [ "$NEW" = "true" ]; then
+            ssh "${REMOTE}" "ln -sf '${REMOTE_CELLAR}/$bin' '/opt/homebrew/bin/$bin' && echo '  ✓ $bin (new — symlinked)'" || echo "  ✓ $bin (new)"
+        else
+            ssh "${REMOTE}" "chmod u-w '${REMOTE_CELLAR}/$bin' 2>/dev/null || true"
+            echo "  ✓ $bin"
+        fi
     done
+    if [ -n "${PHIL_CELLAR}" ]; then
+        ssh "${REMOTE}" "chmod u+w '${PHIL_CELLAR}/phil' '${PHIL_CELLAR}/philotic-web' 2>/dev/null || true"
+        scp -q "target/release/philotic-web" "${REMOTE}:${PHIL_CELLAR}/phil"
+        scp -q "target/release/philotic-web" "${REMOTE}:${PHIL_CELLAR}/philotic-web"
+        ssh "${REMOTE}" "chmod u-w '${PHIL_CELLAR}/phil' '${PHIL_CELLAR}/philotic-web' 2>/dev/null || true"
+        echo "  ✓ phil / philotic-web"
+    else
+        echo "  – phil / philotic-web (philotic-web Cellar not found on remote, skipping)"
+    fi
+    echo "▶ Clearing Gatekeeper quarantine on pushed binaries..."
+    ssh "${REMOTE}" "xattr -d com.apple.quarantine ${REMOTE_CELLAR}/* /opt/homebrew/Cellar/philotic-web/*/bin/* 2>/dev/null || true"
     echo "▶ Applying config on ${REMOTE}..."
-    ssh "${REMOTE}" "/opt/homebrew/bin/aiua load --file ~/mesh-config.json --hotel default"
+    ssh "${REMOTE}" "/opt/homebrew/bin/aiua load --file ~/mesh-config.json --hotel mbp-jane"
     echo "▶ Starting Jane on ${REMOTE}..."
-    ssh "${REMOTE}" "nohup /opt/homebrew/bin/aiua --hotel default >> ~/.philotic/aiua.log 2>&1 & echo \$! > ~/.philotic/aiua.pid && echo 'aiua started pid '\$(cat ~/.philotic/aiua.pid)"
+    ssh "${REMOTE}" "nohup /opt/homebrew/bin/aiua --hotel mbp-jane >> ~/.philotic/aiua.log 2>&1 & echo \$! > ~/.philotic/aiua.pid && echo 'aiua started pid '\$(cat ~/.philotic/aiua.pid)"
     echo "✅ Jane updated and running on ${REMOTE}."
 
 # Stop Jane on mbp-jane without pushing new binaries.
@@ -499,7 +544,7 @@ jane-stop:
 # Start Jane on mbp-jane (without pushing — uses whatever binary is already installed).
 jane-start:
     #!/usr/bin/env bash
-    ssh mbp-jane "nohup /opt/homebrew/bin/aiua --hotel default >> ~/.philotic/aiua.log 2>&1 & echo \$! > ~/.philotic/aiua.pid && echo 'aiua started pid '\$(cat ~/.philotic/aiua.pid)"
+    ssh mbp-jane "nohup /opt/homebrew/bin/aiua --hotel mbp-jane >> ~/.philotic/aiua.log 2>&1 & echo \$! > ~/.philotic/aiua.pid && echo 'aiua started pid '\$(cat ~/.philotic/aiua.pid)"
 
 # Check whether Jane (aiua) is running on mbp-jane.
 jane-status:
@@ -702,7 +747,11 @@ close-workstream:
     DISPOSITION=${DISPOSITION:-completed}
     
     read -p "Verification level (none/test-green/smoke-green/watched-live-green): " VERIFIED
-    VERIFIED=${VERIFIED:-test-green}
+    if [ "$DISPOSITION" = "completed" ] && [ -z "$VERIFIED" ]; then
+        echo "Completed workstreams must include a verification level"
+        exit 1
+    fi
+    VERIFIED=${VERIFIED:-none}
     
     read -p "Summary of work: " SUMMARY
     

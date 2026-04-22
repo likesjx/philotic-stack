@@ -3,13 +3,15 @@ title: Model Controller Proposal
 doc_type: proposal
 domain: tooling-execution
 status: accepted-current-slice
-last_updated: 2026-04-09
+last_updated: 2026-04-10
 tags:
 - model-controller
 - models
 - oauth
 - api-key
 - voice
+- realtime
+- websocket
 - openai-compatible
 - openrouter
 - ollama
@@ -33,6 +35,7 @@ active_seams:
 - openai-provider-contract
 - hotel-openai-oauth-flow
 - provider-capability-overrides
+- provider-native-response-mode-routing
 source_of_truth_targets:
 - ARCHITECTURE_STATUS.md
 - ARCHITECTURE.md
@@ -91,6 +94,11 @@ Pin and prove the first design contract for:
 - a proposal-backed OpenAI provider slice covering standard text/tool/structured-output support, hotel-owned key management, and model-specific capability overrides
 - an explicit compatibility strategy for OpenAI-shaped endpoints such as OpenRouter and Ollama so they are treated as provider/endpoint modes unless a materially different lifecycle forces a new guest boundary
 - a first provider-option override slice for OpenAI reasoning effort, verbosity, background mode, and explicit built-in tool passthrough
+- a first OpenAI realtime websocket transport slice behind `response_mode=realtime_websocket`
+- an explicit shared response-route bucket that separates text-only, image multimodal, audio-capable multimodal, and realtime websocket requests
+- a canonical `response_route` field in the model-call envelope so the reflex can write the route once and providers can render from it
+- an agent-configurable `response_route_policy.default_route` surface so the desktop onboarding/config projection and `agent.configure` can seed the runtime default route without making the provider adapter the policy owner
+- the desktop agent editor now exposes `response_route_policy.default_route` so operators can change the routing preference after onboarding without leaving the management surface
 
 Current confidence for the implemented structured-envelope slice:
 
@@ -830,6 +838,12 @@ This is distinct from provider-chaining:
 
 Philotic should support both paths explicitly.
 
+Routing note:
+
+- the agent routing reflex should remain the authority that chooses between provider-native `response.generate` audio and the `voice.synthesize` pipeline
+- provider adapters should render whichever path is selected, not decide the routing policy themselves
+- if model capability starts influencing routing decisions, that becomes a separate reflex-routing seam rather than a hidden provider concern
+
 ## Gemini Auth Recommendation
 
 Gemini auth should support:
@@ -908,7 +922,9 @@ This proposal intentionally does not yet define:
 - exact context-graph schema for model auth material
 - exact normalized envelope for music and sound-effect artifact metadata
 - the final normalization strategy for OpenAI built-in tools versus Philotic-routed tools
-- whether OpenAI realtime deserves its own materialized guest boundary or remains a provider mode inside the existing controller guest
+- the reflex-routing seam for choosing provider-native response modes versus `voice.synthesize`
+- whether OpenAI realtime websocket handling deserves its own materialized guest boundary or remains a provider mode inside the existing controller guest
+- whether Ollama ever needs a native adapter boundary beyond the OpenAI-compatible family
 
 ## Near-Term Slice Recommendation
 
@@ -923,3 +939,5 @@ Implement the next slice in this order:
 7. add `OpenAIProvider` on the existing `ModelProvider` seam for text/tool/structured-output support
 8. add hotel-side OpenAI auth trigger, key handoff design, and validation path before full implementation
 9. add provider capability-overrides for reasoning effort and the first specialized OpenAI controls without broadening the shared contract prematurely
+10. define the provider-native response-mode routing seam so the agent routing reflex can choose between `response.generate` audio, OpenAI realtime websocket handling, and `voice.synthesize`
+11. decide whether Ollama stays compatibility-only or ever justifies a native adapter boundary

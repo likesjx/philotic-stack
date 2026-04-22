@@ -81,6 +81,8 @@ pub trait ShellExecutor: Send + Sync {
     ) -> anyhow::Result<ExecuteCommandResponse>;
 }
 
+pub use client::SandboxedShellExecutor;
+
 /// Direct executor — current behavior, for development.
 pub struct DirectShellExecutor;
 

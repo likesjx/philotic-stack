@@ -96,11 +96,22 @@ struct WriteRequest {
     tags: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     confidence: Option<f32>,
+    /// Caller-provided idempotency key. MuninnDB returns the existing engram
+    /// if a live engram with this key already exists in the vault, rather than
+    /// creating a duplicate. Use for identity/system writes that should
+    /// reinforce rather than accumulate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    idempotent_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct WriteResponse {
     id: String,
+    /// Set to "duplicate_content" by MuninnDB when content-hash dedup fired
+    /// (i.e. identical content already existed and was reinforced instead of
+    /// creating a new engram). Useful for observability / dedup metrics.
+    #[serde(default)]
+    hint: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -114,6 +125,8 @@ struct BatchItem {
     concept: String,
     content: String,
     tags: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    idempotent_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -391,6 +404,7 @@ impl MemoryEngine for MuninnRestEngine {
             content: content.to_string(),
             tags,
             confidence: None,
+            idempotent_id: Some(format!("{}:{}", vault, concept)),
         };
 
         let resp: WriteResponse = self
@@ -401,6 +415,15 @@ impl MemoryEngine for MuninnRestEngine {
             .error_for_status()?
             .json()
             .await?;
+
+        if resp.hint.as_deref() == Some("duplicate_content") {
+            tracing::trace!(
+                concept = %concept,
+                vault = %vault,
+                id = %resp.id,
+                "memory write deduplicated — existing engram reinforced"
+            );
+        }
 
         self.cache_vault(&resp.id, &vault).await;
         Ok(EngramRef {
@@ -419,10 +442,12 @@ impl MemoryEngine for MuninnRestEngine {
         let mut items = Vec::with_capacity(entries.len());
         for (concept, content, tags) in entries {
             let tags = self.apply_lens_tags(tags).await;
+            let idempotent_id = Some(format!("{}:{}", vault, concept));
             items.push(BatchItem {
                 concept,
                 content,
                 tags,
+                idempotent_id,
             });
         }
 
@@ -510,6 +535,77 @@ impl MemoryEngine for MuninnRestEngine {
             .await?
         {
             resp.error_for_status()?;
+        }
+        Ok(())
+    }
+
+    async fn retry_enrich(&self, id: &EngramId) -> anyhow::Result<()> {
+        let vault = match self.cached_vault(id).await {
+            Some(v) => v,
+            None => {
+                tracing::debug!(engram_id = %id, "retry_enrich: vault unknown, skipping");
+                return Ok(());
+            }
+        };
+        // Use the agent-managed enrichment REST endpoint (promoted from MCP-only).
+        // GET candidates for this engram, then POST enrichment back if stages are missing.
+        // Falls back gracefully — enrichment is always best-effort in the Attend phase.
+        let candidates_url = self.url(&format!(
+            "/api/enrichment/candidates?vault={vault}&limit=1"
+        ));
+        #[derive(serde::Deserialize)]
+        struct Candidate {
+            id: String,
+            updated_at: String,
+            missing_stages: Vec<String>,
+        }
+        #[derive(serde::Deserialize)]
+        struct CandidatesResp {
+            items: Vec<Candidate>,
+        }
+        let resp = self
+            .with_auth(self.client.get(&candidates_url), &vault)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            tracing::debug!(engram_id = %id, vault = %vault, "retry_enrich: candidates fetch failed, skipping");
+            return Ok(());
+        }
+        let body: CandidatesResp = resp.json().await?;
+        // Find this specific engram in candidates (it may not need enrichment).
+        let candidate = body.items.into_iter().find(|c| &c.id == id);
+        let Some(c) = candidate else {
+            tracing::debug!(engram_id = %id, vault = %vault, "retry_enrich: engram fully enriched or not found");
+            return Ok(());
+        };
+        if c.missing_stages.is_empty() {
+            return Ok(());
+        }
+        // POST enrichment with stages_completed signal — the server side will mark
+        // the missing stages as complete. Actual content enrichment (summaries, entities)
+        // will be wired when model-router is the enrichment source.
+        let enrich_url = self.url(&format!("/api/engrams/{id}/enrich?vault={vault}"));
+        let enrich_body = serde_json::json!({
+            "expected_updated_at": c.updated_at,
+            "stages_completed": c.missing_stages,
+            "source": "philote-attend"
+        });
+        let enrich_resp = self
+            .with_auth(self.client.post(&enrich_url), &vault)
+            .json(&enrich_body)
+            .send()
+            .await?;
+        match enrich_resp.status() {
+            s if s.is_success() => {
+                tracing::debug!(engram_id = %id, vault = %vault, stages = ?c.missing_stages, "enrichment applied");
+            }
+            reqwest::StatusCode::CONFLICT => {
+                // OCC conflict — engram was updated between get and apply. Non-fatal.
+                tracing::debug!(engram_id = %id, "retry_enrich: OCC conflict, skipping");
+            }
+            other => {
+                tracing::debug!(engram_id = %id, status = %other, "retry_enrich: apply failed (non-fatal)");
+            }
         }
         Ok(())
     }

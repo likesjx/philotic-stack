@@ -16,6 +16,7 @@ members = [
     "crates/graph-runner",
     "crates/philotic-sandbox",
     "crates/mlx-runner",
+    "crates/media-prep",
     "crates/graph-intelligence",
     "crates/philotic-graph",
 ]

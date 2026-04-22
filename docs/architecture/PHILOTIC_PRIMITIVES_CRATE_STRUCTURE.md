@@ -2,7 +2,7 @@
 title: Philotic Primitives Crate Structure
 doc_type: proposal
 domain: runtime-sessions
-status: proposed
+status: accepted-current-slice
 last_updated: 2026-04-09
 tags:
 - architecture
@@ -11,6 +11,7 @@ tags:
 - technical-debt
 related_docs:
 - ARCHITECTURE.md
+- ARCHITECTURE_STATUS.md
 task_refs:
 - docs/task.md
 tracks_domains:
@@ -23,14 +24,37 @@ tracks_domains:
 
 ## Goal
 
-Ensure our crate architecture follows and enforces our distinct runtime boundaries.
-Currently, `ansible-mesh-core` acts as a monolithic catch-all for all types, envelopes, storage traits, and mesh operations. 
+Split `ansible-mesh-core` into a small set of primitive crates that match the
+repo's actual runtime boundaries instead of keeping every shared type, trait,
+envelope, and storage helper in one catch-all crate.
 
-We need to decouple these primitives into distinct areas of concern tied to our functionality primitives: **hotel (aiua)**, **agent (philote)**, **model controller**, **tool runner**, and **data runner**.
+The split should make the compiler enforce the same boundary that the runtime
+already implies:
+
+- hotel orchestration belongs with `aiua`
+- agent-loop state belongs with `philote`
+- model/provider execution belongs with `model-router`
+- tool execution belongs with `tool-runner`
+- graph/memory/storage primitives should no longer be a monolith
 
 ## Core Recommendation
 
-Phase out the `ansible-mesh-core` monolith and replace it with a structured set of primitive crates. These crates will contain the stateless data envelopes, IPC message variants, and shared traits required by each specific subsystem, preventing dependency creep and enforcing architectural boundaries at compile time.
+Phase out the `ansible-mesh-core` monolith and replace it with a structured set
+of primitive crates. These crates should own the stateless data envelopes, IPC
+message variants, and shared traits required by each specific subsystem, which
+prevents dependency creep and keeps boundary ownership honest at compile time.
+
+The split should follow dependency depth, not aesthetic preference:
+
+1. `philotic-primitives-mesh` / `philotic-primitives-core`
+2. `philotic-primitives-data`
+3. `philotic-primitives-hotel`
+4. `philotic-primitives-agent`
+5. `philotic-primitives-model`
+6. `philotic-primitives-tool`
+
+If a type is shared across multiple crates, it belongs in the lowest crate that
+can own it without dragging in unrelated runtime behavior.
 
 **Proposed Crate Splitting:**
 
@@ -60,9 +84,23 @@ Phase out the `ansible-mesh-core` monolith and replace it with a structured set 
 
 ## Disposition
 
-`proposed`
+`accepted-current-slice`
+
+## Repo Truth Right Now
+
+- `ansible-mesh-core` still owns the shared primitives surface.
+- `aiua`, `philote`, `model-router`, and `tool-runner` already imply the
+  runtime ownership boundaries the split should preserve.
+- the current refactor pressure is to separate ownership boundaries without
+  inventing a second authority for graph, session, or model state.
 
 ## Current Slice
 
-- Drafted the initial proposal to break down `ansible-mesh-core`.
-- Waiting for operator alignment before scaffolding the inner crates and re-wiring the workspaces.
+Turn the proposal into a dependency map and extraction plan:
+
+- inventory the current `ansible-mesh-core` modules against the target crates
+- identify the first extraction boundary that can compile cleanly on its own
+- define the dependency order for the remaining crates
+- keep the runtime code unchanged until the first extracted interface is stable
+
+Linked task surface: [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md)

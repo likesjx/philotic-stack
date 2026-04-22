@@ -8,6 +8,8 @@ use inquire::{Confirm, Password, Select, Text};
 use serde_json::{json, Map, Value};
 use std::path::Path;
 
+#[cfg(target_os = "macos")]
+use crate::service;
 use crate::presets::{self, ApprovalPolicy};
 
 /// Run the interactive onboarding wizard.
@@ -54,6 +56,35 @@ pub async fn run_interactive(config_path: &Path, force: bool) -> Result<()> {
         .with_default("gemini-2.0-flash-exp")
         .with_help_message("Model ID for the primary LLM provider")
         .prompt()?;
+
+    let response_route = Select::new(
+        "Default response route:",
+        vec![
+            "auto".to_string(),
+            "text_only".to_string(),
+            "image_multimodal".to_string(),
+            "audio_multimodal".to_string(),
+            "realtime_websocket".to_string(),
+        ],
+    )
+    .with_help_message("Preferred route for model turns; auto lets the runtime infer per turn")
+    .prompt()?;
+
+    let import_workspace = Text::new("Workspace path for tool-runner (optional):")
+        .with_default("")
+        .with_help_message("Seed path for the agent workspace / import bundle")
+        .prompt()?;
+
+    let default_skillset = Text::new("Initial skillset (comma-separated, optional):")
+        .with_default("")
+        .with_help_message("Examples: planning, implementation, research")
+        .prompt()?;
+    let default_skillset: Vec<String> = default_skillset
+        .split(',')
+        .map(str::trim)
+        .filter(|skill| !skill.is_empty())
+        .map(str::to_string)
+        .collect();
 
     println!();
     println!("  ── First Agent ──");
@@ -197,10 +228,13 @@ pub async fn run_interactive(config_path: &Path, force: bool) -> Result<()> {
         &capitalize(&agent_name),
         &first_agent_prompt,
         &[],
+        Some(import_workspace.as_str()),
+        &default_skillset,
         &approval_policy,
         first_tg_token.as_deref(),
         first_tg_username.as_deref(),
         &default_model,
+        &response_route,
     );
     agents.insert(agent_name.clone(), first_agent);
 
@@ -228,7 +262,7 @@ pub async fn run_interactive(config_path: &Path, force: bool) -> Result<()> {
             "default_model": default_model,
         },
         "hotels": {
-            hotel_name: {
+            hotel_name.clone(): {
                 "agents": Value::Object(agents),
             }
         }
@@ -241,6 +275,24 @@ pub async fn run_interactive(config_path: &Path, force: bool) -> Result<()> {
     }
     std::fs::write(config_path, &pretty)
         .with_context(|| format!("write {}", config_path.display()))?;
+
+    #[cfg(target_os = "macos")]
+    {
+        println!();
+        let install_service = Confirm::new("Install and start the aiua launchd service now?")
+            .with_default(true)
+            .with_help_message("Uses `phil service install` so this hotel starts on login and can be managed later.")
+            .prompt()?;
+        if install_service {
+            service::install(hotel_name.clone()).await?;
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        println!();
+        println!("  launchd service management is macOS-only; use `phil start` on this platform.");
+    }
 
     // ── Summary ──────────────────────────────────────────────────────────────
 
@@ -270,6 +322,7 @@ pub async fn run_interactive(config_path: &Path, force: bool) -> Result<()> {
     println!();
     println!("  Next steps:");
     println!("    phil start        start the hotel daemon");
+    println!("    phil service status  inspect the launchd service");
     println!("    phil serve        open the management UI");
     println!();
 
@@ -281,10 +334,13 @@ fn build_agent_entry(
     display_name: &str,
     system_prompt: &str,
     toolset_tags: &[&str],
+    import_workspace: Option<&str>,
+    default_skillset: &[String],
     approval_policy: &ApprovalPolicy,
     telegram_token: Option<&str>,
     telegram_username: Option<&str>,
     model: &str,
+    response_route: &str,
 ) -> Value {
     let mut entry = json!({
         "agent_id": format!("agent-{name}"),
@@ -294,6 +350,10 @@ fn build_agent_entry(
         "model": {
             "default_model": model,
         },
+        "response_route_policy": {
+            "default_route": response_route,
+        },
+        "default_skillset": default_skillset,
         "approval_policy": {
             "require_approval": approval_policy.require_approval,
             "preapproved_classes": approval_policy.preapproved_classes,
@@ -309,6 +369,10 @@ fn build_agent_entry(
 
     if !toolset_tags.is_empty() {
         entry["toolset_tags"] = json!(toolset_tags);
+    }
+
+    if let Some(workspace) = import_workspace.filter(|value| !value.trim().is_empty()) {
+        entry["import_workspace"] = json!(workspace);
     }
 
     if let (Some(token), Some(username)) = (telegram_token, telegram_username) {

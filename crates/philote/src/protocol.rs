@@ -52,6 +52,12 @@ pub struct InboundTaskPayload {
     pub sender_id: Option<String>,
     #[serde(default)]
     pub sender_username: Option<String>,
+    /// The Telegram chat type: "private", "group", "supergroup", or "channel".
+    #[serde(default)]
+    pub chat_type: Option<String>,
+    /// The sender's first name (display name for group chat attribution).
+    #[serde(default)]
+    pub sender_first_name: Option<String>,
     #[serde(default)]
     pub message_kind: Option<String>,
     #[serde(default)]
@@ -90,11 +96,37 @@ pub struct InboundTaskPayload {
     /// `paracrine_response` tasks. Carries the paracrine_id and routing hint.
     #[serde(default)]
     pub exosome: Option<serde_json::Value>,
+    /// When true (set by membrane variants with per-route approval gates,
+    /// e.g. membrane-mcp), the philote must park this turn as WaitingApproval
+    /// before model invocation and emit `approval_required` back to the sender.
+    #[serde(default)]
+    pub requires_approval: bool,
 }
 
 // Transitional note: older emitters may still carry failures in
 // `agent_action.model_result.error`, but the preferred cross-component contract is the
 // top-level `error` envelope on inbound tasks.
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LigandEnvelope {
+    /// Semantic intent of the routed envelope, e.g. `tool_planning`.
+    pub signal_type: String,
+    /// Human-readable purpose text for the specialist receptor path.
+    pub purpose: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preferred_provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preferred_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub visible_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub visible_tool_classes: Vec<String>,
+    /// Flexible posture metadata for the router / approval layer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_posture: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelRequestPayload {
@@ -115,6 +147,14 @@ pub struct ModelRequestPayload {
     /// Forwarded verbatim to the model controller as `response_contract`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_contract: Option<serde_json::Value>,
+    /// Forwarded verbatim to the model controller as `response_route`.
+    /// This is the canonical route decision carried by the model-call envelope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_route: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ligand: Option<LigandEnvelope>,
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub provider_options: serde_json::Map<String, serde_json::Value>,
     pub chat_id: String,
     pub reply_to: String,
     pub reply_role: String,
@@ -138,6 +178,10 @@ pub struct FinalReplyPayload {
     /// content alongside the audio (e.g. as a Telegram caption).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub send_text_caption: bool,
+    /// Optional transport-level reply markup (e.g. Telegram inline keyboard JSON).
+    /// Transports that don't understand it should ignore it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_markup: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]

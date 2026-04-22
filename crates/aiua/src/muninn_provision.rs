@@ -52,6 +52,46 @@ struct CreateKeyResponse {
     token: String,
 }
 
+/// Plasticity config sent to `PUT /api/admin/vault/{name}/plasticity`.
+/// Only LTP and inline enrichment fields are set — all other fields are
+/// left nil (use preset defaults).
+#[derive(Debug, Serialize)]
+struct PlasticityPatch {
+    version: u32,
+    preset: &'static str,
+    ltp_threshold: u32,
+    ltp_weight_floor: f32,
+    /// "caller_preferred" — Rust Attend-phase enrichment takes priority;
+    /// background LLM pipeline fills any stages we haven't provided.
+    inline_enrichment: &'static str,
+}
+
+impl PlasticityPatch {
+    /// Per-agent vault: memories are personal and high-value.
+    /// LTP potentiates after 5 co-activations; floor at 0.3.
+    fn for_agent_vault() -> Self {
+        Self {
+            version: 1,
+            preset: "default",
+            ltp_threshold: 5,
+            ltp_weight_floor: 0.3,
+            inline_enrichment: "caller_preferred",
+        }
+    }
+
+    /// Shared user vault: memories span multiple agents, slightly higher bar.
+    /// LTP potentiates after 8 co-activations; floor at 0.2.
+    fn for_user_vault() -> Self {
+        Self {
+            version: 1,
+            preset: "default",
+            ltp_threshold: 8,
+            ltp_weight_floor: 0.2,
+            inline_enrichment: "caller_preferred",
+        }
+    }
+}
+
 // ──── Public entry point ──────────────────────────────────────────────────────
 
 /// Provision MuninnDB vaults for all agents and users derived from the mesh
@@ -186,6 +226,45 @@ pub async fn provision_muninn_vaults(
                 secret_ref,
             })
             .with_context(|| format!("Failed to register vault {vault_name}"))?;
+
+        // Step 5: Configure LTP and inline enrichment plasticity.
+        // self_* vaults get aggressive LTP (threshold 5); user_* vaults get
+        // a slightly higher bar (threshold 8). Both prefer Rust-generated
+        // enrichment over the background LLM pipeline.
+        let patch = if vault_name.starts_with("self_") {
+            PlasticityPatch::for_agent_vault()
+        } else {
+            PlasticityPatch::for_user_vault()
+        };
+        let plasticity_url = format!(
+            "{}/api/admin/vault/{}/plasticity",
+            endpoint.trim_end_matches('/'),
+            vault_name,
+        );
+        let resp = client
+            .put(&plasticity_url)
+            .json(&patch)
+            .send()
+            .await
+            .with_context(|| format!("Failed to set plasticity for {vault_name}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            // Non-fatal: plasticity defaults are safe. Log and continue.
+            tracing::warn!(
+                vault = %vault_name,
+                %status,
+                body = %body,
+                "Failed to configure vault plasticity — using defaults"
+            );
+        } else {
+            info!(
+                vault = %vault_name,
+                ltp_threshold = patch.ltp_threshold,
+                ltp_weight_floor = patch.ltp_weight_floor,
+                "Vault plasticity configured"
+            );
+        }
 
         info!(vault = %vault_name, "Vault provisioned and registered");
     }

@@ -20,6 +20,7 @@ The first three are the standing loop. Retrospective is not mandatory for every 
 At session start or when resuming meaningful work:
 
 - do Muninn bootstrap and orientation (`just session-start` — also runs harness drift check)
+- when the graph server is reachable, `just session-start` also claims a visible graph session/workstream on the board using the `session-start-bootstrap-slice` seam
 - identify the current owner of truth
 - inspect the relevant code, tests, and nearby docs
 - name the current slice and the next seam
@@ -53,7 +54,8 @@ At slice close or end of session:
 - update docs/tasks if current truth or active seams changed
 - store durable memory to Muninn
 - state what is working, what is incomplete, and the next highest-value seam
-- close any open harness trial: `just harness-trial-close`
+- close any open harness trial: `just harness-trial-close [status] [verified] [summary]`
+- close any active workstream with explicit verification on completed closes: `just close-workstream`
 
 Use:
 
@@ -216,14 +218,14 @@ Managed harnesses track desired/rendered/observed state for each coding agent ru
 - `just harness-drift` — drift report for all managed harnesses
 - `just harness-apply [harness] [profile]` — re-apply canonical profile and verify (default: `claude-local` / `philotic-operator`)
 - `just harness-trial-start <seam-id> [harness] [profile]` — begin a measured trial; session ID written to `/tmp/philotic-harness-trial-session`
-- `just harness-trial-report <activity-type> [tokens_in] [tokens_out]` — record activity against the active trial
-- `just harness-trial-close [status] [summary]` — close the active trial
+- `just harness-trial-report <activity-type> [phase] [tokens_in] [tokens_out] [elapsed_ms] [lines_changed] [files] [note]` — record activity against the active trial; empty reports are rejected
+- `just harness-trial-close [status] [verified] [summary]` — close the active trial; completed trials must include a verification level
 
 Canonical profiles for this repo:
 
 | Profile | Role | Skills |
 |---|---|---|
-| `philotic-operator` | orchestrator | graph-intelligence, implementation, philotic-slice-closeout, verification-orchestrator, session-hygiene, muninn-memory-habit, check-engine |
+| `philotic-operator` | orchestrator | graph-intelligence, implementation, philotic-slice-closeout, verification-orchestrator, sver-harness, session-hygiene, muninn-memory-habit, check-engine |
 | `philotic-implementer` | implementer | graph-intelligence, implementation, runtime-debugger, runtime-materialization, runtime-rollout-watch, subagent-delegation |
 | `philotic-reviewer` | reviewer | graph-intelligence, review, verification-ladder, verification-orchestrator, architecture-docs-maintainer, proposal-maintainer |
 | `philotic-orchestrator` | orchestrator | graph-intelligence, planning, multi-agent-orchestration, subagent-delegation, session-hygiene, proposal-maintainer, muninn-memory-habit |
@@ -240,6 +242,7 @@ Use repo-local skills for process execution:
 - `multi-agent-orchestration` — coordinating implementer/reviewer/verifier/orchestrator roles on one workstream
 - `windsurf-harness-setup` — single-harness multi-role configuration for windsurf-native
 - `verification-orchestrator` — SVER state, test-run pipeline, verification evidence
+- `sver-harness` — harness trial mechanics, explicit verification on close, telemetry hygiene
 - `proposal-pipeline` — proposal lifecycle, disposition management, metadata hygiene
 - `check-engine` — end-of-session review (now includes graph health check)
 - `philotic-slice-closeout` — closing implementation slices
