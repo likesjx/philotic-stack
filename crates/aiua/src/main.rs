@@ -114,6 +114,7 @@ async fn run_operator_surface_query_worker(
     local_node_id: String,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
+    let mut backoff_ms: u64 = 250;
     loop {
         let connect_fut = PhiloticClient::connect_at(
             &socket_path,
@@ -126,12 +127,15 @@ async fn run_operator_surface_query_worker(
         let mut client = tokio::select! {
             _ = shutdown_rx.recv() => return,
             connect_result = connect_fut => match connect_result {
-                Ok(client) => client,
+                Ok(client) => { backoff_ms = 250; client }
                 Err(err) => {
                     warn!("Operator surface query worker failed to connect: {}", err);
                     tokio::select! {
                         _ = shutdown_rx.recv() => return,
-                        _ = tokio::time::sleep(tokio::time::Duration::from_millis(250)) => continue,
+                        _ = tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)) => {
+                            backoff_ms = (backoff_ms * 2).min(30_000);
+                            continue;
+                        }
                     }
                 }
             }
