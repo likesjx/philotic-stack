@@ -881,6 +881,10 @@ pub struct IpcServer {
     /// Broadcast channel for hotel-wide push events (e.g. NetworkState).
     /// The sender is cloned into each `handle_client` task for forwarding.
     network_broadcast: tokio::sync::broadcast::Sender<IpcResponse>,
+    /// In-process channel for operator surface query tasks.
+    /// When set, tasks addressed to `OPERATOR_SURFACE_QUERY_ROLE` are sent here
+    /// instead of through the UDS inbox registry, eliminating the self-connection.
+    operator_surface_tx: Option<mpsc::Sender<String>>,
 }
 
 struct LoggingLeaseObserver;
@@ -2231,7 +2235,13 @@ impl IpcServer {
             peer_sockets: Arc::new(RwLock::new(HashMap::new())),
             muninn_config: None,
             network_broadcast,
+            operator_surface_tx: None,
         }
+    }
+
+    pub fn with_operator_surface_channel(mut self, tx: mpsc::Sender<String>) -> Self {
+        self.operator_surface_tx = Some(tx);
+        self
     }
 
     /// Returns a sender for the hotel-wide broadcast channel.
@@ -2291,6 +2301,7 @@ impl IpcServer {
                     let peer_sockets = self.peer_sockets.clone();
                     let muninn_config = self.muninn_config.clone();
                     let network_broadcast_rx = self.network_broadcast.subscribe();
+                    let operator_surface_tx = self.operator_surface_tx.clone();
                     tokio::spawn(async move {
                         if let Err(e) = Self::handle_client(
                             stream,
@@ -2310,6 +2321,7 @@ impl IpcServer {
                             peer_sockets,
                             muninn_config,
                             network_broadcast_rx,
+                            operator_surface_tx,
                         )
                         .await
                         {
@@ -2342,6 +2354,7 @@ impl IpcServer {
         peer_sockets: Arc<RwLock<HashMap<String, String>>>,
         muninn_config: Option<Arc<memory_core::MuninnConfig>>,
         network_broadcast_rx: tokio::sync::broadcast::Receiver<IpcResponse>,
+        operator_surface_tx: Option<mpsc::Sender<String>>,
     ) -> anyhow::Result<()> {
         let conn_id = Uuid::new_v4();
         let (mut reader, mut writer) = stream.into_split();
@@ -2430,6 +2443,7 @@ impl IpcServer {
                             &mut subscribed_roles,
                             &mut current_identity,
                             &mut follow_up_responses,
+                            operator_surface_tx.as_ref(),
                         )
                         .await;
                         let _ = outbound_tx.send(response);
@@ -3690,6 +3704,7 @@ impl IpcServer {
         subscribed_roles: &mut Vec<String>,
         current_identity: &mut Option<GuestIdentity>,
         follow_up_responses: &mut Vec<IpcResponse>,
+        operator_surface_tx: Option<&mpsc::Sender<String>>,
     ) -> IpcResponse {
         match req {
             IpcRequest::Register(identity) => {
@@ -5010,6 +5025,20 @@ impl IpcServer {
                 target_guest_id,
                 task_json,
             } => {
+                // Short-circuit operator surface queries to the in-process channel,
+                // eliminating the UDS self-connection and its socket leak.
+                if target_role == philotic_client::OPERATOR_SURFACE_QUERY_ROLE {
+                    if let Some(tx) = operator_surface_tx {
+                        let _ = tx.try_send(task_json).ok();
+                        return IpcResponse::Standard {
+                            ok: true,
+                            code: "OK".into(),
+                            message: "operator surface query dispatched in-process".into(),
+                            corr_id: String::new(),
+                            data: None,
+                        };
+                    }
+                }
                 let task_json = match (
                     infer_agent_context_for_task(
                         graph,
