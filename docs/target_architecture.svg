@@ -15,7 +15,7 @@
 <line x1="0" y1="76" x2="1400" y2="76" stroke="#1e2540" stroke-width="1"/>
 
 <!-- Crate count -->
-<text x="1370" y="37" text-anchor="end" font-size="11" font-weight="600" fill="#00e5ff">14 crates</text>
+<text x="1370" y="37" text-anchor="end" font-size="11" font-weight="600" fill="#00e5ff">29 crates</text>
 <text x="1370" y="52" text-anchor="end" font-size="10" fill="#4a5370">~74K LOC · Rust</text>
 
 <!-- ════════════════════════════════════════════════════════════════════ -->
@@ -84,8 +84,8 @@
 
 <!-- Auth Exchange -->
 <rect x="46" y="530" width="230" height="34" rx="7" fill="#161b2e" stroke="#ffc107" stroke-width="0.5" stroke-opacity="0.5"/>
-<text x="56" y="547" font-size="10" font-weight="500" fill="#8892b0">Auth Exchange</text>
-<text x="56" y="558" font-size="8" fill="#4a5370" font-family="JetBrains Mono, monospace">OAuth token management</text>
+<text x="56" y="547" font-size="10" font-weight="500" fill="#8892b0">Mesh PKI &amp; Auth</text>
+<text x="56" y="558" font-size="8" fill="#4a5370" font-family="JetBrains Mono, monospace">Ed25519 identity + X25519 session keys</text>
 
 <!-- ════════════════════════════════════════════════════════════════════ -->
 <!-- STORAGE LAYER                                                       -->
@@ -138,9 +138,9 @@
 <text x="584" y="242" font-size="8" fill="#4a5370" font-family="JetBrains Mono, monospace">philote crate</text>
 
 <rect x="832" y="194" width="248" height="60" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
-<text x="842" y="213" font-size="11" font-weight="600" fill="#e8eaf0">Membrane</text>
-<text x="842" y="227" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">Telegram gateway · polls/webhooks</text>
-<text x="842" y="242" font-size="8" fill="#4a5370" font-family="JetBrains Mono, monospace">membrane crate</text>
+<text x="842" y="213" font-size="11" font-weight="600" fill="#e8eaf0">Membranes</text>
+<text x="842" y="227" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">Telegram, Discord, MCP gateways</text>
+<text x="842" y="242" font-size="8" fill="#4a5370" font-family="JetBrains Mono, monospace">membrane-* crates</text>
 
 <rect x="1090" y="194" width="266" height="60" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
 <text x="1100" y="213" font-size="11" font-weight="600" fill="#e8eaf0">Philote Worker</text>
@@ -188,8 +188,8 @@
 
 <!-- Row 4: Library crates -->
 <rect x="574" y="394" width="355" height="42" rx="7" fill="#161b2e" stroke="#1de9b6" stroke-width="1" stroke-opacity="0.6"/>
-<text x="584" y="411" font-size="10" font-weight="600" fill="#1de9b6">ansible-mesh-core</text>
-<text x="584" y="424" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">core types · GraphDomain · beacon · events · validation</text>
+<text x="584" y="411" font-size="10" font-weight="600" fill="#1de9b6">philotic-primitives-*</text>
+<text x="584" y="424" font-size="8" fill="#8892b0" font-family="JetBrains Mono, monospace">extracted: mesh · hotel · agent · data · model · tool</text>
 
 <rect x="939" y="394" width="190" height="42" rx="7" fill="#161b2e" stroke="#1de9b6" stroke-width="1" stroke-opacity="0.6"/>
 <text x="949" y="411" font-size="10" font-weight="600" fill="#1de9b6">philotic-client</text>

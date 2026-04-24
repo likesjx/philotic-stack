@@ -102,13 +102,16 @@ Generated UML/PlantUML diagrams for the graph-visible hierarchy live under
 | Crate               | Role                                                         |
 | ------------------- | ------------------------------------------------------------ |
 | `aiua`           | Hotel daemon — orchestration and service host                |
-| `ansible-mesh-core` | Shared primitives, traits, mesh types, storage               |
+| `ansible-mesh-core` | Shared primitives, traits, mesh types, storage (Legacy monolith) |
+| `philotic-primitives-*` | Extracted primitives (mesh, hotel, agent, data, model, tool) |
 | `philotic-client`   | Guest SDK — IPC client for guests to talk to the hotel       |
-| `membrane`           | Telegram/gateway guest binary                                |
+| `membrane-*`        | Protocol gateway guests (Telegram, Discord, MCP)             |
 | `philote`           | Persona/agent cognitive loop guest binary                    |
-| `model-router`      | Multi-provider model routing (Gemini, ElevenLabs, etc.)      |
+| `model-router`      | Shared LLM inference routing SDK                             |
 | `philotic-web`      | Desktop operator surface (Next.js)                           |
 | `tool-runner`       | Workspace tool executor guest                                |
+| `graph-datasource`  | Autonomous graph partition management                        |
+| `graph-intelligence`| Project intelligence graph + MCP server                      |
 | `robot-kit`         | Embedded robotics HAL (separate concern, not hotel/guest)    |
 
 ### 2.1 The Legacy Reference
@@ -242,9 +245,11 @@ the hotel exclusively over the IPC UDS socket using `PhiloticClient`.
 | Binary                      | Crate                 | Role identity                    | Purpose                                                    |
 | --------------------------- | --------------------- | -------------------------------- | ---------------------------------------------------------- |
 | `membrane-telegram`         | `crates/membrane-telegram` | `membrane-telegram-01`       | Telegram gateway, ingress/egress for external messages     |
+| `membrane-discord`          | `crates/membrane-discord`  | `membrane-discord-01`        | Discord gateway                                            |
+| `membrane-mcp`              | `crates/membrane-mcp`      | `membrane-mcp-01`            | MCP gateway                                                |
 | `membrane`                 | `crates/membrane`      | compatibility wrapper             | Transitional wrapper over shared membrane runtime during provider extraction |
 | `philote`                | `crates/philote`      | `agent-{persona}-01`             | Persona runtime, long-running reasoning loop               |
-| `model-router`              | `crates/model-router` | `model-router-01`                | Multi-provider LLM/TTS routing guest (Gemini, ElevenLabs)  |
+| `model-controller-*`        | `crates/model-router` | `model-router-01`                | Multi-provider LLM/TTS routing guest (Gemini, ElevenLabs)  |
 | `tool-runner`               | `crates/tool-runner`  | `{hotel}:tool-runner`            | Workspace tool executor                                    |
 | `philotic-web`              | `crates/philotic-web` | `desktop-operator-01`            | Desktop/web operator surface                               |
 
@@ -594,12 +599,13 @@ To move a guest process from Hotel A → Hotel B:
 
 | Layer        | Mechanism                                                       |
 | ------------ | --------------------------------------------------------------- |
-| Mesh PSK     | HMAC-SHA256 over `(payload \|\| timestamp)` with pre-shared key |
+| Mesh PKI     | WireGuard-inspired Ed25519 node identities and ephemeral X25519 ECDH session keys |
+| Legacy Mesh PSK | HMAC-SHA256 over `(payload \|\| timestamp)` with pre-shared key (migrating out) |
 | Replay guard | ±5 minute timestamp window on all BeaconMessages                |
 | IPC          | Unix file-system permissions on the UDS socket                  |
-| Future       | Asymmetric PKI / per-hotel keypairs                             |
+| Future       | Automated certificate rotation                                  |
 
-Set `PHILOTIC_MESH_PSK=<secret>` on all hotels in the same mesh cluster.
+Set `PHILOTIC_MESH_PSK=<secret>` on all hotels in the same mesh cluster for fallback.
 Default is `INSECURE_DEV_DEFAULT_PSK` — override before production.
 
 ---

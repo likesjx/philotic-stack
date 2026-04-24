@@ -72,7 +72,7 @@ aiua --load-config mesh-config.json
 
 ## Crates
 
-14 crates, ~74K lines of Rust.
+29 crates.
 
 ### Binaries
 
@@ -80,23 +80,37 @@ aiua --load-config mesh-config.json
 |---|---|
 | [`aiua`](crates/aiua/) | Hotel daemon — guest materialization, IPC server, mesh routing |
 | [`philote`](crates/philote/) | Agent core — cognitive loop, session management, role incarnation |
-| [`membrane`](crates/membrane/) | Telegram / external protocol gateway |
+| [`membrane`](crates/membrane/) | Transitional wrapper over membrane runtime |
+| [`membrane-telegram`](crates/membrane-telegram/) | Telegram / external protocol gateway |
+| [`membrane-discord`](crates/membrane-discord/) | Discord gateway |
+| [`membrane-mcp`](crates/membrane-mcp/) | MCP gateway |
 | [`philotic-web`](crates/philotic-web/) | Operator CLI + desktop membrane (REST API, WebSocket, operator chat) |
-| [`model-router`](crates/model-router/) | Multi-provider LLM/TTS routing (Gemini, ElevenLabs, ONNX, MLX) |
+| [`model-router`](crates/model-router/) | Shared LLM inference routing SDK |
 | [`tool-runner`](crates/tool-runner/) | Sandboxed tool execution (Landlock + seccomp via philotic-sandbox) |
 | [`graph-runner`](crates/graph-runner/) | Shared project graph store |
 | [`agent-graph-runner`](crates/agent-graph-runner/) | Per-agent cognitive graph (`agent.graph.*` tool surface) |
+| [`graph-datasource`](crates/graph-datasource/) | Autonomous graph partition management tool surface |
+| [`graph-intelligence`](crates/graph-intelligence/) | Project intelligence graph + MCP server |
 
 ### Libraries
 
 | Crate | Role |
 |---|---|
-| [`ansible-mesh-core`](crates/ansible-mesh-core/) | Core types, GraphDomain, storage traits, beacon, events, validation |
+| [`ansible-mesh-core`](crates/ansible-mesh-core/) | Legacy monolith (in process of being extracted into primitives) |
+| [`philotic-primitives-mesh`](crates/philotic-primitives-mesh/) | Mesh primitives (EventEnvelope, BeaconMessage, etc.) |
+| [`philotic-primitives-hotel`](crates/philotic-primitives-hotel/) | Hotel orchestration primitives |
+| [`philotic-primitives-agent`](crates/philotic-primitives-agent/) | Agent and persona primitives |
+| [`philotic-primitives-data`](crates/philotic-primitives-data/) | Data and storage primitives |
+| [`philotic-primitives-model`](crates/philotic-primitives-model/) | Model routing and context primitives |
+| [`philotic-primitives-tool`](crates/philotic-primitives-tool/) | Tool execution primitives |
 | [`philotic-client`](crates/philotic-client/) | Guest SDK — IPC client for hotel communication |
 | [`memory-core`](crates/memory-core/) | MemoryEngine trait, CognitiveEngine, Muninn integration |
+| [`philotic-graph`](crates/philotic-graph/) | Core graph intelligence and SVE tooling |
+| [`datasource`](crates/datasource/) | SQLite partition and datasource management |
 | [`onnx-runner`](crates/onnx-runner/) | Local ONNX inference (embeddings, transcription) |
 | [`mlx-runner`](crates/mlx-runner/) | Local MLX inference (Apple Silicon) |
 | [`philotic-sandbox`](crates/philotic-sandbox/) | Secure execution sandbox (Landlock + seccomp policies) |
+| [`media-prep`](crates/media-prep/) | Media processing and preparation |
 
 ## The Agent Fleet
 
@@ -113,7 +127,7 @@ The default Philotic stack materializes a fleet of specialized agents, each with
 - **Hotel = source of truth.** The Context Graph SQLite DB owns all state.
 - **Security first, especially at the perimeter.** External communication surfaces default to minimal trust and explicit policy.
 - **IPC for intra-hotel.** All local communication uses Unix Domain Sockets (`/tmp/philotic-aiua.sock`).
-- **Mesh for inter-hotel.** Cross-machine coordination uses UDP Gossip/Beacons (Control Plane) and TCP Exec-Transport (Data Plane).
+- **Mesh for inter-hotel.** Cross-machine coordination uses UDP Gossip/Beacons (Control Plane) and TCP Exec-Transport (Data Plane), secured by a WireGuard-inspired Ed25519 PKI identity and ephemeral X25519 session keys.
 - **GraphDomain is the access layer.** Entity-typed graph methods enforce naming conventions and reduce raw SQL surface area.
 - **Guests are crash-safe.** The supervisor loop auto-respawns dead guests every 5s.
 - **Memory is eventually consistent.** Guests write optimistically; the hotel resolves conflicts via Last-Writer-Wins.

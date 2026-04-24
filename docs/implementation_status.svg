@@ -93,10 +93,10 @@
   <rect x="46" y="656" width="290" height="58" rx="7" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
   <circle cx="326" cy="668" r="6" fill="#00e676" opacity="0.2"/>
   <circle cx="326" cy="668" r="3.5" fill="#00e676"/>
-  <text x="55" y="672" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Auth Exchange</text>
+  <text x="55" y="672" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Auth &amp; PKI Exchange</text>
   <rect x="55" y="677" width="34.4" height="13" rx="3" fill="#00e676" fill-opacity="0.18" stroke="#00e676" stroke-opacity="0.5" stroke-width="0.7"/>
   <text x="60" y="686" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">DONE</text>
-  <text x="55" y="697" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">OAuth + HMAC-PSK</text>
+  <text x="55" y="697" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">WireGuard-inspired Ed25519</text>
   <rect x="46" y="720" width="290" height="58" rx="7" fill="#161b2e" stroke="#ffc107" stroke-width="1"/>
   <circle cx="326" cy="732" r="6" fill="#00e676" opacity="0.2"/>
   <circle cx="326" cy="732" r="3.5" fill="#00e676"/>
@@ -183,7 +183,7 @@
   <!-- Networking & Primitives -->
   <rect x="618" y="182" width="280" height="330" rx="12" fill="#d500f9" fill-opacity="0.04" stroke="#d500f9" stroke-opacity="0.4" stroke-width="1.5"/>
   <circle cx="636" cy="201" r="4" fill="#d500f9" opacity="0.9"/>
-  <text x="648" y="206" font-size="9" font-weight="700" letter-spacing="1.6" fill="#d500f9" font-family="Inter, system-ui, -apple-system, sans-serif" style="text-transform:uppercase">ANSIBLE-MESH-CORE</text>
+  <text x="648" y="206" font-size="9" font-weight="700" letter-spacing="1.6" fill="#d500f9" font-family="Inter, system-ui, -apple-system, sans-serif" style="text-transform:uppercase">PHILOTIC-PRIMITIVES</text>
   <rect x="628" y="208" width="260" height="50" rx="7" fill="#161b2e" stroke="#d500f9" stroke-width="1"/>
   <circle cx="878" cy="220" r="6" fill="#00e676" opacity="0.2"/>
   <circle cx="878" cy="220" r="3.5" fill="#00e676"/>
@@ -201,10 +201,10 @@
   <rect x="628" y="320" width="260" height="50" rx="7" fill="#161b2e" stroke="#d500f9" stroke-width="1"/>
   <circle cx="878" cy="332" r="6" fill="#00e676" opacity="0.2"/>
   <circle cx="878" cy="332" r="3.5" fill="#00e676"/>
-  <text x="637" y="336" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">AuthZ</text>
+  <text x="637" y="336" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">AuthZ &amp; PKI</text>
   <rect x="637" y="341" width="34.4" height="13" rx="3" fill="#00e676" fill-opacity="0.18" stroke="#00e676" stroke-opacity="0.5" stroke-width="0.7"/>
   <text x="642" y="350" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">DONE</text>
-  <text x="637" y="361" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">OAuth + HMAC-PSK  rust_auth</text>
+  <text x="637" y="361" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">Ed25519 + ephemeral keys</text>
   <rect x="628" y="376" width="260" height="50" rx="7" fill="#161b2e" stroke="#d500f9" stroke-width="1"/>
   <circle cx="878" cy="388" r="6" fill="#00e676" opacity="0.2"/>
   <circle cx="878" cy="388" r="3.5" fill="#00e676"/>
@@ -496,5 +496,5 @@
   <text x="1003" y="1123" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">pre-built binary</text>
 
   <!-- Footer -->
-  <text x="700" y="1188" text-anchor="middle" font-size="9" fill="#4a5370" font-family="Inter, system-ui, -apple-system, sans-serif">philotic-stack  ·  Implementation Status  ·  2026-03-26  ·  14 crates  ·  ~74K LOC</text>
+  <text x="700" y="1188" text-anchor="middle" font-size="9" fill="#4a5370" font-family="Inter, system-ui, -apple-system, sans-serif">philotic-stack  ·  Implementation Status  ·  2026-04-24  ·  29 crates  ·  ~100K LOC</text>
 </svg>
