@@ -23,7 +23,8 @@ use crate::protocol::{
     ServerCapabilities, ServerInfo, ToolCallParams, ToolCallResult, ToolsCapability,
     ToolsListResult, error_code,
 };
-use crate::routing::SharedRoutingTable;
+use crate::routing::{SharedEndpointTable, SharedRoutingTable};
+use crate::transform;
 
 const DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Approval-required routes park the HTTP connection for up to 5 minutes.
@@ -32,19 +33,20 @@ const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 // ── Application state ─────────────────────────────────────────────────────────
 
 pub struct MembraneState {
+    /// Legacy per-agent route table (UpdateMcpRoutes path).
     pub routing_table: SharedRoutingTable,
+    /// Config-driven endpoint table (ProvisionMcpEndpoint path). Takes
+    /// priority over `routing_table` when an endpoint config is present.
+    pub endpoint_table: SharedEndpointTable,
     pub vault_cache: VaultHashCache,
     pub allotment: AllotmentTracker,
     pub vault: Box<dyn VaultResolver>,
-    /// Hotel node ID — used as `final_reply_to` so philote routes replies
-    /// back through the local hotel to the mcp-membrane role.
+    /// Hotel node ID — used as `final_reply_to` so replies route back
+    /// through the local hotel to the mcp-membrane role.
     pub node_id: String,
-    /// Channel into the runtime's IPC dispatch loop; HTTP handlers send
-    /// envelopes here which the runtime forwards to the hotel as CreateTask.
+    /// Channel into the runtime's IPC dispatch loop.
     pub inbound_tx: mpsc::Sender<InboundEnvelope>,
-    /// Pending tool-call responses keyed by turn_id. The HTTP handler parks
-    /// a oneshot sender here; `McpMembrane::deliver` fires it when the hotel
-    /// pushes back the philote reply.
+    /// Pending tool-call responses keyed by turn_id.
     pub pending_responses: Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>,
 }
 
@@ -133,11 +135,16 @@ async fn handle_tools_list(
     id: Value,
     auth_header: Option<&str>,
 ) -> JsonRpcResponse {
-    let caller_id = crate::auth::extract_bearer(auth_header);
-
-    let table = state.routing_table.read().await;
-    let tools: Vec<McpToolDescriptor> = table.visible_descriptors(caller_id);
-    drop(table);
+    // Prefer config-driven endpoint table; fall back to legacy route table.
+    let endpoint = state.endpoint_table.read().await;
+    let tools: Vec<McpToolDescriptor> = if endpoint.is_active() {
+        endpoint.tool_descriptors()
+    } else {
+        drop(endpoint);
+        let caller_id = crate::auth::extract_bearer(auth_header);
+        let table = state.routing_table.read().await;
+        table.visible_descriptors(caller_id)
+    };
 
     JsonRpcResponse::ok(
         id,
@@ -162,7 +169,116 @@ async fn handle_tools_call(
     let tool_name = &params.name;
     let args = params.arguments.unwrap_or(json!({}));
 
-    // Look up the route.
+    // ── Config-driven path (McpEndpointConfig) ────────────────────────────
+    let endpoint = state.endpoint_table.read().await;
+    if endpoint.is_active() {
+        let tool_spec = match endpoint.find_tool(tool_name) {
+            Some(s) => s.clone(),
+            None => {
+                return JsonRpcResponse::err(
+                    id,
+                    error_code::TOOL_NOT_FOUND,
+                    format!("tool '{}' not found", tool_name),
+                );
+            }
+        };
+
+        // Pre-approval check: apply_inbound tells us the action; check rules.
+        let inbound = match transform::apply_inbound(&tool_spec, &args) {
+            Ok(r) => r,
+            Err(e) => {
+                return JsonRpcResponse::err(id, error_code::INVALID_PARAMS, e);
+            }
+        };
+
+        let preapproved = endpoint.is_preapproved(&inbound.action);
+        drop(endpoint);
+
+        let requires_approval = !preapproved && !is_loopback;
+        let timeout = if requires_approval { APPROVAL_TIMEOUT } else { DISPATCH_TIMEOUT };
+
+        let turn_id = Uuid::new_v4().to_string();
+        let session_id = format!("mcp-{}-{}", tool_spec.name, &turn_id[..8]);
+
+        info!(
+            tool = tool_name,
+            action = %inbound.action,
+            target_kind = %inbound.target_kind,
+            target_id = %inbound.target_id,
+            %turn_id,
+            preapproved,
+            "dispatching via transform engine"
+        );
+
+        let envelope = InboundEnvelope {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            sender: SenderInfo {
+                id: Some("mcp-caller".into()),
+                display_name: None,
+                username: None,
+                is_operator: false,
+            },
+            content: serde_json::to_string(&json!({
+                "action": inbound.action,
+                "payload": inbound.payload,
+                "target_kind": inbound.target_kind,
+                "target_id": inbound.target_id,
+            }))
+            .unwrap_or_default(),
+            attachments: vec![],
+            command: Some(inbound.action.clone()),
+            reply_to: Some(turn_id.clone()),
+            raw_transport: json!({
+                "transport": "mcp",
+                "tool": tool_name,
+                "target_kind": inbound.target_kind,
+                "target_id": inbound.target_id,
+            }),
+            requires_approval,
+            final_reply_to: Some(state.node_id.clone()),
+            final_reply_role: Some("mcp-membrane".into()),
+            final_reply_guest_id: None,
+        };
+
+        let (tx, rx) = oneshot::channel::<String>();
+        {
+            let mut pending = state.pending_responses.lock().await;
+            pending.insert(turn_id.clone(), tx);
+        }
+
+        if let Err(e) = state.inbound_tx.send(envelope).await {
+            let mut pending = state.pending_responses.lock().await;
+            pending.remove(&turn_id);
+            warn!(tool = tool_name, err = %e, "inbound_tx send failed");
+            return JsonRpcResponse::err(id, error_code::DISPATCH_ERROR, "IPC send failed");
+        }
+
+        return match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(content)) => {
+                let transformed = transform::apply_outbound(&tool_spec, &content);
+                let result_value = serde_json::from_str(&transformed)
+                    .unwrap_or(json!({ "text": transformed }));
+                JsonRpcResponse::ok(
+                    id,
+                    serde_json::to_value(ToolCallResult::json(result_value)).unwrap(),
+                )
+            }
+            Ok(Err(_)) => {
+                warn!(tool = tool_name, %turn_id, "pending oneshot sender dropped");
+                JsonRpcResponse::err(id, error_code::DISPATCH_ERROR, "IPC connection lost")
+            }
+            Err(_) => {
+                let mut pending = state.pending_responses.lock().await;
+                pending.remove(&turn_id);
+                warn!(tool = tool_name, %turn_id, "dispatch timed out");
+                JsonRpcResponse::err(id, error_code::DISPATCH_ERROR, "tool call timed out")
+            }
+        };
+    }
+    drop(endpoint);
+
+    // ── Legacy route-table path (UpdateMcpRoutes) ─────────────────────────
     let table = state.routing_table.read().await;
     let route = match table.get(tool_name) {
         Some(r) => r.clone(),
@@ -176,7 +292,6 @@ async fn handle_tools_call(
     };
     drop(table);
 
-    // Authorize the call.
     let caller = match authorize_call(
         tool_name,
         &route.record.security.auth,
@@ -193,21 +308,18 @@ async fn handle_tools_call(
         }
     };
 
-    // Determine if operator approval is required for this route.
     let requires_approval = route.record.security.require_approval;
     let timeout = if requires_approval { APPROVAL_TIMEOUT } else { DISPATCH_TIMEOUT };
 
-    // Generate correlation IDs.
     let session_id = format!("mcp-{}", caller.token_id);
     let turn_id = Uuid::new_v4().to_string();
 
     if requires_approval {
-        info!(tool = tool_name, caller_id = %caller.token_id, %turn_id, "dispatching with approval gate — waiting up to {}s", timeout.as_secs());
+        info!(tool = tool_name, caller_id = %caller.token_id, %turn_id, "dispatching with approval gate");
     } else {
-        info!(tool = tool_name, caller_id = %caller.token_id, %turn_id, "dispatching via IPC");
+        info!(tool = tool_name, caller_id = %caller.token_id, %turn_id, "dispatching via legacy route");
     }
 
-    // Build the inbound envelope that philote will receive.
     let envelope = InboundEnvelope {
         session_id: session_id.clone(),
         turn_id: turn_id.clone(),
@@ -227,20 +339,17 @@ async fn handle_tools_call(
         reply_to: Some(turn_id.clone()),
         raw_transport: json!({ "transport": "mcp", "tool": tool_name }),
         requires_approval,
-        // Route philote replies back to this hotel node, role=mcp-membrane.
         final_reply_to: Some(state.node_id.clone()),
         final_reply_role: Some("mcp-membrane".into()),
         final_reply_guest_id: None,
     };
 
-    // Park a oneshot waiting for the philote reply.
     let (tx, rx) = oneshot::channel::<String>();
     {
         let mut pending = state.pending_responses.lock().await;
         pending.insert(turn_id.clone(), tx);
     }
 
-    // Forward to the hotel via the runtime's IPC dispatch loop.
     if let Err(e) = state.inbound_tx.send(envelope).await {
         let mut pending = state.pending_responses.lock().await;
         pending.remove(&turn_id);
@@ -248,22 +357,19 @@ async fn handle_tools_call(
         return JsonRpcResponse::err(id, error_code::DISPATCH_ERROR, "IPC send failed");
     }
 
-    // Await the reply with a timeout (longer for approval-gated routes).
     match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(content)) => JsonRpcResponse::ok(
             id,
-            serde_json::to_value(ToolCallResult::json(serde_json::from_str(&content).unwrap_or(
-                json!({ "text": content }),
-            )))
+            serde_json::to_value(ToolCallResult::json(
+                serde_json::from_str(&content).unwrap_or(json!({ "text": content })),
+            ))
             .unwrap(),
         ),
         Ok(Err(_)) => {
-            // Sender dropped — runtime disconnected mid-call.
             warn!(tool = tool_name, %turn_id, "pending oneshot sender dropped");
             JsonRpcResponse::err(id, error_code::DISPATCH_ERROR, "IPC connection lost")
         }
         Err(_) => {
-            // Timeout — clean up pending entry.
             let mut pending = state.pending_responses.lock().await;
             pending.remove(&turn_id);
             warn!(tool = tool_name, %turn_id, "dispatch timed out");
