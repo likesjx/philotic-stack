@@ -23,6 +23,7 @@ implements: []
 implemented_by:
 - workspace-runner-overlay-slice
 - workspace-runner-base-policy-slice
+- desktop-observe-metadata-scaffold
 active_seams:
 - shell-runner-split
 - desktop-runner-materialization
@@ -66,10 +67,14 @@ Current code already points this way:
   - workspace runner base policy now rides in hotel/session-driven route metadata
   - `tool-runner` treats env vars as fallback defaults instead of primary truth
   - canonical session snapshots now include workspace runner base config for routed workspace tools
+- fourth coding slice landed:
+  - `desktop.observe` is cataloged and routed as a pinned `desktop` task-runner tool
+  - `tool-runner` advertises `desktop.observe` and returns metadata-only observation scaffolding
+  - screenshot and input actions remain deferred behind approval and artifact-policy seams
 
 Still pending:
 
-- explicit task-runner specialization and configuration, including the first `desktop`/CUA runner family
+- explicit task-runner specialization and configuration beyond the first `desktop.observe` scaffold
 - shell runner split
 - unreachable-incarnation fallback/materialization policy
 

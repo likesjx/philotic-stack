@@ -287,6 +287,28 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
     );
 
     m.insert(
+        "desktop.observe".into(),
+        ToolDefinition {
+            tool_name: "desktop.observe".into(),
+            description: "Returns low-agency metadata about the bound desktop automation runner \
+                          and desktop session. This observe-only CUA scaffold does not take a \
+                          screenshot and cannot click, type, press keys, or scroll."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "detail": {
+                        "type": "string",
+                        "enum": ["summary"],
+                        "description": "Observation detail level. Only summary metadata is supported in the first scaffold."
+                    }
+                }
+            }),
+            class: Some("desktop".into()),
+        },
+    );
+
+    m.insert(
         "skill.register".into(),
         ToolDefinition {
             tool_name: "skill.register".into(),

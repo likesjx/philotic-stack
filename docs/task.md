@@ -1217,7 +1217,7 @@ Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membra
 - [ ] Review [TOOL_MANAGEMENT_PLANE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TOOL_MANAGEMENT_PLANE_PROPOSAL.md).
 - [ ] Review [RUNNER_ARTIFACT_BUILD_DISTRIBUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RUNNER_ARTIFACT_BUILD_DISTRIBUTION_PROPOSAL.md).
 - [x] Define the computer-use/CUA runner boundary as a pinned desktop task-runner family rather than desktop membrane execution authority.
-- [ ] CUA runner observe-only scaffold (`desktop-runner-materialization`): advertise one low-agency `desktop.screenshot` or `desktop.observe` tool with runner/hotel/environment/desktop-session attribution.
+- [x] CUA runner observe-only scaffold (`desktop-runner-materialization`): advertise one low-agency `desktop.observe` tool with runner/hotel/environment/desktop-session attribution.
 - [ ] CUA observation contract (`desktop-observation-contract`): define screenshot/artifact redaction, provenance fields, and shaped model-facing observation results.
 - [ ] CUA action approval policy (`desktop-action-approval-policy`): keep click/type/key/scroll unavailable until explicit approval posture and high-agency input gating are implemented.
 - [x] Introduce a first-class `ToolAssembly` model with model-facing tool definitions and runtime-facing execution routes.

@@ -923,7 +923,11 @@ impl AgentRuntime {
                 if let Some(roles) = data.get("roles").and_then(|v| v.as_array()) {
                     let names: Vec<String> = roles
                         .iter()
-                        .filter_map(|r| r.get("role_name").and_then(|n| n.as_str()).map(str::to_string))
+                        .filter_map(|r| {
+                            r.get("role_name")
+                                .and_then(|n| n.as_str())
+                                .map(str::to_string)
+                        })
                         .collect();
                     info!(
                         agent_id = %self.agent_id,
@@ -1097,25 +1101,41 @@ impl AgentRuntime {
         // Parked approval turns count as waiting (they live in parked_approval_turn, not active_turn).
         let session_ids: Vec<String> = self.sessions.keys().cloned().collect();
         for session_id in &session_ids {
-            let is_waiting = self.sessions.get(session_id).map(|s| {
-                let active_waiting = s.active_turn.as_ref().map(|t| {
-                    matches!(t.phase, TurnPhase::WaitingModel | TurnPhase::WaitingTool | TurnPhase::WaitingVoice)
-                }).unwrap_or(false);
-                active_waiting || s.has_parked_approval_turn()
-            }).unwrap_or(false);
+            let is_waiting = self
+                .sessions
+                .get(session_id)
+                .map(|s| {
+                    let active_waiting = s
+                        .active_turn
+                        .as_ref()
+                        .map(|t| {
+                            matches!(
+                                t.phase,
+                                TurnPhase::WaitingModel
+                                    | TurnPhase::WaitingTool
+                                    | TurnPhase::WaitingVoice
+                            )
+                        })
+                        .unwrap_or(false);
+                    active_waiting || s.has_parked_approval_turn()
+                })
+                .unwrap_or(false);
 
             if is_waiting {
-                self.stuck_turn_first_seen.entry(session_id.clone()).or_insert(now);
+                self.stuck_turn_first_seen
+                    .entry(session_id.clone())
+                    .or_insert(now);
             } else {
                 self.stuck_turn_first_seen.remove(session_id);
             }
         }
         // Also remove entries for sessions that no longer exist.
-        self.stuck_turn_first_seen.retain(|id, _| self.sessions.contains_key(id));
+        self.stuck_turn_first_seen
+            .retain(|id, _| self.sessions.contains_key(id));
 
         // Step 2: collect sessions whose waiting turn has exceeded the deadline.
         // Parked approval turns (in parked_approval_turn) use WAITING_APPROVAL_SECS.
-        let timed_out: Vec<(String, String, String, Option<String>, Option<String>, String, u64)> = self
+        let timed_out: Vec<(String, String, String, Option<String>, String, String, u64)> = self
             .sessions
             .iter()
             .filter_map(|(session_id, state)| {
@@ -1159,7 +1179,9 @@ impl AgentRuntime {
             .collect();
 
         // Step 3: evict.
-        for (session_id, reply_to, reply_role, reply_guest_id, chat_id, phase, elapsed_secs) in timed_out {
+        for (session_id, reply_to, reply_role, reply_guest_id, chat_id, phase, elapsed_secs) in
+            timed_out
+        {
             warn!(
                 session_id = %session_id,
                 phase = %phase,
@@ -1548,7 +1570,8 @@ impl AgentRuntime {
                 // for a parked turn. Extract `decision` and optional `note` from the content
                 // field (parsed as JSON), then synthesize a SlashCommand to reuse the existing
                 // approval resolution path.
-                let session_id = session_id.unwrap_or_else(|| task.session_id_or_default(&self.agent_id));
+                let session_id =
+                    session_id.unwrap_or_else(|| task.session_id_or_default(&self.agent_id));
                 // The sender encodes the decision as JSON in `content`, e.g.:
                 //   {"decision": "approved", "note": "looks good"}
                 let parsed_content = task
@@ -1575,7 +1598,10 @@ impl AgentRuntime {
                 let local_node = local_node_id();
                 let cmd_chat_id = task.chat_id.clone().unwrap_or_default();
                 let cmd_reply_to = task.final_reply_to.clone().unwrap_or(local_node);
-                let cmd_reply_role = task.final_reply_role.clone().unwrap_or_else(|| "membrane".into());
+                let cmd_reply_role = task
+                    .final_reply_role
+                    .clone()
+                    .unwrap_or_else(|| "membrane".into());
                 let cmd_reply_guest_id = task.final_reply_guest_id.clone();
                 info!(
                     session_id = %session_id,
@@ -1745,7 +1771,10 @@ impl AgentRuntime {
                 SlashCommand::Tts { .. } => {}
                 SlashCommand::Voice { .. } => {}
                 SlashCommand::Abandon { .. } => {}
-                SlashCommand::Correct { turn_id: voice_turn_id, text } => {
+                SlashCommand::Correct {
+                    turn_id: voice_turn_id,
+                    text,
+                } => {
                     return self
                         .handle_correction_command(
                             task_id,
@@ -1933,10 +1962,7 @@ impl AgentRuntime {
                     .ok_or_else(|| anyhow::anyhow!("session missing after start_turn"))?;
 
                 // Build a synthetic approval so handle_approval_command can resolve it.
-                let tool_name = task
-                    .command
-                    .as_deref()
-                    .unwrap_or("unknown tool");
+                let tool_name = task.command.as_deref().unwrap_or("unknown tool");
                 let approval = ApprovalRequest {
                     approval_id: Some(format!("mcp-gate:{}", turn_id)),
                     reason: format!("MCP tool call '{}' requires operator approval.", tool_name),
@@ -6651,19 +6677,24 @@ impl AgentRuntime {
                     .await
                 {
                     Ok(IpcResponse::Standard {
-                        ok: true, data: Some(data), ..
+                        ok: true,
+                        data: Some(data),
+                        ..
                     }) => {
                         let text = serde_json::to_string_pretty(&data)
                             .unwrap_or_else(|_| data.to_string());
                         (text, None)
                     }
-                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
                         let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
                         (e.display_message(), Some(e))
                     }
-                    Ok(_) => {
-                        ("Hotel status unavailable.".into(), None)
-                    }
+                    Ok(_) => ("Hotel status unavailable.".into(), None),
                     Err(e) => {
                         let err = TaskErrorPayload::transport_error(
                             "philote",
@@ -6701,7 +6732,9 @@ impl AgentRuntime {
                     .await
                 {
                     Ok(IpcResponse::Standard {
-                        ok: true, data: Some(data), ..
+                        ok: true,
+                        data: Some(data),
+                        ..
                     }) => {
                         let log = data
                             .get("log")
@@ -6710,13 +6743,16 @@ impl AgentRuntime {
                             .to_string();
                         (log, None)
                     }
-                    Ok(IpcResponse::Standard { ok: false, code, message, .. }) => {
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
                         let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
                         (e.display_message(), Some(e))
                     }
-                    Ok(_) => {
-                        ("Hotel logs unavailable.".into(), None)
-                    }
+                    Ok(_) => ("Hotel logs unavailable.".into(), None),
                     Err(e) => {
                         let err = TaskErrorPayload::transport_error(
                             "philote",
@@ -7066,7 +7102,8 @@ impl AgentRuntime {
                         .fail_active_turn(
                             payload.session_id,
                             payload.turn_id,
-                            "role.create_or_update: missing required object argument 'reasoning'".into(),
+                            "role.create_or_update: missing required object argument 'reasoning'"
+                                .into(),
                         )
                         .await;
                 }
@@ -7079,8 +7116,12 @@ impl AgentRuntime {
                     .get("role_manifest")
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
-                let is_admin = args.get("is_admin").and_then(|v| v.as_bool()).unwrap_or(false);
-                let inactive_ttl_seconds = args.get("inactive_ttl_seconds").and_then(|v| v.as_u64());
+                let is_admin = args
+                    .get("is_admin")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let inactive_ttl_seconds =
+                    args.get("inactive_ttl_seconds").and_then(|v| v.as_u64());
                 let iteration_cap = args
                     .get("iteration_cap")
                     .and_then(|v| v.as_u64())
@@ -7758,14 +7799,17 @@ impl AgentRuntime {
                     })
                     .await
                 {
-                    Ok(IpcResponse::RoleHomeSet { role_name: name, home_node }) => {
+                    Ok(IpcResponse::RoleHomeSet {
+                        role_name: name,
+                        home_node,
+                    }) => {
                         let msg = match home_node {
                             Some(ref node) => format!(
                                 "Role '{name}' pinned to hotel '{node}'. Next handoff.to_role will route there."
                             ),
-                            None => format!(
-                                "Role '{name}' home cleared — will run on authority hotel."
-                            ),
+                            None => {
+                                format!("Role '{name}' home cleared — will run on authority hotel.")
+                            }
                         };
                         (msg, None)
                     }
@@ -7922,43 +7966,66 @@ impl AgentRuntime {
                     ..Default::default()
                 };
 
-                let (content, tool_err) = match self
-                    .ipc_client
-                    .send_request(IpcRequest::HandoffToRole {
-                        session_id: payload.session_id.clone(),
-                        role_name: role_name.clone(),
-                        handoff_bundle,
-                    })
-                    .await
-                {
-                    Ok(IpcResponse::HandoffAck {
-                        handoff_guest_id, ..
-                    }) => (
-                        format!("Handed off to role '{role_name}' (guest {handoff_guest_id})."),
-                        None,
-                    ),
-                    Ok(IpcResponse::Error(msg)) => {
-                        let e = TaskErrorPayload::tool_execution(
-                            "handoff.to_role",
-                            msg,
-                            Some("HANDOFF_REJECTED"),
-                        );
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(_) => {
-                        let e = TaskErrorPayload::ipc_failure(
-                            "aiua",
-                            "UNEXPECTED_RESPONSE",
-                            "handoff.to_role: unexpected hotel response",
-                        );
-                        (e.display_message(), Some(e))
-                    }
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("handoff.to_role: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
+                // Retry HandoffPending up to ~3 seconds while the target role materializes.
+                const HANDOFF_MAX_RETRIES: u32 = 12;
+                const HANDOFF_DEFAULT_WAIT_MS: u64 = 250;
+                let handoff_req = IpcRequest::HandoffToRole {
+                    session_id: payload.session_id.clone(),
+                    role_name: role_name.clone(),
+                    handoff_bundle,
+                };
+                let mut handoff_attempt = 0u32;
+                let (content, tool_err) = loop {
+                    let resp = self.ipc_client.send_request(handoff_req.clone()).await;
+                    match resp {
+                        Ok(IpcResponse::HandoffAck {
+                            handoff_guest_id, ..
+                        }) => {
+                            break (
+                                format!(
+                                    "Handed off to role '{role_name}' (guest {handoff_guest_id})."
+                                ),
+                                None,
+                            );
+                        }
+                        Ok(IpcResponse::HandoffPending { retry_after_ms, .. }) => {
+                            handoff_attempt += 1;
+                            if handoff_attempt >= HANDOFF_MAX_RETRIES {
+                                let e = TaskErrorPayload::tool_execution(
+                                    "handoff.to_role",
+                                    format!(
+                                        "Role '{role_name}' did not become live after {HANDOFF_MAX_RETRIES} retries"
+                                    ),
+                                    Some("HANDOFF_TIMEOUT"),
+                                );
+                                break (e.display_message(), Some(e));
+                            }
+                            let wait_ms = retry_after_ms.unwrap_or(HANDOFF_DEFAULT_WAIT_MS);
+                            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                        }
+                        Ok(IpcResponse::Error(msg)) => {
+                            let e = TaskErrorPayload::tool_execution(
+                                "handoff.to_role",
+                                msg,
+                                Some("HANDOFF_REJECTED"),
+                            );
+                            break (e.display_message(), Some(e));
+                        }
+                        Ok(_) => {
+                            let e = TaskErrorPayload::ipc_failure(
+                                "aiua",
+                                "UNEXPECTED_RESPONSE",
+                                "handoff.to_role: unexpected hotel response",
+                            );
+                            break (e.display_message(), Some(e));
+                        }
+                        Err(e) => {
+                            let err = TaskErrorPayload::transport_error(
+                                "philote",
+                                format!("handoff.to_role: IPC transport error — {e}"),
+                            );
+                            break (err.display_message(), Some(err));
+                        }
                     }
                 };
 

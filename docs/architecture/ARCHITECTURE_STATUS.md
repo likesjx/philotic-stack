@@ -129,7 +129,7 @@ Primary references:
 - abstract tool catalog seeding exists in the context graph
 - tool assembly uses catalog-backed metadata and approval annotations
 - local workspace tooling exists through `tool-runner`, and its shell path (`bash.exec`) can now delegate to `philotic-sandbox` as the backing enforcement worker when sandbox mode is configured, although broader routed error-envelope and management-plane work remains incomplete
-- computer-use automation is now scoped as a future pinned desktop task-runner family (`desktop.*`/CUA), with observation-first implementation recommended; no dedicated CUA runner exists yet, and the desktop membrane remains ingress/approval/visibility rather than executor
+- computer-use automation is now scoped as a pinned desktop task-runner family (`desktop.*`/CUA); the first `desktop.observe` metadata-only scaffold is wired through `tool-runner` and pinned routing, while screenshot and input actions remain deferred, and the desktop membrane remains ingress/approval/visibility rather than executor
 - `model-router` is the shared model execution boundary for current providers
 - an `OpenAIProvider` adapter and dedicated `model-controller-openai` guest now exist on that seam, with OpenRouter/Ollama treated as compatibility modes unless their runtime lifecycle forces a different boundary
 - OpenAI auth now has hotel-side key management and validation commands, with endpoint-scoped secret refs, explicit base URL/default model settings, and optional project header support; the first real startup smoke is now green

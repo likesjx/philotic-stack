@@ -2648,6 +2648,25 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             class: "shell".into(),
             tool_markers: vec!["high_agency".into()],
         },
+        AbstractToolRecord {
+            tool_name: "desktop.observe".into(),
+            description: "Returns low-agency metadata about the bound desktop automation runner \
+                          and desktop session. This observe-only CUA scaffold does not take a \
+                          screenshot and cannot click, type, press keys, or scroll."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "detail": {
+                        "type": "string",
+                        "enum": ["summary"],
+                        "description": "Observation detail level. Only summary metadata is supported in the first scaffold."
+                    }
+                }
+            }),
+            class: "desktop".into(),
+            tool_markers: vec!["desktop_bound".into(), "local_only".into(), "low_agency".into()],
+        },
     ];
 
     for tool in &catalog {

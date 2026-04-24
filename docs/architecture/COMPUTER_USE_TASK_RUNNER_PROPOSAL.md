@@ -23,7 +23,8 @@ task_refs:
 proposal_id: computer-use-task-runner
 implements:
 - task-runner
-implemented_by: []
+implemented_by:
+- desktop-observe-metadata-scaffold
 active_seams:
 - desktop-runner-materialization
 - desktop-action-approval-policy
@@ -79,23 +80,22 @@ Current repo truth:
 - generic `tool-runner` exists and already proves external routed execution for workspace and shell tooling
 - `TASK_RUNNER_PROPOSAL.md` already defines pinned, environment-bound, policy-constrained runner families
 - `DESKTOP_MEMBRANE_PROPOSAL.md` already defines desktop membrane as bounded operator ingress rather than privileged direct authority
-- no dedicated computer-use runner exists yet
-- no `desktop.*` tool family is currently advertised by tool assembly
+- `desktop.observe` is now advertised as a pinned desktop task-runner tool and returns metadata-only observation scaffolding
+- screenshot and input actions are not implemented
 
-This proposal narrows the next implementation path instead of claiming implementation.
+This proposal narrows the next implementation path while naming the first landed scaffold honestly.
 
 ## Current Slice
 
-This slice records the CUA boundary in architecture and graph-managed proposal surfaces.
+This slice records the CUA boundary in architecture and graph-managed proposal surfaces, then lands the first low-agency `desktop.observe` scaffold.
 
-The first implementation slice should be deliberately low-agency:
+The landed implementation is deliberately low-agency:
 
-1. create a desktop runner scaffold that can advertise exactly one observation-only tool
-2. prefer `desktop.screenshot` or `desktop.observe` before click/type/key tools
-3. require runner identity, host environment, desktop-session identity, and lease metadata in the runner advertisement
-4. route through the existing pinned task-runner/tool assembly path
-5. return a normalized tool result with provenance, target desktop identity, and redaction posture
-6. leave click/type/key/scroll unavailable until the approval policy seam is explicit
+1. `desktop.observe` is registered in the Philote catalog and hotel abstract tool catalog
+2. `desktop.observe` routes as a pinned `desktop` task-runner tool
+3. the current `tool-runner` advertises and subscribes to `tool.desktop.observe`
+4. the result is metadata-only JSON with runner, hotel, environment, desktop-session, and redaction posture fields
+5. screenshot, click, type, key, and scroll remain unavailable until the approval and artifact-policy seams are explicit
 
 ## Boundary Model
 
@@ -230,6 +230,6 @@ It preserves [DESKTOP_MEMBRANE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stac
 
 ## Reality Gap
 
-There is no dedicated CUA runner yet.
+There is no dedicated standalone CUA runner yet.
 
-The architectural direction is ready for a first observe-only implementation, but click/type/key tools should remain unavailable until the approval and observation seams are explicit enough to prevent accidental ambient desktop authority.
+The current scaffold proves routing and metadata shape through the existing `tool-runner`, but click/type/key tools should remain unavailable until the approval and observation seams are explicit enough to prevent accidental ambient desktop authority.

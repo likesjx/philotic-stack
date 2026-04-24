@@ -10300,7 +10300,11 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
 fn is_pinned_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "workspace.list" | "workspace.read" | "workspace.search" | "workspace.write"
+        "workspace.list"
+            | "workspace.read"
+            | "workspace.search"
+            | "workspace.write"
+            | "desktop.observe"
     )
 }
 
@@ -10311,6 +10315,10 @@ fn task_runner_kind_for_tool(tool_name: &str) -> Option<&'static str> {
 
     if tool_name.starts_with("shell.") {
         return Some("shell");
+    }
+
+    if tool_name.starts_with("desktop.") {
+        return Some("desktop");
     }
 
     None
@@ -15345,6 +15353,45 @@ mod tests {
         assert_eq!(tools[0]["tool_name"], "workspace.read");
         assert!(assembly["execution_routes"].get("workspace.read").is_some());
         assert!(assembly["execution_routes"].get("workspace.list").is_none());
+    }
+
+    #[test]
+    fn compose_tool_assembly_routes_desktop_observe_as_pinned_desktop_runner() {
+        let bindings = serde_json::json!({
+            "effective_toolset": ["desktop.observe"],
+            "effective_rights": ["tool.desktop.observe"],
+            "shared_tool_markers": [{
+                "tool_name": "desktop.observe",
+                "class": "desktop",
+                "description": "Observe-only desktop metadata.",
+                "input_schema": { "type": "object" },
+                "tool_markers": ["desktop_bound", "local_only", "low_agency"]
+            }]
+        });
+        let registered = vec![ToolRunnerRegistryEntry {
+            guest_id: "tool-runner-01".into(),
+            supported_tools: vec!["desktop.observe".into()],
+            last_seen_at: 1,
+        }];
+        let live = vec![LiveToolRunner {
+            guest_id: "tool-runner-01".into(),
+            supported_tools: vec!["desktop.observe".into()],
+        }];
+
+        let assembly = compose_tool_assembly(&bindings, &registered, &live, &[], "local-aiua-01");
+        let route = &assembly["execution_routes"]["desktop.observe"];
+
+        assert_eq!(
+            assembly["tools_for_model"][0]["tool_name"],
+            "desktop.observe"
+        );
+        assert_eq!(route["execution_mode"], "pinned");
+        assert_eq!(route["task_runner_kind"], "desktop");
+        assert_eq!(route["target_role"], "tool.desktop.observe");
+        assert_eq!(
+            assembly["policy_annotations"]["desktop.observe"]["approval_required"],
+            false
+        );
     }
 
     #[test]

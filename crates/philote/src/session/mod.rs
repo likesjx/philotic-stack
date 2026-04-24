@@ -3075,7 +3075,11 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
 fn is_pinned_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "workspace.list" | "workspace.read" | "workspace.search" | "workspace.write"
+        "workspace.list"
+            | "workspace.read"
+            | "workspace.search"
+            | "workspace.write"
+            | "desktop.observe"
     )
 }
 
@@ -3086,6 +3090,10 @@ fn task_runner_kind_for_tool(tool_name: &str) -> Option<String> {
 
     if tool_name.starts_with("shell.") || tool_name == "bash.exec" {
         return Some("shell".into());
+    }
+
+    if tool_name.starts_with("desktop.") {
+        return Some("desktop".into());
     }
 
     None
@@ -3964,6 +3972,18 @@ mod tests {
         assert!(props.contains_key("command"));
         assert!(props.contains_key("working_dir"));
         assert!(props.contains_key("timeout_secs"));
+    }
+
+    #[test]
+    fn desktop_observe_is_desktop_class_and_low_agency() {
+        use crate::catalog::{tool_catalog, tool_class, tool_requires_approval};
+        let catalog = tool_catalog();
+        assert!(
+            catalog.contains_key("desktop.observe"),
+            "desktop.observe must be in catalog"
+        );
+        assert_eq!(tool_class("desktop.observe"), Some("desktop"));
+        assert!(!tool_requires_approval("desktop.observe"));
     }
 
     #[test]
@@ -5000,6 +5020,27 @@ mod tests {
         assert_eq!(read_route.target_role, "tool.workspace.read");
         assert_eq!(list_route.target_role, "tool.workspace.list");
         assert_eq!(search_route.target_role, "tool.workspace.search");
+    }
+
+    #[test]
+    fn desktop_observe_gets_pinned_desktop_route() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("desktop.observe");
+        state.rebuild_default_tool_assembly();
+
+        let route = state
+            .resolve_tool_route("desktop.observe")
+            .expect("desktop.observe route should exist");
+
+        assert_eq!(route.execution_mode, "pinned");
+        assert_eq!(route.task_runner_kind.as_deref(), Some("desktop"));
+        assert_eq!(route.target_role, "tool.desktop.observe");
+        assert_eq!(
+            route.selection_reason.as_deref(),
+            Some("default_pinned_route")
+        );
     }
 
     #[test]
