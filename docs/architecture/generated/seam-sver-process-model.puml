@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - sver-process-model
+
+rectangle "sver-process-model" as sver_process_model #Orange {
+}
+
+
+@enduml

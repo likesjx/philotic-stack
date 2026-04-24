@@ -1,0 +1,48 @@
+[
+  {
+    "hotel_name": "default",
+    "mesh_host": "100.64.230.106",
+    "mesh_port": 24849,
+    "blob_port": 24850,
+    "execution_port": 24851,
+    "ipc_socket_path": "",
+    "active_pid": null,
+    "capabilities": {
+      "node_id": "default-aiua-01",
+      "roles": [
+        "ansible-node",
+        "membrane"
+      ],
+      "models": [],
+      "tools": [],
+      "constraints": {
+        "latency_hint_ms": null,
+        "max_concurrent_jobs": null,
+        "trust_level": null
+      }
+    }
+  },
+  {
+    "hotel_name": "mbp-jane",
+    "mesh_host": "100.79.239.64",
+    "mesh_port": 13104,
+    "blob_port": 13105,
+    "execution_port": 13106,
+    "ipc_socket_path": "",
+    "active_pid": null,
+    "capabilities": {
+      "node_id": "mbp-jane-aiua-01",
+      "roles": [
+        "ansible-node",
+        "membrane"
+      ],
+      "models": [],
+      "tools": [],
+      "constraints": {
+        "latency_hint_ms": null,
+        "max_concurrent_jobs": null,
+        "trust_level": null
+      }
+    }
+  }
+]

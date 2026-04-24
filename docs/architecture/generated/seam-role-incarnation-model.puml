@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - role-incarnation-model
+
+rectangle "role-incarnation-model" as role_incarnation_model #Orange {
+}
+
+
+@enduml

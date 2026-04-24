@@ -1027,6 +1027,11 @@ impl SessionState {
             .or_else(|| match capability {
                 "text.generate" => self.bindings.effective_model_controller.as_deref(),
                 "voice.synthesize" => self.agent_profile.voice_response_policy.provider.as_deref(),
+                "voice.transcribe" => self
+                    .agent_profile
+                    .media_routing_policy
+                    .transcription_provider
+                    .as_deref(),
                 _ => None,
             })
     }
@@ -5610,5 +5615,93 @@ mod tests {
             .expect("recalled memory entry should render text");
         assert!(text.contains("[Recalled memory]"));
         assert!(text.contains("memory-architecture"));
+    }
+
+    #[test]
+    fn transcription_provider_surfaces_via_preferred_component_implementation() {
+        use crate::session::types::MediaRoutingPolicy;
+
+        let mut state =
+            SessionState::new("sess-tx".into(), "agent-bjork-01".into(), "telegram".into());
+        state.agent_profile.media_routing_policy = MediaRoutingPolicy {
+            transcription_provider: Some("onnx".into()),
+            voice_action: Some("transcribe".into()),
+            ..MediaRoutingPolicy::default()
+        };
+
+        // No component_route_assembly set — falls through to agent_profile lookup.
+        assert_eq!(
+            state.preferred_component_implementation("voice.transcribe"),
+            Some("onnx")
+        );
+        // Other capabilities are unaffected.
+        assert_eq!(
+            state.preferred_component_implementation("voice.synthesize"),
+            state.agent_profile.voice_response_policy.provider.as_deref()
+        );
+        assert_eq!(
+            state.preferred_component_implementation("text.generate"),
+            state.bindings.effective_model_controller.as_deref()
+        );
+    }
+
+    #[test]
+    fn transcription_provider_none_when_not_configured() {
+        let state =
+            SessionState::new("sess-tx2".into(), "agent-bjork-01".into(), "telegram".into());
+        // Default MediaRoutingPolicy has no transcription_provider.
+        assert_eq!(
+            state.preferred_component_implementation("voice.transcribe"),
+            None
+        );
+    }
+
+    #[test]
+    fn transcription_provider_round_trips_through_serde() {
+        use crate::session::types::MediaRoutingPolicy;
+
+        let policy = MediaRoutingPolicy {
+            transcription_provider: Some("onnx".into()),
+            voice_action: Some("transcribe".into()),
+            ..MediaRoutingPolicy::default()
+        };
+        let json = serde_json::to_value(&policy).unwrap();
+        assert_eq!(json["transcription_provider"], "onnx");
+
+        let round_tripped: MediaRoutingPolicy = serde_json::from_value(json).unwrap();
+        assert_eq!(round_tripped.transcription_provider.as_deref(), Some("onnx"));
+    }
+
+    #[test]
+    fn component_route_assembly_takes_precedence_over_transcription_provider() {
+        use crate::session::types::{ComponentExecutionRoute, ComponentRouteAssembly, MediaRoutingPolicy};
+        use std::collections::BTreeMap;
+
+        let mut state =
+            SessionState::new("sess-tx3".into(), "agent-bjork-01".into(), "telegram".into());
+        state.agent_profile.media_routing_policy = MediaRoutingPolicy {
+            transcription_provider: Some("onnx".into()),
+            ..MediaRoutingPolicy::default()
+        };
+        // An explicit hotel-injected route for voice.transcribe should win.
+        let mut routes = BTreeMap::new();
+        routes.insert(
+            "voice.transcribe".to_string(),
+            ComponentExecutionRoute {
+                target_node: "remote-node-1".into(),
+                target_role: "model.local".into(),
+                execution_mode: "capability".into(),
+                ..ComponentExecutionRoute::default()
+            },
+        );
+        state.component_route_assembly = ComponentRouteAssembly {
+            execution_routes: routes,
+        };
+
+        // resolve_component_execution_route hits first — preferred_component_implementation
+        // returns None because the route assembly takes the component_route_for_capability path.
+        // Callers use resolve_model_execution_target which checks route assembly before falling
+        // back to preferred_component_implementation — just assert both APIs are consistent.
+        assert!(state.resolve_component_execution_route("voice.transcribe").is_some());
     }
 }

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 use tracing;
 
+use crate::engine::ManageProposalRequest;
 use crate::scanner::{full_scan, ScanConfig};
 use crate::schema::*;
 
@@ -115,6 +116,20 @@ pub struct MempalaceTurnBody {
     pub turn_transcript: String,
 }
 
+#[derive(Deserialize)]
+pub struct ManageProposalBody {
+    pub agent: String,
+    pub session: Option<String>,
+    pub status: Option<String>,
+    pub disposition: Option<String>,
+    pub current_goal: Option<String>,
+    pub observation: Option<String>,
+    pub assumption: Option<String>,
+    pub open_question: Option<String>,
+    pub pending_writeback_item: Option<String>,
+    pub reason: String,
+}
+
 // ── Response types ──
 
 #[derive(Serialize)]
@@ -190,6 +205,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/proposals", get(list_proposals))
         .route("/api/proposals/:id", get(get_proposal))
         .route("/api/proposals/:id/content", get(get_proposal_content))
+        .route("/api/proposals/:id/manage", post(post_manage_proposal))
         .route("/api/seams", get(list_seams))
         .route("/api/worktrees", get(list_worktrees))
         .route("/api/mutations", get(list_mutations))
@@ -337,6 +353,7 @@ async fn get_status(
         NodeKind::Domain,
         NodeKind::Task,
         NodeKind::Decision,
+        NodeKind::AgentWorkFocus,
     ];
 
     let mut counts = serde_json::Map::new();
@@ -584,6 +601,47 @@ async fn get_proposal_content(
         .ok_or_else(|| not_found(&format!("Proposal '{}' not found", id)))?;
 
     Ok(Json(node_content_response(&node)))
+}
+
+async fn post_manage_proposal(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<ManageProposalBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let engine = state.engine.lock().await;
+    let result = engine
+        .manage_proposal(ManageProposalRequest {
+            proposal_id: id,
+            agent: body.agent.clone(),
+            session: body.session.clone(),
+            status: body.status.clone(),
+            disposition: body.disposition.clone(),
+            current_goal: body.current_goal.clone(),
+            observation: body.observation.clone(),
+            assumption: body.assumption.clone(),
+            open_question: body.open_question.clone(),
+            pending_writeback_item: body.pending_writeback_item.clone(),
+            reason: body.reason.clone(),
+        })
+        .map_err(internal_error)?;
+
+    let _ = state.change_tx.send(ChangeEvent {
+        event_type: "proposal_managed".to_string(),
+        payload: serde_json::json!({
+            "proposal_id": result.proposal.id,
+            "agent": body.agent,
+            "work_focus_id": result.work_focus.id,
+            "mutation_id": result.mutation.id,
+        }),
+    });
+
+    Ok(Json(serde_json::json!({
+        "managed": true,
+        "proposal": result.proposal,
+        "agent": result.agent_node,
+        "work_focus": result.work_focus,
+        "mutation_id": result.mutation.id,
+    })))
 }
 
 async fn get_node_content(

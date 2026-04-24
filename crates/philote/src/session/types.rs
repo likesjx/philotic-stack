@@ -422,6 +422,11 @@ pub struct MediaRoutingPolicy {
     /// When true (default), tools are stripped from the model request on media turns.
     #[serde(default = "default_true")]
     pub strip_tools_on_media: bool,
+    /// Which model implementation handles `voice.transcribe` for this agent.
+    /// Accepts the same values as `voice_response_policy.provider`: `"onnx"`, `"gemini"`, etc.
+    /// `None` falls back to the hotel-resolved route or the `model` role default.
+    #[serde(default)]
+    pub transcription_provider: Option<String>,
 }
 
 impl Default for MediaRoutingPolicy {
@@ -432,6 +437,7 @@ impl Default for MediaRoutingPolicy {
             image_action: None,
             document_action: None,
             strip_tools_on_media: true,
+            transcription_provider: None,
         }
     }
 }

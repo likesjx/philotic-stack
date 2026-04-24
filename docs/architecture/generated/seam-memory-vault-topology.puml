@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - memory-vault-topology
+
+rectangle "memory-vault-topology" as memory_vault_topology #Orange {
+}
+
+
+@enduml

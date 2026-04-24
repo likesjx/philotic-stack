@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - mcp-endpoint-config
+
+rectangle "mcp-endpoint-config" as mcp_endpoint_config #Orange {
+}
+
+
+@enduml

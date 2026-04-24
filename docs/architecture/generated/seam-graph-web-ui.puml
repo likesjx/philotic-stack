@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - graph-web-ui
+
+rectangle "graph-web-ui" as graph_web_ui #Orange {
+}
+
+
+@enduml

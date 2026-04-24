@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - memory-enrichment-pipeline
+
+rectangle "memory-enrichment-pipeline" as memory_enrichment_pipeline #Orange {
+}
+
+
+@enduml

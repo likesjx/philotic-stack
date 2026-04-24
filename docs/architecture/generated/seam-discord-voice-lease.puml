@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - discord-voice-lease
+
+rectangle "discord-voice-lease" as discord_voice_lease #Orange {
+}
+
+
+@enduml

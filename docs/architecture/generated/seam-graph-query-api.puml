@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - graph-query-api
+
+rectangle "graph-query-api" as graph_query_api #Orange {
+}
+
+
+@enduml

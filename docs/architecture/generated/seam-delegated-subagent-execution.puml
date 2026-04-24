@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - delegated-subagent-execution
+
+rectangle "delegated-subagent-execution" as delegated_subagent_execution #Orange {
+}
+
+
+@enduml

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - mlx-provider-dispatch
+
+rectangle "mlx-provider-dispatch" as mlx_provider_dispatch #Orange {
+}
+
+
+@enduml

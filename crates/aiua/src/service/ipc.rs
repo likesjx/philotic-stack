@@ -2331,6 +2331,11 @@ impl IpcServer {
                     });
                 }
                 Err(e) => {
+                    // EMFILE / ENFILE: FD table is full. Back off to let existing
+                    // connections drain rather than spinning and burning CPU.
+                    if e.raw_os_error() == Some(24) || e.raw_os_error() == Some(23) {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                    }
                     error!("IPC listener accept error: {}", e);
                 }
             }
@@ -9946,16 +9951,17 @@ fn component_implementation_to_role(implementation: &str) -> String {
         .find(|segment| !segment.is_empty())
         .unwrap_or("gemini");
 
-    if prefix == "elevenlabs" {
-        "model.elevenlabs".into()
-    } else {
-        "model".into()
+    match prefix {
+        "elevenlabs" => "model.elevenlabs".into(),
+        "onnx" | "local" => "model.local".into(),
+        _ => "model".into(),
     }
 }
 
 fn default_component_role(capability: &str) -> &'static str {
     match capability {
         "voice.synthesize" => "model.elevenlabs",
+        "voice.transcribe" => "model.local",
         _ => "model",
     }
 }
@@ -10287,6 +10293,7 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
             | "skill.register"
             | "subagent.spawn"
             | "role.configure"
+            | "bash.exec"
     )
 }
 

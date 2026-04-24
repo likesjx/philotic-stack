@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - discord-voice-webrtc-bridge
+
+rectangle "discord-voice-webrtc-bridge" as discord_voice_webrtc_bridge #Orange {
+}
+
+
+@enduml

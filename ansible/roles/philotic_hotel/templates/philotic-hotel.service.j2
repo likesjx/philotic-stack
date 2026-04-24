@@ -39,7 +39,15 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ReadWritePaths={{ philotic_data_dir }} {{ philotic_blob_dir }}
-ReadOnlyPaths={% for item in philotic_agents.values() %}{% if item.import_workspace is defined %}{{ item.import_workspace }} {% endif %}{% endfor %}
+{% set read_only_paths = [] %}
+{% for item in philotic_agents.values() %}
+{% if item.import_workspace is defined %}
+{% set _ = read_only_paths.append(item.import_workspace) %}
+{% endif %}
+{% endfor %}
+{% if read_only_paths | length > 0 %}
+ReadOnlyPaths={{ read_only_paths | join(' ') }}
+{% endif %}
 ProtectHome=yes
 
 [Install]

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - desktop-membrane-lease
+
+rectangle "desktop-membrane-lease" as desktop_membrane_lease #Orange {
+}
+
+
+@enduml

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - agent-preset-library
+
+rectangle "agent-preset-library" as agent_preset_library #Orange {
+}
+
+
+@enduml

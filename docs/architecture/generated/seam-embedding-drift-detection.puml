@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - embedding-drift-detection
+
+rectangle "embedding-drift-detection" as embedding_drift_detection #Orange {
+}
+
+
+@enduml

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - distribution-pipeline
+
+rectangle "distribution-pipeline" as distribution_pipeline #Orange {
+}
+
+
+@enduml

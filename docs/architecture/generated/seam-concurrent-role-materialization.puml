@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - concurrent-role-materialization
+
+rectangle "concurrent-role-materialization" as concurrent_role_materialization #Orange {
+}
+
+
+@enduml

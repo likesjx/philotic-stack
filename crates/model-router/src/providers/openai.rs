@@ -786,6 +786,7 @@ impl OpenAIProvider {
             memory_concept: None,
             memory_candidate: None,
             active_plan: None,
+            model_gen: None,
         })
     }
 
@@ -822,6 +823,7 @@ impl OpenAIProvider {
             memory_concept,
             memory_candidate,
             active_plan,
+            model_gen: None,
         })
     }
 

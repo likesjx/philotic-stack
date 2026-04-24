@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - graph-datasource
+
+rectangle "graph-datasource" as graph_datasource #Orange {
+}
+
+
+@enduml

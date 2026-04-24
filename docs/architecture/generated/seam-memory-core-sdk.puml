@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - memory-core-sdk
+
+rectangle "memory-core-sdk" as memory_core_sdk #Orange {
+}
+
+
+@enduml

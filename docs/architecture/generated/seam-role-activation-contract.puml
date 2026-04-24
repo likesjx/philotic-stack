@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - role-activation-contract
+
+rectangle "role-activation-contract" as role_activation_contract #Orange {
+}
+
+
+@enduml

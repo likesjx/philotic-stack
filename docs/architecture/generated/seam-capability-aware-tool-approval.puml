@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - capability-aware-tool-approval
+
+rectangle "capability-aware-tool-approval" as capability_aware_tool_approval #Orange {
+}
+
+
+@enduml

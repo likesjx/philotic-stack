@@ -1198,6 +1198,10 @@ pub enum ProviderOutput {
         memory_concept: Option<String>,
         memory_candidate: Option<serde_json::Value>,
         active_plan: Option<serde_json::Value>,
+        /// Provenance token for transform outputs (e.g. `"whisper-small@abc12345"`).
+        /// `None` for cognitive text generation.
+        #[allow(dead_code)]
+        model_gen: Option<String>,
     },
     Audio(AudioArtifact),
     /// Model chose to call a tool rather than produce a text response.
@@ -1258,6 +1262,7 @@ impl ControllerResponseEnvelope {
                 memory_concept,
                 memory_candidate,
                 active_plan,
+                model_gen: _,
             } => {
                 let text_result = TextResult {
                     display_text: display_text.or_else(|| Some(content.clone())),
@@ -2229,6 +2234,7 @@ mod tests {
                 memory_concept: None,
                 memory_candidate: None,
                 active_plan: None,
+                model_gen: None,
             },
         )
         .unwrap();
@@ -2273,6 +2279,7 @@ mod tests {
                     "tags": ["greeting", "session"]
                 })),
                 active_plan: None,
+                model_gen: None,
             },
         )
         .unwrap();

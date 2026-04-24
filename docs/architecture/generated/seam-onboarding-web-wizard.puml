@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - onboarding-web-wizard
+
+rectangle "onboarding-web-wizard" as onboarding_web_wizard #Orange {
+}
+
+
+@enduml

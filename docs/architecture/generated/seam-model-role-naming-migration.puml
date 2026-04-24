@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - model-role-naming-migration
+
+rectangle "model-role-naming-migration" as model_role_naming_migration #Orange {
+}
+
+
+@enduml

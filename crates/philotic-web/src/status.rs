@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::init::{active_profile, profile_dir};
 use crate::start::{pid_path, process_alive, read_pid, socket_path};
 
-pub async fn run(config: Option<PathBuf>) -> Result<()> {
+pub async fn run(config: Option<PathBuf>, hotel: String) -> Result<()> {
     let default_config = match active_profile() {
         Some(_) => profile_dir().join("config.json"),
         None => PathBuf::from("mesh-config.json"),
@@ -39,7 +39,7 @@ pub async fn run(config: Option<PathBuf>) -> Result<()> {
     };
 
     // ── IPC health check ───────────────────────────────────────────────────
-    let socket_path = socket_path("aiua");
+    let socket_path = socket_path(&hotel);
 
     if daemon_alive {
         println!("\nipc");

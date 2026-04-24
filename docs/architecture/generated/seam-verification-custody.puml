@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - verification-custody
+
+rectangle "verification-custody" as verification_custody #Orange {
+}
+
+
+@enduml

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - router-training-tap
+
+rectangle "router-training-tap" as router_training_tap #Orange {
+}
+
+
+@enduml

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - session-start-bootstrap-slice
+
+rectangle "session-start-bootstrap-slice" as session_start_bootstrap_slice #Orange {
+}
+
+
+@enduml

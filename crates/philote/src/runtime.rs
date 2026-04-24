@@ -1115,7 +1115,7 @@ impl AgentRuntime {
 
         // Step 2: collect sessions whose waiting turn has exceeded the deadline.
         // Parked approval turns (in parked_approval_turn) use WAITING_APPROVAL_SECS.
-        let timed_out: Vec<(String, String, String, Option<String>, String, u64)> = self
+        let timed_out: Vec<(String, String, String, Option<String>, Option<String>, String, u64)> = self
             .sessions
             .iter()
             .filter_map(|(session_id, state)| {
@@ -1129,6 +1129,7 @@ impl AgentRuntime {
                             turn.final_reply_to.clone(),
                             turn.final_reply_role.clone(),
                             turn.final_reply_guest_id.clone(),
+                            turn.chat_id.clone(),
                             "WaitingApproval(parked)".into(),
                             elapsed,
                         ));
@@ -1150,6 +1151,7 @@ impl AgentRuntime {
                     turn.final_reply_to.clone(),
                     turn.final_reply_role.clone(),
                     turn.final_reply_guest_id.clone(),
+                    turn.chat_id.clone(),
                     format!("{:?}", turn.phase),
                     elapsed,
                 ))
@@ -1157,7 +1159,7 @@ impl AgentRuntime {
             .collect();
 
         // Step 3: evict.
-        for (session_id, reply_to, reply_role, reply_guest_id, phase, elapsed_secs) in timed_out {
+        for (session_id, reply_to, reply_role, reply_guest_id, chat_id, phase, elapsed_secs) in timed_out {
             warn!(
                 session_id = %session_id,
                 phase = %phase,
@@ -1193,6 +1195,7 @@ impl AgentRuntime {
                 task_json: serde_json::json!({
                     "action": "send_reply",
                     "session_id": session_id,
+                    "chat_id": chat_id,
                     "content": "*(I seem to have gotten stuck waiting for a response. The session is unblocked — please try again.)*",
                     "final": true,
                 })
@@ -1742,6 +1745,21 @@ impl AgentRuntime {
                 SlashCommand::Tts { .. } => {}
                 SlashCommand::Voice { .. } => {}
                 SlashCommand::Abandon { .. } => {}
+                SlashCommand::Correct { turn_id: voice_turn_id, text } => {
+                    return self
+                        .handle_correction_command(
+                            task_id,
+                            session_id,
+                            turn_id,
+                            chat_id,
+                            final_reply_to,
+                            final_reply_role,
+                            final_reply_guest_id,
+                            voice_turn_id,
+                            text,
+                        )
+                        .await;
+                }
             }
         }
 
@@ -2026,6 +2044,8 @@ impl AgentRuntime {
                 }
                 // ApprovalClear always returns from the pre-turn gate above; unreachable here.
                 SlashCommand::ApprovalClear { .. } => Ok(()),
+                // Correct always returns from the pre-turn gate above; unreachable here.
+                SlashCommand::Correct { .. } => Ok(()),
                 SlashCommand::Tts { .. } | SlashCommand::Voice { .. } => {
                     self.handle_session_control_command(
                         task_id, session_id, turn_id, chat_id, command,
@@ -4898,7 +4918,8 @@ impl AgentRuntime {
                 | SlashCommand::ApprovalClear { .. }
                 | SlashCommand::Abandon { .. }
                 | SlashCommand::Tts { .. }
-                | SlashCommand::Voice { .. } => {}
+                | SlashCommand::Voice { .. }
+                | SlashCommand::Correct { .. } => {}
             }
             (
                 state.checkpoint_memory_type(),
@@ -5120,7 +5141,8 @@ impl AgentRuntime {
             | SlashCommand::ApprovalClear { .. }
             | SlashCommand::Abandon { .. }
             | SlashCommand::Tts { .. }
-            | SlashCommand::Voice { .. } => {}
+            | SlashCommand::Voice { .. }
+            | SlashCommand::Correct { .. } => {}
         }
 
         Ok(())
@@ -5892,6 +5914,70 @@ impl AgentRuntime {
         self.complete_local_command(session_id, turn_id, ack).await
     }
 
+    /// Emit a `transcription_correction` envelope to the `router-listener` guest so it can
+    /// apply the operator correction to the stored Whisper training sample and mark it
+    /// `training_eligible = true`.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_correction_command(
+        &mut self,
+        task_id: Uuid,
+        session_id: String,
+        command_turn_id: String,
+        command_chat_id: String,
+        final_reply_to: String,
+        final_reply_role: String,
+        final_reply_guest_id: Option<String>,
+        voice_turn_id: String,
+        corrected_text: String,
+    ) -> Result<()> {
+        let correction_json = serde_json::to_string(&serde_json::json!({
+            "kind": "transcription_correction",
+            "session_id": session_id,
+            "turn_id": voice_turn_id,
+            "corrected_transcript": corrected_text,
+            "correction_source": "operator",
+        }))?;
+
+        let _ = self
+            .ipc_client
+            .send_request(IpcRequest::EmitTask {
+                target_node: local_node_id(),
+                target_role: "router-listener".to_string(),
+                target_guest_id: None,
+                task_json: correction_json,
+            })
+            .await;
+
+        // Mark the command turn as started before completing.
+        let _ = self
+            .ipc_client
+            .send_request(IpcRequest::UpdateTask {
+                task_id,
+                state: "transcription_correction_submitted".into(),
+                payload: serde_json::json!({
+                    "session_id": session_id,
+                    "turn_id": command_turn_id,
+                    "chat_id": command_chat_id,
+                    "voice_turn_id": voice_turn_id,
+                }),
+            })
+            .await;
+
+        self.complete_command_without_turn(
+            task_id,
+            session_id,
+            command_turn_id,
+            command_chat_id,
+            final_reply_to,
+            final_reply_role,
+            final_reply_guest_id,
+            format!("Correction submitted for turn `{voice_turn_id}`."),
+            None,
+            None,
+        )
+        .await
+    }
+
     async fn handle_session_control_command(
         &mut self,
         command_task_id: Uuid,
@@ -6236,7 +6322,8 @@ impl AgentRuntime {
                 | SlashCommand::Approve { .. }
                 | SlashCommand::Deny { .. }
                 | SlashCommand::ApprovalClear { .. }
-                | SlashCommand::Abandon { .. } => (
+                | SlashCommand::Abandon { .. }
+                | SlashCommand::Correct { .. } => (
                     "Unsupported session control command.".to_string(),
                     "session_control_unsupported",
                     serde_json::json!({

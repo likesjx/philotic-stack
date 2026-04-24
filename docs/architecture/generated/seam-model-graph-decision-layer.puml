@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - model-graph-decision-layer
+
+rectangle "model-graph-decision-layer" as model_graph_decision_layer #Orange {
+}
+
+
+@enduml

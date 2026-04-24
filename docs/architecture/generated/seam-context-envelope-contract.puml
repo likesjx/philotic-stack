@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - context-envelope-contract
+
+rectangle "context-envelope-contract" as context_envelope_contract #Orange {
+}
+
+
+@enduml

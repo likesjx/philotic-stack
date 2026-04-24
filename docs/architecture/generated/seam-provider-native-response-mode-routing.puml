@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - provider-native-response-mode-routing
+
+rectangle "provider-native-response-mode-routing" as provider_native_response_mode_routing #Orange {
+}
+
+
+@enduml

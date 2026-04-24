@@ -8,9 +8,16 @@ philotic_default_model: "gemini-pro"
 # Backbone peers — other hotels this node should announce to.
 # host is Tailscale MagicDNS name (transitional; will become explicit address).
 philotic_backbone_peers:
-  - name: "jane-vps"
-    host: "jane-vps"
-    beacon_port: 8999
+  - name: "default"
+    host: "100.64.230.106"
+    beacon_port: 24849
+    blob_port: 24850
+    execution_port: 24851
+  - name: "mbp-jane"
+    host: "100.79.239.64"
+    beacon_port: 13104
+    blob_port: 13105
+    execution_port: 13106
 
 # Agent configuration projected into mesh-config.json.
 # Do not put secrets here — reference vault variables instead.

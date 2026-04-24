@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - provisional-relation-layer
+
+rectangle "provisional-relation-layer" as provisional_relation_layer #Orange {
+}
+
+
+@enduml

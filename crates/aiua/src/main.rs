@@ -134,7 +134,7 @@ async fn run_operator_surface_query_worker(
                     warn!("Operator surface query worker failed to connect: {}", err);
                     tokio::select! {
                         _ = shutdown_rx.recv() => return,
-                        _ = tokio::time::sleep(tokio::time::Duration::from_millis(250)) => continue,
+                        _ = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => continue,
                     }
                 }
             }
@@ -1711,6 +1711,123 @@ fn hotel_object<'a>(
         .as_object()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfiguredPeerHotel {
+    hotel_name: String,
+    mesh_host: String,
+    mesh_port: u16,
+    blob_port: u16,
+    execution_port: u16,
+}
+
+fn merge_configured_peer_hotels(
+    merged: &mut std::collections::BTreeMap<String, ConfiguredPeerHotel>,
+    hotel: &serde_json::Map<String, serde_json::Value>,
+) {
+    let Some(peers) = hotel
+        .get("backbone_peers")
+        .or_else(|| hotel.get("backbonePeers"))
+        .or_else(|| hotel.get("peers"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return;
+    };
+
+    for peer in peers {
+        let Some(peer_obj) = peer.as_object() else {
+            continue;
+        };
+
+        let Some(peer_name) = peer_obj
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+
+        let Some(peer_host) = peer_obj
+            .get("host")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+
+        let mesh_port = peer_obj
+            .get("beacon_port")
+            .or_else(|| peer_obj.get("beaconPort"))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok())
+            .unwrap_or(8999);
+        let blob_port = peer_obj
+            .get("blob_port")
+            .or_else(|| peer_obj.get("blobPort"))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok())
+            .unwrap_or(mesh_port.saturating_add(1));
+        let execution_port = peer_obj
+            .get("execution_port")
+            .or_else(|| peer_obj.get("executionPort"))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok())
+            .unwrap_or(mesh_port.saturating_add(2));
+
+        merged.insert(
+            peer_name.to_string(),
+            ConfiguredPeerHotel {
+                hotel_name: peer_name.to_string(),
+                mesh_host: peer_host.to_string(),
+                mesh_port,
+                blob_port,
+                execution_port,
+            },
+        );
+    }
+}
+
+fn configured_peer_hotels(config_json: &serde_json::Value, hotel_name: &str) -> Vec<ConfiguredPeerHotel> {
+    let mut merged = std::collections::BTreeMap::new();
+
+    if let Some(default_hotel) = hotel_object(config_json, "default") {
+        merge_configured_peer_hotels(&mut merged, default_hotel);
+    }
+
+    if hotel_name != "default" {
+        if let Some(hotel) = hotel_object(config_json, hotel_name) {
+            merge_configured_peer_hotels(&mut merged, hotel);
+        }
+    }
+
+    merged.remove(hotel_name);
+    merged.into_values().collect()
+}
+
+fn seed_peer_hotels_from_config(
+    graph: &GraphDomain,
+    config_json: &serde_json::Value,
+    local_hotel_name: &str,
+) -> Result<usize> {
+    let peers = configured_peer_hotels(config_json, local_hotel_name);
+    let mut count = 0;
+
+    for peer in peers {
+        let mut hotel = graph
+            .get_hotel(&peer.hotel_name)?
+            .unwrap_or_else(|| default_hotel_record(&peer.hotel_name));
+        hotel.mesh_host = Some(peer.mesh_host);
+        hotel.mesh_port = peer.mesh_port;
+        hotel.blob_port = peer.blob_port;
+        hotel.execution_port = peer.execution_port;
+        graph.upsert_hotel(&hotel)?;
+        count += 1;
+    }
+
+    Ok(count)
+}
+
 #[cfg(test)]
 fn selected_agent_key_for_hotel(
     hotel: &serde_json::Map<String, serde_json::Value>,
@@ -2503,6 +2620,33 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             }),
             class: "config".into(),
             tool_markers: Vec::new(),
+        },
+        AbstractToolRecord {
+            tool_name: "bash.exec".into(),
+            description: "Last-resort shell execution. Runs a shell command and returns stdout, \
+                          stderr, and exit code. Use ONLY when no Philotic-native tool can \
+                          accomplish the task. Requires explicit operator approval before execution."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The shell command to execute (passed to `sh -c`)."
+                    },
+                    "working_dir": {
+                        "type": "string",
+                        "description": "Optional absolute path to use as the working directory."
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "description": "Maximum seconds to wait before killing the process. Defaults to 30."
+                    }
+                },
+                "required": ["command"]
+            }),
+            class: "shell".into(),
+            tool_markers: vec!["high_agency".into()],
         },
     ];
 
@@ -4930,6 +5074,11 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
         warn!("Config file has no context_graph entries.");
     }
 
+    let seeded_peer_hotels = seed_peer_hotels_from_config(&graph_domain, &config_json, hotel_name)?;
+    if seeded_peer_hotels > 0 {
+        info!("Seeded {} peer hotel record(s) from config.", seeded_peer_hotels);
+    }
+
     // Provision MuninnDB vaults if configured.
     if let Some(muninn) = config_json
         .get("context_graph")
@@ -5813,6 +5962,7 @@ mod tests {
                 agent_id: "agent-beacon-01".into(),
                 persona_name: "Beacon".into(),
                 import_workspace: None,
+                is_admin: false,
             },
         );
         let membrane_guest = guests
@@ -6072,6 +6222,7 @@ mod tests {
             agent_id: "agent-aria".into(),
             persona_name: "Aria".into(),
             import_workspace: None,
+            is_admin: false,
         };
         let guests = guest_seed_for_profile("default", &profile);
         let membrane = guests
@@ -6097,6 +6248,7 @@ mod tests {
             agent_id: "agent-beacon".into(),
             persona_name: "Beacon".into(),
             import_workspace: None,
+            is_admin: false,
         };
         let mut agent_config = serde_json::Map::new();
         agent_config.insert(
@@ -6117,6 +6269,7 @@ mod tests {
             persona_name: "Beacon".into(),
             // Workspace path that doesn't exist — bundle will be empty
             import_workspace: None,
+            is_admin: false,
         };
         let mut agent_config = serde_json::Map::new();
         agent_config.insert("system_prompt".into(), "Fallback prompt.".into());
@@ -6194,6 +6347,91 @@ mod tests {
             identity.bundle_json["workspace_path"].as_str(),
             Some("/tmp/aria-workspace")
         );
+    }
+
+    #[test]
+    fn configured_peer_hotels_reads_backbone_peers_from_selected_hotel() {
+        let config = serde_json::json!({
+            "hotels": {
+                "beacon-test-hotel": {
+                    "backbone_peers": [
+                        {
+                            "name": "mbp-jane",
+                            "host": "100.79.239.64",
+                            "beacon_port": 8999
+                        },
+                        {
+                            "name": "default",
+                            "host": "100.64.230.106",
+                            "beacon_port": 9100,
+                            "blob_port": 9101,
+                            "execution_port": 9102
+                        }
+                    ]
+                }
+            }
+        });
+
+        let peers = super::configured_peer_hotels(&config, "beacon-test-hotel");
+        assert_eq!(peers.len(), 2);
+        assert!(peers.iter().any(|peer| {
+            peer.hotel_name == "mbp-jane"
+                && peer.mesh_host == "100.79.239.64"
+                && peer.mesh_port == 8999
+                && peer.blob_port == 9000
+                && peer.execution_port == 9001
+        }));
+        assert!(peers.iter().any(|peer| {
+            peer.hotel_name == "default"
+                && peer.mesh_host == "100.64.230.106"
+                && peer.mesh_port == 9100
+                && peer.blob_port == 9101
+                && peer.execution_port == 9102
+        }));
+    }
+
+    #[test]
+    fn configured_peer_hotels_overlay_default_entries() {
+        let config = serde_json::json!({
+            "hotels": {
+                "default": {
+                    "backbone_peers": [
+                        {
+                            "name": "shared-peer",
+                            "host": "100.64.0.1",
+                            "beacon_port": 8999
+                        }
+                    ]
+                },
+                "mbp-jane": {
+                    "backbone_peers": [
+                        {
+                            "name": "shared-peer",
+                            "host": "100.64.0.2",
+                            "beacon_port": 9100
+                        },
+                        {
+                            "name": "beacon-test-hotel",
+                            "host": "100.64.212.8",
+                            "beacon_port": 8999
+                        }
+                    ]
+                }
+            }
+        });
+
+        let peers = super::configured_peer_hotels(&config, "mbp-jane");
+        assert_eq!(peers.len(), 2);
+        assert!(peers.iter().any(|peer| {
+            peer.hotel_name == "shared-peer"
+                && peer.mesh_host == "100.64.0.2"
+                && peer.mesh_port == 9100
+        }));
+        assert!(peers.iter().any(|peer| {
+            peer.hotel_name == "beacon-test-hotel"
+                && peer.mesh_host == "100.64.212.8"
+                && peer.mesh_port == 8999
+        }));
     }
 
     #[test]

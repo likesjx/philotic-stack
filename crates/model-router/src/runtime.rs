@@ -53,7 +53,7 @@ enum StubResponse {
 }
 
 pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
-    tracing_subscriber::fmt::init();
+    let _ = tracing_subscriber::fmt().try_init();
     info!(
         "Starting Materialized Model Controller Guest [{}] for role [{}]...",
         config.guest_id, config.role
@@ -385,6 +385,54 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                 None,
                                 latency_ms,
                             );
+
+                            // ── Transcription flywheel fan-out ────────────────
+                            // After a successful AudioTranscribe, fire a capture
+                            // envelope to role=router-listener (if enabled).
+                            if controller_task.kind == TaskKind::AudioTranscribe {
+                                if let ProviderOutput::Text { ref content, ref model_gen, .. } = output {
+                                    if std::env::var("PHILOTIC_ROUTER_CAPTURE_ENABLED").as_deref() == Ok("true") {
+                                        let blob_url = controller_task
+                                            .media_attachments()
+                                            .first()
+                                            .and_then(|a| a.url.clone());
+
+                                        let capture_json = serde_json::to_string(&json!({
+                                            "kind": "transcription_capture",
+                                            "session_id": reply.session_id,
+                                            "turn_id": reply.turn_id,
+                                            "agent_id": config.guest_id,
+                                            "transcript": content,
+                                            "model_gen": model_gen,
+                                            "blob_download_url": blob_url,
+                                            "timestamp": SystemTime::now()
+                                                .duration_since(UNIX_EPOCH)
+                                                .map(|d| d.as_secs())
+                                                .unwrap_or(0),
+                                        }))
+                                        .unwrap_or_default();
+
+                                        let fanout_identity = GuestIdentity {
+                                            guest_id: format!("capture-fanout-{}", Ulid::new()),
+                                            role: config.guest_id.to_string(),
+                                            supported_tools: Vec::new(),
+                                        };
+                                        tokio::spawn(async move {
+                                            if let Ok(mut fanout_ipc) = PhiloticClient::connect(fanout_identity).await {
+                                                let _ = fanout_ipc
+                                                    .send_request(IpcRequest::EmitTask {
+                                                        target_node: local_node_id(),
+                                                        target_role: "router-listener".to_string(),
+                                                        target_guest_id: None,
+                                                        task_json: capture_json,
+                                                    })
+                                                    .await;
+                                            }
+                                        });
+                                    }
+                                }
+                            }
+
                             let response = ControllerResponseEnvelope::from_output(
                                 &controller_task,
                                 provider.id(),

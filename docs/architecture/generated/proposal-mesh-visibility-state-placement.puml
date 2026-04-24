@@ -1,0 +1,7 @@
+@startuml
+!theme plain
+
+title Proposal Architecture - doc:mesh-visibility-state-placement
+
+
+@enduml

@@ -67,6 +67,23 @@
   when: not philotic_artifacts_remote
   notify: Restart philotic-hotel
 
+- name: Check which remote Philotic binaries are available on host
+  stat:
+    path: "{{ philotic_artifacts_dir }}/{{ item }}"
+  loop: "{{ philotic_binaries }}"
+  register: philotic_remote_artifact_stats
+  when: philotic_artifacts_remote
+
+- name: Warn about missing remote Philotic binaries
+  debug:
+    msg: >
+      Skipping remote artifact {{ item.item }} because {{ philotic_artifacts_dir }}/{{ item.item }}
+      is not present on the target host.
+  loop: "{{ philotic_remote_artifact_stats.results }}"
+  when:
+    - philotic_artifacts_remote
+    - not item.stat.exists
+
 - name: Install Philotic binaries (already built on host)
   copy:
     src: "{{ philotic_artifacts_dir }}/{{ item }}"
@@ -75,7 +92,13 @@
     group: "{{ philotic_group }}"
     mode: "0755"
     remote_src: yes
-  loop: "{{ philotic_binaries }}"
+  loop: >-
+    {{
+      philotic_remote_artifact_stats.results
+      | selectattr('stat.exists')
+      | map(attribute='item')
+      | list
+    }}
   when: philotic_artifacts_remote
   notify: Restart philotic-hotel
 

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - active-plan-streaming
+
+rectangle "active-plan-streaming" as active_plan_streaming #Orange {
+}
+
+
+@enduml

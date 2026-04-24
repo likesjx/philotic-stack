@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - discord-agent-routing-reflex
+
+rectangle "discord-agent-routing-reflex" as discord_agent_routing_reflex #Orange {
+}
+
+
+@enduml

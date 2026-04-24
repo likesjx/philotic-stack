@@ -1105,6 +1105,7 @@ impl GeminiProvider {
                 memory_concept: None,
                 memory_candidate: None,
                 active_plan: None,
+                model_gen: None,
             },
             partial_text_deltas,
             session_marker,
@@ -1372,6 +1373,7 @@ impl ModelProvider for GeminiProvider {
                 memory_concept,
                 memory_candidate,
                 active_plan,
+                model_gen: None,
             })
         } else {
             let content = Self::parse_response_text(status, body);
@@ -1389,6 +1391,7 @@ impl ModelProvider for GeminiProvider {
                 memory_concept: None,
                 memory_candidate: None,
                 active_plan: None,
+                model_gen: None,
             })
         }
     }
@@ -1451,6 +1454,7 @@ impl ModelProvider for GeminiProvider {
                 memory_concept: None,
                 memory_candidate: None,
                 active_plan: None,
+                model_gen: None,
             });
         }
 
@@ -1559,6 +1563,7 @@ impl ModelProvider for GeminiProvider {
                 memory_concept,
                 memory_candidate,
                 active_plan,
+                model_gen: None,
             })
         } else {
             Ok(ProviderOutput::Text {
@@ -1572,6 +1577,7 @@ impl ModelProvider for GeminiProvider {
                 memory_concept: None,
                 memory_candidate: None,
                 active_plan: None,
+                model_gen: None,
             })
         }
     }

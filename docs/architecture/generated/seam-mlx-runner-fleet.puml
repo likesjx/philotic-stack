@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - mlx-runner-fleet
+
+rectangle "mlx-runner-fleet" as mlx_runner_fleet #Orange {
+}
+
+
+@enduml

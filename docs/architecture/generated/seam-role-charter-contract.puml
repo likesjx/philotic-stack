@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - role-charter-contract
+
+rectangle "role-charter-contract" as role_charter_contract #Orange {
+}
+
+
+@enduml

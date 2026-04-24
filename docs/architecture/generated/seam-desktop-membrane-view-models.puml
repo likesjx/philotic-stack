@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - desktop-membrane-view-models
+
+rectangle "desktop-membrane-view-models" as desktop_membrane_view_models #Orange {
+}
+
+
+@enduml

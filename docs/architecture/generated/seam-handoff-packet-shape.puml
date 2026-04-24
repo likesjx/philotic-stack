@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - handoff-packet-shape
+
+rectangle "handoff-packet-shape" as handoff_packet_shape #Orange {
+}
+
+
+@enduml

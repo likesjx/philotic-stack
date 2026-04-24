@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - git-scanner
+
+rectangle "git-scanner" as git_scanner #Orange {
+}
+
+
+@enduml

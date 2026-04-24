@@ -228,6 +228,7 @@ pub async fn run(
     _db: Option<PathBuf>,
     config: Option<PathBuf>,
     allow_origins: Option<String>,
+    open_path: Option<String>,
 ) -> Result<()> {
     let db_path = _db.unwrap_or_else(|| match crate::init::active_profile() {
         Some(_) => crate::init::profile_dir().join("context.db"),
@@ -357,6 +358,7 @@ pub async fn run(
         .route("/api/guests/:guest_id/restart", post(handle_guest_restart))
         .route("/api/guests/:guest_id/stop", post(handle_guest_stop))
         .route("/ws", get(handle_ws))
+        .route("/setup-guide", get(handle_setup_guide))
         // Embedded UI — index.html gets token injected; cookie auth bootstrap; all other assets served as-is
         .route("/", get(handle_index))
         .fallback(get(handle_static))
@@ -379,9 +381,12 @@ pub async fn run(
     println!();
     println!("  Press Ctrl-C to stop.");
 
+    let open_path = normalized_open_path(open_path.as_deref());
+    let browser_url = format!("http://127.0.0.1:{port}{open_path}");
+
     // Auto-open the embedded desktop in the default browser
     let _ = tokio::process::Command::new("open")
-        .arg(format!("http://127.0.0.1:{port}"))
+        .arg(&browser_url)
         .spawn();
 
     let shutdown_reason = wait_for_shutdown(shutdown_rx);
@@ -634,6 +639,210 @@ async fn handle_index(State(state): State<AppState>) -> Response {
     response
 }
 
+async fn handle_setup_guide() -> Response {
+    let html = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Philotic Setup Guide</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4efe4;
+      --panel: rgba(255, 252, 247, 0.92);
+      --text: #1d1b18;
+      --muted: #665f57;
+      --accent: #1d6b57;
+      --accent-2: #c46a2a;
+      --border: rgba(29, 27, 24, 0.1);
+      --shadow: 0 24px 60px rgba(58, 46, 34, 0.12);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(196, 106, 42, 0.16), transparent 34%),
+        radial-gradient(circle at top right, rgba(29, 107, 87, 0.18), transparent 30%),
+        linear-gradient(180deg, #fbf7f0 0%, var(--bg) 100%);
+      min-height: 100vh;
+    }
+    main {
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 48px 24px 64px;
+    }
+    .hero, .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 28px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(12px);
+    }
+    .hero {
+      padding: 32px;
+      margin-bottom: 24px;
+    }
+    .eyebrow {
+      text-transform: uppercase;
+      letter-spacing: 0.14em;
+      font-size: 12px;
+      color: var(--accent);
+      font-weight: 700;
+      margin: 0 0 12px;
+    }
+    h1 {
+      font-size: clamp(32px, 4vw, 54px);
+      line-height: 0.96;
+      margin: 0 0 14px;
+      max-width: 10ch;
+    }
+    .lede {
+      font-size: 18px;
+      line-height: 1.6;
+      color: var(--muted);
+      max-width: 60ch;
+      margin: 0;
+    }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 24px;
+    }
+    .actions a {
+      text-decoration: none;
+      padding: 12px 18px;
+      border-radius: 999px;
+      font-weight: 700;
+    }
+    .actions a.primary {
+      background: var(--accent);
+      color: white;
+    }
+    .actions a.secondary {
+      background: rgba(29, 107, 87, 0.08);
+      color: var(--accent);
+      border: 1px solid rgba(29, 107, 87, 0.18);
+    }
+    .grid {
+      display: grid;
+      gap: 18px;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    }
+    .panel {
+      padding: 24px;
+    }
+    .panel h2 {
+      margin: 0 0 12px;
+      font-size: 22px;
+    }
+    .panel p, .panel li {
+      color: var(--muted);
+      line-height: 1.6;
+    }
+    ol, ul {
+      margin: 0;
+      padding-left: 20px;
+    }
+    .callout {
+      margin-top: 24px;
+      padding: 18px 20px;
+      border-left: 4px solid var(--accent-2);
+      background: rgba(196, 106, 42, 0.08);
+      border-radius: 18px;
+      color: var(--text);
+    }
+    code {
+      font-family: "SFMono-Regular", "Menlo", monospace;
+      font-size: 0.95em;
+      background: rgba(29, 27, 24, 0.06);
+      padding: 2px 6px;
+      border-radius: 6px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="hero">
+      <p class="eyebrow">Philotic Setup</p>
+      <h1>Finish the operator handoff.</h1>
+      <p class="lede">
+        Onboarding got the hotel alive. This guide is the part where we stop pretending the rest is obvious and
+        make the model, workspace, and component setup explicit.
+      </p>
+      <div class="actions">
+        <a class="primary" href="/">Open Management UI</a>
+        <a class="secondary" href="/api/component-templates">View Component Templates</a>
+      </div>
+    </section>
+
+    <section class="grid">
+      <article class="panel">
+        <h2>1. Confirm the hotel is healthy</h2>
+        <ol>
+          <li>Use the main dashboard to confirm the daemon, guests, and agents are visible.</li>
+          <li>If you just finished onboarding, check that the hotel you seeded is the one you expect.</li>
+          <li>If anything looks stale, run <code>phil status --hotel &lt;hotel&gt;</code> in the terminal for a second opinion.</li>
+        </ol>
+      </article>
+
+      <article class="panel">
+        <h2>2. Configure your model path</h2>
+        <p>The management UI is where model setup should become legible instead of hidden in config folklore.</p>
+        <ul>
+          <li>Remote Gemini path: confirm the configured default model and the Gemini secret/config entries.</li>
+          <li>MLX path: add or edit the <code>model-controller-mlx</code> component and define its model fleet.</li>
+          <li>Local controller path: use the local model controller surfaces when you want a local-first or offline-ish route.</li>
+        </ul>
+      </article>
+
+      <article class="panel">
+        <h2>3. Point the agent at real local files</h2>
+        <p>
+          The agent workspace matters. Philotic uses it for both identity file import
+          and as the bash working directory fallback, so this is the seam where “local files”
+          becomes a real operating mode rather than a vague intention.
+        </p>
+        <ul>
+          <li>Set the agent workspace/import path to the folder you actually want the operator to work from.</li>
+          <li>Keep <code>AGENTS.md</code>, <code>IDENTITY.md</code>, and related context files there if you want the agent bundle to hydrate from disk.</li>
+          <li>Use the dashboard’s agent editing surfaces to revise this without re-running bootstrap.</li>
+        </ul>
+      </article>
+
+      <article class="panel">
+        <h2>4. Keep the explanation honest</h2>
+        <p>
+          If a human has to guess where models live, which workspace is canonical, or why a local controller exists,
+          the setup is still under-authored. This guide is the first corrective, not the final word.
+        </p>
+        <ul>
+          <li>Add a small skill bundle for your operator personas once the basic model path is stable.</li>
+          <li>Use this UI session to note friction points for Anj and Mauricio rather than trying to solve the whole platform in one turn.</li>
+          <li>Prefer one explanatory panel that tells the truth over three “smart” surfaces that assume it.</li>
+        </ul>
+      </article>
+    </section>
+
+    <div class="callout">
+      Best next move: get one operator through this guide with a real local-files workspace and one model path
+      configured end-to-end. That gives you signal. Everything else is still tempting architecture perfume.
+    </div>
+  </main>
+</body>
+</html>"#;
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        html,
+    )
+        .into_response()
+}
+
 /// Serve any other embedded asset (JS, CSS, icons, etc.).
 /// Falls back to `index.html` for SPA client-side routes.
 async fn handle_static(State(state): State<AppState>, uri: axum::http::Uri) -> Response {
@@ -702,6 +911,14 @@ fn auth_cookie_header(state: &AppState) -> HeaderValue {
 
 fn no_store_header_value() -> &'static str {
     "no-store, no-cache, must-revalidate, private"
+}
+
+fn normalized_open_path(open_path: Option<&str>) -> String {
+    match open_path.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(path) if path.starts_with('/') => path.to_string(),
+        Some(path) => format!("/{path}"),
+        None => "/".into(),
+    }
 }
 
 fn unauthorized() -> Response {

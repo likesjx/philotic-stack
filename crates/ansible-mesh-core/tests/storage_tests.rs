@@ -130,6 +130,7 @@ fn sample_role_incarnation(role_name: &str) -> RoleIncarnationRecord {
             context_window_policy: Some("balanced".into()),
             loop_script: None,
         },
+        home_node: None,
     }
 }
 
@@ -877,6 +878,7 @@ fn graph_storage_lists_role_incarnations_by_agent() {
             readiness_state: RoleReadinessState::Configured,
             inactive_ttl_seconds: None,
             turn_loop_config: TurnLoopConfig::default(),
+            home_node: None,
         })
         .unwrap();
 
