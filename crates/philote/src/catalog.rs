@@ -993,5 +993,101 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         },
     );
 
+    m.insert(
+        "mcp.provision".into(),
+        ToolDefinition {
+            tool_name: "mcp.provision".into(),
+            description: "Declare or update an MCP endpoint this agent exposes to external \
+                          callers. Specifies the port, tool listing with inbound/outbound \
+                          transforms, and pre-approval rules. The hotel materializes a \
+                          membrane-mcp guest for this endpoint. The provisioning turn is the \
+                          authorization event — pre-approval rules carry that authority forward \
+                          so future requests matching the declared envelope shapes are not \
+                          re-blocked for approval."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "endpoint_id": {
+                        "type": "string",
+                        "description": "Stable ID for this endpoint (e.g. 'bjork-mcp-01'). \
+                                        Must be unique within the hotel."
+                    },
+                    "port": {
+                        "type": "integer",
+                        "description": "Port the membrane-mcp guest should bind on (e.g. 8910)."
+                    },
+                    "tools": {
+                        "type": "array",
+                        "description": "Tools to advertise to MCP clients.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string" },
+                                "description": { "type": "string" },
+                                "input_schema": { "type": "object" },
+                                "inbound_transform": {
+                                    "type": "object",
+                                    "description": "FieldMap: { kind: 'field_map', action, target, mappings }. \
+                                                    Target: { kind: 'datasource'|'philote'|'tool', datasource_id|agent_id|tool_ref }. \
+                                                    Mappings: [{ from: 'arg.key', to: 'payload.key' }]."
+                                },
+                                "outbound_transform": {
+                                    "type": "object",
+                                    "description": "PassThrough: { kind: 'pass_through' }. \
+                                                    Extract: { kind: 'extract', path: 'dot.path' }."
+                                }
+                            },
+                            "required": ["name", "description", "input_schema",
+                                         "inbound_transform", "outbound_transform"]
+                        }
+                    },
+                    "preapproval_rules": {
+                        "type": "array",
+                        "description": "Envelope actions pre-approved by this provisioning turn.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "action_pattern": {
+                                    "type": "string",
+                                    "description": "Exact action string or '*' to match all."
+                                },
+                                "expires_at": {
+                                    "type": "integer",
+                                    "description": "Optional unix epoch expiry. Absent = permanent."
+                                }
+                            },
+                            "required": ["action_pattern"]
+                        }
+                    }
+                },
+                "required": ["endpoint_id", "port", "tools"]
+            }),
+            class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "mcp.revoke".into(),
+        ToolDefinition {
+            tool_name: "mcp.revoke".into(),
+            description: "Tear down an MCP endpoint and remove its configuration. \
+                          The hotel signals the membrane-mcp guest to shut down and \
+                          clears all stored config and pre-approval rules."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "endpoint_id": {
+                        "type": "string",
+                        "description": "The endpoint ID to revoke (must be owned by this agent)."
+                    }
+                },
+                "required": ["endpoint_id"]
+            }),
+            class: Some("config".into()),
+        },
+    );
+
     m
 }
